@@ -1,0 +1,340 @@
+import { describe, expect, it } from "vitest"
+
+import type {
+  AdaptedContentPart,
+  AdaptedDelegationWorkUnitPart,
+  AdaptedMessage,
+  AdaptedToolCallPart,
+} from "@/lib/adapters/ai-elements-adapter"
+import { buildDelegationTaskRows } from "@/lib/delegation-status"
+import {
+  projectDelegationTranscript,
+  shouldFoldLiveDelegationTool,
+} from "@/lib/delegation-transcript-projection"
+
+function assistant(
+  id: string,
+  ...content: AdaptedContentPart[]
+): AdaptedMessage {
+  return {
+    id,
+    role: "assistant",
+    content,
+    timestamp: `2026-07-27T00:00:${id.padStart(2, "0")}Z`,
+  }
+}
+
+function delegate(
+  toolCallId: string,
+  taskId: string,
+  workUnitKey: string | null,
+  options: {
+    toolName?: "delegate_to_agent" | "continue_delegation"
+    targetTaskId?: string | null
+    childConversationId?: number
+  } = {}
+): AdaptedToolCallPart {
+  const targetTaskId = options.targetTaskId ?? null
+  return {
+    type: "tool-call",
+    toolCallId,
+    toolName: options.toolName ?? "delegate_to_agent",
+    input: JSON.stringify({
+      task: "implement",
+      ...(workUnitKey ? { work_unit_key: workUnitKey } : {}),
+      ...(targetTaskId ? { task_id: targetTaskId } : {}),
+    }),
+    output: JSON.stringify({
+      content: [{ type: "text", text: `Delegated ${taskId}` }],
+      structuredContent: {
+        status: "running",
+        task_id: taskId,
+        child_conversation_id: options.childConversationId ?? 3001,
+        ...(targetTaskId ? { continued_from_task_id: targetTaskId } : {}),
+      },
+    }),
+    state: "output-available",
+  }
+}
+
+type ReportStatus = "running" | "completed" | "failed" | "canceled"
+
+function status(
+  toolCallId: string,
+  reports: Array<{ taskId: string; status: ReportStatus }>
+): AdaptedContentPart {
+  return {
+    type: "delegation-status-group",
+    polls: [
+      {
+        type: "tool-call",
+        toolCallId,
+        toolName: "get_delegation_status",
+        input: JSON.stringify({
+          task_ids: reports.map((report) => report.taskId),
+        }),
+        output: JSON.stringify({
+          content: [{ type: "text", text: "status batch" }],
+          structuredContent: {
+            tasks: reports.map((report) => ({
+              task_id: report.taskId,
+              status: report.status,
+              ...(report.status === "completed"
+                ? { text: "done" }
+                : { message: "Running." }),
+            })),
+          },
+        }),
+        state: "output-available",
+      },
+    ],
+  }
+}
+
+function text(value: string): AdaptedContentPart {
+  return { type: "text", text: value }
+}
+
+function allParts(messages: readonly AdaptedMessage[]): AdaptedContentPart[] {
+  return messages.flatMap((message) => message.content)
+}
+
+function workUnits(
+  messages: readonly AdaptedMessage[]
+): AdaptedDelegationWorkUnitPart[] {
+  return allParts(messages).filter(
+    (part): part is AdaptedDelegationWorkUnitPart =>
+      part.type === "delegation-work-unit"
+  )
+}
+
+function visibleStatusTaskIds(messages: readonly AdaptedMessage[]): string[] {
+  return allParts(messages).flatMap((part) => {
+    if (part.type !== "delegation-status-group") return []
+    const visible = part.visibleTaskIds
+      ? new Set(part.visibleTaskIds)
+      : undefined
+    return buildDelegationTaskRows(part.polls, visible)
+      .map((row) => row.taskId)
+      .filter((taskId): taskId is string => taskId !== null)
+  })
+}
+
+describe("projectDelegationTranscript", () => {
+  it("projects a 2075-like history to one work-unit card and one residual row", () => {
+    const messages = [
+      assistant("1", delegate("tool-1", "run-1", "unit-a")),
+      assistant(
+        "2",
+        status("poll-1", [{ taskId: "run-1", status: "running" }])
+      ),
+      assistant("3", text("checkpoint explanation")),
+      assistant(
+        "4",
+        delegate("tool-2", "run-2", "unit-a", {
+          toolName: "continue_delegation",
+          targetTaskId: "run-1",
+        })
+      ),
+      assistant(
+        "5",
+        status("poll-2", [{ taskId: "run-2", status: "running" }])
+      ),
+      assistant("6", text("still working")),
+      assistant(
+        "7",
+        status("poll-3", [
+          { taskId: "run-2", status: "completed" },
+          { taskId: "unknown-run", status: "completed" },
+        ])
+      ),
+    ]
+    const originalParts = allParts(messages)
+
+    const projected = projectDelegationTranscript(messages, 2075)
+
+    expect(workUnits(projected.messages)).toHaveLength(1)
+    expect(workUnits(projected.messages)[0]).toMatchObject({
+      key: "wu:unit-a",
+      explicitUserCancel: false,
+    })
+    expect(
+      workUnits(projected.messages)[0].sources.map(
+        (source) => source.toolCallId
+      )
+    ).toEqual(["tool-1", "tool-2"])
+    expect(
+      allParts(projected.messages)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+    ).toEqual(["checkpoint explanation", "still working"])
+    expect(visibleStatusTaskIds(projected.messages)).toEqual(["unknown-run"])
+    expect(projected.messages[2]).toBe(messages[2])
+    expect(projected.messages[5]).toBe(messages[5])
+    expect(originalParts).toEqual(allParts(messages))
+    expect(originalParts).not.toContainEqual(
+      expect.objectContaining({ type: "delegation-work-unit" })
+    )
+  })
+
+  it("keeps parallel explicit work units separate", () => {
+    const projected = projectDelegationTranscript(
+      [
+        assistant(
+          "1",
+          delegate("a", "run-a", "unit-a", { childConversationId: 10 })
+        ),
+        assistant(
+          "2",
+          delegate("b", "run-b", "unit-b", { childConversationId: 20 })
+        ),
+        assistant(
+          "3",
+          status("poll", [
+            { taskId: "run-a", status: "running" },
+            { taskId: "run-b", status: "running" },
+          ])
+        ),
+      ],
+      2075
+    )
+
+    expect(workUnits(projected.messages).map((unit) => unit.key)).toEqual([
+      "wu:unit-a",
+      "wu:unit-b",
+    ])
+    expect(visibleStatusTaskIds(projected.messages)).toEqual([])
+  })
+
+  it("resolves out-of-order task linkage while preserving source order", () => {
+    const projected = projectDelegationTranscript(
+      [
+        assistant(
+          "1",
+          delegate("continue", "run-2", null, {
+            toolName: "continue_delegation",
+            targetTaskId: "run-1",
+          })
+        ),
+        assistant("2", delegate("initial", "run-1", null)),
+      ],
+      2075
+    )
+
+    expect(workUnits(projected.messages)).toHaveLength(1)
+    expect(
+      workUnits(projected.messages)[0].sources.map(
+        (source) => source.toolCallId
+      )
+    ).toEqual(["continue", "initial"])
+  })
+
+  it("retains wholly unmapped status groups by reference", () => {
+    const statusPart = status("poll", [
+      { taskId: "unknown", status: "running" },
+    ])
+    const statusMessage = assistant("2", statusPart)
+    const projected = projectDelegationTranscript(
+      [assistant("1", delegate("a", "run-a", "unit-a")), statusMessage],
+      2075
+    )
+
+    expect(projected.messages[1]).toBe(statusMessage)
+    expect(projected.messages[1].content[0]).toBe(statusPart)
+  })
+
+  it("marks mapped successful cancellation without removing its audit card", () => {
+    const cancel: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "cancel-1",
+      toolName: "cancel_delegation",
+      input: JSON.stringify({ task_id: "run-1" }),
+      output: JSON.stringify({
+        status: "canceled",
+        task_id: "run-1",
+        error_code: "user_cancelled",
+      }),
+      state: "output-available",
+    }
+    const projected = projectDelegationTranscript(
+      [
+        assistant("1", delegate("a", "run-1", "unit-a")),
+        assistant("2", cancel),
+      ],
+      2075
+    )
+
+    expect(workUnits(projected.messages)[0].explicitUserCancel).toBe(true)
+    expect(allParts(projected.messages)).toContain(cancel)
+  })
+
+  it("recurses through goal-run items without changing goal chrome", () => {
+    const start = delegate("goal-start-shape", "unused", null)
+    start.toolName = "create_goal"
+    const goal: AdaptedContentPart = {
+      type: "goal-run",
+      start,
+      end: null,
+      items: [delegate("nested", "run-1", "unit-a")],
+      isRunning: false,
+    }
+    const projected = projectDelegationTranscript([assistant("1", goal)], 2075)
+
+    expect(projected.messages[0].content[0]).toMatchObject({
+      type: "goal-run",
+      start,
+      end: null,
+      isRunning: false,
+    })
+    const projectedGoal = projected.messages[0].content[0]
+    expect(projectedGoal.type).toBe("goal-run")
+    if (projectedGoal.type === "goal-run") {
+      expect(projectedGoal.items[0].type).toBe("delegation-work-unit")
+    }
+  })
+})
+
+describe("shouldFoldLiveDelegationTool", () => {
+  const projected = projectDelegationTranscript(
+    [assistant("1", delegate("a", "run-1", "unit-a"))],
+    2075
+  )
+
+  it("folds only status calls whose non-empty ids are all known", () => {
+    const known = (
+      status("known", [{ taskId: "run-1", status: "running" }]) as Extract<
+        AdaptedContentPart,
+        { type: "delegation-status-group" }
+      >
+    ).polls[0]
+    const mixed = (
+      status("mixed", [
+        { taskId: "run-1", status: "running" },
+        { taskId: "unknown", status: "running" },
+      ]) as Extract<AdaptedContentPart, { type: "delegation-status-group" }>
+    ).polls[0]
+
+    expect(
+      shouldFoldLiveDelegationTool(known, projected.identityIndex, 2075)
+    ).toBe(true)
+    expect(
+      shouldFoldLiveDelegationTool(mixed, projected.identityIndex, 2075)
+    ).toBe(false)
+  })
+
+  it("folds a linked continuation but not an identity-free initial dispatch", () => {
+    const continuation = delegate("continue", "run-2", null, {
+      toolName: "continue_delegation",
+      targetTaskId: "run-1",
+    })
+    const initial = delegate("new", "run-new", null)
+    initial.output = null
+
+    expect(
+      shouldFoldLiveDelegationTool(continuation, projected.identityIndex, 2075)
+    ).toBe(true)
+    expect(
+      shouldFoldLiveDelegationTool(initial, projected.identityIndex, 2075)
+    ).toBe(false)
+  })
+})

@@ -570,6 +570,29 @@ describe("buildDelegationTaskRows", () => {
     expect(rows[0].taskId).toBe("t1")
   })
 
+  it("keeps only allowlisted task rows while preserving unattributed rows", () => {
+    const rows = buildDelegationTaskRows(
+      [
+        statusPoll({
+          input: JSON.stringify({ task_ids: ["run-1", "orphan"] }),
+          output: batchEnvelope([
+            { task_id: "run-1", status: "running", message: "Running." },
+            { task_id: "orphan", status: "completed", text: "done" },
+          ]),
+        }),
+        statusPoll({
+          toolCallId: "unattributed",
+          input: "{}",
+          output: "settled note without an id",
+          toolStatus: "completed",
+        }),
+      ],
+      new Set(["orphan"])
+    )
+
+    expect(rows.map((row) => row.taskId)).toEqual(["orphan", null])
+  })
+
   it("builds one row per task from a codex live-wire batch poll", () => {
     // End-to-end shape of the reported bug: with codex as the main agent the
     // `{result, error}` wrapper hid the batch, collapsing both tasks into one
