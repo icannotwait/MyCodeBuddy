@@ -99,10 +99,63 @@ pub struct AutomationEngine {
     _engine_lock: std::fs::File,
 }
 
+#[derive(Clone, Debug)]
 struct ResolvedCwd {
     folder_id: i32,
     working_dir: String,
     worktree_folder_id: Option<i32>,
+}
+
+/// Deterministic early-exit injects for Task 7 launch-boundary tests.
+/// Production builds compile these hooks out (`cfg(test)` only).
+#[cfg(test)]
+mod launch_inject {
+    use super::ResolvedCwd;
+    use std::sync::Mutex;
+
+    /// Where to fail inside [`super::AutomationEngine::launch_after_cwd`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        /// Fail at the agent install / launch-input site (before cancel gate).
+        AgentFail,
+        /// Pass agent site (skipped), then fail at `spawn_agent`.
+        SpawnFail,
+        /// Pass agent + cancel, inject a test connection, fail conversation insert.
+        InsertFail,
+        /// Pass agent site (skipped), then exercise the real cancel gate
+        /// (`run_no_longer_running`). Caller must settle the run first.
+        Cancel,
+    }
+
+    static KIND: Mutex<Option<Kind>> = Mutex::new(None);
+    static CWD: Mutex<Option<ResolvedCwd>> = Mutex::new(None);
+
+    pub fn arm(kind: Kind, cwd: ResolvedCwd) {
+        *KIND.lock().expect("kind lock") = Some(kind);
+        *CWD.lock().expect("cwd lock") = Some(cwd);
+    }
+
+    pub fn clear() {
+        *KIND.lock().expect("kind lock") = None;
+        *CWD.lock().expect("cwd lock") = None;
+    }
+
+    /// Peek kind without consuming (cancel / spawn / insert still need it later).
+    pub fn kind() -> Option<Kind> {
+        *KIND.lock().expect("kind lock")
+    }
+
+    pub fn take_cwd_override() -> Option<ResolvedCwd> {
+        CWD.lock().expect("cwd lock").take()
+    }
+
+    /// Drop guard that always clears inject state (parallel tests / panics).
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
 }
 
 /// Visibility-only empty-close for a per-run automation worktree folder after
@@ -439,13 +492,11 @@ impl AutomationEngine {
         // conversation insert fail) and settle-with-no-conversation paths
         // leave through here. Atomic empty-close no-ops when a live
         // conversation exists or when there is no per-run worktree folder.
-        let result = self.launch_after_cwd(auto, run_id, &cwd, &cfg, agent_type, blocks).await;
-        close_empty_worktree_folder_if_needed(
-            &self.db.conn,
-            &self.emitter,
-            cwd.worktree_folder_id,
-        )
-        .await;
+        let result = self
+            .launch_after_cwd(auto, run_id, &cwd, &cfg, agent_type, blocks)
+            .await;
+        close_empty_worktree_folder_if_needed(&self.db.conn, &self.emitter, cwd.worktree_folder_id)
+            .await;
         result
     }
 
@@ -460,20 +511,72 @@ impl AutomationEngine {
         agent_type: AgentType,
         blocks: Vec<PromptInputBlock>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        let inject = launch_inject::kind();
+
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
         // Automation is a row-less root: resolve against the shared live runtime.
-        let runtime = self.runtime.snapshot();
-        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
-            &self.db,
-            agent_type,
-            None,
-            &self.data_dir,
-            crate::acp::terminal_context::AcpRouteRequest::root(None, None),
-            &runtime,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if matches!(inject, Some(launch_inject::Kind::AgentFail)) {
+            return Err("injected: agent disabled or not installed".to_string());
+        }
+
+        // Test injects for later failure sites skip the real install probe so
+        // CI hosts without the agent CLI still reach cancel/spawn/insert.
+        #[cfg(test)]
+        let skip_real_agent = matches!(
+            inject,
+            Some(
+                launch_inject::Kind::SpawnFail
+                    | launch_inject::Kind::InsertFail
+                    | launch_inject::Kind::Cancel
+            )
+        );
+
+        #[cfg(test)]
+        let launch_inputs = if skip_real_agent {
+            // Placeholder only — inject paths fail or use a test connection
+            // before any real CLI spawn consumes these inputs.
+            crate::acp::terminal_context::AcpLaunchInputs::with_placeholder_route(
+                std::collections::BTreeMap::new(),
+                crate::models::SystemTerminalSettings::default(),
+            )
+        } else {
+            let runtime = self.runtime.snapshot();
+            crate::acp::terminal_context::build_acp_launch_inputs(
+                &self.db,
+                agent_type,
+                None,
+                &self.data_dir,
+                crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+                &runtime,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        };
+        #[cfg(test)]
+        if !skip_real_agent {
+            verify_agent_installed(agent_type)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(not(test))]
+        let launch_inputs = {
+            let runtime = self.runtime.snapshot();
+            crate::acp::terminal_context::build_acp_launch_inputs(
+                &self.db,
+                agent_type,
+                None,
+                &self.data_dir,
+                crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+                &runtime,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        };
+        #[cfg(not(test))]
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
@@ -501,10 +604,51 @@ impl AutomationEngine {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if matches!(inject, Some(launch_inject::Kind::SpawnFail)) {
+            return Err("injected: spawn_agent failed".to_string());
+        }
+
         // Fresh connection (session_id=None), owner-labelled "automation".
         // System language + display_text capture for title admission.
         let (launch_context, capture) =
             automation_root_title_admission(&self.db.conn, &cfg.display_text).await;
+
+        #[cfg(test)]
+        let conn_id = if matches!(inject, Some(launch_inject::Kind::InsertFail)) {
+            // Reach the conversation-insert site without a real agent CLI.
+            let id = format!("auto-inject-insert-{run_id}");
+            let _rx = self
+                .manager
+                .insert_test_connection_live(
+                    &id,
+                    agent_type,
+                    Some(PathBuf::from(&cwd.working_dir)),
+                    self.emitter.clone(),
+                )
+                .await;
+            let _ = launch_inputs;
+            let _ = launch_context;
+            id
+        } else {
+            self.manager
+                .spawn_agent(
+                    agent_type,
+                    Some(cwd.working_dir.clone()),
+                    None,
+                    launch_inputs,
+                    "automation".to_string(),
+                    self.emitter.clone(),
+                    cfg.mode_id.clone(),
+                    cfg.config_values.clone(),
+                    launch_context,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        #[cfg(not(test))]
         let conn_id = self
             .manager
             .spawn_agent(
@@ -525,6 +669,11 @@ impl AutomationEngine {
 
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
+        #[cfg(test)]
+        if matches!(inject, Some(launch_inject::Kind::InsertFail)) {
+            let _ = self.manager.disconnect(&conn_id).await;
+            return Err("injected: conversation insert failed".to_string());
+        }
         let conversation_id = match create_conversation_core(
             &self.db.conn,
             cwd.folder_id,
@@ -614,6 +763,14 @@ impl AutomationEngine {
     /// branch)`, reusing the existing worktree/checkout machinery. v1 requires a
     /// target folder (folderless deferred).
     async fn resolve_cwd(&self, auto: &AutomationInfo, run_id: i32) -> Result<ResolvedCwd, String> {
+        // Tests inject a pre-opened per-run worktree folder so early-exit
+        // coverage does not depend on a real `git worktree add`.
+        #[cfg(test)]
+        if let Some(cwd) = launch_inject::take_cwd_override() {
+            let _ = run_id;
+            return Ok(cwd);
+        }
+
         let Some(root_folder_id) = auto.root_folder_id else {
             return Err("automation has no target folder".to_string());
         };
@@ -1360,17 +1517,50 @@ mod tests {
             .is_open
     }
 
-    /// Open a per-run worktree folder (path on disk), then run the same early-exit
-    /// empty-close helper production `launch` invokes after every pre-conversation
-    /// exit. Asserts visibility close + AutoEmpty emit + disk path retained.
-    async fn assert_early_exit_closes_empty_worktree(label: &str) {
+    /// Build a non-global engine for launch-boundary tests (does not touch
+    /// process-wide `ENGINE` OnceLock).
+    fn engine_for_launch_test(
+        db: AppDatabase,
+        emitter: EventEmitter,
+        data_dir: PathBuf,
+    ) -> AutomationEngine {
+        use crate::acp::EventBusMetrics;
+        use crate::commands::delegation::DelegationRuntimeSettings;
+
+        let engine_lock = match acquire_engine_ownership(&data_dir) {
+            Ownership::Exclusive(f) => f,
+            Ownership::Taken => panic!("test engine lock already taken"),
+            Ownership::Unavailable => panic!("test engine lock unavailable"),
+        };
+        AutomationEngine {
+            db,
+            manager: ConnectionManager::new(),
+            emitter,
+            bus: Arc::new(InternalEventBus::new(Arc::new(EventBusMetrics::default()))),
+            data_dir,
+            runtime: DelegationRuntimeSettings::default(),
+            index: Arc::new(Mutex::new(HashMap::new())),
+            automation_locks: Arc::new(Mutex::new(HashMap::new())),
+            root_locks: Arc::new(Mutex::new(HashMap::new())),
+            _engine_lock: engine_lock,
+        }
+    }
+
+    /// Drive production [`AutomationEngine::launch`] with an injected early exit.
+    /// Asserts the single cleanup boundary flips the worktree closed, emits
+    /// AutoEmpty, and leaves the on-disk path/marker intact.
+    async fn assert_launch_early_exit_closes_worktree(kind: launch_inject::Kind, label: &str) {
         use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::models::{AutomationDraft, IsolationMode, TriggerKind};
         use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
         use std::sync::Arc;
 
+        let _guard = launch_inject::Guard;
+        launch_inject::clear();
+
         let disk = tempfile::tempdir().expect("disk worktree dir");
+        let data_dir = tempfile::tempdir().expect("engine data dir");
         let wt_path = disk.path().to_string_lossy().to_string();
-        // Keep a marker file so "disk remains" is stronger than just the temp dir.
         let marker = disk.path().join(format!("{label}-marker.txt"));
         std::fs::write(&marker, label).expect("write marker");
 
@@ -1386,31 +1576,120 @@ mod tests {
             "{label}: worktree folder must start open"
         );
 
+        let auto = automation_service::create(
+            &db.conn,
+            AutomationDraft {
+                name: format!("early-exit-{label}"),
+                enabled: true,
+                trigger_kind: TriggerKind::Manual,
+                cron: None,
+                timezone: "UTC".to_string(),
+                agent_type: "claude_code".to_string(),
+                root_folder_id: Some(root.id),
+                isolation: IsolationMode::WorktreePerRun,
+                branch: None,
+                is_remote_branch: false,
+                config: serde_json::json!({
+                    "display_text": "task",
+                    "prompt_blocks": [{ "type": "text", "text": "hello" }]
+                }),
+            },
+        )
+        .await
+        .expect("create automation");
+        let run = automation_service::start_run(&db.conn, auto.id, "manual", None)
+            .await
+            .expect("start run");
+
+        if matches!(kind, launch_inject::Kind::Cancel) {
+            // Concurrent cancel settled the run while resolve_cwd was "running".
+            let settled = automation_service::settle_run(
+                &db.conn,
+                run.id,
+                AutomationRunStatus::Cancelled,
+                Some("cancelled".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("settle cancel");
+            assert!(
+                settled,
+                "{label}: cancel settle must flip running→cancelled"
+            );
+        }
+
+        launch_inject::arm(
+            kind,
+            ResolvedCwd {
+                folder_id: wt.id,
+                working_dir: wt_path.clone(),
+                worktree_folder_id: Some(wt.id),
+            },
+        );
+
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let mut rx = broadcaster.subscribe();
         let emitter = EventEmitter::test_web_only(broadcaster);
+        let engine = engine_for_launch_test(db, emitter, data_dir.path().to_path_buf());
 
-        // Simulate production: folder was announced, then this exit path runs.
-        emit_folder_upsert(&emitter, wt.clone());
-        let _ = rx.try_recv(); // Upsert — not under test
+        let launch_result = engine.launch(&auto, run.id).await;
+        match kind {
+            launch_inject::Kind::Cancel => {
+                assert!(
+                    launch_result.is_ok(),
+                    "{label}: cancel path returns Ok (run already settled): {launch_result:?}"
+                );
+            }
+            launch_inject::Kind::AgentFail
+            | launch_inject::Kind::SpawnFail
+            | launch_inject::Kind::InsertFail => {
+                assert!(
+                    launch_result.is_err(),
+                    "{label}: failure inject must return Err: {launch_result:?}"
+                );
+            }
+        }
 
-        close_empty_worktree_folder_if_needed(&db.conn, &emitter, Some(wt.id)).await;
-
-        let after_detail = folder_service::get_folder_by_id(&db.conn, wt.id)
-            .await
-            .expect("get after")
-            .expect("row remains");
+        // Drain until we see Close{auto_empty} (Upsert is emitted first).
+        let mut saw_auto_empty = false;
+        for _ in 0..8 {
+            match rx.try_recv() {
+                Ok(evt) if evt.channel == FOLDER_CHANGED_EVENT => {
+                    if (&*evt.payload)["kind"] == "close"
+                        && (&*evt.payload)["folder_id"] == wt.id
+                        && (&*evt.payload)["cause"] == "auto_empty"
+                    {
+                        saw_auto_empty = true;
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
         assert!(
-            !raw_folder_is_open(&db.conn, wt.id).await,
-            "{label}: empty per-run worktree must flip is_open=false"
+            saw_auto_empty,
+            "{label}: launch boundary must emit Close{{AutoEmpty}} on flip"
+        );
+
+        assert!(
+            !raw_folder_is_open(&engine.db.conn, wt.id).await,
+            "{label}: empty per-run worktree must flip is_open=false via launch"
         );
         assert!(
             marker.exists(),
             "{label}: disk worktree / marker must remain after visibility close"
         );
-        assert_eq!(after_detail.path, wt_path, "{label}: history path unchanged");
-
-        let open_ids: Vec<i32> = folder_service::list_open_folders(&db.conn)
+        let after_detail = folder_service::get_folder_by_id(&engine.db.conn, wt.id)
+            .await
+            .expect("get after")
+            .expect("row remains");
+        assert_eq!(
+            after_detail.path, wt_path,
+            "{label}: history path unchanged"
+        );
+        let open_ids: Vec<i32> = folder_service::list_open_folders(&engine.db.conn)
             .await
             .expect("list open")
             .into_iter()
@@ -1420,38 +1699,33 @@ mod tests {
             !open_ids.contains(&wt.id),
             "{label}: closed worktree must leave open list"
         );
-
-        let evt = rx
-            .try_recv()
-            .unwrap_or_else(|_| panic!("{label}: must emit AutoEmpty on flip"));
-        assert_eq!(evt.channel, FOLDER_CHANGED_EVENT);
-        assert_eq!((&*evt.payload)["kind"], "close");
-        assert_eq!((&*evt.payload)["folder_id"], wt.id);
-        assert_eq!((&*evt.payload)["cause"], "auto_empty");
+        let live = folder_service::count_live_conversations_for_folder(&engine.db.conn, wt.id)
+            .await
+            .expect("count live");
+        assert_eq!(live, 0, "{label}: no live conversation after early exit");
     }
 
     #[tokio::test]
     async fn early_exit_cancel_closes_empty_worktree_folder() {
-        // Concurrent cancel before spawn — no live conversation yet.
-        assert_early_exit_closes_empty_worktree("cancel").await;
+        assert_launch_early_exit_closes_worktree(launch_inject::Kind::Cancel, "cancel").await;
     }
 
     #[tokio::test]
     async fn early_exit_agent_fail_closes_empty_worktree_folder() {
-        // Disabled / missing agent after resolve_cwd opened the folder.
-        assert_early_exit_closes_empty_worktree("agent-fail").await;
+        assert_launch_early_exit_closes_worktree(launch_inject::Kind::AgentFail, "agent-fail")
+            .await;
     }
 
     #[tokio::test]
     async fn early_exit_spawn_fail_closes_empty_worktree_folder() {
-        // spawn_agent failure before create_conversation_core.
-        assert_early_exit_closes_empty_worktree("spawn-fail").await;
+        assert_launch_early_exit_closes_worktree(launch_inject::Kind::SpawnFail, "spawn-fail")
+            .await;
     }
 
     #[tokio::test]
     async fn early_exit_insert_fail_closes_empty_worktree_folder() {
-        // create_conversation_core failure after spawn (no live row remains).
-        assert_early_exit_closes_empty_worktree("insert-fail").await;
+        assert_launch_early_exit_closes_worktree(launch_inject::Kind::InsertFail, "insert-fail")
+            .await;
     }
 
     #[tokio::test]
