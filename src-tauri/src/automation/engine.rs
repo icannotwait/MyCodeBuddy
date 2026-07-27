@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::EntityTrait;
+use sea_orm::{DatabaseConnection, EntityTrait};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -30,19 +30,20 @@ use crate::commands::conversations::{
     create_conversation_core, emit_conversation_state, emit_conversation_upsert,
 };
 use crate::commands::folders::{
-    emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
-    git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
+    emit_folder_close, emit_folder_upsert, get_folder_core, git_checkout, git_is_clean,
+    git_list_branches, git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::service::automation_service;
 use crate::db::service::conversation_service;
+use crate::db::service::folder_service;
 use crate::db::AppDatabase;
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::{
     AgentType, AutomationConfig, AutomationInfo, AutomationRunStatus, IsolationMode,
 };
 use crate::web::event_bridge::{
-    emit_event, AutomationChange, EventEmitter, AUTOMATION_CHANGED_EVENT,
+    emit_event, AutomationChange, EventEmitter, FolderCloseCause, AUTOMATION_CHANGED_EVENT,
 };
 
 /// Generous absolute cap before a run we are no longer tracking (lost index, or
@@ -102,6 +103,36 @@ struct ResolvedCwd {
     folder_id: i32,
     working_dir: String,
     worktree_folder_id: Option<i32>,
+}
+
+/// Visibility-only empty-close for a per-run automation worktree folder after
+/// an early exit with no live conversation.
+///
+/// No-ops when `worktree_folder_id` is `None` (shared-root runs), when the
+/// folder still has live conversations, or when it is already closed. Never
+/// removes the on-disk worktree or soft-deletes the history row. Errors are
+/// logged only so they cannot mask the original launch failure/cancel result.
+async fn close_empty_worktree_folder_if_needed(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    worktree_folder_id: Option<i32>,
+) {
+    let Some(wt_id) = worktree_folder_id else {
+        return;
+    };
+    match folder_service::close_folder_if_no_live_conversations(conn, wt_id).await {
+        Ok(true) => {
+            emit_folder_close(emitter, wt_id, FolderCloseCause::AutoEmpty);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(
+                folder_id = wt_id,
+                error = %e,
+                "[automation] failed to close empty worktree folder after early exit"
+            );
+        }
+    }
 }
 
 /// Build the engine and publish it to the process global, then return the handle
@@ -403,6 +434,32 @@ impl AutomationEngine {
             emit_folder_upsert(&self.emitter, detail);
         }
 
+        // Single cleanup boundary: every pre-conversation exit (launch-input
+        // fail, disabled/missing agent, concurrent cancel, spawn fail,
+        // conversation insert fail) and settle-with-no-conversation paths
+        // leave through here. Atomic empty-close no-ops when a live
+        // conversation exists or when there is no per-run worktree folder.
+        let result = self.launch_after_cwd(auto, run_id, &cwd, &cfg, agent_type, blocks).await;
+        close_empty_worktree_folder_if_needed(
+            &self.db.conn,
+            &self.emitter,
+            cwd.worktree_folder_id,
+        )
+        .await;
+        result
+    }
+
+    /// Launch steps after the working folder is resolved and announced.
+    /// Callers must run [`close_empty_worktree_folder_if_needed`] on exit.
+    async fn launch_after_cwd(
+        &self,
+        auto: &AutomationInfo,
+        run_id: i32,
+        cwd: &ResolvedCwd,
+        cfg: &AutomationConfig,
+        agent_type: AgentType,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), String> {
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
         // Automation is a row-less root: resolve against the shared live runtime.
@@ -1291,5 +1348,191 @@ mod tests {
             acquire_engine_ownership(file.path()),
             Ownership::Unavailable
         ));
+    }
+
+    async fn raw_folder_is_open(conn: &DatabaseConnection, folder_id: i32) -> bool {
+        use crate::db::entities::folder;
+        folder::Entity::find_by_id(folder_id)
+            .one(conn)
+            .await
+            .expect("query folder")
+            .expect("folder row")
+            .is_open
+    }
+
+    /// Open a per-run worktree folder (path on disk), then run the same early-exit
+    /// empty-close helper production `launch` invokes after every pre-conversation
+    /// exit. Asserts visibility close + AutoEmpty emit + disk path retained.
+    async fn assert_early_exit_closes_empty_worktree(label: &str) {
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
+        use std::sync::Arc;
+
+        let disk = tempfile::tempdir().expect("disk worktree dir");
+        let wt_path = disk.path().to_string_lossy().to_string();
+        // Keep a marker file so "disk remains" is stronger than just the temp dir.
+        let marker = disk.path().join(format!("{label}-marker.txt"));
+        std::fs::write(&marker, label).expect("write marker");
+
+        let db = fresh_in_memory_db().await;
+        let root = folder_service::add_folder(&db.conn, &format!("/tmp/auto-root-{label}"))
+            .await
+            .expect("root");
+        let wt = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("open worktree folder");
+        assert!(
+            raw_folder_is_open(&db.conn, wt.id).await,
+            "{label}: worktree folder must start open"
+        );
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        // Simulate production: folder was announced, then this exit path runs.
+        emit_folder_upsert(&emitter, wt.clone());
+        let _ = rx.try_recv(); // Upsert — not under test
+
+        close_empty_worktree_folder_if_needed(&db.conn, &emitter, Some(wt.id)).await;
+
+        let after_detail = folder_service::get_folder_by_id(&db.conn, wt.id)
+            .await
+            .expect("get after")
+            .expect("row remains");
+        assert!(
+            !raw_folder_is_open(&db.conn, wt.id).await,
+            "{label}: empty per-run worktree must flip is_open=false"
+        );
+        assert!(
+            marker.exists(),
+            "{label}: disk worktree / marker must remain after visibility close"
+        );
+        assert_eq!(after_detail.path, wt_path, "{label}: history path unchanged");
+
+        let open_ids: Vec<i32> = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open")
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(
+            !open_ids.contains(&wt.id),
+            "{label}: closed worktree must leave open list"
+        );
+
+        let evt = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("{label}: must emit AutoEmpty on flip"));
+        assert_eq!(evt.channel, FOLDER_CHANGED_EVENT);
+        assert_eq!((&*evt.payload)["kind"], "close");
+        assert_eq!((&*evt.payload)["folder_id"], wt.id);
+        assert_eq!((&*evt.payload)["cause"], "auto_empty");
+    }
+
+    #[tokio::test]
+    async fn early_exit_cancel_closes_empty_worktree_folder() {
+        // Concurrent cancel before spawn — no live conversation yet.
+        assert_early_exit_closes_empty_worktree("cancel").await;
+    }
+
+    #[tokio::test]
+    async fn early_exit_agent_fail_closes_empty_worktree_folder() {
+        // Disabled / missing agent after resolve_cwd opened the folder.
+        assert_early_exit_closes_empty_worktree("agent-fail").await;
+    }
+
+    #[tokio::test]
+    async fn early_exit_spawn_fail_closes_empty_worktree_folder() {
+        // spawn_agent failure before create_conversation_core.
+        assert_early_exit_closes_empty_worktree("spawn-fail").await;
+    }
+
+    #[tokio::test]
+    async fn early_exit_insert_fail_closes_empty_worktree_folder() {
+        // create_conversation_core failure after spawn (no live row remains).
+        assert_early_exit_closes_empty_worktree("insert-fail").await;
+    }
+
+    #[tokio::test]
+    async fn close_empty_worktree_noop_when_live_conversation_exists() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::WebEventBroadcaster;
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let wt = folder_service::add_folder(&db.conn, "/tmp/auto-wt-live")
+            .await
+            .expect("open wt");
+        conversation_service::create(&db.conn, wt.id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("live conv");
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        close_empty_worktree_folder_if_needed(&db.conn, &emitter, Some(wt.id)).await;
+
+        assert!(
+            raw_folder_is_open(&db.conn, wt.id).await,
+            "non-empty worktree must stay open"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "must not emit AutoEmpty when live conversations exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_empty_worktree_noop_when_no_worktree_folder_id() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::web::event_bridge::WebEventBroadcaster;
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        // Shared-in-root: worktree_folder_id is None — helper must not touch anything.
+        let root = folder_service::add_folder(&db.conn, "/tmp/auto-shared-root")
+            .await
+            .expect("root");
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        close_empty_worktree_folder_if_needed(&db.conn, &emitter, None).await;
+
+        assert!(
+            raw_folder_is_open(&db.conn, root.id).await,
+            "shared root must stay open when id is None"
+        );
+        assert!(rx.try_recv().is_err(), "None worktree id must not emit");
+    }
+
+    #[tokio::test]
+    async fn close_empty_worktree_idempotent_second_call_no_emit() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::web::event_bridge::WebEventBroadcaster;
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let wt = folder_service::add_folder(&db.conn, "/tmp/auto-wt-idem")
+            .await
+            .expect("open wt");
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        close_empty_worktree_folder_if_needed(&db.conn, &emitter, Some(wt.id)).await;
+        let first = rx.try_recv().expect("first flip emits");
+        assert_eq!((&*first.payload)["cause"], "auto_empty");
+
+        close_empty_worktree_folder_if_needed(&db.conn, &emitter, Some(wt.id)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "second call after flip must not re-emit AutoEmpty"
+        );
     }
 }
