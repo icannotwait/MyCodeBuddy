@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest"
+import { renderHook } from "@testing-library/react"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   buildDelegationCardModel,
   isTickerEligible,
+  useDelegationCardModel,
 } from "@/hooks/use-delegation-card-model"
 import type { DelegationBinding } from "@/lib/delegation-binding-reduce"
 import type { ChildCardProjection } from "@/lib/delegation-child-projection-cache"
@@ -12,11 +14,56 @@ import {
   type ParsedToolOutput,
 } from "@/lib/delegation-card"
 import {
+  applyStickyObservation,
+  type StickyBucket,
+} from "@/lib/delegation-sticky-runtime"
+import * as stickyStore from "@/lib/delegation-sticky-store"
+import * as transport from "@/lib/transport"
+import {
   emptyRuntimeStats,
   type AttentionRequestSummary,
   type CardSummary,
   type DelegationRuntimeStats,
 } from "@/lib/types"
+
+vi.mock("@/hooks/use-delegated-sub-session", () => ({
+  useDelegatedSubSession: () => ({
+    binding: undefined,
+    detail: null,
+    loading: false,
+    error: null,
+  }),
+}))
+
+vi.mock("@/contexts/acp-connections-context", () => ({
+  useConnectionStore: () => ({
+    subscribeKey: () => () => {},
+    getConnection: () => undefined,
+    getActiveKey: () => null,
+    subscribeActiveKey: () => () => {},
+  }),
+}))
+
+vi.mock("@/lib/delegation-child-projection-cache", async () => {
+  const actual = await vi.importActual<
+    typeof import("@/lib/delegation-child-projection-cache")
+  >("@/lib/delegation-child-projection-cache")
+  return {
+    ...actual,
+    delegationChildProjectionCache: {
+      subscribe: () => () => {},
+      get: () => null,
+      retain: () => () => {},
+      ensure: () => {},
+    },
+  }
+})
+
+vi.mock("@/lib/delegation-running-ticker", () => ({
+  getRunningTickerVersion: () => 0,
+  retainRunningTicker: () => () => {},
+  subscribeRunningTicker: () => () => {},
+}))
 
 const STARTED_AT = "2026-07-19T00:00:00.000Z"
 const FINISHED_AT = "2026-07-19T00:01:30.000Z"
@@ -932,5 +979,328 @@ describe("buildDelegationCardModel — identity + secondary", () => {
       (second as typeof second & { cardSummary?: CardSummary | null })
         .cardSummary
     ).toEqual(secondSummary)
+  })
+})
+
+describe("buildDelegationCardModel — sticky latest-only merge", () => {
+  const recoveryOn = {
+    liveBindingRunning: true,
+    childProjectionRunning: false,
+    activeRunNonTerminal: true,
+    openAttention: false,
+    parentWaitingForThisChild: false,
+    continueOrReplaceAdmitted: false,
+  }
+
+  function bucketFromObs(
+    observations: Parameters<typeof applyStickyObservation>[2][]
+  ): StickyBucket {
+    let b: StickyBucket | null = null
+    for (const obs of observations) {
+      b = applyStickyObservation(b, "sticky|1|parent_child|99", obs)
+    }
+    if (!b) throw new Error("expected bucket")
+    return b
+  }
+
+  it("two cards same unit: only generation-2 gets showGeneratingSegment", () => {
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 3,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: recoveryOn,
+      },
+      {
+        type: "running",
+        taskId: "run-2",
+        generation: 2,
+        parentToolUseId: "pt-2",
+        startedAt: "2026-07-19T00:01:00.000Z",
+        toolCallCount: 4,
+        nowMs: Date.parse("2026-07-19T00:01:00.000Z"),
+        recovery: recoveryOn,
+      },
+    ])
+
+    const older = build({
+      stickyBucket,
+      parentToolUseId: "pt-1",
+      parsedMeta: meta({
+        status: "ok",
+        taskId: "run-1",
+        generation: 1,
+        finishedAt: FINISHED_AT,
+        runtimeStats: LIVE_STATS,
+      }),
+      runSnapshot: {
+        task_id: "run-1",
+        root_task_id: "run-1",
+        previous_task_id: null,
+        generation: 1,
+        parent_tool_use_id: "pt-1",
+        child_conversation_id: 99,
+        agent_type: "codex",
+        profile_id: null,
+        task_preview: "first",
+        status: "completed",
+        error_code: null,
+        started_at: STARTED_AT,
+        finished_at: FINISHED_AT,
+        runtime_stats: LIVE_STATS,
+        card_summary: null,
+        child_turn_anchor: null,
+        replaced_task_id: null,
+        replacement_reason: null,
+      },
+    })
+    const newer = build({
+      stickyBucket,
+      parentToolUseId: "pt-2",
+      parsedMeta: meta({
+        status: "running",
+        taskId: "run-2",
+        generation: 2,
+        finishedAt: null,
+        runtimeStats: {
+          ...emptyRuntimeStats("2026-07-19T00:01:00.000Z"),
+          tool_call_count: 4,
+        },
+      }),
+    })
+
+    expect(older.showGeneratingSegment).toBe(false)
+    expect(older.lifecycleStatus).toBe("ok")
+    expect(newer.showGeneratingSegment).toBe(true)
+    expect(newer.lifecycleStatus).toBe("running")
+    expect(newer.stickyKey).toBe(stickyBucket.identityKey)
+  })
+
+  it("recovery-owned parent_turn_failed on latest → generating + badge running", () => {
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 5,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: recoveryOn,
+      },
+      {
+        type: "canceled",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        errorCode: "parent_turn_failed",
+        nowMs: Date.parse(FINISHED_AT),
+        recovery: recoveryOn,
+      },
+    ])
+    expect(stickyBucket.phase).toBe("active_sticky")
+
+    const model = build({
+      stickyBucket,
+      parentToolUseId: "pt-1",
+      parsedMeta: meta({
+        status: "err",
+        taskId: "run-1",
+        generation: 1,
+        errorCode: "parent_turn_failed",
+        finishedAt: FINISHED_AT,
+        runtimeStats: {
+          ...emptyRuntimeStats(STARTED_AT),
+          tool_call_count: 5,
+          finished_at: FINISHED_AT,
+        },
+      }),
+      state: "output-error",
+      errorText: "parent turn failed",
+    })
+
+    expect(model.showGeneratingSegment).toBe(true)
+    expect(model.lifecycleStatus).toBe("running")
+    expect(model.status).toBe("running")
+    expect(model.errorCode).toBe("parent_turn_failed")
+  })
+
+  it("parent_canceled → not generating", () => {
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 2,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: recoveryOn,
+      },
+      {
+        type: "canceled",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        errorCode: "parent_canceled",
+        nowMs: Date.parse(FINISHED_AT),
+        recovery: recoveryOn,
+      },
+    ])
+    expect(stickyBucket.phase).toBe("terminal")
+
+    const model = build({
+      stickyBucket,
+      parentToolUseId: "pt-1",
+      parsedMeta: meta({
+        status: "err",
+        taskId: "run-1",
+        generation: 1,
+        errorCode: "parent_canceled",
+        finishedAt: FINISHED_AT,
+      }),
+      state: "output-error",
+    })
+
+    expect(model.showGeneratingSegment).toBe(false)
+    expect(model.lifecycleStatus).toBe("err")
+    expect(model.status).toBe("err")
+  })
+
+  it("applies peak-sum tools on latest sticky-active card", () => {
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 5,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: recoveryOn,
+      },
+      {
+        type: "running",
+        taskId: "run-2",
+        generation: 2,
+        parentToolUseId: "pt-2",
+        startedAt: "2026-07-19T00:01:00.000Z",
+        toolCallCount: 2,
+        nowMs: Date.parse("2026-07-19T00:01:00.000Z"),
+        recovery: recoveryOn,
+      },
+    ])
+    expect(stickyBucket.lastDisplayToolCount).toBe(7)
+
+    const model = build({
+      stickyBucket,
+      parentToolUseId: "pt-2",
+      parsedMeta: meta({
+        status: "running",
+        taskId: "run-2",
+        generation: 2,
+        runtimeStats: {
+          ...emptyRuntimeStats("2026-07-19T00:01:00.000Z"),
+          tool_call_count: 2,
+        },
+      }),
+    })
+
+    expect(model.showGeneratingSegment).toBe(true)
+    expect(model.toolCallCount).toBe(7)
+  })
+
+  it("pure build does not call observeSticky", () => {
+    const spy = vi.spyOn(stickyStore, "observeSticky")
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 1,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: recoveryOn,
+      },
+    ])
+    build({
+      stickyBucket,
+      parentToolUseId: "pt-1",
+      parsedMeta: meta({ status: "running", taskId: "run-1" }),
+    })
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it("attention open: showGenerating stays true when sticky-active", () => {
+    const stickyBucket = bucketFromObs([
+      {
+        type: "running",
+        taskId: "run-1",
+        generation: 1,
+        parentToolUseId: "pt-1",
+        startedAt: STARTED_AT,
+        toolCallCount: 1,
+        nowMs: Date.parse(STARTED_AT),
+        recovery: { ...recoveryOn, openAttention: true },
+      },
+    ])
+
+    const model = build({
+      stickyBucket,
+      parentToolUseId: "pt-1",
+      binding: binding({
+        status: "running",
+        taskId: "run-1",
+        observation: "waiting_input",
+        attentionRequest: ATTENTION,
+      }),
+    })
+
+    expect(model.showGeneratingSegment).toBe(true)
+    expect(model.lifecycleStatus).toBe("running")
+    expect(model.attentionRequest).toEqual(ATTENTION)
+    // Attention/waiting_input badge remains distinct from ops generating line.
+    expect(model.status).toBe("waiting_input")
+  })
+})
+
+describe("useDelegationCardModel sticky observe wiring", () => {
+  beforeEach(() => {
+    stickyStore.resetStickyBackend(transport.getActiveBackendCacheKey())
+  })
+
+  it("wires backendCacheKey from getActiveBackendCacheKey into observeSticky", () => {
+    const backendKey = "test-backend-cache-key"
+    vi.spyOn(transport, "getActiveBackendCacheKey").mockReturnValue(backendKey)
+    const observeSpy = vi.spyOn(stickyStore, "observeSticky")
+
+    renderHook(() =>
+      useDelegationCardModel({
+        parentToolUseId: "pt-wire",
+        parentConversationId: 42,
+        input: JSON.stringify({ agent_type: "codex", task: "wire" }),
+        meta: {
+          "codeg.delegation": {
+            status: "running",
+            task_id: "run-wire",
+            generation: 1,
+            child_conversation_id: 99,
+            started_at: STARTED_AT,
+          },
+        },
+      })
+    )
+
+    expect(observeSpy).toHaveBeenCalled()
+    const call = observeSpy.mock.calls.find((c) => c[0]?.taskId === "run-wire")
+    expect(call?.[0]?.backendCacheKey).toBe(backendKey)
+
+    observeSpy.mockRestore()
+    vi.mocked(transport.getActiveBackendCacheKey).mockRestore()
   })
 })

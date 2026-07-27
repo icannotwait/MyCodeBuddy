@@ -16,7 +16,13 @@
  * shared running ticker.
  */
 
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+} from "react"
 
 import {
   ALL_AGENT_TYPES,
@@ -58,6 +64,20 @@ import {
   retainRunningTicker,
   subscribeRunningTicker,
 } from "@/lib/delegation-running-ticker"
+import {
+  isLatestStickyCard,
+  resolveStickyIdentity,
+  stickyIdentityToString,
+  type RecoverySignals,
+  type StickyBucket,
+  type StickyObservation,
+} from "@/lib/delegation-sticky-runtime"
+import {
+  getStickySnapshot,
+  observeSticky,
+  subscribeSticky,
+} from "@/lib/delegation-sticky-store"
+import { getActiveBackendCacheKey } from "@/lib/transport"
 
 const RUNNING_SNAPSHOT_REFRESH_MS = 15_000
 
@@ -113,6 +133,14 @@ export interface DelegationCardModel {
   /** A replacement belongs to another child session and remains a separate row. */
   isReplacement: boolean
   childTurnAnchor: string | null
+  /**
+   * True when sticky phase is `active_sticky` and this card is the latest for
+   * the unit — drives continuous generating chrome (Task 5) without reactivating
+   * historical sibling cards.
+   */
+  showGeneratingSegment: boolean
+  /** Sticky store identity key when a bucket is projected; else null. */
+  stickyKey: string | null
 }
 
 function parseTimestampMs(value: string | null | undefined): number | null {
@@ -180,6 +208,52 @@ function agentTypeFromRunSnapshot(
 ): AgentType | null {
   if (!snapshot || !ALL_AGENT_TYPES.includes(snapshot.agent_type)) return null
   return snapshot.agent_type
+}
+
+/** Terminal badges cannot sit next to sticky generating chrome. */
+function coerceStickyGeneratingBadge(
+  status: DelegationCardStatus
+): DelegationCardStatus {
+  if (status === "ok" || status === "err" || status === "starting") {
+    return "running"
+  }
+  return status
+}
+
+const CANCEL_LIKE_ERROR_CODES = new Set([
+  "parent_canceled",
+  "cancel_delegation",
+  "canceled",
+  "parent_ended",
+  "parent_turn_failed",
+  "join_abandoned",
+  "parent_disconnected",
+])
+
+function resolveStickyObserveType(input: {
+  lifecycleStatus: DelegationLifecycleStatus
+  runSnapshot: DelegationRunSnapshot | null
+  errorCode: string | null | undefined
+}): StickyObservation["type"] {
+  const { lifecycleStatus, runSnapshot, errorCode } = input
+  if (runSnapshot) {
+    switch (runSnapshot.status) {
+      case "reserving":
+      case "running":
+        return "running"
+      case "completed":
+        return "completed"
+      case "failed":
+        return "failed"
+      case "canceled":
+        return "canceled"
+    }
+  }
+  if (lifecycleStatus === "running") return "running"
+  if (lifecycleStatus === "ok") return "completed"
+  const code = errorCode?.trim() ?? ""
+  if (CANCEL_LIKE_ERROR_CODES.has(code)) return "canceled"
+  return "failed"
 }
 
 /**
@@ -449,6 +523,13 @@ export function buildDelegationCardModel(input: {
   nowMs: number
   /** Optional short display id already extracted from tool output. */
   displayTaskId?: string | null
+  /**
+   * Sticky bucket snapshot (read-only). Pure merge only — never mutates the
+   * sticky store. Latest-only generating projection + peak tool fold.
+   */
+  stickyBucket?: StickyBucket | null
+  /** Parent tool-use id for latest-only card identity compare. */
+  parentToolUseId?: string | null
 }): DelegationCardModel {
   const {
     parsedInput,
@@ -462,6 +543,8 @@ export function buildDelegationCardModel(input: {
     errorText,
     nowMs,
     displayTaskId = null,
+    stickyBucket = null,
+    parentToolUseId = null,
   } = input
 
   // Cold reconstruction injects correlation metadata before the immutable run
@@ -610,32 +693,83 @@ export function buildDelegationCardModel(input: {
     runSnapshot
   )
 
+  const generation = runSnapshot?.generation ?? parsedMeta?.generation ?? null
+
+  // Latest-only sticky projection (pure — no store mutation).
+  const cardIdentity = {
+    taskId: brokerTaskId,
+    parentToolUseId,
+    generation,
+  }
+  const isLatest = stickyBucket
+    ? isLatestStickyCard(cardIdentity, stickyBucket)
+    : false
+  const showGeneratingSegment =
+    stickyBucket?.phase === "active_sticky" && isLatest
+  const stickyKey = stickyBucket?.identityKey ?? null
+
+  let projectedLifecycle = lifecycleStatus
+  let projectedStatus = status
+  let projectedStartedAt = startedAt
+  let projectedFinishedAt = finishedAt
+  let projectedElapsedMs = elapsedMs
+  let projectedToolCallCount = toolCallCount
+
+  if (showGeneratingSegment && stickyBucket) {
+    projectedLifecycle = "running"
+    projectedStatus = coerceStickyGeneratingBadge(status)
+    // Anchor drives continuous elapsed + ticker eligibility.
+    if (stickyBucket.anchorStartedAtMs != null) {
+      projectedStartedAt = new Date(
+        stickyBucket.anchorStartedAtMs
+      ).toISOString()
+      projectedFinishedAt = null
+      const elapsed = nowMs - stickyBucket.anchorStartedAtMs
+      projectedElapsedMs = elapsed >= 0 ? elapsed : null
+    } else {
+      projectedFinishedAt = null
+      projectedElapsedMs = computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt: projectedStartedAt,
+        finishedAt: null,
+        completedDurationMs: null,
+        nowMs,
+      })
+    }
+    // Peak-sum tools when any task peaks were observed; never invent zeros.
+    if (stickyBucket.peakByTaskId.size > 0) {
+      projectedToolCallCount = stickyBucket.lastDisplayToolCount
+    }
+  }
+
   return {
     agentType,
     agentDisplayLabel: parsedInput.profileLabel,
     task,
     taskId: displayTaskId ?? brokerTaskId,
     brokerTaskId,
-    generation: runSnapshot?.generation ?? parsedMeta?.generation ?? null,
-    status,
-    lifecycleStatus,
+    generation,
+    status: projectedStatus,
+    lifecycleStatus: projectedLifecycle,
     errorCode,
     childConversationId,
     childConnectionId,
     hasModel,
     displaySecondary,
     conversationTitle,
-    startedAt,
-    finishedAt,
+    startedAt: projectedStartedAt,
+    finishedAt: projectedFinishedAt,
     runtimeStats,
     attentionRequest,
     completedDurationMs,
-    elapsedMs,
-    toolCallCount,
+    elapsedMs: projectedElapsedMs,
+    toolCallCount: projectedToolCallCount,
     editRollup,
     cardSummary: binding?.cardSummary ?? runSnapshot?.card_summary ?? null,
     isReplacement: Boolean(runSnapshot?.replaced_task_id),
     childTurnAnchor: runSnapshot?.child_turn_anchor ?? null,
+    showGeneratingSegment,
+    stickyKey,
   }
 }
 
@@ -717,6 +851,23 @@ function useDelegationRunSnapshot(
   return snapshot
 }
 
+function parseWorkUnitKeyFromInput(
+  raw: string | null | undefined
+): string | null {
+  if (!raw || typeof raw !== "string") return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null
+    }
+    const obj = parsed as Record<string, unknown>
+    const key = obj.work_unit_key ?? obj.workUnitKey
+    return typeof key === "string" && key.length > 0 ? key : null
+  } catch {
+    return null
+  }
+}
+
 export function useDelegationCardModel(
   source: DelegationCardSource
 ): DelegationCardModel {
@@ -736,6 +887,7 @@ export function useDelegationCardModel(
     () => parseDelegateTaskId(output, errorText),
     [output, errorText]
   )
+  const workUnitKey = useMemo(() => parseWorkUnitKeyFromInput(input), [input])
 
   // `enabled: false` — the model never fetches the child's persisted detail
   // here; cold title/stats come from `delegationChildProjectionCache`.
@@ -783,6 +935,39 @@ export function useDelegationCardModel(
   const childLive = useDelegationChildLive(childConnectionId)
   const childAwaitingPermission = childLive?.pendingPermission != null
 
+  // Sticky identity (subscribe key) — pure resolve, no mutation.
+  const backendCacheKey = getActiveBackendCacheKey()
+  const stickyIdentityKey = useMemo(() => {
+    const resolved = resolveStickyIdentity({
+      backendCacheKey,
+      parentConversationId,
+      childConversationId,
+      workUnitKey,
+      taskId: currentTaskId,
+    })
+    return resolved ? stickyIdentityToString(resolved) : null
+  }, [
+    backendCacheKey,
+    parentConversationId,
+    childConversationId,
+    workUnitKey,
+    currentTaskId,
+  ])
+
+  const subscribeStickyStore = useCallback(
+    (cb: () => void) => subscribeSticky(cb),
+    []
+  )
+  const getStickyBucketSnapshot = useCallback((): StickyBucket | null => {
+    if (!stickyIdentityKey) return null
+    return getStickySnapshot(stickyIdentityKey) ?? null
+  }, [stickyIdentityKey])
+  const stickyBucket = useSyncExternalStore(
+    subscribeStickyStore,
+    getStickyBucketSnapshot,
+    () => null
+  )
+
   // Eligibility without building the full model (avoids ticker chicken-egg).
   const knownTaskId = currentTaskId
   const tickerMeta = effectiveDelegationMeta(parsedMeta, runSnapshot)
@@ -799,15 +984,148 @@ export function useDelegationCardModel(
     state,
     errorText,
   })
+  const runtimeStatsPreview = pickRuntimeStats(
+    binding,
+    tickerMeta,
+    runSnapshot,
+    runScopedProjection
+  )
   const startedAtPreview = pickStartedAt(
     binding,
     tickerMeta,
     runSnapshot,
     runScopedProjection,
-    pickRuntimeStats(binding, tickerMeta, runSnapshot, runScopedProjection)
+    runtimeStatsPreview
   )
+  const generationPreview =
+    runSnapshot?.generation ?? tickerMeta?.generation ?? null
+  const stickyGeneratingPreview =
+    stickyBucket?.phase === "active_sticky" &&
+    isLatestStickyCard(
+      {
+        taskId: currentTaskId,
+        parentToolUseId,
+        generation: generationPreview,
+      },
+      stickyBucket
+    )
+  const stickyAnchorStartedAt =
+    stickyGeneratingPreview && stickyBucket?.anchorStartedAtMs != null
+      ? new Date(stickyBucket.anchorStartedAtMs).toISOString()
+      : null
+  const tickerStartedAt = stickyAnchorStartedAt ?? startedAtPreview
   const tickerEligible =
-    lifecyclePreview === "running" && parseTimestampMs(startedAtPreview) != null
+    (lifecyclePreview === "running" || stickyGeneratingPreview) &&
+    parseTimestampMs(tickerStartedAt) != null
+
+  const observeErrorCode =
+    binding?.errorCode ??
+    tickerMeta?.errorCode ??
+    runSnapshot?.error_code ??
+    runScopedProjection?.errorCode ??
+    (toolOutput?.kind === "outcome" ? toolOutput.errorCode : null) ??
+    null
+  const observeFinishedAt =
+    binding?.finishedAt ??
+    tickerMeta?.finishedAt ??
+    runSnapshot?.finished_at ??
+    runScopedProjection?.finishedAt ??
+    null
+  const observeToolCallCount = runtimeStatsPreview?.tool_call_count ?? null
+  const openAttention =
+    (binding?.attentionRequest ??
+      tickerMeta?.attentionRequest ??
+      runScopedProjection?.attentionRequest) != null
+  const liveBindingRunning = binding?.status === "running"
+  const childProjectionRunning = runScopedProjection?.taskStatus === "running"
+  const activeRunNonTerminal =
+    runSnapshot?.status === "running" || runSnapshot?.status === "reserving"
+  const continueOrReplaceAdmitted =
+    (generationPreview != null && generationPreview > 1) ||
+    Boolean(runSnapshot?.replaced_task_id)
+  const observeType = resolveStickyObserveType({
+    lifecycleStatus: lifecyclePreview,
+    runSnapshot,
+    errorCode: observeErrorCode,
+  })
+
+  // Dedupe identical observations so store emit → re-render cannot loop when
+  // parents pass fresh meta object identities each render.
+  const lastObserveSigRef = useRef<string | null>(null)
+
+  // Observe sticky only from effects — never from pure build.
+  useEffect(() => {
+    if (!currentTaskId || uncorrelatedFailure) return
+
+    const recovery: RecoverySignals = {
+      liveBindingRunning,
+      childProjectionRunning,
+      activeRunNonTerminal,
+      openAttention,
+      // Wait projection is conversation-scoped; treat as weak positive only
+      // when this card has a known child in the unit (not global-wait alone).
+      parentWaitingForThisChild: false,
+      continueOrReplaceAdmitted,
+    }
+
+    const sig = [
+      backendCacheKey,
+      parentConversationId ?? "",
+      childConversationId ?? "",
+      workUnitKey ?? "",
+      observeType,
+      currentTaskId,
+      generationPreview ?? "",
+      parentToolUseId,
+      startedAtPreview ?? "",
+      observeFinishedAt ?? "",
+      observeToolCallCount ?? "",
+      observeErrorCode ?? "",
+      liveBindingRunning,
+      childProjectionRunning,
+      activeRunNonTerminal,
+      openAttention,
+      continueOrReplaceAdmitted,
+    ].join("\0")
+    if (lastObserveSigRef.current === sig) return
+    lastObserveSigRef.current = sig
+
+    observeSticky({
+      backendCacheKey,
+      parentConversationId,
+      childConversationId,
+      workUnitKey,
+      type: observeType,
+      taskId: currentTaskId,
+      nowMs: Date.now(),
+      generation: generationPreview,
+      parentToolUseId,
+      startedAt: startedAtPreview,
+      finishedAt: observeFinishedAt,
+      toolCallCount: observeToolCallCount,
+      errorCode: observeErrorCode,
+      recovery,
+    })
+  }, [
+    backendCacheKey,
+    parentConversationId,
+    childConversationId,
+    workUnitKey,
+    currentTaskId,
+    uncorrelatedFailure,
+    observeType,
+    generationPreview,
+    parentToolUseId,
+    startedAtPreview,
+    observeFinishedAt,
+    observeToolCallCount,
+    observeErrorCode,
+    liveBindingRunning,
+    childProjectionRunning,
+    activeRunNonTerminal,
+    openAttention,
+    continueOrReplaceAdmitted,
+  ])
 
   useEffect(() => {
     if (!tickerEligible) return
@@ -841,6 +1159,8 @@ export function useDelegationCardModel(
         errorText,
         nowMs: Date.now(),
         displayTaskId,
+        stickyBucket,
+        parentToolUseId,
       }),
     // tickerVersion forces elapsed recompute while running.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tickerVersion is intentional
@@ -855,6 +1175,8 @@ export function useDelegationCardModel(
       state,
       errorText,
       displayTaskId,
+      stickyBucket,
+      parentToolUseId,
       tickerVersion,
     ]
   )
