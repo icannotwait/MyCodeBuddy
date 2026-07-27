@@ -217,6 +217,12 @@ intermediate state when there is no live binding, continuation/replacement
 evidence, or newer observation. The guard remains longer than the 600-second
 checkpoint.
 
+The orphan clock uses the latest valid persisted observation time, in order:
+run `finished_at`, runtime `finished_at`, `last_agent_activity_at`, then run
+`started_at`. A live transition may use its receipt time until a persisted time
+arrives. On historical reload, a recoverable terminal record with no trustworthy
+time is left terminal instead of starting a fresh 15-minute generating window.
+
 A later legal continuation of the same unit re-enters `active_sticky` without
 resetting the original elapsed anchor or prior per-run peaks.
 
