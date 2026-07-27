@@ -957,7 +957,10 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
     let mut q = delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(phase.to_string()))
-        .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()));
+        .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .order_by_desc(delegation_workflow_node_binding::Column::IntroducedRevision)
+        .order_by_asc(delegation_workflow_node_binding::Column::NodeId);
     if let Some(idx) = task_index {
         q = q.filter(delegation_workflow_node_binding::Column::TaskIndex.eq(idx));
     }
@@ -3283,6 +3286,154 @@ mod tests {
                 TaskStoreError::WorkflowAdmission { ref code, .. } if code == "final_fixer_before_non_pass"
             ),
             "got {err:?}"
+        );
+    }
+
+    async fn replace_with_active_final_binding(
+        db: &AppDatabase,
+        workflow_id: &str,
+        retired_node_id: &str,
+        replacement_node_id: &str,
+        role: &str,
+        agent: &str,
+    ) {
+        let now = Utc::now();
+        let binding = delegation_workflow_node_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            retired_node_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("published Final binding");
+        let mut retired: delegation_workflow_node_binding::ActiveModel = binding.into();
+        retired.retired_revision = Set(Some(2));
+        retired.retained_observed = Set(true);
+        retired.updated_at = Set(now);
+        retired
+            .update(&db.conn)
+            .await
+            .expect("retire Final binding");
+
+        delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set(workflow_id.to_string()),
+            node_id: Set(replacement_node_id.to_string()),
+            work_unit_key: Set(format!("replacement-final|{role}|{replacement_node_id}")),
+            role: Set(role.to_string()),
+            agent_type: Set(agent.to_string()),
+            profile_id: Set(None),
+            phase_id: Set(PHASE_FINAL.to_string()),
+            task_index: Set(None),
+            introduced_revision: Set(2),
+            retired_revision: Set(None),
+            is_observed: Set(false),
+            retained_observed: Set(false),
+            cohort_frozen: Set(false),
+            node_outcome: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert replacement Final binding");
+    }
+
+    async fn workflow_header(db: &AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
+        delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("workflow header")
+    }
+
+    #[tokio::test]
+    async fn task6_active_final_evidence_ignores_retired_reviewer_binding() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "task6-active-final-reviewer").await;
+        replace_with_active_final_binding(
+            &db,
+            &workflow_id,
+            "final-reviewer",
+            "final-reviewer-replacement",
+            "reviewer",
+            "codex",
+        )
+        .await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00b1",
+            &workflow_id,
+            "final-reviewer-replacement",
+            &reviewer_key,
+            "codex",
+            r#"{"kind":"review","verdict":"request_changes","critical":1,"important":0,"minor":0,"summary":"fix"}"#,
+            true,
+        )
+        .await;
+
+        let evidence = load_latest_final_reviewer_evidence(
+            &db.conn,
+            &workflow_header(&db, &workflow_id).await,
+        )
+        .await
+        .unwrap()
+        .expect("authoritative active Final reviewer evidence");
+
+        assert_eq!(evidence.task_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00b1");
+        assert!(reviewer_is_request_changes_or_block(&evidence));
+    }
+
+    #[tokio::test]
+    async fn task6_active_final_evidence_ignores_retired_fixer_binding() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "task6-active-final-fixer").await;
+        replace_with_active_final_binding(
+            &db,
+            &workflow_id,
+            "final-fixer",
+            "final-fixer-replacement",
+            "fixer",
+            "grok",
+        )
+        .await;
+        let fixer_key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00c2",
+            &workflow_id,
+            "final-fixer-replacement",
+            &fixer_key,
+            "grok",
+            r#"{"kind":"implementation","phase":"fix","status":"done","summary":"fixed"}"#,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            evaluate_final_fixer_terminal_pass(
+                &db.conn,
+                &workflow_header(&db, &workflow_id).await,
+            )
+            .await
+            .unwrap(),
+            Some(true)
         );
     }
 
