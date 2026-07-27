@@ -408,6 +408,81 @@ pub async fn set_folder_open(
     Ok(())
 }
 
+/// Count live conversations for a folder (`deleted_at IS NULL`).
+///
+/// Diagnostic / import decision aid only — **never** use this count alone as
+/// the auto-close guard (TOCTOU). Close uses
+/// [`close_folder_if_no_live_conversations`]'s atomic `NOT EXISTS` UPDATE.
+pub async fn count_live_conversations_for_folder(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<u64, DbError> {
+    use crate::db::entities::conversation;
+    use sea_orm::PaginatorTrait;
+
+    let n = conversation::Entity::find()
+        .filter(conversation::Column::FolderId.eq(folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .count(conn)
+        .await?;
+    Ok(n)
+}
+
+/// Visibility-only auto-close for one folder when it is still open, regular,
+/// not soft-deleted, and has zero live conversations.
+///
+/// Atomic: a single conditional `UPDATE` with `NOT EXISTS` live conversations.
+/// Returns `true` only when this statement flipped `is_open` true→false.
+/// No-op (`false`) for missing, chat kind, already closed, soft-deleted, or
+/// non-empty folders — never touches `deleted_at`.
+pub async fn close_folder_if_no_live_conversations(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let now = Utc::now();
+    let result = folder::Entity::update_many()
+        .col_expr(folder::Column::IsOpen, Expr::value(false))
+        .col_expr(folder::Column::UpdatedAt, Expr::value(now))
+        .filter(folder::Column::Id.eq(folder_id))
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::Kind.eq(FolderKind::Regular))
+        .filter(folder::Column::IsOpen.eq(true))
+        .filter(Expr::cust(
+            "NOT EXISTS (SELECT 1 FROM conversation c \
+             WHERE c.folder_id = folder.id AND c.deleted_at IS NULL)",
+        ))
+        .exec(conn)
+        .await?;
+
+    Ok(result.rows_affected == 1)
+}
+
+/// Bulk reconcile: close every open regular folder that currently has zero live
+/// conversations. Returns the ids that were closed (caller derives count).
+///
+/// Each close uses the same atomic [`close_folder_if_no_live_conversations`]
+/// primitive (`WHERE NOT EXISTS` live), not a pre-count then set.
+pub async fn close_open_folders_with_no_live_conversations(
+    conn: &DatabaseConnection,
+) -> Result<Vec<i32>, DbError> {
+    let candidates = folder::Entity::find()
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::IsOpen.eq(true))
+        .filter(folder::Column::Kind.eq(FolderKind::Regular))
+        .all(conn)
+        .await?;
+
+    let mut closed = Vec::new();
+    for row in candidates {
+        if close_folder_if_no_live_conversations(conn, row.id).await? {
+            closed.push(row.id);
+        }
+    }
+    Ok(closed)
+}
+
 pub async fn list_open_folders(
     conn: &DatabaseConnection,
 ) -> Result<Vec<FolderHistoryEntry>, DbError> {
@@ -500,15 +575,67 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        add_chat_folder, add_folder, force_add_folder_skip_existing_for_test, get_folder_by_id,
-        update_folder_last_agent,
+        add_chat_folder, add_folder, close_folder_if_no_live_conversations,
+        close_open_folders_with_no_live_conversations, force_add_folder_skip_existing_for_test,
+        get_folder_by_id, list_open_folders, update_folder_last_agent,
     };
     use crate::db::entities::folder;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::agent::AgentType;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
     use std::sync::Arc;
     use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn close_open_folders_with_no_live_conversations_closes_empty_regular() {
+        let db = fresh_in_memory_db().await;
+        let empty_id = seed_folder(&db, "/tmp/codeg-empty-open").await;
+        let kept_id = seed_folder(&db, "/tmp/codeg-kept-open").await;
+        seed_conversation(&db, kept_id, AgentType::ClaudeCode).await;
+
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("reconcile");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0], empty_id);
+
+        let open = list_open_folders(&db.conn).await.expect("list");
+        let open_ids: Vec<i32> = open.iter().map(|f| f.id).collect();
+        assert!(!open_ids.contains(&empty_id));
+        assert!(open_ids.contains(&kept_id));
+    }
+
+    #[tokio::test]
+    async fn close_open_folders_skips_chat_kind() {
+        let db = fresh_in_memory_db().await;
+        let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-scratch/x")
+            .await
+            .expect("chat folder");
+        // ensure is_open true (add_chat_folder already opens)
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("reconcile");
+        assert!(closed.is_empty());
+        let still = get_folder_by_id(&db.conn, chat.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        // chat still exists and was not soft-deleted; open flag may remain true
+        // (list_open_folder_details excludes chat regardless)
+        let _ = still;
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_is_idempotent() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-once").await;
+        assert!(close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn concurrent_add_folder_same_path_converges_without_unique_error() {
