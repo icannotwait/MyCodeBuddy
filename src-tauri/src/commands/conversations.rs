@@ -946,6 +946,23 @@ pub(crate) async fn import_selected_from_summaries(
                 if let Ok(Some(detail)) = folder_service::get_folder_by_id(conn, folder_id).await {
                     crate::commands::folders::emit_folder_upsert(emitter, detail);
                 }
+                // `add_folder` always opens the row. When the group imported
+                // zero live conversations (all skipped/failed, or only
+                // soft-deleted matches), close immediately so the sidebar does
+                // not keep an empty open folder. Close is atomic (NOT EXISTS
+                // live); emit AutoEmpty only on flip, and always *after* the
+                // Upsert above so clients see membership then correct it.
+                match folder_service::close_folder_if_no_live_conversations(conn, folder_id).await {
+                    Ok(true) => crate::commands::folders::emit_folder_close(
+                        emitter,
+                        folder_id,
+                        crate::web::event_bridge::FolderCloseCause::AutoEmpty,
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::error!(
+                        "[conversations] empty-folder close after import failed (folder {folder_id}): {e}"
+                    ),
+                }
             }
             // The folder itself could not be created/reopened — the whole group
             // produced nothing, so there is no folder to broadcast.
@@ -6308,6 +6325,119 @@ Call get_delegation_status with the returned task_id to collect the result.";
         }
         assert_eq!(folder_events, 2, "one folder upsert per touched folder");
         assert_eq!(bulk_events, 1, "exactly one bulk nudge, never per-row spam");
+    }
+
+    #[tokio::test]
+    async fn batch_import_closes_folder_left_empty_after_zero_live_import() {
+        // Import can reopen/create a folder via add_folder even when every
+        // selected session is skipped (soft-deleted never resurrects). The
+        // group must not stay open with zero live conversations: flip is_open
+        // and broadcast Close{AutoEmpty} after the folder Upsert.
+        use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
+
+        // First import creates a live conversation, then soft-delete both the
+        // conversation and the folder so the next batch reopens an empty shell.
+        let make = || {
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-empty-import"),
+                at(0),
+            )]
+        };
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("seed import");
+
+        let conv = conversation::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("seeded conversation");
+        let mut conv_active = conv.into_active_model();
+        conv_active.deleted_at = Set(Some(chrono::Utc::now()));
+        conv_active.update(&db.conn).await.unwrap();
+
+        let folder_row = crate::db::entities::folder::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut folder_active = folder_row.into_active_model();
+        folder_active.deleted_at = Set(Some(chrono::Utc::now()));
+        folder_active.is_open = Set(false);
+        folder_active.update(&db.conn).await.unwrap();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &emitter,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("empty-group import");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(
+            result.created_folders, 1,
+            "reopening soft-deleted folder counts as created"
+        );
+
+        let open = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open");
+        assert!(
+            open.iter().all(|f| f.id != folder_id),
+            "folder reopened by import with zero live sessions must not stay open"
+        );
+
+        let mut saw_upsert = false;
+        let mut saw_auto_empty_close = false;
+        let mut upsert_before_close = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.channel != FOLDER_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "upsert" && p["folder"]["id"] == folder_id {
+                saw_upsert = true;
+                if !saw_auto_empty_close {
+                    upsert_before_close = true;
+                }
+            }
+            if p["kind"] == "close"
+                && p["folder_id"] == folder_id
+                && p["cause"] == "auto_empty"
+            {
+                saw_auto_empty_close = true;
+            }
+        }
+        assert!(saw_upsert, "empty-group import still Upserts the reopened folder");
+        assert!(
+            saw_auto_empty_close,
+            "zero-live import group must emit Close{{AutoEmpty}}"
+        );
+        assert!(
+            upsert_before_close,
+            "Close{{AutoEmpty}} must follow Upsert for the same folder in the batch"
+        );
     }
 
     #[tokio::test]
