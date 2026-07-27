@@ -46,7 +46,7 @@ pub use project::{
 pub use state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
 pub use store::{
     get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    PublishResult, PublishWorkflowRequest, SettleResult, SettleWorkflowRequest,
+    PublishResult, PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
     WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;

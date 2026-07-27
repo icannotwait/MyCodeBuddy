@@ -1477,9 +1477,11 @@ impl DelegationListener {
                 expected_graph_revision: req.expected_graph_revision,
                 gate_cycle: req.gate_cycle,
                 outcome,
-                critical_count: req.critical_count,
-                important_count: req.important_count,
-                minor_count: req.minor_count,
+                evidence: crate::acp::delegation::workflow::SettleGateEvidence::Design {
+                    critical_count: req.critical_count,
+                    important_count: req.important_count,
+                    minor_count: req.minor_count,
+                },
                 summary: req.summary,
             },
         )
@@ -1821,6 +1823,7 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
     let code = match &err {
         WorkflowStoreError::Validation(_) => "validation",
+        WorkflowStoreError::PlanReview(_) => "plan_review",
         WorkflowStoreError::NotFound(_) => "not_found",
         WorkflowStoreError::CrossParent { .. } => "cross_parent",
         WorkflowStoreError::StaleManifestRevision { .. } => "stale_manifest_revision",

@@ -6,7 +6,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::types::{DocumentRef, ManifestWorkflowState};
+use super::plan_review::PlanReviewRoundState;
+use super::types::{DocumentRef, ManifestTaskPolicy, ManifestWorkflowState};
 
 /// Full agent-facing recovery payload (A5 + B4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,12 +21,17 @@ pub struct WorkflowStateDto {
     pub graph_revision: u64,
     pub schema_version: u64,
     pub publication_token: String,
+    pub plan_target_rel_path: String,
+    pub risk_policy_version: String,
+    pub task_policies: Vec<ManifestTaskPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<DocumentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<DocumentRef>,
     pub nodes: Vec<WorkflowNodeStateDto>,
     pub gates: Vec<WorkflowGateStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_plan_review: Option<PlanReviewRoundState>,
     /// True when oldest completed node evidence was dropped under A15 size class.
     pub evidence_truncated: bool,
 }
@@ -59,6 +65,14 @@ pub struct WorkflowNodeStateDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_conversation_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_cycle: Option<i64>,
@@ -77,6 +91,7 @@ pub struct WorkflowGateStateDto {
     pub gate_id: String,
     pub gate_kind: String,
     pub resolution_mode: String,
+    pub reviewer_cohort_node_ids: Vec<String>,
     pub required_reviewer_node_ids: Vec<String>,
     /// Highest settled cycle, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]

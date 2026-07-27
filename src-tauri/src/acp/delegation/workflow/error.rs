@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use super::plan_review::PlanReviewError;
 pub use super::types::WorkflowError;
 
 /// Errors from publish / settle / get_workflow_state core paths.
@@ -9,6 +10,9 @@ pub use super::types::WorkflowError;
 pub enum WorkflowStoreError {
     #[error(transparent)]
     Validation(#[from] WorkflowError),
+
+    #[error(transparent)]
+    PlanReview(#[from] PlanReviewError),
 
     #[error("workflow not found: {0}")]
     NotFound(String),
