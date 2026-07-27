@@ -59,6 +59,7 @@ import {
 } from "@/stores/live-transcript-store"
 import type { DelegationIdentityIndex } from "@/lib/delegation-work-unit"
 import { shouldFoldLiveDelegationTool } from "@/lib/delegation-transcript-projection"
+import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 
 export interface LiveTranscriptRowProps {
   conversationId: number
@@ -68,6 +69,7 @@ export interface LiveTranscriptRowProps {
   /** Test / perf hook: called once per LiveToolCard render with toolCallId. */
   onToolRender?: (toolCallId: string) => void
   delegationIdentityIndex?: DelegationIdentityIndex | null
+  isDelegatedChild?: boolean
 }
 
 const PendingTypingIndicator = memo(function PendingTypingIndicator() {
@@ -481,6 +483,7 @@ function buildLiveFooterItems(
   segmentIds: readonly string[],
   groupIds: readonly string[],
   showThinking: boolean,
+  isDelegatedChild: boolean,
   delegationIdentityIndex?: DelegationIdentityIndex | null
 ): LiveFooterItem[] {
   // Only multi-tool runs collapse into a summary chip. Lone tools keep a
@@ -501,6 +504,13 @@ function buildLiveFooterItems(
   for (const segmentId of segmentIds) {
     const segment = liveTranscriptStore.getSegment(conversationId, segmentId)
     if (segment?.type === "thinking" && !showThinking) continue
+    if (
+      segment?.type === "text" &&
+      isDelegatedChild &&
+      isConversationInterruptedAgentText(segment.text)
+    ) {
+      continue
+    }
     if (segment?.type === "tool") {
       const tool = liveTranscriptStore.getTool(
         conversationId,
@@ -541,6 +551,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   showThinking,
   onToolRender,
   delegationIdentityIndex,
+  isDelegatedChild = false,
 }: LiveTranscriptRowProps) {
   const segmentIds = useLiveTranscriptSegmentIds(conversationId)
   const groupIds = useLiveTranscriptToolGroupIds(conversationId)
@@ -566,6 +577,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
         segmentIds,
         groupIds,
         showThinking,
+        isDelegatedChild,
         delegationIdentityIndex
       ),
     [
@@ -573,6 +585,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
       segmentIds,
       groupIds,
       showThinking,
+      isDelegatedChild,
       delegationIdentityIndex,
     ]
   )

@@ -355,6 +355,33 @@ describe("LiveTranscriptRow", () => {
     expect(screen.getByTestId("message-response")).toHaveTextContent("hello")
   })
 
+  it("hides the exact live marker only for delegated children", () => {
+    liveTranscriptStore.rebuild(
+      CID,
+      "c1",
+      liveMessage("*Conversation interrupted*"),
+      1
+    )
+    const ui = (isDelegatedChild: boolean) => (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTranscriptRow
+          conversationId={CID}
+          agentType="codex"
+          showThinking
+          isDelegatedChild={isDelegatedChild}
+        />
+      </NextIntlClientProvider>
+    )
+    const { rerender } = render(ui(true))
+
+    expect(
+      screen.queryByText(/Conversation interrupted/)
+    ).not.toBeInTheDocument()
+
+    rerender(ui(false))
+    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
+  })
+
   it("updates text without remounting the row when chunks append", () => {
     liveTranscriptStore.rebuild(CID, "c1", liveMessage("a"), 1)
     renderRow()

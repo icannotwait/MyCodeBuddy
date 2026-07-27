@@ -62,6 +62,7 @@ import {
   deriveNativeActivitiesFromToolCalls,
 } from "@/lib/delegation-activity"
 import { projectDelegationTranscript } from "@/lib/delegation-transcript-projection"
+import { filterDelegatedInterruptParts } from "@/lib/delegation-conversation-interrupted"
 import type { DelegationActivityView } from "@/lib/types"
 import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
@@ -141,6 +142,8 @@ interface MessageListViewProps {
   historyLoadComplete?: boolean
   /** Optional durable child turn id to reveal after the transcript loads. */
   focusTurnAnchor?: string | null
+  /** Display-only filtering for delegated child conversation artifacts. */
+  isDelegatedChild?: boolean
 }
 
 export function canReloadSessionLoadError(
@@ -1023,6 +1026,7 @@ export function MessageListView({
   initialHistoryScrollEligible = false,
   historyLoadComplete = false,
   focusTurnAnchor = null,
+  isDelegatedChild = false,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -1183,7 +1187,17 @@ export function MessageListView({
     const nonStreaming = allAdapted.filter(
       (_, index) => timelineTurns[index].phase !== "streaming"
     )
-    const projected = projectDelegationTranscript(allAdapted, conversationId)
+    const displayAdapted = isDelegatedChild
+      ? allAdapted.map((message) => {
+          if (message.role !== "assistant") return message
+          const content = filterDelegatedInterruptParts(message.content, true)
+          return content === message.content ? message : { ...message, content }
+        })
+      : allAdapted
+    const projected = projectDelegationTranscript(
+      displayAdapted,
+      conversationId
+    )
 
     // Map each adapted message directly to a render item (1:1).
     // Backend group_into_turns() already ensures each turn is a complete unit.
@@ -1297,6 +1311,7 @@ export function MessageListView({
     useIncrementalLive,
     mergedRunCache,
     conversationId,
+    isDelegatedChild,
   ])
   const { threadItems, nonStreamingAdapted, delegationIdentityIndex } =
     adaptedThread
@@ -1316,6 +1331,7 @@ export function MessageListView({
         conversationId={conversationId}
         agentType={agentType}
         showThinking={showThinking}
+        isDelegatedChild={isDelegatedChild}
         delegationIdentityIndex={delegationIdentityIndex}
       />
     )
@@ -1324,6 +1340,7 @@ export function MessageListView({
     conversationId,
     agentType,
     showThinking,
+    isDelegatedChild,
     delegationIdentityIndex,
   ])
 

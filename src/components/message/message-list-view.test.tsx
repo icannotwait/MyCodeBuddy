@@ -628,8 +628,8 @@ function enableIncremental() {
   })
 }
 
-function renderMessageList() {
-  return render(
+function messageListUi(isDelegatedChild = false) {
+  return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
         conversationId={CID}
@@ -637,9 +637,14 @@ function renderMessageList() {
         connStatus="prompting"
         isActive
         showMessageNav={false}
+        isDelegatedChild={isDelegatedChild}
       />
     </NextIntlClientProvider>
   )
+}
+
+function renderMessageList(isDelegatedChild = false) {
+  return render(messageListUi(isDelegatedChild))
 }
 
 function assistantTexts(): string[] {
@@ -1108,6 +1113,32 @@ describe("MessageListView delegation work-unit projection", () => {
         (delegation) => delegation.parentToolUseId
       )
     ).toEqual(["tool-1", "tool-2"])
+  })
+})
+
+describe("MessageListView delegated interruption marker", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    seedHistory([assistantTurn("a1", " **Conversation interrupted** \n")])
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("hides the exact historical marker only for delegated children", () => {
+    const { rerender } = renderMessageList(true)
+    expect(
+      screen.queryByText(/Conversation interrupted/)
+    ).not.toBeInTheDocument()
+
+    rerender(messageListUi(false))
+    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
   })
 })
 
