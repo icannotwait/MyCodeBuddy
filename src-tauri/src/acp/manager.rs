@@ -6428,6 +6428,171 @@ mod tests {
         let _ = child_rx.try_recv();
     }
 
+    /// Production legacy path (`prebound_child = None`) resolves folder from
+    /// the child connection working_dir via RegistrationOnly — must not
+    /// ForceOpen an absent path just because a hidden child conversation is
+    /// created.
+    #[tokio::test]
+    async fn manager_legacy_delegation_child_keeps_working_dir_folder_closed() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+        use crate::db::entities::folder;
+        use crate::db::test_helpers;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        let mgr = Arc::new(ConnectionManager::new());
+        let child_id = "deleg-child-reg-only";
+        // Absent path: not pre-seeded open. ensure_folder must create closed.
+        let workdir = PathBuf::from("/tmp/codeg-mgr-reg-only-absent");
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(workdir.clone()),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = ConnectionPurpose::Delegation;
+        }
+
+        let parent_folder = test_helpers::seed_folder(&db, "/tmp/codeg-mgr-reg-only-parent").await;
+        let parent_conversation = conversation_service::create(
+            &db.conn,
+            parent_folder,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("parent conversation");
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+
+        let accepted = spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                "reg-only manager task".into(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-mgr-reg-only".into(),
+                    delegation_call_id: "call-mgr-reg-only".into(),
+                },
+                None, // legacy path → ensure_folder(RegistrationOnly)
+            )
+            .await
+            .expect("delegated send must succeed");
+        assert!(accepted.child_conversation_id > 0);
+        let _ = child_rx.try_recv();
+
+        let path = workdir.to_string_lossy().to_string();
+        let row = folder::Entity::find()
+            .filter(folder::Column::Path.eq(&path))
+            .one(&db.conn)
+            .await
+            .expect("query folder")
+            .expect("working_dir folder must exist after legacy reserve");
+        assert!(
+            !row.is_open,
+            "manager legacy child reserve must not ForceOpen working_dir folder"
+        );
+        assert!(row.deleted_at.is_none());
+    }
+
+    /// Pre-existing closed folder stays closed through the same production path.
+    #[tokio::test]
+    async fn manager_legacy_delegation_child_preserves_closed_working_dir() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+        use crate::db::entities::folder;
+        use crate::db::service::folder_service;
+        use crate::db::test_helpers;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        let path = "/tmp/codeg-mgr-reg-only-closed";
+        let folder_id = test_helpers::seed_folder(&db, path).await;
+        folder_service::set_folder_open(&db.conn, folder_id, false)
+            .await
+            .expect("close folder");
+        assert!(
+            !folder::Entity::find_by_id(folder_id)
+                .one(&db.conn)
+                .await
+                .expect("load")
+                .expect("folder")
+                .is_open
+        );
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let child_id = "deleg-child-reg-only-closed";
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(PathBuf::from(path)),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = ConnectionPurpose::Delegation;
+        }
+
+        let parent_folder =
+            test_helpers::seed_folder(&db, "/tmp/codeg-mgr-reg-only-closed-parent").await;
+        let parent_conversation = conversation_service::create(
+            &db.conn,
+            parent_folder,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("parent conversation");
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+
+        spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                "reg-only closed task".into(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-mgr-reg-closed".into(),
+                    delegation_call_id: "call-mgr-reg-closed".into(),
+                },
+                None,
+            )
+            .await
+            .expect("delegated send");
+        let _ = child_rx.try_recv();
+
+        let row = folder::Entity::find()
+            .filter(folder::Column::Path.eq(path))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("folder");
+        assert_eq!(row.id, folder_id);
+        assert!(
+            !row.is_open,
+            "manager legacy path must not ForceOpen an already-closed folder"
+        );
+    }
+
     #[test]
     fn is_reserved_turn_id_matches_only_the_parser_namespace() {
         // Rejected: the parsers' `turn-<digits>` ids (an untrusted client id of

@@ -146,9 +146,18 @@ fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
 /// Test-only: next N `ensure_folder` / `add_folder` calls skip a successful
 /// existing-row find so concurrent callers both reach INSERT and exercise
 /// UNIQUE recovery.
+///
+/// **Not** safe to arm bare under parallel `cargo test` — use
+/// [`ForceSkipExistingGuard`] which serializes ownership of this seam and
+/// always resets the counter on drop (including panic).
 #[cfg(test)]
 static FORCE_ADD_FOLDER_SKIP_EXISTING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes tests that arm [`FORCE_ADD_FOLDER_SKIP_EXISTING`] so concurrent
+/// suites cannot consume each other's skip budget.
+#[cfg(test)]
+static SKIP_EXISTING_SEAM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 fn take_force_skip_existing() -> bool {
@@ -164,10 +173,42 @@ fn take_force_skip_existing() -> bool {
         .is_ok()
 }
 
-/// Arm the skip-existing race for tests (see `FORCE_ADD_FOLDER_SKIP_EXISTING`).
+/// RAII ownership of the UNIQUE-recovery skip-existing inject.
+///
+/// Holding the guard:
+/// - exclusively owns the process-global skip counter (other tests block)
+/// - arms `n` skip-find hits for concurrent INSERT / UNIQUE recovery
+/// - always stores `0` on drop so panics cannot leak armed state
 #[cfg(test)]
-pub fn force_add_folder_skip_existing_for_test(n: usize) {
-    FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, std::sync::atomic::Ordering::SeqCst);
+pub struct ForceSkipExistingGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ForceSkipExistingGuard {
+    /// Acquire exclusive seam ownership and arm the next `n` find-skips.
+    pub fn arm(n: usize) -> Self {
+        use std::sync::atomic::Ordering;
+        let lock = SKIP_EXISTING_SEAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, Ordering::SeqCst);
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceSkipExistingGuard {
+    fn drop(&mut self) {
+        FORCE_ADD_FOLDER_SKIP_EXISTING.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the skip-existing race for tests. Returns an RAII guard — keep it live
+/// for the full armed interval (including concurrent tasks that consume skips).
+#[cfg(test)]
+pub fn force_add_folder_skip_existing_for_test(n: usize) -> ForceSkipExistingGuard {
+    ForceSkipExistingGuard::arm(n)
 }
 
 /// Test-only: when armed with a folder id, the next
@@ -1014,7 +1055,8 @@ mod tests {
         let db = Arc::new(fresh_in_memory_db().await);
         let path = "/tmp/codeg-folder-unique-race";
         // Force both callers past find → INSERT so one hits UNIQUE recovery.
-        force_add_folder_skip_existing_for_test(2);
+        // Guard serializes the seam for the full concurrent window.
+        let _skip = force_add_folder_skip_existing_for_test(2);
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
         let db1 = db.clone();
@@ -1039,7 +1081,7 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(rows.len(), 1, "exactly one row for path");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
     }
 
     /// Deterministic UNIQUE recovery: pre-insert the winner, then force
@@ -1049,11 +1091,11 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let path = "/tmp/codeg-folder-unique-recovery";
         let first = add_folder(&db.conn, path).await.expect("seed winner");
-        force_add_folder_skip_existing_for_test(1);
+        let _skip = force_add_folder_skip_existing_for_test(1);
         let second = add_folder(&db.conn, path)
             .await
             .expect("UNIQUE recovery must reopen winner");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
         assert_eq!(first.id, second.id);
         assert_eq!(second.path, path);
         let rows = folder::Entity::find()
@@ -1161,11 +1203,11 @@ mod tests {
             .await
             .expect("seed winner");
         assert!(!raw_folder(&db.conn, first.id).await.is_open);
-        force_add_folder_skip_existing_for_test(1);
+        let _skip = force_add_folder_skip_existing_for_test(1);
         let second = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
             .await
             .expect("UNIQUE recovery must re-resolve winner");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
         assert_eq!(first.id, second.id);
         let row = raw_folder(&db.conn, first.id).await;
         assert!(
@@ -1184,7 +1226,7 @@ mod tests {
     async fn concurrent_registration_only_same_path_converges_closed() {
         let db = Arc::new(fresh_in_memory_db().await);
         let path = "/tmp/codeg-reg-only-concurrent";
-        force_add_folder_skip_existing_for_test(2);
+        let _skip = force_add_folder_skip_existing_for_test(2);
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
         let db1 = db.clone();
@@ -1204,7 +1246,7 @@ mod tests {
         assert_eq!(a.id, b.id);
         let row = raw_folder(&db.conn, a.id).await;
         assert!(!row.is_open, "concurrent RegistrationOnly must stay closed");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
     }
 
     #[tokio::test]
@@ -1228,14 +1270,11 @@ mod tests {
         );
     }
 
-    /// Delegation manager + broker only register working_dir for hidden child
-    /// conversation FK rows — they must call RegistrationOnly, never ForceOpen
-    /// solely because a child conversation exists. (Call sites verified in
-    /// manager.rs / broker.rs; semantics covered by the matrix above.)
+    /// Service-level composition only. Production call sites are covered by
+    /// `manager_legacy_delegation_child_keeps_working_dir_folder_closed` and
+    /// `durable_reserve_registers_working_dir_folder_closed`.
     #[tokio::test]
     async fn registration_only_does_not_open_when_hidden_child_would_use_path() {
-        // Product path: ensure folder for working_dir, then create a linked
-        // (hidden) child conversation. Folder must remain closed.
         let db = fresh_in_memory_db().await;
         let path = "/tmp/codeg-reg-only-hidden-child";
         let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
@@ -1259,7 +1298,6 @@ mod tests {
 
     #[tokio::test]
     async fn last_agent_round_trips_only_for_regular_folders() {
-        force_add_folder_skip_existing_for_test(0);
         let db = fresh_in_memory_db().await;
         let regular_id = seed_folder(&db, "/tmp/codeg-last-agent").await;
         let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-last-agent")

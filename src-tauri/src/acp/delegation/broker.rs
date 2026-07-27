@@ -31243,6 +31243,81 @@ mod tests {
         child.id
     }
 
+    /// Durable gen-1 reserve uses `ensure_folder(..., RegistrationOnly)` for
+    /// the child working_dir. An absent path must stay closed after reserve
+    /// (hidden child FK must not ForceOpen workspace membership).
+    #[tokio::test]
+    async fn durable_reserve_registers_working_dir_folder_closed() {
+        use crate::db::entities::folder;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let parent_folder = seed_folder(&db, "/tmp/codeg-broker-reg-only-parent").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            parent_folder,
+            AgentType::ClaudeCode,
+            Some("parent-reg-only".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-reg-only".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        // Real directory so resolve_workspace_path succeeds; not pre-opened.
+        let cwd = std::env::current_dir().expect("test cwd");
+        let root = tempfile::Builder::new()
+            .prefix("codeg-broker-reg-only-")
+            .tempdir_in(&cwd)
+            .expect("temp workspace root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let canonical = std::fs::canonicalize(&workspace)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+
+        // Prove path was not open in DB before reserve.
+        assert!(
+            folder::Entity::find()
+                .filter(folder::Column::Path.eq(&canonical))
+                .one(&db.conn)
+                .await
+                .expect("pre-query")
+                .is_none(),
+            "workspace must be absent from folder table before reserve"
+        );
+
+        let mut req = request(parent.id, "tu-broker-reg-only");
+        req.working_dir = Some(canonical.clone());
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(
+            ack.status,
+            TaskStatus::Running,
+            "durable reserve + dispatch must succeed: {ack:?}"
+        );
+
+        let row = folder::Entity::find()
+            .filter(folder::Column::Path.eq(&canonical))
+            .one(&db.conn)
+            .await
+            .expect("query folder")
+            .expect("working_dir folder must exist after durable reserve");
+        assert!(
+            !row.is_open,
+            "broker durable reserve must not ForceOpen working_dir folder"
+        );
+        assert!(row.deleted_at.is_none());
+        // Keep tempdir alive until after DB assertions.
+        drop(root);
+    }
+
     /// I1: concurrent same work_unit_key dual first-dispatch — loser never
     /// reaches spawn/prompt (durable fence wins before dispatch).
     #[tokio::test]
