@@ -3492,12 +3492,18 @@ fn continuation_enabled_for_launch(
     agent_type: AgentType,
     env_value: Option<&std::ffi::OsStr>,
 ) -> bool {
-    plan.expose_codeg_delegation
-        && agent_type == AgentType::Codex
-        && env_value.is_some_and(|value| {
+    // Codex + Codeg-route only. Default on; kill-switch via env
+    // `CODEG_DELEGATION_CONTINUATION_V1=0` or `false`.
+    if !plan.expose_codeg_delegation || agent_type != AgentType::Codex {
+        return false;
+    }
+    match env_value {
+        None => true,
+        Some(value) => {
             let value = value.to_string_lossy();
-            value.as_ref() == "1" || value.eq_ignore_ascii_case("true")
-        })
+            !(value.as_ref() == "0" || value.eq_ignore_ascii_case("false"))
+        }
+    }
 }
 
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
@@ -13899,8 +13905,8 @@ mod tests {
     }
 
     #[test]
-    fn continuation_capability_defaults_off() {
-        assert!(!continuation_enabled_for_launch(
+    fn continuation_capability_defaults_on_for_codex_codeg() {
+        assert!(continuation_enabled_for_launch(
             &codeg_plan(AgentType::Codex),
             AgentType::Codex,
             None,
@@ -13908,28 +13914,44 @@ mod tests {
     }
 
     #[test]
-    fn continuation_capability_enables_only_opted_in_codex_codeg_launch() {
+    fn continuation_capability_kill_switch_and_scope() {
         use std::ffi::OsStr;
 
         let codex_codeg = codeg_plan(AgentType::Codex);
-        for enabled in [OsStr::new("1"), OsStr::new("true"), OsStr::new("TRUE")] {
+        for enabled in [
+            OsStr::new("1"),
+            OsStr::new("true"),
+            OsStr::new("TRUE"),
+            OsStr::new("yes"),
+        ] {
             assert!(continuation_enabled_for_launch(
                 &codex_codeg,
                 AgentType::Codex,
                 Some(enabled),
             ));
         }
-        for disabled in [OsStr::new("0"), OsStr::new("false"), OsStr::new("yes")] {
+        for disabled in [OsStr::new("0"), OsStr::new("false"), OsStr::new("FALSE")] {
             assert!(!continuation_enabled_for_launch(
                 &codex_codeg,
                 AgentType::Codex,
                 Some(disabled),
             ));
         }
+        // Scope: never on native routes or non-Codex agents, even with env on.
+        assert!(!continuation_enabled_for_launch(
+            &native_plan(AgentType::Codex),
+            AgentType::Codex,
+            None,
+        ));
         assert!(!continuation_enabled_for_launch(
             &native_plan(AgentType::Codex),
             AgentType::Codex,
             Some(OsStr::new("1")),
+        ));
+        assert!(!continuation_enabled_for_launch(
+            &codeg_plan(AgentType::ClaudeCode),
+            AgentType::ClaudeCode,
+            None,
         ));
         assert!(!continuation_enabled_for_launch(
             &codeg_plan(AgentType::ClaudeCode),

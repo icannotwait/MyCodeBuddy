@@ -1,4 +1,4 @@
-# Delegation Continuation (opt-in)
+# Delegation Continuation (default-on for Codex)
 
 ## Behavior change
 
@@ -25,8 +25,10 @@ continuation row, or live children.
 
 | Condition | Result |
 | --- | --- |
-| `CODEG_DELEGATION_CONTINUATION_V1` unset / `0` / other | **Default off** — no arming |
-| Env `1` or `true` (case-insensitive) | Opt-in allowed |
+| Env unset | **Default on** for eligible launches (Codex + Codeg route) |
+| Env `1` or `true` (case-insensitive) | Explicit on (same as default) |
+| Env `0` or `false` (case-insensitive) | **Kill-switch** — no arming |
+| Other env values | Treated as on (not a kill-switch) |
 | Agent type Codex + Codeg route exposure | Capability can arm |
 | Non-Codex agents | Never arms (Codex-only) |
 | Native / non-Codeg route | Never arms |
@@ -35,30 +37,27 @@ continuation row, or live children.
 Connection-bound: the flag is evaluated at companion injection / launch and
 stored on the token as `delegation_continuation_v1`.
 
-## Opt-in command examples
+## Kill-switch command examples
 
 ```powershell
-# Desktop (process env before launch)
-$env:CODEG_DELEGATION_CONTINUATION_V1 = "1"
+# Desktop (process env before launch) — disable continuation
+$env:CODEG_DELEGATION_CONTINUATION_V1 = "0"
 # then start the Codeg desktop binary as usual
 ```
 
 ```powershell
-# Server
-$env:CODEG_DELEGATION_CONTINUATION_V1 = "1"
+# Server — disable continuation
+$env:CODEG_DELEGATION_CONTINUATION_V1 = "0"
 # then start codeg-server with your usual CODEG_* host/port/token vars
 ```
 
 ```bash
-# Unix shell
-export CODEG_DELEGATION_CONTINUATION_V1=1
+# Unix shell — disable continuation
+export CODEG_DELEGATION_CONTINUATION_V1=0
 ```
 
-Only the literal values `1` and `true` (any case) enable the capability.
-Values such as `yes`, `on`, or `0` leave it disabled.
-
-**This document does not claim default-on rollout.** Default remains off until
-exit criteria below are met and a separate release decision flips the default.
+Only the literal values `0` and `false` (any case) disable the capability.
+Unset, `1`, `true`, and other values leave it enabled for eligible Codex launches.
 
 ## Observability
 
@@ -102,10 +101,9 @@ in user-facing channels.
 
 ## Rollback order
 
-1. **Disable new arming** — unset `CODEG_DELEGATION_CONTINUATION_V1` (or set to
-   a non-enabling value) and restart processes so new launches inject
-   capability-off tokens. Existing event-driven Join behavior returns for new
-   waits.
+1. **Disable new arming** — set `CODEG_DELEGATION_CONTINUATION_V1=0` (or
+   `false`) and restart processes so new launches inject capability-off tokens.
+   Existing event-driven Join behavior returns for new waits.
 2. **Let understood active rows finish** — allow in-flight continuations to
    complete, cancel via user Stop, fail on disconnect, or be reconciled on
    process restart. Deploy builds that still understand the
@@ -132,18 +130,6 @@ The migration is additive; empty tables may remain after rollback.
 - **Cross-connection handoff** — a continuation is bound to the parent
   connection that armed it; ownership is not transferred to another live
   connection.
-- Default-on for all agents or non-Codeg routes.
+- Default-on for non-Codex agents or non-Codeg routes.
 - UI configuration of the 240s checkpoint (fixed backend constant in v1).
 - Periodic parent model polling while children are merely running.
-
-## Default-on exit criteria
-
-Do **not** flip the default until a telemetry window shows:
-
-- no orphan tasks after Stop, disconnect, or restart;
-- no duplicate admissions / dual hidden prompts for one generation;
-- no hidden-message leaks into live `UserMessage` or cold user transcripts;
-- no stuck conversation locks (`waiting_for_subagents`) after terminal rows;
-
-and the Codex-shaped e2e matrix (`delegation_continuation_e2e_*`) plus desktop,
-server, companion, and frontend verification remain green on a release build.
