@@ -6082,7 +6082,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
             listener.local_addr().expect("local_addr").port()
         };
-        crate::office_watch::insert_known_watch_for_file_for_test(
+        // RAII: Drop kills/joins the short-lived sleeper even on panic.
+        let _watch_guard = crate::office_watch::KnownWatchForFileGuard::install(
             port,
             "auto-empty-cap",
             watch_file,
@@ -6149,8 +6150,7 @@ mod tests {
             marker.is_file(),
             "AutoEmpty must not remove on-disk files under the folder"
         );
-
-        crate::office_watch::remove_known_watch_for_file_for_test(port);
+        // `_watch_guard` drops here → reaps sleeper if still registered.
     }
 
     /// UserRemove on a non-empty folder still cascades tabs, stops office
@@ -6224,7 +6224,9 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
             listener.local_addr().expect("local_addr").port()
         };
-        crate::office_watch::insert_known_watch_for_file_for_test(
+        // RAII: UserRemove stops the watch via production path; Drop is still a
+        // no-op-safe reap if the entry was already removed (or test panics early).
+        let _watch_guard = crate::office_watch::KnownWatchForFileGuard::install(
             port,
             "user-remove-cap",
             watch_file,
@@ -6305,9 +6307,7 @@ mod tests {
             marker.is_file(),
             "UserRemove must not remove on-disk files under the folder"
         );
-
-        // Already cleaned by stop_office_watches_under_root; remove is no-op if gone.
-        crate::office_watch::remove_known_watch_for_file_for_test(port);
+        // `_watch_guard` drops here (no-op if production path already reaped).
     }
 
     /// Create `rel` (relative to `root`) as a file, making parent dirs.

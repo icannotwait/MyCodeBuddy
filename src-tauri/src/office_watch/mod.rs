@@ -643,84 +643,66 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Seed a live watch entry (backed by a real long-lived child bound to `port`)
-/// so proxy integration tests can exercise the gate without a real officecli.
+/// Max lifetime of a test sleeper child. Short enough that a leaked fixture
+/// cannot pin a PowerShell/`sleep` process for 10 minutes; long enough that
+/// normal test body work finishes first. Callers must still use the Drop
+/// guard / `remove_*` so cleanup is prompt under success and panic.
 #[cfg(feature = "test-utils")]
-pub fn insert_known_port_for_test(port: u16, cap: &str) {
+const TEST_SLEEPER_SECS: u64 = 30;
+
+/// Spawn a short-lived "live child" for registry/liveness tests.
+///
+/// Uses `kill_on_drop(true)` so dropping the [`Child`] (via [`reap_join_test_child`]
+/// or process exit) always terminates the sleeper.
+#[cfg(feature = "test-utils")]
+fn spawn_test_sleeper_child() -> Child {
     #[cfg(windows)]
     let mut sleeper = {
+        // Prefer `timeout.exe` over PowerShell: lighter, no profile, easier to kill.
         let system_root = std::env::var_os("SystemRoot")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        let mut command =
-            tokio_command(system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Sleep -Seconds 600",
-        ]);
+        let mut command = tokio_command(system_root.join(r"System32\timeout.exe"));
+        // `/t N` seconds, `/nobreak` ignores keypress; status 1 on timeout is normal.
+        command.args(["/t", &TEST_SLEEPER_SECS.to_string(), "/nobreak"]);
         command
     };
     #[cfg(not(windows))]
     let mut sleeper = {
         let mut command = tokio_command("sleep");
-        command.arg("600");
+        command.arg(TEST_SLEEPER_SECS.to_string());
         command
     };
-    let child = sleeper.spawn().expect("spawn test sleeper");
-    lock_watches().insert(
-        format!("__test__:{port}"),
-        WatchInstance {
-            child,
-            port,
-            cap: cap.to_string(),
-            file_canonical: PathBuf::from(format!("/__test__/{port}")),
-            ref_count: 1,
-            last_activity: Instant::now(),
-            proxied: false,
-            sse_leases: 0,
-        },
-    );
+    sleeper.kill_on_drop(true);
+    sleeper.spawn().expect("spawn test sleeper")
 }
 
+/// Kill and join a test sleeper so it cannot outlive the calling test.
 #[cfg(feature = "test-utils")]
-pub fn remove_known_port_for_test(port: u16) {
-    if let Some(entry) = lock_watches().remove(&format!("__test__:{port}")) {
-        reap(entry.child);
+fn reap_join_test_child(mut child: Child) {
+    let _ = child.start_kill();
+    // Poll briefly for exit so we don't leave a detached sleeper racing Drop.
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return,
+        }
     }
+    // Final best-effort kill; `kill_on_drop(true)` finishes on drop.
+    let _ = child.start_kill();
 }
 
-/// Seed a live watch whose `file_canonical` is under a real workspace path so
-/// [`stop_office_watches_under_root`] side-effect tests can assert kill vs keep.
 #[cfg(feature = "test-utils")]
-pub fn insert_known_watch_for_file_for_test(port: u16, cap: &str, file_canonical: PathBuf) {
-    #[cfg(windows)]
-    let mut sleeper = {
-        let system_root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        let mut command =
-            tokio_command(system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Sleep -Seconds 600",
-        ]);
-        command
-    };
-    #[cfg(not(windows))]
-    let mut sleeper = {
-        let mut command = tokio_command("sleep");
-        command.arg("600");
-        command
-    };
-    let child = sleeper.spawn().expect("spawn test sleeper");
+fn insert_test_watch_entry(
+    key: String,
+    port: u16,
+    cap: &str,
+    file_canonical: PathBuf,
+) {
+    let child = spawn_test_sleeper_child();
     lock_watches().insert(
-        format!("__test_file__:{port}"),
+        key,
         WatchInstance {
             child,
             port,
@@ -735,10 +717,81 @@ pub fn insert_known_watch_for_file_for_test(port: u16, cap: &str, file_canonical
 }
 
 #[cfg(feature = "test-utils")]
-pub fn remove_known_watch_for_file_for_test(port: u16) {
-    if let Some(entry) = lock_watches().remove(&format!("__test_file__:{port}")) {
-        reap(entry.child);
+fn remove_and_reap_test_watch(key: &str) {
+    if let Some(entry) = lock_watches().remove(key) {
+        reap_join_test_child(entry.child);
     }
+}
+
+/// Seed a live watch entry (backed by a short-lived child bound to `port`)
+/// so proxy integration tests can exercise the gate without a real officecli.
+///
+/// Prefer pairing with [`remove_known_port_for_test`] in a `defer`/finally path;
+/// the child is also capped at [`TEST_SLEEPER_SECS`] and uses `kill_on_drop`.
+#[cfg(feature = "test-utils")]
+pub fn insert_known_port_for_test(port: u16, cap: &str) {
+    insert_test_watch_entry(
+        format!("__test__:{port}"),
+        port,
+        cap,
+        PathBuf::from(format!("/__test__/{port}")),
+    );
+}
+
+#[cfg(feature = "test-utils")]
+pub fn remove_known_port_for_test(port: u16) {
+    remove_and_reap_test_watch(&format!("__test__:{port}"));
+}
+
+/// RAII fixture: live watch whose `file_canonical` is under a real workspace path
+/// so [`stop_office_watches_under_root`] side-effect tests can assert kill vs keep.
+///
+/// **Always** reaps the sleeper on drop (success, early return, or panic), so a
+/// 10-minute PowerShell sleeper cannot leak from these tests.
+#[cfg(feature = "test-utils")]
+pub struct KnownWatchForFileGuard {
+    port: u16,
+    key: String,
+}
+
+#[cfg(feature = "test-utils")]
+impl KnownWatchForFileGuard {
+    /// Install a live registry entry under `file_canonical` and return a guard
+    /// that kills/joins the child when dropped.
+    pub fn install(port: u16, cap: &str, file_canonical: PathBuf) -> Self {
+        let key = format!("__test_file__:{port}");
+        insert_test_watch_entry(key.clone(), port, cap, file_canonical);
+        Self { port, key }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl Drop for KnownWatchForFileGuard {
+    fn drop(&mut self) {
+        remove_and_reap_test_watch(&self.key);
+    }
+}
+
+/// Seed a live watch under a path. Prefer [`KnownWatchForFileGuard::install`] so
+/// cleanup is panic-safe; this free form remains for call sites that already
+/// pair with [`remove_known_watch_for_file_for_test`].
+#[cfg(feature = "test-utils")]
+pub fn insert_known_watch_for_file_for_test(port: u16, cap: &str, file_canonical: PathBuf) {
+    insert_test_watch_entry(
+        format!("__test_file__:{port}"),
+        port,
+        cap,
+        file_canonical,
+    );
+}
+
+#[cfg(feature = "test-utils")]
+pub fn remove_known_watch_for_file_for_test(port: u16) {
+    remove_and_reap_test_watch(&format!("__test_file__:{port}"));
 }
 
 /// Kill every watch process. Used on app/window/server shutdown.
