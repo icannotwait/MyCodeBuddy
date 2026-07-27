@@ -2720,9 +2720,11 @@ pub async fn cleanup_chat_folder_for_deleted_conversation(
 
 /// Full conversation-delete orchestration shared by the Tauri command and the web
 /// handler: capture the backing folder BEFORE the soft-delete (so a hidden chat
-/// folder can be retired afterward), soft-delete, broadcast the deletion, then run
-/// the tab + chat-folder cleanups. The thin `delete_conversation_core` primitive
-/// stays event-free for internal/test callers, so the orchestration lives here.
+/// folder can be retired afterward), soft-delete, broadcast the deletion, run the
+/// tab + chat-folder cleanups, then visibility-close an empty regular folder with
+/// `Close{AutoEmpty}` when live count hits zero. The thin `delete_conversation_core`
+/// primitive stays event-free for internal/test callers, so the orchestration lives
+/// here.
 pub async fn delete_conversation_with_cleanup_core(
     emitter: &EventEmitter,
     conn: &sea_orm::DatabaseConnection,
@@ -2750,6 +2752,20 @@ pub async fn delete_conversation_with_cleanup_core(
     cleanup_tabs_for_deleted_conversation(emitter, conn, conversation_id).await;
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
+        // Visibility-only: when a regular folder now has zero live conversations,
+        // flip is_open and broadcast Close{AutoEmpty}. Draft re-open is client-side
+        // (Task 5/2); chat-kind folders are no-ops inside the service primitive.
+        match folder_service::close_folder_if_no_live_conversations(conn, folder_id).await {
+            Ok(true) => crate::commands::folders::emit_folder_close(
+                emitter,
+                folder_id,
+                crate::web::event_bridge::FolderCloseCause::AutoEmpty,
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                "[conversations] empty-folder close after delete failed (folder {folder_id}): {e}"
+            ),
+        }
     }
     Ok(())
 }
@@ -5610,6 +5626,65 @@ Call get_delegation_status with the returned task_id to collect the result.";
         assert!(
             saw_parent_upsert,
             "parent must re-broadcast an Upsert for child_count convergence"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_last_conversation_closes_empty_regular_folder() {
+        // Deleting the sole live conversation of an open regular folder must
+        // visibility-close the folder and broadcast Close{AutoEmpty} so every
+        // client drops it from the workspace open list.
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-delete-last-closes-folder").await;
+        let conv_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create sole conversation");
+
+        // Precondition: folder is open while it still has a live conversation.
+        let open_before = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open before");
+        assert!(
+            open_before.iter().any(|f| f.id == folder_id),
+            "seeded regular folder must start open"
+        );
+
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut rx = broadcaster.subscribe();
+        delete_conversation_with_cleanup_core(
+            &emitter,
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            conv_id,
+        )
+        .await
+        .expect("delete last conversation");
+
+        let open_after = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open after");
+        assert!(
+            open_after.iter().all(|f| f.id != folder_id),
+            "empty regular folder must leave list_open_folders after last delete"
+        );
+
+        let mut saw_auto_empty_close = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.channel != crate::web::event_bridge::FOLDER_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "close"
+                && p["folder_id"] == folder_id
+                && p["cause"] == "auto_empty"
+            {
+                saw_auto_empty_close = true;
+            }
+        }
+        assert!(
+            saw_auto_empty_close,
+            "last delete on empty regular folder must emit Close{{AutoEmpty}}"
         );
     }
 
