@@ -1124,6 +1124,18 @@ async fn publish_in_txn(
             }
         };
 
+    let prior_normalized = if let Some(prior) = prior_header.as_ref() {
+        let document = load_active_manifest_document_txn(
+            txn,
+            &prior.workflow_id,
+            prior.active_manifest_revision,
+        )
+        .await?;
+        validate_manifest_document(&document).ok()
+    } else {
+        None
+    };
+
     // A8: material Plan structure change forces demotion when previously
     // approved or already demoted (supersedes set). Design fingerprint is
     // independent so Design settlements survive plan-only rewrites.
@@ -1135,20 +1147,9 @@ async fn publish_in_txn(
     let mut next_structural_rev = next_manifest_rev;
     if let Some(prior) = prior_header.as_ref() {
         let plan_changed = if prior.plan_fingerprint.is_empty() {
-            // Legacy rows before fingerprint columns were backfilled.
-            match load_active_manifest_document_txn(
-                txn,
-                &prior.workflow_id,
-                prior.active_manifest_revision,
-            )
-            .await
-            {
-                Ok(prior_doc) => match validate_manifest_document(&prior_doc) {
-                    Ok(prior_norm) => plan_structure_changed(&prior_norm, normalized),
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            }
+            prior_normalized
+                .as_ref()
+                .is_none_or(|prior| plan_structure_changed(prior, normalized))
         } else {
             prior.plan_fingerprint != next_plan_fp
         };
@@ -1225,6 +1226,7 @@ async fn publish_in_txn(
         &workflow_id,
         next_manifest_rev,
         normalized,
+        prior_normalized.as_ref(),
         &existing_bindings,
         &has_run_bindings,
         now,
@@ -1554,12 +1556,19 @@ async fn load_observed_node_ids<C: sea_orm::ConnectionTrait>(
     Ok(rows.into_iter().map(|r| r.node_id).collect())
 }
 
+fn frozen_cohort_error(task_index: i64) -> WorkflowStoreError {
+    WorkflowStoreError::FrozenPartnerDrop {
+        node_id: format!("Task {task_index}"),
+    }
+}
+
 /// Apply node-binding create / retain / freeze rules for a publish.
 async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
     next_revision: i64,
     normalized: &NormalizedManifest,
+    prior_normalized: Option<&NormalizedManifest>,
     existing: &[delegation_workflow_node_binding::Model],
     nodes_with_runs: &HashSet<String>,
     now: chrono::DateTime<Utc>,
@@ -1574,10 +1583,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         .collect();
     let new_ids: HashSet<&str> = new_work_units.iter().map(|n| n.id.as_str()).collect();
 
-    // B14: if either Task-pair node is observed/retained/has runs, both are
-    // protected against silent partner drop — even when cohort_frozen was not
-    // yet set by admission (Task 6).
-    let task_pair_active: HashSet<i64> = existing
+    let admitted_task_indices: HashSet<i64> = existing
         .iter()
         .filter(|b| {
             b.task_index.is_some()
@@ -1589,33 +1595,60 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         .filter_map(|b| b.task_index)
         .collect();
 
+    let mut frozen_routes: HashMap<i64, HashSet<String>> = HashMap::new();
+    for task_index in admitted_task_indices {
+        let prior_policy = prior_normalized
+            .and_then(|manifest| {
+                manifest
+                    .task_policies
+                    .iter()
+                    .find(|policy| policy.task_index as i64 == task_index)
+            })
+            .ok_or_else(|| frozen_cohort_error(task_index))?;
+        let next_policy = normalized
+            .task_policies
+            .iter()
+            .find(|policy| policy.task_index as i64 == task_index)
+            .ok_or_else(|| frozen_cohort_error(task_index))?;
+        if prior_policy != next_policy {
+            return Err(frozen_cohort_error(task_index));
+        }
+        let mut route = HashSet::with_capacity(prior_policy.route.reviewer_node_ids.len() + 1);
+        route.insert(prior_policy.route.implementer_node_id.clone());
+        route.extend(prior_policy.route.reviewer_node_ids.iter().cloned());
+        frozen_routes.insert(task_index, route);
+    }
+
     for b in existing {
         if new_ids.contains(b.node_id.as_str()) {
             continue;
         }
         let is_admitted = b.is_observed || nodes_with_runs.contains(&b.node_id);
-        let pair_protected = b.cohort_frozen
+        let route_frozen = b.task_index.is_some_and(|task_index| {
+            frozen_routes
+                .get(&task_index)
+                .is_some_and(|route| route.contains(&b.node_id))
+        });
+        let binding_protected = b.cohort_frozen
             || b.is_observed
             || b.retained_observed
-            || nodes_with_runs.contains(&b.node_id)
-            || b.task_index
-                .is_some_and(|idx| task_pair_active.contains(&idx));
+            || nodes_with_runs.contains(&b.node_id);
 
-        if pair_protected && !is_canceled_drop(normalized, b) {
+        if route_frozen {
+            return Err(frozen_cohort_error(
+                b.task_index.expect("frozen route has Task index"),
+            ));
+        }
+        if binding_protected && !is_canceled_drop(normalized, b) {
             return Err(WorkflowStoreError::FrozenPartnerDrop {
                 node_id: b.node_id.clone(),
             });
         }
 
-        if is_admitted || b.retained_observed || b.cohort_frozen || pair_protected {
+        if is_admitted || b.retained_observed || b.cohort_frozen || binding_protected {
             let mut am: delegation_workflow_node_binding::ActiveModel = b.clone().into();
             am.retired_revision = Set(Some(next_revision));
             am.retained_observed = Set(true);
-            if b.task_index
-                .is_some_and(|idx| task_pair_active.contains(&idx))
-            {
-                am.cohort_frozen = Set(true);
-            }
             am.updated_at = Set(now);
             am.update(conn).await.map_err(db_err)?;
         } else {
@@ -1637,20 +1670,26 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         let outcome = node.node_outcome.map(|o| match o {
             ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
         });
-        let freeze_pair = node
-            .task_index
-            .is_some_and(|idx| task_pair_active.contains(&(idx as i64)));
+        let freeze_cohort = node.task_index.is_some_and(|task_index| {
+            frozen_routes
+                .get(&(task_index as i64))
+                .is_some_and(|route| route.contains(&node.id))
+        });
 
         if let Some(prev) = existing_by_id.get(node.id.as_str()) {
             let is_admitted = prev.is_observed || nodes_with_runs.contains(&node.id);
-            if is_admitted
-                && (prev.work_unit_key != *key
-                    || prev.role != role
-                    || prev.agent_type != agent
-                    || prev.profile_id != node.profile_id
-                    || prev.phase_id != phase
-                    || prev.task_index != node.task_index.map(|i| i as i64))
-            {
+            let identity_changed = prev.work_unit_key != *key
+                || prev.role != role
+                || prev.agent_type != agent
+                || prev.profile_id != node.profile_id
+                || prev.phase_id != phase
+                || prev.task_index != node.task_index.map(|i| i as i64);
+            if freeze_cohort && identity_changed {
+                return Err(frozen_cohort_error(
+                    node.task_index.expect("frozen cohort Task index") as i64,
+                ));
+            }
+            if is_admitted && identity_changed {
                 return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
                     node_id: node.id.clone(),
                 });
@@ -1666,7 +1705,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             }
             am.retired_revision = Set(None);
             am.retained_observed = Set(prev.retained_observed && prev.retired_revision.is_some());
-            if freeze_pair {
+            if freeze_cohort {
                 am.cohort_frozen = Set(true);
             }
             if let Some(o) = outcome {
@@ -1688,7 +1727,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
                 retired_revision: Set(None),
                 is_observed: Set(false),
                 retained_observed: Set(false),
-                cohort_frozen: Set(freeze_pair),
+                cohort_frozen: Set(freeze_cohort),
                 node_outcome: Set(outcome),
                 created_at: Set(now),
                 updated_at: Set(now),

@@ -30,6 +30,7 @@ use crate::acp::delegation::store::{
     SqliteTransientClass, TaskStoreError, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::TaskStatus;
+use crate::acp::delegation::workflow::admission::ensure_workflow_child_conversation_independent;
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
@@ -1947,6 +1948,13 @@ impl RunStore {
                         (false, false) => {}
                     }
 
+                    ensure_workflow_child_conversation_independent(
+                        txn,
+                        insert.parent_conversation_id,
+                        insert.work_unit_key.as_deref(),
+                        insert.child_conversation_id,
+                    )
+                    .await?;
                     insert_reserving_txn(txn, &insert).await?;
 
                     // B2: replacement gen-1 uses ContinueOrReplacement; bare gen-1
@@ -1960,6 +1968,7 @@ impl RunStore {
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: insert.parent_conversation_id,
+                            child_conversation_id: insert.child_conversation_id,
                             task_id: &insert.task_id,
                             work_unit_key: insert.work_unit_key.as_deref(),
                             agent_type: &insert.agent_type,
@@ -2183,11 +2192,19 @@ impl RunStore {
                         replacement_reason: None,
                         started_at: Some(Utc::now()),
                     };
+                    ensure_workflow_child_conversation_independent(
+                        txn,
+                        insert.parent_conversation_id,
+                        insert.work_unit_key.as_deref(),
+                        insert.child_conversation_id,
+                    )
+                    .await?;
                     insert_reserving_txn(txn, &insert).await?;
                     let effect = admit_workflow_run_txn(
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: insert.parent_conversation_id,
+                            child_conversation_id: insert.child_conversation_id,
                             task_id: &insert.task_id,
                             work_unit_key: insert.work_unit_key.as_deref(),
                             agent_type: &insert.agent_type,
@@ -4582,6 +4599,224 @@ mod tests {
             replacement_reason: None,
             started_at: Some(Utc::now()),
         }
+    }
+
+    async fn seed_workflow_mapped_run(
+        db: &Arc<AppDatabase>,
+        store: &RunStore,
+        task_id: &str,
+        parent_id: i32,
+        child_id: i32,
+        role: &str,
+        phase_id: &str,
+    ) {
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert mapped run");
+        let now = Utc::now();
+        let workflow_id = format!("workflow-{task_id}");
+        crate::db::entities::delegation_workflow::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            parent_conversation_id: Set(parent_id),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(crate::db::entities::delegation_workflow::WorkflowState::Estimated),
+            capability_version: Set("workflow_manifest_v1".into()),
+            publication_token: Set(format!("token-{task_id}")),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design-fingerprint".into()),
+            plan_fingerprint: Set("plan-fingerprint".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert workflow header");
+        crate::db::entities::delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            node_id: Set(format!("node-{task_id}")),
+            work_unit_key: Set("unit-a".into()),
+            role: Set(role.into()),
+            agent_type: Set("codex".into()),
+            profile_id: Set(None),
+            phase_id: Set(phase_id.into()),
+            task_index: Set((phase_id == "tasks").then_some(1)),
+            introduced_revision: Set(1),
+            retired_revision: Set(None),
+            is_observed: Set(true),
+            retained_observed: Set(false),
+            cohort_frozen: Set(phase_id == "tasks"),
+            node_outcome: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert workflow node");
+        crate::db::entities::delegation_workflow_run_binding::ActiveModel {
+            task_id: Set(task_id.into()),
+            workflow_id: Set(workflow_id),
+            node_id: Set(format!("node-{task_id}")),
+            gate_id: Set(None),
+            gate_cycle: Set(None),
+            manifest_revision: Set(1),
+            content_fingerprint: Set(None),
+            artifact_digest: Set(None),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert workflow run binding");
+        ensure_bound(store, task_id, &format!("conn-{task_id}")).await;
+        store
+            .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
+            .await
+            .expect("promote mapped run");
+    }
+
+    #[tokio::test]
+    async fn task5_workflow_terminal_summaries_are_role_aware() {
+        let cases = [
+            (
+                "51000000-0000-4000-8000-000000000001",
+                "author",
+                "plan",
+                r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"wrong role"}"#,
+            ),
+            (
+                "51000000-0000-4000-8000-000000000002",
+                "reviewer",
+                "plan",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"missing report"}"#,
+            ),
+            (
+                "51000000-0000-4000-8000-000000000003",
+                "reviewer",
+                "tasks",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"missing report"}"#,
+            ),
+            (
+                "51000000-0000-4000-8000-000000000004",
+                "implementer",
+                "tasks",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"wrong role","report_file":"reports/review.md"}"#,
+            ),
+            (
+                "51000000-0000-4000-8000-000000000005",
+                "fixer",
+                "final",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"wrong role"}"#,
+            ),
+        ];
+
+        for (task_id, role, phase, summary) in cases {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+            let store = RunStore::new(db.clone());
+            seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, role, phase).await;
+            store
+                .settle_terminal(
+                    task_id,
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                        .with_card_summary_json(summary),
+                )
+                .await
+                .expect("settle role-aware summary");
+            let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+                task_id.to_string(),
+            )
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                !binding.summary_validated,
+                "{phase}/{role} must reject a mismatched or incomplete summary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_plan_and_task_reviewers_reject_blank_report_paths() {
+        let cases = [
+            (
+                "51000000-0000-4000-8000-000000000007",
+                "plan",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"empty report","report_file":""}"#,
+            ),
+            (
+                "51000000-0000-4000-8000-000000000008",
+                "tasks",
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"blank report","report_file":"   "}"#,
+            ),
+        ];
+
+        for (task_id, phase, summary) in cases {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+            let store = RunStore::new(db.clone());
+            seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "reviewer", phase)
+                .await;
+            store
+                .settle_terminal(
+                    task_id,
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                        .with_card_summary_json(summary),
+                )
+                .await
+                .expect("settle reviewer with blank report path");
+            let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+                task_id.to_string(),
+            )
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                !binding.summary_validated,
+                "{phase} reviewer must reject a blank report path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_author_summary_stamps_plan_digest_on_binding() {
+        let task_id = "51000000-0000-4000-8000-000000000006";
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "author", "plan").await;
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                    .with_card_summary_json(
+                        r#"{"kind":"author","status":"done","summary":"authored","plan_digest":"sha256:author-plan","report_file":"reports/author.md"}"#,
+                    ),
+            )
+            .await
+            .unwrap();
+        let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+            task_id.to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(binding.summary_validated);
+        assert_eq!(
+            binding.artifact_digest.as_deref(),
+            Some("sha256:author-plan")
+        );
     }
 
     /// Parent-end durable sweep may settle a pure reserving claim before
