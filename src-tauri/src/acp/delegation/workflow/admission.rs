@@ -406,7 +406,8 @@ fn validate_identity_match(
     // Role from key vs binding.
     let (expected_role, expected_phase) = match parsed {
         ParsedWorkUnitKey::Design { .. } => ("reviewer", "design"),
-        ParsedWorkUnitKey::Plan { .. } => ("reviewer", "plan"),
+        ParsedWorkUnitKey::PlanAuthor { .. } => ("author", "plan"),
+        ParsedWorkUnitKey::PlanReviewer { .. } => ("reviewer", "plan"),
         ParsedWorkUnitKey::TaskImplementer { .. } => ("implementer", PHASE_TASKS),
         ParsedWorkUnitKey::TaskReviewer { .. } => ("reviewer", PHASE_TASKS),
         ParsedWorkUnitKey::FinalReviewer { .. } => ("reviewer", PHASE_FINAL),
@@ -442,8 +443,12 @@ async fn enforce_phase_readiness<C: ConnectionTrait>(
     admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
     match parsed {
+        ParsedWorkUnitKey::PlanAuthor { .. } => Err(admission_err(
+            "plan_author_admission_unavailable",
+            "Plan Author admission remains fail-closed until durable Author admission is implemented",
+        )),
         // Document reviewers: only published Design/Plan nodes (already bound).
-        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::Plan { .. } => Ok(()),
+        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::PlanReviewer { .. } => Ok(()),
 
         ParsedWorkUnitKey::TaskImplementer { task_index, .. }
         | ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
@@ -660,7 +665,7 @@ fn document_gate_content_fingerprint(
 ) -> Option<String> {
     match parsed {
         ParsedWorkUnitKey::Design { .. } => Some(header.design_fingerprint.clone()),
-        ParsedWorkUnitKey::Plan { .. } => Some(header.plan_fingerprint.clone()),
+        ParsedWorkUnitKey::PlanReviewer { .. } => Some(header.plan_fingerprint.clone()),
         _ => None,
     }
 }
@@ -845,7 +850,11 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
     TaskStoreError,
 > {
     match parsed {
-        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::Plan { .. } => {
+        ParsedWorkUnitKey::PlanAuthor { .. } => Err(admission_err(
+            "plan_author_admission_unavailable",
+            "Plan Author admission remains fail-closed until durable Author admission is implemented",
+        )),
+        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::PlanReviewer { .. } => {
             let (gate_id, cycle, digest) =
                 document_gate_stamp(conn, header, binding, parsed).await?;
             Ok((gate_id, cycle, digest, None, None))
@@ -934,7 +943,7 @@ async fn document_gate_stamp<C: ConnectionTrait>(
     };
     let kind = match parsed {
         ParsedWorkUnitKey::Design { .. } => DocumentGateKind::Design,
-        ParsedWorkUnitKey::Plan { .. } => DocumentGateKind::Plan,
+        ParsedWorkUnitKey::PlanReviewer { .. } => DocumentGateKind::Plan,
         _ => return Ok((None, None, None)),
     };
     let gate = normalized.gates.iter().find(|g| g.gate_kind == kind);
@@ -1220,8 +1229,10 @@ mod tests {
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestNodeKind,
-        ManifestNodeRole, ManifestPhase, ManifestWorkflowState, ResolutionMode, WorkUnitKeyParts,
-        PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+        ManifestNodeRole, ManifestPhase, ManifestTaskPolicy, ManifestTaskRisk, ManifestTaskRoute,
+        ManifestWorkflowState, ResolutionMode, TaskRiskLevel, WorkUnitKeyParts,
+        MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
+        WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
@@ -1285,7 +1296,13 @@ mod tests {
             profile_id: None,
         })
         .unwrap();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -1315,8 +1332,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: token.into(),
@@ -1396,6 +1415,16 @@ mod tests {
                     final_fix,
                     vec!["final-reviewer".into()],
                 ),
+                wu(
+                    "plan-author",
+                    PHASE_PLAN,
+                    ManifestNodeRole::Author,
+                    "codex",
+                    None,
+                    None,
+                    author_key,
+                    vec![],
+                ),
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -1405,17 +1434,33 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
     }
 

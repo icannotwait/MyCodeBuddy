@@ -1764,6 +1764,8 @@ fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
     ManifestDocument {
         schema_version: m.schema_version,
         workflow_kind: m.workflow_kind.clone(),
+        plan_target_rel_path: m.plan_target_rel_path.clone(),
+        risk_policy_version: m.risk_policy_version.clone(),
         workflow_id: m.workflow_id.clone(),
         expected_manifest_revision: m.expected_manifest_revision,
         publication_token: m.publication_token.clone(),
@@ -1795,11 +1797,13 @@ fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
             .iter()
             .map(|g| super::types::ManifestGate {
                 id: g.id.clone(),
+                reviewer_cohort_node_ids: g.reviewer_cohort_node_ids.clone(),
                 required_reviewer_node_ids: g.required_reviewer_node_ids.clone(),
                 resolution_mode: g.resolution_mode,
                 gate_kind: Some(g.gate_kind),
             })
             .collect(),
+        task_policies: m.task_policies.clone(),
     }
 }
 
@@ -1843,6 +1847,7 @@ fn manifest_state_str(s: ManifestWorkflowState) -> &'static str {
 
 fn role_str(r: ManifestNodeRole) -> &'static str {
     match r {
+        ManifestNodeRole::Author => "author",
         ManifestNodeRole::Reviewer => "reviewer",
         ManifestNodeRole::Implementer => "implementer",
         ManifestNodeRole::Fixer => "fixer",
@@ -1942,8 +1947,9 @@ mod tests {
     use crate::acp::delegation::workflow::events::WORKFLOW_GRAPH_CHANGED_EVENT as CHANGED;
     use crate::acp::delegation::workflow::key::build_work_unit_key;
     use crate::acp::delegation::workflow::types::{
-        DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase, WorkUnitKeyParts,
-        PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
+        DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase, ManifestTaskPolicy,
+        ManifestTaskRisk, ManifestTaskRoute, TaskRiskLevel, WorkUnitKeyParts,
+        MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
     };
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -1970,7 +1976,13 @@ mod tests {
             profile_id: Some("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"),
         })
         .unwrap();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -2000,8 +2012,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: token.into(),
@@ -2081,6 +2095,16 @@ mod tests {
                     final_fix,
                     vec!["final-reviewer".into()],
                 ),
+                wu(
+                    "plan-author",
+                    PHASE_PLAN,
+                    ManifestNodeRole::Author,
+                    "codex",
+                    None,
+                    None,
+                    author_key,
+                    vec![],
+                ),
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -2090,17 +2114,33 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
     }
 
@@ -2115,12 +2155,14 @@ mod tests {
         doc.gates = vec![
             ManifestGate {
                 id: "design".into(),
+                reviewer_cohort_node_ids: vec![],
                 required_reviewer_node_ids: vec![],
                 resolution_mode: ResolutionMode::SelfReview,
                 gate_kind: Some(DocumentGateKind::Design),
             },
             ManifestGate {
                 id: "plan".into(),
+                reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                 required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                 resolution_mode: ResolutionMode::ParentAdjudication,
                 gate_kind: Some(DocumentGateKind::Plan),
@@ -2962,18 +3004,17 @@ mod tests {
         )
         .await
         .unwrap_err();
-        // brainstorm_to_delivery now rejects incomplete task pairs at validation
-        // (exactly one implementer+reviewer per index). FrozenPartnerDrop remains
-        // defense-in-depth in apply_binding_diff when a pair shape is otherwise valid.
+        // V2 route validation rejects an omitted cohort node before the existing
+        // frozen-pair defense-in-depth path needs to inspect the binding diff.
         assert!(
-            matches!(
-                err,
-                WorkflowStoreError::FrozenPartnerDrop { .. }
-                    | WorkflowStoreError::Validation(
-                        super::super::types::WorkflowError::InvalidTaskIndex(_)
-                    )
-            ),
-            "expected freeze or pair-validation reject, got {err:?}"
+            matches!(err, WorkflowStoreError::FrozenPartnerDrop { .. })
+                || matches!(
+                    err,
+                    WorkflowStoreError::Validation(
+                        super::super::types::WorkflowError::InvalidField(ref message)
+                    ) if message.contains("route")
+                ),
+            "expected freeze or route-validation reject, got {err:?}"
         );
     }
 

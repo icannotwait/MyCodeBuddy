@@ -1438,7 +1438,8 @@ async fn project_observed_only(
 fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
     match parsed {
         ParsedWorkUnitKey::Design { .. } => ("design".into(), "reviewer".into(), None),
-        ParsedWorkUnitKey::Plan { .. } => ("plan".into(), "reviewer".into(), None),
+        ParsedWorkUnitKey::PlanAuthor { .. } => ("plan".into(), "author".into(), None),
+        ParsedWorkUnitKey::PlanReviewer { .. } => ("plan".into(), "reviewer".into(), None),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             ("tasks".into(), "implementer".into(), Some(*task_index))
         }
@@ -1455,7 +1456,8 @@ fn synthetic_node_id(parsed: &ParsedWorkUnitKey, work_unit_key: &str) -> String 
     let key_tag = short_key_tag(work_unit_key);
     match parsed {
         ParsedWorkUnitKey::Design { .. } => format!("observed-design-{key_tag}"),
-        ParsedWorkUnitKey::Plan { .. } => format!("observed-plan-{key_tag}"),
+        ParsedWorkUnitKey::PlanAuthor { .. } => format!("observed-plan-author-{key_tag}"),
+        ParsedWorkUnitKey::PlanReviewer { .. } => format!("observed-plan-reviewer-{key_tag}"),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             format!("observed-task-{task_index}-impl")
         }
@@ -1551,6 +1553,7 @@ fn node_kind_str(k: ManifestNodeKind) -> &'static str {
 
 fn role_str(r: ManifestNodeRole) -> &'static str {
     match r {
+        ManifestNodeRole::Author => "author",
         ManifestNodeRole::Reviewer => "reviewer",
         ManifestNodeRole::Implementer => "implementer",
         ManifestNodeRole::Fixer => "fixer",
@@ -1670,7 +1673,8 @@ mod tests {
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase,
-        WorkUnitKeyParts, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
+        ManifestTaskPolicy, ManifestTaskRisk, ManifestTaskRoute, TaskRiskLevel, WorkUnitKeyParts,
+        MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
     };
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -1729,7 +1733,13 @@ mod tests {
             profile_id: Some("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"),
         })
         .unwrap();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -1759,8 +1769,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: token.into(),
@@ -1840,6 +1852,16 @@ mod tests {
                     final_fix,
                     vec!["final-reviewer".into()],
                 ),
+                wu(
+                    "plan-author",
+                    PHASE_PLAN,
+                    ManifestNodeRole::Author,
+                    "codex",
+                    None,
+                    None,
+                    author_key,
+                    vec![],
+                ),
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -1849,17 +1871,33 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
     }
 
@@ -2847,7 +2885,7 @@ mod tests {
         srow.insert(&db.conn).await.unwrap();
 
         // Reviewer run_binding for cycle 1 / rev 1 (old fingerprint).
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -2963,7 +3001,7 @@ mod tests {
         };
         srow.insert(&db.conn).await.unwrap();
 
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -3050,7 +3088,7 @@ mod tests {
 
         // Old plan run stamped with old fingerprint, cycle 1.
         let now = Utc::now();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
