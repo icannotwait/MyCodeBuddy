@@ -134,10 +134,17 @@ pub fn map_xai_session_notification(
 }
 
 /// Pure context-window size resolution (SessionState wrapper lives in connection).
+///
+/// Preference: user-configured `[model.<id>].context_window` → existing live
+/// size → model-family inference → 256K default.
 pub fn resolve_context_window_size_from_parts(
     existing_usage_size: Option<u64>,
     model_id: Option<&str>,
+    configured_size: Option<u64>,
 ) -> u64 {
+    if let Some(size) = configured_size.filter(|s| *s > 0) {
+        return size;
+    }
     if let Some(size) = existing_usage_size.filter(|s| *s > 0) {
         return size;
     }
@@ -319,9 +326,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefers_existing_size() {
+    fn resolve_prefers_configured_over_existing_and_model() {
         assert_eq!(
-            resolve_context_window_size_from_parts(Some(500_000), Some("grok-4.5")),
+            resolve_context_window_size_from_parts(
+                Some(500_000),
+                Some("grok-4.5"),
+                Some(131_072)
+            ),
+            131_072
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_existing_size_when_no_config() {
+        assert_eq!(
+            resolve_context_window_size_from_parts(Some(500_000), Some("grok-4.5"), None),
             500_000
         );
     }
@@ -329,25 +348,28 @@ mod tests {
     #[test]
     fn resolve_uses_model_family_when_no_usage_size() {
         assert_eq!(
-            resolve_context_window_size_from_parts(None, Some("grok-4.5")),
+            resolve_context_window_size_from_parts(None, Some("grok-4.5"), None),
             500_000
         );
         assert_eq!(
-            resolve_context_window_size_from_parts(None, Some("grok-4.3")),
+            resolve_context_window_size_from_parts(None, Some("grok-4.3"), None),
             1_000_000
         );
         assert_eq!(
-            resolve_context_window_size_from_parts(None, Some("grok-code-fast-1")),
+            resolve_context_window_size_from_parts(None, Some("grok-code-fast-1"), None),
             256_000
         );
         assert_eq!(
-            resolve_context_window_size_from_parts(None, Some("grok-4-fast")),
+            resolve_context_window_size_from_parts(None, Some("grok-4-fast"), None),
             2_000_000
         );
     }
 
     #[test]
     fn resolve_defaults_unknown_grok() {
-        assert_eq!(resolve_context_window_size_from_parts(None, None), 256_000);
+        assert_eq!(
+            resolve_context_window_size_from_parts(None, None, None),
+            256_000
+        );
     }
 }
