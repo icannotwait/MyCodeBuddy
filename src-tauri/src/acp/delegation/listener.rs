@@ -1182,20 +1182,19 @@ impl DelegationListener {
                             }
                         }
                         let cause =
-                            crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
-                                .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                            crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx);
                         // Coordinator may still own the registration; deregister
                         // is idempotent via stamp match / NotFound.
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         drop(_cancel_waiter_on_drop);
-                        Ok(DelegationStatusBatch::joined(
-                            canonical_task_ids
-                                .iter()
-                                .map(|id| wait_cancel_report(id, cause))
-                                .collect(),
-                            DelegationWakeReason::Unavailable,
-                            Vec::new(),
-                        ))
+                        Ok(self
+                            .continuation_release_batch(
+                                &entry.parent_connection_id,
+                                parent_conversation_id,
+                                &canonical_task_ids,
+                                cause,
+                            )
+                            .await)
                     }
                     Err(error) => {
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
@@ -1207,6 +1206,36 @@ impl DelegationListener {
                 }
             }
         }
+    }
+
+    async fn continuation_release_batch(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+        canonical_task_ids: &[String],
+        cause: Option<crate::acp::tool_watchdog::CancelCause>,
+    ) -> DelegationStatusBatch {
+        if let Some(cause) = cause {
+            return DelegationStatusBatch::joined(
+                canonical_task_ids
+                    .iter()
+                    .map(|id| wait_cancel_report(id, cause))
+                    .collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            );
+        }
+
+        let tasks = self
+            .broker
+            .get_tasks_status(
+                parent_connection_id,
+                Some(parent_conversation_id),
+                canonical_task_ids,
+                StatusWait::Snapshot,
+            )
+            .await;
+        DelegationStatusBatch::joined(tasks, DelegationWakeReason::Unavailable, Vec::new())
     }
 
     /// Stable non-secret rejection for unauthorized or capability-denied
@@ -3385,6 +3414,84 @@ mod tests {
                 }),
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn continuation_causeless_release_returns_running_snapshot() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let listener = make_listener_with_wait_cancel(
+            broker,
+            tokens,
+            Some(1),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+        );
+
+        let batch = listener
+            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id), None)
+            .await;
+
+        assert_eq!(batch.tasks[0].status, TaskStatus::Running);
+        assert_eq!(batch.tasks[0].error_code, None);
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn continuation_causeless_release_returns_completed_snapshot() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        complete_running_task(&broker, &task_id).await;
+        let listener = make_listener_with_wait_cancel(
+            broker,
+            tokens,
+            Some(1),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+        );
+
+        let batch = listener
+            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id), None)
+            .await;
+
+        assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+        assert_ne!(
+            batch.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_explicit_release_causes_keep_wire_error_codes() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let listener = make_listener_with_wait_cancel(
+            broker,
+            tokens,
+            Some(1),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+        );
+
+        let timeout = listener
+            .continuation_release_batch(
+                "parent-conn",
+                1,
+                std::slice::from_ref(&task_id),
+                Some(crate::acp::tool_watchdog::CancelCause::AutoTimeout),
+            )
+            .await;
+        assert_eq!(
+            timeout.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+
+        let stopped = listener
+            .continuation_release_batch(
+                "parent-conn",
+                1,
+                std::slice::from_ref(&task_id),
+                Some(crate::acp::tool_watchdog::CancelCause::UserStop),
+            )
+            .await;
+        assert_eq!(
+            stopped.tasks[0].error_code.as_deref(),
+            Some("user_cancelled")
+        );
     }
 
     #[tokio::test]
