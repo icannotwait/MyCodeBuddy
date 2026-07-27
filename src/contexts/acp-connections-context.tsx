@@ -84,9 +84,12 @@ import {
 } from "@/lib/app-error"
 import {
   completeLiveTranscriptTurn,
+  enterOwnerPreserve,
   getConversationIdByExternalIdFromStore,
   getUserStopFenceToken,
   isStaleUserStopEnvelope,
+  isUserStopNoCoordinatorCompletion,
+  markUserStopNoCoordinatorCompletion,
   noteUserStopTurnOwnership,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -3051,22 +3054,60 @@ export function acceptUserStopTurnComplete(params: {
   }
 
   const runtimeActions = useConversationRuntimeStore.getState().actions
-  runtimeActions.recordTurnOutcome({
+  const outcomeStatus = runtimeActions.recordTurnOutcome({
     conversationId,
     connectionId: params.connectionId,
     completionSeq: params.completionSeq,
     outcome,
   })
 
-  // Coordinator start gates (store re-checks persisted id + non-empty provider).
+  // First unbound/missing-provider acceptance is terminal for coordinator
+  // start. Track completion identity so redelivery after migrate/bind never
+  // starts cancel reconcile (outcome footer remains idempotent separately).
+  if (
+    isUserStopNoCoordinatorCompletion(params.connectionId, params.completionSeq)
+  ) {
+    enterOwnerPreserve(conversationId)
+    return
+  }
+
+  // Duplicate completion: decision already made on first accept — do not
+  // re-run coordinator transition logic.
+  if (outcomeStatus === "duplicate") {
+    return
+  }
+
+  // Coordinator start gates: non-empty provider id + positive persisted
+  // conversation id. Missing provider id or unbound detail id (≤0) still
+  // record the outcome above, enter durable owner_preserve, and skip the
+  // coordinator (design Round 4e).
   if (params.stopReason === "cancelled" && providerTurnId) {
-    runtimeActions.startCancelReconcile({
-      conversationId,
-      connectionId: params.connectionId,
-      completionSeq: params.completionSeq,
-      providerTurnId,
-      activeTurnToken: fenceToken,
-    })
+    const sessionAfter = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(conversationId)
+    const persistedId = sessionAfter?.dbConversationId ?? conversationId
+    if (persistedId > 0) {
+      runtimeActions.startCancelReconcile({
+        conversationId,
+        connectionId: params.connectionId,
+        completionSeq: params.completionSeq,
+        providerTurnId,
+        activeTurnToken: fenceToken,
+      })
+    } else {
+      markUserStopNoCoordinatorCompletion(
+        params.connectionId,
+        params.completionSeq
+      )
+      enterOwnerPreserve(conversationId)
+    }
+  } else if (params.stopReason === "cancelled") {
+    // user_stop accepted without provider_turn_id.
+    markUserStopNoCoordinatorCompletion(
+      params.connectionId,
+      params.completionSeq
+    )
+    enterOwnerPreserve(conversationId)
   }
 }
 

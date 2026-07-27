@@ -39,6 +39,8 @@ function seedSession(detail: DbConversationDetail | null) {
           pendingCleanup: false,
           delegateSyncError: null,
           pendingCancel: null,
+          softFence: false,
+          ownerPreserve: false,
         },
       ],
     ]),

@@ -22,6 +22,7 @@ import {
   noteUserStopTurnOwnership,
   resetConversationRuntimeStore,
   resolveRuntimeConversationIdForOwnership,
+  SOFT_FENCE_AGE_OUT_MS,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
@@ -113,6 +114,8 @@ function emptySession(
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
+    softFence: false,
+    ownerPreserve: false,
     ...overrides,
   }
 }
@@ -474,7 +477,7 @@ describe("FE11 dual-path completion orderings", () => {
     expect(mockGet).not.toHaveBeenCalled()
   })
 
-  it("user_stop without provider_turn_id records outcome but does not start coordinator", () => {
+  it("user_stop without provider_turn_id records outcome, enters ownerPreserve, no coordinator", () => {
     seed({
       localTurns: [userTurn("u1")],
       liveMessage: liveMessage("lm1", "live"),
@@ -489,7 +492,236 @@ describe("FE11 dual-path completion orderings", () => {
       source: "user_stop",
     })
     expect(session().pendingCancel).toBeNull()
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(true)
     expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("unbound detail id (<=0) records outcome, no coordinator, enters ownerPreserve", () => {
+    const RUNTIME = -9100
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          RUNTIME,
+          emptySession(RUNTIME, {
+            dbConversationId: null,
+            externalId: SESSION,
+            localTurns: [userTurn("u1")],
+            liveMessage: liveMessage("lm1", "draft live"),
+            syncState: "awaiting_persist",
+            activeTurnToken: "tok-unbound",
+            lastTurnOwned: true,
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([[SESSION, RUNTIME]]),
+    })
+    noteUserStopTurnOwnership(RUNTIME)
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: RUNTIME,
+    })
+    const s = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(RUNTIME)!
+    expect(lastTurn(s.localTurns)?.outcome).toMatchObject({
+      status: "interrupted",
+      source: "user_stop",
+      provider_turn_id: PROVIDER,
+    })
+    expect(s.pendingCancel).toBeNull()
+    expect(s.softFence).toBe(false)
+    expect(s.ownerPreserve).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("unbound accept then migrate to positive id: redelivered envelope never starts coordinator", () => {
+    // Important fix: first unbound acceptance is terminal for coordinator start.
+    const RUNTIME = -9101
+    const TO = 9101
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          RUNTIME,
+          emptySession(RUNTIME, {
+            dbConversationId: null,
+            externalId: SESSION,
+            localTurns: [userTurn("u1")],
+            liveMessage: liveMessage("lm1", "draft live"),
+            syncState: "awaiting_persist",
+            activeTurnToken: "tok-unbound-mig",
+            lastTurnOwned: true,
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([[SESSION, RUNTIME]]),
+    })
+    noteUserStopTurnOwnership(RUNTIME)
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: RUNTIME,
+    })
+    const unbound = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(RUNTIME)!
+    expect(unbound.pendingCancel).toBeNull()
+    expect(unbound.ownerPreserve).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+
+    // Runtime-key migrate to positive id (DB bind path).
+    actions().migrateConversation(RUNTIME, TO)
+    // Positive db binding on destination.
+    actions().setDbConversationId(TO, TO)
+
+    const afterMigrate = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(afterMigrate.ownerPreserve).toBe(true)
+    expect(afterMigrate.pendingCancel).toBeNull()
+
+    // Redeliver same completion identity after positive bind.
+    mockGet.mockResolvedValue(detailWithFence())
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: TO,
+    })
+    const redelivered = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(redelivered.pendingCancel).toBeNull()
+    expect(redelivered.ownerPreserve).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+    // Footer not duplicated.
+    expect(
+      redelivered.localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
+  })
+
+  it("late envelope after soft-fence age-out still current may start coordinator", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm1", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-age",
+      lastTurnOwned: true,
+      dbConversationId: CID,
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+    noteUserStopTurnOwnership(CID)
+    expect(session().softFence).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(SOFT_FENCE_AGE_OUT_MS)
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(true)
+
+    envelopeUserStop()
+    expect(session().pendingCancel).toMatchObject({
+      connectionId: CONN,
+      completionSeq: SEQ,
+      providerTurnId: PROVIDER,
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("late envelope after age-out + next prompt is stale and no-ops", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm1", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-age-stale",
+      lastTurnOwned: true,
+      dbConversationId: CID,
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+    noteUserStopTurnOwnership(CID)
+    await vi.advanceTimersByTimeAsync(SOFT_FENCE_AGE_OUT_MS)
+    expect(session().ownerPreserve).toBe(true)
+
+    actions().appendOptimisticTurn(
+      CID,
+      userTurn("u2", "next prompt B"),
+      "tok-B"
+    )
+    envelopeUserStop()
+    expect(session().pendingCancel).toBeNull()
+    expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
+    expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("runtime-key migrate keeps late envelope current (no gen bump)", () => {
+    const FROM = CID
+    const TO = 8801
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm1", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-mig",
+      lastTurnOwned: true,
+      externalId: SESSION,
+      dbConversationId: FROM,
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+    noteUserStopTurnOwnership(FROM)
+    actions().migrateConversation(FROM, TO)
+
+    // Envelope resolves via external id → TO; ownership/gen migrated without bump.
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: FROM,
+    })
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(toSession.pendingCancel).toMatchObject({
+      conversationId: TO,
+      completionSeq: SEQ,
+      providerTurnId: PROVIDER,
+    })
+    expect(
+      toSession.localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
+    expect(lastTurn(toSession.localTurns)?.outcome).toMatchObject({
+      source: "user_stop",
+    })
+
+    // Duplicate envelope does not second footer / second coordinator key.
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: TO,
+    })
+    expect(
+      toSession.localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(TO)
+        ?.pendingCancel?.completionSeq
+    ).toBe(SEQ)
   })
 })
 

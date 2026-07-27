@@ -40,6 +40,8 @@ function seedSession(sessionStats: SessionStats) {
           pendingCleanup: false,
           delegateSyncError: null,
           pendingCancel: null,
+          softFence: false,
+          ownerPreserve: false,
         },
       ],
     ]),

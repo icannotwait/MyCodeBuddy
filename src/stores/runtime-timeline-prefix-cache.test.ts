@@ -74,6 +74,8 @@ function seedSession(
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
+    softFence: false,
+    ownerPreserve: false,
     ...overrides,
   }
   const prev = useConversationRuntimeStore.getState().byConversationId

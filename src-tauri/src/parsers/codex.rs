@@ -1549,7 +1549,7 @@ impl CodexParser {
                                 // Readable append-order fence for user-stop
                                 // reconciliation. Text-only `<turn_aborted>`
                                 // response_item envelopes are ignored elsewhere;
-                                // only this event_msg arm can attach a matchable
+                                // only this event_msg arm can attach a
                                 // TurnOutcome. Pending reasoning was already
                                 // flushed by the pre-match guard above.
                                 //
@@ -1558,6 +1558,14 @@ impl CodexParser {
                                 // wall-clock). Leave `source` absent — live
                                 // TurnComplete + RECONCILE_CANCELLED_TURN own
                                 // authoritative `user_stop` origin.
+                                //
+                                // `reason === "interrupted"`:
+                                // - non-empty turn_id → matchable fence
+                                //   (`provider_turn_id` set; coordinator may apply)
+                                // - null/empty turn_id → display-only outcome
+                                //   (footer on cold open; no matchable fence)
+                                // Other reasons (`replaced` / `review_ended` /
+                                // unknown): no interrupted outcome.
                                 let reason =
                                     payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
                                 if reason == "interrupted" {
@@ -1566,37 +1574,32 @@ impl CodexParser {
                                         .and_then(|v| v.as_str())
                                         .map(str::trim)
                                         .filter(|s| !s.is_empty());
-                                    if let Some(tid) = turn_id {
-                                        let abort_ts = parse_codex_timestamp(&value);
-                                        let duration_ms = payload
-                                            .get("duration_ms")
-                                            .and_then(|v| v.as_u64())
-                                            .or_else(|| {
-                                                value.get("duration_ms").and_then(|v| v.as_u64())
-                                            });
-                                        let outcome = TurnOutcome {
-                                            status: TurnOutcomeStatus::Interrupted,
-                                            stop_reason: TurnOutcomeStopReason::Cancelled,
-                                            source: None,
-                                            provider_turn_id: Some(tid.to_string()),
-                                            completed_at: abort_ts,
-                                            duration_ms,
-                                        };
-                                        // Synthetic outcome-only message still
-                                        // needs a MessageTurn timestamp; fall
-                                        // back only for that local bookkeeping,
-                                        // never for TurnOutcome.completed_at.
-                                        attach_interrupted_turn_outcome(
-                                            &mut messages,
-                                            &mut turn_outcomes,
-                                            outcome,
-                                            abort_ts.unwrap_or(timestamp),
-                                        );
-                                    }
+                                    let abort_ts = parse_codex_timestamp(&value);
+                                    let duration_ms = payload
+                                        .get("duration_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .or_else(|| {
+                                            value.get("duration_ms").and_then(|v| v.as_u64())
+                                        });
+                                    let outcome = TurnOutcome {
+                                        status: TurnOutcomeStatus::Interrupted,
+                                        stop_reason: TurnOutcomeStopReason::Cancelled,
+                                        source: None,
+                                        provider_turn_id: turn_id.map(str::to_string),
+                                        completed_at: abort_ts,
+                                        duration_ms,
+                                    };
+                                    // Synthetic outcome-only message still
+                                    // needs a MessageTurn timestamp; fall
+                                    // back only for that local bookkeeping,
+                                    // never for TurnOutcome.completed_at.
+                                    attach_interrupted_turn_outcome(
+                                        &mut messages,
+                                        &mut turn_outcomes,
+                                        outcome,
+                                        abort_ts.unwrap_or(timestamp),
+                                    );
                                 }
-                                // reason replaced / review_ended / unknown, or
-                                // null/empty turn_id: no fence (content already
-                                // preserved; reasoning already flushed).
                             }
                             "token_count" => {
                                 if let Some(info) = payload.get("info") {
@@ -6616,8 +6619,11 @@ earlier terminal context records.\n\
         }
     }
 
+    /// null/empty `turn_id` + interrupted still attaches a **display-only**
+    /// outcome (footer on cold open) but never a matchable fence
+    /// (`provider_turn_id` must be absent so the coordinator cannot apply).
     #[test]
-    fn turn_aborted_null_or_empty_turn_id_produces_no_matchable_fence() {
+    fn turn_aborted_null_or_empty_turn_id_is_display_only_outcome() {
         for turn_id in [
             serde_json::Value::Null,
             serde_json::Value::String(String::new()),
@@ -6634,11 +6640,148 @@ earlier terminal context records.\n\
                 .expect("parse ok");
             let _ = fs::remove_file(&path);
 
+            // Pre-abort content still preserved.
             assert!(
-                interrupted_outcomes(&detail).is_empty(),
-                "null/empty turn_id must not create a matchable fence"
+                assistant_text_blocks(&detail)
+                    .iter()
+                    .any(|t| t.contains("Working on the patch next.")),
+                "pre-abort content must survive null/empty turn_id: {:?}",
+                assistant_text_blocks(&detail)
+            );
+
+            let outcomes = interrupted_outcomes(&detail);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "null/empty turn_id must still attach a display-only interrupted outcome"
+            );
+            let outcome = outcomes[0];
+            assert!(matches!(outcome.status, TurnOutcomeStatus::Interrupted));
+            assert!(matches!(
+                outcome.stop_reason,
+                TurnOutcomeStopReason::Cancelled
+            ));
+            assert_eq!(
+                outcome.provider_turn_id, None,
+                "display-only outcome must omit provider_turn_id (not a matchable fence)"
+            );
+            assert_eq!(
+                outcome.source, None,
+                "cold parse must not claim user_stop; live reconcile owns origin"
             );
         }
+    }
+
+    /// Marker text used only in the post-abort residual fixture (Phase B).
+    const POST_ABORT_RESIDUAL_MARKER: &str = "POST_ABORT_RESIDUAL_MARKER_v1";
+
+    /// Same-file two-phase residual fixture (plan contract):
+    /// 1. Write + parse Phase A (pre-abort content + matching `turn_aborted` only).
+    /// 2. APPEND one in-scope post-abort `agent_message` to that same temp file.
+    /// 3. Re-parse the same path for Phase B.
+    ///
+    /// Documents the v1 first-match residual under append-order: Phase A is the
+    /// snapshot a coordinator would apply (marker absent); design does **not**
+    /// auto re-apply after the first accepted reconcile, so residual content
+    /// that lands after the abort line is only visible on a later full re-read
+    /// (Phase B / Manual Reload / cold open).
+    #[test]
+    fn turn_aborted_two_phase_residual_same_file_append_and_reread() {
+        use std::io::Write;
+
+        // ── Phase A: first readable abort fence snapshot ──────────────────
+        let lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-residual-fence",
+            "reason": "interrupted"
+        }));
+        let path = write_temp_rollout("turn-aborted-two-phase", &lines);
+
+        let detail_a = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("phase A parse ok");
+
+        let outcomes_a = interrupted_outcomes(&detail_a);
+        assert_eq!(
+            outcomes_a.len(),
+            1,
+            "Phase A must expose a matchable fence"
+        );
+        assert_eq!(
+            outcomes_a[0].provider_turn_id.as_deref(),
+            Some("turn-residual-fence"),
+            "Phase A fence key must be non-empty provider turn id"
+        );
+
+        let texts_a = assistant_text_blocks(&detail_a);
+        assert!(
+            texts_a.iter().any(|t| t.contains("Found the project root.")),
+            "Phase A pre-abort content must survive: {texts_a:?}"
+        );
+        assert!(
+            texts_a
+                .iter()
+                .any(|t| t.contains("Working on the patch next.")),
+            "Phase A second agent message must survive: {texts_a:?}"
+        );
+        assert!(
+            !texts_a
+                .iter()
+                .any(|t| t.contains(POST_ABORT_RESIDUAL_MARKER)),
+            "Phase A snapshot (first-match apply surface) must not contain post-abort residual content"
+        );
+
+        // ── Append post-abort residual to THE SAME rollout file ───────────
+        let post_abort_line = rollout_line(
+            "2026-07-17T12:00:08Z",
+            "event_msg",
+            serde_json::json!({
+                "type": "agent_message",
+                "message": POST_ABORT_RESIDUAL_MARKER
+            }),
+        );
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open same rollout for append");
+            writeln!(file, "{post_abort_line}").expect("append post-abort agent_message");
+        }
+
+        // ── Phase B: re-parse the same path after append ──────────────────
+        let detail_b = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("phase B re-parse same path ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes_b = interrupted_outcomes(&detail_b);
+        assert_eq!(
+            outcomes_b.len(),
+            1,
+            "Phase B must still expose a matchable fence"
+        );
+        assert_eq!(
+            outcomes_b[0].provider_turn_id.as_deref(),
+            Some("turn-residual-fence")
+        );
+
+        let texts_b = assistant_text_blocks(&detail_b);
+        assert!(
+            texts_b
+                .iter()
+                .any(|t| t.contains("Working on the patch next.")),
+            "Phase B pre-abort content must survive: {texts_b:?}"
+        );
+        // Contract note: v1 coordinator first-match apply uses the Phase A
+        // snapshot and does not auto re-apply after the first accepted
+        // reconcile, so a live session that applied Phase A can miss this
+        // residual until Manual Reload / cold open (this Phase B re-read).
+        assert!(
+            texts_b
+                .iter()
+                .any(|t| t.contains(POST_ABORT_RESIDUAL_MARKER)),
+            "Phase B full re-read of same file must include post-abort residual content: {texts_b:?}"
+        );
     }
 
     #[test]

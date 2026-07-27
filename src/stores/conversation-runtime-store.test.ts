@@ -132,6 +132,8 @@ function seedRuntimeSession(input: SeedInput = {}) {
           pendingCleanup: false,
           delegateSyncError: null,
           pendingCancel: null,
+          softFence: false,
+          ownerPreserve: false,
         },
       ],
     ]),
@@ -469,6 +471,8 @@ describe("selectHistoricalTimelineTurns edge-case semantics", () => {
         pendingCleanup: false,
         delegateSyncError: null,
         pendingCancel: null,
+        softFence: false,
+        ownerPreserve: false,
       })
       return { byConversationId: next }
     })
