@@ -2797,11 +2797,11 @@ mod tests {
         sessions: true,
         workflow_v1: false,
     };
-    const ALL_FEATURES: CompanionFeatures = CompanionFeatures {
+    const GROK_FEATURES: CompanionFeatures = CompanionFeatures {
         delegation: true,
         coordination_v1: true,
         feedback: true,
-        ask: true,
+        ask: false,
         sessions: true,
         workflow_v1: true,
     };
@@ -2821,11 +2821,6 @@ mod tests {
         sessions: false,
         workflow_v1: true,
     };
-
-    // Grok stdio hosts serialize the full tools/list in one line; stay at or
-    // under this budget (including the trailing newline). Raised from 7_680
-    // when workflow_v1 added four Root tools (compact schemas only).
-    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 10_240;
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
         let resp = unwrap_respond(action);
@@ -3273,10 +3268,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_feature_tools_list_stays_within_grok_stdio_budget() {
+    async fn grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget() {
         let response = unwrap_respond(
             dispatch_with_features(
-                ALL_FEATURES,
+                GROK_FEATURES,
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
             )
             .await,
@@ -3296,7 +3291,6 @@ mod tests {
                 "get_delegation_status",
                 "cancel_delegation",
                 "check_user_feedback",
-                "ask_user_question",
                 "get_session_info",
                 "reply_to_delegation",
                 "get_workflow_capabilities",
@@ -3308,11 +3302,13 @@ mod tests {
         let mut line = serde_json::to_vec(&response).unwrap();
         line.push(b'\n');
 
+        // Compatibility contract: Grok splits a JSONL line at 8,192 bytes and
+        // does not reassemble it. Keep 512 bytes of headroom; do not raise this
+        // literal to make a growing catalog pass.
         assert!(
-            line.len() <= GROK_STDIO_SAFE_TOOLS_LIST_BYTES,
-            "all-feature tools/list line is {} bytes; limit is {} bytes",
+            line.len() <= 7_680,
+            "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
             line.len(),
-            GROK_STDIO_SAFE_TOOLS_LIST_BYTES
         );
     }
 

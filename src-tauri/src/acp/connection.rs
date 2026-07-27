@@ -3258,19 +3258,18 @@ pub struct DelegationInjection {
     pub leases: Arc<crate::acp::delegation::lease::CompanionLeaseRegistry>,
     pub socket_path: PathBuf,
     /// Hot-swappable "is live-feedback enabled?" flag. Read at injection time
-    /// so `codeg-mcp` is injected when feedback (or ask/sessions) is on even
-    /// when the plan omits Codeg delegation. Shares the same `tokens` registry
-    /// and UDS socket as the ready lease.
+    /// so `codeg-mcp` can be injected even when the plan omits Codeg delegation.
+    /// Shares the same `tokens` registry and UDS socket as the ready lease.
     pub feedback: crate::acp::feedback::FeedbackRuntimeConfig,
     /// Hot-swappable "is ask-user-question enabled?" flag. Read at injection
-    /// time alongside feedback/sessions so `codeg-mcp` is injected when ANY
-    /// of the three is on, and the companion's `--features` lists `ask` to expose
-    /// the `ask_user_question` tool.
+    /// time. Non-Grok agents list companion feature `ask`; Grok omits that
+    /// duplicate and uses this flag for its native `_x.ai/ask_user_question`
+    /// bridge instead.
     pub ask: crate::acp::question::QuestionRuntimeConfig,
     /// Hot-swappable "is get-session-info enabled?" flag. Read at injection time
-    /// alongside the other three so `codeg-mcp` is injected when ANY of the four
-    /// is on, and the companion's `--features` lists `sessions` to expose the
-    /// `get_session_info` tool. No teardown handle (the lookup is stateless).
+    /// so `codeg-mcp` can be injected on its own; the companion's `--features`
+    /// lists `sessions` to expose `get_session_info`. No teardown handle (the
+    /// lookup is stateless).
     pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
     /// Question registry handle for the teardown cascade. The `run_connection`
     /// cleanup guard calls `cancel_questions_by_parent` through this so a pending
@@ -3413,19 +3412,17 @@ fn is_executable_file(path: &Path) -> bool {
     true
 }
 
-/// Append the built-in `codeg-mcp` MCP entry if delegation is enabled
-/// AND the companion binary is present on disk. Returns the per-launch token
-/// that was registered, or `None` when injection was skipped (disabled by
-/// config, or binary missing).
+/// Append the built-in `codeg-mcp` MCP entry when this agent has at least one
+/// applicable companion feature and the binary is present on disk. Returns the
+/// registered per-launch token, or `None` when injection was skipped.
 ///
 /// When the binary is missing we log a single-line warning and skip
 /// injection rather than register the token + emit a phantom McpServerStdio
 /// pointing at a non-existent path. Phantom injection would have made every
 /// new ACP session ship a guaranteed-to-fail MCP server entry: stricter
-/// agents (Claude Code) refuse the whole session; lax agents lose the
-/// delegate tool silently. Skipping leaves the agent fully functional minus
-/// `delegate_to_agent`, which is the right degradation when codeg-mcp didn't
-/// make it into the install.
+/// agents (Claude Code) refuse the whole session; lax agents lose companion
+/// tools silently. Skipping leaves native agent features, including Grok's
+/// native question bridge, unaffected.
 /// The `--features` value for a companion launch given the feature flags,
 /// or `None` when none is enabled (the companion isn't injected at all).
 /// Pulled out as a pure function so the inject/skip decision is unit-testable
@@ -3465,6 +3462,29 @@ fn companion_features_arg(
         features.push("workflow_v1");
     }
     Some(features.join(","))
+}
+
+/// Apply agent-specific companion policy before building `--features`.
+/// Grok already exposes a native blocking question tool through
+/// `_x.ai/ask_user_question`, so advertising the companion duplicate wastes
+/// catalog bytes and gives the model two routes for the same interaction.
+fn companion_features_arg_for_agent(
+    agent_type: AgentType,
+    delegation_enabled: bool,
+    coordination_v1: bool,
+    feedback_enabled: bool,
+    ask_enabled: bool,
+    sessions_enabled: bool,
+    workflow_v1: bool,
+) -> Option<String> {
+    companion_features_arg(
+        delegation_enabled,
+        coordination_v1,
+        feedback_enabled,
+        ask_enabled && agent_type != AgentType::Grok,
+        sessions_enabled,
+        workflow_v1,
+    )
 }
 
 fn continuation_enabled_for_launch(
@@ -3523,7 +3543,8 @@ async fn inject_codeg_mcp(
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
     // `None` (no feature enabled) short-circuits the whole injection.
-    let features_arg = companion_features_arg(
+    let features_arg = companion_features_arg_for_agent(
+        agent_type,
         delegation_enabled,
         coordination_v1,
         feedback_enabled,
@@ -3534,8 +3555,7 @@ async fn inject_codeg_mcp(
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
             "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
-             exe sibling, and PATH); skipping delegate_to_agent / check_user_feedback / \
-             ask_user_question / get_session_info tool injection for connection \
+             exe sibling, and PATH); skipping companion features {features_arg} for connection \
              {parent_connection_id}. Reinstall codeg or set CODEG_MCP_BIN to fix."
         );
         return None;
@@ -19605,6 +19625,18 @@ mod tests {
         // All on → comma-joined, in declaration order.
         assert_eq!(
             companion_features_arg(true, true, true, true, true, true),
+            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v1".to_string())
+        );
+    }
+
+    #[test]
+    fn companion_features_arg_uses_native_ask_for_grok_only() {
+        assert_eq!(
+            companion_features_arg_for_agent(AgentType::Grok, true, true, true, true, true, true,),
+            Some("delegation,coordination_v1,feedback,sessions,workflow_v1".to_string())
+        );
+        assert_eq!(
+            companion_features_arg_for_agent(AgentType::Codex, true, true, true, true, true, true,),
             Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v1".to_string())
         );
     }

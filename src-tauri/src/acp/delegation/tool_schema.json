@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start a local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. Child starts cold and cannot see this conversation, open files, or earlier turns; task must include all context. Fan out independent work, then Join required task_ids with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0). Each @AgentName/codeg://agent/<agent_type> mention requests one call. For each distinct codeg://delegation-profile/<uuid>, call once with profile_id. Recover admission_failed/admission_unknown only by explicit replacement, never continue_delegation.",
+    "description": "Start a cold local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. It cannot see this conversation; task must include all context. Fan out independent work, then Join required task_ids with get_delegation_status. For each distinct agent/profile mention, call once; pass profile_id for a profile. Replace admission_failed/admission_unknown explicitly, never continue_delegation.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -89,7 +89,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Get status or results for task_ids. Omit wait_ms for an immediate snapshot. To block, Join with return_when=all_terminal_or_attention and wait_ms=0; positive wait_ms is rejected on coordination_v1. Join returns when all requested tasks are terminal, attention required, or Broker unavailable. Answer attention, then re-Join only still-running required task ids. Returns {\"tasks\":[...]} in input order; Join includes wake_reason and attention_requests.",
+    "description": "Get task_ids status/results in input order. Omit wait_ms for an immediate snapshot. Join via return_when=all_terminal_or_attention, wait_ms=0; positive wait_ms is rejected. Join returns when all requested tasks are terminal, attention is required, or unavailable. Answer attention, then re-Join only still-running required task_ids. Includes wake_reason and attention_requests.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -98,18 +98,18 @@
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1,
-          "description": "One or more task IDs. One checks a single task; several check a fan-out together."
+          "description": "Task IDs to inspect together."
         },
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
           "maximum": 0,
-          "description": "Omit wait_ms for an immediate snapshot. Use 0 with return_when=all_terminal_or_attention for Join. Positive wait_ms is rejected on coordination_v1."
+          "description": "Use 0 with return_when for Join."
         },
         "return_when": {
           "type": "string",
           "enum": ["all_terminal_or_attention"],
-          "description": "Canonical Join condition. Requires wait_ms=0; returns for all terminal, attention required, or unavailable."
+          "description": "Join condition; requires wait_ms=0."
         }
       }
     }
@@ -135,7 +135,7 @@
   },
   {
     "name": "check_user_feedback",
-    "description": "Read pending user guidance during this turn; messages are available only through this tool. Non-blocking and immediate. Call before starting implementation, before a significant decision, and after a meaningful sub-task. Treat returned messages as HIGH-PRIORITY steering; an empty result means continue.",
+    "description": "Read pending messages; messages are available only through this tool. Non-blocking. Call before starting implementation, a significant decision, and after a meaningful sub-task. Treat them as HIGH-PRIORITY steering; empty result means continue.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -198,7 +198,7 @@
   },
   {
     "name": "get_session_info",
-    "description": "Resolve a codeg://session/<number> reference to read-only metadata and optional recent messages. Call when a mentioned session is needed. Pass Codeg's internal conversation ID as session_id, not the agent session ID. A missing session returns found: false, not an error.",
+    "description": "Resolve codeg://session/<number> to read-only metadata and optional recent messages. Use Codeg's internal conversation ID, not the agent session ID. Missing returns found: false, not an error.",
     "inputSchema": {
       "type": "object",
       "required": ["session_id"],
