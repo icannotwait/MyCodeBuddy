@@ -147,6 +147,7 @@ import {
 import { cn } from "@/lib/utils"
 import { FolderAliasLabel } from "./folder-alias-label"
 import { toErrorMessage } from "@/lib/app-error"
+import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 
 // Layout effect on the client (so the sticky overlay is positioned before
 // paint) but a no-op-safe passive effect during the static-export prerender.
@@ -728,7 +729,6 @@ export function SidebarConversationList({
     (s) => s.removeFolderFromWorkspace
   )
   const reorderFolders = useAppWorkspaceStore((s) => s.reorderFolders)
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const refreshFolder = useAppWorkspaceStore((s) => s.refreshFolder)
   const refreshing = loading
   const { activeFolder } = useActiveFolder()
@@ -2060,7 +2060,7 @@ export function SidebarConversationList({
         })
         if (!result) return
         const selected = Array.isArray(result) ? result[0] : result
-        await openFolder(selected)
+        await openFolderWithDraft(selected)
       } catch (err) {
         console.error("[SidebarConversationList] failed to open folder:", err)
         toast.error(t("toasts.openFolderFailed"))
@@ -2068,7 +2068,7 @@ export function SidebarConversationList({
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder, t])
+  }, [t])
 
   // Stable trigger for the Clone Repository dialog, passed to the memoized
   // Folders section header. Empty deps (setCloneOpen is a stable setter) so the
@@ -2077,12 +2077,12 @@ export function SidebarConversationList({
 
   const handleBrowserSelect = useCallback(
     (path: string) => {
-      openFolder(path).catch((err) => {
+      openFolderWithDraft(path).catch((err) => {
         console.error("[SidebarConversationList] failed to open folder:", err)
         toast.error(t("toasts.openFolderFailed"))
       })
     },
-    [openFolder, t]
+    [t]
   )
 
   const handleProjectBoot = useCallback(() => {

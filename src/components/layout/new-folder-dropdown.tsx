@@ -11,15 +11,14 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
 import { openProjectBootWindow } from "@/lib/api"
+import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { CloneDialog } from "@/components/layout/clone-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 
 export function NewFolderDropdown() {
   const t = useTranslations("Folder.folderNameDropdown")
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const [cloneOpen, setCloneOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)
 
@@ -35,7 +34,9 @@ export function NewFolderDropdown() {
         multiple: false,
       })
       if (selected) {
-        await openFolder(Array.isArray(selected) ? selected[0] : selected)
+        await openFolderWithDraft(
+          Array.isArray(selected) ? selected[0] : selected
+        )
       }
     } else {
       setBrowserOpen(true)
@@ -75,7 +76,7 @@ export function NewFolderDropdown() {
         open={browserOpen}
         onOpenChange={setBrowserOpen}
         onSelect={(path) => {
-          openFolder(path).catch((err) => {
+          openFolderWithDraft(path).catch((err) => {
             console.error("[NewFolderDropdown] failed to open folder:", err)
           })
         }}

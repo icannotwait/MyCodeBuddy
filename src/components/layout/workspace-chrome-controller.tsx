@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { openSettingsWindow } from "@/lib/api"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { isDesktop, openFileDialog } from "@/lib/platform"
@@ -34,7 +34,6 @@ import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-di
  * visible bar. Renders no visible chrome — only the dialogs.
  */
 export function WorkspaceChromeController() {
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const { activeFolder } = useActiveFolder()
   const isChatMode = useIsActiveChatMode()
   const { toggle } = useSidebarContext()
@@ -70,7 +69,7 @@ export function WorkspaceChromeController() {
         })
         if (!result) return
         const selected = Array.isArray(result) ? result[0] : result
-        await openFolder(selected)
+        await openFolderWithDraft(selected)
       } catch (err) {
         console.error("[WorkspaceChromeController] failed to open folder:", err)
         toast.error(tSidebar("toasts.openFolderFailed"))
@@ -78,7 +77,7 @@ export function WorkspaceChromeController() {
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder, tSidebar])
+  }, [tSidebar])
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -208,7 +207,7 @@ export function WorkspaceChromeController() {
         open={browserOpen}
         onOpenChange={setBrowserOpen}
         onSelect={(path) => {
-          openFolder(path).catch((err) => {
+          openFolderWithDraft(path).catch((err) => {
             console.error(
               "[WorkspaceChromeController] failed to open folder:",
               err

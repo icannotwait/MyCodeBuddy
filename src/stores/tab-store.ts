@@ -7,6 +7,10 @@ import {
   listOpenedTabs,
   saveOpenedTabs,
 } from "@/lib/api"
+import {
+  hasLocalLiveConversations,
+  maybeCloseEmptyFolder,
+} from "@/lib/maybe-close-empty-folder"
 import { resolveDefaultAgent } from "@/lib/resolve-default-agent"
 import { formatConversationTitle } from "@/lib/conversation-title"
 import {
@@ -200,8 +204,8 @@ export interface TabStoreState {
   /**
    * UserRemove draft dispose: retarget the singleton draft off `folderId`
    * (another open folder, or chat/no-folder shell). Updates `rawTabs` and
-   * recomputes the decorated `tabs` projection. Full last-tab product rules
-   * complete in empty-folder Task 5.
+   * recomputes the decorated `tabs` projection. Last-tab empty leave uses a
+   * separate optimistic-drop path in `closeTab` (not this dispose).
    */
   disposeDraftBindingForRemovedFolder: (folderId: number) => void
   bindConversationTab: (
@@ -587,24 +591,31 @@ function makeReplacementDraftTab(preferred?: TabItemInternal): TabItemInternal {
   const preferredIsChat =
     preferred?.isChat === true ||
     allFolders.find((f) => f.id === preferred?.folderId)?.kind === "chat"
+  // Last-tab empty-folder leave optimistically drops F before replacement —
+  // never rebind the new draft to a folder that is no longer open.
+  const preferredStillOpen =
+    preferred != null &&
+    !preferredIsChat &&
+    preferred.folderId > 0 &&
+    folders.some((f) => f.id === preferred.folderId && f.kind !== "chat")
   const nonChatFallbackId = folders.find((f) => f.kind !== "chat")?.id ?? 0
-  const folderId = preferredIsChat
-    ? nonChatFallbackId
-    : (preferred?.folderId ?? nonChatFallbackId)
-  const workingDir = preferredIsChat
-    ? (folders.find((f) => f.id === folderId)?.path ?? "")
-    : (preferred?.workingDir ??
+  const folderId = preferredStillOpen ? preferred!.folderId : nonChatFallbackId
+  const workingDir = preferredStillOpen
+    ? (preferred?.workingDir ??
       folders.find((f) => f.id === folderId)?.path ??
       "")
-  // If we have a preferred (closing) tab, inherit BOTH its agent and its
-  // provisional flag — never silently launder a system best-guess into a
-  // confirmed value just because the source tab was closed.
-  const { agentType, provisional } = preferred?.agentType
-    ? {
-        agentType: preferred.agentType,
-        provisional: preferred.agentTypeProvisional ?? false,
-      }
-    : resolveAgentForFolder(folderId, null)
+    : (folders.find((f) => f.id === folderId)?.path ?? "")
+  // If we have a preferred (closing) tab whose folder is still open, inherit
+  // BOTH its agent and its provisional flag — never silently launder a system
+  // best-guess into a confirmed value just because the source tab was closed.
+  // When the preferred folder was auto-dropped, re-resolve against the fallback.
+  const { agentType, provisional } =
+    preferredStillOpen && preferred?.agentType
+      ? {
+          agentType: preferred.agentType,
+          provisional: preferred.agentTypeProvisional ?? false,
+        }
+      : resolveAgentForFolder(folderId, null)
   return {
     id: makeNewConversationTabId(),
     kind: "conversation",
@@ -616,6 +627,31 @@ function makeReplacementDraftTab(preferred?: TabItemInternal): TabItemInternal {
     workingDir,
     agentTypeProvisional: provisional,
   }
+}
+
+/** Whether the singleton draft still targets a regular (non-chat) folder. */
+function draftStillOnFolder(folderId: number): boolean {
+  return useTabStore
+    .getState()
+    .rawTabs.some(
+      (t) => t.conversationId == null && t.folderId === folderId && !t.isChat
+    )
+}
+
+/** Schedule visibility-only empty close after a draft leave (never user-remove). */
+function scheduleMaybeCloseEmptyFolder(folderId: number): void {
+  void maybeCloseEmptyFolder(folderId, draftStillOnFolder)
+}
+
+/**
+ * True when closing this tab is a draft leave that may empty-close `folderId`.
+ * Chat / folderless drafts and bound conversation tabs are not leave triggers.
+ */
+function isDraftLeaveFromFolder(tab: TabItemInternal): number | null {
+  if (tab.conversationId != null) return null
+  if (tab.isChat) return null
+  if (tab.folderId <= 0) return null
+  return tab.folderId
 }
 
 function initialTabState() {
@@ -807,6 +843,21 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     if (index >= 0) {
       const closingTab = prevState.rawTabs[index]
       const next = prevState.rawTabs.filter((t) => t.id !== tabId)
+      const leftFolderId = isDraftLeaveFromFolder(closingTab)
+
+      // Last-tab empty-folder leave: drop F from the open list *before*
+      // makeReplacementDraftTab so the replacement cannot rebind F.
+      // Do not await the network — selection is fully local/synchronous.
+      if (
+        next.length === 0 &&
+        leftFolderId != null &&
+        !hasLocalLiveConversations(leftFolderId) &&
+        useAppWorkspaceStore
+          .getState()
+          .folders.some((f) => f.id === leftFolderId)
+      ) {
+        useAppWorkspaceStore.getState().dropFolderFromOpenList(leftFolderId)
+      }
 
       if (next.length === 0) {
         if (useAppWorkspaceStore.getState().folders.length === 0) {
@@ -830,6 +881,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         set({ rawTabs: next })
       }
       recomputeTabs()
+
+      if (leftFolderId != null) {
+        scheduleMaybeCloseEmptyFolder(leftFolderId)
+      }
     }
 
     if (shouldActivateConversation) {
@@ -865,6 +920,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     recomputeTabs()
     if (nextActive) {
       runtime.activateConversationPane()
+    }
+    const leftFolderId = isDraftLeaveFromFolder(tab)
+    if (leftFolderId != null) {
+      scheduleMaybeCloseEmptyFolder(leftFolderId)
     }
     return {
       ok: true,
@@ -964,11 +1023,20 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     ) {
       return
     }
+    const leftFolderIds = new Set<number>()
+    for (const tab of prevState.rawTabs) {
+      if (tab.id === tabId) continue
+      const left = isDraftLeaveFromFolder(tab)
+      if (left != null) leftFolderIds.add(left)
+    }
     set({
       rawTabs: stampActiveTab([target], tabId),
       activeTabId: tabId,
     })
     recomputeTabs()
+    for (const folderId of leftFolderIds) {
+      scheduleMaybeCloseEmptyFolder(folderId)
+    }
   },
 
   closeAllTabs: () => {
@@ -1180,6 +1248,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const needsDisconnect =
       existingDraft != null &&
       !(existingDraft.isChat && existingDraft.folderId === 0)
+    // Draft leave: folder → chat detaches the previous regular folder.
+    const leftFolderId =
+      existingDraft != null ? isDraftLeaveFromFolder(existingDraft) : null
 
     const tabId = makeNewConversationTabId()
     const prevState = get()
@@ -1237,6 +1308,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         rawTabs: stampActiveTab(updated, existingTab.id),
       })
       recomputeTabs()
+      if (leftFolderId != null) {
+        scheduleMaybeCloseEmptyFolder(leftFolderId)
+      }
     }
 
     if (needsDisconnect && existingDraft) {
@@ -1904,6 +1978,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         ) {
           return
         }
+        const previousFolderId = isDraftLeaveFromFolder(target)
         set({
           rawTabs: rawTabs.map((tab) =>
             tab.id === request.tabId
@@ -1919,6 +1994,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           ),
         })
         recomputeTabs()
+        // Retarget A→B: after commit, leave A when empty (visibility-only).
+        if (previousFolderId != null && previousFolderId !== request.folderId) {
+          scheduleMaybeCloseEmptyFolder(previousFolderId)
+        }
       })()
     }
   },
@@ -2011,7 +2090,8 @@ export function useTabActions() {
       confirmDraftAgent: s.confirmDraftAgent,
       setDraftAgentFromFallback: s.setDraftAgentFromFallback,
       setDraftDelegationRoute: s.setDraftDelegationRoute,
-      disposeDraftBindingForRemovedFolder: s.disposeDraftBindingForRemovedFolder,
+      disposeDraftBindingForRemovedFolder:
+        s.disposeDraftBindingForRemovedFolder,
       bindConversationTab: s.bindConversationTab,
       setTabRuntimeConversationId: s.setTabRuntimeConversationId,
       reorderTabs: s.reorderTabs,

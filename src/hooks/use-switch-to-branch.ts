@@ -6,6 +6,10 @@ import { toast } from "sonner"
 import { gitCheckout, resolveWorktreeFolder } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { planBranchSwitch } from "@/lib/branch-switch"
+import {
+  openFolderByIdWithDraft,
+  openWorktreeFolderWithDraft,
+} from "@/lib/open-folder-with-draft"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
@@ -86,7 +90,7 @@ export function useSwitchToBranch(): (
 
       // Workspace state/actions are event-time reads — getState() sees the
       // lists as of *now* (post-await), never a stale render capture.
-      const { allFolders, openWorktreeFolder, setBranch, refreshFolder } =
+      const { allFolders, setBranch, refreshFolder } =
         useAppWorkspaceStore.getState()
 
       const plan = planBranchSwitch({
@@ -96,13 +100,18 @@ export function useSwitchToBranch(): (
         isRemote: isRemote === true,
       })
 
-      // Re-open a closed/registered-only folder before opening a conversation in
-      // it, so `resolveAgentForFolder` can see the folder (and apply its saved
-      // default agent). `addFolderToWorkspaceById` awaits the backend upsert.
-      const ensureOpen = async (folderId: number) => {
+      /** Ensure open membership + singleton draft (user-intent choke point). */
+      const ensureOpenWithDraft = async (folder: FolderDetail) => {
         const workspace = useAppWorkspaceStore.getState()
-        if (!workspace.folders.some((f) => f.id === folderId)) {
-          await workspace.addFolderToWorkspaceById(folderId)
+        const draftOpts = {
+          inheritFromActive: true as const,
+          folderDefaultAgent: folder.default_agent_type,
+          folderRecentAgent: folder.last_agent_type,
+        }
+        if (!workspace.folders.some((f) => f.id === folder.id)) {
+          await openFolderByIdWithDraft(folder.id, draftOpts)
+        } else {
+          openNewConversationTab(folder.id, folder.path, draftOpts)
         }
       }
 
@@ -114,15 +123,10 @@ export function useSwitchToBranch(): (
           const target = allFolders.find((f) => f.id === plan.folderId)
           if (!target) return
           try {
-            await ensureOpen(target.id)
             // Return to the conversation workspace if a route (e.g.
             // Automations) was covering the content region.
             openConversations()
-            openNewConversationTab(target.id, target.path, {
-              inheritFromActive: true,
-              folderDefaultAgent: target.default_agent_type,
-              folderRecentAgent: target.last_agent_type,
-            })
+            await ensureOpenWithDraft(target)
             toast.success(t("toasts.switchedToFolder", { name: target.name }))
           } catch (err) {
             toast.error(t("toasts.switchFailed"), {
@@ -134,13 +138,12 @@ export function useSwitchToBranch(): (
 
         case "navigateExternal": {
           try {
-            const detail = await openWorktreeFolder(plan.path, plan.rootId)
             openConversations()
-            openNewConversationTab(detail.id, detail.path, {
-              inheritFromActive: true,
-              folderDefaultAgent: detail.default_agent_type,
-              folderRecentAgent: detail.last_agent_type,
-            })
+            const detail = await openWorktreeFolderWithDraft(
+              plan.path,
+              plan.rootId,
+              { inheritFromActive: true }
+            )
             toast.success(t("toasts.switchedToFolder", { name: detail.name }))
           } catch (err) {
             toast.error(t("toasts.switchFailed"), {
@@ -156,13 +159,8 @@ export function useSwitchToBranch(): (
           // folder; already in root → a plain in-place checkout (no new draft).
           if (root.id !== activeFolder.id) {
             try {
-              await ensureOpen(root.id)
               openConversations()
-              openNewConversationTab(root.id, root.path, {
-                inheritFromActive: true,
-                folderDefaultAgent: root.default_agent_type,
-                folderRecentAgent: root.last_agent_type,
-              })
+              await ensureOpenWithDraft(root)
             } catch (err) {
               toast.error(t("toasts.switchFailed"), {
                 description: toErrorMessage(err),

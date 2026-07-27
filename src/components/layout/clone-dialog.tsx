@@ -6,9 +6,9 @@ import { toast } from "sonner"
 import { FolderOpen, Loader2 } from "lucide-react"
 import { cloneRepository } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
+import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
   Dialog,
@@ -30,7 +30,6 @@ interface CloneDialogProps {
 export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const { withCredentialRetry } = useGitCredential()
   const [url, setUrl] = useState("")
   const [targetDir, setTargetDir] = useState("")
@@ -80,7 +79,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
         (creds) => cloneRepository(url, fullPath, creds),
         { remoteUrl: url }
       )
-      await openFolder(fullPath)
+      await openFolderWithDraft(fullPath)
       onOpenChange(false)
       resetForm()
     } catch (err) {
