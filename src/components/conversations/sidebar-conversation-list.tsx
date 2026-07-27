@@ -70,7 +70,6 @@ import {
   loadConversationExpanded,
   saveConversationExpanded,
   type SidebarSectionCollapsed,
-  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
 import { getEffectiveConversationUpdatedAt } from "@/lib/conversation-activity"
@@ -680,7 +679,6 @@ export interface SidebarConversationListHandle {
 
 export interface SidebarConversationListProps {
   showCompleted?: boolean
-  sortMode?: SidebarSortMode
   sectionOrder?: SidebarSectionOrder
   /** When on, each repo's worktree child folders render as indented sub-groups
    *  instead of being merged flat into the parent group. Defaults to off. */
@@ -690,7 +688,6 @@ export interface SidebarConversationListProps {
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
   sectionOrder = "folders-first",
   showWorktrees = false,
 }: SidebarConversationListProps & {
@@ -1081,19 +1078,13 @@ export function SidebarConversationList({
   const byFolder = useMemo(() => {
     const grouped = groupByFolderWithReuse(
       folderConversations,
-      sortMode,
       byFolderRef.current,
       displayChildToParent,
       optimisticActivityById
     )
     byFolderRef.current = grouped
     return grouped
-  }, [
-    folderConversations,
-    sortMode,
-    displayChildToParent,
-    optimisticActivityById,
-  ])
+  }, [folderConversations, displayChildToParent, optimisticActivityById])
 
   // Counts the unfiltered-but-non-pinned conversations per display group, so the
   // empty-hint renderer distinguishes a truly empty folder from one whose rows

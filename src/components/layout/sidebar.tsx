@@ -45,13 +45,10 @@ import { leftChromeReserve } from "@/lib/window-chrome"
 import {
   loadShowCompleted,
   loadShowWorktrees,
-  loadSortMode,
   loadSectionOrder,
   saveShowCompleted,
   saveShowWorktrees,
-  saveSortMode,
   saveSectionOrder,
-  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
 import { cn } from "@/lib/utils"
@@ -138,7 +135,6 @@ export function Sidebar() {
   // preference is applied.
   const [showCompleted, setShowCompleted] = useState(false)
   const [showWorktrees, setShowWorktrees] = useState(true)
-  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
   const [allExpanded, setAllExpanded] = useState(true)
@@ -163,7 +159,6 @@ export function Sidebar() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowCompleted(loadShowCompleted())
     setShowWorktrees(loadShowWorktrees())
-    setSortMode(loadSortMode())
     setSectionOrder(loadSectionOrder())
   }, [])
 
@@ -175,12 +170,6 @@ export function Sidebar() {
   const handleSetShowWorktrees = useCallback((value: boolean) => {
     setShowWorktrees(value)
     saveShowWorktrees(value)
-  }, [])
-
-  const handleSetSortMode = useCallback((value: string) => {
-    const mode: SidebarSortMode = value === "updated" ? "updated" : "created"
-    setSortMode(mode)
-    saveSortMode(mode)
   }, [])
 
   const handleSetSectionOrder = useCallback((value: string) => {
@@ -344,19 +333,6 @@ export function Sidebar() {
                 {t("showWorktrees")}
               </DropdownMenuCheckboxItem>
               <DropdownMenuSeparator />
-              <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
-              <DropdownMenuRadioGroup
-                value={sortMode}
-                onValueChange={handleSetSortMode}
-              >
-                <DropdownMenuRadioItem value="created">
-                  {t("sortByCreatedAt")}
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="updated">
-                  {t("sortByUpdatedAt")}
-                </DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-              <DropdownMenuSeparator />
               <DropdownMenuLabel>{t("sectionOrder")}</DropdownMenuLabel>
               <DropdownMenuRadioGroup
                 value={sectionOrder}
@@ -438,7 +414,6 @@ export function Sidebar() {
           ref={listRef}
           showCompleted={showCompleted}
           showWorktrees={showWorktrees}
-          sortMode={sortMode}
           sectionOrder={sectionOrder}
         />
       </div>

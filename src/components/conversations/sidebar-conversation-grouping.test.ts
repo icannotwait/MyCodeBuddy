@@ -119,7 +119,7 @@ describe("groupByFolderWithReuse", () => {
     // Non-optimistic: updated_at wins → activeNewer first (created order
     // would put createdNewer first).
     expect(
-      groupByFolderWithReuse([createdNewer, activeNewer], "updated", new Map())
+      groupByFolderWithReuse([createdNewer, activeNewer], new Map())
         .get(10)!
         .map((row) => row.id)
     ).toEqual([1, 2])
@@ -138,28 +138,10 @@ describe("groupByFolderWithReuse", () => {
     expect(
       groupByFolderWithReuse(
         [createdNewer, activeNewer],
-        "updated",
         new Map(),
         undefined,
         optimistic
       )
-        .get(10)!
-        .map((row) => row.id)
-    ).toEqual([2, 1])
-  })
-
-  it("sorts by created time when created mode is selected", () => {
-    const createdNewer = conv(2, 10, {
-      created_at: "2026-07-18T03:00:00.000Z",
-      updated_at: "2026-07-18T01:00:00.000Z",
-    })
-    const activeNewer = conv(1, 10, {
-      created_at: "2026-07-18T01:00:00.000Z",
-      updated_at: "2026-07-18T04:00:00.000Z",
-    })
-
-    expect(
-      groupByFolderWithReuse([activeNewer, createdNewer], "created", new Map())
         .get(10)!
         .map((row) => row.id)
     ).toEqual([2, 1])
@@ -177,7 +159,7 @@ describe("groupByFolderWithReuse", () => {
       updated_at: sameUpdated,
     })
     expect(
-      groupByFolderWithReuse([olderCreated, newerCreated], "updated", new Map())
+      groupByFolderWithReuse([olderCreated, newerCreated], new Map())
         .get(10)!
         .map((c) => c.id)
     ).toEqual([2, 1])
@@ -192,7 +174,7 @@ describe("groupByFolderWithReuse", () => {
       updated_at: sameUpdated,
     })
     expect(
-      groupByFolderWithReuse([lowId, highId], "updated", new Map())
+      groupByFolderWithReuse([lowId, highId], new Map())
         .get(20)!
         .map((c) => c.id)
     ).toEqual([20, 10])
@@ -202,12 +184,12 @@ describe("groupByFolderWithReuse", () => {
     const a1 = conv(1, 10)
     const a2 = conv(2, 10)
     const b1 = conv(3, 20)
-    const first = groupByFolderWithReuse([a1, a2, b1], "updated", new Map())
+    const first = groupByFolderWithReuse([a1, a2, b1], new Map())
 
     // Simulate a status event on folder 10: one summary is replaced by a new
     // object (slice + spread), every other summary keeps its identity.
     const a2Patched = { ...a2, status: "completed" as const }
-    const second = groupByFolderWithReuse([a1, a2Patched, b1], "updated", first)
+    const second = groupByFolderWithReuse([a1, a2Patched, b1], first)
 
     // Folder 20 is untouched → same array reference (memo can bail out).
     expect(second.get(20)).toBe(first.get(20))
@@ -222,8 +204,8 @@ describe("groupByFolderWithReuse", () => {
 
   it("reuses every bucket when nothing changed at all", () => {
     const list = [conv(1, 10), conv(2, 20)]
-    const first = groupByFolderWithReuse(list, "updated", new Map())
-    const second = groupByFolderWithReuse(list, "updated", first)
+    const first = groupByFolderWithReuse(list, new Map())
+    const second = groupByFolderWithReuse(list, first)
     expect(second.get(10)).toBe(first.get(10))
     expect(second.get(20)).toBe(first.get(20))
   })
@@ -235,12 +217,7 @@ describe("groupByFolderWithReuse", () => {
       [12, 10],
     ])
     const list = [conv(1, 10), conv(2, 11), conv(3, 12), conv(4, 20)]
-    const grouped = groupByFolderWithReuse(
-      list,
-      "updated",
-      new Map(),
-      childToParent
-    )
+    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
 
     // No child folder gets its own bucket; everything lands under the root (10).
     expect([...grouped.keys()].sort((a, b) => a - b)).toEqual([10, 20])
@@ -280,23 +257,13 @@ describe("groupByFolderWithReuse", () => {
         updated_at: "2026-07-18T03:00:00.000Z",
       }),
     ]
-    const grouped = groupByFolderWithReuse(
-      list,
-      "updated",
-      new Map(),
-      childToParent
-    )
+    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 2, 1])
   })
 
   it("leaves grouping unchanged when childToParent is empty/omitted", () => {
     const list = [conv(1, 10), conv(2, 11)]
-    const withEmpty = groupByFolderWithReuse(
-      list,
-      "updated",
-      new Map(),
-      new Map()
-    )
+    const withEmpty = groupByFolderWithReuse(list, new Map(), new Map())
     expect([...withEmpty.keys()].sort((a, b) => a - b)).toEqual([10, 11])
   })
 })
@@ -1103,7 +1070,6 @@ describe("buildRows", () => {
     const childToParent = new Map<number, number>([[11, 10]])
     const byFolder = groupByFolderWithReuse(
       [rootConv, worktreeConv],
-      "updated",
       new Map(),
       childToParent
     )

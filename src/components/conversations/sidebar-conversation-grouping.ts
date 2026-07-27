@@ -1,8 +1,5 @@
 import type { DbConversationSummary, FolderDetail } from "@/lib/types"
-import type {
-  SidebarSortMode,
-  SidebarSectionOrder,
-} from "@/lib/sidebar-view-mode-storage"
+import type { SidebarSectionOrder } from "@/lib/sidebar-view-mode-storage"
 import {
   EMPTY_OPTIMISTIC_ACTIVITY_BY_ID,
   getEffectiveConversationUpdatedAt,
@@ -33,19 +30,6 @@ export function compareByUpdatedAtDesc(
     parseActivityTimestamp(right.created_at) -
     parseActivityTimestamp(left.created_at)
   return createdDiff !== 0 ? createdDiff : right.id - left.id
-}
-
-export function compareByCreatedAtDesc(
-  left: DbConversationSummary,
-  right: DbConversationSummary
-): number {
-  const createdDiff =
-    parseTimestamp(right.created_at) - parseTimestamp(left.created_at)
-  if (createdDiff !== 0) return createdDiff
-
-  const updatedDiff =
-    parseTimestamp(right.updated_at) - parseTimestamp(left.updated_at)
-  return updatedDiff !== 0 ? updatedDiff : right.id - left.id
 }
 
 /**
@@ -206,7 +190,6 @@ export function reuseSelected(
  */
 export function groupByFolderWithReuse(
   filtered: readonly DbConversationSummary[],
-  sortMode: SidebarSortMode,
   prev: Map<number, DbConversationSummary[]>,
   childToParent?: ReadonlyMap<number, number>,
   optimisticActivityById: OptimisticActivityById = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
@@ -219,13 +202,14 @@ export function groupByFolderWithReuse(
     else next.set(groupId, [conv])
   }
 
-  const comparator =
-    sortMode === "updated"
-      ? (left: DbConversationSummary, right: DbConversationSummary) =>
-          compareByUpdatedAtDesc(left, right, optimisticActivityById)
-      : compareByCreatedAtDesc
+  // Activity order is mandatory for root rows: effective updated_at (with
+  // optimistic overlay) is the only presentation sort. Creation-time sorting was
+  // removed so a fresh reply always promotes the session even when labels alone
+  // update first.
   for (const [folderId, list] of next) {
-    list.sort(comparator)
+    list.sort((left, right) =>
+      compareByUpdatedAtDesc(left, right, optimisticActivityById)
+    )
     const prevList = prev.get(folderId)
     // Replacing an existing key's value mid-iteration is safe (we never add or
     // remove keys here).
