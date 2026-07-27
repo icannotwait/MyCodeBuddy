@@ -43,7 +43,7 @@ pub enum WorkflowStoreError {
     AdmittedNodeIdentityMutation { node_id: String },
 
     #[error("admitted workflow binding or Task cohort policy/complete route is immutable at {node_id} (cohort_frozen)")]
-    FrozenPartnerDrop { node_id: String },
+    CohortFrozen { node_id: String },
 
     #[error("gate not ready: {0}")]
     GateNotReady(String),

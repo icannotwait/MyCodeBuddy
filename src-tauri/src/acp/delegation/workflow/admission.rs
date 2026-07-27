@@ -1522,6 +1522,7 @@ mod tests {
         TaskHardTriggerKind, TaskRiskLevel, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION,
         PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
+    use crate::acp::delegation::workflow::WorkflowStoreError;
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -2847,7 +2848,10 @@ mod tests {
         )
         .await
         .expect_err("any frozen policy mutation must reject");
-        assert!(err.to_string().contains("cohort_frozen"), "got {err:?}");
+        assert!(
+            matches!(err, WorkflowStoreError::CohortFrozen { .. }),
+            "got {err:?}"
+        );
         let after = delegation_workflow_node_binding::Entity::find()
             .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(revised.workflow_id))
             .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1_i64))
@@ -2871,7 +2875,10 @@ mod tests {
         )
         .await
         .expect_err("frozen route removal must reject");
-        assert!(err.to_string().contains("cohort_frozen"), "got {err:?}");
+        assert!(
+            matches!(err, WorkflowStoreError::CohortFrozen { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

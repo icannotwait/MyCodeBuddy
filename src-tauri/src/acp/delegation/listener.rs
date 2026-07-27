@@ -1833,7 +1833,7 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::AdmittedNodeIdentityMutation { .. } => {
             "admitted_node_identity_mutation"
         }
-        WorkflowStoreError::FrozenPartnerDrop { .. } => "frozen_partner_drop",
+        WorkflowStoreError::CohortFrozen { .. } => "cohort_frozen",
         WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
         WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
         WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
@@ -2865,6 +2865,15 @@ mod tests {
             .await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+    }
+
+    #[test]
+    fn cohort_frozen_workflow_error_uses_exact_wire_code() {
+        let outcome = workflow_store_error_value(WorkflowStoreError::CohortFrozen {
+            node_id: "Task 1".into(),
+        });
+
+        assert_eq!(outcome["error"]["code"], "cohort_frozen");
     }
 
     // -- Task 1: correlation_id parse/forward ------------------------------

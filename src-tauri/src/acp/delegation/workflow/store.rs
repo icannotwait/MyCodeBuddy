@@ -1557,7 +1557,7 @@ async fn load_observed_node_ids<C: sea_orm::ConnectionTrait>(
 }
 
 fn frozen_cohort_error(task_index: i64) -> WorkflowStoreError {
-    WorkflowStoreError::FrozenPartnerDrop {
+    WorkflowStoreError::CohortFrozen {
         node_id: format!("Task {task_index}"),
     }
 }
@@ -1640,7 +1640,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             ));
         }
         if binding_protected && !is_canceled_drop(normalized, b) {
-            return Err(WorkflowStoreError::FrozenPartnerDrop {
+            return Err(WorkflowStoreError::CohortFrozen {
                 node_id: b.node_id.clone(),
             });
         }
@@ -3980,7 +3980,7 @@ mod tests {
         // V2 route validation rejects an omitted cohort node before the existing
         // frozen-pair defense-in-depth path needs to inspect the binding diff.
         assert!(
-            matches!(err, WorkflowStoreError::FrozenPartnerDrop { .. })
+            matches!(err, WorkflowStoreError::CohortFrozen { .. })
                 || matches!(
                     err,
                     WorkflowStoreError::Validation(
