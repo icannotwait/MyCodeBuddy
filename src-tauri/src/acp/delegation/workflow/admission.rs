@@ -29,7 +29,7 @@ use crate::web::event_bridge::EventEmitter;
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
-    TerminalRunStatus,
+    RequiredReviewerEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
 use super::project::evidence_from_run_and_binding;
@@ -879,26 +879,38 @@ async fn evaluate_task_index_gate<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     task_index: u32,
 ) -> Result<super::gates::ExecutionGateEval, TaskStoreError> {
-    let impl_ev = load_latest_role_evidence(
-        conn,
-        header,
-        PHASE_TASKS,
-        "implementer",
-        Some(task_index as i64),
-    )
-    .await?;
-    let rev_ev = load_latest_role_evidence(
-        conn,
-        header,
-        PHASE_TASKS,
-        "reviewer",
-        Some(task_index as i64),
-    )
-    .await?;
+    let doc = load_active_manifest_doc(conn, header)
+        .await?
+        .ok_or_else(|| admission_err("workflow_manifest_missing", "active manifest missing"))?;
+    let normalized = validate_manifest_document(&doc).map_err(|err| {
+        admission_err(
+            "workflow_manifest_invalid",
+            format!("active manifest invalid: {err}"),
+        )
+    })?;
+    let policy = normalized
+        .task_policies
+        .iter()
+        .find(|policy| policy.task_index == task_index)
+        .ok_or_else(|| {
+            admission_err(
+                "task_policy_missing",
+                format!("Task {task_index} has no active policy route"),
+            )
+        })?;
+    let impl_ev =
+        load_latest_node_evidence(conn, header, &policy.route.implementer_node_id).await?;
+    let mut required_reviewers = Vec::with_capacity(policy.route.reviewer_node_ids.len());
+    for node_id in &policy.route.reviewer_node_ids {
+        required_reviewers.push(RequiredReviewerEvidence {
+            node_id: node_id.clone(),
+            evidence: load_latest_node_evidence(conn, header, node_id).await?,
+        });
+    }
     Ok(evaluate_execution_gate(&ExecutionGateInput {
         kind: ExecutionGateKind::Task,
         implementer_or_fixer: impl_ev,
-        reviewer: rev_ev,
+        required_reviewers,
         branch_tip_digest: None,
     }))
 }
@@ -954,9 +966,28 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
         return Ok(None);
     };
 
+    load_latest_node_evidence(conn, header, &binding.node_id).await
+}
+
+async fn load_latest_node_evidence<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    node_id: &str,
+) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
+    let active = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .filter(delegation_workflow_node_binding::Column::NodeId.eq(node_id.to_string()))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    if active.is_none() {
+        return Ok(None);
+    }
+
     let rbs = delegation_workflow_run_binding::Entity::find()
         .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
-        .filter(delegation_workflow_run_binding::Column::NodeId.eq(binding.node_id.clone()))
+        .filter(delegation_workflow_run_binding::Column::NodeId.eq(node_id.to_string()))
         .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
         .all(conn)
         .await

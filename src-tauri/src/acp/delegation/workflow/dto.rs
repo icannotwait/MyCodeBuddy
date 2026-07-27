@@ -100,6 +100,14 @@ pub struct WorkflowNodeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_risk_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_risk_reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_reviewer_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_reviewer_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub status: ProjectedNodeStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -566,6 +574,10 @@ mod tests {
                 agent_type: Some("grok".into()),
                 profile_id: None,
                 task_index: Some(1),
+                task_risk_level: None,
+                task_risk_reason_codes: vec![],
+                required_reviewer_count: None,
+                returned_reviewer_count: None,
                 title: None,
                 status: ProjectedNodeStatus::Estimated,
                 status_reason: None,

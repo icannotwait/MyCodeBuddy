@@ -31,7 +31,7 @@ pub use events::{
 };
 pub use gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
-    ExecutionGateReason, ExecutionGateRunEvidence, TerminalRunStatus,
+    ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
 pub use plan_review::{
