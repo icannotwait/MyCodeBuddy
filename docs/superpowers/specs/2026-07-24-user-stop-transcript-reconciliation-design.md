@@ -1,9 +1,9 @@
 # User Stop Transcript Preservation and Reconciliation Design
 
 Date: 2026-07-24  
-Revised: 2026-07-26 (Round 4e — baseline map rebased onto HEAD partial implementation)
+Revised: 2026-07-27 (product decision: no self-managed codex-acp binary / AC3 packaging deferred)
 
-Status: Design approved (Round 4e document review group); implementation plan next
+Status: Design approved; **v1 delivery excludes self-hosted adapter packaging**
 
 ## Summary
 
@@ -158,7 +158,7 @@ rather than re-landing duplicate greenfield work.
 | Viewer / background destructive sync | store + sync helpers | **MODIFY** — expand guards beyond `pendingCancel` alone |
 | Presentation adapter / list cache | `ai-elements-adapter.ts`, `message-list-view.tsx` | **RETAIN** / **MODIFY** if outcome fingerprint incomplete |
 | Codex parser `turn_aborted` | `parsers/codex.rs` | **MODIFY** — arm + tests exist; amend null-id **display-only** outcome; keep matchable fence rules |
-| Production pin / managed seed | `registry.rs`, packaging | **ADD** / **MODIFY** — still public `@…/codex-acp@1.1.7`; AC3 path not landed |
+| Production pin / managed seed | `registry.rs`, packaging | **RETAIN public** `@agentclientprotocol/codex-acp@1.1.7` via Npx — **no** managed seed/binary in v1 (2026-07-27 product decision) |
 | i18n `responseInterrupted` | `src/i18n/messages/*.json` | **RETAIN** if present in all 10 locales |
 
 ### Implementation Baseline Gap List (HEAD vs this design)
@@ -171,62 +171,49 @@ Use this as the plan’s “reconcile with tree” checklist:
 4. **Branch A/B merge:** empty fenced detail + non-empty local → Branch B keep overlays + `owner_preserve`.
 5. **Migration:** runtime-key migrate without bumping `cancelGeneration`; identity replacement bumps and clears (HEAD may still bump on rebind).
 6. **Unbound detail id:** accepted `user_stop` + provider id + no positive DB id → outcome + `owner_preserve`, no coordinator.
-7. **AC3:** managed-prefix seed + pin `1.1.7-mycodebuddy.stop1` + resolver + packaging hooks.
-8. **Vendor:** submodule init/reachable gitlink; marker removal + `activeTurnId` emit on delivery baseline.
+7. ~~**AC3 managed packaging**~~ — **OUT OF SCOPE for v1** (see Adapter Launch below).
+8. ~~**Vendor submodule ship**~~ — **OUT OF SCOPE for v1**.
 9. **Tests:** expand for soft fence, `owner_preserve`, Branch B post-apply suppress, migration-no-bump, display-only null id, late envelope after age-out.
 
-### Adapter Delivery (required)
+### Adapter Launch (v1 — product decision 2026-07-27)
 
-Adapter changes land in the git submodule
-`src-tauri/vendor/codex-acp` (currently pin-linked for development; production
-launch still uses `@agentclientprotocol/codex-acp@1.1.7` via npx unless the
-registry pin is updated).
+**Codeg does not self-manage a codex-acp binary, seed tree, or managed npm
+prefix in this delivery.** Production continues to launch the public Npx pin:
 
-Implementation plan must include, as discrete work:
+```text
+@agentclientprotocol/codex-acp@1.1.7
+```
 
-1. Init the vendor submodule (`git submodule update --init src-tauri/vendor/codex-acp`).
-2. Edit vendored TypeScript sources under `src-tauri/vendor/codex-acp/src/`.
-3. Build/package the adapter per that package's `build.mjs` / package scripts.
-4. **Mandatory for delivery acceptance (AC3) — LOCKED production path** (not
-   open-ended “or equivalent”):
-   - **Baseline policy (normative delivery baseline):** rebase/merge the
-     Codeg fork onto the upstream **`1.1.7` lineage** production currently
-     pins, apply Stop patches, and version as **`1.1.7-mycodebuddy.stop1`**.
-     Shipping a `1.1.2-mycodebuddy.stop1` pin that drops post-1.1.2 host
-     capabilities (sub-agent/retry/compaction signals from 1.1.3+, steering
-     1.1.6, Plan-mode 1.1.7 — see `registry.rs` integration notes) is **not**
-     an allowed silent fallback. If rebase is blocked, delivery is blocked
-     until either the rebase lands or an explicit **capability-parity gate**
-     is written and proven (forward-port + host/adapter smoke for every
-     post-1.1.2 behavior Codeg consumes). Plan tasks must not choose 1.1.2
-     pin without that parity evidence.
-   - **Launch mechanism:** application-managed npm prefix under the process
-     data dir (`<app_data>/agent-runtimes/codex-acp-<lockedPin>/`), seeded from
-     packaged `resources/codex-acp-seed/` (desktop resources, server ZIP,
-     Docker). Resolver prefers managed prefix / seed over ambient PATH public
-     `1.1.7`; `CODEG_CODEX_ACP_BIN` absolute override wins.
-   - **Build stage:** every desktop/server/Docker/local package path runs
-     `npm ci && npm run build` in the vendor tree and stages the seed payload.
-   - **Registry / connection:** locked pin string
-     `1.1.7-mycodebuddy.stop1` (or capability-parity-approved alternate) in
-     `registry.rs`; `resolve_codex_acp_command()` used for Codex launch.
-   - **Acceptance tests (names are normative intent):** managed-prefix over PATH
-     public 1.1.7; restart survives managed prefix; ACP `initialize` smoke via
-     production resolver; single-flight concurrent install; partial/mismatch
-     repair; env override; plus capability-level smokes if any non-1.1.7
-     baseline is ever approved. Local-only submodule edits without seed + pin +
-     resolver are **blocked**, not complete.
-5. Run adapter unit tests from the vendor package (`vitest` per
-   `src-tauri/vendor/codex-acp/vitest.config.ts`).
-6. Record the submodule commit SHA in the parent repo. The gitlink must be
-   **reachable** from the configured remote for clean-checkout init; if the
-   recorded object is missing, repair/publish the gitlink before adapter tasks.
-   Incident Evidence “sourced at vendor path” means the fork/submodule used for
-   development and packaging, not that public npm 1.1.7 trees are checked in.
+as already configured in `registry.rs`. Optional escape hatch remains
+`CODEG_CODEX_ACP_BIN` if the operator supplies an absolute executable; that is
+operator-owned, not an app-packaged artifact.
 
-CI for Codeg does not currently treat an uninitialized submodule as fatal for
-all targets; the implementation plan must list submodule init as a prerequisite
-for adapter tasks.
+#### What this means for Stop UX
+
+| Concern | v1 expectation |
+| --- | --- |
+| Live content preservation on Stop | **In scope** (FE/Rust runtime Tasks) |
+| Typed interruption footer | **In scope** |
+| Abort-fenced best-effort reconcile when `provider_turn_id` is known | **In scope** |
+| Adapter stops emitting `*Conversation interrupted*` | **Not guaranteed** while public 1.1.7 is the launch pin; may still appear as ordinary assistant text from the adapter |
+| Reliable `_meta.codex.activeTurnId` on every turn | **Not guaranteed** from public 1.1.7; missing id → conservative path (keep live + footer, no destructive reconcile) |
+
+#### Explicit non-work (cancelled for v1)
+
+Do **not** implement as part of this delivery:
+
+- Publishing `1.1.7-mycodebuddy.stop1` (or any private adapter version)
+- Managed prefix under `<app_data>/agent-runtimes/…`
+- Staging `resources/codex-acp-seed/` into desktop/server/Docker
+- Replacing Npx with `resolve_codex_acp_command` for default Codex launch
+- Making an unreachable vendor gitlink a delivery blocker
+
+#### Future optional path (not this delivery)
+
+If Codeg later chooses to host a patched adapter **or** upstream ships the
+marker removal + `activeTurnId` emit, a follow-up may bump the public (or
+private) pin only. That work is a separate design/plan; it is not a gate on
+v1 runtime/parser delivery.
 
 ## Semantic Contract
 
@@ -1039,18 +1026,18 @@ domains, preventing duplicate footers and cross-turn reconciliation.
 
 ### Synthetic Marker Compatibility
 
-Removing the producer prevents new markers. No global text heuristic is added,
-so genuine model output is never silently deleted. A stale old live marker can
-remain only until a matching fenced detail replaces that cancelled turn. AC3
-allows that legacy transitional case.
+No global text heuristic is added, so genuine model output is never silently
+deleted. With the **public 1.1.7** launch pin, the adapter may still produce
+`*Conversation interrupted*` as ordinary assistant text; Codeg does not filter
+it. Typed `TurnOutcome` footer remains the product status signal. A later pin
+bump (upstream or hosted) that removes the producer is optional follow-up.
 
-### Adapter Packaging
+### Adapter Packaging (v1 residual)
 
-If the registry pin / managed-prefix seed path is not updated, production
-continues to emit the synthetic marker even when Codeg FE/Rust are ready. The
-**LOCKED** managed-prefix + seed + pin path above is a **mandatory** delivery
-prerequisite for AC3; local-only submodule verification without seed packaging
-and resolver switch is incomplete.
+**Accepted residual:** Codeg does not ship or manage a patched codex-acp
+binary in this delivery. Production uses public Npx `@…/codex-acp@1.1.7`.
+Marker removal and guaranteed `activeTurnId` emit are **not** v1 acceptance
+gates. Runtime/parser/presentation work remains in scope without them.
 
 ### Fence Completeness Residual
 
@@ -1075,9 +1062,10 @@ parser projection.
    buffer is **best-effort** restored from the rollout parser projection
    without duplicate turns (append-order fence contract; not absolute
    completeness).
-3. New sessions do not emit `Conversation interrupted` as an assistant summary;
-   interruption appears as typed terminal status. Legacy in-memory markers may
-   remain only until a matching fenced reconcile replaces that turn.
+3. Interruption appears as typed terminal status (footer) on user Stop.
+   **v1 residual:** public `@agentclientprotocol/codex-acp@1.1.7` may still
+   emit `Conversation interrupted` as ordinary assistant text; Codeg does not
+   self-host a patched adapter to remove that producer. No global string filter.
 4. Automatic detail reads without the exact abort fence cannot remove, shorten,
    or reorder live content (coordinator, viewer sync, background terminal sync,
    including the pre-envelope soft-fence window after Stop).
@@ -1205,3 +1193,11 @@ amendments; plan writing remains gated on Critical/Important = 0.
 - Codex CLI — APPROVE_WITH_MINORS
 
 Document review group: design approved for implementation planning (Critical = 0, Important = 0). Minors are plan-level (semantic **ADD** wording residual, id spelling, parser test enumeration, soft hedges).
+
+### Product decision 2026-07-27 — no self-managed codex-acp
+
+| Theme | Disposition |
+| --- | --- |
+| AC3 managed pin / seed / resolver | **Cancelled for v1** — keep public Npx `@agentclientprotocol/codex-acp@1.1.7` |
+| Marker / activeTurnId from adapter | **Accepted residual** until upstream or a future pin decision |
+| Runtime/parser/presentation scope | **Unchanged** — remains the delivery core |
