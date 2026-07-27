@@ -19,6 +19,7 @@ import { useEffect, useReducer } from "react"
 import type { DbConversationDetail } from "@/lib/types"
 import { getFolderConversation } from "@/lib/api"
 import {
+  selectPreferredDelegationBinding,
   useDelegation,
   type DelegationBinding,
 } from "@/contexts/delegation-context"
@@ -64,8 +65,18 @@ export function useDelegatedSubSession(
   const enabled = options?.enabled ?? true
   const fallbackChildConversationId =
     options?.fallbackChildConversationId ?? null
-  const { findByParentToolUseId } = useDelegation()
-  const binding = findByParentToolUseId(parentToolUseId)
+  const { findByParentToolUseId, findByChildConversationId } = useDelegation()
+  const directBinding = findByParentToolUseId(parentToolUseId)
+  const childBinding =
+    fallbackChildConversationId == null
+      ? undefined
+      : findByChildConversationId(fallbackChildConversationId)
+  const binding =
+    !directBinding ||
+    (childBinding &&
+      directBinding.childConversationId === childBinding.childConversationId)
+      ? selectPreferredDelegationBinding(directBinding, childBinding)
+      : directBinding
   // When the live binding is unavailable (snapshot replay after refresh,
   // or the parent UI mounted after `delegation_started` was consumed),
   // fall back to a child id provided by the caller — typically derived

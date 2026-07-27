@@ -64,18 +64,28 @@ export function DelegatedSubThread({
   errorText,
   state,
   meta,
+  workUnitKey = null,
+  workUnitSources,
+  explicitUserCancel = false,
 }: Props) {
   const t = useTranslations("Folder.chat.delegation")
   const [filesExpanded, setFilesExpanded] = useState(false)
-  const model = useDelegationCardModel({
-    parentToolUseId,
-    parentConversationId,
-    input,
-    output,
-    errorText,
-    state,
-    meta,
-  })
+  const model = useDelegationCardModel(
+    {
+      parentToolUseId,
+      parentConversationId,
+      input,
+      output,
+      errorText,
+      state,
+      meta,
+    },
+    {
+      workUnitSources,
+      stickyKey: workUnitKey,
+      explicitUserCancel,
+    }
+  )
   const {
     agentType,
     agentDisplayLabel,
@@ -95,6 +105,7 @@ export function DelegatedSubThread({
     runtimeStats,
     cardSummary,
     childTurnAnchor,
+    showGeneratingSegment,
   } = model
 
   // Child id is enough for the affordance; open helper may resolve agentType
@@ -122,6 +133,7 @@ export function DelegatedSubThread({
   return (
     <div
       data-testid="delegated-sub-thread"
+      data-work-unit-key={workUnitKey ?? undefined}
       className="@container/delegcard rounded-lg border border-border bg-card ws-msg-card"
     >
       <div className="flex w-full items-stretch rounded-lg overflow-hidden">
@@ -172,6 +184,7 @@ export function DelegatedSubThread({
               runtimeStats={runtimeStats}
               filesExpanded={filesExpanded}
               onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+              showGeneratingSegment={showGeneratingSegment}
             />
             <DelegationRunSummary summary={cardSummary} />
           </div>

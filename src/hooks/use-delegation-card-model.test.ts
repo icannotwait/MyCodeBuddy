@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest"
 import {
   buildDelegationCardModel,
   isTickerEligible,
+  mergeDelegationWorkUnitModel,
+  type DelegationCardSource,
 } from "@/hooks/use-delegation-card-model"
 import type { DelegationBinding } from "@/lib/delegation-binding-reduce"
 import type { ChildCardProjection } from "@/lib/delegation-child-projection-cache"
@@ -135,6 +137,41 @@ function build(
     nowMs: NOW_MS,
     ...overrides,
   })
+}
+
+function sourceWithStats(input: {
+  parentToolUseId: string
+  taskId: string
+  status: "running" | "completed" | "failed"
+  toolCallCount: number
+  startedAt: string
+  finishedAt?: string | null
+  errorCode?: string | null
+}): DelegationCardSource {
+  return {
+    parentToolUseId: input.parentToolUseId,
+    parentConversationId: 10,
+    input: JSON.stringify({
+      agent_type: "codex",
+      task: "work-unit task",
+      work_unit_key: "unit-a",
+    }),
+    meta: {
+      "codeg.delegation": {
+        status: input.status,
+        task_id: input.taskId,
+        child_conversation_id: 99,
+        started_at: input.startedAt,
+        finished_at: input.finishedAt ?? null,
+        error_code: input.errorCode ?? null,
+        runtime_stats: {
+          ...emptyRuntimeStats(input.startedAt),
+          finished_at: input.finishedAt ?? null,
+          tool_call_count: input.toolCallCount,
+        },
+      },
+    },
+  }
 }
 
 describe("buildDelegationCardModel — merge precedence", () => {
@@ -810,6 +847,145 @@ describe("buildDelegationCardModel — synthetic / cold path", () => {
     expect(model.runtimeStats).toBeNull()
     expect(model.toolCallCount).toBeNull()
   })
+})
+
+describe("mergeDelegationWorkUnitModel", () => {
+  const workStartedAt = "2026-07-27T00:00:00.000Z"
+  const continuedAt = "2026-07-27T00:05:00.000Z"
+  const nowMs = Date.parse("2026-07-27T00:06:00.000Z")
+
+  it("sums per-run peaks and preserves the work-unit elapsed anchor", () => {
+    const sources = [
+      sourceWithStats({
+        parentToolUseId: "pt-1",
+        taskId: "run-1",
+        status: "completed",
+        toolCallCount: 5,
+        startedAt: workStartedAt,
+        finishedAt: continuedAt,
+      }),
+      sourceWithStats({
+        parentToolUseId: "pt-2",
+        taskId: "run-2",
+        status: "running",
+        toolCallCount: 2,
+        startedAt: continuedAt,
+      }),
+    ]
+    const current = build({
+      parsedMeta: meta({
+        status: "running",
+        taskId: "run-2",
+        startedAt: continuedAt,
+        runtimeStats: {
+          ...emptyRuntimeStats(continuedAt),
+          tool_call_count: 2,
+        },
+      }),
+      nowMs,
+    })
+
+    const merged = mergeDelegationWorkUnitModel({
+      model: current,
+      sources,
+      stickyKey: "unit-a",
+      nowMs,
+      hasLiveBinding: true,
+      explicitUserCancel: false,
+    })
+
+    expect(merged.toolCallCount).toBe(7)
+    expect(merged.startedAt).toBe(workStartedAt)
+    expect(merged.elapsedMs).toBe(360_000)
+    expect(merged.showGeneratingSegment).toBe(true)
+    expect(merged.stickyKey).toBe("unit-a")
+  })
+
+  it("keeps a recent recoverable orchestration error generating", () => {
+    const source = sourceWithStats({
+      parentToolUseId: "pt-1",
+      taskId: "run-1",
+      status: "failed",
+      toolCallCount: 5,
+      startedAt: workStartedAt,
+      finishedAt: continuedAt,
+      errorCode: "parent_turn_failed",
+    })
+    const current = build({
+      parsedMeta: meta({
+        status: "err",
+        taskId: "run-1",
+        errorCode: "parent_turn_failed",
+        startedAt: workStartedAt,
+        finishedAt: continuedAt,
+        runtimeStats: {
+          ...emptyRuntimeStats(workStartedAt),
+          finished_at: continuedAt,
+          tool_call_count: 5,
+        },
+      }),
+      nowMs,
+    })
+
+    const merged = mergeDelegationWorkUnitModel({
+      model: current,
+      sources: [source],
+      stickyKey: "unit-a",
+      nowMs,
+      hasLiveBinding: false,
+      explicitUserCancel: false,
+    })
+
+    expect(merged.lifecycleStatus).toBe("running")
+    expect(merged.status).toBe("running")
+    expect(merged.errorCode).toBeUndefined()
+    expect(merged.showGeneratingSegment).toBe(true)
+  })
+
+  it.each([
+    ["completed", "ok", null, false],
+    ["failed", "err", "user_cancelled", true],
+  ] as const)(
+    "does not show generating after %s",
+    (sourceStatus, modelStatus, errorCode, explicitUserCancel) => {
+      const source = sourceWithStats({
+        parentToolUseId: "pt-1",
+        taskId: "run-1",
+        status: sourceStatus,
+        toolCallCount: 5,
+        startedAt: workStartedAt,
+        finishedAt: continuedAt,
+        errorCode,
+      })
+      const current = build({
+        parsedMeta: meta({
+          status: modelStatus,
+          taskId: "run-1",
+          errorCode,
+          startedAt: workStartedAt,
+          finishedAt: continuedAt,
+          runtimeStats: {
+            ...emptyRuntimeStats(workStartedAt),
+            finished_at: continuedAt,
+            tool_call_count: 5,
+          },
+        }),
+        nowMs,
+      })
+
+      const merged = mergeDelegationWorkUnitModel({
+        model: current,
+        sources: [source],
+        stickyKey: "unit-a",
+        nowMs,
+        hasLiveBinding: false,
+        explicitUserCancel,
+      })
+
+      expect(merged.lifecycleStatus).toBe(modelStatus)
+      expect(merged.showGeneratingSegment).toBe(false)
+    }
+  )
 })
 
 describe("buildDelegationCardModel — identity + secondary", () => {

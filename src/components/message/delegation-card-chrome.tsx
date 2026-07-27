@@ -46,6 +46,8 @@ export interface DelegationCardChromeProps {
   runtimeStats: DelegationRuntimeStats | null
   filesExpanded: boolean
   onToggleFilesExpanded: () => void
+  /** Prepend the localized active-generation label to operational stats. */
+  showGeneratingSegment?: boolean
   /**
    * Overlay rows use single-line truncate; the message-stream card uses
    * clamp so long titles still fit without expanding the card height.
@@ -101,6 +103,7 @@ export function DelegationCardChrome({
   runtimeStats,
   filesExpanded,
   onToggleFilesExpanded,
+  showGeneratingSegment = false,
   compact = false,
   className,
 }: DelegationCardChromeProps) {
@@ -116,6 +119,9 @@ export function DelegationCardChrome({
 
   const operationalSegments = useMemo(() => {
     const segments: string[] = []
+    if (showGeneratingSegment) {
+      segments.push(tLive("streaming"))
+    }
     if (elapsedMs != null) {
       segments.push(formatElapsedLabel(elapsedMs, tLive))
     }
@@ -129,7 +135,7 @@ export function DelegationCardChrome({
     )
     if (editSegment) segments.push(editSegment)
     return segments
-  }, [elapsedMs, toolCallCount, editRollup, t, tLive])
+  }, [showGeneratingSegment, elapsedMs, toolCallCount, editRollup, t, tLive])
 
   const operationalLine =
     operationalSegments.length > 0 ? operationalSegments.join(" | ") : null
