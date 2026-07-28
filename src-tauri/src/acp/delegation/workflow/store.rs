@@ -41,7 +41,7 @@ use super::types::{
 use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
-pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v1";
+pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v2";
 
 /// Soft evidence budget for `get_workflow_state` (A15 class: same as MAX_NODES).
 const MAX_STATE_NODE_EVIDENCE: usize = MAX_NODES;
@@ -87,7 +87,8 @@ pub struct PublishWorkflowRequest {
     pub document: ManifestDocument,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SettleGateEvidence {
     Design {
         critical_count: i64,
@@ -442,8 +443,7 @@ pub async fn settle_workflow_gate_core(
                             != Some(submission.covered_plan_digest.as_str())
                         {
                             return Err(WorkflowStoreError::GateNotReady(
-                                "Plan submission digest does not match the active Plan artifact"
-                                    .into(),
+                                "artifact_digest_mismatch: Plan submission digest does not match the active Plan artifact".into(),
                             ));
                         }
 
@@ -1028,6 +1028,7 @@ async fn publish_in_txn(
         )
         .await?;
         if active_digest.as_deref() == Some(document_digest) {
+            let by_token = stamp_workflow_capability_version(txn, by_token).await?;
             return Ok(PublishResult {
                 workflow_id: by_token.workflow_id,
                 manifest_revision: by_token.active_manifest_revision as u64,
@@ -1110,6 +1111,7 @@ async fn publish_in_txn(
                 )
                 .await?;
                 if active_digest.as_deref() == Some(document_digest) {
+                    let existing = stamp_workflow_capability_version(txn, existing).await?;
                     return Ok(PublishResult {
                         workflow_id: existing.workflow_id.clone(),
                         manifest_revision: existing.active_manifest_revision as u64,
@@ -1180,6 +1182,7 @@ async fn publish_in_txn(
         am.active_manifest_revision = Set(next_manifest_rev);
         am.graph_revision = Set(next_graph_rev);
         am.workflow_state = Set(workflow_state);
+        am.capability_version = Set(WORKFLOW_CAPABILITY_VERSION.into());
         am.supersedes_approved_revision = Set(supersedes);
         am.structural_revision = Set(next_structural_rev);
         am.design_fingerprint = Set(next_design_fp);
@@ -1409,7 +1412,7 @@ async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
 
 async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     conn: &C,
-    header: delegation_workflow::Model,
+    mut header: delegation_workflow::Model,
     parent_conversation_id: i32,
     token: &str,
     document_digest: &str,
@@ -1417,6 +1420,11 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     let active_digest =
         load_active_manifest_digest_txn(conn, &header.workflow_id, header.active_manifest_revision)
             .await?;
+    if header.parent_conversation_id == parent_conversation_id
+        && active_digest.as_deref() == Some(document_digest)
+    {
+        header = stamp_workflow_capability_version(conn, header).await?;
+    }
     classify_header_against_digest(
         token,
         parent_conversation_id,
@@ -1428,6 +1436,18 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
         header.graph_revision as u64,
         workflow_state_to_manifest(header.workflow_state),
     )
+}
+
+async fn stamp_workflow_capability_version<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    header: delegation_workflow::Model,
+) -> Result<delegation_workflow::Model, WorkflowStoreError> {
+    if header.capability_version == WORKFLOW_CAPABILITY_VERSION {
+        return Ok(header);
+    }
+    let mut active: delegation_workflow::ActiveModel = header.into();
+    active.capability_version = Set(WORKFLOW_CAPABILITY_VERSION.into());
+    active.update(conn).await.map_err(db_err)
 }
 
 /// Pure B8 reclassify once a **durable** header row is known.
@@ -1563,6 +1583,7 @@ fn frozen_cohort_error(task_index: i64) -> WorkflowStoreError {
 }
 
 /// Apply node-binding create / retain / freeze rules for a publish.
+#[allow(clippy::too_many_arguments)]
 async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -1920,16 +1941,19 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
     }
     if author_binding.task_id != submission.covered_author_task_id {
         return Err(WorkflowStoreError::GateNotReady(format!(
-            "covered Author task {} is not the latest active Plan Author task {}",
+            "reviewed_task_stale: covered Author task {} is not the latest active Plan Author task {}",
             submission.covered_author_task_id, author_binding.task_id
         )));
     }
-    if !author_binding.summary_validated
-        || author_binding.artifact_digest.as_deref()
-            != Some(submission.covered_plan_digest.as_str())
-    {
+    if !author_binding.summary_validated {
         return Err(WorkflowStoreError::GateNotReady(
-            "Author evidence is not validated against the covered Plan digest".into(),
+            "covered Author evidence is not validated".into(),
+        ));
+    }
+    if author_binding.artifact_digest.as_deref() != Some(submission.covered_plan_digest.as_str()) {
+        return Err(WorkflowStoreError::GateNotReady(
+            "artifact_digest_mismatch: Author evidence does not match the covered Plan digest"
+                .into(),
         ));
     }
     let author_run =
@@ -1953,6 +1977,14 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
             plan_digest,
             ..
         }) if plan_digest == submission.covered_plan_digest => {}
+        Some(CardSummary::Author {
+            status: WorkStatus::Done | WorkStatus::DoneWithConcerns,
+            ..
+        }) => {
+            return Err(WorkflowStoreError::GateNotReady(
+                "artifact_digest_mismatch: completed Plan Author card does not match the covered Plan digest".into(),
+            ));
+        }
         _ => {
             return Err(WorkflowStoreError::GateNotReady(
                 "covered Plan Author task lacks matching completed Author evidence".into(),
@@ -1979,12 +2011,21 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
                     gate.id
                 ))
             })?;
+        if binding.reviewed_task_id.as_deref() != Some(submission.covered_author_task_id.as_str()) {
+            return Err(WorkflowStoreError::GateNotReady(format!(
+                "reviewed_task_stale: Plan reviewer {reviewer_id} does not cover Author task {}",
+                submission.covered_author_task_id
+            )));
+        }
+        if binding.artifact_digest.as_deref() != Some(submission.covered_plan_digest.as_str()) {
+            return Err(WorkflowStoreError::GateNotReady(format!(
+                "artifact_digest_mismatch: Plan reviewer {reviewer_id} does not cover digest {}",
+                submission.covered_plan_digest
+            )));
+        }
         let binding_matches = binding.summary_validated
             && binding.manifest_revision == active_manifest_revision
             && binding.content_fingerprint.as_deref() == Some(current_content_fingerprint)
-            && binding.artifact_digest.as_deref() == Some(submission.covered_plan_digest.as_str())
-            && binding.reviewed_task_id.as_deref()
-                == Some(submission.covered_author_task_id.as_str())
             && !prior_ts.is_some_and(|timestamp| binding.created_at <= timestamp);
         let run = delegation_task_run::Entity::find_by_id(binding.task_id)
             .one(conn)
@@ -3085,6 +3126,214 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/wf-store").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         (db, parent)
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_v2_persisted_header_stamps_capability_version() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("workflow-manifest-v2-header"),
+            },
+        )
+        .await
+        .expect("publish v2 skeleton");
+        let header = delegation_workflow::Entity::find_by_id(published.workflow_id)
+            .one(&db.conn)
+            .await
+            .expect("load header")
+            .expect("persisted header");
+        assert_eq!(header.capability_version, "workflow_manifest_v2");
+        assert_eq!(WORKFLOW_CAPABILITY_VERSION, "workflow_manifest_v2");
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_v2_replay_and_update_upgrade_existing_header() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = design_plan_doc("workflow-manifest-v2-upgrade");
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .expect("publish initial manifest");
+
+        let downgrade_header = async || {
+            let header = delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+                .one(&db.conn)
+                .await
+                .expect("load header")
+                .expect("persisted header");
+            let mut active: delegation_workflow::ActiveModel = header.into();
+            active.capability_version = Set("workflow_manifest_v1".into());
+            active.update(&db.conn).await.expect("seed v1 header");
+        };
+
+        downgrade_header().await;
+        let replay = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .expect("replay through v2 endpoint");
+        assert!(replay.idempotent_replay);
+        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+            .await
+            .expect("recover replayed workflow");
+        assert_eq!(recovery.capability_version, "workflow_manifest_v2");
+
+        downgrade_header().await;
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(1);
+        document.plan.as_mut().expect("Plan document").digest = "sha256:plan-v2".into();
+        let update = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .expect("update through v2 endpoint");
+        assert!(!update.idempotent_replay);
+        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+            .await
+            .expect("recover updated workflow");
+        assert_eq!(recovery.capability_version, "workflow_manifest_v2");
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_v2_plan_digest_mismatch_has_typed_marker() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("workflow-manifest-v2-digest-error"),
+            },
+        )
+        .await
+        .expect("publish Plan workflow");
+
+        let error = settle_for_test(
+            &db,
+            &emitter,
+            parent,
+            &published.workflow_id,
+            "plan",
+            1,
+            published.graph_revision,
+            1,
+            GateSettlementOutcome::ChangesRequested,
+            TestGateEvidence::Plan(plan_submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &["plan-reviewer-1"],
+                vec![],
+                "author-task-1",
+                "sha256:contradictory-plan",
+            )),
+            "contradictory Plan digest",
+        )
+        .await
+        .expect_err("contradictory Plan digest must fail");
+        assert!(
+            matches!(
+                error,
+                WorkflowStoreError::GateNotReady(ref message)
+                    if message.starts_with("artifact_digest_mismatch:")
+            ),
+            "real store producer must preserve the stable typed marker: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_v2_author_card_digest_mismatch_has_typed_marker() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("workflow-manifest-v2-author-card-digest"),
+            },
+        )
+        .await
+        .expect("publish Plan workflow");
+        insert_plan_author_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "author-card-digest-task",
+            1,
+            "sha256:plan",
+            "reports/author-card-digest.md",
+            0,
+        )
+        .await;
+        let run = delegation_task_run::Entity::find_by_id("author-card-digest-task")
+            .one(&db.conn)
+            .await
+            .expect("load Author run")
+            .expect("persisted Author run");
+        let mut active: delegation_task_run::ActiveModel = run.into();
+        active.card_summary_json = Set(Some(
+            serde_json::json!({
+                "kind": "author",
+                "status": "done",
+                "summary": "Plan artifact completed",
+                "plan_digest": "sha256:contradictory-author-card",
+                "report_file": "reports/author-card-digest.md"
+            })
+            .to_string(),
+        ));
+        active.update(&db.conn).await.expect("mutate Author card");
+
+        let error = settle_for_test(
+            &db,
+            &emitter,
+            parent,
+            &published.workflow_id,
+            "plan",
+            1,
+            published.graph_revision,
+            1,
+            GateSettlementOutcome::ChangesRequested,
+            TestGateEvidence::Plan(plan_submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &["plan-reviewer-1"],
+                vec![],
+                "author-card-digest-task",
+                "sha256:plan",
+            )),
+            "contradictory Author card digest",
+        )
+        .await
+        .expect_err("contradictory Author card digest must fail");
+        assert!(
+            matches!(
+                error,
+                WorkflowStoreError::GateNotReady(ref message)
+                    if message.starts_with("artifact_digest_mismatch:")
+            ),
+            "Author card producer must preserve the stable typed marker: {error:?}"
+        );
     }
 
     /// Design document digest used by `design_plan_doc`.

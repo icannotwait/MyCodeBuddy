@@ -11,11 +11,11 @@
 //! `ask_user_question` (block on a multiple-choice card), `get_session_info`
 //! (resolve a referenced session by id), coordination-only
 //! `request_parent_decision` / `reply_to_delegation`, plus Root-only
-//! `workflow_v1` tools (`get_workflow_capabilities`, `get_workflow_state`,
+//! `workflow_v2` tools (`get_workflow_capabilities`, `get_workflow_state`,
 //! `publish_workflow_manifest`, `settle_workflow_gate`) — whose schemas are
 //! embedded at compile time from [`TOOL_SCHEMA_JSON`] and gated by the
 //! `--features` groups (delegation / coordination_v1 / feedback / ask /
-//! sessions / workflow_v1) and launch role.
+//! sessions / workflow_v2) and launch role.
 //! Only `delegate_to_agent` registers a broker-side cancel handle; canceling a
 //! status / cancel / feedback / session / decision round-trip merely suppresses
 //! its response — and for `check_user_feedback` also skips the delivery commit,
@@ -170,13 +170,13 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
-    /// Root-only workflow_manifest_v1 mutation/recovery tools. Single bit
+    /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
     /// enables all four B9 tools together (structural catalog agreement).
-    pub workflow_v1: bool,
+    pub workflow_v2: bool,
 }
 
-/// Canonical B9 tool set for `workflow_manifest_v1`.
-pub const WORKFLOW_V1_TOOLS: &[&str] = &[
+/// Canonical root tool set for `workflow_manifest_v2`.
+pub const WORKFLOW_V2_TOOLS: &[&str] = &[
     "get_workflow_capabilities",
     "get_workflow_state",
     "publish_workflow_manifest",
@@ -186,42 +186,41 @@ pub const WORKFLOW_V1_TOOLS: &[&str] = &[
 /// Capability catalog classification (B9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowCapabilityMode {
-    /// None of the four workflow tools present → legacy companion.
-    Legacy,
-    /// All four present → v1 mode (capability must also report true).
-    WorkflowManifestV1,
-    /// Partial tool set → inconsistent hard-block (not legacy downgrade).
+    /// None of the four workflow tools present; workflow is unavailable.
+    Unavailable,
+    /// All four present → v2 mode (capability must also report true).
+    WorkflowManifestV2,
+    /// Partial tool set → inconsistent hard-block.
     Inconsistent,
 }
 
-/// Classify a tool-name catalog under B9. `none → legacy`, `all four → v1`,
-/// any other subset → inconsistent hard-block.
+/// Classify a workflow catalog. Missing and partial catalogs both fail closed.
 pub fn classify_workflow_tool_catalog<'a, I>(tool_names: I) -> WorkflowCapabilityMode
 where
     I: IntoIterator<Item = &'a str>,
 {
     let mut mask = 0u8;
     for name in tool_names {
-        if let Some(i) = WORKFLOW_V1_TOOLS.iter().position(|t| *t == name) {
+        if let Some(i) = WORKFLOW_V2_TOOLS.iter().position(|t| *t == name) {
             mask |= 1 << i;
         }
     }
-    let all = (1u8 << WORKFLOW_V1_TOOLS.len()) - 1;
+    let all = (1u8 << WORKFLOW_V2_TOOLS.len()) - 1;
     match mask {
-        0 => WorkflowCapabilityMode::Legacy,
-        m if m == all => WorkflowCapabilityMode::WorkflowManifestV1,
+        0 => WorkflowCapabilityMode::Unavailable,
+        m if m == all => WorkflowCapabilityMode::WorkflowManifestV2,
         _ => WorkflowCapabilityMode::Inconsistent,
     }
 }
 
 /// Local `get_workflow_capabilities` payload from launch features/role (A15.1).
-/// Does not touch durable workflow state. When `workflow_v1` is on and role is
-/// Root, returns v1 true with the four operation names; otherwise v1 false and
+/// Does not touch durable workflow state. When `workflow_v2` is on and role is
+/// Root, returns v2 true with the four operation names; otherwise v2 false and
 /// empty operations (tool itself is normally absent when feature is off).
 pub fn local_workflow_capabilities(features: &CompanionFeatures, role: CompanionRole) -> Value {
-    let enabled = features.workflow_v1 && role == CompanionRole::Root;
+    let enabled = features.workflow_v2 && role == CompanionRole::Root;
     let operations: Vec<&str> = if enabled {
-        WORKFLOW_V1_TOOLS.to_vec()
+        WORKFLOW_V2_TOOLS.to_vec()
     } else {
         Vec::new()
     };
@@ -230,13 +229,13 @@ pub fn local_workflow_capabilities(features: &CompanionFeatures, role: Companion
             WORKFLOW_CAPABILITY_VERSION: enabled,
         },
         "operations": operations,
-        "workflow_manifest_v1": enabled,
+        "workflow_manifest_v2": enabled,
     })
 }
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,coordination_v1,feedback,ask,sessions,workflow_v1`). Unknown
+    /// `delegation,coordination_v1,feedback,ask,sessions,workflow_v2`). Unknown
     /// tokens are ignored. An absent value (`None`) defaults to
     /// delegation-only without Join or workflow — backward compatible with a
     /// parent that predates feature gating.
@@ -248,7 +247,7 @@ impl CompanionFeatures {
                 feedback: false,
                 ask: false,
                 sessions: false,
-                workflow_v1: false,
+                workflow_v2: false,
             };
         };
         let mut f = Self {
@@ -257,7 +256,7 @@ impl CompanionFeatures {
             feedback: false,
             ask: false,
             sessions: false,
-            workflow_v1: false,
+            workflow_v2: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -266,7 +265,7 @@ impl CompanionFeatures {
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
-                "workflow_v1" => f.workflow_v1 = true,
+                "workflow_v2" => f.workflow_v2 = true,
                 _ => {}
             }
         }
@@ -287,10 +286,10 @@ impl CompanionFeatures {
         }
     }
 
-    /// Whether workflow_manifest_v1 tools are structurally enabled (feature bit).
+    /// Whether workflow_manifest_v2 tools are structurally enabled (feature bit).
     /// Role gating is applied separately in [`CompanionContext::allows_tool`].
     pub fn workflow_tools_enabled(&self) -> bool {
-        self.workflow_v1
+        self.workflow_v2
     }
 }
 
@@ -319,12 +318,12 @@ impl CompanionContext {
                     && self.role == CompanionRole::DelegationChild
             }
             "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
-            // B9 / A4: all four workflow tools require workflow_v1 + Root.
+            // All four workflow tools require workflow_v2 + Root.
             "get_workflow_capabilities"
             | "get_workflow_state"
             | "publish_workflow_manifest"
             | "settle_workflow_gate" => {
-                self.features.workflow_v1 && self.role == CompanionRole::Root
+                self.features.workflow_v2 && self.role == CompanionRole::Root
             }
             other => self.features.allows_legacy_tool(other),
         }
@@ -878,9 +877,33 @@ fn parse_settle_workflow_args(
     let manifest_revision = parse_u64_arg(arguments, "manifest_revision")?;
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
     let gate_cycle = parse_u64_arg(arguments, "gate_cycle")?;
-    let critical_count = parse_nonneg_count_arg(arguments, "critical_count")?;
-    let important_count = parse_nonneg_count_arg(arguments, "important_count")?;
-    let minor_count = parse_nonneg_count_arg(arguments, "minor_count")?;
+    let evidence_value = arguments
+        .get("evidence")
+        .cloned()
+        .ok_or_else(|| "settle_workflow_gate requires structured evidence".to_string())?;
+    let evidence: crate::acp::delegation::workflow::SettleGateEvidence =
+        serde_json::from_value(evidence_value)
+            .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
+    if let crate::acp::delegation::workflow::SettleGateEvidence::Design {
+        critical_count,
+        important_count,
+        minor_count,
+    } = &evidence
+    {
+        for (key, value) in [
+            ("critical_count", critical_count),
+            ("important_count", important_count),
+            ("minor_count", minor_count),
+        ] {
+            if *value < 0 {
+                return Err(format!(
+                    "settle_workflow_gate {key} must be a non-negative integer"
+                ));
+            }
+        }
+    }
+    let evidence = serde_json::to_value(evidence)
+        .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
     Ok(BrokerSettleWorkflowRequest {
         token: token.to_string(),
         workflow_id,
@@ -889,9 +912,7 @@ fn parse_settle_workflow_args(
         expected_graph_revision,
         gate_cycle,
         outcome,
-        critical_count,
-        important_count,
-        minor_count,
+        evidence,
         summary,
     })
 }
@@ -906,25 +927,6 @@ fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
             .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
         _ => Err(format!("settle_workflow_gate requires {key}")),
     }
-}
-
-/// Adjudication finding counts: integer ≥ 0 (MCP schema `minimum: 0`).
-fn parse_nonneg_count_arg(arguments: &Value, key: &str) -> Result<i64, String> {
-    let value = match arguments.get(key) {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer"))?,
-        Some(Value::String(s)) => s
-            .parse::<i64>()
-            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer"))?,
-        _ => return Err(format!("settle_workflow_gate requires {key}")),
-    };
-    if value < 0 {
-        return Err(format!(
-            "settle_workflow_gate {key} must be a non-negative integer"
-        ));
-    }
-    Ok(value)
 }
 
 /// Local capability result (no broker error shape).
@@ -1814,7 +1816,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
-            workflow_v1: false,
+            workflow_v2: false,
         })
     }
 
@@ -2771,7 +2773,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: false,
-        workflow_v1: false,
+        workflow_v2: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2779,7 +2781,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: false,
-        workflow_v1: false,
+        workflow_v2: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2787,7 +2789,7 @@ mod tests {
         feedback: false,
         ask: true,
         sessions: false,
-        workflow_v1: false,
+        workflow_v2: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -2795,7 +2797,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: true,
-        workflow_v1: false,
+        workflow_v2: false,
     };
     const GROK_FEATURES: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2803,7 +2805,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: true,
-        workflow_v1: true,
+        workflow_v2: true,
     };
     const COORDINATION: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2811,7 +2813,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: false,
-        workflow_v1: false,
+        workflow_v2: false,
     };
     const WORKFLOW_ROOT: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -2819,7 +2821,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: false,
-        workflow_v1: true,
+        workflow_v2: true,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -2839,7 +2841,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
-            workflow_v1: false,
+            workflow_v2: false,
         })
     }
 
@@ -3061,38 +3063,92 @@ mod tests {
         assert!(def.delegation && !def.feedback && !def.coordination_v1);
         assert!(!def.ask);
         assert!(!def.sessions);
-        assert!(!def.workflow_v1);
+        assert!(!def.workflow_v2);
         // Explicit list, whitespace + unknown tokens tolerated.
         let all = CompanionFeatures::parse(Some(
-            " delegation , coordination_v1 , feedback , ask , sessions , workflow_v1 ,bogus",
+            " delegation , coordination_v1 , feedback , ask , sessions , workflow_v2 ,bogus",
         ));
         assert!(all.delegation && all.coordination_v1 && all.feedback && all.ask && all.sessions);
-        assert!(all.workflow_v1);
+        assert!(all.workflow_v2);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
-        assert!(!fb.workflow_v1);
+        assert!(!fb.workflow_v2);
         let ask = CompanionFeatures::parse(Some("ask"));
         assert!(!ask.delegation && !ask.feedback && ask.ask);
         let sessions = CompanionFeatures::parse(Some("sessions"));
         assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
-        let wf = CompanionFeatures::parse(Some("workflow_v1"));
-        assert!(wf.workflow_v1 && !wf.delegation);
+        let wf = CompanionFeatures::parse(Some("workflow_v2"));
+        assert!(wf.workflow_v2 && !wf.delegation);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
         assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
         assert!(!none.coordination_v1);
-        assert!(!none.workflow_v1);
+        assert!(!none.workflow_v2);
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_feature_token_is_exclusive_and_root_only() {
+        let v2 = CompanionFeatures::parse(Some("workflow_v2"));
+        assert!(
+            v2.workflow_tools_enabled(),
+            "the literal workflow_v2 token must enable the atomic workflow catalog"
+        );
+
+        let mut root = ctx_with(v2);
+        root.role = CompanionRole::Root;
+        let root_names = list_tool_names(dispatch_with_context(root, tools_list()).await);
+        let root_workflow_names: Vec<&str> = root_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| WORKFLOW_V2_TOOLS.contains(name))
+            .collect();
+        assert_eq!(root_workflow_names, WORKFLOW_V2_TOOLS);
+
+        let mut child = ctx_with(v2);
+        child.role = CompanionRole::DelegationChild;
+        let child_names = list_tool_names(dispatch_with_context(child, tools_list()).await);
+        assert!(
+            WORKFLOW_V2_TOOLS
+                .iter()
+                .all(|tool| !child_names.iter().any(|name| name == tool)),
+            "delegation children must expose no workflow tools: {child_names:?}"
+        );
+
+        let v1 = CompanionFeatures::parse(Some("workflow_v1"));
+        assert!(
+            !v1.workflow_tools_enabled(),
+            "workflow_v1 must be ignored as an unknown token"
+        );
+    }
+
+    #[test]
+    fn workflow_v2_catalog_modes_fail_closed() {
+        assert_eq!(
+            format!("{:?}", classify_workflow_tool_catalog(std::iter::empty())),
+            "Unavailable"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                classify_workflow_tool_catalog(WORKFLOW_V2_TOOLS.iter().copied())
+            ),
+            "WorkflowManifestV2"
+        );
+        assert_eq!(
+            classify_workflow_tool_catalog(["get_workflow_capabilities"]),
+            WorkflowCapabilityMode::Inconsistent
+        );
     }
 
     #[test]
     fn b9_partial_tool_set_is_inconsistent_hard_block() {
         assert_eq!(
             classify_workflow_tool_catalog(std::iter::empty()),
-            WorkflowCapabilityMode::Legacy
+            WorkflowCapabilityMode::Unavailable
         );
         assert_eq!(
-            classify_workflow_tool_catalog(WORKFLOW_V1_TOOLS.iter().copied()),
-            WorkflowCapabilityMode::WorkflowManifestV1
+            classify_workflow_tool_catalog(WORKFLOW_V2_TOOLS.iter().copied()),
+            WorkflowCapabilityMode::WorkflowManifestV2
         );
         // Any non-empty proper subset → hard-block, not legacy.
         assert_eq!(
@@ -3114,20 +3170,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_v1_root_catalog_agrees_with_local_capabilities() {
+    async fn workflow_v2_root_catalog_agrees_with_local_capabilities() {
         let names = list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
-        for tool in WORKFLOW_V1_TOOLS {
+        for tool in WORKFLOW_V2_TOOLS {
             assert!(
                 names.iter().any(|n| n == *tool),
-                "root workflow_v1 must expose {tool}; names={names:?}"
+                "root workflow_v2 must expose {tool}; names={names:?}"
             );
         }
         assert_eq!(
             classify_workflow_tool_catalog(names.iter().map(String::as_str)),
-            WorkflowCapabilityMode::WorkflowManifestV1
+            WorkflowCapabilityMode::WorkflowManifestV2
         );
         let caps = local_workflow_capabilities(&WORKFLOW_ROOT, CompanionRole::Root);
-        assert_eq!(caps["workflow_manifest_v1"], true);
+        assert_eq!(caps["workflow_manifest_v2"], true);
         assert_eq!(caps["versions"][WORKFLOW_CAPABILITY_VERSION], true);
         let ops: Vec<&str> = caps["operations"]
             .as_array()
@@ -3135,7 +3191,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(ops, WORKFLOW_V1_TOOLS);
+        assert_eq!(ops, WORKFLOW_V2_TOOLS);
         // Catalog ∩ capability operations agreement (A15.1 / B9).
         for op in &ops {
             assert!(names.iter().any(|n| n == *op));
@@ -3143,11 +3199,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_v1_child_hides_all_workflow_tools() {
+    async fn workflow_v2_child_hides_all_workflow_tools() {
         let mut child = ctx_with(WORKFLOW_ROOT);
         child.role = CompanionRole::DelegationChild;
         let names = list_tool_names(dispatch_with_context(child.clone(), tools_list()).await);
-        for tool in WORKFLOW_V1_TOOLS {
+        for tool in WORKFLOW_V2_TOOLS {
             assert!(
                 !names.iter().any(|n| n == *tool),
                 "child must not expose {tool}; names={names:?}"
@@ -3182,7 +3238,7 @@ mod tests {
         let resp = unwrap_respond(action);
         let result = resp.result.expect("capabilities result");
         assert_eq!(result["isError"], false);
-        assert_eq!(result["structuredContent"]["workflow_manifest_v1"], true);
+        assert_eq!(result["structuredContent"]["workflow_manifest_v2"], true);
         assert_eq!(
             result["structuredContent"]["versions"][WORKFLOW_CAPABILITY_VERSION],
             true
@@ -3202,9 +3258,12 @@ mod tests {
                     "expected_graph_revision": 1,
                     "gate_cycle": 1,
                     "outcome": "changes_requested",
-                    "critical_count": -1,
-                    "important_count": 0,
-                    "minor_count": 0,
+                    "evidence": {
+                        "kind": "design",
+                        "critical_count": -1,
+                        "important_count": 0,
+                        "minor_count": 0
+                    },
                     "summary": "nope",
                 }),
             ),
@@ -3217,9 +3276,12 @@ mod tests {
                     "expected_graph_revision": 1,
                     "gate_cycle": 1,
                     "outcome": "changes_requested",
-                    "critical_count": 0,
-                    "important_count": -2,
-                    "minor_count": 0,
+                    "evidence": {
+                        "kind": "design",
+                        "critical_count": 0,
+                        "important_count": -2,
+                        "minor_count": 0
+                    },
                     "summary": "nope",
                 }),
             ),
@@ -3232,9 +3294,12 @@ mod tests {
                     "expected_graph_revision": 1,
                     "gate_cycle": 1,
                     "outcome": "blocked",
-                    "critical_count": 0,
-                    "important_count": 0,
-                    "minor_count": -3,
+                    "evidence": {
+                        "kind": "design",
+                        "critical_count": 0,
+                        "important_count": 0,
+                        "minor_count": -3
+                    },
                     "summary": "nope",
                 }),
             ),
@@ -3253,6 +3318,111 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn workflow_manifest_v2_plan_settlement_preserves_structured_evidence() {
+        let evidence = json!({
+            "kind": "plan",
+            "scope": "full",
+            "revision_kind": "initial",
+            "scope_reason": "initial independent review",
+            "covered_author_task_id": "author-task-1",
+            "covered_plan_digest": "sha256:plan",
+            "required_reviewer_node_ids": ["plan-reviewer-codex", "plan-reviewer-grok"],
+            "finding_updates": [{
+                "finding_id": "finding-1",
+                "severity": "important",
+                "status": "open",
+                "owner_reviewer_node_ids": ["plan-reviewer-codex"],
+                "summary": "missing failure mode",
+                "evidence_ref": "plan.md:42",
+                "report_file": "reports/plan-review-codex.md"
+            }],
+            "lineage_reset_reason": null
+        });
+        let req = parse_settle_workflow_args(
+            &json!({
+                "workflow_id": "wf-1",
+                "manifest_revision": 1,
+                "gate_id": "plan",
+                "expected_graph_revision": 1,
+                "gate_cycle": 1,
+                "outcome": "changes_requested",
+                "evidence": evidence,
+                "summary": "one important finding"
+            }),
+            "token",
+        )
+        .expect("structured Plan evidence parses");
+        let wire = serde_json::to_value(req).expect("serialize settle broker request");
+        assert_eq!(wire["evidence"], evidence);
+        assert!(wire.get("critical_count").is_none());
+        assert!(wire.get("important_count").is_none());
+        assert!(wire.get("minor_count").is_none());
+    }
+
+    #[test]
+    fn workflow_manifest_v2_schema_is_compact_and_constructible() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+        let tools = schema.as_array().expect("tool catalog array");
+        let capabilities = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_workflow_capabilities")
+            .expect("capabilities tool");
+        assert!(tool_guidance(capabilities).contains("workflow_manifest_v2"));
+
+        let publish = tools
+            .iter()
+            .find(|tool| tool["name"] == "publish_workflow_manifest")
+            .expect("publish tool");
+        assert_eq!(
+            publish["inputSchema"]["properties"]["schema_version"]["const"],
+            2
+        );
+        assert_eq!(
+            publish["inputSchema"]["properties"]["risk_policy_version"]["const"],
+            "b2d_task_risk_v1"
+        );
+        for required in [
+            "plan_target_rel_path",
+            "risk_policy_version",
+            "task_policies",
+        ] {
+            assert!(
+                publish["inputSchema"]["required"]
+                    .as_array()
+                    .expect("publish required")
+                    .iter()
+                    .any(|value| value == required),
+                "publish schema must require {required}"
+            );
+        }
+
+        let settle = tools
+            .iter()
+            .find(|tool| tool["name"] == "settle_workflow_gate")
+            .expect("settle tool");
+        let guidance = tool_guidance(settle);
+        for phrase in [
+            "full",
+            "scoped",
+            "revision_kind",
+            "covered_author_task_id",
+            "required_reviewer_node_ids",
+            "finding_updates",
+            "report_file",
+        ] {
+            assert!(
+                guidance.contains(phrase),
+                "settle guidance lost required phrase: {phrase}"
+            );
+        }
+        assert!(settle["inputSchema"]["required"]
+            .as_array()
+            .expect("settle required")
+            .iter()
+            .any(|value| value == "evidence"));
     }
 
     #[tokio::test]
@@ -3282,7 +3452,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        // Root + coordination_v1 + workflow_v1: reply + four workflow tools.
+        // Root + coordination_v1 + workflow_v2: reply + four workflow tools.
         assert_eq!(
             names,
             vec![
@@ -3305,6 +3475,7 @@ mod tests {
         // Compatibility contract: Grok splits a JSONL line at 8,192 bytes and
         // does not reassemble it. Keep 512 bytes of headroom; do not raise this
         // literal to make a growing catalog pass.
+        println!("Grok tools/list JSONL bytes: {}", line.len());
         assert!(
             line.len() <= 7_680,
             "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",

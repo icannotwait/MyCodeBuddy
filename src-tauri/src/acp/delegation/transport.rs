@@ -37,7 +37,7 @@
 //!     `reply_to_delegation`. Immediate (no long-poll): first durable reply wins;
 //!     identical replay is idempotent.
 //!   * `publish_workflow` / `settle_workflow` / `get_workflow_state` —
-//!     Root-only `workflow_v1` tools routed to store `_core` (Task 5).
+//!     Root-only `workflow_v2` tools routed to store `_core`.
 //!   * `cancel` — fire-and-forget [`BrokerCancelRequest`] from MCP
 //!     `notifications/cancelled`, targeting an in-flight `delegate_to_agent`
 //!     call by `external_handle`; gets a `Value::Null` ack.
@@ -281,10 +281,48 @@ pub struct BrokerSettleWorkflowRequest {
     pub expected_graph_revision: u64,
     pub gate_cycle: u64,
     pub outcome: String,
-    pub critical_count: i64,
-    pub important_count: i64,
-    pub minor_count: i64,
+    /// Tagged `design` or `plan` evidence. Listener deserializes this into the
+    /// canonical store evidence type so nested validation stays in Rust.
+    pub evidence: Value,
     pub summary: String,
+}
+
+#[cfg(test)]
+mod workflow_v2_tests {
+    use super::BrokerSettleWorkflowRequest;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_manifest_v2_settle_transport_round_trip_preserves_evidence() {
+        let evidence = json!({
+            "kind": "plan",
+            "scope": "scoped",
+            "revision_kind": "localized",
+            "scope_reason": "recheck finding owners",
+            "covered_author_task_id": "author-task-2",
+            "covered_plan_digest": "sha256:plan-2",
+            "required_reviewer_node_ids": ["plan-reviewer-codex"],
+            "finding_updates": [],
+            "lineage_reset_reason": null
+        });
+        let request: BrokerSettleWorkflowRequest = serde_json::from_value(json!({
+            "token": "secret",
+            "workflow_id": "wf-1",
+            "manifest_revision": 2,
+            "gate_id": "plan",
+            "expected_graph_revision": 3,
+            "gate_cycle": 2,
+            "outcome": "approved",
+            "evidence": evidence,
+            "summary": "all findings resolved"
+        }))
+        .expect("structured Plan evidence decodes");
+        let round_trip = serde_json::to_value(request).expect("encode settle request");
+        assert_eq!(round_trip["evidence"], evidence);
+        assert!(round_trip.get("critical_count").is_none());
+        assert!(round_trip.get("important_count").is_none());
+        assert!(round_trip.get("minor_count").is_none());
+    }
 }
 
 /// Load durable workflow recovery state. Backs `get_workflow_state`.
