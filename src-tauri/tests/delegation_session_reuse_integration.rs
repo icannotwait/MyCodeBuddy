@@ -627,6 +627,11 @@ struct SkillScenario {
     max_replacements: i64,
 }
 
+/// Collapse Skill markdown wrapping so contract phrases match across line breaks.
+fn normalize_skill_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn skill_forward_scenarios() -> Vec<SkillScenario> {
     vec![
         SkillScenario {
@@ -744,7 +749,7 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
-            policy_outcome: "at most one replacement and two",
+            policy_outcome: "at most one replacement and two unexpected continues per work unit",
             must_differ_from: &[],
             max_unexpected_continues: 2,
             max_replacements: 1,
@@ -762,6 +767,7 @@ fn skill_forward_routing_invariants_nine_scenarios() {
         .join("SKILL.md");
     let skill = std::fs::read_to_string(&skill_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
+    let skill = normalize_skill_whitespace(&skill);
     // Markers must match current Skill contract language (not legacy prose).
     // Runtime wire codes such as busy_thread are asserted elsewhere.
     for marker in [
