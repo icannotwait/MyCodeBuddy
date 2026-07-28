@@ -238,7 +238,9 @@ export function validateRouteTables(taskRouteSection) {
   if (!normalKey) {
     failures.push("Task route missing `### Normal route` table")
   } else {
-    const rows = tables.get(normalKey).filter((r) => classifyRole(roleCell(r.cells)))
+    const rows = tables
+      .get(normalKey)
+      .filter((r) => classifyRole(roleCell(r.cells)))
     const impls = []
     const revs = []
     const extras = []
@@ -290,7 +292,9 @@ export function validateRouteTables(taskRouteSection) {
   if (!highKey) {
     failures.push("Task route missing `### High route` table")
   } else {
-    const rows = tables.get(highKey).filter((r) => classifyRole(roleCell(r.cells)))
+    const rows = tables
+      .get(highKey)
+      .filter((r) => classifyRole(roleCell(r.cells)))
     const impls = []
     const revs = []
     const extras = []
@@ -356,24 +360,112 @@ export function validateRouteTables(taskRouteSection) {
   return failures
 }
 
-const PARENT_ACTIONS = [
-  [
-    /\b(?:writes?|authors?|rewrites?|edits?|implements?)\s+(?:the\s+)?plan\b/gi,
-    "Parent writes Plan",
-  ],
-  [
-    /\b(?:writes?|authors?|rewrites?|edits?)\s+(?:the\s+)?tasks?(?:\s+code)?\b/gi,
-    "Parent writes Task code",
-  ],
-  [
-    /\bimplements?\s+(?:the\s+)?tasks?(?:\s+code)?\b/gi,
-    "Parent implements Task",
-  ],
-  [
-    /\binvoke(?:s|d)?\s+writing-plans\b|\binvoking\s+writing-plans\b/gi,
-    "parent invokes writing-plans (Author must)",
-  ],
-]
+const ACTION_FORMS = new Map([
+  ["write", "write"],
+  ["writes", "write"],
+  ["writing", "write"],
+  ["wrote", "write"],
+  ["author", "author"],
+  ["authors", "author"],
+  ["authoring", "author"],
+  ["authored", "author"],
+  ["rewrite", "rewrite"],
+  ["rewrites", "rewrite"],
+  ["rewriting", "rewrite"],
+  ["rewrote", "rewrite"],
+  ["edit", "edit"],
+  ["edits", "edit"],
+  ["editing", "edit"],
+  ["edited", "edit"],
+  ["implement", "implement"],
+  ["implements", "implement"],
+  ["implementing", "implement"],
+  ["implemented", "implement"],
+  ["invoke", "invoke"],
+  ["invokes", "invoke"],
+  ["invoking", "invoke"],
+  ["invoked", "invoke"],
+])
+
+const CONTENT_ACTIONS = new Set(["write", "author", "rewrite", "edit"])
+const CONTRAST_BOUNDARIES = new Set(["but", "however", "yet", "then"])
+const NON_PARENT_SUBJECTS = new Set([
+  "author",
+  "child",
+  "codex",
+  "fixer",
+  "grok",
+  "implementer",
+  "reviewer",
+])
+const PROGRESSIVE_AUXILIARIES = new Set([
+  "am",
+  "are",
+  "be",
+  "been",
+  "being",
+  "is",
+  "was",
+  "were",
+])
+const AFFIRMATIVE_MODALS = new Set([
+  "am",
+  "are",
+  "can",
+  "could",
+  "did",
+  "do",
+  "does",
+  "is",
+  "may",
+  "might",
+  "must",
+  "shall",
+  "should",
+  "was",
+  "were",
+  "will",
+  "would",
+])
+const OBJECT_BOUNDARIES = new Set([
+  ".",
+  ",",
+  ";",
+  ":",
+  "!",
+  "?",
+  ")",
+  "/",
+  "and",
+  "or",
+  ...CONTRAST_BOUNDARIES,
+  "after",
+  "as",
+  "before",
+  "because",
+  "by",
+  "during",
+  "for",
+  "if",
+  "once",
+  "to",
+  "under",
+  "unless",
+  "until",
+  "when",
+  "where",
+  "while",
+  "with",
+  "without",
+])
+const OBJECT_TRAILING_MODIFIERS = new Set([
+  "directly",
+  "immediately",
+  "itself",
+  "personally",
+  "quickly",
+  "urgently",
+])
 
 function normalizeOwnershipText(text) {
   return String(text ?? "")
@@ -381,40 +473,205 @@ function normalizeOwnershipText(text) {
     .replace(/[\t ]+/g, " ")
 }
 
-/**
- * Decide whether negation immediately governs an ownership action. Earlier
- * negatives about another verb do not suppress a later affirmative action.
- */
-function actionIsProhibited(prefix) {
-  const context = prefix.replace(/\s+/g, " ").trim().toLowerCase()
-  const directNegation =
-    /(?:\b(?:must|may|can|could|should|shall|will|would|do|does|did)\s+not|\bcannot|\bnever|\b(?:do|does|did)n['’]t|\b(?:is|are)\s+forbidden\s+(?:to|from)|\b(?:is|are)\s+not\s+(?:allowed|permitted|authorized)\s+to|不得|禁止|不要|不得亲自)\s*$/i
-  if (directNegation.test(context)) return true
+function tokenizeOwnershipText(text) {
+  return (
+    text.match(/[a-z]+(?:['’][a-z]+)?(?:-[a-z]+)*|[-.,;:!?()/]/gi) ?? []
+  ).map((raw) => ({ raw, value: raw.toLowerCase() }))
+}
 
-  // Negation can govern a coordinated ownership verb: "must not write or
-  // rewrite the Plan". The intervening verb must itself be ownership-related.
-  return /(?:\b(?:must|may|can|could|should|shall|will|would|do|does|did)\s+not|\bcannot|\bnever|\b(?:do|does|did)n['’]t)\s+(?:write|author|rewrite|edit|implement|invoke)\s+(?:or|and)\s*$/i.test(
-    context
+function nextObjectToken(tokens, actionIndex) {
+  let index = actionIndex + 1
+  if (tokens[index]?.value === "the") index += 1
+  return index
+}
+
+function objectEndsAt(tokens, index) {
+  let cursor = index + 1
+  while (OBJECT_TRAILING_MODIFIERS.has(tokens[cursor]?.value)) cursor += 1
+  if (tokens[cursor]?.value === "(") {
+    const modifierStart = ++cursor
+    while (OBJECT_TRAILING_MODIFIERS.has(tokens[cursor]?.value)) cursor += 1
+    if (cursor === modifierStart || tokens[cursor]?.value !== ")") return false
+    cursor += 1
+  }
+  const next = tokens[cursor]?.value
+  return next === undefined || OBJECT_BOUNDARIES.has(next) || next === "now"
+}
+
+function progressiveHasAuxiliary(tokens, actionIndex) {
+  let cursor = actionIndex - 1
+  while (
+    tokens[cursor]?.value === "not" ||
+    tokens[cursor]?.value === "now" ||
+    OBJECT_TRAILING_MODIFIERS.has(tokens[cursor]?.value)
+  ) {
+    cursor -= 1
+  }
+  return PROGRESSIVE_AUXILIARIES.has(tokens[cursor]?.value)
+}
+
+/** Return a label only for the exact protected object owned by the action. */
+function classifyProtectedAction(tokens, actionIndex) {
+  const actionToken = tokens[actionIndex]?.value
+  const action = ACTION_FORMS.get(actionToken)
+  if (!action) return null
+  if (
+    actionToken === "writing" &&
+    !progressiveHasAuxiliary(tokens, actionIndex)
+  ) {
+    return null
+  }
+
+  const objectIndex = nextObjectToken(tokens, actionIndex)
+  const object = tokens[objectIndex]?.value
+
+  if (action === "invoke") {
+    return object === "writing-plans" && objectEndsAt(tokens, objectIndex)
+      ? "parent invokes writing-plans (Author must)"
+      : null
+  }
+
+  if (action === "implement") {
+    if (object !== "task" && object !== "tasks") return null
+    const codeIndex = objectIndex + 1
+    if (tokens[codeIndex]?.value === "code") {
+      return objectEndsAt(tokens, codeIndex) ? "Parent implements Task" : null
+    }
+    return objectEndsAt(tokens, objectIndex) ? "Parent implements Task" : null
+  }
+
+  if (!CONTENT_ACTIONS.has(action)) return null
+  if (object === "plan") {
+    const containerIndex = objectIndex + 1
+    if (["file", "document"].includes(tokens[containerIndex]?.value)) {
+      return objectEndsAt(tokens, containerIndex) ? "Parent writes Plan" : null
+    }
+    return objectEndsAt(tokens, objectIndex) ? "Parent writes Plan" : null
+  }
+
+  if (object === "task" || object === "tasks") {
+    const codeIndex = objectIndex + 1
+    if (
+      tokens[codeIndex]?.value === "code" &&
+      objectEndsAt(tokens, codeIndex)
+    ) {
+      return "Parent writes Task code"
+    }
+  }
+  return null
+}
+
+function tokenStartsProhibition(token) {
+  return (
+    token === "not" ||
+    token === "never" ||
+    token === "cannot" ||
+    token === "without" ||
+    token === "forbidden" ||
+    token === "prohibited" ||
+    /n't$/.test(token)
   )
 }
 
-function findEnglishParentActions(line, found) {
-  const parents = [...line.matchAll(/\bparent\b/gi)]
-  for (let i = 0; i < parents.length; i += 1) {
-    const start = parents[i].index + parents[i][0].length
-    const end = parents[i + 1]?.index ?? line.length
-    const parentSpan = line.slice(start, end)
+function scanParentSpan(tokens, found) {
+  let pendingProhibition = false
+  let sharedProhibition = false
+  let pendingCoordinate = false
+  let clauseStart = false
 
-    for (const [actionRe, label] of PARENT_ACTIONS) {
-      actionRe.lastIndex = 0
-      let action
-      while ((action = actionRe.exec(parentSpan)) !== null) {
-        const prefix = parentSpan.slice(0, action.index)
-        if (!actionIsProhibited(prefix)) {
-          found.push(`parent authorship permission present: ${label}`)
-        }
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index].value
+
+    if (clauseStart && NON_PARENT_SUBJECTS.has(token)) break
+    if (token === ".") break
+    if (token === ",") {
+      if (!sharedProhibition) pendingProhibition = false
+      pendingCoordinate = false
+      clauseStart = true
+      continue
+    }
+    if (
+      CONTRAST_BOUNDARIES.has(token) ||
+      token === ";" ||
+      token === ":" ||
+      token === "-" ||
+      token === "/"
+    ) {
+      pendingProhibition = false
+      sharedProhibition = false
+      pendingCoordinate = false
+      clauseStart = true
+      continue
+    }
+    if (AFFIRMATIVE_MODALS.has(token)) {
+      pendingProhibition = false
+      sharedProhibition = false
+      pendingCoordinate = false
+      continue
+    }
+    if (tokenStartsProhibition(token)) {
+      pendingProhibition = true
+      sharedProhibition = false
+      pendingCoordinate = false
+      continue
+    }
+    if (token === "and" || token === "or") {
+      if (!sharedProhibition && !pendingCoordinate) {
+        pendingProhibition = false
+      }
+      pendingCoordinate = false
+      clauseStart = true
+      continue
+    }
+
+    if (
+      clauseStart &&
+      !ACTION_FORMS.has(token) &&
+      !PROGRESSIVE_AUXILIARIES.has(token) &&
+      !OBJECT_TRAILING_MODIFIERS.has(token) &&
+      !["a", "an", "not", "now", "the", "to"].includes(token)
+    ) {
+      pendingProhibition = false
+      sharedProhibition = false
+      pendingCoordinate = false
+      clauseStart = false
+    }
+
+    const label = classifyProtectedAction(tokens, index)
+    if (label) {
+      const prohibited = pendingProhibition || sharedProhibition
+      if (!prohibited) {
+        found.push(`parent authorship permission present: ${label}`)
+      }
+      if (pendingProhibition) sharedProhibition = true
+      pendingProhibition = false
+      pendingCoordinate = false
+      clauseStart = false
+      continue
+    }
+
+    if (ACTION_FORMS.has(token)) {
+      clauseStart = false
+      pendingCoordinate =
+        pendingProhibition && ["and", "or"].includes(tokens[index + 1]?.value)
+      if (!pendingCoordinate) {
+        pendingProhibition = false
+        sharedProhibition = false
       }
     }
+  }
+}
+
+function findEnglishParentActions(line, found) {
+  const tokens = tokenizeOwnershipText(line)
+  const parentIndexes = tokens
+    .map((token, index) => (token.value === "parent" ? index : -1))
+    .filter((index) => index >= 0)
+
+  for (let index = 0; index < parentIndexes.length; index += 1) {
+    const start = parentIndexes[index] + 1
+    const end = parentIndexes[index + 1] ?? tokens.length
+    scanParentSpan(tokens.slice(start, end), found)
   }
 }
 
@@ -450,7 +707,10 @@ export function findParentPermissionViolations(skill) {
         "parent authorship permission present: parent Chinese permission to author Plan/Task"
       )
     }
-    if (/父会话.*writing-plans/.test(line) && !/父会话.*(?:不得|禁止|不要)/.test(line)) {
+    if (
+      /父会话.*writing-plans/.test(line) &&
+      !/父会话.*(?:不得|禁止|不要)/.test(line)
+    ) {
       found.push(
         "parent authorship permission present: parent Chinese writing-plans ownership"
       )

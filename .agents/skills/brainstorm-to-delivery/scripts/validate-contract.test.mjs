@@ -23,7 +23,9 @@ const realSkill = readFileSync(join(__dirname, "..", "SKILL.md"), "utf8")
 
 /** Minimal skill that satisfies all contracts (hand-maintained fixture). */
 function baseValidSkill(overrides = {}) {
-  const route = overrides.route ?? `## 4. Task route
+  const route =
+    overrides.route ??
+    `## 4. Task route
 
 ### Normal route
 
@@ -251,7 +253,9 @@ describe("validateRouteTables", () => {
 `
     const failures = validateRouteTables(section)
     assert.ok(
-      failures.some((f) => /high|exact|mixed|identity|implementer|reviewer/i.test(f)),
+      failures.some((f) =>
+        /high|exact|mixed|identity|implementer|reviewer/i.test(f)
+      ),
       `mixed high cells must fail; got: ${failures.join("; ")}`
     )
   })
@@ -339,9 +343,7 @@ describe("validateRouteTables", () => {
     assert.equal(fallback.ok, false, "Codex (Grok fallback) must fail closed")
 
     // Harmless annotation control: still allowed
-    const harmless = parseExactAgentIdentity(
-      "Codex (≠ implementer, ≠ Author)"
-    )
+    const harmless = parseExactAgentIdentity("Codex (≠ implementer, ≠ Author)")
     assert.deepEqual(harmless, { ok: true, agent: "codex" })
 
     const child = parseExactAgentIdentity("Grok (independent child)")
@@ -367,13 +369,216 @@ describe("validateRouteTables", () => {
 `
     const failures = validateRouteTables(section)
     assert.ok(
-      failures.some((f) => /parenthetical|mixed|exact|identity|fallback/i.test(f)),
+      failures.some((f) =>
+        /parenthetical|mixed|exact|identity|fallback/i.test(f)
+      ),
       `parenthetical identity smuggling must fail; got: ${failures.join("; ")}`
     )
   })
 })
 
 describe("validateParentOwnership", () => {
+  const ownershipGrammarCases = [
+    // Protected affirmative actions.
+    ["protected affirmative", "Parent writes the Plan", "Parent writes Plan"],
+    [
+      "protected affirmative",
+      "Parent authors Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "protected affirmative",
+      "Parent edits the Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "protected affirmative",
+      "Parent implements the Task",
+      "Parent implements Task",
+    ],
+    [
+      "protected affirmative",
+      "Parent may write the Plan document",
+      "Parent writes Plan",
+    ],
+    [
+      "protected affirmative",
+      "Parent invokes writing-plans",
+      "parent invokes writing-plans (Author must)",
+    ],
+    [
+      "protected affirmative",
+      "Parent is writing the Plan",
+      "Parent writes Plan",
+    ],
+    [
+      "protected affirmative",
+      "Parent is now writing the Plan",
+      "Parent writes Plan",
+    ],
+    [
+      "protected affirmative",
+      "Parent writes the Plan itself",
+      "Parent writes Plan",
+    ],
+    [
+      "protected affirmative",
+      "Parent writes the Plan (directly)",
+      "Parent writes Plan",
+    ],
+
+    // A prohibition governs its action and a coordinated action-object series.
+    ["protected prohibition", "Parent must not write the Plan", null],
+    ["protected prohibition", "Parent does not implement the Task", null],
+    ["protected prohibition", "Parent never authors Task code", null],
+    ["protected prohibition", "Parent must not invoke writing-plans", null],
+    [
+      "shared prohibition",
+      "Parent must not write the Plan or implement the Task",
+      null,
+    ],
+    [
+      "shared prohibition",
+      "Parent must not invoke writing-plans or write Task code",
+      null,
+    ],
+    [
+      "shared prohibition",
+      "Parent must not write the Plan and edit Task code",
+      null,
+    ],
+    [
+      "shared prohibition",
+      "Parent must not write the Plan, implement the Task, or edit Task code",
+      null,
+    ],
+
+    // Contrast and affirmative modals end the shared prohibition scope.
+    [
+      "contrast boundary",
+      "Parent must not write the Plan but implements the Task",
+      "Parent implements Task",
+    ],
+    [
+      "contrast boundary",
+      "Parent must not write the Plan; however, authors Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "contrast boundary",
+      "Parent must not invoke writing-plans yet writes the Plan",
+      "Parent writes Plan",
+    ],
+    [
+      "contrast boundary",
+      "Parent must not write Task code, then implements the Task",
+      "Parent implements Task",
+    ],
+    [
+      "affirmative boundary",
+      "Parent must not write the Plan and may implement the Task",
+      "Parent implements Task",
+    ],
+    [
+      "affirmative boundary",
+      "Parent must not write the Plan and does implement the Task",
+      "Parent implements Task",
+    ],
+    [
+      "affirmative boundary",
+      "Parent must not write the Plan and is allowed to implement the Task",
+      "Parent implements Task",
+    ],
+    [
+      "affirmative boundary",
+      "Parent must not write the Plan and is authorized to invoke writing-plans",
+      "parent invokes writing-plans (Author must)",
+    ],
+    [
+      "affirmative boundary",
+      "Parent does not write the Plan, reviews findings, and implements the Task",
+      "Parent implements Task",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent must not wait and writes Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent must not review findings and implements the Task",
+      "Parent implements Task",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent works without delay and invokes writing-plans",
+      "parent invokes writing-plans (Author must)",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent writes Task brief without delay and implements Task",
+      "Parent implements Task",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent must not wait - writes the Plan",
+      "Parent writes Plan",
+    ],
+    [
+      "unrelated prohibition",
+      "Parent must not wait, writes Task code",
+      "Parent writes Task code",
+    ],
+
+    // Coordination artifacts are not the protected Plan or Task code objects.
+    [
+      "legitimate artifact",
+      "Parent writes Task brief for the implementer",
+      null,
+    ],
+    ["legitimate artifact", "Parent writes the Task review report", null],
+    [
+      "legitimate artifact",
+      "Parent authors Task acceptance criteria for the brief",
+      null,
+    ],
+    [
+      "legitimate artifact",
+      "Parent edits Plan review findings without editing the Plan file",
+      null,
+    ],
+    [
+      "legitimate artifact",
+      "Parent edits Plan quarterly review findings",
+      null,
+    ],
+    ["legitimate artifact", "Parent edits Plan (review findings)", null],
+    [
+      "foreign subject",
+      "Parent must not write the Plan; Author writes the Plan",
+      null,
+    ],
+    [
+      "foreign subject",
+      "Parent writes Task brief, but Implementer writes Task code",
+      null,
+    ],
+  ]
+
+  for (const [category, sentence, expectedLabel] of ownershipGrammarCases) {
+    it(`${category}: ${sentence}`, () => {
+      const violations = findParentPermissionViolations(sentence)
+      const expected = expectedLabel
+        ? [`parent authorship permission present: ${expectedLabel}`]
+        : []
+      assert.deepEqual(
+        violations,
+        expected,
+        `${JSON.stringify(sentence)} expected ${JSON.stringify(expected)}; got: ${violations.join("; ")}`
+      )
+    })
+  }
+
   it("rejects contradictory parent Plan authoring even when Author owns is stated", () => {
     const skill = `Codex Plan Author owns every Plan. Author owns the Plan.
 Parent must not implement Task code. Parent must not write or rewrite the Plan.
