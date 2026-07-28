@@ -18,6 +18,7 @@ const SUBJECT_MAX: usize = 200;
 const CONCERNS_MAX: usize = 20;
 const CONCERN_MAX_CHARS: usize = 240;
 const COUNT_MAX: u32 = 1_000_000;
+const PLAN_DIGEST_MAX: usize = 128;
 const REPORT_FILE_MAX: usize = 512;
 
 /// Wire-stable validated card summary (serde for event + DB JSON).
@@ -30,6 +31,14 @@ pub enum CardSummary {
         important: u32,
         minor: u32,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<String>,
+    },
+    Author {
+        status: WorkStatus,
+        summary: String,
+        plan_digest: String,
+        report_file: String,
     },
     Implementation {
         phase: ImplementationPhase,
@@ -160,12 +169,31 @@ pub fn parse_and_validate_summary_json(json: &str) -> Option<CardSummary> {
             let important = parse_count(obj.get("important")?)?;
             let minor = parse_count(obj.get("minor")?)?;
             let summary = parse_bounded_string(obj.get("summary")?.as_str()?, SUMMARY_MAX_CHARS)?;
+            let report_file = parse_optional_report_file(obj.get("report_file"))?;
             Some(CardSummary::Review {
                 verdict,
                 critical,
                 important,
                 minor,
                 summary,
+                report_file,
+            })
+        }
+        "author" => {
+            let status = parse_work_status(obj.get("status")?.as_str()?)?;
+            let summary = parse_bounded_string(obj.get("summary")?.as_str()?, SUMMARY_MAX_CHARS)?;
+            let plan_digest =
+                parse_bounded_non_empty_string(obj.get("plan_digest")?.as_str()?, PLAN_DIGEST_MAX)?;
+            let report_file = obj.get("report_file")?.as_str()?;
+            if report_file.is_empty() {
+                return None;
+            }
+            let report_file = validate_report_file(report_file)?;
+            Some(CardSummary::Author {
+                status,
+                summary,
+                plan_digest,
+                report_file,
             })
         }
         "implementation" => {
@@ -245,6 +273,20 @@ fn parse_bounded_string(s: &str, max_chars: usize) -> Option<String> {
         return None;
     }
     Some(s.to_string())
+}
+
+fn parse_bounded_non_empty_string(s: &str, max_chars: usize) -> Option<String> {
+    if s.trim().is_empty() {
+        return None;
+    }
+    parse_bounded_string(s, max_chars)
+}
+
+fn parse_optional_report_file(v: Option<&serde_json::Value>) -> Option<Option<String>> {
+    match v {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => Some(Some(validate_report_file(value.as_str()?)?)),
+    }
 }
 
 fn parse_commits(v: Option<&serde_json::Value>) -> Option<Vec<CommitEntry>> {
@@ -331,7 +373,7 @@ fn parse_concerns(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn validate_report_file(path: &str) -> Option<String> {
+pub(crate) fn validate_report_file(path: &str) -> Option<String> {
     if path.chars().count() > REPORT_FILE_MAX {
         return None;
     }
@@ -379,6 +421,20 @@ mod tests {
  "report_file":".superpowers/sdd/task-3-report.md"}
 -->"#
             .to_string()
+    }
+
+    fn author_block(digest: Option<&str>, report_file: Option<&str>) -> String {
+        let digest = digest
+            .map(|value| format!(r#","plan_digest":"{value}""#))
+            .unwrap_or_default();
+        let report_file = report_file
+            .map(|value| format!(r#","report_file":"{value}""#))
+            .unwrap_or_default();
+        format!(
+            r#"<!-- codeg-card-summary-v1
+{{"kind":"author","status":"done","summary":"Plan is ready."{digest}{report_file}}}
+-->"#
+        )
     }
 
     #[test]
@@ -475,6 +531,87 @@ mod tests {
                 assert!(summary.contains("Minor"));
             }
             other => panic!("expected review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_author_evidence_parses() {
+        let summary = extract_card_summary(&author_block(
+            Some("sha256:plan-v2"),
+            Some("docs/superpowers/plans/adaptive-routing.md"),
+        ))
+        .expect("valid author summary");
+        assert_eq!(
+            serde_json::to_value(summary).unwrap(),
+            serde_json::json!({
+                "kind": "author",
+                "status": "done",
+                "summary": "Plan is ready.",
+                "plan_digest": "sha256:plan-v2",
+                "report_file": "docs/superpowers/plans/adaptive-routing.md"
+            })
+        );
+    }
+
+    #[test]
+    fn author_digest_is_required_and_non_empty() {
+        assert!(extract_card_summary(&author_block(
+            None,
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_none());
+        assert!(extract_card_summary(&author_block(
+            Some(""),
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn author_digest_enforces_unicode_scalar_bound() {
+        assert_eq!(PLAN_DIGEST_MAX, 128);
+
+        let at_limit = "\u{1f9ed}".repeat(128);
+        assert!(extract_card_summary(&author_block(
+            Some(&at_limit),
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_some());
+
+        let over_limit = "\u{1f9ed}".repeat(129);
+        assert!(extract_card_summary(&author_block(
+            Some(&over_limit),
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn author_report_file_is_required_and_workspace_relative() {
+        assert!(extract_card_summary(&author_block(Some("sha256:plan-v2"), None)).is_none());
+        for report_file in ["C:/repo/plan.md", "/repo/plan.md", "../plan.md"] {
+            assert!(
+                extract_card_summary(&author_block(Some("sha256:plan-v2"), Some(report_file)))
+                    .is_none(),
+                "expected {report_file:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn review_report_file_is_preserved_when_valid_and_rejected_when_unsafe() {
+        let summary = extract_card_summary(&review_block(
+            r#", "report_file":".superpowers/sdd/plan-review.md""#,
+        ))
+        .expect("valid review report path");
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["report_file"],
+            ".superpowers/sdd/plan-review.md"
+        );
+
+        for report_file in ["C:/repo/review.md", "/repo/review.md", "../review.md"] {
+            let extra = format!(r#", "report_file":"{report_file}""#);
+            assert!(extract_card_summary(&review_block(&extra)).is_none());
         }
     }
 

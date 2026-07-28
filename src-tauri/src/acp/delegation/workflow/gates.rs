@@ -41,14 +41,21 @@ pub struct ExecutionGateRunEvidence {
     pub reviewed_implementer_generation: Option<i64>,
 }
 
+/// Evidence for one reviewer required by the normalized policy route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredReviewerEvidence {
+    pub node_id: String,
+    pub evidence: Option<ExecutionGateRunEvidence>,
+}
+
 /// Input bundle for `evaluate_execution_gate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionGateInput {
     pub kind: ExecutionGateKind,
     /// Latest terminal Task implementer, or Final fixer when a fix cycle exists.
     pub implementer_or_fixer: Option<ExecutionGateRunEvidence>,
-    /// Latest terminal Task/Final reviewer.
-    pub reviewer: Option<ExecutionGateRunEvidence>,
+    /// Latest evidence for every reviewer required by the authoritative route.
+    pub required_reviewers: Vec<RequiredReviewerEvidence>,
     /// Optional workspace/branch tip digest for Final first-pass coverage.
     /// When set, reviewer `artifact_digest` must match.
     pub branch_tip_digest: Option<String>,
@@ -73,6 +80,8 @@ pub enum ExecutionGateReason {
 pub struct ExecutionGateEval {
     pub passed: bool,
     pub reason: ExecutionGateReason,
+    /// Required reviewer that produced `reason`; never projected as free text.
+    pub reviewer_node_id: Option<String>,
 }
 
 /// Evaluate Task/Final execution-gate readiness (A7 + B3 + B13).
@@ -82,7 +91,7 @@ pub struct ExecutionGateEval {
 /// - Reviewer terminal pass: completed + validated summary with
 ///   `approve` / `approve_with_minors`, **and** B13 exact `reviewed_task_id`
 ///   match against the latest implementer/fixer (when one exists), **and**
-///   B3 digest rules (implementer digest present ⇒ reviewer must match).
+///   non-empty B3 digest match against the producer/fixer artifact.
 /// - `reviewed_implementer_generation` is informational only.
 /// - Final first-pass (no fixer terminal): reviewer terminal completed with
 ///   validated approve summary and non-empty task_id.
@@ -100,33 +109,55 @@ fn evaluate_task_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
     if !implementer_terminal_pass(impl_ev) {
         return fail(ExecutionGateReason::ImplementerNotTerminalPass);
     }
-    let Some(rev) = input.reviewer.as_ref() else {
-        return fail(ExecutionGateReason::MissingReviewer);
-    };
-    if !reviewer_verdict_pass(rev) {
-        return fail(ExecutionGateReason::ReviewerNotTerminalPass);
+    if non_empty_digest(impl_ev.artifact_digest.as_deref()).is_none() {
+        return fail(ExecutionGateReason::ArtifactDigestMismatch);
     }
-    if let Err(reason) = reviewer_covers_implementer(rev, impl_ev) {
-        return fail(reason);
+    if input.required_reviewers.is_empty() {
+        return fail(ExecutionGateReason::MissingReviewer);
+    }
+    for required in &input.required_reviewers {
+        let Some(rev) = required.evidence.as_ref() else {
+            return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
+        };
+        if !reviewer_verdict_pass(rev) {
+            return fail_for_reviewer(
+                ExecutionGateReason::ReviewerNotTerminalPass,
+                &required.node_id,
+            );
+        }
+        if let Err(reason) = reviewer_covers_implementer(rev, impl_ev) {
+            return fail_for_reviewer(reason, &required.node_id);
+        }
     }
     pass()
 }
 
 fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
+    if input.required_reviewers.len() != 1 {
+        return fail(ExecutionGateReason::MissingReviewer);
+    }
+    let required = &input.required_reviewers[0];
+
     // When a Final fixer terminal exists, gate requires fixer pass + reviewer
     // covering that exact fixer run (same as Task pair).
     if let Some(fixer) = input.implementer_or_fixer.as_ref() {
         if !implementer_terminal_pass(fixer) {
             return fail(ExecutionGateReason::ImplementerNotTerminalPass);
         }
-        let Some(rev) = input.reviewer.as_ref() else {
-            return fail(ExecutionGateReason::MissingReviewer);
+        if non_empty_digest(fixer.artifact_digest.as_deref()).is_none() {
+            return fail(ExecutionGateReason::ArtifactDigestMismatch);
+        }
+        let Some(rev) = required.evidence.as_ref() else {
+            return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
         };
         if !reviewer_verdict_pass(rev) {
-            return fail(ExecutionGateReason::ReviewerNotTerminalPass);
+            return fail_for_reviewer(
+                ExecutionGateReason::ReviewerNotTerminalPass,
+                &required.node_id,
+            );
         }
         if let Err(reason) = reviewer_covers_implementer(rev, fixer) {
-            return fail(reason);
+            return fail_for_reviewer(reason, &required.node_id);
         }
         return pass();
     }
@@ -134,17 +165,23 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
     // First-pass Final: no fixer/implementer terminal.
     // Require non-empty terminal evidence with validated approve **and**
     // non-empty artifact coverage (no empty-evidence pass).
-    let Some(rev) = input.reviewer.as_ref() else {
-        return fail(ExecutionGateReason::MissingReviewer);
+    let Some(rev) = required.evidence.as_ref() else {
+        return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
     };
     if rev.task_id.trim().is_empty() {
-        return fail(ExecutionGateReason::ReviewerNotTerminalPass);
+        return fail_for_reviewer(
+            ExecutionGateReason::ReviewerNotTerminalPass,
+            &required.node_id,
+        );
     }
     if !reviewer_verdict_pass(rev) {
-        return fail(ExecutionGateReason::ReviewerNotTerminalPass);
+        return fail_for_reviewer(
+            ExecutionGateReason::ReviewerNotTerminalPass,
+            &required.node_id,
+        );
     }
     if let Err(reason) = final_first_pass_coverage(rev, input.branch_tip_digest.as_deref()) {
-        return fail(reason);
+        return fail_for_reviewer(reason, &required.node_id);
     }
     pass()
 }
@@ -199,7 +236,7 @@ fn reviewer_verdict_pass(ev: &ExecutionGateRunEvidence) -> bool {
 /// B3:
 /// - implementer has non-empty digest and reviewer missing/empty → fail
 /// - both non-empty and differ → fail
-/// - both empty/absent → rely on B13 `reviewed_task_id` only
+/// - producer/fixer digest is required by the caller
 fn reviewer_covers_implementer(
     rev: &ExecutionGateRunEvidence,
     impl_ev: &ExecutionGateRunEvidence,
@@ -224,7 +261,7 @@ fn reviewer_covers_implementer(
             // Reviewer digest present but implementer absent → fail closed.
             return Err(ExecutionGateReason::ArtifactDigestMismatch);
         }
-        // both empty → B13 task_id only; both same → ok
+        // Equal non-empty digests pass. The caller rejects an empty producer.
         _ => {}
     }
 
@@ -240,6 +277,7 @@ fn pass() -> ExecutionGateEval {
     ExecutionGateEval {
         passed: true,
         reason: ExecutionGateReason::Passed,
+        reviewer_node_id: None,
     }
 }
 
@@ -247,6 +285,15 @@ fn fail(reason: ExecutionGateReason) -> ExecutionGateEval {
     ExecutionGateEval {
         passed: false,
         reason,
+        reviewer_node_id: None,
+    }
+}
+
+fn fail_for_reviewer(reason: ExecutionGateReason, node_id: &str) -> ExecutionGateEval {
+    ExecutionGateEval {
+        passed: false,
+        reason,
+        reviewer_node_id: Some(node_id.to_string()),
     }
 }
 
@@ -336,7 +383,10 @@ mod tests {
         ExecutionGateInput {
             kind: ExecutionGateKind::Task,
             implementer_or_fixer: impl_ev,
-            reviewer: rev,
+            required_reviewers: vec![RequiredReviewerEvidence {
+                node_id: "task-reviewer".into(),
+                evidence: rev,
+            }],
             branch_tip_digest: None,
         }
     }
@@ -349,9 +399,272 @@ mod tests {
         ExecutionGateInput {
             kind: ExecutionGateKind::Final,
             implementer_or_fixer: impl_ev,
-            reviewer: rev,
+            required_reviewers: vec![RequiredReviewerEvidence {
+                node_id: "final-reviewer".into(),
+                evidence: rev,
+            }],
             branch_tip_digest: tip.map(|s| s.into()),
         }
+    }
+
+    fn routed_task_input(
+        producer: ExecutionGateRunEvidence,
+        reviewers: Vec<(&str, Option<ExecutionGateRunEvidence>)>,
+    ) -> ExecutionGateInput {
+        ExecutionGateInput {
+            kind: ExecutionGateKind::Task,
+            implementer_or_fixer: Some(producer),
+            required_reviewers: reviewers
+                .into_iter()
+                .map(|(node_id, evidence)| RequiredReviewerEvidence {
+                    node_id: node_id.into(),
+                    evidence,
+                })
+                .collect(),
+            branch_tip_digest: None,
+        }
+    }
+
+    #[test]
+    fn task6_normal_route_requires_its_one_reviewer() {
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-1", 1, Some("digest-1")),
+            vec![(
+                "task-1-codex-reviewer",
+                Some(rev_approve(
+                    "codex-review-1",
+                    "impl-1",
+                    Some(1),
+                    Some("digest-1"),
+                )),
+            )],
+        ));
+
+        assert!(eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::Passed);
+        assert_eq!(eval.reviewer_node_id, None);
+    }
+
+    #[test]
+    fn task6_high_route_requires_both_reviewers_over_same_artifact() {
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-1", 1, Some("digest-1")),
+            vec![
+                (
+                    "task-1-codex-reviewer",
+                    Some(rev_approve(
+                        "codex-review-1",
+                        "impl-1",
+                        Some(1),
+                        Some("digest-1"),
+                    )),
+                ),
+                (
+                    "task-1-grok-reviewer",
+                    Some(rev_approve(
+                        "grok-review-1",
+                        "impl-1",
+                        Some(1),
+                        Some("digest-1"),
+                    )),
+                ),
+            ],
+        ));
+
+        assert!(eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::Passed);
+    }
+
+    #[test]
+    fn task6_high_route_rejects_missing_second_reviewer_with_node_detail() {
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-1", 1, Some("digest-1")),
+            vec![
+                (
+                    "task-1-codex-reviewer",
+                    Some(rev_approve(
+                        "codex-review-1",
+                        "impl-1",
+                        Some(1),
+                        Some("digest-1"),
+                    )),
+                ),
+                ("task-1-grok-reviewer", None),
+            ],
+        ));
+
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::MissingReviewer);
+        assert_eq!(
+            eval.reviewer_node_id.as_deref(),
+            Some("task-1-grok-reviewer")
+        );
+    }
+
+    #[test]
+    fn task6_each_non_passing_reviewer_state_fails_with_stable_reason() {
+        for status in [
+            TerminalRunStatus::Failed,
+            TerminalRunStatus::Canceled,
+            TerminalRunStatus::NonTerminal,
+        ] {
+            let mut second = rev_approve("grok-review-1", "impl-1", Some(1), Some("digest-1"));
+            second.status = status;
+            let eval = evaluate_execution_gate(&routed_task_input(
+                impl_done("impl-1", 1, Some("digest-1")),
+                vec![
+                    (
+                        "task-1-codex-reviewer",
+                        Some(rev_approve(
+                            "codex-review-1",
+                            "impl-1",
+                            Some(1),
+                            Some("digest-1"),
+                        )),
+                    ),
+                    ("task-1-grok-reviewer", Some(second)),
+                ],
+            ));
+            assert!(!eval.passed, "status {status:?} must fail");
+            assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+            assert_eq!(
+                eval.reviewer_node_id.as_deref(),
+                Some("task-1-grok-reviewer")
+            );
+        }
+    }
+
+    #[test]
+    fn task6_stale_empty_and_mismatched_second_reviewer_evidence_fails() {
+        let cases = [
+            (
+                rev_approve("grok-review-old", "impl-old", Some(1), Some("digest-1")),
+                ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer,
+            ),
+            (
+                rev_approve("grok-review-empty", "impl-1", Some(1), None),
+                ExecutionGateReason::ArtifactDigestMismatch,
+            ),
+            (
+                rev_approve("grok-review-wrong", "impl-1", Some(1), Some("digest-old")),
+                ExecutionGateReason::ArtifactDigestMismatch,
+            ),
+        ];
+
+        for (second, expected_reason) in cases {
+            let eval = evaluate_execution_gate(&routed_task_input(
+                impl_done("impl-1", 1, Some("digest-1")),
+                vec![
+                    (
+                        "task-1-codex-reviewer",
+                        Some(rev_approve(
+                            "codex-review-1",
+                            "impl-1",
+                            Some(1),
+                            Some("digest-1"),
+                        )),
+                    ),
+                    ("task-1-grok-reviewer", Some(second)),
+                ],
+            ));
+            assert!(!eval.passed);
+            assert_eq!(eval.reason, expected_reason);
+            assert_eq!(
+                eval.reviewer_node_id.as_deref(),
+                Some("task-1-grok-reviewer")
+            );
+        }
+    }
+
+    #[test]
+    fn task6_one_approval_plus_one_request_changes_fails_strict_and() {
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-1", 1, Some("abc")),
+            vec![
+                (
+                    "task-1-codex-reviewer",
+                    Some(rev_approve(
+                        "codex-review-1",
+                        "impl-1",
+                        Some(1),
+                        Some("abc"),
+                    )),
+                ),
+                (
+                    "task-1-grok-reviewer",
+                    Some(rev_changes("grok-review-1", "impl-1")),
+                ),
+            ],
+        ));
+
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+        assert_eq!(
+            eval.reviewer_node_id.as_deref(),
+            Some("task-1-grok-reviewer")
+        );
+    }
+
+    #[test]
+    fn task6_new_producer_invalidates_every_prior_approval() {
+        let prior = |task_id: &str| rev_approve(task_id, "impl-old", Some(1), Some("digest-old"));
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-new", 2, Some("digest-new")),
+            vec![
+                ("task-1-codex-reviewer", Some(prior("codex-review-old"))),
+                ("task-1-grok-reviewer", Some(prior("grok-review-old"))),
+            ],
+        ));
+
+        assert!(!eval.passed);
+        assert_eq!(
+            eval.reason,
+            ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer
+        );
+        assert_eq!(
+            eval.reviewer_node_id.as_deref(),
+            Some("task-1-codex-reviewer")
+        );
+    }
+
+    #[test]
+    fn task6_empty_producer_digest_fails_closed() {
+        let eval = evaluate_execution_gate(&routed_task_input(
+            impl_done("impl-1", 1, None),
+            vec![(
+                "task-1-codex-reviewer",
+                Some(rev_approve("codex-review-1", "impl-1", Some(1), None)),
+            )],
+        ));
+
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
+        assert_eq!(eval.reviewer_node_id, None);
+    }
+
+    #[test]
+    fn task6_new_final_fixer_invalidates_prior_reviewer_approval() {
+        let eval = evaluate_execution_gate(&ExecutionGateInput {
+            kind: ExecutionGateKind::Final,
+            implementer_or_fixer: Some(impl_done("final-fixer-new", 2, Some("digest-new"))),
+            required_reviewers: vec![RequiredReviewerEvidence {
+                node_id: "final-reviewer".into(),
+                evidence: Some(rev_approve(
+                    "final-review-old",
+                    "final-fixer-old",
+                    Some(1),
+                    Some("digest-old"),
+                )),
+            }],
+            branch_tip_digest: None,
+        });
+
+        assert!(!eval.passed);
+        assert_eq!(
+            eval.reason,
+            ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer
+        );
+        assert_eq!(eval.reviewer_node_id.as_deref(), Some("final-reviewer"));
     }
 
     #[test]
@@ -515,12 +828,13 @@ mod tests {
     }
 
     #[test]
-    fn b3_empty_digests_rely_on_task_id() {
+    fn task6_empty_producer_and_reviewer_digests_fail_closed() {
         let eval = evaluate_execution_gate(&task_input(
             Some(impl_done("impl-1", 1, None)),
             Some(rev_approve("rev-1", "impl-1", Some(1), None)),
         ));
-        assert!(eval.passed);
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
     }
 
     #[test]

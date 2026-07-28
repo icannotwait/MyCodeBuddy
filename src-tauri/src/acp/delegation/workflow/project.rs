@@ -28,12 +28,13 @@ use super::dto::{
 };
 use super::gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
-    ExecutionGateReason, ExecutionGateRunEvidence, TerminalRunStatus,
+    ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
 use super::types::{
-    ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestWorkflowState, ParsedWorkUnitKey,
-    ResolutionMode, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
+    ManifestWorkflowState, ParsedWorkUnitKey, ResolutionMode, TaskHardTriggerKind, TaskRiskLevel,
+    TaskSoftSignalKind, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -205,7 +206,7 @@ async fn project_manifest_mode(
 
     // Active + retained bindings drive the node set (plus any still on manifest).
     // Gate pairing only uses *active* candidates (non-retired, in-manifest or
-    // pair_frozen); retained_observed superseded history is projected but not paired.
+    // cohort_frozen); retained_observed superseded history is projected but not paired.
     let mut seen_node_ids: HashSet<String> = HashSet::new();
     let mut bound_keys: HashSet<String> = HashSet::new();
     let mut gate_eligible_public: HashSet<String> = HashSet::new();
@@ -252,8 +253,15 @@ async fn project_manifest_mode(
 
     // Build latest evidence + gate overlays on canonical nodes only (before orphans).
     let evidence_by_node = build_evidence_by_node(&nodes, &rbs_by_node, &run_by_id);
-    let gate_summary =
-        apply_execution_gate_overlays(&mut nodes, &evidence_by_node, &gate_eligible_public);
+    let gate_summary = apply_execution_gate_overlays(
+        &mut nodes,
+        &evidence_by_node,
+        &gate_eligible_public,
+        &normalized.task_policies,
+        &mut id_map,
+    );
+
+    ensure_author_before_plan_reviewers(&mut nodes);
 
     // A9 orphans: recognized keys with no binding — after pairing so they never
     // overwrite Task/Final pair candidates.
@@ -493,6 +501,10 @@ fn project_node_from_binding(
         agent_type: Some(id_map.map_id(&b.agent_type)),
         profile_id: b.profile_id.as_deref().map(|p| id_map.map_id(p)),
         task_index: b.task_index.map(|i| i as u32),
+        task_risk_level: None,
+        task_risk_reason_codes: vec![],
+        required_reviewer_count: None,
+        returned_reviewer_count: None,
         title,
         status,
         status_reason,
@@ -527,6 +539,10 @@ fn project_node_from_manifest_only(
         agent_type: mn.agent_type.as_deref().map(|s| id_map.map_id(s)),
         profile_id: mn.profile_id.as_deref().map(|s| id_map.map_id(s)),
         task_index: mn.task_index,
+        task_risk_level: None,
+        task_risk_reason_codes: vec![],
+        required_reviewer_count: None,
+        returned_reviewer_count: None,
         title: mn.title.as_deref().map(redact_display_string),
         status: ProjectedNodeStatus::Estimated,
         status_reason: None,
@@ -637,6 +653,20 @@ fn project_node_status(
             }
         }
     }
+    if let Some(CardSummary::Author { status, .. }) = &parsed {
+        match status {
+            WorkStatus::Blocked | WorkStatus::NeedsContext => {
+                return (
+                    ProjectedNodeStatus::Blocked,
+                    Some(work_status_str(status).into()),
+                    summary_text,
+                );
+            }
+            WorkStatus::Done | WorkStatus::DoneWithConcerns => {
+                return (ProjectedNodeStatus::Completed, None, summary_text);
+            }
+        }
+    }
     if let Some(CardSummary::Review { verdict, .. }) = &parsed {
         match verdict {
             ReviewVerdict::Block => {
@@ -665,6 +695,7 @@ fn project_node_status(
 fn summary_text_from_card(card: &CardSummary) -> Option<String> {
     match card {
         CardSummary::Review { summary, .. } => Some(summary.clone()),
+        CardSummary::Author { summary, .. } => Some(summary.clone()),
         CardSummary::Implementation { summary, .. } => Some(summary.clone()),
     }
 }
@@ -704,7 +735,7 @@ fn build_evidence_by_node(
     out
 }
 
-/// Active gate candidate: non-retired, in active manifest **or** pair_frozen,
+/// Active gate candidate: non-retired, in active manifest **or** cohort_frozen,
 /// and not pure retained-observed superseded history.
 fn is_active_gate_binding(
     b: &delegation_workflow_node_binding::Model,
@@ -712,15 +743,15 @@ fn is_active_gate_binding(
     in_manifest: bool,
 ) -> bool {
     // Retired bindings are history-only (superseded after plan revision).
-    if b.retired_revision.is_some() && !b.pair_frozen {
+    if b.retired_revision.is_some() && !b.cohort_frozen {
         return false;
     }
     // Pure retained_observed without pair_freeze and not in manifest → superseded.
-    if b.retained_observed && !b.pair_frozen && !in_manifest {
+    if b.retained_observed && !b.cohort_frozen && !in_manifest {
         return false;
     }
     // Active when in the active manifest, or pair-frozen (B14 continue path).
-    in_manifest || b.pair_frozen
+    in_manifest || b.cohort_frozen
 }
 
 /// Branch tip for Final first-pass: durable Task implementer artifact_digest.
@@ -821,72 +852,111 @@ fn apply_execution_gate_overlays(
     nodes: &mut [WorkflowNodeSnapshot],
     evidence_by_node: &HashMap<String, ExecutionGateRunEvidence>,
     gate_eligible: &HashSet<String>,
+    task_policies: &[ManifestTaskPolicy],
+    id_map: &mut PublicIdAllocator,
 ) -> ExecutionGateOverlaySummary {
     let mut summary = ExecutionGateOverlaySummary::default();
     let branch_tip = derive_branch_tip_digest(nodes, evidence_by_node, gate_eligible);
 
-    // --- Task pairs: only active/eligible Task phase nodes ---
-    let mut by_task: HashMap<u32, (Option<usize>, Option<usize>)> = HashMap::new();
-    for (i, n) in nodes.iter().enumerate() {
-        if !gate_eligible.contains(&n.node_id) {
-            continue;
-        }
-        if !n.required {
-            continue;
-        }
-        if matches!(n.status, ProjectedNodeStatus::Superseded) {
-            continue;
-        }
-        if n.status_reason.as_deref() == Some("orphan_observed") {
-            continue;
-        }
-        let Some(idx) = n.task_index else { continue };
-        if n.phase_id.as_deref() != Some("tasks") {
-            continue;
-        }
-        let entry = by_task.entry(idx).or_insert((None, None));
-        match n.role.as_deref() {
-            Some("implementer") => entry.0 = Some(i),
-            Some("reviewer") => entry.1 = Some(i),
-            _ => {}
-        }
-    }
-
-    for (_task_idx, (impl_i, rev_i)) in by_task {
-        let (Some(ii), Some(ri)) = (impl_i, rev_i) else {
+    // Task policy routes are authoritative. Never infer a reviewer from role or
+    // task index because high-risk Tasks require both routed reviewers.
+    for policy in task_policies {
+        let implementer_id = id_map.map_id(&policy.route.implementer_node_id);
+        let reviewer_ids: Vec<String> = policy
+            .route
+            .reviewer_node_ids
+            .iter()
+            .map(|node_id| id_map.map_id(node_id))
+            .collect();
+        let Some(implementer_index) = nodes.iter().position(|node| node.node_id == implementer_id)
+        else {
             continue;
         };
-        let impl_id = nodes[ii].node_id.clone();
-        let rev_id = nodes[ri].node_id.clone();
-        let impl_ev = evidence_by_node.get(&impl_id).cloned();
-        let rev_ev = evidence_by_node.get(&rev_id).cloned();
+        let reviewer_indices: Vec<usize> = reviewer_ids
+            .iter()
+            .filter_map(|node_id| nodes.iter().position(|node| node.node_id == *node_id))
+            .collect();
+        if reviewer_indices.len() != reviewer_ids.len() {
+            continue;
+        }
 
-        if impl_ev.is_none() && rev_ev.is_none() {
-            if matches!(nodes[ii].status, ProjectedNodeStatus::Completed)
-                && matches!(
-                    nodes[ri].status,
-                    ProjectedNodeStatus::Estimated | ProjectedNodeStatus::Superseded
+        let implementer_evidence = gate_eligible
+            .contains(&implementer_id)
+            .then(|| evidence_by_node.get(&implementer_id).cloned())
+            .flatten();
+        let required_reviewers: Vec<RequiredReviewerEvidence> = reviewer_ids
+            .iter()
+            .map(|node_id| RequiredReviewerEvidence {
+                node_id: node_id.clone(),
+                evidence: gate_eligible
+                    .contains(node_id)
+                    .then(|| evidence_by_node.get(node_id).cloned())
+                    .flatten(),
+            })
+            .collect();
+        let individual_evals: Vec<ExecutionGateEval> = required_reviewers
+            .iter()
+            .map(|required| {
+                evaluate_execution_gate(&ExecutionGateInput {
+                    kind: ExecutionGateKind::Task,
+                    implementer_or_fixer: implementer_evidence.clone(),
+                    required_reviewers: vec![required.clone()],
+                    branch_tip_digest: None,
+                })
+            })
+            .collect();
+        let returned_count = required_reviewers
+            .iter()
+            .filter(|required| {
+                reviewer_returned_for_current_producer(
+                    implementer_evidence.as_ref(),
+                    required.evidence.as_ref(),
                 )
-            {
-                nodes[ri].status = ProjectedNodeStatus::WaitingReview;
+            })
+            .count() as u64;
+        apply_task_policy_metadata(
+            nodes,
+            implementer_index,
+            &reviewer_indices,
+            policy,
+            returned_count,
+        );
+
+        if implementer_evidence.is_none()
+            && required_reviewers
+                .iter()
+                .all(|required| required.evidence.is_none())
+        {
+            if matches!(
+                nodes[implementer_index].status,
+                ProjectedNodeStatus::Completed
+            ) {
+                for reviewer_index in &reviewer_indices {
+                    if matches!(
+                        nodes[*reviewer_index].status,
+                        ProjectedNodeStatus::Estimated | ProjectedNodeStatus::Superseded
+                    ) {
+                        nodes[*reviewer_index].status = ProjectedNodeStatus::WaitingReview;
+                    }
+                }
             }
             continue;
         }
 
         let eval = evaluate_execution_gate(&ExecutionGateInput {
             kind: ExecutionGateKind::Task,
-            implementer_or_fixer: impl_ev,
-            reviewer: rev_ev,
+            implementer_or_fixer: implementer_evidence,
+            required_reviewers,
             branch_tip_digest: None,
         });
-        let (impl_node, rev_node) = if ii < ri {
-            let (left, right) = nodes.split_at_mut(ri);
-            (&mut left[ii], &mut right[0])
-        } else {
-            let (left, right) = nodes.split_at_mut(ii);
-            (&mut right[0], &mut left[ri])
-        };
-        apply_eval_to_pair(impl_node, rev_node, &eval, &mut summary, true);
+        apply_eval_to_task(
+            nodes,
+            implementer_index,
+            &reviewer_indices,
+            &individual_evals,
+            &eval,
+            &mut summary,
+        );
     }
 
     // --- Final pair: phase=final reviewer + optional fixer (eligible only) ---
@@ -945,7 +1015,10 @@ fn apply_execution_gate_overlays(
             let eval = evaluate_execution_gate(&ExecutionGateInput {
                 kind: ExecutionGateKind::Final,
                 implementer_or_fixer: fix_ev,
-                reviewer: rev_ev,
+                required_reviewers: vec![RequiredReviewerEvidence {
+                    node_id: rev_id,
+                    evidence: rev_ev,
+                }],
                 branch_tip_digest: tip,
             });
             apply_eval_to_final(&mut nodes[ri], &eval, &mut summary);
@@ -955,55 +1028,149 @@ fn apply_execution_gate_overlays(
     summary
 }
 
-fn apply_eval_to_pair(
-    impl_node: &mut WorkflowNodeSnapshot,
-    rev_node: &mut WorkflowNodeSnapshot,
+fn apply_task_policy_metadata(
+    nodes: &mut [WorkflowNodeSnapshot],
+    implementer_index: usize,
+    reviewer_indices: &[usize],
+    policy: &ManifestTaskPolicy,
+    returned_count: u64,
+) {
+    let level = match policy.risk.level {
+        TaskRiskLevel::Normal => "normal",
+        TaskRiskLevel::High => "high",
+    };
+    let reason_codes: Vec<String> = policy
+        .risk
+        .hard_triggers
+        .iter()
+        .map(|trigger| task_hard_trigger_code(trigger.kind).to_string())
+        .chain(
+            policy
+                .risk
+                .soft_signals
+                .iter()
+                .map(|signal| task_soft_signal_code(signal.kind).to_string()),
+        )
+        .collect();
+    let required_count = reviewer_indices.len() as u64;
+    for node_index in std::iter::once(implementer_index).chain(reviewer_indices.iter().copied()) {
+        let node = &mut nodes[node_index];
+        node.task_risk_level = Some(level.to_string());
+        node.task_risk_reason_codes = reason_codes.clone();
+        node.required_reviewer_count = Some(required_count);
+        node.returned_reviewer_count = Some(returned_count);
+    }
+}
+
+fn reviewer_returned_for_current_producer(
+    producer: Option<&ExecutionGateRunEvidence>,
+    reviewer: Option<&ExecutionGateRunEvidence>,
+) -> bool {
+    let (Some(producer), Some(reviewer)) = (producer, reviewer) else {
+        return false;
+    };
+    if !matches!(producer.status, TerminalRunStatus::Completed)
+        || !producer.summary_validated
+        || !matches!(
+            producer.work_status,
+            Some(WorkStatus::Done) | Some(WorkStatus::DoneWithConcerns)
+        )
+        || !matches!(reviewer.status, TerminalRunStatus::Completed)
+        || !reviewer.summary_validated
+        || reviewer.review_verdict.is_none()
+        || reviewer.reviewed_task_id.as_deref() != Some(producer.task_id.as_str())
+    {
+        return false;
+    }
+    let producer_digest = producer
+        .artifact_digest
+        .as_deref()
+        .map(str::trim)
+        .filter(|digest| !digest.is_empty());
+    let reviewer_digest = reviewer
+        .artifact_digest
+        .as_deref()
+        .map(str::trim)
+        .filter(|digest| !digest.is_empty());
+    matches!((producer_digest, reviewer_digest), (Some(a), Some(b)) if a == b)
+}
+
+fn task_hard_trigger_code(kind: TaskHardTriggerKind) -> &'static str {
+    match kind {
+        TaskHardTriggerKind::ConcurrencyLifecycle => "concurrency_lifecycle",
+        TaskHardTriggerKind::SecurityTrustBoundary => "security_trust_boundary",
+        TaskHardTriggerKind::MigrationDestructivePersistence => "migration_destructive_persistence",
+        TaskHardTriggerKind::PublicCompatibility => "public_compatibility",
+        TaskHardTriggerKind::UnsafeFfi => "unsafe_ffi",
+        TaskHardTriggerKind::UpdateRollback => "update_rollback",
+    }
+}
+
+fn task_soft_signal_code(kind: TaskSoftSignalKind) -> &'static str {
+    match kind {
+        TaskSoftSignalKind::CrossRuntimeOrProcess => "cross_runtime_or_process",
+        TaskSoftSignalKind::BroadProductionSurface => "broad_production_surface",
+        TaskSoftSignalKind::MultipleOwnershipModules => "multiple_ownership_modules",
+        TaskSoftSignalKind::SharedInterface => "shared_interface",
+        TaskSoftSignalKind::DependencyOrBuild => "dependency_or_build",
+        TaskSoftSignalKind::MultiLayerWithoutTestSeam => "multi_layer_without_test_seam",
+    }
+}
+
+fn ensure_author_before_plan_reviewers(nodes: &mut Vec<WorkflowNodeSnapshot>) {
+    let Some(author_index) = nodes.iter().position(|node| {
+        node.phase_id.as_deref() == Some("plan") && node.role.as_deref() == Some("author")
+    }) else {
+        return;
+    };
+    let Some(first_reviewer_index) = nodes.iter().position(|node| {
+        node.phase_id.as_deref() == Some("plan") && node.role.as_deref() == Some("reviewer")
+    }) else {
+        return;
+    };
+    if author_index > first_reviewer_index {
+        let author = nodes.remove(author_index);
+        nodes.insert(first_reviewer_index, author);
+    }
+}
+
+fn apply_eval_to_task(
+    nodes: &mut [WorkflowNodeSnapshot],
+    implementer_index: usize,
+    reviewer_indices: &[usize],
+    individual_evals: &[ExecutionGateEval],
     eval: &ExecutionGateEval,
     summary: &mut ExecutionGateOverlaySummary,
-    is_task: bool,
 ) {
     if eval.passed {
-        if is_task {
-            summary.task_gates_passed += 1;
-        } else {
-            summary.final_gate_passed = Some(true);
-        }
+        summary.task_gates_passed += 1;
         return;
     }
 
-    if is_task {
-        summary.task_gates_failed += 1;
-    } else {
-        summary.final_gate_passed = Some(false);
-    }
-
-    // Stale B13 / B3 / missing coverage: reviewer must NOT remain Completed.
-    demote_reviewer_on_gate_fail(rev_node, &eval.reason);
-
-    // If implementer is the problem, leave status from project_node_status;
-    // only annotate when gate says implementer not pass and node looked completed.
-    if matches!(
-        eval.reason,
-        ExecutionGateReason::ImplementerNotTerminalPass | ExecutionGateReason::MissingImplementer
-    ) && matches!(impl_node.status, ProjectedNodeStatus::Completed)
-    {
-        // Keep implementer completed if work is done but pair not gated — no demote.
-        // status_reason for diagnostics only on reviewer.
-    }
-
-    // Waiting for reviewer when implementer done and reviewer missing/not ready.
-    if matches!(
-        eval.reason,
-        ExecutionGateReason::MissingReviewer | ExecutionGateReason::ReviewerNotTerminalPass
-    ) && matches!(impl_node.status, ProjectedNodeStatus::Completed)
-        && matches!(
-            rev_node.status,
-            ProjectedNodeStatus::Estimated
-                | ProjectedNodeStatus::Superseded
-                | ProjectedNodeStatus::WaitingReview
-        )
-    {
-        rev_node.status = ProjectedNodeStatus::WaitingReview;
+    summary.task_gates_failed += 1;
+    let implementer_completed = matches!(
+        nodes[implementer_index].status,
+        ProjectedNodeStatus::Completed
+    );
+    for (reviewer_index, reviewer_eval) in reviewer_indices.iter().zip(individual_evals) {
+        if reviewer_eval.passed {
+            continue;
+        }
+        let reviewer = &mut nodes[*reviewer_index];
+        demote_reviewer_on_gate_fail(reviewer, &reviewer_eval.reason);
+        if matches!(
+            reviewer_eval.reason,
+            ExecutionGateReason::MissingReviewer | ExecutionGateReason::ReviewerNotTerminalPass
+        ) && implementer_completed
+            && matches!(
+                reviewer.status,
+                ProjectedNodeStatus::Estimated
+                    | ProjectedNodeStatus::Superseded
+                    | ProjectedNodeStatus::WaitingReview
+            )
+        {
+            reviewer.status = ProjectedNodeStatus::WaitingReview;
+        }
     }
 }
 
@@ -1124,6 +1291,10 @@ fn append_orphan_observed_nodes(
             agent_type: Some(id_map.map_id(&latest.agent_type)),
             profile_id: latest.profile_id.as_deref().map(|p| id_map.map_id(p)),
             task_index,
+            task_risk_level: None,
+            task_risk_reason_codes: vec![],
+            required_reviewer_count: None,
+            returned_reviewer_count: None,
             title: None,
             status,
             status_reason: Some("orphan_observed".into()),
@@ -1373,6 +1544,10 @@ async fn project_observed_only(
             agent_type: Some(id_map.map_id(&latest.agent_type)),
             profile_id: latest.profile_id.as_deref().map(|p| id_map.map_id(p)),
             task_index,
+            task_risk_level: None,
+            task_risk_reason_codes: vec![],
+            required_reviewer_count: None,
+            returned_reviewer_count: None,
             title: None,
             status,
             status_reason: None,
@@ -1438,7 +1613,8 @@ async fn project_observed_only(
 fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
     match parsed {
         ParsedWorkUnitKey::Design { .. } => ("design".into(), "reviewer".into(), None),
-        ParsedWorkUnitKey::Plan { .. } => ("plan".into(), "reviewer".into(), None),
+        ParsedWorkUnitKey::PlanAuthor { .. } => ("plan".into(), "author".into(), None),
+        ParsedWorkUnitKey::PlanReviewer { .. } => ("plan".into(), "reviewer".into(), None),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             ("tasks".into(), "implementer".into(), Some(*task_index))
         }
@@ -1455,7 +1631,8 @@ fn synthetic_node_id(parsed: &ParsedWorkUnitKey, work_unit_key: &str) -> String 
     let key_tag = short_key_tag(work_unit_key);
     match parsed {
         ParsedWorkUnitKey::Design { .. } => format!("observed-design-{key_tag}"),
-        ParsedWorkUnitKey::Plan { .. } => format!("observed-plan-{key_tag}"),
+        ParsedWorkUnitKey::PlanAuthor { .. } => format!("observed-plan-author-{key_tag}"),
+        ParsedWorkUnitKey::PlanReviewer { .. } => format!("observed-plan-reviewer-{key_tag}"),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             format!("observed-task-{task_index}-impl")
         }
@@ -1551,6 +1728,7 @@ fn node_kind_str(k: ManifestNodeKind) -> &'static str {
 
 fn role_str(r: ManifestNodeRole) -> &'static str {
     match r {
+        ManifestNodeRole::Author => "author",
         ManifestNodeRole::Reviewer => "reviewer",
         ManifestNodeRole::Implementer => "implementer",
         ManifestNodeRole::Fixer => "fixer",
@@ -1603,7 +1781,8 @@ pub fn evidence_from_run_and_binding(
         .as_deref()
         .and_then(parse_and_validate_summary_json);
     let (work_status, review_verdict) = match parsed {
-        Some(CardSummary::Implementation { status, .. }) => (Some(status), None),
+        Some(CardSummary::Implementation { status, .. })
+        | Some(CardSummary::Author { status, .. }) => (Some(status), None),
         Some(CardSummary::Review { verdict, .. }) => (None, Some(verdict)),
         None => (None, None),
     };
@@ -1641,7 +1820,10 @@ pub fn evaluate_task_gate_from_pairs(
     evaluate_execution_gate(&ExecutionGateInput {
         kind: ExecutionGateKind::Task,
         implementer_or_fixer: implementer.map(|(r, b)| evidence_from_run_and_binding(r, b)),
-        reviewer: reviewer.map(|(r, b)| evidence_from_run_and_binding(r, b)),
+        required_reviewers: vec![RequiredReviewerEvidence {
+            node_id: "reviewer".into(),
+            evidence: reviewer.map(|(r, b)| evidence_from_run_and_binding(r, b)),
+        }],
         branch_tip_digest: None,
     })
 }
@@ -1670,7 +1852,10 @@ mod tests {
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase,
-        WorkUnitKeyParts, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
+        ManifestTaskHardTrigger, ManifestTaskPolicy, ManifestTaskRisk, ManifestTaskRoute,
+        ManifestTaskSoftSignal, TaskHardTriggerKind, TaskRiskLevel, TaskSoftSignalKind,
+        WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
+        PHASE_TASKS,
     };
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -1729,7 +1914,13 @@ mod tests {
             profile_id: Some("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"),
         })
         .unwrap();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -1759,8 +1950,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: token.into(),
@@ -1840,6 +2033,16 @@ mod tests {
                     final_fix,
                     vec!["final-reviewer".into()],
                 ),
+                wu(
+                    "plan-author",
+                    PHASE_PLAN,
+                    ManifestNodeRole::Author,
+                    "codex",
+                    None,
+                    None,
+                    author_key,
+                    vec![],
+                ),
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -1849,18 +2052,102 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
+    }
+
+    fn high_risk_doc(token: &str) -> ManifestDocument {
+        let mut doc = design_plan_doc(token);
+        let implementer = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "task-1-impl")
+            .expect("task implementer");
+        implementer.agent_type = Some("codex".into());
+        implementer.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 1,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+        );
+
+        let grok_reviewer_id = "task-1-rev-grok";
+        doc.nodes.push(wu(
+            grok_reviewer_id,
+            PHASE_TASKS,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            Some(1),
+            build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+                task_index: 1,
+                agent_type: "grok",
+                profile_id: None,
+            })
+            .unwrap(),
+            vec!["task-1-impl".into()],
+        ));
+        let final_reviewer = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "final-reviewer")
+            .expect("final reviewer");
+        final_reviewer.deps.push(grok_reviewer_id.into());
+        doc.edges.push(ManifestEdge {
+            id: Some("task-1-grok-review".into()),
+            from: "task-1-impl".into(),
+            to: grok_reviewer_id.into(),
+        });
+        doc.task_policies[0] = ManifestTaskPolicy {
+            task_index: 1,
+            risk: ManifestTaskRisk {
+                level: TaskRiskLevel::High,
+                hard_triggers: vec![ManifestTaskHardTrigger {
+                    kind: TaskHardTriggerKind::ConcurrencyLifecycle,
+                    evidence: vec![r"D:\private\lifecycle-evidence.md".into()],
+                }],
+                soft_signals: vec![ManifestTaskSoftSignal {
+                    kind: TaskSoftSignalKind::SharedInterface,
+                    score: 1,
+                    evidence: vec!["/private/shared-interface-evidence.md".into()],
+                }],
+                score: 1,
+                reason: "private free-form reason must never project".into(),
+            },
+            route: ManifestTaskRoute {
+                implementer_node_id: "task-1-impl".into(),
+                reviewer_node_ids: vec!["task-1-rev".into(), grok_reviewer_id.into()],
+            },
+        };
+        doc
     }
 
     async fn seed_parent() -> (AppDatabase, i32) {
@@ -1965,6 +2252,323 @@ mod tests {
             updated_at: Set(now),
         };
         rb.insert(&db.conn).await.expect("insert rb");
+    }
+
+    async fn insert_completed_task_evidence(
+        db: &AppDatabase,
+        parent: i32,
+        workflow_id: &str,
+        node_id: &str,
+        task_id: &str,
+        agent: &str,
+        digest: &str,
+        reviewed_task_id: Option<&str>,
+        lineage_ordinal: i64,
+    ) {
+        let summary = if reviewed_task_id.is_some() {
+            r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"approved"}"#
+        } else {
+            r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"implemented","commits":[],"concerns":[]}"#
+        };
+        insert_run(
+            db,
+            parent,
+            task_id,
+            None,
+            DelegationRunStatus::Completed,
+            lineage_ordinal,
+            Some(summary),
+            None,
+            agent,
+        )
+        .await;
+        insert_run_binding(
+            db,
+            task_id,
+            workflow_id,
+            node_id,
+            lineage_ordinal,
+            true,
+            Some(digest),
+            reviewed_task_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task6_projects_normal_and_high_routes_with_redacted_policy_metadata() {
+        for (token, doc, expected_level, expected_reviewer_count) in [
+            (
+                "task6-normal-projection",
+                design_plan_doc("task6-normal-projection"),
+                "normal",
+                1,
+            ),
+            (
+                "task6-high-projection",
+                high_risk_doc("task6-high-projection"),
+                "high",
+                2,
+            ),
+        ] {
+            let (db, parent) = seed_parent().await;
+            publish_workflow_manifest_core(
+                &db,
+                &emitter(),
+                parent,
+                PublishWorkflowRequest { document: doc },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("publish {token}: {err}"));
+
+            let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+            let task_nodes: Vec<_> = snap
+                .nodes
+                .iter()
+                .filter(|node| node.task_index == Some(1))
+                .collect();
+            assert_eq!(task_nodes.len(), expected_reviewer_count + 1);
+            for node in task_nodes {
+                assert_eq!(node.task_risk_level.as_deref(), Some(expected_level));
+                assert_eq!(
+                    node.required_reviewer_count,
+                    Some(expected_reviewer_count as u64)
+                );
+                assert_eq!(node.returned_reviewer_count, Some(0));
+            }
+
+            if expected_level == "high" {
+                let implementer = snap
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == "task-1-impl")
+                    .unwrap();
+                let reviewers: Vec<_> = ["task-1-rev", "task-1-rev-grok"]
+                    .into_iter()
+                    .map(|id| snap.nodes.iter().find(|node| node.node_id == id).unwrap())
+                    .collect();
+                assert!(reviewers
+                    .iter()
+                    .all(|reviewer| reviewer.deps == vec![implementer.node_id.clone()]));
+                assert_eq!(
+                    implementer.task_risk_reason_codes,
+                    vec!["concurrency_lifecycle", "shared_interface"]
+                );
+                let json = serde_json::to_string(&snap).unwrap();
+                assert!(!json.contains("lifecycle-evidence"));
+                assert!(!json.contains("shared-interface-evidence"));
+                assert!(!json.contains("private free-form reason"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task6_high_route_counts_strict_and_and_invalidates_both_old_approvals() {
+        let (db, parent) = seed_parent().await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: high_risk_doc("task6-high-counts"),
+            },
+        )
+        .await
+        .unwrap();
+
+        insert_completed_task_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "task-1-impl",
+            "impl-old",
+            "codex",
+            "digest-old",
+            None,
+            1,
+        )
+        .await;
+        let zero = project_workflow_graph_core(&db, parent).await.unwrap();
+        let zero_impl = zero
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "task-1-impl")
+            .unwrap();
+        assert_eq!(zero_impl.returned_reviewer_count, Some(0));
+        assert_ne!(zero.overall_state, WorkflowOverallState::Completed);
+
+        insert_completed_task_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "task-1-rev",
+            "codex-review-old",
+            "codex",
+            "digest-old",
+            Some("impl-old"),
+            1,
+        )
+        .await;
+        let one = project_workflow_graph_core(&db, parent).await.unwrap();
+        let one_impl = one
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "task-1-impl")
+            .unwrap();
+        assert_eq!(one_impl.returned_reviewer_count, Some(1));
+        assert_ne!(one.overall_state, WorkflowOverallState::Completed);
+
+        let request_changes_summary = r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#;
+        insert_run(
+            &db,
+            parent,
+            "grok-review-changes",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(request_changes_summary),
+            None,
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "grok-review-changes",
+            &published.workflow_id,
+            "task-1-rev-grok",
+            1,
+            true,
+            Some("digest-old"),
+            Some("impl-old"),
+        )
+        .await;
+        let changes = project_workflow_graph_core(&db, parent).await.unwrap();
+        let changes_impl = changes
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "task-1-impl")
+            .unwrap();
+        assert_eq!(changes_impl.returned_reviewer_count, Some(2));
+        assert_ne!(changes.overall_state, WorkflowOverallState::Completed);
+        assert_ne!(
+            changes
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "task-1-rev-grok")
+                .unwrap()
+                .status,
+            ProjectedNodeStatus::Completed
+        );
+
+        insert_completed_task_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "task-1-rev-grok",
+            "grok-review-old",
+            "grok",
+            "digest-old",
+            Some("impl-old"),
+            2,
+        )
+        .await;
+        let two = project_workflow_graph_core(&db, parent).await.unwrap();
+        let two_impl = two
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "task-1-impl")
+            .unwrap();
+        assert_eq!(two_impl.returned_reviewer_count, Some(2));
+        for reviewer_id in ["task-1-rev", "task-1-rev-grok"] {
+            assert_eq!(
+                two.nodes
+                    .iter()
+                    .find(|node| node.node_id == reviewer_id)
+                    .unwrap()
+                    .status,
+                ProjectedNodeStatus::Completed
+            );
+        }
+
+        insert_completed_task_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "task-1-impl",
+            "impl-new",
+            "codex",
+            "digest-new",
+            None,
+            2,
+        )
+        .await;
+        let stale = project_workflow_graph_core(&db, parent).await.unwrap();
+        let stale_impl = stale
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "task-1-impl")
+            .unwrap();
+        assert_eq!(stale_impl.returned_reviewer_count, Some(0));
+        for reviewer_id in ["task-1-rev", "task-1-rev-grok"] {
+            let reviewer = stale
+                .nodes
+                .iter()
+                .find(|node| node.node_id == reviewer_id)
+                .unwrap();
+            assert_ne!(reviewer.status, ProjectedNodeStatus::Completed);
+            assert_eq!(
+                reviewer.status_reason.as_deref(),
+                Some("reviewer_does_not_cover_latest_implementer")
+            );
+        }
+        assert_ne!(stale.overall_state, WorkflowOverallState::Completed);
+    }
+
+    #[tokio::test]
+    async fn task6_author_precedes_plan_reviewers_and_final_shape_is_unchanged() {
+        let (db, parent) = seed_parent().await;
+        publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: high_risk_doc("task6-order-final"),
+            },
+        )
+        .await
+        .unwrap();
+        let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+        let author_position = snap
+            .nodes
+            .iter()
+            .position(|node| node.node_id == "plan-author")
+            .unwrap();
+        let reviewer_position = snap
+            .nodes
+            .iter()
+            .position(|node| node.node_id == "plan-reviewer-1")
+            .unwrap();
+        assert!(author_position < reviewer_position);
+
+        for node_id in ["final-reviewer", "final-fixer"] {
+            let node = snap
+                .nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .unwrap();
+            assert_eq!(node.task_risk_level, None);
+            assert!(node.task_risk_reason_codes.is_empty());
+            assert_eq!(node.required_reviewer_count, None);
+            assert_eq!(node.returned_reviewer_count, None);
+        }
+        assert_eq!(
+            snap.nodes
+                .iter()
+                .filter(|node| node.phase_id.as_deref() == Some(PHASE_FINAL))
+                .filter(|node| node.role.as_deref() == Some("reviewer"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2767,6 +3371,10 @@ mod tests {
             agent_type: Some("grok".into()),
             profile_id: None,
             task_index: Some(task_index),
+            task_risk_level: None,
+            task_risk_reason_codes: vec![],
+            required_reviewer_count: None,
+            returned_reviewer_count: None,
             title: None,
             status: ProjectedNodeStatus::Completed,
             status_reason: None,
@@ -2843,11 +3451,12 @@ mod tests {
             summary: Set("old approve".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         srow.insert(&db.conn).await.unwrap();
 
         // Reviewer run_binding for cycle 1 / rev 1 (old fingerprint).
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -2960,10 +3569,11 @@ mod tests {
             summary: Set("need changes".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         srow.insert(&db.conn).await.unwrap();
 
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -3050,7 +3660,7 @@ mod tests {
 
         // Old plan run stamped with old fingerprint, cycle 1.
         let now = Utc::now();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -3103,6 +3713,7 @@ mod tests {
             summary: Set("design ok".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         drow.insert(&db.conn).await.unwrap();
 

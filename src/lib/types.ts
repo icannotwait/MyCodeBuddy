@@ -737,6 +737,10 @@ export interface WorkflowNodeSnapshot {
   agent_type?: string | null
   profile_id?: string | null
   task_index?: number | null
+  task_risk_level?: "normal" | "high" | null
+  task_risk_reason_codes: string[]
+  required_reviewer_count?: number | null
+  returned_reviewer_count?: number | null
   title?: string | null
   status: ProjectedNodeStatus
   status_reason?: string | null
@@ -2042,6 +2046,14 @@ export type CardSummary =
       important: number
       minor: number
       summary: string
+      report_file?: string | null
+    }
+  | {
+      kind: "author"
+      status: "done" | "done_with_concerns" | "blocked" | "needs_context"
+      summary: string
+      plan_digest: string
+      report_file: string
     }
   | {
       kind: "implementation"

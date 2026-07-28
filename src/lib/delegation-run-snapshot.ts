@@ -13,9 +13,11 @@ const TEST_STATUS_MAX_CHARS = 64
 const COUNT_MAX = 1_000_000
 const COMMITS_MAX = 20
 const CONCERNS_MAX = 20
+const PLAN_DIGEST_MAX = 128
 const REPORT_FILE_MAX = 512
 
 type ReviewSummary = Extract<CardSummary, { kind: "review" }>
+type AuthorSummary = Extract<CardSummary, { kind: "author" }>
 type ImplementationSummary = Extract<CardSummary, { kind: "implementation" }>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -68,6 +70,13 @@ export function normalizeCardSummary(value: unknown): CardSummary | null {
     ) {
       return null
     }
+    if (
+      value.report_file != null &&
+      (typeof value.report_file !== "string" ||
+        !isValidReportFile(value.report_file))
+    ) {
+      return null
+    }
     return {
       kind: "review",
       verdict: value.verdict as ReviewSummary["verdict"],
@@ -75,6 +84,29 @@ export function normalizeCardSummary(value: unknown): CardSummary | null {
       important: value.important,
       minor: value.minor,
       summary: value.summary,
+      ...(value.report_file == null ? {} : { report_file: value.report_file }),
+    }
+  }
+
+  if (value.kind === "author") {
+    if (
+      !["done", "done_with_concerns", "blocked", "needs_context"].includes(
+        String(value.status)
+      ) ||
+      !isBoundedString(value.plan_digest, PLAN_DIGEST_MAX) ||
+      value.plan_digest.trim().length === 0 ||
+      typeof value.report_file !== "string" ||
+      value.report_file.length === 0 ||
+      !isValidReportFile(value.report_file)
+    ) {
+      return null
+    }
+    return {
+      kind: "author",
+      status: value.status as AuthorSummary["status"],
+      summary: value.summary,
+      plan_digest: value.plan_digest,
+      report_file: value.report_file,
     }
   }
 

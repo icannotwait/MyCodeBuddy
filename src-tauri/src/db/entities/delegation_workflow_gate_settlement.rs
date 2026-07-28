@@ -14,6 +14,44 @@ pub enum GateSettlementOutcome {
     Blocked,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReviewScope {
+    #[sea_orm(string_value = "full")]
+    Full,
+    #[sea_orm(string_value = "scoped")]
+    Scoped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRevisionKind {
+    #[sea_orm(string_value = "initial")]
+    Initial,
+    #[sea_orm(string_value = "localized")]
+    Localized,
+    #[sea_orm(string_value = "material")]
+    Material,
+    #[sea_orm(string_value = "holistic_rewrite")]
+    HolisticRewrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReviewNextAction {
+    #[sea_orm(string_value = "continue_review")]
+    ContinueReview,
+    #[sea_orm(string_value = "holistic_rewrite_required")]
+    HolisticRewriteRequired,
+    #[sea_orm(string_value = "user_decision_required")]
+    UserDecisionRequired,
+    #[sea_orm(string_value = "approved")]
+    Approved,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation_workflow_gate_settlements")]
 pub struct Model {
@@ -36,6 +74,22 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub summary: String,
     pub graph_revision_at_settle: i64,
+    pub review_scope: Option<PlanReviewScope>,
+    pub revision_kind: Option<PlanRevisionKind>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub scope_reason: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub required_reviewer_node_ids_json: Option<String>,
+    pub covered_author_task_id: Option<String>,
+    pub covered_plan_digest: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub finding_ledger_json: Option<String>,
+    pub net_improvement: Option<bool>,
+    pub stagnation_count: i64,
+    pub rewrite_used: bool,
+    pub next_action: Option<PlanReviewNextAction>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub report_files_json: Option<String>,
     pub created_at: DateTimeUtc,
 }
 

@@ -2589,6 +2589,25 @@
         "openSession": "Abrir conversa",
         "estimatedNonActionable": "Estimado — ainda sem sessão",
         "optionalReviewer": "Opcional",
+        "reviewerCohort": "Grupo de revisores",
+        "riskLevel": {
+          "normal": "Risco normal",
+          "high": "Risco alto"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "Concorrência ou ciclo de vida",
+          "security_trust_boundary": "Limite de segurança ou confiança",
+          "migration_destructive_persistence": "Migração ou persistência destrutiva",
+          "public_compatibility": "Compatibilidade pública",
+          "unsafe_ffi": "FFI insegura",
+          "update_rollback": "Atualização ou reversão",
+          "cross_runtime_or_process": "Entre runtimes ou processos",
+          "broad_production_surface": "Superfície de produção ampla",
+          "multiple_ownership_modules": "Vários módulos responsáveis",
+          "shared_interface": "Interface compartilhada",
+          "dependency_or_build": "Dependência ou compilação",
+          "multi_layer_without_test_seam": "Várias camadas sem ponto de teste"
+        },
         "roleLabel": "Função: {role}",
         "agentLabel": "Agente: {agent}",
         "currentWork": "Atual: {title}",
@@ -2806,6 +2825,7 @@
         "replacement": "Sessão de substituição",
         "summary": {
           "review": "Revisão: {verdict}",
+          "author": "Plano: {status}",
           "implementation": "Entrega: {status}",
           "critical": "Crítico: {count}",
           "important": "Importante: {count}",

@@ -39,6 +39,25 @@ export function DelegationRunSummary({ summary, compact = false }: Props) {
     )
   }
 
+  if (summary.kind === "author") {
+    return (
+      <section
+        data-testid="delegation-run-summary"
+        dir="auto"
+        className="min-w-0 border-t border-border/60 pt-2"
+      >
+        <span className="break-words text-xs font-medium text-foreground">
+          {t("summary.author", {
+            status: t(`summary.workStatus.${summary.status}`),
+          })}
+        </span>
+        <p className="mt-1 break-words text-xs leading-snug text-muted-foreground">
+          {summary.summary}
+        </p>
+      </section>
+    )
+  }
+
   const commits = summary.commits ?? []
   const concerns = summary.concerns ?? []
   return (

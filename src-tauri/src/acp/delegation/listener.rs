@@ -40,7 +40,8 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::{
     get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    ManifestDocument, PublishWorkflowRequest, SettleWorkflowRequest, WorkflowStoreError,
+    ManifestDocument, PlanReviewError, PublishWorkflowRequest, SettleWorkflowRequest,
+    WorkflowError, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
@@ -121,8 +122,8 @@ pub struct TokenEntry {
     pub delegation_continuation_v1: bool,
     /// Immutable companion role for this launch.
     pub role: CompanionRole,
-    /// Whether this launch advertised `workflow_v1` (Root-only mutation tools).
-    pub workflow_v1: bool,
+    /// Whether this launch advertised `workflow_v2` (Root-only mutation tools).
+    pub workflow_v2: bool,
 }
 
 impl TokenEntry {
@@ -134,7 +135,7 @@ impl TokenEntry {
             coordination_v1: false,
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
-            workflow_v1: false,
+            workflow_v2: false,
         }
     }
 }
@@ -1427,7 +1428,7 @@ impl DelegationListener {
             .await
     }
 
-    /// Auth + Root/`workflow_v1` gate for workflow mutation/recovery tools.
+    /// Auth + Root/`workflow_v2` gate for workflow mutation/recovery tools.
     async fn workflow_auth_context(
         &self,
         token: &str,
@@ -1437,7 +1438,7 @@ impl DelegationListener {
             .lookup(token)
             .await
             .ok_or(WorkflowWireError::InvalidToken)?;
-        if !entry.workflow_v1 {
+        if !entry.workflow_v2 {
             return Err(WorkflowWireError::FeatureDisabled);
         }
         if entry.role != CompanionRole::Root {
@@ -1495,6 +1496,15 @@ impl DelegationListener {
             Ok(o) => o,
             Err(msg) => return WorkflowWireError::InvalidArguments(msg).to_value(),
         };
+        let evidence = match serde_json::from_value(req.evidence) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return WorkflowWireError::InvalidArguments(format!(
+                    "settle_workflow_gate evidence: {error}"
+                ))
+                .to_value();
+            }
+        };
         match settle_workflow_gate_core(
             runs.db(),
             &self.workflow_emitter,
@@ -1506,9 +1516,7 @@ impl DelegationListener {
                 expected_graph_revision: req.expected_graph_revision,
                 gate_cycle: req.gate_cycle,
                 outcome,
-                critical_count: req.critical_count,
-                important_count: req.important_count,
-                minor_count: req.minor_count,
+                evidence,
                 summary: req.summary,
             },
         )
@@ -1809,7 +1817,7 @@ impl WorkflowWireError {
             Self::InvalidToken => ("invalid_token", "invalid token".to_string()),
             Self::FeatureDisabled => (
                 "feature_disabled",
-                "workflow_v1 is not enabled for this companion".to_string(),
+                "workflow_v2 is not enabled for this companion".to_string(),
             ),
             Self::RootOnly => (
                 "root_only",
@@ -1849,7 +1857,17 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
 
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
     let code = match &err {
+        WorkflowStoreError::Validation(WorkflowError::RiskAssessmentInvalid(_)) => {
+            "risk_assessment_invalid"
+        }
+        WorkflowStoreError::Validation(WorkflowError::TaskRouteMismatch(_)) => {
+            "task_route_mismatch"
+        }
         WorkflowStoreError::Validation(_) => "validation",
+        WorkflowStoreError::PlanReview(PlanReviewError::RequiredReviewerSetMismatch { .. }) => {
+            "reviewer_set_mismatch"
+        }
+        WorkflowStoreError::PlanReview(_) => "plan_review",
         WorkflowStoreError::NotFound(_) => "not_found",
         WorkflowStoreError::CrossParent { .. } => "cross_parent",
         WorkflowStoreError::StaleManifestRevision { .. } => "stale_manifest_revision",
@@ -1859,7 +1877,9 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::AdmittedNodeIdentityMutation { .. } => {
             "admitted_node_identity_mutation"
         }
-        WorkflowStoreError::FrozenPartnerDrop { .. } => "frozen_partner_drop",
+        WorkflowStoreError::CohortFrozen { .. } => "cohort_frozen",
+        WorkflowStoreError::ReviewedTaskStale(_) => "reviewed_task_stale",
+        WorkflowStoreError::ArtifactDigestMismatch(_) => "artifact_digest_mismatch",
         WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
         WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
         WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
@@ -1879,6 +1899,14 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
             "message": err.to_string(),
         }
     })
+}
+
+#[cfg(test)]
+pub(crate) fn workflow_store_error_code_for_test(err: WorkflowStoreError) -> String {
+    workflow_store_error_value(err)["error"]["code"]
+        .as_str()
+        .expect("workflow errors have string codes")
+        .to_string()
 }
 
 fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerResponse> {
@@ -2643,7 +2671,7 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
-            workflow_v1: false,
+            workflow_v2: false,
         }
     }
 
@@ -2891,6 +2919,15 @@ mod tests {
             .await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+    }
+
+    #[test]
+    fn cohort_frozen_workflow_error_uses_exact_wire_code() {
+        let outcome = workflow_store_error_value(WorkflowStoreError::CohortFrozen {
+            node_id: "Task 1".into(),
+        });
+
+        assert_eq!(outcome["error"]["code"], "cohort_frozen");
     }
 
     // -- Task 1: correlation_id parse/forward ------------------------------
@@ -6240,7 +6277,7 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
-            workflow_v1: false,
+            workflow_v2: false,
         }
     }
 
@@ -6251,7 +6288,7 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
-            workflow_v1: false,
+            workflow_v2: false,
         }
     }
 
@@ -6263,7 +6300,7 @@ mod tests {
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
             // Feature bit set but role is child — must still hard-deny.
-            workflow_v1: true,
+            workflow_v2: true,
         }
     }
 
@@ -6292,7 +6329,7 @@ mod tests {
             .await;
         assert_eq!(
             outcome["error"]["code"], "root_only",
-            "child must not publish even when workflow_v1 token bit is set: {outcome}"
+            "child must not publish even when workflow_v2 token bit is set: {outcome}"
         );
     }
 
@@ -6311,6 +6348,297 @@ mod tests {
             })
             .await;
         assert_eq!(outcome["error"]["code"], "feature_disabled");
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_v2_framed_publish_and_plan_settle_reach_store() {
+        use crate::acp::delegation::companion::{
+            dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
+        };
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/workflow-v2-listener").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "workflow-v2-token".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-v2".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                    coordination_v1: false,
+                    delegation_continuation_v1: false,
+                    role: CompanionRole::Root,
+                    workflow_v2: true,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent));
+        #[cfg(windows)]
+        let socket_path = PathBuf::from(format!(
+            r"\\.\pipe\codeg-workflow-v2-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        #[cfg(unix)]
+        let socket_path = std::env::temp_dir().join(format!(
+            "codeg-workflow-v2-test-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let listener_task = tokio::spawn(Arc::clone(&listener).run(socket_path.clone()));
+        #[cfg(unix)]
+        while !socket_path.try_exists().expect("check listener socket") {
+            tokio::task::yield_now().await;
+        }
+
+        let companion = CompanionContext {
+            parent_connection_id: "parent-v2".into(),
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            token: "workflow-v2-token".into(),
+            features: CompanionFeatures::parse(Some("workflow_v2")),
+            role: CompanionRole::Root,
+        };
+        let inflight = Arc::new(InflightCalls::new());
+
+        async fn call_companion_workflow(
+            context: &CompanionContext,
+            inflight: Arc<InflightCalls>,
+            id: u64,
+            name: &str,
+            arguments: Value,
+        ) -> Value {
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            })
+            .to_string();
+            let LineAction::Spawn(call) = dispatch_line(context, inflight, &line).await else {
+                panic!("workflow call must cross the companion transport")
+            };
+            call.future
+                .await
+                .response
+                .expect("workflow response")
+                .result
+                .expect("workflow result")
+        }
+
+        let manifest = json!({
+            "schema_version": 2,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "listener-v2-plan",
+            "workflow_state": "estimated",
+            "plan_target_rel_path": "docs/superpowers/plans/p.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "plan": {
+                "rel_path": "docs/superpowers/plans/p.md",
+                "digest": "sha256:plan"
+            },
+            "phases": [{"id": "plan"}, {"id": "tasks"}],
+            "nodes": [
+                {
+                    "id": "plan-author",
+                    "kind": "work_unit",
+                    "phase_id": "plan",
+                    "role": "author",
+                    "agent_type": "codex",
+                    "work_unit_key": "plan|docs/superpowers/plans/p.md|author|codex|none",
+                    "deps": []
+                },
+                {
+                    "id": "plan-reviewer-codex",
+                    "kind": "work_unit",
+                    "phase_id": "plan",
+                    "role": "reviewer",
+                    "agent_type": "codex",
+                    "work_unit_key": "plan|docs/superpowers/plans/p.md|reviewer|codex|none",
+                    "deps": ["plan-author"]
+                },
+                {
+                    "id": "plan-reviewer-grok",
+                    "kind": "work_unit",
+                    "phase_id": "plan",
+                    "role": "reviewer",
+                    "agent_type": "grok",
+                    "work_unit_key": "plan|docs/superpowers/plans/p.md|reviewer|grok|none",
+                    "deps": ["plan-author"]
+                },
+                {
+                    "id": "task-1-implementer",
+                    "kind": "work_unit",
+                    "phase_id": "tasks",
+                    "role": "implementer",
+                    "agent_type": "codex",
+                    "task_index": 1,
+                    "work_unit_key": "task|1|implementer|codex|none",
+                    "deps": []
+                },
+                {
+                    "id": "task-1-reviewer-codex",
+                    "kind": "work_unit",
+                    "phase_id": "tasks",
+                    "role": "reviewer",
+                    "agent_type": "codex",
+                    "task_index": 1,
+                    "work_unit_key": "task|1|reviewer|codex|none",
+                    "deps": ["task-1-implementer"]
+                },
+                {
+                    "id": "task-1-reviewer-grok",
+                    "kind": "work_unit",
+                    "phase_id": "tasks",
+                    "role": "reviewer",
+                    "agent_type": "grok",
+                    "task_index": 1,
+                    "work_unit_key": "task|1|reviewer|grok|none",
+                    "deps": ["task-1-implementer"]
+                }
+            ],
+            "edges": [],
+            "gates": [{
+                "id": "plan-gate",
+                "gate_kind": "plan",
+                "reviewer_cohort_node_ids": [
+                    "plan-reviewer-codex",
+                    "plan-reviewer-grok"
+                ],
+                "required_reviewer_node_ids": ["plan-reviewer-codex"],
+                "resolution_mode": "parent_adjudication"
+            }],
+            "task_policies": [{
+                "task_index": 1,
+                "risk": {
+                    "level": "high",
+                    "hard_triggers": [{
+                        "kind": "public_compatibility",
+                        "evidence": ["serialized workflow protocol"]
+                    }],
+                    "soft_signals": [],
+                    "score": 0,
+                    "reason": "public compatibility freezes high risk"
+                },
+                "route": {
+                    "implementer_node_id": "task-1-implementer",
+                    "reviewer_node_ids": [
+                        "task-1-reviewer-codex",
+                        "task-1-reviewer-grok"
+                    ]
+                }
+            }]
+        });
+
+        let publish_result = call_companion_workflow(
+            &companion,
+            Arc::clone(&inflight),
+            1,
+            "publish_workflow_manifest",
+            manifest.clone(),
+        )
+        .await;
+        assert_eq!(publish_result["isError"], false);
+        let workflow_id = publish_result["structuredContent"]["workflow_id"]
+            .as_str()
+            .expect("published workflow id")
+            .to_string();
+
+        let mut v1 = manifest;
+        v1["schema_version"] = json!(1);
+        v1["publication_token"] = json!("listener-v1-rejected");
+        let v1_result = call_companion_workflow(
+            &companion,
+            Arc::clone(&inflight),
+            2,
+            "publish_workflow_manifest",
+            v1,
+        )
+        .await;
+        assert_eq!(
+            v1_result["structuredContent"]["error"]["code"],
+            "validation"
+        );
+
+        let omitted_evidence = json!({
+            "workflow_id": workflow_id,
+            "manifest_revision": 1,
+            "gate_id": "plan-gate",
+            "expected_graph_revision": 1,
+            "gate_cycle": 1,
+            "outcome": "changes_requested",
+            "summary": "missing structured evidence"
+        });
+        let omitted_line = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "settle_workflow_gate",
+                "arguments": omitted_evidence
+            }
+        })
+        .to_string();
+        let LineAction::Respond(omitted_response) =
+            dispatch_line(&companion, Arc::clone(&inflight), &omitted_line).await
+        else {
+            panic!("omitted evidence must be rejected by the companion")
+        };
+        assert_eq!(
+            omitted_response.error.expect("invalid arguments").code,
+            -32602
+        );
+
+        let plan_evidence = json!({
+            "kind": "plan",
+            "scope": "full",
+            "revision_kind": "initial",
+            "scope_reason": "initial independent review",
+            "covered_author_task_id": "author-task-1",
+            "covered_plan_digest": "sha256:contradictory-plan",
+            "required_reviewer_node_ids": ["plan-reviewer-codex"],
+            "finding_updates": [],
+            "lineage_reset_reason": null
+        });
+        let settle_result = call_companion_workflow(
+            &companion,
+            inflight,
+            4,
+            "settle_workflow_gate",
+            json!({
+                "workflow_id": workflow_id,
+                "manifest_revision": 1,
+                "gate_id": "plan-gate",
+                "expected_graph_revision": 1,
+                "gate_cycle": 1,
+                "outcome": "changes_requested",
+                "evidence": plan_evidence,
+                "summary": "framed contradictory Plan evidence"
+            }),
+        )
+        .await;
+        assert_eq!(
+            settle_result["structuredContent"]["error"]["code"],
+            "artifact_digest_mismatch"
+        );
+        listener_task.abort();
+        let _ = listener_task.await;
+        #[cfg(unix)]
+        let _ = tokio::fs::remove_file(socket_path).await;
     }
 
     async fn decision_fixture() -> (

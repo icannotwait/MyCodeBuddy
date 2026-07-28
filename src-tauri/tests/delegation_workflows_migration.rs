@@ -78,6 +78,20 @@ async fn count_table(db: &DatabaseConnection, table: &str) -> i64 {
     row.try_get::<i64>("", "c").unwrap()
 }
 
+async fn table_columns(db: &DatabaseConnection, table: &str) -> Vec<(String, Option<String>)> {
+    db.query_all(sql(format!("PRAGMA table_info({table})")))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "name").unwrap(),
+                row.try_get::<Option<String>>("", "dflt_value").unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn workflow_tables_exist_after_migration() {
     let db = open_db().await;
@@ -143,7 +157,7 @@ async fn delete_workflow_cascades_to_child_tables() {
     db.execute(sql("INSERT INTO delegation_workflow_node_bindings ( \
            workflow_id, node_id, work_unit_key, role, agent_type, profile_id, phase_id, \
            task_index, introduced_revision, retired_revision, is_observed, retained_observed, \
-           pair_frozen, node_outcome, created_at, updated_at \
+           cohort_frozen, node_outcome, created_at, updated_at \
          ) VALUES ( \
            'wf-1', 'n1', 'task|1|implementer|grok|none', 'implementer', 'grok', NULL, 'tasks', \
            1, 1, NULL, 0, 0, \
@@ -220,6 +234,171 @@ async fn delete_workflow_cascades_to_child_tables() {
         count_table(&db, "delegation_workflow_run_bindings").await,
         0,
         "run bindings must cascade-delete with workflow"
+    );
+}
+
+#[tokio::test]
+async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
+    const MIGRATIONS_THROUGH_GATE_FINGERPRINTS: u32 = 41;
+
+    let db = open_db().await;
+    Migrator::up(&db, Some(MIGRATIONS_THROUGH_GATE_FINGERPRINTS))
+        .await
+        .unwrap();
+    seed_folder_and_parent(&db).await;
+
+    db.execute(sql("INSERT INTO delegation_workflows ( \
+           workflow_id, parent_conversation_id, workflow_kind, schema_version, \
+           active_manifest_revision, graph_revision, workflow_state, capability_version, \
+           publication_token, created_at, updated_at \
+         ) VALUES ( \
+           'wf-v2-migration', 1, 'brainstorm_to_delivery', 1, \
+           1, 1, 'estimated', 'workflow_manifest_v1', \
+           'pub-v2-migration', '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z' \
+         )"))
+        .await
+        .unwrap();
+    db.execute(sql("INSERT INTO delegation_workflow_node_bindings ( \
+           workflow_id, node_id, work_unit_key, role, agent_type, phase_id, \
+           introduced_revision, is_observed, retained_observed, pair_frozen, \
+           created_at, updated_at \
+         ) VALUES ( \
+           'wf-v2-migration', 'task-1-impl', 'task|1|implementer|codex|none', \
+           'implementer', 'codex', 'tasks', 1, 0, 0, 1, \
+           '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z' \
+         )"))
+        .await
+        .unwrap();
+    db.execute(sql("INSERT INTO delegation_workflow_gate_settlements ( \
+           workflow_id, gate_id, gate_cycle, manifest_revision, structural_revision, \
+           content_fingerprint, outcome, critical_count, important_count, minor_count, \
+           summary, graph_revision_at_settle, created_at \
+         ) VALUES ( \
+           'wf-v2-migration', 'design_gate', 1, 1, 1, 'design-digest', 'approved', \
+           0, 0, 0, 'approved', 1, '2026-07-27T00:00:00Z' \
+         )"))
+        .await
+        .unwrap();
+
+    Migrator::up(&db, None).await.unwrap();
+
+    let binding_columns = table_columns(&db, "delegation_workflow_node_bindings").await;
+    assert!(binding_columns
+        .iter()
+        .any(|(name, _)| name == "cohort_frozen"));
+    assert!(!binding_columns
+        .iter()
+        .any(|(name, _)| name == "pair_frozen"));
+    let row = db
+        .query_one(sql(
+            "SELECT cohort_frozen FROM delegation_workflow_node_bindings \
+             WHERE workflow_id = 'wf-v2-migration' AND node_id = 'task-1-impl'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "cohort_frozen").unwrap(), 1);
+
+    let settlement_columns = table_columns(&db, "delegation_workflow_gate_settlements").await;
+    let expected_columns = [
+        ("review_scope", None),
+        ("revision_kind", None),
+        ("scope_reason", None),
+        ("required_reviewer_node_ids_json", None),
+        ("covered_author_task_id", None),
+        ("covered_plan_digest", None),
+        ("finding_ledger_json", None),
+        ("net_improvement", None),
+        ("stagnation_count", Some("0")),
+        ("rewrite_used", Some("0")),
+        ("next_action", None),
+        ("report_files_json", None),
+    ];
+    for (name, default) in expected_columns {
+        let actual = settlement_columns
+            .iter()
+            .find(|(column, _)| column == name)
+            .unwrap_or_else(|| panic!("missing settlement column {name}"));
+        assert_eq!(actual.1.as_deref(), default, "default for {name}");
+    }
+
+    let row =
+        db.query_one(sql("SELECT review_scope, revision_kind, scope_reason, \
+                    required_reviewer_node_ids_json, covered_author_task_id, \
+                    covered_plan_digest, finding_ledger_json, net_improvement, \
+                    stagnation_count, rewrite_used, next_action, report_files_json \
+             FROM delegation_workflow_gate_settlements \
+             WHERE workflow_id = 'wf-v2-migration' AND gate_id = 'design_gate'"))
+            .await
+            .unwrap()
+            .unwrap();
+    for name in [
+        "review_scope",
+        "revision_kind",
+        "scope_reason",
+        "required_reviewer_node_ids_json",
+        "covered_author_task_id",
+        "covered_plan_digest",
+        "finding_ledger_json",
+        "net_improvement",
+        "next_action",
+        "report_files_json",
+    ] {
+        assert_eq!(row.try_get::<Option<String>>("", name).unwrap(), None);
+    }
+    assert_eq!(row.try_get::<i64>("", "stagnation_count").unwrap(), 0);
+    assert_eq!(row.try_get::<i64>("", "rewrite_used").unwrap(), 0);
+
+    let invalid_check_values = [
+        ("review_scope", "'partial'"),
+        ("revision_kind", "'cosmetic'"),
+        ("net_improvement", "2"),
+        ("stagnation_count", "-1"),
+        ("rewrite_used", "2"),
+        ("next_action", "'retry_later'"),
+    ];
+    for (index, (column, invalid_value)) in invalid_check_values.into_iter().enumerate() {
+        let update = db
+            .execute(sql(format!(
+                "UPDATE delegation_workflow_gate_settlements \
+                 SET {column} = {invalid_value} \
+                 WHERE workflow_id = 'wf-v2-migration' AND gate_id = 'design_gate'"
+            )))
+            .await;
+        let update_error = update.expect_err("CHECK accepted invalid update");
+        assert!(
+            update_error.to_string().contains("CHECK constraint failed"),
+            "invalid update for {column} failed for the wrong reason: {update_error}"
+        );
+
+        let insert = db
+            .execute(sql(format!(
+                "INSERT INTO delegation_workflow_gate_settlements ( \
+                   workflow_id, gate_id, gate_cycle, manifest_revision, structural_revision, \
+                   content_fingerprint, outcome, critical_count, important_count, minor_count, \
+                   summary, graph_revision_at_settle, created_at, {column} \
+                 ) VALUES ( \
+                   'wf-v2-migration', 'invalid-{index}', 1, 1, 1, 'invalid-check', 'approved', \
+                   0, 0, 0, 'invalid', 1, '2026-07-27T00:00:00Z', {invalid_value} \
+                 )"
+            )))
+            .await;
+        let insert_error = insert.expect_err("CHECK accepted invalid insert");
+        assert!(
+            insert_error.to_string().contains("CHECK constraint failed"),
+            "invalid insert for {column} failed for the wrong reason: {insert_error}"
+        );
+    }
+
+    let fresh = open_db().await;
+    migrate_all(&fresh).await;
+    assert_eq!(
+        table_columns(&fresh, "delegation_workflow_node_bindings").await,
+        binding_columns
+    );
+    assert_eq!(
+        table_columns(&fresh, "delegation_workflow_gate_settlements").await,
+        settlement_columns
     );
 }
 

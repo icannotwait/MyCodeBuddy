@@ -24,6 +24,42 @@ interface WorkflowNodeDetailProps {
   className?: string
 }
 
+type RiskReasonTranslationKey =
+  | "riskReason.concurrency_lifecycle"
+  | "riskReason.security_trust_boundary"
+  | "riskReason.migration_destructive_persistence"
+  | "riskReason.public_compatibility"
+  | "riskReason.unsafe_ffi"
+  | "riskReason.update_rollback"
+  | "riskReason.cross_runtime_or_process"
+  | "riskReason.broad_production_surface"
+  | "riskReason.multiple_ownership_modules"
+  | "riskReason.shared_interface"
+  | "riskReason.dependency_or_build"
+  | "riskReason.multi_layer_without_test_seam"
+
+function riskReasonTranslationKey(
+  code: string
+): RiskReasonTranslationKey | null {
+  switch (code) {
+    case "concurrency_lifecycle":
+    case "security_trust_boundary":
+    case "migration_destructive_persistence":
+    case "public_compatibility":
+    case "unsafe_ffi":
+    case "update_rollback":
+    case "cross_runtime_or_process":
+    case "broad_production_surface":
+    case "multiple_ownership_modules":
+    case "shared_interface":
+    case "dependency_or_build":
+    case "multi_layer_without_test_seam":
+      return `riskReason.${code}`
+    default:
+      return null
+  }
+}
+
 export const WorkflowNodeDetail = memo(function WorkflowNodeDetail({
   node,
   onOpenSession,
@@ -32,6 +68,13 @@ export const WorkflowNodeDetail = memo(function WorkflowNodeDetail({
   const t = useTranslations("Folder.chat.workflowGraph")
   const openable = canOpenWorkflowNode(node)
   const estimated = isEstimatedNode(node)
+  const riskReasonKeys = Array.from(
+    new Set(
+      (node.task_risk_reason_codes ?? [])
+        .map(riskReasonTranslationKey)
+        .filter((key): key is RiskReasonTranslationKey => key != null)
+    )
+  )
 
   return (
     <div
@@ -64,10 +107,38 @@ export const WorkflowNodeDetail = memo(function WorkflowNodeDetail({
             {t("optionalReviewer")}
           </Badge>
         )}
+        {node.task_risk_level && (
+          <Badge
+            variant={
+              node.task_risk_level === "high" ? "destructive" : "outline"
+            }
+            className="h-5"
+            data-testid="workflow-node-risk-level"
+          >
+            {t(`riskLevel.${node.task_risk_level}`)}
+          </Badge>
+        )}
       </div>
 
       {node.summary && (
         <p className="text-muted-foreground line-clamp-3">{node.summary}</p>
+      )}
+
+      {riskReasonKeys.length > 0 && (
+        <div
+          className="flex min-w-0 flex-wrap gap-1"
+          data-testid="workflow-node-risk-reasons"
+        >
+          {riskReasonKeys.map((key) => (
+            <Badge
+              key={key}
+              variant="outline"
+              className="h-auto max-w-full whitespace-normal px-1.5 py-0.5 text-left text-[10px] leading-tight"
+            >
+              {t(key)}
+            </Badge>
+          ))}
+        </div>
       )}
 
       {/* B12 field vocabulary — separate labels, never collapsed into one counter */}

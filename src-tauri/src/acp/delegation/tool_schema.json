@@ -254,7 +254,7 @@
   },
   {
     "name": "get_workflow_capabilities",
-    "description": "Local workflow_manifest_v1 discovery before Design review. No workflow_id.",
+    "description": "Local workflow_manifest_v2 discovery.",
     "inputSchema": { "type": "object", "properties": {} }
   },
   {
@@ -269,7 +269,7 @@
   },
   {
     "name": "publish_workflow_manifest",
-    "description": "Root-only publish/CAS-update of brainstorm_to_delivery manifest.",
+    "description": "Publish/CAS v2 brainstorm_to_delivery; Rust validates nested fields.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -277,33 +277,27 @@
         "workflow_kind",
         "publication_token",
         "workflow_state",
+        "plan_target_rel_path",
+        "risk_policy_version",
+        "task_policies",
         "phases",
         "nodes",
         "edges",
         "gates"
       ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "workflow_kind": { "type": "string" },
+        "schema_version": { "type": "integer", "const": 2 },
         "workflow_id": { "type": "string" },
         "expected_manifest_revision": { "type": "integer", "minimum": 0 },
-        "publication_token": { "type": "string" },
-        "workflow_state": {
-          "type": "string",
-          "enum": ["skeleton", "estimated", "approved", "blocked"]
-        },
-        "design": { "type": "object" },
-        "plan": { "type": "object" },
-        "phases": { "type": "array" },
-        "nodes": { "type": "array" },
-        "edges": { "type": "array" },
-        "gates": { "type": "array" }
+        "plan_target_rel_path": { "type": "string" },
+        "risk_policy_version": { "type": "string", "const": "b2d_task_risk_v1" },
+        "task_policies": { "type": "array" }
       }
     }
   },
   {
     "name": "settle_workflow_gate",
-    "description": "Root-only Design/Plan document-gate settle for one cycle.",
+    "description": "Root-only Design/Plan gate settle with structured evidence.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -313,9 +307,7 @@
         "expected_graph_revision",
         "gate_cycle",
         "outcome",
-        "critical_count",
-        "important_count",
-        "minor_count",
+        "evidence",
         "summary"
       ],
       "properties": {
@@ -328,9 +320,12 @@
           "type": "string",
           "enum": ["approved", "changes_requested", "blocked"]
         },
-        "critical_count": { "type": "integer", "minimum": 0 },
-        "important_count": { "type": "integer", "minimum": 0 },
-        "minor_count": { "type": "integer", "minimum": 0 },
+        "evidence": {
+          "type": "object",
+          "description": "kind=design: critical_count, important_count, minor_count. kind=plan: scope full/scoped; revision_kind initial/localized/material/holistic_rewrite; scope_reason; covered_author_task_id; covered_plan_digest; required_reviewer_node_ids; finding_updates of finding_id, severity, status, owner_reviewer_node_ids, summary, evidence_ref, report_file; optional lineage_reset_reason.",
+          "required": ["kind"],
+          "properties": { "kind": { "enum": ["design", "plan"] } }
+        },
         "summary": { "type": "string" }
       }
     }

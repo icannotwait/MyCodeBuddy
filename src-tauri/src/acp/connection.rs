@@ -3428,7 +3428,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// Pulled out as a pure function so the inject/skip decision is unit-testable
 /// without a real binary on disk or a live broker. `coordination_v1` is only
 /// advertised when delegation is on (Join requires the delegation tools).
-/// `workflow_v1` is Root-only mutation/recovery (A15.1); never inject for
+/// `workflow_v2` is Root-only mutation/recovery (A15.1); never inject for
 /// delegation children.
 fn companion_features_arg(
     delegation_enabled: bool,
@@ -3436,9 +3436,9 @@ fn companion_features_arg(
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
-    workflow_v1: bool,
+    workflow_v2: bool,
 ) -> Option<String> {
-    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled && !workflow_v1
+    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled && !workflow_v2
     {
         return None;
     }
@@ -3458,8 +3458,8 @@ fn companion_features_arg(
     if sessions_enabled {
         features.push("sessions");
     }
-    if workflow_v1 {
-        features.push("workflow_v1");
+    if workflow_v2 {
+        features.push("workflow_v2");
     }
     Some(features.join(","))
 }
@@ -3475,7 +3475,7 @@ fn companion_features_arg_for_agent(
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
-    workflow_v1: bool,
+    workflow_v2: bool,
 ) -> Option<String> {
     companion_features_arg(
         delegation_enabled,
@@ -3483,7 +3483,7 @@ fn companion_features_arg_for_agent(
         feedback_enabled,
         ask_enabled && agent_type != AgentType::Grok,
         sessions_enabled,
-        workflow_v1,
+        workflow_v2,
     )
 }
 
@@ -3543,7 +3543,7 @@ async fn inject_codeg_mcp(
     };
     // A15.1 / A4: workflow mutation tools only on Root when persistence paths
     // are available (delegation stack + run store). Children never get the bit.
-    let workflow_v1 = matches!(role, crate::acp::delegation::transport::CompanionRole::Root)
+    let workflow_v2 = matches!(role, crate::acp::delegation::transport::CompanionRole::Root)
         && delegation_enabled;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
@@ -3556,7 +3556,7 @@ async fn inject_codeg_mcp(
         feedback_enabled,
         ask_enabled,
         sessions_enabled,
-        workflow_v1,
+        workflow_v2,
     )?;
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
@@ -3577,7 +3577,7 @@ async fn inject_codeg_mcp(
                 coordination_v1,
                 delegation_continuation_v1,
                 role,
-                workflow_v1,
+                workflow_v2,
             },
         )
         .await;
@@ -3607,7 +3607,7 @@ async fn inject_codeg_mcp(
         "--parent-pid".to_string(),
         std::process::id().to_string(),
         // Tool groups to expose this launch (delegation / coordination_v1 /
-        // feedback / ask / sessions / workflow_v1).
+        // feedback / ask / sessions / workflow_v2).
         "--features".to_string(),
         features_arg,
         "--role".to_string(),
@@ -19618,10 +19618,10 @@ mod tests {
             companion_features_arg(true, true, false, false, false, false),
             Some("delegation,coordination_v1".to_string())
         );
-        // Root + delegation enables workflow_v1 injection.
+        // Root + delegation enables workflow_v2 injection.
         assert_eq!(
             companion_features_arg(true, true, false, false, false, true),
-            Some("delegation,coordination_v1,workflow_v1".to_string())
+            Some("delegation,coordination_v1,workflow_v2".to_string())
         );
         // Feedback only — the decoupling: companion injected for feedback even
         // when delegation is off.
@@ -19642,12 +19642,12 @@ mod tests {
         // Workflow alone still injects (feature bit on without other groups).
         assert_eq!(
             companion_features_arg(false, false, false, false, false, true),
-            Some("workflow_v1".to_string())
+            Some("workflow_v2".to_string())
         );
         // All on → comma-joined, in declaration order.
         assert_eq!(
             companion_features_arg(true, true, true, true, true, true),
-            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v1".to_string())
+            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v2".to_string())
         );
     }
 
@@ -19655,12 +19655,20 @@ mod tests {
     fn companion_features_arg_uses_native_ask_for_grok_only() {
         assert_eq!(
             companion_features_arg_for_agent(AgentType::Grok, true, true, true, true, true, true,),
-            Some("delegation,coordination_v1,feedback,sessions,workflow_v1".to_string())
+            Some("delegation,coordination_v1,feedback,sessions,workflow_v2".to_string())
         );
         assert_eq!(
             companion_features_arg_for_agent(AgentType::Codex, true, true, true, true, true, true,),
-            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v1".to_string())
+            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v2".to_string())
         );
+    }
+
+    #[test]
+    fn workflow_v2_launch_feature_uses_only_the_canonical_token() {
+        let root = companion_features_arg(true, true, false, false, false, true)
+            .expect("root workflow launch features");
+        assert!(root.split(',').any(|token| token == "workflow_v2"));
+        assert!(!root.split(',').any(|token| token == "workflow_v1"));
     }
 
     // ── ResumeExistingOnly connection contract harness ──────────────────────

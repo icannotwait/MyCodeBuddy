@@ -2589,6 +2589,25 @@
         "openSession": "開啟工作階段",
         "estimatedNonActionable": "預估節點 — 尚無工作階段",
         "optionalReviewer": "選用",
+        "reviewerCohort": "審查者群組",
+        "riskLevel": {
+          "normal": "一般風險",
+          "high": "高風險"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "並行或生命週期",
+          "security_trust_boundary": "安全或信任邊界",
+          "migration_destructive_persistence": "遷移或破壞性持久化",
+          "public_compatibility": "公開相容性",
+          "unsafe_ffi": "不安全的 FFI",
+          "update_rollback": "更新或回復",
+          "cross_runtime_or_process": "跨執行階段或程序",
+          "broad_production_surface": "廣泛的正式環境影響面",
+          "multiple_ownership_modules": "多個歸屬模組",
+          "shared_interface": "共用介面",
+          "dependency_or_build": "相依性或建置",
+          "multi_layer_without_test_seam": "缺少測試接縫的多層變更"
+        },
         "roleLabel": "角色：{role}",
         "agentLabel": "代理：{agent}",
         "currentWork": "目前：{title}",
@@ -2806,6 +2825,7 @@
         "replacement": "替代工作階段",
         "summary": {
           "review": "審查：{verdict}",
+          "author": "計畫：{status}",
           "implementation": "交付：{status}",
           "critical": "嚴重：{count}",
           "important": "重要：{count}",

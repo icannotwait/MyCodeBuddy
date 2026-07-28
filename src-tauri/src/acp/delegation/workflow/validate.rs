@@ -5,10 +5,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use super::key::{build_work_unit_key, normalize_rel_path, validate_agent_type};
 use super::types::{
     DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
-    ManifestNodeRole, ManifestPhase, NormalizedGate, NormalizedManifest, NormalizedNode,
-    ResolutionMode, WorkUnitKeyParts, WorkflowError, MANIFEST_SCHEMA_VERSION, MAX_EDGES, MAX_GATES,
-    MAX_MANIFEST_JSON_BYTES, MAX_NODES, MAX_TASKS, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
-    PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    ManifestNodeRole, ManifestPhase, ManifestTaskHardTrigger, ManifestTaskPolicy, ManifestTaskRisk,
+    ManifestTaskSoftSignal, NormalizedGate, NormalizedManifest, NormalizedNode, ResolutionMode,
+    TaskRiskLevel, TaskSoftSignalKind, WorkUnitKeyParts, WorkflowError, MANIFEST_SCHEMA_VERSION,
+    MAX_ADJUDICATION_SUMMARY_BYTES, MAX_EDGES, MAX_GATES, MAX_MANIFEST_JSON_BYTES, MAX_NODES,
+    MAX_TASKS, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, TASK_RISK_POLICY_VERSION,
+    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 
 /// Validate a raw manifest document and return the normalized form.
@@ -22,6 +24,15 @@ pub fn validate_manifest_document(
         return Err(WorkflowError::UnsupportedWorkflowKind(
             doc.workflow_kind.clone(),
         ));
+    }
+    let plan_target_rel_path = normalize_rel_path(&doc.plan_target_rel_path)?;
+    if doc.risk_policy_version != TASK_RISK_POLICY_VERSION {
+        return Err(WorkflowError::RiskAssessmentInvalid(Box::new(
+            WorkflowError::InvalidField(format!(
+                "risk_policy_version must be {TASK_RISK_POLICY_VERSION}, got {}",
+                doc.risk_policy_version
+            )),
+        )));
     }
     if doc.publication_token.trim().is_empty() {
         return Err(WorkflowError::MissingField("publication_token".into()));
@@ -63,6 +74,14 @@ pub fn validate_manifest_document(
 
     let design = normalize_document_ref(doc.design.as_ref())?;
     let plan = normalize_document_ref(doc.plan.as_ref())?;
+    if let Some(plan) = &plan {
+        if plan.rel_path != plan_target_rel_path {
+            return Err(WorkflowError::InvalidField(format!(
+                "plan rel_path {} must equal plan_target_rel_path {plan_target_rel_path}",
+                plan.rel_path
+            )));
+        }
+    }
 
     let mut phase_ids = HashSet::new();
     let mut phases = Vec::with_capacity(doc.phases.len());
@@ -86,7 +105,13 @@ pub fn validate_manifest_document(
     let mut nodes = Vec::with_capacity(doc.nodes.len());
 
     for node in &doc.nodes {
-        let normalized = normalize_node(node, design.as_ref(), plan.as_ref(), &phase_ids)?;
+        let normalized = normalize_node(
+            node,
+            design.as_ref(),
+            plan.as_ref(),
+            &plan_target_rel_path,
+            &phase_ids,
+        )?;
         if !node_ids.insert(normalized.id.clone()) {
             return Err(WorkflowError::DuplicateId(format!(
                 "node:{}",
@@ -117,8 +142,8 @@ pub fn validate_manifest_document(
             )));
         }
     }
-    // brainstorm_to_delivery: contiguous 1..=N with exactly one implementer
-    // and one reviewer work unit per Task index.
+    // brainstorm_to_delivery Task indices remain contiguous; route-dependent
+    // implementer/reviewer cardinality is validated from task_policies below.
     if !task_indices.is_empty() {
         let max = *task_indices.iter().max().expect("non-empty");
         if task_indices.len() != max as usize || !(1..=max).all(|i| task_indices.contains(&i)) {
@@ -126,27 +151,10 @@ pub fn validate_manifest_document(
                 "task indices must be contiguous 1..={max}, got {task_indices:?}"
             )));
         }
-        for idx in 1..=max {
-            let impl_count = nodes
-                .iter()
-                .filter(|n| {
-                    n.task_index == Some(idx)
-                        && matches!(n.role, Some(ManifestNodeRole::Implementer))
-                })
-                .count();
-            let rev_count = nodes
-                .iter()
-                .filter(|n| {
-                    n.task_index == Some(idx) && matches!(n.role, Some(ManifestNodeRole::Reviewer))
-                })
-                .count();
-            if impl_count != 1 || rev_count != 1 {
-                return Err(WorkflowError::InvalidTaskIndex(format!(
-                    "task_index {idx} requires exactly one implementer and one reviewer work unit (implementer={impl_count}, reviewer={rev_count})"
-                )));
-            }
-        }
     }
+
+    validate_author_and_skeleton(doc, &nodes, &task_indices)?;
+    let task_policies = normalize_task_policies(doc, &nodes, &task_indices)?;
 
     let node_id_set: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     for node in &nodes {
@@ -207,6 +215,8 @@ pub fn validate_manifest_document(
     Ok(NormalizedManifest {
         schema_version: doc.schema_version,
         workflow_kind: doc.workflow_kind.clone(),
+        plan_target_rel_path,
+        risk_policy_version: doc.risk_policy_version.clone(),
         workflow_id: doc.workflow_id.clone(),
         expected_manifest_revision: doc.expected_manifest_revision,
         publication_token: doc.publication_token.clone(),
@@ -217,6 +227,7 @@ pub fn validate_manifest_document(
         nodes,
         edges,
         gates,
+        task_policies,
         task_count: task_indices.len(),
     })
 }
@@ -239,6 +250,7 @@ fn normalize_node(
     node: &ManifestNode,
     design: Option<&DocumentRef>,
     plan: Option<&DocumentRef>,
+    plan_target_rel_path: &str,
     phase_ids: &HashSet<String>,
 ) -> Result<NormalizedNode, WorkflowError> {
     if node.id.trim().is_empty() {
@@ -256,7 +268,9 @@ fn normalize_node(
     let required = node.required.unwrap_or(true);
 
     match node.kind {
-        ManifestNodeKind::WorkUnit => normalize_work_unit(node, design, plan, required),
+        ManifestNodeKind::WorkUnit => {
+            normalize_work_unit(node, design, plan, plan_target_rel_path, required)
+        }
         ManifestNodeKind::Milestone | ManifestNodeKind::Gate | ManifestNodeKind::Placeholder => {
             if node.work_unit_key.is_some()
                 || node.role.is_some()
@@ -291,6 +305,7 @@ fn normalize_work_unit(
     node: &ManifestNode,
     design: Option<&DocumentRef>,
     plan: Option<&DocumentRef>,
+    plan_target_rel_path: &str,
     required: bool,
 ) -> Result<NormalizedNode, WorkflowError> {
     let role = node
@@ -316,8 +331,15 @@ fn normalize_work_unit(
         )));
     }
 
-    let profile_ref = node.profile_id.as_deref();
-    let parts = classify_work_unit_parts(node, design, plan, role, phase, agent_type, profile_ref)?;
+    let parts = classify_work_unit_parts(
+        node,
+        design,
+        plan,
+        plan_target_rel_path,
+        role,
+        phase,
+        agent_type,
+    )?;
     let expected_key = build_work_unit_key(&parts)?;
     let submitted = node.work_unit_key.as_deref().ok_or_else(|| {
         WorkflowError::MissingField(format!("work_unit_key on work unit {}", node.id))
@@ -354,12 +376,34 @@ fn classify_work_unit_parts<'a>(
     node: &'a ManifestNode,
     design: Option<&'a DocumentRef>,
     plan: Option<&'a DocumentRef>,
+    plan_target_rel_path: &'a str,
     role: ManifestNodeRole,
     phase: &'a str,
     agent_type: &'a str,
-    profile_ref: Option<&'a str>,
 ) -> Result<WorkUnitKeyParts<'a>, WorkflowError> {
+    let profile_ref = node.profile_id.as_deref();
     match (role, phase, node.task_index) {
+        (ManifestNodeRole::Author, PHASE_PLAN, None) => {
+            if agent_type != "codex" {
+                return Err(WorkflowError::RoleMismatch(format!(
+                    "Plan Author node {} must use agent_type=codex",
+                    node.id
+                )));
+            }
+            Ok(WorkUnitKeyParts::PlanAuthor {
+                rel_plan_path: plan_target_rel_path,
+                agent_type,
+                profile_id: profile_ref,
+            })
+        }
+        (ManifestNodeRole::Author, _, Some(_)) => Err(WorkflowError::RoleMismatch(format!(
+            "Plan Author node {} must not have task_index",
+            node.id
+        ))),
+        (ManifestNodeRole::Author, other, None) => Err(WorkflowError::RoleMismatch(format!(
+            "Plan Author node {} must have phase_id=plan, got {other}",
+            node.id
+        ))),
         (ManifestNodeRole::Implementer, PHASE_TASKS, Some(idx)) => {
             Ok(WorkUnitKeyParts::TaskImplementer {
                 task_index: idx,
@@ -401,7 +445,7 @@ fn classify_work_unit_parts<'a>(
             let plan_doc = plan.ok_or_else(|| {
                 WorkflowError::MissingField(format!("plan document required for node {}", node.id))
             })?;
-            Ok(WorkUnitKeyParts::Plan {
+            Ok(WorkUnitKeyParts::PlanReviewer {
                 rel_plan_path: &plan_doc.rel_path,
                 agent_type,
                 profile_id: profile_ref,
@@ -436,6 +480,291 @@ fn classify_work_unit_parts<'a>(
     }
 }
 
+fn validate_author_and_skeleton(
+    doc: &ManifestDocument,
+    nodes: &[NormalizedNode],
+    task_indices: &HashSet<u32>,
+) -> Result<(), WorkflowError> {
+    let author_count = nodes
+        .iter()
+        .filter(|node| node.role == Some(ManifestNodeRole::Author))
+        .count();
+    if author_count != 1 {
+        return Err(WorkflowError::InvalidField(format!(
+            "manifest requires exactly one Codex Plan Author node, got {author_count}"
+        )));
+    }
+
+    if doc.workflow_state == super::types::ManifestWorkflowState::Skeleton {
+        if doc.plan.is_some() {
+            return Err(WorkflowError::InvalidField(
+                "skeleton manifest must not contain a Plan document".into(),
+            ));
+        }
+        if !task_indices.is_empty() {
+            return Err(WorkflowError::InvalidField(
+                "skeleton manifest must not contain Task nodes".into(),
+            ));
+        }
+        if !doc.task_policies.is_empty() {
+            return Err(WorkflowError::InvalidField(
+                "skeleton manifest must not contain Task policies".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_task_policies(
+    doc: &ManifestDocument,
+    nodes: &[NormalizedNode],
+    task_indices: &HashSet<u32>,
+) -> Result<Vec<ManifestTaskPolicy>, WorkflowError> {
+    let mut policy_indices = HashSet::new();
+    let mut policies = Vec::with_capacity(doc.task_policies.len());
+
+    for policy in &doc.task_policies {
+        if policy.task_index == 0 || policy.task_index as usize > MAX_TASKS {
+            return Err(WorkflowError::InvalidTaskIndex(format!(
+                "Task policy index {} out of range 1..={MAX_TASKS}",
+                policy.task_index
+            )));
+        }
+        if !policy_indices.insert(policy.task_index) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "Task policy index {}",
+                policy.task_index
+            )));
+        }
+        if !task_indices.contains(&policy.task_index) {
+            return Err(WorkflowError::InvalidField(format!(
+                "Task policy index {} has no matching Task nodes",
+                policy.task_index
+            )));
+        }
+
+        let risk = normalize_task_risk(policy.task_index, &policy.risk)
+            .map_err(|error| WorkflowError::RiskAssessmentInvalid(Box::new(error)))?;
+        validate_task_route(policy.task_index, &risk, &policy.route, nodes)
+            .map_err(|error| WorkflowError::TaskRouteMismatch(Box::new(error)))?;
+        policies.push(ManifestTaskPolicy {
+            task_index: policy.task_index,
+            risk,
+            route: policy.route.clone(),
+        });
+    }
+
+    if policy_indices != *task_indices {
+        return Err(WorkflowError::InvalidField(format!(
+            "Task policy indices {policy_indices:?} must exactly match Task node indices {task_indices:?}"
+        )));
+    }
+
+    Ok(policies)
+}
+
+fn normalize_task_risk(
+    task_index: u32,
+    risk: &ManifestTaskRisk,
+) -> Result<ManifestTaskRisk, WorkflowError> {
+    let mut hard_kinds = HashSet::new();
+    let mut hard_triggers = Vec::with_capacity(risk.hard_triggers.len());
+    for trigger in &risk.hard_triggers {
+        if !hard_kinds.insert(trigger.kind) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "Task {task_index} hard trigger {:?}",
+                trigger.kind
+            )));
+        }
+        hard_triggers.push(ManifestTaskHardTrigger {
+            kind: trigger.kind,
+            evidence: normalize_risk_evidence(task_index, "hard trigger", &trigger.evidence)?,
+        });
+    }
+
+    let mut soft_kinds = HashSet::new();
+    let mut soft_signals = Vec::with_capacity(risk.soft_signals.len());
+    let mut score = 0u32;
+    for signal in &risk.soft_signals {
+        if !soft_kinds.insert(signal.kind) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "Task {task_index} soft signal {:?}",
+                signal.kind
+            )));
+        }
+        let expected = task_soft_signal_weight(signal.kind);
+        if signal.score != expected {
+            return Err(WorkflowError::InvalidField(format!(
+                "Task {task_index} soft signal {:?} score must be {expected}, got {}",
+                signal.kind, signal.score
+            )));
+        }
+        score = score.checked_add(expected).ok_or_else(|| {
+            WorkflowError::InvalidField(format!("Task {task_index} soft score overflow"))
+        })?;
+        soft_signals.push(ManifestTaskSoftSignal {
+            kind: signal.kind,
+            score: expected,
+            evidence: normalize_risk_evidence(task_index, "soft signal", &signal.evidence)?,
+        });
+    }
+    if risk.score != score {
+        return Err(WorkflowError::InvalidField(format!(
+            "Task {task_index} submitted soft score {} must equal derived score {score}",
+            risk.score
+        )));
+    }
+
+    let expected_level = if !hard_triggers.is_empty() || score >= 3 {
+        TaskRiskLevel::High
+    } else {
+        TaskRiskLevel::Normal
+    };
+    if risk.level != expected_level {
+        return Err(WorkflowError::InvalidField(format!(
+            "Task {task_index} risk level {:?} contradicts derived level {expected_level:?}",
+            risk.level
+        )));
+    }
+
+    let reason = risk.reason.trim();
+    if reason.is_empty() || reason.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
+        return Err(WorkflowError::InvalidField(format!(
+            "Task {task_index} risk reason must be non-empty and at most {MAX_ADJUDICATION_SUMMARY_BYTES} bytes"
+        )));
+    }
+
+    Ok(ManifestTaskRisk {
+        level: expected_level,
+        hard_triggers,
+        soft_signals,
+        score,
+        reason: reason.to_string(),
+    })
+}
+
+const fn task_soft_signal_weight(kind: TaskSoftSignalKind) -> u32 {
+    match kind {
+        TaskSoftSignalKind::CrossRuntimeOrProcess => 2,
+        TaskSoftSignalKind::BroadProductionSurface
+        | TaskSoftSignalKind::MultipleOwnershipModules
+        | TaskSoftSignalKind::SharedInterface
+        | TaskSoftSignalKind::DependencyOrBuild
+        | TaskSoftSignalKind::MultiLayerWithoutTestSeam => 1,
+    }
+}
+
+fn normalize_risk_evidence(
+    task_index: u32,
+    signal_type: &str,
+    evidence: &[String],
+) -> Result<Vec<String>, WorkflowError> {
+    if evidence.is_empty() {
+        return Err(WorkflowError::InvalidField(format!(
+            "Task {task_index} {signal_type} evidence must not be empty"
+        )));
+    }
+    evidence
+        .iter()
+        .map(|item| {
+            let item = item.trim();
+            if item.is_empty() || item.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
+                return Err(WorkflowError::InvalidField(format!(
+                    "Task {task_index} {signal_type} evidence must be non-empty and at most {MAX_ADJUDICATION_SUMMARY_BYTES} bytes"
+                )));
+            }
+            Ok(item.to_string())
+        })
+        .collect()
+}
+
+fn validate_task_route(
+    task_index: u32,
+    risk: &ManifestTaskRisk,
+    route: &super::types::ManifestTaskRoute,
+    nodes: &[NormalizedNode],
+) -> Result<(), WorkflowError> {
+    let route_error = |message: String| {
+        WorkflowError::InvalidField(format!("Task {task_index} route mismatch: {message}"))
+    };
+    let implementer = nodes
+        .iter()
+        .find(|node| node.id == route.implementer_node_id)
+        .ok_or_else(|| route_error(format!("unknown implementer {}", route.implementer_node_id)))?;
+    if implementer.role != Some(ManifestNodeRole::Implementer)
+        || implementer.task_index != Some(task_index)
+    {
+        return Err(route_error(format!(
+            "implementer {} must be an implementer for this Task index",
+            implementer.id
+        )));
+    }
+
+    let mut route_ids = HashSet::new();
+    route_ids.insert(implementer.id.as_str());
+    let mut reviewer_agents = Vec::with_capacity(route.reviewer_node_ids.len());
+    for reviewer_id in &route.reviewer_node_ids {
+        if !route_ids.insert(reviewer_id.as_str()) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "Task {task_index} route node {reviewer_id}"
+            )));
+        }
+        let reviewer = nodes
+            .iter()
+            .find(|node| node.id == *reviewer_id)
+            .ok_or_else(|| route_error(format!("unknown reviewer {reviewer_id}")))?;
+        if reviewer.role != Some(ManifestNodeRole::Reviewer)
+            || reviewer.task_index != Some(task_index)
+        {
+            return Err(route_error(format!(
+                "reviewer {reviewer_id} must be a reviewer for this Task index"
+            )));
+        }
+        reviewer_agents.push(
+            reviewer
+                .agent_type
+                .as_deref()
+                .expect("validated work unit has agent_type"),
+        );
+    }
+
+    let task_node_ids: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| node.task_index == Some(task_index))
+        .map(|node| node.id.as_str())
+        .collect();
+    if route_ids != task_node_ids {
+        return Err(route_error(
+            "route must contain every Task implementer and reviewer exactly once".into(),
+        ));
+    }
+
+    let implementer_agent = implementer
+        .agent_type
+        .as_deref()
+        .expect("validated work unit has agent_type");
+    match risk.level {
+        TaskRiskLevel::Normal => {
+            if implementer_agent != "grok" || reviewer_agents.as_slice() != ["codex"] {
+                return Err(route_error(
+                    "normal risk requires one Grok implementer and one Codex reviewer".into(),
+                ));
+            }
+        }
+        TaskRiskLevel::High => {
+            reviewer_agents.sort_unstable();
+            if implementer_agent != "codex" || reviewer_agents.as_slice() != ["codex", "grok"] {
+                return Err(route_error(
+                    "high risk requires one Codex implementer and distinct Codex/Grok reviewers"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_gate(
     gate: &ManifestGate,
     node_ids: &HashSet<&str>,
@@ -450,6 +779,45 @@ fn normalize_gate(
     let gate_kind = resolve_gate_kind(gate, node_ids, nodes)?;
     let expected_phase = gate_kind.expected_reviewer_phase();
 
+    let mut seen_cohort = HashSet::new();
+    for reviewer_id in &gate.reviewer_cohort_node_ids {
+        if !node_ids.contains(reviewer_id.as_str()) {
+            return Err(WorkflowError::UnknownReference(format!(
+                "gate cohort reviewer {reviewer_id}"
+            )));
+        }
+        if !seen_cohort.insert(reviewer_id.clone()) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "gate {} cohort reviewer {reviewer_id}",
+                gate.id
+            )));
+        }
+        let node = nodes
+            .iter()
+            .find(|n| n.id == *reviewer_id)
+            .expect("cohort reviewer id present in node_ids");
+        validate_document_gate_reviewer(gate, node, expected_phase)?;
+    }
+
+    let complete_cohort: HashSet<String> = nodes
+        .iter()
+        .filter(|node| {
+            node.kind == ManifestNodeKind::WorkUnit
+                && node.role == Some(ManifestNodeRole::Reviewer)
+                && node.phase_id.as_deref() == Some(expected_phase)
+                && node.task_index.is_none()
+        })
+        .map(|node| node.id.clone())
+        .collect();
+    let design_self_review =
+        gate_kind == DocumentGateKind::Design && gate.resolution_mode == ResolutionMode::SelfReview;
+    if !design_self_review && seen_cohort != complete_cohort {
+        return Err(WorkflowError::InvalidGateShape(format!(
+            "gate {} reviewer cohort must exactly match all configured {expected_phase} reviewers",
+            gate.id
+        )));
+    }
+
     let mut seen_reviewers = HashSet::new();
     for reviewer_id in &gate.required_reviewer_node_ids {
         if !node_ids.contains(reviewer_id.as_str()) {
@@ -460,6 +828,12 @@ fn normalize_gate(
         if !seen_reviewers.insert(reviewer_id.clone()) {
             return Err(WorkflowError::DuplicateId(format!(
                 "gate {} reviewer {reviewer_id}",
+                gate.id
+            )));
+        }
+        if !seen_cohort.contains(reviewer_id) {
+            return Err(WorkflowError::InvalidGateShape(format!(
+                "gate {} required reviewer {reviewer_id} is outside reviewer cohort",
                 gate.id
             )));
         }
@@ -476,6 +850,12 @@ fn normalize_gate(
             if gate.required_reviewer_node_ids.is_empty() {
                 return Err(WorkflowError::InvalidGateShape(format!(
                     "plan gate {} cannot have empty required_reviewer_node_ids",
+                    gate.id
+                )));
+            }
+            if gate.reviewer_cohort_node_ids.is_empty() {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "plan gate {} cannot have empty reviewer cohort",
                     gate.id
                 )));
             }
@@ -501,6 +881,12 @@ fn normalize_gate(
                         gate.id
                     )));
                 }
+                if !gate.reviewer_cohort_node_ids.is_empty() {
+                    return Err(WorkflowError::InvalidGateShape(format!(
+                        "zero-reviewer design gate {} requires empty reviewer cohort",
+                        gate.id
+                    )));
+                }
             } else if gate.resolution_mode == ResolutionMode::SelfReview {
                 return Err(WorkflowError::InvalidGateShape(format!(
                     "design gate {} self_review requires empty required_reviewer_node_ids",
@@ -517,6 +903,7 @@ fn normalize_gate(
 
     Ok(NormalizedGate {
         id: gate.id.clone(),
+        reviewer_cohort_node_ids: gate.reviewer_cohort_node_ids.clone(),
         required_reviewer_node_ids: gate.required_reviewer_node_ids.clone(),
         resolution_mode: gate.resolution_mode,
         gate_kind,
@@ -531,6 +918,12 @@ fn resolve_gate_kind(
 ) -> Result<DocumentGateKind, WorkflowError> {
     if gate.required_reviewer_node_ids.is_empty() {
         // Empty reviewers: only Design self_review is legal (never empty Plan).
+        if gate.gate_kind == Some(DocumentGateKind::Plan) {
+            return Err(WorkflowError::InvalidGateShape(format!(
+                "plan gate {} cannot have empty required_reviewer_node_ids",
+                gate.id
+            )));
+        }
         if gate.resolution_mode != ResolutionMode::SelfReview {
             return Err(WorkflowError::InvalidGateShape(format!(
                 "empty-reviewer gate {} requires resolution_mode=self_review (Design only)",
@@ -539,10 +932,7 @@ fn resolve_gate_kind(
         }
         match gate.gate_kind {
             None | Some(DocumentGateKind::Design) => Ok(DocumentGateKind::Design),
-            Some(DocumentGateKind::Plan) => Err(WorkflowError::InvalidGateShape(format!(
-                "plan gate {} cannot have empty required_reviewer_node_ids",
-                gate.id
-            ))),
+            Some(DocumentGateKind::Plan) => unreachable!("handled above"),
         }
     } else {
         // Non-empty: all reviewers must share one document phase → that is the kind.
@@ -719,6 +1109,176 @@ fn ensure_acyclic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::delegation::workflow::types::ManifestTaskRoute;
+    use serde_json::{json, Value};
+
+    fn validate_wire(value: Value) -> Result<NormalizedManifest, String> {
+        let doc: ManifestDocument = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        validate_manifest_document(&doc).map_err(|e| e.to_string())
+    }
+
+    fn v2_skeleton_wire() -> Value {
+        json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "workflow_kind": WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+            "publication_token": "token-v2",
+            "workflow_state": "skeleton",
+            "plan_target_rel_path": "docs/superpowers/plans/p.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "phases": [{ "id": "plan" }],
+            "nodes": [{
+                "id": "plan-author",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "author",
+                "agent_type": "codex",
+                "work_unit_key": "plan|docs/superpowers/plans/p.md|author|codex|none",
+                "deps": []
+            }],
+            "edges": [],
+            "gates": [],
+            "task_policies": []
+        })
+    }
+
+    fn soft_signal(kind: &str, score: u32) -> Value {
+        json!({
+            "kind": kind,
+            "score": score,
+            "evidence": [format!("evidence for {kind}")]
+        })
+    }
+
+    fn estimated_wire(
+        level: &str,
+        hard_triggers: Vec<Value>,
+        soft_signals: Vec<Value>,
+        score: u32,
+        implementer_agent: &str,
+        task_reviewers: &[(&str, &str)],
+    ) -> Value {
+        let mut nodes = vec![
+            json!({
+                "id": "plan-author",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "author",
+                "agent_type": "codex",
+                "work_unit_key": "plan|docs/superpowers/plans/p.md|author|codex|none",
+                "deps": []
+            }),
+            json!({
+                "id": "plan-reviewer-codex",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "reviewer",
+                "agent_type": "codex",
+                "work_unit_key": "plan|docs/superpowers/plans/p.md|reviewer|codex|none",
+                "deps": ["plan-author"]
+            }),
+            json!({
+                "id": "plan-reviewer-grok",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "reviewer",
+                "agent_type": "grok",
+                "work_unit_key": "plan|docs/superpowers/plans/p.md|reviewer|grok|none",
+                "deps": ["plan-author"]
+            }),
+            json!({
+                "id": "task-1-implementer",
+                "kind": "work_unit",
+                "phase_id": "tasks",
+                "role": "implementer",
+                "agent_type": implementer_agent,
+                "task_index": 1,
+                "work_unit_key": format!("task|1|implementer|{implementer_agent}|none"),
+                "deps": []
+            }),
+        ];
+        let mut reviewer_ids = Vec::new();
+        for (id, agent) in task_reviewers {
+            reviewer_ids.push((*id).to_string());
+            nodes.push(json!({
+                "id": id,
+                "kind": "work_unit",
+                "phase_id": "tasks",
+                "role": "reviewer",
+                "agent_type": agent,
+                "task_index": 1,
+                "work_unit_key": format!("task|1|reviewer|{agent}|none"),
+                "deps": ["task-1-implementer"]
+            }));
+        }
+
+        json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "workflow_kind": WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+            "publication_token": "token-v2",
+            "workflow_state": "estimated",
+            "plan_target_rel_path": "docs/superpowers/plans/p.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "plan": {
+                "rel_path": "docs/superpowers/plans/p.md",
+                "digest": "plan-digest"
+            },
+            "phases": [{ "id": "plan" }, { "id": "tasks" }],
+            "nodes": nodes,
+            "edges": [],
+            "gates": [{
+                "id": "plan-gate",
+                "gate_kind": "plan",
+                "reviewer_cohort_node_ids": [
+                    "plan-reviewer-codex",
+                    "plan-reviewer-grok"
+                ],
+                "required_reviewer_node_ids": ["plan-reviewer-codex"],
+                "resolution_mode": "parent_adjudication"
+            }],
+            "task_policies": [{
+                "task_index": 1,
+                "risk": {
+                    "level": level,
+                    "hard_triggers": hard_triggers,
+                    "soft_signals": soft_signals,
+                    "score": score,
+                    "reason": format!("{level} risk fixture")
+                },
+                "route": {
+                    "implementer_node_id": "task-1-implementer",
+                    "reviewer_node_ids": reviewer_ids
+                }
+            }]
+        })
+    }
+
+    fn normal_estimated_wire() -> Value {
+        estimated_wire(
+            "normal",
+            vec![],
+            vec![],
+            0,
+            "grok",
+            &[("task-1-reviewer-codex", "codex")],
+        )
+    }
+
+    fn high_estimated_wire() -> Value {
+        estimated_wire(
+            "high",
+            vec![json!({
+                "kind": "public_compatibility",
+                "evidence": ["serialized workflow contract"]
+            })],
+            vec![],
+            0,
+            "codex",
+            &[
+                ("task-1-reviewer-codex", "codex"),
+                ("task-1-reviewer-grok", "grok"),
+            ],
+        )
+    }
     use crate::acp::delegation::workflow::types::{
         ManifestEdge, ManifestNodeOutcome, ManifestWorkflowState,
     };
@@ -732,7 +1292,13 @@ mod tests {
         })
         .unwrap();
         let plan_path = "docs/superpowers/plans/p.md";
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -762,8 +1328,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: TASK_RISK_POLICY_VERSION.into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: "pub-token-1".into(),
@@ -883,6 +1451,20 @@ mod tests {
                     node_outcome: None,
                     title: None,
                 },
+                ManifestNode {
+                    id: "plan-author".into(),
+                    kind: ManifestNodeKind::WorkUnit,
+                    phase_id: Some(PHASE_PLAN.into()),
+                    role: Some(ManifestNodeRole::Author),
+                    agent_type: Some("codex".into()),
+                    profile_id: None,
+                    task_index: None,
+                    work_unit_key: Some(author_key),
+                    deps: vec![],
+                    required: None,
+                    node_outcome: None,
+                    title: None,
+                },
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -892,17 +1474,33 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
     }
 
@@ -911,7 +1509,7 @@ mod tests {
         let doc = minimal_valid_doc();
         let normalized = validate_manifest_document(&doc).expect("valid");
         assert_eq!(normalized.task_count, 1);
-        assert_eq!(normalized.nodes.len(), 6);
+        assert_eq!(normalized.nodes.len(), 7);
         assert_eq!(normalized.gates.len(), 2);
     }
 
@@ -978,14 +1576,7 @@ mod tests {
         doc.edges
             .retain(|e| e.from != "task-1-rev" && e.to != "task-1-rev");
         let err = validate_manifest_document(&doc).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WorkflowError::InvalidTaskIndex(ref m)
-                    if m.contains("exactly one implementer and one reviewer")
-            ),
-            "got {err:?}"
-        );
+        assert!(matches!(err, WorkflowError::TaskRouteMismatch(_)));
     }
 
     #[test]
@@ -1016,6 +1607,7 @@ mod tests {
     #[test]
     fn design_zero_reviewer_requires_self_review() {
         let mut doc = minimal_valid_doc();
+        doc.gates[0].reviewer_cohort_node_ids.clear();
         doc.gates[0].required_reviewer_node_ids.clear();
         doc.gates[0].resolution_mode = ResolutionMode::ParentAdjudication;
         let err = validate_manifest_document(&doc).unwrap_err();
@@ -1029,6 +1621,7 @@ mod tests {
     fn empty_reviewers_infer_design_only_never_plan() {
         // Missing gate_kind + empty + self_review → Design.
         let mut doc = minimal_valid_doc();
+        doc.gates[0].reviewer_cohort_node_ids.clear();
         doc.gates[0].required_reviewer_node_ids.clear();
         doc.gates[0].resolution_mode = ResolutionMode::SelfReview;
         doc.gates[0].gate_kind = None;
@@ -1060,6 +1653,8 @@ mod tests {
         // Mixed design+plan reviewers on one gate → reject.
         doc.gates[1].required_reviewer_node_ids =
             vec!["design-reviewer-1".into(), "plan-reviewer-1".into()];
+        doc.gates[1].reviewer_cohort_node_ids =
+            vec!["design-reviewer-1".into(), "plan-reviewer-1".into()];
         let err = validate_manifest_document(&doc).unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidGateShape(_)));
     }
@@ -1082,11 +1677,13 @@ mod tests {
             title: None,
         });
         doc.gates[1].required_reviewer_node_ids = vec!["milestone-1".into()];
+        doc.gates[1].reviewer_cohort_node_ids = vec!["milestone-1".into()];
         let err = validate_manifest_document(&doc).unwrap_err();
         assert!(matches!(err, WorkflowError::RoleMismatch(_)));
 
         // Design-phase reviewer cannot satisfy a Plan gate.
         doc.gates[1].required_reviewer_node_ids = vec!["design-reviewer-1".into()];
+        doc.gates[1].reviewer_cohort_node_ids = vec!["design-reviewer-1".into()];
         let err = validate_manifest_document(&doc).unwrap_err();
         assert!(
             matches!(err, WorkflowError::RoleMismatch(_))
@@ -1133,7 +1730,7 @@ mod tests {
             validate_manifest_document(&doc).unwrap_err(),
             WorkflowError::InvalidSchemaVersion(99)
         ));
-        doc.schema_version = 1;
+        doc.schema_version = MANIFEST_SCHEMA_VERSION;
         doc.workflow_kind = "other".into();
         assert!(matches!(
             validate_manifest_document(&doc).unwrap_err(),
@@ -1204,19 +1801,31 @@ mod tests {
 
         // gate_kind is optional on the wire (frozen fields: id, reviewers, mode).
         let optional_gate_kind = r#"{
-            "schema_version": 1,
+            "schema_version": 2,
             "workflow_kind": "brainstorm_to_delivery",
+            "plan_target_rel_path": "docs/p.md",
+            "risk_policy_version": "b2d_task_risk_v1",
             "publication_token": "t",
-            "workflow_state": "estimated",
+            "workflow_state": "skeleton",
             "design": { "rel_path": "docs/a.md", "digest": "d" },
-            "phases": [{ "id": "design" }],
-            "nodes": [],
+            "phases": [{ "id": "design" }, { "id": "plan" }],
+            "nodes": [{
+                "id": "plan-author",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "author",
+                "agent_type": "codex",
+                "work_unit_key": "plan|docs/p.md|author|codex|none",
+                "deps": []
+            }],
             "edges": [],
             "gates": [{
                 "id": "mystery",
+                "reviewer_cohort_node_ids": [],
                 "required_reviewer_node_ids": [],
                 "resolution_mode": "self_review"
-            }]
+            }],
+            "task_policies": []
         }"#;
         let doc: ManifestDocument =
             serde_json::from_str(optional_gate_kind).expect("gate_kind optional");
@@ -1278,6 +1887,7 @@ mod tests {
         for i in 0..=MAX_GATES {
             doc.gates.push(ManifestGate {
                 id: format!("extra-gate-{i}"),
+                reviewer_cohort_node_ids: vec![plan_reviewer.clone()],
                 required_reviewer_node_ids: vec![plan_reviewer.clone()],
                 resolution_mode: ResolutionMode::ParentAdjudication,
                 gate_kind: Some(DocumentGateKind::Plan),
@@ -1335,5 +1945,376 @@ mod tests {
             matches!(err, WorkflowError::BoundsExceeded(ref m) if m.contains("manifest JSON")),
             "expected JSON size bound, got {err:?}"
         );
+    }
+
+    #[test]
+    fn v1_manifest_is_rejected() {
+        let mut wire = v2_skeleton_wire();
+        wire["schema_version"] = json!(1);
+        let err = validate_wire(wire).expect_err("schema v1 must be rejected");
+        assert!(
+            err.contains("schema version") && err.contains('1'),
+            "expected explicit v1 schema rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn v2_fields_are_required_by_serde() {
+        let complete = json!({
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "workflow_kind": WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+            "publication_token": "serde-v2",
+            "workflow_state": "skeleton",
+            "plan_target_rel_path": "docs/superpowers/plans/p.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "phases": [],
+            "nodes": [],
+            "edges": [],
+            "gates": [],
+            "task_policies": []
+        });
+        serde_json::from_value::<ManifestDocument>(complete.clone())
+            .expect("complete v2 serde fixture");
+        for field in [
+            "plan_target_rel_path",
+            "risk_policy_version",
+            "task_policies",
+        ] {
+            let mut missing = complete.clone();
+            missing
+                .as_object_mut()
+                .expect("manifest object")
+                .remove(field);
+            let result = serde_json::from_value::<ManifestDocument>(missing);
+            assert!(result.is_err(), "missing {field} must fail serde");
+        }
+
+        let mut missing_cohort = complete;
+        missing_cohort["gates"] = json!([{
+            "id": "plan-gate",
+            "reviewer_cohort_node_ids": [],
+            "required_reviewer_node_ids": [],
+            "resolution_mode": "parent_adjudication"
+        }]);
+        serde_json::from_value::<ManifestDocument>(missing_cohort.clone())
+            .expect("complete v2 gate serde fixture");
+        missing_cohort["gates"][0]
+            .as_object_mut()
+            .expect("gate object")
+            .remove("reviewer_cohort_node_ids");
+        assert!(
+            serde_json::from_value::<ManifestDocument>(missing_cohort).is_err(),
+            "missing reviewer_cohort_node_ids must fail serde"
+        );
+    }
+
+    #[test]
+    fn skeleton_requires_one_codex_author_and_no_plan_or_task_policies() {
+        validate_wire(v2_skeleton_wire()).expect("minimal v2 skeleton");
+
+        let mut no_author = v2_skeleton_wire();
+        no_author["nodes"] = json!([]);
+        let err = validate_wire(no_author).expect_err("missing Author rejected");
+        assert!(err.to_lowercase().contains("author"), "got {err}");
+
+        let mut grok_author = v2_skeleton_wire();
+        grok_author["nodes"][0]["agent_type"] = json!("grok");
+        grok_author["nodes"][0]["work_unit_key"] =
+            json!("plan|docs/superpowers/plans/p.md|author|grok|none");
+        let err = validate_wire(grok_author).expect_err("non-Codex Author rejected");
+        assert!(err.to_lowercase().contains("author"), "got {err}");
+
+        let mut with_plan = v2_skeleton_wire();
+        with_plan["plan"] = json!({
+            "rel_path": "docs/superpowers/plans/p.md",
+            "digest": "not-yet-allowed"
+        });
+        let err = validate_wire(with_plan).expect_err("skeleton Plan rejected");
+        assert!(err.to_lowercase().contains("skeleton"), "got {err}");
+
+        let mut with_policy = v2_skeleton_wire();
+        with_policy["task_policies"] = normal_estimated_wire()["task_policies"].clone();
+        let err = validate_wire(with_policy).expect_err("skeleton policy rejected");
+        assert!(err.to_lowercase().contains("skeleton"), "got {err}");
+    }
+
+    #[test]
+    fn eventual_plan_path_equals_declared_target() {
+        validate_wire(normal_estimated_wire()).expect("matching Plan target");
+
+        let mut mismatch = normal_estimated_wire();
+        mismatch["plan"]["rel_path"] = json!("docs/superpowers/plans/other.md");
+        let err = validate_wire(mismatch).expect_err("Plan target mismatch rejected");
+        assert!(err.contains("plan_target_rel_path"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_or_duplicate_risk_signals_are_rejected() {
+        let mut unknown = normal_estimated_wire();
+        unknown["task_policies"][0]["risk"]["soft_signals"] =
+            json!([soft_signal("future_signal", 1)]);
+        unknown["task_policies"][0]["risk"]["score"] = json!(1);
+        let err = validate_wire(unknown).expect_err("unknown signal rejected");
+        assert!(
+            err.contains("future_signal") || err.contains("unknown variant"),
+            "got {err}"
+        );
+
+        let mut duplicate = normal_estimated_wire();
+        duplicate["task_policies"][0]["risk"]["soft_signals"] = json!([
+            soft_signal("shared_interface", 1),
+            soft_signal("shared_interface", 1)
+        ]);
+        duplicate["task_policies"][0]["risk"]["score"] = json!(1);
+        let err = validate_wire(duplicate).expect_err("duplicate signal rejected");
+        assert!(err.to_lowercase().contains("duplicate"), "got {err}");
+
+        let mut empty_evidence = normal_estimated_wire();
+        empty_evidence["task_policies"][0]["risk"]["soft_signals"] = json!([{
+            "kind": "shared_interface",
+            "score": 1,
+            "evidence": ["   "]
+        }]);
+        empty_evidence["task_policies"][0]["risk"]["score"] = json!(1);
+        let err = validate_wire(empty_evidence).expect_err("blank evidence rejected");
+        assert!(err.to_lowercase().contains("evidence"), "got {err}");
+    }
+
+    #[test]
+    fn every_hard_trigger_forces_high_risk() {
+        for kind in [
+            "concurrency_lifecycle",
+            "security_trust_boundary",
+            "migration_destructive_persistence",
+            "public_compatibility",
+            "unsafe_ffi",
+            "update_rollback",
+        ] {
+            let hard = vec![json!({
+                "kind": kind,
+                "evidence": [format!("evidence for {kind}")]
+            })];
+            let high = estimated_wire(
+                "high",
+                hard.clone(),
+                vec![],
+                0,
+                "codex",
+                &[
+                    ("task-1-reviewer-codex", "codex"),
+                    ("task-1-reviewer-grok", "grok"),
+                ],
+            );
+            validate_wire(high).unwrap_or_else(|err| panic!("{kind} high: {err}"));
+
+            let contradictory = estimated_wire(
+                "normal",
+                hard,
+                vec![],
+                0,
+                "grok",
+                &[("task-1-reviewer-codex", "codex")],
+            );
+            let err =
+                validate_wire(contradictory).expect_err("hard trigger declared normal must fail");
+            assert!(err.to_lowercase().contains("risk"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn soft_score_threshold_table_selects_risk() {
+        let cases = [
+            (vec![], 0, "normal"),
+            (vec![soft_signal("shared_interface", 1)], 1, "normal"),
+            (
+                vec![soft_signal("cross_runtime_or_process", 2)],
+                2,
+                "normal",
+            ),
+            (
+                vec![
+                    soft_signal("cross_runtime_or_process", 2),
+                    soft_signal("shared_interface", 1),
+                ],
+                3,
+                "high",
+            ),
+            (
+                vec![
+                    soft_signal("cross_runtime_or_process", 2),
+                    soft_signal("shared_interface", 1),
+                    soft_signal("dependency_or_build", 1),
+                ],
+                4,
+                "high",
+            ),
+        ];
+        for (signals, score, level) in cases {
+            let (implementer, reviewers): (&str, Vec<(&str, &str)>) = if level == "high" {
+                (
+                    "codex",
+                    vec![
+                        ("task-1-reviewer-codex", "codex"),
+                        ("task-1-reviewer-grok", "grok"),
+                    ],
+                )
+            } else {
+                ("grok", vec![("task-1-reviewer-codex", "codex")])
+            };
+            let wire = estimated_wire(level, vec![], signals, score, implementer, &reviewers);
+            validate_wire(wire)
+                .unwrap_or_else(|err| panic!("score {score} expected {level}: {err}"));
+        }
+    }
+
+    #[test]
+    fn submitted_soft_scores_match_unique_signal_weights() {
+        let mut wrong_weight = normal_estimated_wire();
+        wrong_weight["task_policies"][0]["risk"]["soft_signals"] =
+            json!([soft_signal("cross_runtime_or_process", 1)]);
+        wrong_weight["task_policies"][0]["risk"]["score"] = json!(1);
+        let err = validate_wire(wrong_weight).expect_err("wrong signal weight rejected");
+        assert!(err.to_lowercase().contains("score"), "got {err}");
+
+        let mut wrong_total = normal_estimated_wire();
+        wrong_total["task_policies"][0]["risk"]["soft_signals"] =
+            json!([soft_signal("cross_runtime_or_process", 2)]);
+        wrong_total["task_policies"][0]["risk"]["score"] = json!(1);
+        let err = validate_wire(wrong_total).expect_err("wrong total rejected");
+        assert!(err.to_lowercase().contains("score"), "got {err}");
+    }
+
+    #[test]
+    fn estimated_and_approved_tasks_have_exactly_one_policy() {
+        for state in ["estimated", "approved"] {
+            let mut missing = normal_estimated_wire();
+            missing["workflow_state"] = json!(state);
+            missing["task_policies"] = json!([]);
+            let err = validate_wire(missing).expect_err("missing Task policy rejected");
+            assert!(err.to_lowercase().contains("policy"), "{state}: {err}");
+
+            let mut duplicate = normal_estimated_wire();
+            duplicate["workflow_state"] = json!(state);
+            let policy = duplicate["task_policies"][0].clone();
+            duplicate["task_policies"] = json!([policy.clone(), policy]);
+            let err = validate_wire(duplicate).expect_err("duplicate Task policy rejected");
+            assert!(err.to_lowercase().contains("duplicate"), "{state}: {err}");
+
+            let mut wrong_index = normal_estimated_wire();
+            wrong_index["workflow_state"] = json!(state);
+            wrong_index["task_policies"][0]["task_index"] = json!(2);
+            let err = validate_wire(wrong_index).expect_err("wrong Task policy index rejected");
+            assert!(err.to_lowercase().contains("policy"), "{state}: {err}");
+        }
+    }
+
+    #[test]
+    fn normal_and_high_routes_match_agent_matrix() {
+        validate_wire(normal_estimated_wire()).expect("normal Grok/Codex route");
+        validate_wire(high_estimated_wire()).expect("high Codex/Codex+Grok route");
+
+        let mut normal_wrong_implementer = normal_estimated_wire();
+        normal_wrong_implementer["nodes"][3]["agent_type"] = json!("codex");
+        normal_wrong_implementer["nodes"][3]["work_unit_key"] =
+            json!("task|1|implementer|codex|none");
+        let err = validate_wire(normal_wrong_implementer).expect_err("wrong route rejected");
+        assert!(err.to_lowercase().contains("route"), "got {err}");
+
+        let mut high_one_reviewer = high_estimated_wire();
+        high_one_reviewer["task_policies"][0]["route"]["reviewer_node_ids"] =
+            json!(["task-1-reviewer-codex"]);
+        let err = validate_wire(high_one_reviewer).expect_err("incomplete high route rejected");
+        assert!(err.to_lowercase().contains("route"), "got {err}");
+    }
+
+    #[test]
+    fn plan_required_reviewers_are_subset_of_complete_cohort() {
+        validate_wire(normal_estimated_wire()).expect("required Plan subset");
+
+        let mut empty_required = normal_estimated_wire();
+        empty_required["gates"][0]["required_reviewer_node_ids"] = json!([]);
+        let err = validate_wire(empty_required).expect_err("empty Plan subset rejected");
+        assert!(err.to_lowercase().contains("plan gate"), "got {err}");
+
+        let mut outside_cohort = normal_estimated_wire();
+        outside_cohort["gates"][0]["reviewer_cohort_node_ids"] = json!(["plan-reviewer-grok"]);
+        let err = validate_wire(outside_cohort).expect_err("outside cohort rejected");
+        assert!(err.to_lowercase().contains("cohort"), "got {err}");
+
+        let mut incomplete_cohort = normal_estimated_wire();
+        incomplete_cohort["gates"][0]["reviewer_cohort_node_ids"] = json!(["plan-reviewer-codex"]);
+        let err = validate_wire(incomplete_cohort).expect_err("incomplete cohort rejected");
+        assert!(err.to_lowercase().contains("cohort"), "got {err}");
+
+        let mut design_self_review = normal_estimated_wire();
+        design_self_review["design"] = json!({
+            "rel_path": "docs/superpowers/specs/d.md",
+            "digest": "design-digest"
+        });
+        design_self_review["phases"]
+            .as_array_mut()
+            .expect("phases")
+            .push(json!({ "id": "design" }));
+        design_self_review["gates"]
+            .as_array_mut()
+            .expect("gates")
+            .push(json!({
+                "id": "design-gate",
+                "gate_kind": "design",
+                "reviewer_cohort_node_ids": [],
+                "required_reviewer_node_ids": [],
+                "resolution_mode": "self_review"
+            }));
+        validate_wire(design_self_review).expect("empty Design self-review sets");
+    }
+
+    #[test]
+    fn task_route_cannot_omit_duplicate_or_cross_task_nodes() {
+        let mut omitted = high_estimated_wire();
+        omitted["task_policies"][0]["route"]["reviewer_node_ids"] =
+            json!(["task-1-reviewer-codex"]);
+        let err = validate_wire(omitted).expect_err("omitted route node rejected");
+        assert!(err.to_lowercase().contains("route"), "got {err}");
+
+        let mut duplicate = high_estimated_wire();
+        duplicate["task_policies"][0]["route"]["reviewer_node_ids"] =
+            json!(["task-1-reviewer-codex", "task-1-reviewer-codex"]);
+        let err = validate_wire(duplicate).expect_err("duplicate route node rejected");
+        assert!(err.to_lowercase().contains("duplicate"), "got {err}");
+
+        let mut wrong_task = normal_estimated_wire();
+        wrong_task["nodes"][4]["task_index"] = json!(2);
+        wrong_task["nodes"][4]["work_unit_key"] = json!("task|2|reviewer|codex|none");
+        let err = validate_wire(wrong_task).expect_err("cross-Task route node rejected");
+        assert!(
+            err.to_lowercase().contains("task") || err.to_lowercase().contains("route"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn workflow_v2_typed_error_real_producers_risk_assessment() {
+        let mut wire = normal_estimated_wire();
+        wire["risk_policy_version"] = json!("not-b2d-task-risk-v1");
+        let document: ManifestDocument = serde_json::from_value(wire).expect("manifest wire");
+        let error = validate_manifest_document(&document).expect_err("invalid risk policy");
+        assert!(matches!(&error, WorkflowError::RiskAssessmentInvalid(_)));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(
+            crate::acp::delegation::workflow::WorkflowStoreError::Validation(error),
+        );
+        assert_eq!(code, "risk_assessment_invalid");
+    }
+
+    #[test]
+    fn workflow_v2_typed_error_real_producers_task_route() {
+        let mut wire = high_estimated_wire();
+        wire["task_policies"][0]["route"]["reviewer_node_ids"] = json!(["task-1-reviewer-codex"]);
+        let document: ManifestDocument = serde_json::from_value(wire).expect("manifest wire");
+        let error = validate_manifest_document(&document).expect_err("incomplete high-risk route");
+        assert!(matches!(&error, WorkflowError::TaskRouteMismatch(_)));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(
+            crate::acp::delegation::workflow::WorkflowStoreError::Validation(error),
+        );
+        assert_eq!(code, "task_route_mismatch");
     }
 }

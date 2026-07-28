@@ -1,20 +1,21 @@
-//! Workflow run admission enforcement + graph-revision hooks (Task 6).
+//! Workflow run admission enforcement + graph-revision hooks.
 //!
 //! - B2/A14: active vs retained-observed binding; role/agent/profile match
 //! - A8.3: block **new** Task first-dispatch while Plan re-open / not approved
 //! - B6: Final reviewer / fixer / re-review readiness via `evaluate_execution_gate`
-//! - B14: first Task-pair admission freezes both partners
+//! - Task 5: independent child sessions + complete routed-cohort freezing
 //! - B5/A10: run_binding + graph_revision same transaction; post-commit emit
 //! - A1 key without manifest: compatibility_nudge only
 //! - Non-workflow / non-A1 key: no workflow write
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, JoinType, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
 use crate::acp::delegation::card_summary::{
-    parse_and_validate_summary_json, ReviewVerdict, WorkStatus,
+    parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
 use crate::acp::delegation::store::TaskStoreError;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
@@ -28,7 +29,7 @@ use crate::web::event_bridge::EventEmitter;
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
-    TerminalRunStatus,
+    RequiredReviewerEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
 use super::project::evidence_from_run_and_binding;
@@ -94,6 +95,7 @@ impl WorkflowTxnSideEffect {
 #[derive(Debug, Clone)]
 pub struct WorkflowAdmitInput<'a> {
     pub parent_conversation_id: i32,
+    pub child_conversation_id: i32,
     pub task_id: &'a str,
     pub work_unit_key: Option<&'a str>,
     pub agent_type: &'a str,
@@ -207,6 +209,16 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         ));
     }
 
+    ensure_child_conversation_independent(
+        conn,
+        &header.workflow_id,
+        &binding.node_id,
+        input.child_conversation_id,
+    )
+    .await?;
+
+    let task_route = resolve_task_route(conn, &header, &binding, &parsed).await?;
+
     // A8.3 / B6 readiness for Task and Final (first-dispatch and Final re-entry).
     enforce_phase_readiness(
         conn,
@@ -244,8 +256,11 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     };
     rb.insert(conn).await.map_err(map_db)?;
 
-    // Mark node observed + B14 pair freeze when first Task partner admits.
-    mark_observed_and_maybe_freeze_pair(conn, &header.workflow_id, &binding, now).await?;
+    mark_node_observed(conn, &binding, now).await?;
+    if let Some((task_index, route_node_ids)) = task_route {
+        mark_observed_and_freeze_cohort(conn, &header.workflow_id, task_index, &route_node_ids)
+            .await?;
+    }
 
     let next_rev = bump_graph_revision(conn, &header.workflow_id, now).await?;
 
@@ -300,13 +315,42 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     };
 
     let now = Utc::now();
-    let validated = card_summary_json
-        .and_then(parse_and_validate_summary_json)
-        .is_some();
+    let summary = card_summary_json.and_then(parse_and_validate_summary_json);
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        rb.workflow_id.clone(),
+        rb.node_id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(map_db)?;
+    let (validated, author_digest) = match (node.as_ref(), summary.as_ref()) {
+        (Some(node), Some(CardSummary::Author { plan_digest, .. }))
+            if node.role == "author" && node.phase_id == "plan" =>
+        {
+            (true, Some(plan_digest.clone()))
+        }
+        (Some(node), Some(CardSummary::Review { report_file, .. })) if node.role == "reviewer" => {
+            let required_report = node.phase_id == "plan" || node.phase_id == PHASE_TASKS;
+            let has_report = report_file
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty());
+            (!required_report || has_report, None)
+        }
+        (Some(node), Some(CardSummary::Implementation { .. }))
+            if node.role == "implementer" || node.role == "fixer" =>
+        {
+            (true, None)
+        }
+        _ => (false, None),
+    };
 
     let mut am: delegation_workflow_run_binding::ActiveModel = rb.clone().into();
     am.summary_validated = Set(validated);
     am.updated_at = Set(now);
+
+    if let Some(digest) = author_digest.as_ref() {
+        am.artifact_digest = Set(Some(digest.clone()));
+    }
 
     if matches!(
         run_status,
@@ -314,6 +358,7 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
             | DelegationRunStatus::Failed
             | DelegationRunStatus::Canceled
     ) && rb.artifact_digest.is_none()
+        && author_digest.is_none()
     {
         if let Some(digest) = workspace_head_commit(workspace_path) {
             am.artifact_digest = Set(Some(digest));
@@ -395,7 +440,7 @@ fn validate_identity_match(
         ));
     }
     let bind_profile = binding.profile_id.as_deref();
-    let run_profile = profile_id.filter(|s| !s.is_empty());
+    let run_profile = profile_id;
     if bind_profile != run_profile {
         return Err(admission_err(
             "workflow_profile_mismatch",
@@ -406,7 +451,8 @@ fn validate_identity_match(
     // Role from key vs binding.
     let (expected_role, expected_phase) = match parsed {
         ParsedWorkUnitKey::Design { .. } => ("reviewer", "design"),
-        ParsedWorkUnitKey::Plan { .. } => ("reviewer", "plan"),
+        ParsedWorkUnitKey::PlanAuthor { .. } => ("author", "plan"),
+        ParsedWorkUnitKey::PlanReviewer { .. } => ("reviewer", "plan"),
         ParsedWorkUnitKey::TaskImplementer { .. } => ("implementer", PHASE_TASKS),
         ParsedWorkUnitKey::TaskReviewer { .. } => ("reviewer", PHASE_TASKS),
         ParsedWorkUnitKey::FinalReviewer { .. } => ("reviewer", PHASE_FINAL),
@@ -433,6 +479,118 @@ fn validate_identity_match(
     Ok(())
 }
 
+async fn ensure_child_conversation_independent<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    node_id: &str,
+    child_conversation_id: i32,
+) -> Result<(), TaskStoreError> {
+    let run_relation =
+        delegation_workflow_run_binding::Entity::belongs_to(delegation_task_run::Entity)
+            .from(delegation_workflow_run_binding::Column::TaskId)
+            .to(delegation_task_run::Column::TaskId)
+            .into();
+    let conflict = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(workflow_id.to_string()))
+        .filter(delegation_workflow_run_binding::Column::NodeId.ne(node_id.to_string()))
+        .join(JoinType::InnerJoin, run_relation)
+        .filter(delegation_task_run::Column::ChildConversationId.eq(child_conversation_id))
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    if let Some(binding) = conflict {
+        return Err(admission_err(
+            "reviewer_not_independent",
+            format!(
+                "child conversation {child_conversation_id} is already bound to workflow node {}",
+                binding.node_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_workflow_child_conversation_independent<C: ConnectionTrait>(
+    conn: &C,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+    child_conversation_id: i32,
+) -> Result<(), TaskStoreError> {
+    let Some(key) = work_unit_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return Ok(());
+    };
+    if parse_recognized_work_unit_key(key).is_none() {
+        return Ok(());
+    }
+    let Some(header) = load_workflow_header(conn, parent_conversation_id).await? else {
+        return Ok(());
+    };
+    let Some(binding) = find_node_binding(conn, &header.workflow_id, key).await? else {
+        return Ok(());
+    };
+    ensure_child_conversation_independent(
+        conn,
+        &header.workflow_id,
+        &binding.node_id,
+        child_conversation_id,
+    )
+    .await
+}
+
+async fn resolve_task_route<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    binding: &delegation_workflow_node_binding::Model,
+    parsed: &ParsedWorkUnitKey,
+) -> Result<Option<(i64, Vec<String>)>, TaskStoreError> {
+    let task_index = match parsed {
+        ParsedWorkUnitKey::TaskImplementer { task_index, .. }
+        | ParsedWorkUnitKey::TaskReviewer { task_index, .. } => *task_index,
+        _ => return Ok(None),
+    };
+    let doc = load_active_manifest_doc(conn, header)
+        .await?
+        .ok_or_else(|| admission_err("task_route_mismatch", "active manifest is missing"))?;
+    let normalized = validate_manifest_document(&doc).map_err(|err| {
+        admission_err(
+            "task_route_mismatch",
+            format!("active manifest route is invalid: {err}"),
+        )
+    })?;
+    let policy = normalized
+        .task_policies
+        .iter()
+        .find(|policy| policy.task_index == task_index)
+        .ok_or_else(|| {
+            admission_err(
+                "task_route_mismatch",
+                format!("Task {task_index} has no active risk policy/route"),
+            )
+        })?;
+    let mut route_node_ids = Vec::with_capacity(policy.route.reviewer_node_ids.len() + 1);
+    route_node_ids.push(policy.route.implementer_node_id.clone());
+    route_node_ids.extend(policy.route.reviewer_node_ids.iter().cloned());
+    let admitted_on_route = match parsed {
+        ParsedWorkUnitKey::TaskImplementer { .. } => {
+            policy.route.implementer_node_id == binding.node_id
+        }
+        ParsedWorkUnitKey::TaskReviewer { .. } => {
+            policy.route.reviewer_node_ids.contains(&binding.node_id)
+        }
+        _ => unreachable!("Task route parsed above"),
+    };
+    if !admitted_on_route {
+        return Err(admission_err(
+            "task_route_mismatch",
+            format!(
+                "node {} is not assigned to its role in Task {task_index} active route",
+                binding.node_id
+            ),
+        ));
+    }
+    Ok(Some((task_index as i64, route_node_ids)))
+}
+
 async fn enforce_phase_readiness<C: ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
@@ -442,8 +600,9 @@ async fn enforce_phase_readiness<C: ConnectionTrait>(
     admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
     match parsed {
+        ParsedWorkUnitKey::PlanAuthor { .. } => Ok(()),
         // Document reviewers: only published Design/Plan nodes (already bound).
-        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::Plan { .. } => Ok(()),
+        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::PlanReviewer { .. } => Ok(()),
 
         ParsedWorkUnitKey::TaskImplementer { task_index, .. }
         | ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
@@ -660,7 +819,7 @@ fn document_gate_content_fingerprint(
 ) -> Option<String> {
     match parsed {
         ParsedWorkUnitKey::Design { .. } => Some(header.design_fingerprint.clone()),
-        ParsedWorkUnitKey::Plan { .. } => Some(header.plan_fingerprint.clone()),
+        ParsedWorkUnitKey::PlanReviewer { .. } => Some(header.plan_fingerprint.clone()),
         _ => None,
     }
 }
@@ -720,26 +879,38 @@ async fn evaluate_task_index_gate<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     task_index: u32,
 ) -> Result<super::gates::ExecutionGateEval, TaskStoreError> {
-    let impl_ev = load_latest_role_evidence(
-        conn,
-        header,
-        PHASE_TASKS,
-        "implementer",
-        Some(task_index as i64),
-    )
-    .await?;
-    let rev_ev = load_latest_role_evidence(
-        conn,
-        header,
-        PHASE_TASKS,
-        "reviewer",
-        Some(task_index as i64),
-    )
-    .await?;
+    let doc = load_active_manifest_doc(conn, header)
+        .await?
+        .ok_or_else(|| admission_err("workflow_manifest_missing", "active manifest missing"))?;
+    let normalized = validate_manifest_document(&doc).map_err(|err| {
+        admission_err(
+            "workflow_manifest_invalid",
+            format!("active manifest invalid: {err}"),
+        )
+    })?;
+    let policy = normalized
+        .task_policies
+        .iter()
+        .find(|policy| policy.task_index == task_index)
+        .ok_or_else(|| {
+            admission_err(
+                "task_policy_missing",
+                format!("Task {task_index} has no active policy route"),
+            )
+        })?;
+    let impl_ev =
+        load_latest_node_evidence(conn, header, &policy.route.implementer_node_id).await?;
+    let mut required_reviewers = Vec::with_capacity(policy.route.reviewer_node_ids.len());
+    for node_id in &policy.route.reviewer_node_ids {
+        required_reviewers.push(RequiredReviewerEvidence {
+            node_id: node_id.clone(),
+            evidence: load_latest_node_evidence(conn, header, node_id).await?,
+        });
+    }
     Ok(evaluate_execution_gate(&ExecutionGateInput {
         kind: ExecutionGateKind::Task,
         implementer_or_fixer: impl_ev,
-        reviewer: rev_ev,
+        required_reviewers,
         branch_tip_digest: None,
     }))
 }
@@ -786,7 +957,10 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
     let mut q = delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(phase.to_string()))
-        .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()));
+        .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .order_by_desc(delegation_workflow_node_binding::Column::IntroducedRevision)
+        .order_by_asc(delegation_workflow_node_binding::Column::NodeId);
     if let Some(idx) = task_index {
         q = q.filter(delegation_workflow_node_binding::Column::TaskIndex.eq(idx));
     }
@@ -795,9 +969,28 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
         return Ok(None);
     };
 
+    load_latest_node_evidence(conn, header, &binding.node_id).await
+}
+
+async fn load_latest_node_evidence<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    node_id: &str,
+) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
+    let active = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .filter(delegation_workflow_node_binding::Column::NodeId.eq(node_id.to_string()))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    if active.is_none() {
+        return Ok(None);
+    }
+
     let rbs = delegation_workflow_run_binding::Entity::find()
         .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
-        .filter(delegation_workflow_run_binding::Column::NodeId.eq(binding.node_id.clone()))
+        .filter(delegation_workflow_run_binding::Column::NodeId.eq(node_id.to_string()))
         .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
         .all(conn)
         .await
@@ -845,20 +1038,99 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
     TaskStoreError,
 > {
     match parsed {
-        ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::Plan { .. } => {
+        ParsedWorkUnitKey::PlanAuthor { .. } => Ok((None, None, None, None, None)),
+        ParsedWorkUnitKey::Design { .. } => {
             let (gate_id, cycle, digest) =
                 document_gate_stamp(conn, header, binding, parsed).await?;
             Ok((gate_id, cycle, digest, None, None))
         }
+        ParsedWorkUnitKey::PlanReviewer { .. } => {
+            let (gate_id, cycle, digest) =
+                document_gate_stamp(conn, header, binding, parsed).await?;
+            let plan_digest = digest
+                .as_deref()
+                .map(str::trim)
+                .filter(|digest| !digest.is_empty())
+                .ok_or_else(|| {
+                    admission_err(
+                        "plan_digest_missing",
+                        "Plan reviewer admission requires a published Plan digest",
+                    )
+                })?;
+            let (author_run, author_binding) =
+                load_latest_plan_author_binding(conn, header).await?;
+            let author_digest = author_binding
+                .artifact_digest
+                .as_deref()
+                .map(str::trim)
+                .filter(|digest| !digest.is_empty());
+            let author_summary_matches = author_run
+                .card_summary_json
+                .as_deref()
+                .and_then(parse_and_validate_summary_json)
+                .is_some_and(|summary| {
+                    matches!(
+                        summary,
+                        CardSummary::Author { plan_digest: ref digest, .. }
+                            if digest == plan_digest
+                    )
+                });
+            if author_run.status != DelegationRunStatus::Completed
+                || !author_binding.summary_validated
+                || author_digest != Some(plan_digest)
+                || !author_summary_matches
+            {
+                return Err(admission_err(
+                    "plan_author_stale",
+                    "latest active Plan Author must be completed and cover the exact Plan digest",
+                ));
+            }
+            Ok((
+                gate_id,
+                cycle,
+                Some(plan_digest.to_string()),
+                Some(author_run.task_id),
+                None,
+            ))
+        }
         ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
-            // Copy implementer binding digests / task_id for B3/B13.
             let impl_pair =
                 load_latest_implementer_binding(conn, header, *task_index as i64).await?;
-            let (reviewed_task_id, reviewed_gen, digest) = match impl_pair {
-                Some((run, rb)) => (Some(run.task_id), Some(run.generation), rb.artifact_digest),
-                None => (None, None, None),
+            let Some((run, rb)) = impl_pair else {
+                return Err(admission_err(
+                    "producer_artifact_missing",
+                    format!("Task {task_index} has no implementer run to review"),
+                ));
             };
-            Ok((None, None, digest, reviewed_task_id, reviewed_gen))
+            let digest = rb
+                .artifact_digest
+                .as_deref()
+                .map(str::trim)
+                .filter(|digest| !digest.is_empty());
+            let implementation_summary = run
+                .card_summary_json
+                .as_deref()
+                .and_then(parse_and_validate_summary_json)
+                .is_some_and(|summary| matches!(summary, CardSummary::Implementation { .. }));
+            if run.status != DelegationRunStatus::Completed
+                || !rb.summary_validated
+                || digest.is_none()
+                || !implementation_summary
+            {
+                return Err(admission_err(
+                    "producer_artifact_missing",
+                    format!(
+                        "Task {task_index} reviewer requires the latest completed implementer task and non-empty artifact digest"
+                    ),
+                ));
+            }
+            Ok((
+                None,
+                None,
+                digest.map(str::to_string),
+                Some(run.task_id),
+                Some(run.generation),
+            ))
         }
         ParsedWorkUnitKey::FinalReviewer { .. } => {
             // Prefer covering latest fixer if present; else first-pass:
@@ -934,7 +1206,7 @@ async fn document_gate_stamp<C: ConnectionTrait>(
     };
     let kind = match parsed {
         ParsedWorkUnitKey::Design { .. } => DocumentGateKind::Design,
-        ParsedWorkUnitKey::Plan { .. } => DocumentGateKind::Plan,
+        ParsedWorkUnitKey::PlanReviewer { .. } => DocumentGateKind::Plan,
         _ => return Ok((None, None, None)),
     };
     let gate = normalized.gates.iter().find(|g| g.gate_kind == kind);
@@ -964,6 +1236,58 @@ async fn document_gate_stamp<C: ConnectionTrait>(
         DocumentGateKind::Plan => normalized.plan.as_ref().map(|d| d.digest.clone()),
     };
     Ok((Some(gate.id.clone()), Some(cycle), digest))
+}
+
+async fn load_latest_plan_author_binding<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+) -> Result<
+    (
+        delegation_task_run::Model,
+        delegation_workflow_run_binding::Model,
+    ),
+    TaskStoreError,
+> {
+    let author = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .filter(delegation_workflow_node_binding::Column::PhaseId.eq("plan"))
+        .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            admission_err(
+                "plan_author_missing",
+                "Plan reviewer admission requires an active Plan Author",
+            )
+        })?;
+    let binding = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .filter(delegation_workflow_run_binding::Column::NodeId.eq(author.node_id))
+        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+        .order_by_desc(delegation_workflow_run_binding::Column::CreatedAt)
+        .order_by_desc(delegation_workflow_run_binding::Column::TaskId)
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            admission_err(
+                "plan_author_missing",
+                "Plan reviewer admission requires a completed Plan Author run",
+            )
+        })?;
+    let run = delegation_task_run::Entity::find_by_id(binding.task_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            admission_err(
+                "plan_author_missing",
+                "latest Plan Author binding points to a missing run",
+            )
+        })?;
+    Ok((run, binding))
 }
 
 async fn load_latest_implementer_binding<C: ConnectionTrait>(
@@ -1132,9 +1456,8 @@ async fn next_lineage_ordinal<C: ConnectionTrait>(
     })
 }
 
-async fn mark_observed_and_maybe_freeze_pair<C: ConnectionTrait>(
+async fn mark_node_observed<C: ConnectionTrait>(
     conn: &C,
-    workflow_id: &str,
     binding: &delegation_workflow_node_binding::Model,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), TaskStoreError> {
@@ -1142,34 +1465,42 @@ async fn mark_observed_and_maybe_freeze_pair<C: ConnectionTrait>(
     am.is_observed = Set(true);
     am.updated_at = Set(now);
     am.update(conn).await.map_err(map_db)?;
+    Ok(())
+}
 
-    // B14: Task implementer/reviewer pair — freeze both on first admission.
-    let Some(task_index) = binding.task_index else {
-        return Ok(());
-    };
-    if binding.phase_id != PHASE_TASKS {
-        return Ok(());
-    }
-    if binding.role != "implementer" && binding.role != "reviewer" {
-        return Ok(());
-    }
-
-    let partners = delegation_workflow_node_binding::Entity::find()
+async fn mark_observed_and_freeze_cohort<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    task_index: i64,
+    route_node_ids: &[String],
+) -> Result<(), TaskStoreError> {
+    let route_nodes = delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id.to_string()))
         .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(task_index))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(PHASE_TASKS.to_string()))
+        .filter(delegation_workflow_node_binding::Column::NodeId.is_in(route_node_ids.to_vec()))
         .all(conn)
         .await
         .map_err(map_db)?;
-
-    for p in partners {
-        if p.pair_frozen {
+    if route_nodes.len() != route_node_ids.len() {
+        return Err(admission_err(
+            "task_route_mismatch",
+            format!(
+                "Task {task_index} active route has {} ids but {} durable nodes",
+                route_node_ids.len(),
+                route_nodes.len()
+            ),
+        ));
+    }
+    let now = Utc::now();
+    for node in route_nodes {
+        if node.cohort_frozen {
             continue;
         }
-        let mut pam: delegation_workflow_node_binding::ActiveModel = p.into();
-        pam.pair_frozen = Set(true);
-        pam.updated_at = Set(now);
-        pam.update(conn).await.map_err(map_db)?;
+        let mut am: delegation_workflow_node_binding::ActiveModel = node.into();
+        am.cohort_frozen = Set(true);
+        am.updated_at = Set(now);
+        am.update(conn).await.map_err(map_db)?;
     }
     Ok(())
 }
@@ -1220,9 +1551,12 @@ mod tests {
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestNodeKind,
-        ManifestNodeRole, ManifestPhase, ManifestWorkflowState, ResolutionMode, WorkUnitKeyParts,
+        ManifestNodeRole, ManifestPhase, ManifestTaskHardTrigger, ManifestTaskPolicy,
+        ManifestTaskRisk, ManifestTaskRoute, ManifestWorkflowState, ResolutionMode,
+        TaskHardTriggerKind, TaskRiskLevel, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION,
         PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
+    use crate::acp::delegation::workflow::WorkflowStoreError;
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -1285,7 +1619,13 @@ mod tests {
             profile_id: None,
         })
         .unwrap();
-        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: plan_path,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
             rel_plan_path: plan_path,
             agent_type: "codex",
             profile_id: None,
@@ -1315,8 +1655,10 @@ mod tests {
         .unwrap();
 
         ManifestDocument {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+            plan_target_rel_path: plan_path.into(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
             workflow_id: None,
             expected_manifest_revision: None,
             publication_token: token.into(),
@@ -1396,6 +1738,16 @@ mod tests {
                     final_fix,
                     vec!["final-reviewer".into()],
                 ),
+                wu(
+                    "plan-author",
+                    PHASE_PLAN,
+                    ManifestNodeRole::Author,
+                    "codex",
+                    None,
+                    None,
+                    author_key,
+                    vec![],
+                ),
             ],
             edges: vec![ManifestEdge {
                 id: Some("e1".into()),
@@ -1405,18 +1757,176 @@ mod tests {
             gates: vec![
                 ManifestGate {
                     id: "design".into(),
+                    reviewer_cohort_node_ids: vec!["design-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
+                    reviewer_cohort_node_ids: vec!["plan-reviewer-1".into()],
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
                     gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::Normal,
+                    hard_triggers: vec![],
+                    soft_signals: vec![],
+                    score: 0,
+                    reason: "normal fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-impl".into(),
+                    reviewer_node_ids: vec!["task-1-rev".into()],
+                },
+            }],
         }
+    }
+
+    fn skeleton_doc(token: &str) -> ManifestDocument {
+        let mut doc = sample_doc(token, ManifestWorkflowState::Skeleton);
+        doc.plan = None;
+        doc.nodes.retain(|node| {
+            node.id == "design-reviewer-1" || node.role == Some(ManifestNodeRole::Author)
+        });
+        doc.edges.clear();
+        doc.gates
+            .retain(|gate| gate.gate_kind == Some(DocumentGateKind::Design));
+        doc.task_policies.clear();
+        doc
+    }
+
+    fn two_plan_reviewer_doc(token: &str) -> ManifestDocument {
+        let mut doc = sample_doc(token, ManifestWorkflowState::Estimated);
+        let plan_path = doc.plan_target_rel_path.clone();
+        let key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: &plan_path,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.push(wu(
+            "plan-reviewer-2",
+            PHASE_PLAN,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            None,
+            key,
+            vec!["plan-author".into()],
+        ));
+        let gate = doc
+            .gates
+            .iter_mut()
+            .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
+            .unwrap();
+        gate.reviewer_cohort_node_ids = vec!["plan-reviewer-1".into(), "plan-reviewer-2".into()];
+        gate.required_reviewer_node_ids = gate.reviewer_cohort_node_ids.clone();
+        doc
+    }
+
+    fn high_risk_doc(token: &str) -> ManifestDocument {
+        let mut doc = sample_doc(token, ManifestWorkflowState::Estimated);
+        let implementer = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "task-1-impl")
+            .unwrap();
+        implementer.agent_type = Some("codex".into());
+        implementer.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 1,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+        );
+        doc.nodes.push(wu(
+            "task-1-rev-grok",
+            PHASE_TASKS,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            Some(1),
+            build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+                task_index: 1,
+                agent_type: "grok",
+                profile_id: None,
+            })
+            .unwrap(),
+            vec!["task-1-impl".into()],
+        ));
+        doc.task_policies[0] = ManifestTaskPolicy {
+            task_index: 1,
+            risk: ManifestTaskRisk {
+                level: TaskRiskLevel::High,
+                hard_triggers: vec![ManifestTaskHardTrigger {
+                    kind: TaskHardTriggerKind::ConcurrencyLifecycle,
+                    evidence: vec!["first admission and continuation ordering".into()],
+                }],
+                soft_signals: vec![],
+                score: 0,
+                reason: "concurrency lifecycle is a hard trigger".into(),
+            },
+            route: ManifestTaskRoute {
+                implementer_node_id: "task-1-impl".into(),
+                reviewer_node_ids: vec!["task-1-rev".into(), "task-1-rev-grok".into()],
+            },
+        };
+        doc
+    }
+
+    fn two_task_doc(token: &str) -> ManifestDocument {
+        let mut doc = sample_doc(token, ManifestWorkflowState::Estimated);
+        doc.nodes.push(wu(
+            "task-2-impl",
+            PHASE_TASKS,
+            ManifestNodeRole::Implementer,
+            "grok",
+            None,
+            Some(2),
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 2,
+                agent_type: "grok",
+                profile_id: None,
+            })
+            .unwrap(),
+            vec!["task-1-rev".into()],
+        ));
+        doc.nodes.push(wu(
+            "task-2-rev",
+            PHASE_TASKS,
+            ManifestNodeRole::Reviewer,
+            "codex",
+            None,
+            Some(2),
+            build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+                task_index: 2,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+            vec!["task-2-impl".into()],
+        ));
+        doc.task_policies.push(ManifestTaskPolicy {
+            task_index: 2,
+            risk: ManifestTaskRisk {
+                level: TaskRiskLevel::Normal,
+                hard_triggers: vec![],
+                soft_signals: vec![],
+                score: 0,
+                reason: "second normal fixture".into(),
+            },
+            route: ManifestTaskRoute {
+                implementer_node_id: "task-2-impl".into(),
+                reviewer_node_ids: vec!["task-2-rev".into()],
+            },
+        });
+        doc
     }
 
     async fn seed_parent() -> (AppDatabase, i32) {
@@ -1484,6 +1994,53 @@ mod tests {
         (pub2.workflow_id, pub2.graph_revision)
     }
 
+    async fn publish_document_approved(
+        db: &AppDatabase,
+        emitter: &EventEmitter,
+        parent: i32,
+        mut doc: ManifestDocument,
+    ) -> String {
+        let published = publish_workflow_manifest_core(
+            db,
+            emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .expect("publish estimated document");
+        seed_gate_settlement(
+            db,
+            &published.workflow_id,
+            "design",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
+        seed_gate_settlement(
+            db,
+            &published.workflow_id,
+            "plan",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
+        doc.workflow_id = Some(published.workflow_id.clone());
+        doc.expected_manifest_revision = Some(published.manifest_revision);
+        doc.workflow_state = ManifestWorkflowState::Approved;
+        doc.publication_token.push_str("-approved");
+        publish_workflow_manifest_core(
+            db,
+            emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("publish approved document")
+        .workflow_id
+    }
+
     async fn seed_gate_settlement(
         db: &AppDatabase,
         workflow_id: &str,
@@ -1517,6 +2074,7 @@ mod tests {
             summary: Set("ok".into()),
             graph_revision_at_settle: Set(header.graph_revision),
             created_at: Set(now),
+            ..Default::default()
         };
         row.insert(&db.conn).await.expect("seed settlement");
         // Keep header approved when seeding plan approved.
@@ -1568,6 +2126,89 @@ mod tests {
         seed_conversation(db, folder, agent).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_completed_bound_run(
+        db: &AppDatabase,
+        parent: i32,
+        child: i32,
+        workflow_id: &str,
+        node_id: &str,
+        task_id: &str,
+        work_unit_key: &str,
+        agent: &str,
+        lineage_ordinal: i64,
+        summary_json: &str,
+        artifact_digest: Option<&str>,
+        reviewed_task_id: Option<&str>,
+        reviewed_generation: Option<i64>,
+    ) {
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        store
+            .insert_reserving(gen1_insert(
+                parent,
+                child,
+                task_id,
+                agent,
+                Some(work_unit_key),
+                None,
+            ))
+            .await
+            .expect("insert durable source run");
+        let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = Utc::now();
+        let mut run_am: delegation_task_run::ActiveModel = run.into();
+        run_am.status = Set(DelegationRunStatus::Completed);
+        run_am.reached_running_at = Set(Some(now));
+        run_am.finished_at = Set(Some(now));
+        run_am.card_summary_json = Set(Some(summary_json.to_string()));
+        run_am.update(&db.conn).await.unwrap();
+
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        delegation_workflow_run_binding::ActiveModel {
+            task_id: Set(task_id.to_string()),
+            workflow_id: Set(workflow_id.to_string()),
+            node_id: Set(node_id.to_string()),
+            gate_id: Set(None),
+            gate_cycle: Set(None),
+            manifest_revision: Set(header.active_manifest_revision),
+            content_fingerprint: Set(None),
+            artifact_digest: Set(artifact_digest.map(str::to_string)),
+            reviewed_task_id: Set(reviewed_task_id.map(str::to_string)),
+            reviewed_implementer_generation: Set(reviewed_generation),
+            lineage_ordinal: Set(lineage_ordinal),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert durable source binding");
+    }
+
+    fn author_summary(digest: &str) -> String {
+        format!(
+            r#"{{"kind":"author","status":"done","summary":"Plan authored","plan_digest":"{digest}","report_file":"reports/author.md"}}"#
+        )
+    }
+
+    fn review_summary() -> &'static str {
+        r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"approved","report_file":"reports/review.md"}"#
+    }
+
+    fn implementation_summary() -> &'static str {
+        r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"implemented"}"#
+    }
+
     /// Tiny uuid-like counter for unique paths in tests.
     struct UuidLike;
     impl UuidLike {
@@ -1576,6 +2217,909 @@ mod tests {
             static C: AtomicU64 = AtomicU64::new(1);
             format!("{:x}", C.fetch_add(1, Ordering::SeqCst))
         }
+    }
+
+    #[tokio::test]
+    async fn task5_plan_author_admits_on_skeleton_before_plan_digest_exists() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("tok-task5-author-skeleton"),
+            },
+        )
+        .await
+        .expect("publish skeleton");
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Codex).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                "50000000-0000-4000-8000-000000000001",
+                "codex",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect("Plan Author must admit before a Plan digest exists");
+    }
+
+    #[tokio::test]
+    async fn task5_plan_author_rejects_non_codex_identity() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("tok-task5-author-agent"),
+            },
+        )
+        .await
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                "50000000-0000-4000-8000-000000000002",
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect_err("Plan Author identity is Codex-only");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("workflow_agent_mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_plan_author_continuation_reuses_its_own_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("tok-task5-author-continue"),
+            },
+        )
+        .await
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Codex).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let first_task = "50000000-0000-4000-8000-000000000027";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                first_task,
+                "codex",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect("first Author admission");
+        let now = Utc::now();
+        let run = delegation_task_run::Entity::find_by_id(first_task)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run_am: delegation_task_run::ActiveModel = run.into();
+        run_am.status = Set(DelegationRunStatus::Completed);
+        run_am.reached_running_at = Set(Some(now));
+        run_am.finished_at = Set(Some(now));
+        run_am.card_summary_json = Set(Some(author_summary("sha256:first")));
+        run_am.update(&db.conn).await.unwrap();
+        let rb = delegation_workflow_run_binding::Entity::find_by_id(first_task)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rb_am: delegation_workflow_run_binding::ActiveModel = rb.into();
+        rb_am.summary_validated = Set(true);
+        rb_am.artifact_digest = Set(Some("sha256:first".into()));
+        rb_am.update(&db.conn).await.unwrap();
+
+        let next_task = "50000000-0000-4000-8000-000000000028";
+        let mut next = gen1_insert(parent, child, next_task, "codex", Some(&key), None);
+        next.root_task_id = first_task.into();
+        next.previous_task_id = Some(first_task.into());
+        next.generation = 2;
+        next.lineage_root_task_id = first_task.into();
+        next.parent_tool_use_id = Some("tool-author-continuation".into());
+        store.insert_reserving(next).await.unwrap();
+        admit_workflow_run_txn(
+            &db.conn,
+            &WorkflowAdmitInput {
+                parent_conversation_id: parent,
+                child_conversation_id: child,
+                task_id: next_task,
+                work_unit_key: Some(&key),
+                agent_type: "codex",
+                profile_id: None,
+                lineage_root_task_id: first_task,
+                generation: 2,
+                kind: AdmissionDispatchKind::ContinueOrReplacement,
+                admission_class: DbAdmissionClass::NormalRevision,
+                workspace_path: Some("/tmp/ws"),
+            },
+        )
+        .await
+        .expect("same-work-unit Author continuation");
+    }
+
+    #[tokio::test]
+    async fn task5_plan_reviewer_requires_latest_author_and_stamps_exact_plan() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: sample_doc(
+                    "tok-task5-reviewer-author",
+                    ManifestWorkflowState::Estimated,
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let no_author_child = child_for(&db, AgentType::Codex).await;
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                no_author_child,
+                "50000000-0000-4000-8000-000000000003",
+                "codex",
+                Some(&reviewer_key),
+                None,
+            ))
+            .await
+            .expect_err("reviewer before Author must reject");
+        assert_eq!(err.workflow_admission_code(), Some("plan_author_missing"));
+
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        for (task_id, digest, ordinal) in [
+            ("50000000-0000-4000-8000-000000000004", "sha256:old-plan", 1),
+            ("50000000-0000-4000-8000-000000000005", "sha256:plan", 2),
+        ] {
+            let child = child_for(&db, AgentType::Codex).await;
+            seed_completed_bound_run(
+                &db,
+                parent,
+                child,
+                &published.workflow_id,
+                "plan-author",
+                task_id,
+                &author_key,
+                "codex",
+                ordinal,
+                &author_summary(digest),
+                Some(digest),
+                None,
+                None,
+            )
+            .await;
+        }
+
+        let reviewer_child = child_for(&db, AgentType::Codex).await;
+        let reviewer_task = "50000000-0000-4000-8000-000000000006";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                reviewer_child,
+                reviewer_task,
+                "codex",
+                Some(&reviewer_key),
+                None,
+            ))
+            .await
+            .expect("reviewer after current Author");
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(reviewer_task)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.reviewed_task_id.as_deref(),
+            Some("50000000-0000-4000-8000-000000000005")
+        );
+        assert_eq!(binding.artifact_digest.as_deref(), Some("sha256:plan"));
+    }
+
+    #[tokio::test]
+    async fn task5_author_and_plan_reviewer_cannot_share_child_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: sample_doc(
+                    "tok-task5-independent-author",
+                    ManifestWorkflowState::Estimated,
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        let shared_child = child_for(&db, AgentType::Codex).await;
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &published.workflow_id,
+            "plan-author",
+            "50000000-0000-4000-8000-000000000007",
+            &author_key,
+            "codex",
+            1,
+            &author_summary("sha256:plan"),
+            Some("sha256:plan"),
+            None,
+            None,
+        )
+        .await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000008",
+                "codex",
+                Some(&reviewer_key),
+                None,
+            ))
+            .await
+            .expect_err("Author/reviewer child reuse must reject");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_two_plan_reviewers_cannot_share_child_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: two_plan_reviewer_doc("tok-task5-independent-plan-reviewers"),
+            },
+        )
+        .await
+        .unwrap();
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            &published.workflow_id,
+            "plan-author",
+            "50000000-0000-4000-8000-000000000009",
+            &author_key,
+            "codex",
+            1,
+            &author_summary("sha256:plan"),
+            Some("sha256:plan"),
+            None,
+            None,
+        )
+        .await;
+        let shared_child = child_for(&db, AgentType::Grok).await;
+        let reviewer_one_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &published.workflow_id,
+            "plan-reviewer-1",
+            "50000000-0000-4000-8000-000000000010",
+            &reviewer_one_key,
+            "codex",
+            2,
+            review_summary(),
+            Some("sha256:plan"),
+            Some("50000000-0000-4000-8000-000000000009"),
+            None,
+        )
+        .await;
+        let reviewer_two_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000011",
+                "grok",
+                Some(&reviewer_two_key),
+                None,
+            ))
+            .await
+            .expect_err("Plan reviewers must use independent children");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_implementer_and_task_reviewer_cannot_share_child_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task5-independent-task").await;
+        let shared_child = child_for(&db, AgentType::Grok).await;
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let implementer_task = "50000000-0000-4000-8000-000000000012";
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some("producer-digest"),
+            None,
+            None,
+        )
+        .await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000013",
+                "codex",
+                Some(&reviewer_key),
+                None,
+            ))
+            .await
+            .expect_err("implementer/reviewer child reuse must reject");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_high_risk_reviewers_cannot_share_child_and_route_freezes_three_nodes() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let workflow_id =
+            publish_document_approved(&db, &emitter, parent, high_risk_doc("tok-task5-high-route"))
+                .await;
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let implementer_task = "50000000-0000-4000-8000-000000000014";
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "codex",
+            1,
+            implementation_summary(),
+            Some("high-producer-digest"),
+            None,
+            None,
+        )
+        .await;
+        let shared_child = child_for(&db, AgentType::Grok).await;
+        let codex_reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &workflow_id,
+            "task-1-rev",
+            "50000000-0000-4000-8000-000000000015",
+            &codex_reviewer_key,
+            "codex",
+            2,
+            review_summary(),
+            Some("high-producer-digest"),
+            Some(implementer_task),
+            Some(1),
+        )
+        .await;
+        let grok_reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter.clone());
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000016",
+                "grok",
+                Some(&grok_reviewer_key),
+                None,
+            ))
+            .await
+            .expect_err("high-risk reviewers must use independent children");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+
+        let fresh_child = child_for(&db, AgentType::Grok).await;
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                fresh_child,
+                "50000000-0000-4000-8000-000000000017",
+                "grok",
+                Some(&grok_reviewer_key),
+                None,
+            ))
+            .await
+            .expect("independent high-risk reviewer admits");
+        let nodes = delegation_workflow_node_binding::Entity::find()
+            .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id))
+            .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1_i64))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes.iter().all(|node| node.cohort_frozen));
+    }
+
+    #[tokio::test]
+    async fn task5_policy_revision_is_allowed_before_admission_but_frozen_afterward() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let first = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: sample_doc("tok-task5-policy-before", ManifestWorkflowState::Estimated),
+            },
+        )
+        .await
+        .expect("initial normal policy");
+        let mut high = high_risk_doc("tok-task5-policy-material");
+        high.workflow_id = Some(first.workflow_id.clone());
+        high.expected_manifest_revision = Some(first.manifest_revision);
+        let revised = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: high.clone(),
+            },
+        )
+        .await
+        .expect("material risk/route revision is legal before admission");
+
+        seed_gate_settlement(
+            &db,
+            &revised.workflow_id,
+            "plan",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
+        let header = delegation_workflow::Entity::find_by_id(revised.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header_am: delegation_workflow::ActiveModel = header.into();
+        header_am.workflow_state = Set(WorkflowState::Approved);
+        header_am.update(&db.conn).await.unwrap();
+
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter.clone());
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Codex).await,
+                "50000000-0000-4000-8000-000000000018",
+                "codex",
+                Some(&implementer_key),
+                None,
+            ))
+            .await
+            .expect("first cohort admission");
+
+        let before = delegation_workflow_node_binding::Entity::find()
+            .filter(
+                delegation_workflow_node_binding::Column::WorkflowId
+                    .eq(revised.workflow_id.clone()),
+            )
+            .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1_i64))
+            .order_by_asc(delegation_workflow_node_binding::Column::NodeId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        high.workflow_id = Some(revised.workflow_id.clone());
+        high.expected_manifest_revision = Some(revised.manifest_revision);
+        high.publication_token = "tok-task5-policy-after".into();
+        high.task_policies[0].risk.reason = "post-admission policy mutation".into();
+        let err = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: high },
+        )
+        .await
+        .expect_err("any frozen policy mutation must reject");
+        assert!(
+            matches!(err, WorkflowStoreError::CohortFrozen { .. }),
+            "got {err:?}"
+        );
+        let after = delegation_workflow_node_binding::Entity::find()
+            .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(revised.workflow_id))
+            .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1_i64))
+            .order_by_asc(delegation_workflow_node_binding::Column::NodeId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "rejected publish must be atomic");
+
+        let mut removed_route =
+            sample_doc("tok-task5-route-removal", ManifestWorkflowState::Estimated);
+        removed_route.workflow_id = Some(first.workflow_id);
+        removed_route.expected_manifest_revision = Some(revised.manifest_revision);
+        let err = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: removed_route,
+            },
+        )
+        .await
+        .expect_err("frozen route removal must reject");
+        assert!(
+            matches!(err, WorkflowStoreError::CohortFrozen { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_task_and_final_work_units_cannot_share_child_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task5-task-final").await;
+        let implementer_task = "50000000-0000-4000-8000-000000000019";
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some("task-final-digest"),
+            None,
+            None,
+        )
+        .await;
+        let shared_child = child_for(&db, AgentType::Codex).await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &workflow_id,
+            "task-1-rev",
+            "50000000-0000-4000-8000-000000000020",
+            &reviewer_key,
+            "codex",
+            2,
+            review_summary(),
+            Some("task-final-digest"),
+            Some(implementer_task),
+            Some(1),
+        )
+        .await;
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000021",
+                "codex",
+                Some(&final_key),
+                None,
+            ))
+            .await
+            .expect_err("Task/Final child reuse must reject");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_different_task_work_units_cannot_share_child_conversation() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let workflow_id =
+            publish_document_approved(&db, &emitter, parent, two_task_doc("tok-task5-two-tasks"))
+                .await;
+        let implementer_task = "50000000-0000-4000-8000-000000000022";
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some("task-one-digest"),
+            None,
+            None,
+        )
+        .await;
+        let shared_child = child_for(&db, AgentType::Codex).await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            shared_child,
+            &workflow_id,
+            "task-1-rev",
+            "50000000-0000-4000-8000-000000000023",
+            &reviewer_key,
+            "codex",
+            2,
+            review_summary(),
+            Some("task-one-digest"),
+            Some(implementer_task),
+            Some(1),
+        )
+        .await;
+        let task_two_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 2,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                shared_child,
+                "50000000-0000-4000-8000-000000000024",
+                "grok",
+                Some(&task_two_key),
+                None,
+            ))
+            .await
+            .expect_err("different Task work units must not share a child");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("reviewer_not_independent")
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_task_reviewer_requires_completed_producer_artifact_digest() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        publish_approved(&db, &emitter, parent, "tok-task5-producer-digest").await;
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Grok).await,
+                "50000000-0000-4000-8000-000000000025",
+                "grok",
+                Some(&implementer_key),
+                None,
+            ))
+            .await
+            .expect("producer reserves");
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Codex).await,
+                "50000000-0000-4000-8000-000000000026",
+                "codex",
+                Some(&reviewer_key),
+                None,
+            ))
+            .await
+            .expect_err("reviewer must not admit before producer artifact exists");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("producer_artifact_missing")
+        );
     }
 
     #[tokio::test]
@@ -1745,6 +3289,154 @@ mod tests {
         );
     }
 
+    async fn replace_with_active_final_binding(
+        db: &AppDatabase,
+        workflow_id: &str,
+        retired_node_id: &str,
+        replacement_node_id: &str,
+        role: &str,
+        agent: &str,
+    ) {
+        let now = Utc::now();
+        let binding = delegation_workflow_node_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            retired_node_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("published Final binding");
+        let mut retired: delegation_workflow_node_binding::ActiveModel = binding.into();
+        retired.retired_revision = Set(Some(2));
+        retired.retained_observed = Set(true);
+        retired.updated_at = Set(now);
+        retired
+            .update(&db.conn)
+            .await
+            .expect("retire Final binding");
+
+        delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set(workflow_id.to_string()),
+            node_id: Set(replacement_node_id.to_string()),
+            work_unit_key: Set(format!("replacement-final|{role}|{replacement_node_id}")),
+            role: Set(role.to_string()),
+            agent_type: Set(agent.to_string()),
+            profile_id: Set(None),
+            phase_id: Set(PHASE_FINAL.to_string()),
+            task_index: Set(None),
+            introduced_revision: Set(2),
+            retired_revision: Set(None),
+            is_observed: Set(false),
+            retained_observed: Set(false),
+            cohort_frozen: Set(false),
+            node_outcome: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert replacement Final binding");
+    }
+
+    async fn workflow_header(db: &AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
+        delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("workflow header")
+    }
+
+    #[tokio::test]
+    async fn task6_active_final_evidence_ignores_retired_reviewer_binding() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "task6-active-final-reviewer").await;
+        replace_with_active_final_binding(
+            &db,
+            &workflow_id,
+            "final-reviewer",
+            "final-reviewer-replacement",
+            "reviewer",
+            "codex",
+        )
+        .await;
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00b1",
+            &workflow_id,
+            "final-reviewer-replacement",
+            &reviewer_key,
+            "codex",
+            r#"{"kind":"review","verdict":"request_changes","critical":1,"important":0,"minor":0,"summary":"fix"}"#,
+            true,
+        )
+        .await;
+
+        let evidence = load_latest_final_reviewer_evidence(
+            &db.conn,
+            &workflow_header(&db, &workflow_id).await,
+        )
+        .await
+        .unwrap()
+        .expect("authoritative active Final reviewer evidence");
+
+        assert_eq!(evidence.task_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00b1");
+        assert!(reviewer_is_request_changes_or_block(&evidence));
+    }
+
+    #[tokio::test]
+    async fn task6_active_final_evidence_ignores_retired_fixer_binding() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "task6-active-final-fixer").await;
+        replace_with_active_final_binding(
+            &db,
+            &workflow_id,
+            "final-fixer",
+            "final-fixer-replacement",
+            "fixer",
+            "grok",
+        )
+        .await;
+        let fixer_key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00c2",
+            &workflow_id,
+            "final-fixer-replacement",
+            &fixer_key,
+            "grok",
+            r#"{"kind":"implementation","phase":"fix","status":"done","summary":"fixed"}"#,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            evaluate_final_fixer_terminal_pass(
+                &db.conn,
+                &workflow_header(&db, &workflow_id).await,
+            )
+            .await
+            .unwrap(),
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn task_first_dispatch_blocked_when_plan_not_approved() {
         let (db, parent) = seed_parent().await;
@@ -1792,7 +3484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b14_pair_freeze_and_unstarted_reviewer_admittable() {
+    async fn routed_cohort_freezes_before_reviewer_producer_readiness() {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
         // Drain publish events.
@@ -1825,16 +3517,16 @@ mod tests {
         let evt = rx.try_recv().expect("graph changed on admit");
         assert_eq!(evt.channel, WORKFLOW_GRAPH_CHANGED_EVENT);
 
-        // Both pair nodes frozen.
+        // The complete normal-risk route freezes on first admission.
         let nodes = delegation_workflow_node_binding::Entity::find()
             .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1_i64))
             .all(&db.conn)
             .await
             .unwrap();
         assert_eq!(nodes.len(), 2);
-        assert!(nodes.iter().all(|n| n.pair_frozen));
+        assert!(nodes.iter().all(|n| n.cohort_frozen));
 
-        // Unstarted reviewer still admit-able (B14 / B10).
+        // Freeze does not make an unready reviewer admissible.
         let child2 = child_for(&db, AgentType::Codex).await;
         let rev_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
             task_index: 1,
@@ -1842,6 +3534,46 @@ mod tests {
             profile_id: None,
         })
         .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child2,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0011",
+                "codex",
+                Some(&rev_key),
+                None,
+            ))
+            .await
+            .expect_err("reviewer waits for completed producer artifact");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("producer_artifact_missing")
+        );
+
+        let run = delegation_task_run::Entity::find_by_id(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0010".to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut run_am: delegation_task_run::ActiveModel = run.into();
+        run_am.status = Set(DelegationRunStatus::Completed);
+        run_am.reached_running_at = Set(Some(Utc::now()));
+        run_am.finished_at = Set(Some(Utc::now()));
+        run_am.card_summary_json = Set(Some(implementation_summary().into()));
+        run_am.update(&db.conn).await.unwrap();
+        let rb = delegation_workflow_run_binding::Entity::find_by_id(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0010".to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut rb_am: delegation_workflow_run_binding::ActiveModel = rb.into();
+        rb_am.summary_validated = Set(true);
+        rb_am.artifact_digest = Set(Some("producer-ready".into()));
+        rb_am.update(&db.conn).await.unwrap();
         store
             .admit_gen1_reserving(gen1_insert(
                 parent,
@@ -1852,7 +3584,7 @@ mod tests {
                 None,
             ))
             .await
-            .expect("reviewer admit after impl freeze");
+            .expect("independent reviewer admits after producer completion");
     }
 
     #[tokio::test]
@@ -2137,7 +3869,7 @@ mod tests {
         let mut nam: delegation_workflow_node_binding::ActiveModel = node.into();
         nam.retired_revision = Set(Some(2));
         nam.retained_observed = Set(true);
-        nam.pair_frozen = Set(true);
+        nam.cohort_frozen = Set(true);
         nam.updated_at = Set(Utc::now());
         nam.update(&db.conn).await.unwrap();
 
@@ -2178,7 +3910,7 @@ mod tests {
         // Continue/replacement admission against retained_observed must succeed (B2).
         // Exercise the workflow txn helper directly (continue eligibility is separate).
         let cont_task = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0022";
-        let cont_child = child_for(&db, AgentType::Grok).await;
+        let cont_child = child;
         // Insert a reserving run row then admit workflow as ContinueOrReplacement.
         let insert = gen1_insert(parent, cont_child, cont_task, "grok", Some(&impl_key), None);
         db.conn
@@ -2235,6 +3967,7 @@ mod tests {
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: parent,
+                            child_conversation_id: cont_child,
                             task_id: cont_task,
                             work_unit_key: Some(&impl_key),
                             agent_type: "grok",
@@ -2352,6 +4085,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task5_route_requires_exact_profile_identity() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut doc = sample_doc("tok-task5-profile-route", ManifestWorkflowState::Estimated);
+        let implementer = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "task-1-impl")
+            .unwrap();
+        implementer.profile_id = Some("grok-profile".into());
+        implementer.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 1,
+                agent_type: "grok",
+                profile_id: Some("grok-profile"),
+            })
+            .unwrap(),
+        );
+        publish_document_approved(&db, &emitter, parent, doc).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: Some("grok-profile"),
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Grok).await,
+                "50000000-0000-4000-8000-000000000029",
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect_err("omitted profile must not match routed profile");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("workflow_profile_mismatch")
+        );
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Grok).await,
+                "50000000-0000-4000-8000-000000000030",
+                "grok",
+                Some(&key),
+                Some("grok-profile"),
+            ))
+            .await
+            .expect("exact routed profile admits");
+    }
+
+    #[tokio::test]
+    async fn task5_empty_profile_does_not_match_unprofiled_route() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        publish_approved(&db, &emitter, parent, "tok-task5-empty-profile").await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Grok).await,
+                "50000000-0000-4000-8000-000000000033",
+                "grok",
+                Some(&key),
+                Some(""),
+            ))
+            .await
+            .expect_err("empty profile must not match a route with no profile");
+        assert_eq!(
+            err.workflow_admission_code(),
+            Some("workflow_profile_mismatch")
+        );
+    }
+
+    #[tokio::test]
     async fn re_review_before_fixer_pass_reject() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
@@ -2423,6 +4246,7 @@ mod tests {
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: parent,
+                            child_conversation_id: cont_child,
                             task_id: cont_task,
                             work_unit_key: Some(&final_key),
                             agent_type: "codex",
@@ -2524,6 +4348,7 @@ mod tests {
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: parent,
+                            child_conversation_id: cont_child,
                             task_id: cont_task,
                             work_unit_key: Some(&final_key),
                             agent_type: "codex",
@@ -2622,6 +4447,7 @@ mod tests {
                         txn,
                         &WorkflowAdmitInput {
                             parent_conversation_id: parent,
+                            child_conversation_id: cont_child,
                             task_id: cont_task,
                             work_unit_key: Some(&final_key),
                             agent_type: "codex",

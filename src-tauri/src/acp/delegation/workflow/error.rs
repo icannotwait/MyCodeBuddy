@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use super::plan_review::PlanReviewError;
 pub use super::types::WorkflowError;
 
 /// Errors from publish / settle / get_workflow_state core paths.
@@ -9,6 +10,9 @@ pub use super::types::WorkflowError;
 pub enum WorkflowStoreError {
     #[error(transparent)]
     Validation(#[from] WorkflowError),
+
+    #[error(transparent)]
+    PlanReview(#[from] PlanReviewError),
 
     #[error("workflow not found: {0}")]
     NotFound(String),
@@ -38,8 +42,14 @@ pub enum WorkflowStoreError {
     #[error("admitted-node identity mutation rejected for node {node_id}")]
     AdmittedNodeIdentityMutation { node_id: String },
 
-    #[error("cannot drop frozen/unobserved Task partner node {node_id} (pair_frozen)")]
-    FrozenPartnerDrop { node_id: String },
+    #[error("admitted workflow binding or Task cohort policy/complete route is immutable at {node_id} (cohort_frozen)")]
+    CohortFrozen { node_id: String },
+
+    #[error("gate not ready: reviewed_task_stale: {0}")]
+    ReviewedTaskStale(String),
+
+    #[error("gate not ready: artifact_digest_mismatch: {0}")]
+    ArtifactDigestMismatch(String),
 
     #[error("gate not ready: {0}")]
     GateNotReady(String),

@@ -25,7 +25,10 @@ pub const MAX_MANIFEST_JSON_BYTES: usize = 512 * 1024;
 pub const WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY: &str = "brainstorm_to_delivery";
 
 /// Supported schema version for `ManifestDocument`.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+
+/// Exact Task risk policy accepted by manifest schema v2.
+pub const TASK_RISK_POLICY_VERSION: &str = "b2d_task_risk_v1";
 
 /// Typed errors for key derivation and manifest validation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -64,6 +67,10 @@ pub enum WorkflowError {
     InvalidAgentType(String),
     #[error("invalid task index: {0}")]
     InvalidTaskIndex(String),
+    #[error(transparent)]
+    RiskAssessmentInvalid(Box<WorkflowError>),
+    #[error(transparent)]
+    TaskRouteMismatch(Box<WorkflowError>),
 }
 
 /// Materials used to build a canonical A1 `work_unit_key`.
@@ -74,7 +81,12 @@ pub enum WorkUnitKeyParts<'a> {
         agent_type: &'a str,
         profile_id: Option<&'a str>,
     },
-    Plan {
+    PlanAuthor {
+        rel_plan_path: &'a str,
+        agent_type: &'a str,
+        profile_id: Option<&'a str>,
+    },
+    PlanReviewer {
         rel_plan_path: &'a str,
         agent_type: &'a str,
         profile_id: Option<&'a str>,
@@ -107,7 +119,12 @@ pub enum ParsedWorkUnitKey {
         agent_type: String,
         profile_id: Option<String>,
     },
-    Plan {
+    PlanAuthor {
+        rel_plan_path: String,
+        agent_type: String,
+        profile_id: Option<String>,
+    },
+    PlanReviewer {
         rel_plan_path: String,
         agent_type: String,
         profile_id: Option<String>,
@@ -156,9 +173,77 @@ pub enum ManifestNodeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestNodeRole {
+    Author,
     Reviewer,
     Implementer,
     Fixer,
+}
+
+/// Derived risk level for one planned Task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRiskLevel {
+    Normal,
+    High,
+}
+
+/// Any active hard trigger forces a high-risk Task route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskHardTriggerKind {
+    ConcurrencyLifecycle,
+    SecurityTrustBoundary,
+    MigrationDestructivePersistence,
+    PublicCompatibility,
+    UnsafeFfi,
+    UpdateRollback,
+}
+
+/// Weighted soft signals used when no hard trigger is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSoftSignalKind {
+    CrossRuntimeOrProcess,
+    BroadProductionSurface,
+    MultipleOwnershipModules,
+    SharedInterface,
+    DependencyOrBuild,
+    MultiLayerWithoutTestSeam,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestTaskHardTrigger {
+    pub kind: TaskHardTriggerKind,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestTaskSoftSignal {
+    pub kind: TaskSoftSignalKind,
+    pub score: u32,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestTaskRisk {
+    pub level: TaskRiskLevel,
+    pub hard_triggers: Vec<ManifestTaskHardTrigger>,
+    pub soft_signals: Vec<ManifestTaskSoftSignal>,
+    pub score: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestTaskRoute {
+    pub implementer_node_id: String,
+    pub reviewer_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestTaskPolicy {
+    pub task_index: u32,
+    pub risk: ManifestTaskRisk,
+    pub route: ManifestTaskRoute,
 }
 
 /// Optional durable node outcome (B14.3 cancel).
@@ -262,6 +347,8 @@ pub struct ManifestEdge {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestGate {
     pub id: String,
+    /// Complete configured reviewer group for this document gate.
+    pub reviewer_cohort_node_ids: Vec<String>,
     /// Required on the wire (no serde default). Empty only for Design self_review.
     pub required_reviewer_node_ids: Vec<String>,
     pub resolution_mode: ResolutionMode,
@@ -275,6 +362,8 @@ pub struct ManifestGate {
 pub struct ManifestDocument {
     pub schema_version: u32,
     pub workflow_kind: String,
+    pub plan_target_rel_path: String,
+    pub risk_policy_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +382,8 @@ pub struct ManifestDocument {
     pub edges: Vec<ManifestEdge>,
     /// Required on the wire (no serde default).
     pub gates: Vec<ManifestGate>,
+    /// Required on the wire (no serde default).
+    pub task_policies: Vec<ManifestTaskPolicy>,
 }
 
 /// Normalized, validated work-unit node.
@@ -316,6 +407,7 @@ pub struct NormalizedNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedGate {
     pub id: String,
+    pub reviewer_cohort_node_ids: Vec<String>,
     pub required_reviewer_node_ids: Vec<String>,
     pub resolution_mode: ResolutionMode,
     pub gate_kind: DocumentGateKind,
@@ -326,6 +418,8 @@ pub struct NormalizedGate {
 pub struct NormalizedManifest {
     pub schema_version: u32,
     pub workflow_kind: String,
+    pub plan_target_rel_path: String,
+    pub risk_policy_version: String,
     pub workflow_id: Option<String>,
     pub expected_manifest_revision: Option<u64>,
     pub publication_token: String,
@@ -336,6 +430,7 @@ pub struct NormalizedManifest {
     pub nodes: Vec<NormalizedNode>,
     pub edges: Vec<ManifestEdge>,
     pub gates: Vec<NormalizedGate>,
+    pub task_policies: Vec<ManifestTaskPolicy>,
     /// Distinct Task indices present on work units (1-based).
     pub task_count: usize,
 }

@@ -6,7 +6,7 @@
 //! `ask_user_question` (block on a multiple-choice card), and
 //! `get_session_info` (resolve a referenced session by id), gated by the
 //! `--features` groups (`delegation` / `coordination_v1` / `feedback` /
-//! `ask` / `sessions` / `workflow_v1`) and `--role` (`root` | `delegation_child`).
+//! `ask` / `sessions` / `workflow_v2`) and `--role` (`root` | `delegation_child`).
 //!
 //! The agent's MCP config (injected by codeg via `load_mcp_servers_for_agent`)
 //! spawns this binary with three required flags:
@@ -53,7 +53,7 @@ struct Args {
     /// from. Omitted by older parents — backward compatible.
     parent_pid: Option<u32>,
     /// Comma-joined tool groups to expose (e.g.
-    /// `delegation,coordination_v1,feedback,ask,sessions,workflow_v1`).
+    /// `delegation,coordination_v1,feedback,ask,sessions,workflow_v2`).
     /// Omitted by parents that predate feature gating; see
     /// `CompanionFeatures::parse` (defaults to delegation-only without Join).
     features: Option<String>,
@@ -123,7 +123,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v1] [--role root|delegation_child]"
+                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child]"
                 );
                 std::process::exit(0);
             }

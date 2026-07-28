@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod gates;
 pub mod key;
+pub mod plan_review;
 pub mod project;
 pub mod state_dto;
 pub mod store;
@@ -30,9 +31,14 @@ pub use events::{
 };
 pub use gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
-    ExecutionGateReason, ExecutionGateRunEvidence, TerminalRunStatus,
+    ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
+pub use plan_review::{
+    derive_plan_review_round, FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewError,
+    PlanReviewNextAction, PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope,
+    PlanRevisionKind,
+};
 pub use project::{
     evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,
     soft_attach_workflow_graph,
@@ -40,7 +46,7 @@ pub use project::{
 pub use state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
 pub use store::{
     get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    PublishResult, PublishWorkflowRequest, SettleResult, SettleWorkflowRequest,
+    PublishResult, PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
     WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;

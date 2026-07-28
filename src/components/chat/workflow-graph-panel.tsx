@@ -13,6 +13,7 @@ import { WorkflowNodeDetail } from "@/components/chat/workflow-node-detail"
 import { Badge } from "@/components/ui/badge"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import {
+  buildPhaseRail,
   canOpenWorkflowNode,
   isEstimatedNode,
   type PhaseRailKind,
@@ -49,29 +50,10 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   )
 
   const lanes = useMemo(() => {
-    return PHASE_ORDER.map((kind) => {
-      const phaseMeta =
-        snapshot.phases.find((p) => p.kind === kind || p.id === kind) ?? null
-      const nodes = snapshot.nodes.filter((n) => {
-        const pid = n.phase_id
-        if (!pid) return false
-        if (pid === kind) return true
-        if (phaseMeta && pid === phaseMeta.id) return true
-        const meta = snapshot.phases.find((p) => p.id === pid)
-        return meta?.kind === kind
-      })
-      // Stable: task_index then role then node_id
-      nodes.sort((a, b) => {
-        const ta = a.task_index ?? 9999
-        const tb = b.task_index ?? 9999
-        if (ta !== tb) return ta - tb
-        const ra = a.role ?? ""
-        const rb = b.role ?? ""
-        if (ra !== rb) return ra.localeCompare(rb)
-        return a.node_id.localeCompare(b.node_id)
-      })
-      return { kind, title: phaseMeta?.title ?? null, nodes }
-    })
+    const byKind = new Map(
+      buildPhaseRail(snapshot).map((lane) => [lane.kind, lane])
+    )
+    return PHASE_ORDER.map((kind) => byKind.get(kind)!)
   }, [snapshot])
 
   const onOpenSession = useCallback(async (node: WorkflowNodeSnapshot) => {
@@ -92,6 +74,82 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
     },
     [onOpenSession]
   )
+
+  const renderNodeButton = (
+    node: WorkflowNodeSnapshot,
+    laneKind: PhaseRailKind
+  ) => {
+    const estimated = isEstimatedNode(node)
+    const openable = canOpenWorkflowNode(node)
+    const selectedNode = node.node_id === selectedId
+    const accessibleName = [
+      t(`phase.${laneKind}`),
+      node.task_index != null
+        ? t("taskIndex", { index: node.task_index })
+        : null,
+      node.role,
+      node.agent_type,
+      t(`nodeStatus.${node.status}`),
+      node.title,
+    ]
+      .filter(Boolean)
+      .join(", ")
+
+    return (
+      <button
+        type="button"
+        data-testid={`workflow-graph-node-${node.node_id}`}
+        data-status={node.status}
+        data-estimated={estimated ? "true" : "false"}
+        data-openable={openable ? "true" : "false"}
+        aria-label={accessibleName}
+        aria-current={selectedNode ? "true" : undefined}
+        disabled={estimated && !openable}
+        title={
+          estimated
+            ? t("estimatedNonActionable")
+            : openable
+              ? t("openSession")
+              : undefined
+        }
+        onClick={() => onActivateNode(node)}
+        className={cn(
+          "flex h-12 w-full min-w-0 flex-col justify-center gap-0.5 overflow-hidden rounded border px-1.5 py-1 text-left text-[11px] transition-colors",
+          selectedNode
+            ? "border-primary bg-primary/10"
+            : "border-border/70 bg-background/60 hover:bg-muted/50",
+          estimated && "border-dashed text-muted-foreground opacity-80",
+          !openable && estimated && "cursor-default"
+        )}
+      >
+        <span className="w-full truncate font-medium">
+          {node.title?.trim() || node.node_id}
+        </span>
+        <span className="flex w-full min-w-0 items-center gap-1 overflow-hidden">
+          <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9px]">
+            {t(`nodeStatus.${node.status}`)}
+          </Badge>
+          {node.run_count > 0 && (
+            <span className="truncate tabular-nums text-muted-foreground">
+              {t("runCount", { count: node.run_count })}
+            </span>
+          )}
+          {node.replacement_count > 0 && (
+            <span className="truncate tabular-nums text-muted-foreground">
+              {t("replacementCount", {
+                count: node.replacement_count,
+              })}
+            </span>
+          )}
+          {!node.required && (
+            <span className="truncate text-muted-foreground">
+              {t("optionalReviewer")}
+            </span>
+          )}
+        </span>
+      </button>
+    )
+  }
 
   return (
     <div
@@ -116,87 +174,85 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
             <header className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
               {t(`phase.${lane.kind}`)}
             </header>
-            {lane.nodes.length === 0 ? (
+            {lane.nodeRows.length === 0 ? (
               <p className="px-1 text-[10px] text-muted-foreground">
                 {t("emptyLane")}
               </p>
             ) : (
               <ul className="space-y-1">
-                {lane.nodes.map((node) => {
-                  const estimated = isEstimatedNode(node)
-                  const openable = canOpenWorkflowNode(node)
-                  const selectedNode = node.node_id === selectedId
-                  const accessibleName = [
-                    t(`phase.${lane.kind}`),
-                    node.task_index != null
-                      ? t("taskIndex", { index: node.task_index })
-                      : null,
-                    node.role,
-                    node.agent_type,
-                    t(`nodeStatus.${node.status}`),
-                    node.title,
-                  ]
-                    .filter(Boolean)
-                    .join(", ")
+                {lane.nodeRows.map((row) => {
+                  const primary = row.nodes.filter(
+                    (node) => node.role !== "reviewer"
+                  )
+                  const reviewers = row.nodes.filter(
+                    (node) => node.role === "reviewer"
+                  )
+                  const taskRow = lane.kind === "tasks" && row.taskIndex != null
+                  const rowTestId = taskRow
+                    ? `workflow-graph-row-tasks-${row.taskIndex}`
+                    : lane.kind === "plan" && row.id === "plan"
+                      ? "workflow-graph-row-plan"
+                      : undefined
 
                   return (
-                    <li key={node.node_id}>
-                      <button
-                        type="button"
-                        data-testid={`workflow-graph-node-${node.node_id}`}
-                        data-status={node.status}
-                        data-estimated={estimated ? "true" : "false"}
-                        data-openable={openable ? "true" : "false"}
-                        aria-label={accessibleName}
-                        aria-current={selectedNode ? "true" : undefined}
-                        disabled={estimated && !openable}
-                        title={
-                          estimated
-                            ? t("estimatedNonActionable")
-                            : openable
-                              ? t("openSession")
-                              : undefined
-                        }
-                        onClick={() => onActivateNode(node)}
-                        className={cn(
-                          "flex w-full min-w-0 flex-col gap-0.5 rounded border px-1.5 py-1 text-left text-[11px] transition-colors",
-                          selectedNode
-                            ? "border-primary bg-primary/10"
-                            : "border-border/70 bg-background/60 hover:bg-muted/50",
-                          estimated &&
-                            "border-dashed text-muted-foreground opacity-80",
-                          !openable && estimated && "cursor-default"
-                        )}
-                      >
-                        <span className="truncate font-medium">
-                          {node.title?.trim() || node.node_id}
-                        </span>
-                        <span className="flex flex-wrap items-center gap-1">
-                          <Badge
-                            variant="secondary"
-                            className="h-4 px-1 text-[9px]"
+                    <li
+                      key={row.id}
+                      className="min-w-0 overflow-hidden"
+                      data-testid={rowTestId}
+                      data-reviewer-count={reviewers.length}
+                    >
+                      <div className="flex h-12 min-w-0 items-stretch gap-1">
+                        {primary.length > 0 && (
+                          <div
+                            className="grid h-12 min-w-0 flex-1 gap-1"
+                            style={{
+                              gridTemplateColumns: `repeat(${primary.length}, minmax(0, 1fr))`,
+                            }}
                           >
-                            {t(`nodeStatus.${node.status}`)}
-                          </Badge>
-                          {node.run_count > 0 && (
-                            <span className="tabular-nums text-muted-foreground">
-                              {t("runCount", { count: node.run_count })}
-                            </span>
-                          )}
-                          {node.replacement_count > 0 && (
-                            <span className="tabular-nums text-muted-foreground">
-                              {t("replacementCount", {
-                                count: node.replacement_count,
-                              })}
-                            </span>
-                          )}
-                          {!node.required && (
-                            <span className="text-muted-foreground">
-                              {t("optionalReviewer")}
-                            </span>
-                          )}
-                        </span>
-                      </button>
+                            {primary.map((node) => (
+                              <div key={node.node_id} className="min-w-0">
+                                {renderNodeButton(node, lane.kind)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {reviewers.length > 0 && (
+                          <div
+                            className="grid h-12 min-w-0 flex-1 gap-1 border-l border-border/60 pl-1"
+                            style={{
+                              gridTemplateColumns: `repeat(${reviewers.length}, minmax(0, 1fr))`,
+                            }}
+                            data-testid={
+                              taskRow
+                                ? `workflow-task-reviewers-${row.taskIndex}`
+                                : undefined
+                            }
+                            aria-label={t("reviewerCohort")}
+                          >
+                            {reviewers.map((node) => (
+                              <div
+                                key={node.node_id}
+                                className="min-w-0"
+                                data-testid={
+                                  taskRow
+                                    ? `workflow-task-reviewer-node-${node.node_id}`
+                                    : undefined
+                                }
+                              >
+                                {renderNodeButton(node, lane.kind)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {taskRow && row.reviewerProgress && (
+                          <span
+                            className="flex h-12 w-10 shrink-0 items-center justify-center rounded border border-border/70 bg-muted/30 text-[10px] tabular-nums text-muted-foreground"
+                            data-testid={`workflow-task-reviewer-count-${row.taskIndex}`}
+                          >
+                            {t("gateProgress", row.reviewerProgress)}
+                          </span>
+                        )}
+                      </div>
                     </li>
                   )
                 })}

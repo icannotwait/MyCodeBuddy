@@ -10,6 +10,7 @@ vi.mock("@/lib/api", () => ({
 
 import {
   DelegationRunSnapshotCache,
+  normalizeCardSummary,
   normalizeDelegationRunSnapshot,
 } from "@/lib/delegation-run-snapshot"
 import { getActiveBackendCacheKey } from "@/lib/transport"
@@ -103,6 +104,99 @@ describe("delegation run snapshots", () => {
 
     expect(normalized.card_summary).toBeNull()
   })
+
+  it("preserves valid Author and Review role evidence", () => {
+    expect(
+      normalizeCardSummary({
+        kind: "author",
+        status: "done",
+        summary: "Plan is ready.",
+        plan_digest: "sha256:plan-v2",
+        report_file: "docs/superpowers/plans/adaptive-routing.md",
+      })
+    ).toEqual({
+      kind: "author",
+      status: "done",
+      summary: "Plan is ready.",
+      plan_digest: "sha256:plan-v2",
+      report_file: "docs/superpowers/plans/adaptive-routing.md",
+    })
+
+    expect(
+      normalizeCardSummary({
+        kind: "review",
+        verdict: "approve",
+        critical: 0,
+        important: 0,
+        minor: 0,
+        summary: "Plan approved.",
+        report_file: ".superpowers/sdd/plan-review.md",
+      })
+    ).toEqual({
+      kind: "review",
+      verdict: "approve",
+      critical: 0,
+      important: 0,
+      minor: 0,
+      summary: "Plan approved.",
+      report_file: ".superpowers/sdd/plan-review.md",
+    })
+  })
+
+  it("rejects Author summaries without a non-empty digest", () => {
+    const validBase = {
+      kind: "author",
+      status: "done",
+      summary: "Plan is ready.",
+      report_file: "docs/superpowers/plans/adaptive-routing.md",
+    }
+    expect(normalizeCardSummary(validBase)).toBeNull()
+    expect(normalizeCardSummary({ ...validBase, plan_digest: "" })).toBeNull()
+  })
+
+  it("enforces the Author digest bound in Unicode scalar values", () => {
+    const validBase = {
+      kind: "author",
+      status: "done",
+      summary: "Plan is ready.",
+      report_file: "docs/superpowers/plans/adaptive-routing.md",
+    }
+    const atLimit = "\u{1f9ed}".repeat(128)
+    const overLimit = "\u{1f9ed}".repeat(129)
+
+    expect(
+      normalizeCardSummary({ ...validBase, plan_digest: atLimit })
+    ).toMatchObject({ plan_digest: atLimit })
+    expect(
+      normalizeCardSummary({ ...validBase, plan_digest: overLimit })
+    ).toBeNull()
+  })
+
+  it.each(["C:/repo/report.md", "/repo/report.md", "../report.md"])(
+    "rejects unsafe role-specific report path %s",
+    (report_file) => {
+      expect(
+        normalizeCardSummary({
+          kind: "author",
+          status: "done",
+          summary: "Plan is ready.",
+          plan_digest: "sha256:plan-v2",
+          report_file,
+        })
+      ).toBeNull()
+      expect(
+        normalizeCardSummary({
+          kind: "review",
+          verdict: "approve",
+          critical: 0,
+          important: 0,
+          minor: 0,
+          summary: "Plan approved.",
+          report_file,
+        })
+      ).toBeNull()
+    }
+  )
 
   it("does not overwrite a terminal card when a later fetch shares its key", () => {
     const cache = new DelegationRunSnapshotCache()

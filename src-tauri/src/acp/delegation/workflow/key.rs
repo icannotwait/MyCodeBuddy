@@ -94,7 +94,22 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             let profile = profile_token(profile_id)?;
             format!("design|{path}|reviewer|{agent}|{profile}")
         }
-        WorkUnitKeyParts::Plan {
+        WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path,
+            agent_type,
+            profile_id,
+        } => {
+            let path = normalize_rel_path(rel_plan_path)?;
+            let agent = validate_agent_type(agent_type)?;
+            if agent != "codex" {
+                return Err(WorkflowError::RoleMismatch(
+                    "Plan Author agent_type must be codex".into(),
+                ));
+            }
+            let profile = profile_token(profile_id)?;
+            format!("plan|{path}|author|codex|{profile}")
+        }
+        WorkUnitKeyParts::PlanReviewer {
             rel_plan_path,
             agent_type,
             profile_id,
@@ -175,6 +190,18 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
                 profile_id,
             })
         }
+        ["plan", path, "author", "codex", profile] => {
+            let rel = normalize_rel_path(path).ok()?;
+            if rel != *path {
+                return None;
+            }
+            let profile_id = parse_profile(profile)?;
+            Some(ParsedWorkUnitKey::PlanAuthor {
+                rel_plan_path: rel,
+                agent_type: "codex".to_string(),
+                profile_id,
+            })
+        }
         ["plan", path, "reviewer", agent, profile] => {
             let rel = normalize_rel_path(path).ok()?;
             if rel != *path {
@@ -182,7 +209,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
             }
             let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
-            Some(ParsedWorkUnitKey::Plan {
+            Some(ParsedWorkUnitKey::PlanReviewer {
                 rel_plan_path: rel,
                 agent_type,
                 profile_id,
@@ -357,7 +384,7 @@ mod tests {
 
     #[test]
     fn plan_key_and_task_keys_match_a1_table() {
-        let plan = build_work_unit_key(&WorkUnitKeyParts::Plan {
+        let plan = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
             profile_id: None,
@@ -419,6 +446,47 @@ mod tests {
         assert!(parse_recognized_work_unit_key("unit-preboot").is_none());
         assert!(parse_recognized_work_unit_key("task|02|implementer|grok|none").is_none());
         assert!(parse_recognized_work_unit_key("task|0|implementer|grok|none").is_none());
+    }
+
+    #[test]
+    fn plan_author_key_round_trips() {
+        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .expect("Plan Author key builds");
+        assert_eq!(
+            author_key,
+            "plan|docs/superpowers/plans/p.md|author|codex|none"
+        );
+        assert_eq!(
+            parse_recognized_work_unit_key(&author_key),
+            Some(ParsedWorkUnitKey::PlanAuthor {
+                rel_plan_path: "docs/superpowers/plans/p.md".into(),
+                agent_type: "codex".into(),
+                profile_id: None,
+            })
+        );
+
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "grok",
+            profile_id: Some("profile-1"),
+        })
+        .expect("Plan reviewer key builds");
+        assert_eq!(
+            parse_recognized_work_unit_key(&reviewer_key),
+            Some(ParsedWorkUnitKey::PlanReviewer {
+                rel_plan_path: "docs/superpowers/plans/p.md".into(),
+                agent_type: "grok".into(),
+                profile_id: Some("profile-1".into()),
+            })
+        );
+
+        assert!(
+            parse_recognized_work_unit_key("plan|docs/superpowers/plans/p.md|codex|none").is_none()
+        );
     }
 
     #[test]

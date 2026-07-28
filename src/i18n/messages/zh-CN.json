@@ -2589,6 +2589,25 @@
         "openSession": "打开会话",
         "estimatedNonActionable": "预估节点 — 尚无会话",
         "optionalReviewer": "可选",
+        "reviewerCohort": "审查者组",
+        "riskLevel": {
+          "normal": "普通风险",
+          "high": "高风险"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "并发或生命周期",
+          "security_trust_boundary": "安全或信任边界",
+          "migration_destructive_persistence": "迁移或破坏性持久化",
+          "public_compatibility": "公共兼容性",
+          "unsafe_ffi": "不安全的 FFI",
+          "update_rollback": "更新或回滚",
+          "cross_runtime_or_process": "跨运行时或进程",
+          "broad_production_surface": "广泛的生产影响面",
+          "multiple_ownership_modules": "多个归属模块",
+          "shared_interface": "共享接口",
+          "dependency_or_build": "依赖或构建",
+          "multi_layer_without_test_seam": "缺少测试接缝的多层变更"
+        },
         "roleLabel": "角色：{role}",
         "agentLabel": "智能体：{agent}",
         "currentWork": "当前：{title}",
@@ -2806,6 +2825,7 @@
         "replacement": "替代会话",
         "summary": {
           "review": "审查：{verdict}",
+          "author": "计划：{status}",
           "implementation": "交付：{status}",
           "critical": "严重：{count}",
           "important": "重要：{count}",
