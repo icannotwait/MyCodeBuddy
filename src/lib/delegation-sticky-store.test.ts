@@ -58,6 +58,39 @@ describe("sticky store", () => {
     unsub()
   })
 
+  it("isolates the same input work-unit key across replacement children", () => {
+    const first = observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      workUnitKey: "task|1|implementer|grok|none",
+      type: "running",
+      taskId: "t1",
+      startedAt: "2026-07-27T00:00:00.000Z",
+      toolCallCount: 5,
+      nowMs: 0,
+      recovery: recoveryOn,
+    })!
+    const replacement = observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 3,
+      workUnitKey: "task|1|implementer|grok|none",
+      type: "running",
+      taskId: "t2",
+      startedAt: "2026-07-27T00:01:00.000Z",
+      toolCallCount: 2,
+      nowMs: 60_000,
+      recovery: recoveryOn,
+    })!
+
+    expect(replacement.identityKey).not.toBe(first.identityKey)
+    expect(getStickySnapshot(first.identityKey)?.lastDisplayToolCount).toBe(5)
+    expect(
+      getStickySnapshot(replacement.identityKey)?.lastDisplayToolCount
+    ).toBe(2)
+  })
+
   it("resetStickyBackend clears only that backend", () => {
     const a = observeSticky({
       backendCacheKey: "backend-a",

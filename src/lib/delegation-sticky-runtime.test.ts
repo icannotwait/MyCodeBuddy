@@ -30,7 +30,6 @@ describe("identity", () => {
       backendCacheKey: "local",
       parentConversationId: 10,
       workUnitKey: "task|1|implementer|grok|none",
-      childConversationId: 20,
       taskId: "t1",
     })
     expect(id).toMatchObject({
@@ -71,6 +70,22 @@ describe("identity", () => {
       })!
     )
     expect(a).not.toEqual(b)
+  })
+
+  it("prefers a known child over the lowest-trust input work-unit key", () => {
+    const id = resolveStickyIdentity({
+      backendCacheKey: "local",
+      parentConversationId: 10,
+      childConversationId: 20,
+      workUnitKey: "task|1|implementer|grok|none",
+      taskId: "t1",
+    })
+
+    expect(id).toMatchObject({
+      backendCacheKey: "local",
+      parentConversationId: 10,
+      unit: { kind: "parent_child", childConversationId: 20 },
+    })
   })
 })
 

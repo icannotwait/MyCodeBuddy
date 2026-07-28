@@ -155,8 +155,8 @@ function isAdmitted(bucket: StickyBucket, taskId: string): boolean {
 
 /**
  * Resolution priority (when parent id known):
- * 1. trustworthy workUnitKey + parent + backend → work_unit
- * 2. childConversationId → parent_child
+ * 1. childConversationId → parent_child
+ * 2. trustworthy workUnitKey + parent + backend → work_unit
  * 3. taskId only → task (with parent) or task_only (without parent)
  *
  * Never key by bare workUnitKey without parent+backend.
@@ -175,19 +175,6 @@ export function resolveStickyIdentity(input: {
   const hasParent =
     parentConversationId != null && Number.isFinite(parentConversationId)
 
-  const workUnitKey =
-    typeof input.workUnitKey === "string" && input.workUnitKey.length > 0
-      ? input.workUnitKey
-      : null
-
-  if (hasParent && workUnitKey) {
-    return {
-      backendCacheKey,
-      parentConversationId: parentConversationId as number,
-      unit: { kind: "work_unit", workUnitKey },
-    }
-  }
-
   const childConversationId = input.childConversationId
   if (
     hasParent &&
@@ -198,6 +185,19 @@ export function resolveStickyIdentity(input: {
       backendCacheKey,
       parentConversationId: parentConversationId as number,
       unit: { kind: "parent_child", childConversationId },
+    }
+  }
+
+  const workUnitKey =
+    typeof input.workUnitKey === "string" && input.workUnitKey.length > 0
+      ? input.workUnitKey
+      : null
+
+  if (hasParent && workUnitKey) {
+    return {
+      backendCacheKey,
+      parentConversationId: parentConversationId as number,
+      unit: { kind: "work_unit", workUnitKey },
     }
   }
 

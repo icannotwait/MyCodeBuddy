@@ -12,6 +12,9 @@ import {
 import { shouldQueueDirectSend } from "@/lib/queue-flush"
 import { createConversation } from "@/lib/api"
 
+type CreateLiveTranscriptFrameSink =
+  (typeof import("@/stores/live-transcript-store"))["createLiveTranscriptFrameSink"]
+
 // ---------------------------------------------------------------------------
 // Pure surface policy seam (imported from the surface module once exported)
 // ---------------------------------------------------------------------------
@@ -594,7 +597,7 @@ const surfaceH = vi.hoisted(() => ({
 }))
 
 const createLiveTranscriptFrameSinkMock = vi.hoisted(() =>
-  vi.fn(() => ({
+  vi.fn<CreateLiveTranscriptFrameSink>(() => ({
     rebuild: vi.fn(),
     publish: vi.fn(),
     markCompleting: vi.fn(),

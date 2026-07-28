@@ -1037,9 +1037,6 @@ export function useDelegationCardModel(
   const childProjectionRunning = runScopedProjection?.taskStatus === "running"
   const activeRunNonTerminal =
     runSnapshot?.status === "running" || runSnapshot?.status === "reserving"
-  const continueOrReplaceAdmitted =
-    (generationPreview != null && generationPreview > 1) ||
-    Boolean(runSnapshot?.replaced_task_id)
   const observeType = resolveStickyObserveType({
     lifecycleStatus: lifecyclePreview,
     errorCode: observeErrorCode,
@@ -1061,7 +1058,10 @@ export function useDelegationCardModel(
       // Wait projection is conversation-scoped; treat as weak positive only
       // when this card has a known child in the unit (not global-wait alone).
       parentWaitingForThisChild: false,
-      continueOrReplaceAdmitted,
+      // Durable generation/replacement metadata records history, not a live
+      // recovery owner. Current admission is already covered by the live
+      // binding and non-terminal snapshot signals above.
+      continueOrReplaceAdmitted: false,
     }
 
     const sig = [
@@ -1081,7 +1081,6 @@ export function useDelegationCardModel(
       childProjectionRunning,
       activeRunNonTerminal,
       openAttention,
-      continueOrReplaceAdmitted,
     ].join("\0")
     if (lastObserveSigRef.current === sig) return
     lastObserveSigRef.current = sig
@@ -1120,7 +1119,6 @@ export function useDelegationCardModel(
     childProjectionRunning,
     activeRunNonTerminal,
     openAttention,
-    continueOrReplaceAdmitted,
   ])
 
   useEffect(() => {

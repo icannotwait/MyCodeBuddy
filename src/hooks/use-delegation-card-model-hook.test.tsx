@@ -50,6 +50,7 @@ vi.mock("@/lib/delegation-running-ticker", () => ({
 
 import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import { resetBackendScopedStores } from "@/stores/backend-scoped-store-reset"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type { DelegationRunSnapshot } from "@/lib/types"
 
@@ -84,11 +85,31 @@ function completedSnapshot(): DelegationRunSnapshot {
   }
 }
 
+function runningSnapshot(): DelegationRunSnapshot {
+  return {
+    ...completedSnapshot(),
+    status: "running",
+    error_code: null,
+    finished_at: null,
+    replaced_task_id: "run-2",
+  }
+}
+
+function canceledSnapshot(): DelegationRunSnapshot {
+  return {
+    ...completedSnapshot(),
+    status: "canceled",
+    error_code: "parent_turn_failed",
+    replaced_task_id: "run-2",
+  }
+}
+
 describe("useDelegationCardModel ticker lifecycle", () => {
   beforeEach(() => {
     ticker.retain.mockClear()
     ticker.release.mockClear()
     delegationRunSnapshotCache.reset()
+    resetBackendScopedStores()
     vi.spyOn(delegationRunSnapshotCache, "ensure").mockImplementation(() => {})
   })
 
@@ -120,5 +141,35 @@ describe("useDelegationCardModel ticker lifecycle", () => {
 
     expect(result.current.lifecycleStatus).toBe("ok")
     expect(ticker.release).toHaveBeenCalledTimes(1)
+  })
+
+  it("terminalizes generation-3 cancellation after all live recovery owners disappear", () => {
+    delegationRunSnapshotCache.install(cacheKey(), runningSnapshot())
+
+    const { result } = renderHook(() =>
+      useDelegationCardModel({
+        parentToolUseId: "pt-3",
+        parentConversationId: PARENT_ID,
+        input: JSON.stringify({ agent_type: "codex", task: "third review" }),
+        meta: {
+          "codeg.delegation": {
+            status: "running",
+            task_id: TASK_ID,
+            generation: 3,
+            started_at: STARTED_AT,
+            synthetic_historical: true,
+          },
+        },
+      })
+    )
+
+    expect(result.current.showGeneratingSegment).toBe(true)
+
+    act(() => {
+      delegationRunSnapshotCache.install(cacheKey(), canceledSnapshot())
+    })
+
+    expect(result.current.lifecycleStatus).toBe("err")
+    expect(result.current.showGeneratingSegment).toBe(false)
   })
 })
