@@ -1576,10 +1576,7 @@ mod tests {
         doc.edges
             .retain(|e| e.from != "task-1-rev" && e.to != "task-1-rev");
         let err = validate_manifest_document(&doc).unwrap_err();
-        assert!(
-            matches!(err, WorkflowError::InvalidField(ref m) if m.contains("route")),
-            "got {err:?}"
-        );
+        assert!(matches!(err, WorkflowError::TaskRouteMismatch(_)));
     }
 
     #[test]
