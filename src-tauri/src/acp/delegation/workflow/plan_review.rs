@@ -875,6 +875,29 @@ mod tests {
     }
 
     #[test]
+    fn workflow_v2_typed_error_real_producers_reviewer_set() {
+        let error = derive_plan_review_round(
+            None,
+            &ids(&["reviewer-a", "reviewer-b"]),
+            &submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &["reviewer-a"],
+                vec![],
+            ),
+        )
+        .expect_err("initial full review requires the complete reviewer set");
+        assert!(matches!(
+            &error,
+            PlanReviewError::RequiredReviewerSetMismatch { .. }
+        ));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(
+            crate::acp::delegation::workflow::WorkflowStoreError::PlanReview(error),
+        );
+        assert_eq!(code, "reviewer_set_mismatch");
+    }
+
+    #[test]
     fn scoped_round_accepts_a_new_finding_from_a_required_owner() {
         let prior = initial(vec![finding(
             "F-1",

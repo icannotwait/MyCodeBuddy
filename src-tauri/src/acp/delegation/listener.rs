@@ -1828,7 +1828,13 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
 
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
     let code = match &err {
-        WorkflowStoreError::Validation(error) => workflow_validation_error_code(error),
+        WorkflowStoreError::Validation(WorkflowError::RiskAssessmentInvalid(_)) => {
+            "risk_assessment_invalid"
+        }
+        WorkflowStoreError::Validation(WorkflowError::TaskRouteMismatch(_)) => {
+            "task_route_mismatch"
+        }
+        WorkflowStoreError::Validation(_) => "validation",
         WorkflowStoreError::PlanReview(PlanReviewError::RequiredReviewerSetMismatch { .. }) => {
             "reviewer_set_mismatch"
         }
@@ -1843,16 +1849,8 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
             "admitted_node_identity_mutation"
         }
         WorkflowStoreError::CohortFrozen { .. } => "cohort_frozen",
-        WorkflowStoreError::GateNotReady(message)
-            if message.starts_with("reviewed_task_stale:") =>
-        {
-            "reviewed_task_stale"
-        }
-        WorkflowStoreError::GateNotReady(message)
-            if message.starts_with("artifact_digest_mismatch:") =>
-        {
-            "artifact_digest_mismatch"
-        }
+        WorkflowStoreError::ReviewedTaskStale(_) => "reviewed_task_stale",
+        WorkflowStoreError::ArtifactDigestMismatch(_) => "artifact_digest_mismatch",
         WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
         WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
         WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
@@ -1874,25 +1872,12 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
     })
 }
 
-fn workflow_validation_error_code(error: &WorkflowError) -> &'static str {
-    let message = error.to_string();
-    if message.contains("route mismatch") || message.contains("route node") {
-        "task_route_mismatch"
-    } else if message.contains("Task ")
-        && [
-            "risk",
-            "hard trigger",
-            "soft signal",
-            "soft score",
-            "evidence",
-        ]
-        .iter()
-        .any(|needle| message.contains(needle))
-    {
-        "risk_assessment_invalid"
-    } else {
-        "validation"
-    }
+#[cfg(test)]
+pub(crate) fn workflow_store_error_code_for_test(err: WorkflowStoreError) -> String {
+    workflow_store_error_value(err)["error"]["code"]
+        .as_str()
+        .expect("workflow errors have string codes")
+        .to_string()
 }
 
 fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerResponse> {
@@ -6256,56 +6241,6 @@ mod tests {
             })
             .await;
         assert_eq!(outcome["error"]["code"], "feature_disabled");
-    }
-
-    #[test]
-    fn workflow_manifest_v2_maps_protocol_failures_to_stable_codes() {
-        use crate::acp::delegation::workflow::{PlanReviewError, WorkflowError};
-
-        let cases = [
-            (
-                WorkflowStoreError::Validation(WorkflowError::InvalidField(
-                    "Task 1 risk level Normal contradicts derived level High".into(),
-                )),
-                "risk_assessment_invalid",
-            ),
-            (
-                WorkflowStoreError::Validation(WorkflowError::InvalidField(
-                    "Task 1 route mismatch: high risk requires two reviewers".into(),
-                )),
-                "task_route_mismatch",
-            ),
-            (
-                WorkflowStoreError::PlanReview(PlanReviewError::RequiredReviewerSetMismatch {
-                    expected: vec!["codex".into(), "grok".into()],
-                    actual: vec!["codex".into()],
-                }),
-                "reviewer_set_mismatch",
-            ),
-            (
-                WorkflowStoreError::GateNotReady(
-                    "reviewed_task_stale: reviewer covers an old Author task".into(),
-                ),
-                "reviewed_task_stale",
-            ),
-            (
-                WorkflowStoreError::GateNotReady(
-                    "artifact_digest_mismatch: reviewer digest differs".into(),
-                ),
-                "artifact_digest_mismatch",
-            ),
-            (
-                WorkflowStoreError::CohortFrozen {
-                    node_id: "task-1-reviewer".into(),
-                },
-                "cohort_frozen",
-            ),
-        ];
-
-        for (error, expected_code) in cases {
-            let value = workflow_store_error_value(error);
-            assert_eq!(value["error"]["code"], expected_code);
-        }
     }
 
     #[tokio::test]

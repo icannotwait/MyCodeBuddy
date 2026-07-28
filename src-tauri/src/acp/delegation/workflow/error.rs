@@ -45,6 +45,12 @@ pub enum WorkflowStoreError {
     #[error("admitted workflow binding or Task cohort policy/complete route is immutable at {node_id} (cohort_frozen)")]
     CohortFrozen { node_id: String },
 
+    #[error("gate not ready: reviewed_task_stale: {0}")]
+    ReviewedTaskStale(String),
+
+    #[error("gate not ready: artifact_digest_mismatch: {0}")]
+    ArtifactDigestMismatch(String),
+
     #[error("gate not ready: {0}")]
     GateNotReady(String),
 

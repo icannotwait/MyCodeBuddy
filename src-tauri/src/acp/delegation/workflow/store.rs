@@ -442,8 +442,9 @@ pub async fn settle_workflow_gate_core(
                         if current_doc_digest.as_deref()
                             != Some(submission.covered_plan_digest.as_str())
                         {
-                            return Err(WorkflowStoreError::GateNotReady(
-                                "artifact_digest_mismatch: Plan submission digest does not match the active Plan artifact".into(),
+                            return Err(WorkflowStoreError::ArtifactDigestMismatch(
+                                "Plan submission digest does not match the active Plan artifact"
+                                    .into(),
                             ));
                         }
 
@@ -1940,8 +1941,8 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
         ));
     }
     if author_binding.task_id != submission.covered_author_task_id {
-        return Err(WorkflowStoreError::GateNotReady(format!(
-            "reviewed_task_stale: covered Author task {} is not the latest active Plan Author task {}",
+        return Err(WorkflowStoreError::ReviewedTaskStale(format!(
+            "covered Author task {} is not the latest active Plan Author task {}",
             submission.covered_author_task_id, author_binding.task_id
         )));
     }
@@ -1951,9 +1952,8 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
         ));
     }
     if author_binding.artifact_digest.as_deref() != Some(submission.covered_plan_digest.as_str()) {
-        return Err(WorkflowStoreError::GateNotReady(
-            "artifact_digest_mismatch: Author evidence does not match the covered Plan digest"
-                .into(),
+        return Err(WorkflowStoreError::ArtifactDigestMismatch(
+            "Author evidence does not match the covered Plan digest".into(),
         ));
     }
     let author_run =
@@ -1981,8 +1981,8 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
             status: WorkStatus::Done | WorkStatus::DoneWithConcerns,
             ..
         }) => {
-            return Err(WorkflowStoreError::GateNotReady(
-                "artifact_digest_mismatch: completed Plan Author card does not match the covered Plan digest".into(),
+            return Err(WorkflowStoreError::ArtifactDigestMismatch(
+                "completed Plan Author card does not match the covered Plan digest".into(),
             ));
         }
         _ => {
@@ -2012,14 +2012,14 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
                 ))
             })?;
         if binding.reviewed_task_id.as_deref() != Some(submission.covered_author_task_id.as_str()) {
-            return Err(WorkflowStoreError::GateNotReady(format!(
-                "reviewed_task_stale: Plan reviewer {reviewer_id} does not cover Author task {}",
+            return Err(WorkflowStoreError::ReviewedTaskStale(format!(
+                "Plan reviewer {reviewer_id} does not cover Author task {}",
                 submission.covered_author_task_id
             )));
         }
         if binding.artifact_digest.as_deref() != Some(submission.covered_plan_digest.as_str()) {
-            return Err(WorkflowStoreError::GateNotReady(format!(
-                "artifact_digest_mismatch: Plan reviewer {reviewer_id} does not cover digest {}",
+            return Err(WorkflowStoreError::ArtifactDigestMismatch(format!(
+                "Plan reviewer {reviewer_id} does not cover digest {}",
                 submission.covered_plan_digest
             )));
         }
@@ -3215,7 +3215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_manifest_v2_plan_digest_mismatch_has_typed_marker() {
+    async fn workflow_v2_typed_error_real_producers_artifact_digest() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -3251,14 +3251,12 @@ mod tests {
         )
         .await
         .expect_err("contradictory Plan digest must fail");
-        assert!(
-            matches!(
-                error,
-                WorkflowStoreError::GateNotReady(ref message)
-                    if message.starts_with("artifact_digest_mismatch:")
-            ),
-            "real store producer must preserve the stable typed marker: {error:?}"
-        );
+        assert!(matches!(
+            &error,
+            WorkflowStoreError::ArtifactDigestMismatch(_)
+        ));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(error);
+        assert_eq!(code, "artifact_digest_mismatch");
     }
 
     #[tokio::test]
@@ -3326,14 +3324,10 @@ mod tests {
         )
         .await
         .expect_err("contradictory Author card digest must fail");
-        assert!(
-            matches!(
-                error,
-                WorkflowStoreError::GateNotReady(ref message)
-                    if message.starts_with("artifact_digest_mismatch:")
-            ),
-            "Author card producer must preserve the stable typed marker: {error:?}"
-        );
+        assert!(matches!(
+            error,
+            WorkflowStoreError::ArtifactDigestMismatch(_)
+        ));
     }
 
     /// Design document digest used by `design_plan_doc`.
@@ -4233,11 +4227,57 @@ mod tests {
                 || matches!(
                     err,
                     WorkflowStoreError::Validation(
-                        super::super::types::WorkflowError::InvalidField(ref message)
-                    ) if message.contains("route")
+                        super::super::types::WorkflowError::TaskRouteMismatch(_)
+                    )
                 ),
             "expected freeze or route-validation reject, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_typed_error_real_producers_cohort_frozen() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = design_plan_doc("typed-cohort-frozen");
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .expect("publish workflow");
+
+        let binding = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "task-1-impl".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .expect("load implementer binding")
+        .expect("implementer binding");
+        let mut active: delegation_workflow_node_binding::ActiveModel = binding.into();
+        active.is_observed = Set(true);
+        active.update(&db.conn).await.expect("observe implementer");
+
+        document.workflow_id = Some(published.workflow_id);
+        document.expected_manifest_revision = Some(1);
+        document.task_policies[0].risk.reason = "changed after cohort admission".into();
+        document.plan.as_mut().expect("Plan document").digest = "sha256:plan-revision".into();
+        let error = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .expect_err("an admitted Task policy is immutable");
+
+        assert!(matches!(&error, WorkflowStoreError::CohortFrozen { .. }));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(error);
+        assert_eq!(code, "cohort_frozen");
     }
 
     #[tokio::test]
@@ -5975,7 +6015,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
+        assert!(matches!(error, WorkflowStoreError::ReviewedTaskStale(_)));
     }
 
     #[tokio::test]
@@ -6266,7 +6306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_latest_plan_author_binding_is_required() {
+    async fn workflow_v2_typed_error_real_producers_reviewed_task_stale() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -6348,7 +6388,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
+        assert!(matches!(&error, WorkflowStoreError::ReviewedTaskStale(_)));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(error);
+        assert_eq!(code, "reviewed_task_stale");
     }
 
     #[tokio::test]

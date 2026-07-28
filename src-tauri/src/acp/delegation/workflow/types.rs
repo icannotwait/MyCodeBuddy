@@ -67,6 +67,10 @@ pub enum WorkflowError {
     InvalidAgentType(String),
     #[error("invalid task index: {0}")]
     InvalidTaskIndex(String),
+    #[error(transparent)]
+    RiskAssessmentInvalid(Box<WorkflowError>),
+    #[error(transparent)]
+    TaskRouteMismatch(Box<WorkflowError>),
 }
 
 /// Materials used to build a canonical A1 `work_unit_key`.

@@ -27,9 +27,11 @@ pub fn validate_manifest_document(
     }
     let plan_target_rel_path = normalize_rel_path(&doc.plan_target_rel_path)?;
     if doc.risk_policy_version != TASK_RISK_POLICY_VERSION {
-        return Err(WorkflowError::InvalidField(format!(
-            "risk_policy_version must be {TASK_RISK_POLICY_VERSION}, got {}",
-            doc.risk_policy_version
+        return Err(WorkflowError::RiskAssessmentInvalid(Box::new(
+            WorkflowError::InvalidField(format!(
+                "risk_policy_version must be {TASK_RISK_POLICY_VERSION}, got {}",
+                doc.risk_policy_version
+            )),
         )));
     }
     if doc.publication_token.trim().is_empty() {
@@ -542,8 +544,10 @@ fn normalize_task_policies(
             )));
         }
 
-        let risk = normalize_task_risk(policy.task_index, &policy.risk)?;
-        validate_task_route(policy.task_index, &risk, &policy.route, nodes)?;
+        let risk = normalize_task_risk(policy.task_index, &policy.risk)
+            .map_err(|error| WorkflowError::RiskAssessmentInvalid(Box::new(error)))?;
+        validate_task_route(policy.task_index, &risk, &policy.route, nodes)
+            .map_err(|error| WorkflowError::TaskRouteMismatch(Box::new(error)))?;
         policies.push(ManifestTaskPolicy {
             task_index: policy.task_index,
             risk,
@@ -2289,5 +2293,31 @@ mod tests {
             err.to_lowercase().contains("task") || err.to_lowercase().contains("route"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn workflow_v2_typed_error_real_producers_risk_assessment() {
+        let mut wire = normal_estimated_wire();
+        wire["risk_policy_version"] = json!("not-b2d-task-risk-v1");
+        let document: ManifestDocument = serde_json::from_value(wire).expect("manifest wire");
+        let error = validate_manifest_document(&document).expect_err("invalid risk policy");
+        assert!(matches!(&error, WorkflowError::RiskAssessmentInvalid(_)));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(
+            crate::acp::delegation::workflow::WorkflowStoreError::Validation(error),
+        );
+        assert_eq!(code, "risk_assessment_invalid");
+    }
+
+    #[test]
+    fn workflow_v2_typed_error_real_producers_task_route() {
+        let mut wire = high_estimated_wire();
+        wire["task_policies"][0]["route"]["reviewer_node_ids"] = json!(["task-1-reviewer-codex"]);
+        let document: ManifestDocument = serde_json::from_value(wire).expect("manifest wire");
+        let error = validate_manifest_document(&document).expect_err("incomplete high-risk route");
+        assert!(matches!(&error, WorkflowError::TaskRouteMismatch(_)));
+        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(
+            crate::acp::delegation::workflow::WorkflowStoreError::Validation(error),
+        );
+        assert_eq!(code, "task_route_mismatch");
     }
 }
