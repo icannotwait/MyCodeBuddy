@@ -2,16 +2,30 @@
 
 ## Status
 
-Approved in conversation on 2026-07-28.
+Amended after Design Gate cycle 1 on 2026-07-28; pending required cohort
+re-review before plan authoring.
 
 This document specifies a Codeg-side migration of the built-in `codeg-mcp`
 server for Grok from an agent-spawned stdio process to Grok's real ACP reverse
 MCP bridge. It is a design only; no implementation plan has been approved yet.
 
-Baselines inspected while preparing this design:
+Baselines inspected while preparing this design and amendment:
 
-- Codeg: `9677d2b6`
+- Codeg: `6d83de57`
 - Grok checkout `D:\grok-build`: `02d9359`
+
+## Amendment Record
+
+Design Gate cycle 1 resolved these requirements before Plan authoring:
+
+- strict bridge bootstrap failures are typed terminal outcomes, never
+  safe-native fallback candidates;
+- collision preflight covers both forwarded and Grok-native MCP names;
+- peer MCP startup and bridge handshake use separate timing phases;
+- every strict bridge waits for its ready latch before `Connected`, including
+  delegation-off launches; and
+- the implementation boundary and regression suite cover the manager decision
+  boundary, native-name helper, real-Grok release smoke, and T1 observability.
 
 ## Problem
 
@@ -158,10 +172,17 @@ An ordinary reconnection may create a fresh ACP connection and bridge, but it
 does not change the selected transport. Operational rollback is a Codeg version
 rollback, not an automatic runtime fallback.
 
-Bridge bootstrap failures must use a typed connection/bootstrap failure reason
-that the manager classifies as terminal for this connection and ineligible for
-safe-native route selection. This is a control-flow requirement, not merely a
-logging convention.
+Bridge bootstrap failures must use a typed `AcpError::GrokMcpBridgeBootstrap`
+error carrying a stable phase/reason. `finish_route_ready` and every earlier
+bridge-bootstrap failure site MUST send
+`RouteBootstrapOutcome::Fatal(AcpError::GrokMcpBridgeBootstrap { .. })`.
+`RouteBootstrapOutcome::RouteSpecific`,
+`RouteDegradedReason::CompanionInitializationFailed`, and every other existing
+safe-native fallback reason are forbidden on the strict bridge path. The
+bootstrap-outcome classifier must preserve this error as `Fatal`, so the
+manager's Root attempt-one loop returns the connection error without invoking
+`safe_native_fallback` or beginning attempt two. This is a control-flow
+requirement, not merely a logging convention.
 
 ## Architecture
 
@@ -204,7 +225,8 @@ One `GrokAcpMcpRuntime` is owned by one parent ACP connection and contains:
 - `Bootstrapping | Ready | Closing | Closed` state;
 - bootstrap observations for successfully relayed `initialize` and
   `tools/list`;
-- a bridge-ready waiter/latch;
+- a bridge-ready waiter/latch, present exactly when this connection selected
+  the strict ACP bridge and never conditioned on delegation exposure;
 - the authenticated ready-lease hold when delegation is exposed;
 - a per-connection 64-permit admission semaphore;
 - a runtime-owned task set for all spawned bridge calls;
@@ -219,8 +241,10 @@ Refactor the current injection setup into two stages:
 
 1. Build a transport-independent launch specification from the immutable route
    plan and runtime feature snapshots. It contains role, feature bits,
-   continuation support, feedback availability, working directory, and parent
-   connection identity.
+   continuation support, feedback availability, working directory, parent
+   connection identity, and the existing agent-specific feature policy. In
+   particular, the ACP path reuses Grok's current ask-tool suppression rather
+   than re-enabling `ask_user` accidentally.
 2. Materialize either the ACP runtime or the existing stdio server.
 
 The ACP materialization path registers the token and optional lease, constructs
@@ -232,8 +256,11 @@ register the token/lease, build command arguments, and append the stdio
 `McpServer`.
 
 The generalized connection binding retains the token for teardown,
-`feedback_available`, the optional delegation lease waiter, and the optional
-bridge-ready waiter/guard.
+`feedback_available`, the optional delegation lease waiter, and a
+bridge-ready waiter/guard that is present if and only if the strict bridge
+transport was selected. It also records the bridge bootstrap deadline phase so
+all error exits can use the typed terminal bridge error rather than a route
+degradation reason.
 
 ## Shared Companion Protocol Core
 
@@ -301,7 +328,8 @@ User MCP servers remain in the ordinary `mcpServers` field. The built-in
 
 ## Reverse Request Contract
 
-Register a typed ACP extension handler for `x.ai/mcp/sdk_call` with:
+Register a typed ACP extension handler for the exact literal
+`x.ai/mcp/sdk_call` with:
 
 ```json
 {
@@ -314,6 +342,10 @@ Register a typed ACP extension handler for `x.ai/mcp/sdk_call` with:
   }
 }
 ```
+
+The method name has no leading underscore. It is distinct from Codeg's
+unrelated underscore-namespaced ACP extension handlers, so the implementation
+must not copy their naming convention.
 
 For each request the handler:
 
@@ -348,8 +380,22 @@ same ID and skip `after_relay`.
 
 ## Bootstrap and Readiness
 
-The bridge starts in `Bootstrapping`. Readiness uses the first successful
-handshake, in this order:
+The bridge starts in `Bootstrapping`. Grok builds ordinary stdio/HTTP/SSE MCP
+clients before it builds ACP reverse clients. Bootstrap therefore has two
+separate timing phases:
+
+1. `session/new`, `session/load`, or `session/resume` performs Grok's existing
+   peer-MCP startup under that request's existing ACP lifetime and error policy.
+   Codeg does not start a bridge-ready timer in this phase and does not diagnose
+   a peer-start failure as a bridge collision.
+2. After the session attach has succeeded, Codeg captures one 30-second
+   `ready_lease_timeout()` deadline, retaining its existing test override. It
+   waits for the bridge-ready latch and, only when delegation is exposed, the
+   ready-lease latch concurrently against that one deadline. A bridge that
+   completed its reverse handshake while the attach was in flight satisfies its
+   latch immediately.
+
+Readiness uses the first successful bridge handshake in this order:
 
 ```text
 Grok sends MCP initialize
@@ -361,8 +407,8 @@ Grok sends MCP tools/list
   -> ACP responder accepts the original tools/list response
   -> mark bridge Ready
 ACP session attach succeeds
-  -> existing lease gate succeeds
-  -> bridge-ready gate succeeds
+  -> bridge-ready gate succeeds for every strict-bridge connection
+  -> delegation lease gate additionally succeeds when delegation is exposed
   -> emit Connected
 ```
 
@@ -370,11 +416,18 @@ The ready lease is registered before the server registration is exposed, so a
 fast handshake cannot race an unknown token. Establishing the lease may wake
 its waiter before `tools/list` is relayed, but `Connected` remains protected
 by the separate bridge-ready latch and the still-pending ACP session request.
+`finish_route_ready` (or its replacement) MUST apply the bridge-ready gate
+whenever strict bridge transport was selected, even when
+`expose_codeg_delegation` is false. The delegation lease remains an additional
+gate, not the condition that enables bridge readiness.
 
-The connection uses the existing 30-second
-`ready_lease_timeout()` as the bridge bootstrap deadline, with the existing
-test override. No successful `initialize`/ `tools/list` pair before the
-deadline is a connection bootstrap failure.
+No successful `initialize`/`tools/list` pair by the phase-two deadline is a
+terminal `AcpError::GrokMcpBridgeBootstrap` failure. The same terminal result
+applies to a first-response relay failure, a bridge registration failure, or a
+local collision. It never uses `CompanionInitializationFailed`. The timeout
+diagnostic can mention a possible hidden collision only after the local
+wire-plus-native-name preflight has passed; it must also record whether no
+reverse traffic was observed or an incomplete handshake was observed.
 
 After `Ready`, repeat `initialize` or `tools/list` requests may be handled
 normally by the shared dispatcher; they do not rotate the runtime or
@@ -469,10 +522,11 @@ must not label an abandoned upstream future as a received cancellation.
 
 | Failure | Scope | Result | Runtime |
 |---|---|---|---|
-| Exact-name collision detected locally | Bootstrap | Actionable connection error | Closed |
-| No first handshake before deadline | Bootstrap | Connection error; mention possible hidden collision | Closed |
-| Ready lease/authentication failure | Bootstrap | Connection error | Closed |
-| First initialize/tools-list response cannot relay | Bootstrap | Connection error | Closed |
+| Peer stdio/HTTP/SSE MCP startup fails before session attach | Session attach | Existing ACP session error; not a bridge-collision diagnosis | No bridge runtime ready |
+| Exact-name collision detected locally | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error with rename guidance | Closed |
+| No first handshake after the phase-two deadline | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error; mention possible hidden collision | Closed |
+| Ready lease/authentication failure on bridge path | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error | Closed |
+| First initialize/tools-list response cannot relay | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error | Closed |
 | Invalid outer sdk-call envelope or server ID | Request | ACP extension error | Unchanged |
 | Unknown nested MCP method/invalid tool params | Request | Nested JSON-RPC error | Ready |
 | Tool business failure or broker error | Request | Existing nested tool result/error | Ready |
@@ -481,8 +535,9 @@ must not label an abandoned upstream future as a received cancellation.
 | ACP writer/channel closes | Connection | Teardown | Closed |
 | Runtime invariant/task-owner failure | Connection | Teardown and connection error | Closed |
 
-None of the rows on the strict-capability path permits stdio or native
-fallback.
+Every strict-bridge bootstrap row sends `RouteBootstrapOutcome::Fatal`; none
+permits stdio or native fallback. Request-level errors after `Ready` remain
+non-fatal nested MCP/ACP errors as shown above.
 
 ## Same-Name Collision Policy
 
@@ -496,9 +551,13 @@ the initial reverse handshake.
 
 Codeg applies two defenses:
 
-1. Before sending the session request, inspect the user MCP list that will be
-   sent to Grok. An exact case-sensitive `codeg-mcp` entry fails bootstrap
-   with an instruction to rename the user server.
+1. Before sending the session request, inspect the union of the user MCP names
+   that will be sent to Grok and
+   `agent_native_mcp_server_names(AgentType::Grok)`. The latter is required
+   because Codeg deliberately removes native-configured names from the wire
+   list. An exact case-sensitive `codeg-mcp` entry from either source fails
+   bootstrap with an instruction to rename the user server and identifies the
+   source as wire or Grok-native configuration.
 2. If a Grok-owned/shared client not visible to Codeg shadows the registration,
    the bridge-ready deadline fails with a contract-violation diagnostic that
    calls out a possible same-name collision.
@@ -555,7 +614,9 @@ Use stable reason identifiers such as:
 
 The user-visible connection error includes the phase and an actionable remedy
 where one exists. Logs distinguish local response relay from upstream
-consumption and never claim that T1 delivered a cancellation.
+consumption and never claim that T1 delivered a cancellation. In particular,
+the T1 abandonment path must emit no `cancellation_received` log, metric, or
+audit field; any later cleanup is attributed to its actual lifecycle backstop.
 
 ## Compatibility
 
@@ -585,13 +646,20 @@ consumption and never claim that T1 delivered a cancellation.
 - A strict-capability test whose binary lookup is guaranteed to fail, proving
   the lookup is never reached.
 - Metadata merge tests for new, load, and resume without losing existing meta.
-- Exact same-name collision detection and case-sensitive non-collisions.
+- Exact same-name collision detection across both forwarded wire names and
+  Grok-native names, plus case-sensitive non-collisions.
 - Runtime state transitions, single installation, stale IDs, and idempotent
   teardown.
 - Envelope validation, JSON-RPC ID/version validation, 8 MiB boundaries, and
   64-call admission.
 - Bootstrap ordering: neither lease readiness nor session success alone can
-  emit `Connected`.
+  emit `Connected`; the bridge-ready latch is required with and without
+  `expose_codeg_delegation`.
+- Phase-two deadline behavior: slow ordinary peer-MCP startup before session
+  attach does not consume bridge-ready budget; a no-handshake timeout after
+  attach is terminal and carries its observed bootstrap phase.
+- Bootstrap outcome mapping: every strict-bridge failure is `Fatal`, never
+  `RouteSpecific(CompanionInitializationFailed)`.
 - `dispatch_line` versus `dispatch_request` parity for initialize,
   tools/list, method-not-found, invalid params, feature/role filtering, and
   mocked broker paths.
@@ -599,6 +667,8 @@ consumption and never claim that T1 delivered a cancellation.
   response succeeds.
 - Teardown tests proving drain, bounded join, abort, lease release, token
   revocation, and parent cancellation all occur once.
+- T1 abandonment tests proving no cancellation-received observability is
+  emitted while lifecycle-backstop cleanup remains observable.
 
 ### ACP integration tests
 
@@ -610,14 +680,20 @@ Use a mock Grok ACP peer that advertises the capability, consumes
 - session/new, load, and resume registration;
 - responder failure during feedback relay;
 - bootstrap timeout and malformed reverse request;
-- visible and hidden same-name collisions;
+- visible wire, Grok-native, and hidden same-name collisions;
+- a deliberately slow user MCP before ACP reverse-client construction, proving
+  peer startup is not reported as a bridge timeout;
+- delegation-off feedback/sessions-only launch, proving `Connected` still waits
+  for the first relayed `initialize` and `tools/list`;
 - ACP connection close with active delegation calls;
 - caller abandons one request while the parent connection remains alive.
 
-Tests must assert that no stdio/native fallback event occurs on every bridge
-failure case.
+The manager-level suite must drive the real Root managed-Grok two-attempt loop
+for each strict-bridge bootstrap failure and assert one attempt only, no call
+to `safe_native_fallback`, and no stdio/native route event. Mock bridge tests
+alone are insufficient because the fallback decision belongs to the manager.
 
-### Real Grok smoke tests
+### Required Real Grok release smoke
 
 Against the inspected or newer Grok build:
 
@@ -628,11 +704,15 @@ Against the inspected or newer Grok build:
 5. Repeat with the local `codeg-mcp` binary unavailable; the bridge must still
    work.
 6. Add a user MCP named `codeg-mcp`; connection must fail with the collision
-   diagnostic.
+   diagnostic. Repeat with the name in Grok-native configuration so it is not
+   forwarded on the wire.
 7. Force bridge bootstrap failure; connection must fail without either
    fallback.
+8. Include a deliberately slow ordinary user MCP and verify its startup is
+   reported through the session-attach path rather than a bridge timeout.
 
-No Grok source modification is part of these tests.
+This manual smoke is a release/acceptance gate, not an optional exploratory
+test. No Grok source modification is part of it.
 
 ### Repository verification
 
@@ -676,25 +756,31 @@ inside a live connection.
    with built-in tools ready before `Connected`.
 2. On strict capability `true`, Codeg neither locates nor spawns
    `codeg-mcp`; the flow works when that binary is absent.
-3. Bridge initialization failure produces a clear connection failure and
-   recorded evidence that neither stdio nor safe-native fallback ran.
+3. Every bridge bootstrap failure produces
+   `RouteBootstrapOutcome::Fatal(AcpError::GrokMcpBridgeBootstrap { .. })`, a
+   clear connection failure, and recorded evidence that neither stdio nor
+   safe-native fallback nor a second manager attempt ran.
 4. Capability values other than exact boolean `true` retain current stdio
    behavior.
 5. `session/new`, `session/load`, and `session/resume` all register the
    current connection's ID, and reconnect invalidates the old ID.
 6. The first successful `initialize` and `tools/list` response both precede
-   `Connected`.
+   `Connected` for every strict-bridge launch, including when
+   `expose_codeg_delegation` is false.
 7. User Stop preserves the runtime while canceling the active turn/task tree.
 8. Connection teardown leaves no bridge request task, ready hold, token, lease,
    or parent-owned delegation running.
-9. An exact custom `codeg-mcp` collision fails visibly rather than shadowing
-   the bridge.
+9. An exact custom `codeg-mcp` collision from either the forwarded wire list
+   or Grok-native configuration fails visibly rather than shadowing the bridge.
 10. Simulated T1 abandonment does not destabilize Codeg or claim a cancellation
     signal; later lifecycle cleanup remains effective.
 11. Shared-dispatch parity tests prove that ACP and stdio expose the same tools
     and business behavior.
 12. Desktop, server, and `codeg-mcp` Rust targets pass their required test,
     check, and clippy commands.
+13. A slow ordinary peer MCP before ACP reverse-client construction neither
+    consumes bridge-ready time nor produces a false bridge-collision diagnosis.
+14. The required real-Grok release smoke passes.
 
 ## Implementation Boundary
 
@@ -703,8 +789,13 @@ Expected Codeg files/modules in scope:
 - `src-tauri/src/acp/grok_mcp_bridge.rs` (new);
 - `src-tauri/src/acp/mod.rs`;
 - `src-tauri/src/acp/connection.rs`;
+- `src-tauri/src/acp/manager.rs` for terminal outcome handling and the real
+  manager-loop regression test;
+- `src-tauri/src/acp/delegation/route.rs` for the explicit no-fallback boundary
+  and any typed route/bootstrap test helpers;
 - `src-tauri/src/acp/delegation/companion.rs`;
 - `src-tauri/src/bin/codeg_mcp.rs`;
+- `src-tauri/src/commands/mcp.rs` for the Grok-native name preflight helper;
 - focused tests adjacent to those modules.
 
 Changes to `D:\grok-build`, frontend code, database migrations, MCP tool
