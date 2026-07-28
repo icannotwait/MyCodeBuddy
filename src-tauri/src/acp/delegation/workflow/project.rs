@@ -2254,6 +2254,7 @@ mod tests {
         rb.insert(&db.conn).await.expect("insert rb");
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_completed_task_evidence(
         db: &AppDatabase,
         parent: i32,

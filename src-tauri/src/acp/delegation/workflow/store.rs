@@ -3032,6 +3032,7 @@ mod tests {
         rewrite_used: bool,
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn settle_for_test(
         db: &AppDatabase,
         emitter: &EventEmitter,
@@ -3457,6 +3458,7 @@ mod tests {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_plan_author_evidence(
         db: &AppDatabase,
         parent: i32,
