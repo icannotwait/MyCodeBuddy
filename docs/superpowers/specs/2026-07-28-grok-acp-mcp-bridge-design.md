@@ -2,7 +2,7 @@
 
 ## Status
 
-Amended after Design Gate cycle 1 on 2026-07-28; pending required cohort
+Amended after Design Gate cycle 2 on 2026-07-28; pending required cohort
 re-review before plan authoring.
 
 This document specifies a Codeg-side migration of the built-in `codeg-mcp`
@@ -16,12 +16,13 @@ Baselines inspected while preparing this design and amendment:
 
 ## Amendment Record
 
-Design Gate cycle 1 resolved these requirements before Plan authoring:
+Design Gate cycles 1 and 2 resolved these requirements before Plan authoring:
 
 - strict bridge bootstrap failures are typed terminal outcomes, never
   safe-native fallback candidates;
 - collision preflight covers both forwarded and Grok-native MCP names;
-- peer MCP startup and bridge handshake use separate timing phases;
+- bridge readiness uses the existing stdio-style shared post-attach deadline,
+  with a neutral diagnostic when peer startup has delayed reverse traffic;
 - every strict bridge waits for its ready latch before `Connected`, including
   delegation-off launches; and
 - the implementation boundary and regression suite cover the manager decision
@@ -380,33 +381,37 @@ same ID and skip `after_relay`.
 
 ## Bootstrap and Readiness
 
-The bridge starts in `Bootstrapping`. Grok builds ordinary stdio/HTTP/SSE MCP
-clients before it builds ACP reverse clients. Bootstrap therefore has two
-separate timing phases:
+The bridge starts in `Bootstrapping`. Grok returns from `session/new`,
+`session/load`, or `session/resume` before its asynchronous MCP initialization
+task completes. That task starts ordinary stdio/HTTP/SSE MCP clients and only
+then constructs ACP reverse clients. Session attachment can therefore succeed
+while peer-MCP startup is still in progress; Codeg cannot make the first
+reverse request synchronous without an out-of-scope Grok change.
 
-1. `session/new`, `session/load`, or `session/resume` performs Grok's existing
-   peer-MCP startup under that request's existing ACP lifetime and error policy.
-   Codeg does not start a bridge-ready timer in this phase and does not diagnose
-   a peer-start failure as a bridge collision.
-2. After the session attach has succeeded, Codeg captures one 30-second
-   `ready_lease_timeout()` deadline, retaining its existing test override. It
-   waits for the bridge-ready latch and, only when delegation is exposed, the
-   ready-lease latch concurrently against that one deadline. A bridge that
-   completed its reverse handshake while the attach was in flight satisfies its
-   latch immediately.
+After session attach succeeds, Codeg follows the existing stdio companion
+readiness policy: it captures one 30-second `ready_lease_timeout()` deadline,
+retaining its existing test override, and waits for the bridge-ready latch and,
+only when delegation is exposed, the ready-lease latch concurrently against
+that one deadline. This is a shared post-attach budget: remaining peer-MCP
+startup and the bridge `initialize`/`tools/list` handshake both consume it.
+That deliberately preserves the current Codeg connection pacing instead of
+changing Grok's startup ordering.
 
 Readiness uses the first successful bridge handshake in this order:
 
 ```text
-Grok sends MCP initialize
-  -> shared dispatcher builds initialize response
-  -> ACP responder accepts initialize response
-Grok sends MCP tools/list
-  -> shared dispatcher builds the filtered tool list
-  -> establish authenticated ready-lease hold when delegation is enabled
-  -> ACP responder accepts the original tools/list response
-  -> mark bridge Ready
 ACP session attach succeeds
+  -> Codeg begins the shared 30-second post-attach readiness wait
+  -> Grok continues ordinary peer-MCP startup
+  -> Grok constructs the ACP reverse client
+  -> Grok sends MCP initialize
+     -> shared dispatcher builds initialize response
+     -> ACP responder accepts initialize response
+  -> Grok sends MCP tools/list
+     -> shared dispatcher builds the filtered tool list
+     -> establish authenticated ready-lease hold when delegation is enabled
+     -> ACP responder accepts the original tools/list response
+     -> mark bridge Ready
   -> bridge-ready gate succeeds for every strict-bridge connection
   -> delegation lease gate additionally succeeds when delegation is exposed
   -> emit Connected
@@ -421,13 +426,15 @@ whenever strict bridge transport was selected, even when
 `expose_codeg_delegation` is false. The delegation lease remains an additional
 gate, not the condition that enables bridge readiness.
 
-No successful `initialize`/`tools/list` pair by the phase-two deadline is a
-terminal `AcpError::GrokMcpBridgeBootstrap` failure. The same terminal result
-applies to a first-response relay failure, a bridge registration failure, or a
-local collision. It never uses `CompanionInitializationFailed`. The timeout
-diagnostic can mention a possible hidden collision only after the local
-wire-plus-native-name preflight has passed; it must also record whether no
-reverse traffic was observed or an incomplete handshake was observed.
+No successful `initialize`/`tools/list` pair by the shared post-attach deadline
+is a terminal `AcpError::GrokMcpBridgeBootstrap` failure. The same terminal
+result applies to a first-response relay failure, a bridge registration failure,
+or a local collision. It never uses `CompanionInitializationFailed`. A timeout
+records whether no reverse traffic or an incomplete handshake was observed. It
+must remain a neutral bootstrap diagnostic, not classify peer-MCP delay or a
+hidden collision as the cause without direct evidence; after the local
+wire-plus-native-name preflight, it may list either as a non-exclusive
+possibility.
 
 After `Ready`, repeat `initialize` or `tools/list` requests may be handled
 normally by the shared dispatcher; they do not rotate the runtime or
@@ -522,9 +529,9 @@ must not label an abandoned upstream future as a received cancellation.
 
 | Failure | Scope | Result | Runtime |
 |---|---|---|---|
-| Peer stdio/HTTP/SSE MCP startup fails before session attach | Session attach | Existing ACP session error; not a bridge-collision diagnosis | No bridge runtime ready |
+| Ordinary peer stdio/HTTP/SSE MCP startup fails before ACP reverse-client construction | Peer MCP initialization | Existing Grok per-server MCP failure behavior; not a bridge-collision diagnosis | Bridge continues if its ACP client is constructed |
 | Exact-name collision detected locally | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error with rename guidance | Closed |
-| No first handshake after the phase-two deadline | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error; mention possible hidden collision | Closed |
+| No ready handshake by the shared post-attach deadline | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error with neutral no-traffic/incomplete-handshake evidence; no collision diagnosis without direct evidence | Closed |
 | Ready lease/authentication failure on bridge path | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error | Closed |
 | First initialize/tools-list response cannot relay | Bridge bootstrap | Terminal `GrokMcpBridgeBootstrap` error | Closed |
 | Invalid outer sdk-call envelope or server ID | Request | ACP extension error | Unchanged |
@@ -536,8 +543,10 @@ must not label an abandoned upstream future as a received cancellation.
 | Runtime invariant/task-owner failure | Connection | Teardown and connection error | Closed |
 
 Every strict-bridge bootstrap row sends `RouteBootstrapOutcome::Fatal`; none
-permits stdio or native fallback. Request-level errors after `Ready` remain
-non-fatal nested MCP/ACP errors as shown above.
+permits stdio or native fallback. `src-tauri/src/acp/error.rs` must preserve
+`AcpError::GrokMcpBridgeBootstrap` as a typed fatal classifier arm rather than
+mapping it through `CompanionInitializationFailed`. Request-level errors after
+`Ready` remain non-fatal nested MCP/ACP errors as shown above.
 
 ## Same-Name Collision Policy
 
@@ -655,9 +664,10 @@ audit field; any later cleanup is attributed to its actual lifecycle backstop.
 - Bootstrap ordering: neither lease readiness nor session success alone can
   emit `Connected`; the bridge-ready latch is required with and without
   `expose_codeg_delegation`.
-- Phase-two deadline behavior: slow ordinary peer-MCP startup before session
-  attach does not consume bridge-ready budget; a no-handshake timeout after
-  attach is terminal and carries its observed bootstrap phase.
+- Shared post-attach deadline behavior: a slow ordinary peer MCP can consume
+  the same readiness budget as the reverse handshake, matching stdio; expiry
+  is terminal and records neutral no-traffic or incomplete-handshake evidence,
+  not a collision conclusion.
 - Bootstrap outcome mapping: every strict-bridge failure is `Fatal`, never
   `RouteSpecific(CompanionInitializationFailed)`.
 - `dispatch_line` versus `dispatch_request` parity for initialize,
@@ -682,7 +692,8 @@ Use a mock Grok ACP peer that advertises the capability, consumes
 - bootstrap timeout and malformed reverse request;
 - visible wire, Grok-native, and hidden same-name collisions;
 - a deliberately slow user MCP before ACP reverse-client construction, proving
-  peer startup is not reported as a bridge timeout;
+  it shares the stdio-style post-attach readiness deadline and any expiry is
+  neutral rather than a collision diagnosis;
 - delegation-off feedback/sessions-only launch, proving `Connected` still waits
   for the first relayed `initialize` and `tools/list`;
 - ACP connection close with active delegation calls;
@@ -708,8 +719,9 @@ Against the inspected or newer Grok build:
    forwarded on the wire.
 7. Force bridge bootstrap failure; connection must fail without either
    fallback.
-8. Include a deliberately slow ordinary user MCP and verify its startup is
-   reported through the session-attach path rather than a bridge timeout.
+8. Include a deliberately slow ordinary user MCP and verify it shares the
+   stdio-style post-attach readiness deadline; any expiry must remain a neutral
+   bootstrap diagnostic rather than a collision diagnosis.
 
 This manual smoke is a release/acceptance gate, not an optional exploratory
 test. No Grok source modification is part of it.
@@ -778,8 +790,9 @@ inside a live connection.
     and business behavior.
 12. Desktop, server, and `codeg-mcp` Rust targets pass their required test,
     check, and clippy commands.
-13. A slow ordinary peer MCP before ACP reverse-client construction neither
-    consumes bridge-ready time nor produces a false bridge-collision diagnosis.
+13. A slow ordinary peer MCP before ACP reverse-client construction shares the
+    stdio-style post-attach readiness budget; any expiry records neutral
+    no-traffic or incomplete-handshake evidence without asserting a collision.
 14. The required real-Grok release smoke passes.
 
 ## Implementation Boundary
@@ -789,6 +802,8 @@ Expected Codeg files/modules in scope:
 - `src-tauri/src/acp/grok_mcp_bridge.rs` (new);
 - `src-tauri/src/acp/mod.rs`;
 - `src-tauri/src/acp/connection.rs`;
+- `src-tauri/src/acp/error.rs` for the typed bridge error and its fatal
+  classifier arm;
 - `src-tauri/src/acp/manager.rs` for terminal outcome handling and the real
   manager-loop regression test;
 - `src-tauri/src/acp/delegation/route.rs` for the explicit no-fallback boundary
