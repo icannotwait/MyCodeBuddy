@@ -3032,6 +3032,7 @@ mod tests {
         rewrite_used: bool,
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn settle_for_test(
         db: &AppDatabase,
         emitter: &EventEmitter,
@@ -3457,6 +3458,7 @@ mod tests {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_plan_author_evidence(
         db: &AppDatabase,
         parent: i32,
@@ -5629,6 +5631,152 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
+    }
+
+    #[tokio::test]
+    async fn task4_score3_high_route_persists_and_recovers() {
+        const PUBLICATION_TOKEN: &str = "tok-task10-score3-high-store";
+        const RISK_REASON: &str = "three canonical soft-signal points require high-risk routing";
+        const IMPLEMENTER_NODE_ID: &str = "task-1-impl";
+        const CODEX_REVIEWER_NODE_ID: &str = "task-1-rev";
+        const GROK_REVIEWER_NODE_ID: &str = "task-1-rev-grok";
+
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut doc = design_plan_doc(PUBLICATION_TOKEN);
+        doc.task_policies[0].risk = ManifestTaskRisk {
+            level: TaskRiskLevel::High,
+            hard_triggers: vec![],
+            soft_signals: vec![
+                ManifestTaskSoftSignal {
+                    kind: TaskSoftSignalKind::CrossRuntimeOrProcess,
+                    score: 2,
+                    evidence: vec!["Tauri and server runtimes share the workflow store".into()],
+                },
+                ManifestTaskSoftSignal {
+                    kind: TaskSoftSignalKind::SharedInterface,
+                    score: 1,
+                    evidence: vec!["publish and recovery share the manifest policy contract".into()],
+                },
+            ],
+            score: 3,
+            reason: RISK_REASON.into(),
+        };
+
+        let task_impl = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == IMPLEMENTER_NODE_ID)
+            .unwrap();
+        task_impl.agent_type = Some("codex".into());
+        task_impl.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 1,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+        );
+        let grok_reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.push(wu(
+            GROK_REVIEWER_NODE_ID,
+            PHASE_TASKS,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            Some(1),
+            grok_reviewer_key,
+            vec![IMPLEMENTER_NODE_ID.into()],
+        ));
+        doc.task_policies[0].route = ManifestTaskRoute {
+            implementer_node_id: IMPLEMENTER_NODE_ID.into(),
+            reviewer_node_ids: vec![CODEX_REVIEWER_NODE_ID.into(), GROK_REVIEWER_NODE_ID.into()],
+        };
+
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("publish score-3 high-risk workflow through the real store");
+        assert_eq!(published.manifest_revision, 1);
+
+        let persisted = delegation_workflow_manifest_revision::Entity::find_by_id((
+            published.workflow_id.clone(),
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .expect("load persisted score-3 manifest revision")
+        .expect("score-3 manifest revision exists");
+        let persisted_doc: ManifestDocument = serde_json::from_str(&persisted.document_json)
+            .expect("deserialize persisted score-3 manifest");
+        assert_eq!(persisted_doc.publication_token, PUBLICATION_TOKEN);
+        assert_eq!(persisted_doc.risk_policy_version, "b2d_task_risk_v1");
+        assert_eq!(persisted_doc.task_policies.len(), 1);
+        let persisted_policy = &persisted_doc.task_policies[0];
+        assert_eq!(persisted_policy.risk.level, TaskRiskLevel::High);
+        assert!(persisted_policy.risk.hard_triggers.is_empty());
+        assert_eq!(persisted_policy.risk.score, 3);
+        assert_eq!(persisted_policy.risk.reason, RISK_REASON);
+        assert_eq!(
+            persisted_policy
+                .risk
+                .soft_signals
+                .iter()
+                .map(|signal| (signal.kind, signal.score))
+                .collect::<Vec<_>>(),
+            vec![
+                (TaskSoftSignalKind::CrossRuntimeOrProcess, 2),
+                (TaskSoftSignalKind::SharedInterface, 1),
+            ]
+        );
+        assert_eq!(
+            persisted_policy.route.implementer_node_id,
+            IMPLEMENTER_NODE_ID
+        );
+        assert_eq!(
+            persisted_policy.route.reviewer_node_ids,
+            vec![CODEX_REVIEWER_NODE_ID, GROK_REVIEWER_NODE_ID]
+        );
+
+        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+            .await
+            .expect("recover score-3 high-risk workflow from the real store");
+        assert_eq!(recovery.publication_token, PUBLICATION_TOKEN);
+        assert_eq!(recovery.risk_policy_version, "b2d_task_risk_v1");
+        assert_eq!(recovery.task_policies.len(), 1);
+
+        let policy = &recovery.task_policies[0];
+        assert_eq!(policy.task_index, 1);
+        assert_eq!(policy.risk.level, TaskRiskLevel::High);
+        assert!(policy.risk.hard_triggers.is_empty());
+        assert_eq!(policy.risk.score, 3);
+        assert_eq!(policy.risk.reason, RISK_REASON);
+        assert_eq!(
+            policy
+                .risk
+                .soft_signals
+                .iter()
+                .map(|signal| (signal.kind, signal.score))
+                .collect::<Vec<_>>(),
+            vec![
+                (TaskSoftSignalKind::CrossRuntimeOrProcess, 2),
+                (TaskSoftSignalKind::SharedInterface, 1),
+            ]
+        );
+        assert_eq!(policy.route.implementer_node_id, IMPLEMENTER_NODE_ID);
+        assert_eq!(
+            policy.route.reviewer_node_ids,
+            vec![CODEX_REVIEWER_NODE_ID, GROK_REVIEWER_NODE_ID]
+        );
     }
 
     #[tokio::test]
