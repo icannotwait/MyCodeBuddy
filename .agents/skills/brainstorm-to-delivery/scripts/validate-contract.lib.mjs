@@ -356,85 +356,104 @@ export function validateRouteTables(taskRouteSection) {
   return failures
 }
 
-/**
- * True when a clause is a legitimate prohibition (not a permission grant).
- * Scoped to the clause only — an unrelated negative must not mask another action.
- */
-function clauseIsProhibition(clause) {
-  return /\b(must not|may not|cannot|can not|never|forbid|forbidden|do not|don't|does not|doesn't|不得|禁止|不要|不得亲自)\b/i.test(
-    clause
-  )
+const PARENT_ACTIONS = [
+  [
+    /\b(?:writes?|authors?|rewrites?|edits?|implements?)\s+(?:the\s+)?plan\b/gi,
+    "Parent writes Plan",
+  ],
+  [
+    /\b(?:writes?|authors?|rewrites?|edits?)\s+(?:the\s+)?tasks?(?:\s+code)?\b/gi,
+    "Parent writes Task code",
+  ],
+  [
+    /\bimplements?\s+(?:the\s+)?tasks?(?:\s+code)?\b/gi,
+    "Parent implements Task",
+  ],
+  [
+    /\binvoke(?:s|d)?\s+writing-plans\b|\binvoking\s+writing-plans\b/gi,
+    "parent invokes writing-plans (Author must)",
+  ],
+]
+
+function normalizeOwnershipText(text) {
+  return String(text ?? "")
+    .replace(/[*_`~]+/g, "")
+    .replace(/[\t ]+/g, " ")
 }
 
 /**
- * Split a line into independent clauses so prohibition scopes per action.
+ * Decide whether negation immediately governs an ownership action. Earlier
+ * negatives about another verb do not suppress a later affirmative action.
  */
-export function splitPermissionClauses(line) {
-  return String(line ?? "")
-    .split(/;\s*|\.\s+/)
-    .map((c) => c.trim())
-    .filter(Boolean)
+function actionIsProhibited(prefix) {
+  const context = prefix.replace(/\s+/g, " ").trim().toLowerCase()
+  const directNegation =
+    /(?:\b(?:must|may|can|could|should|shall|will|would|do|does|did)\s+not|\bcannot|\bnever|\b(?:do|does|did)n['’]t|\b(?:is|are)\s+forbidden\s+(?:to|from)|\b(?:is|are)\s+not\s+(?:allowed|permitted|authorized)\s+to|不得|禁止|不要|不得亲自)\s*$/i
+  if (directNegation.test(context)) return true
+
+  // Negation can govern a coordinated ownership verb: "must not write or
+  // rewrite the Plan". The intervening verb must itself be ownership-related.
+  return /(?:\b(?:must|may|can|could|should|shall|will|would|do|does|did)\s+not|\bcannot|\bnever|\b(?:do|does|did)n['’]t)\s+(?:write|author|rewrite|edit|implement|invoke)\s+(?:or|and)\s*$/i.test(
+    context
+  )
+}
+
+function findEnglishParentActions(line, found) {
+  const parents = [...line.matchAll(/\bparent\b/gi)]
+  for (let i = 0; i < parents.length; i += 1) {
+    const start = parents[i].index + parents[i][0].length
+    const end = parents[i + 1]?.index ?? line.length
+    const parentSpan = line.slice(start, end)
+
+    for (const [actionRe, label] of PARENT_ACTIONS) {
+      actionRe.lastIndex = 0
+      let action
+      while ((action = actionRe.exec(parentSpan)) !== null) {
+        const prefix = parentSpan.slice(0, action.index)
+        if (!actionIsProhibited(prefix)) {
+          found.push(`parent authorship permission present: ${label}`)
+        }
+      }
+    }
+  }
 }
 
 /**
  * Detect direct Plan/Task authoring or implementation permission statements.
- * Independent of modal verbs. Urgency clauses do not exempt.
- * Prohibition is evaluated per clause, not per whole line.
+ * Independent of modal verbs. Urgency clauses do not exempt. Negation is
+ * evaluated against each matched action instead of a punctuation-based clause.
  */
 export function findParentPermissionViolations(skill) {
   const found = []
-  const lines = skill.split(/\r?\n/)
-
-  // Direct affirmative permission / action patterns (no modal required).
-  const direct = [
-    [
-      /\bparent\s+writes\s+(?:the\s+)?plan\b/i,
-      "Parent writes Plan",
-    ],
-    [
-      /\bparent\s+writes\s+task\s+code\b/i,
-      "Parent writes Task code",
-    ],
-    [
-      /\bparent\s+implements\s+tasks?\b/i,
-      "Parent implements Task",
-    ],
-    [
-      /\bparent\s+(?:authors|rewrites|edits)\s+(?:the\s+)?plan\b/i,
-      "Parent authors/rewrites/edits Plan",
-    ],
-    [
-      /\bparent\s+(?:may|can|should|must)\s+(?:write|author|rewrite|implement|edit)\s+(?:the\s+)?(?:plan|task)\b/i,
-      "parent modal permission to write/implement Plan or Task",
-    ],
-    [
-      /使用\s*`writing-plans`\s*编写任何实施计划/,
-      "parent instructed to invoke writing-plans itself",
-    ],
-    [
-      /\bparent\b[^\n;.]{0,40}\binvoke(?:s|ing)?\s+`?writing-plans`?/i,
-      "parent invokes writing-plans (Author must)",
-    ],
-    [
-      /父会话(?:可以|可|应当|应|必须).*(?:编写|撰写|改写|实现|修复).*(?:计划|Plan|Task|代码)/i,
-      "parent Chinese permission to author Plan/Task",
-    ],
-    [
-      /父会话.*`writing-plans`/,
-      "parent Chinese writing-plans ownership",
-    ],
-  ]
+  const lines = normalizeOwnershipText(skill).split(/\r?\n/)
 
   for (const line of lines) {
     if (!line.trim()) continue
-    const clauses = splitPermissionClauses(line)
-    for (const clause of clauses) {
-      if (clauseIsProhibition(clause)) continue
-      for (const [re, label] of direct) {
-        if (re.test(clause)) {
-          found.push(`parent authorship permission present: ${label}`)
-        }
-      }
+    findEnglishParentActions(line, found)
+
+    if (
+      /使用\s*writing-plans\s*编写任何实施计划/.test(line) &&
+      !/(?:不得|禁止|不要|不得亲自)\s*$/.test(
+        line.slice(0, line.search(/使用\s*writing-plans/))
+      )
+    ) {
+      found.push(
+        "parent authorship permission present: parent instructed to invoke writing-plans itself"
+      )
+    }
+    if (
+      /父会话(?:可以|可|应当|应|必须).*(?:编写|撰写|改写|实现|修复).*(?:计划|Plan|Task|代码)/i.test(
+        line
+      )
+    ) {
+      found.push(
+        "parent authorship permission present: parent Chinese permission to author Plan/Task"
+      )
+    }
+    if (/父会话.*writing-plans/.test(line) && !/父会话.*(?:不得|禁止|不要)/.test(line)) {
+      found.push(
+        "parent authorship permission present: parent Chinese writing-plans ownership"
+      )
     }
   }
 

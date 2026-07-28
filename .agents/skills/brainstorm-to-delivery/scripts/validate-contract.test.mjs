@@ -463,6 +463,117 @@ Parent must not wait; Parent writes Task code when urgency requires it.
     )
   })
 
+  it("rejects the exact comma-but Task-writing mutation", () => {
+    const violations = findParentPermissionViolations(
+      "Parent must not wait, but Parent writes Task code when urgency requires it"
+    )
+    assert.ok(
+      violations.some((v) => /Task code/i.test(v)),
+      `comma-but permission must fail; got: ${violations.join("; ")}`
+    )
+  })
+
+  it("rejects the exact and-joined Task-writing mutation", () => {
+    const violations = findParentPermissionViolations(
+      "Parent must not wait and Parent writes Task code when urgency requires it"
+    )
+    assert.ok(
+      violations.some((v) => /Task code/i.test(v)),
+      `and-joined permission must fail; got: ${violations.join("; ")}`
+    )
+  })
+
+  it("rejects the exact optional-article Task-writing mutation", () => {
+    const violations = findParentPermissionViolations(
+      "Parent writes the Task code when urgency requires it"
+    )
+    assert.ok(
+      violations.some((v) => /Task code/i.test(v)),
+      `optional-article Task write must fail; got: ${violations.join("; ")}`
+    )
+  })
+
+  it("rejects the exact optional-article Task-implementation mutation", () => {
+    const violations = findParentPermissionViolations(
+      "Parent implements the Task when urgency requires it"
+    )
+    assert.ok(
+      violations.some((v) => /implements Task/i.test(v)),
+      `optional-article Task implementation must fail; got: ${violations.join("; ")}`
+    )
+  })
+
+  it("does not use punctuation boundaries to scope unrelated negatives", () => {
+    const mutations = [
+      "Parent must not wait, Parent writes Task code",
+      "Parent must not wait: Parent writes Task code",
+      "Parent must not wait - Parent writes Task code",
+      "Parent must not wait / Parent writes Task code",
+    ]
+
+    for (const mutation of mutations) {
+      const violations = findParentPermissionViolations(mutation)
+      assert.ok(
+        violations.some((v) => /Task code/i.test(v)),
+        `unrelated negative must not mask ${JSON.stringify(mutation)}; got: ${violations.join("; ")}`
+      )
+    }
+  })
+
+  it("allows negation that governs the matched ownership action", () => {
+    const prohibitions = [
+      "Parent must not write the Task code",
+      "Parent does not implement the Task",
+      "Parent never writes the Plan",
+      "Parent must not invoke `writing-plans`",
+    ]
+
+    for (const prohibition of prohibitions) {
+      assert.deepEqual(
+        findParentPermissionViolations(prohibition),
+        [],
+        `relevant prohibition must pass: ${prohibition}`
+      )
+    }
+  })
+
+  it("detects every ownership action after an unrelated negative", () => {
+    const mutations = [
+      ["Parent must not wait: Parent writes the Plan", /writes Plan/i],
+      ["Parent must not wait, but Parent authors the Plan", /authors/i],
+      ["Parent must not wait - Parent implements the Task", /implements Task/i],
+      [
+        "Parent must not wait and Parent invokes `writing-plans`",
+        /writing-plans/i,
+      ],
+    ]
+
+    for (const [mutation, expected] of mutations) {
+      const violations = findParentPermissionViolations(mutation)
+      assert.ok(
+        violations.some((v) => expected.test(v)),
+        `expected ${expected} for ${JSON.stringify(mutation)}; got: ${violations.join("; ")}`
+      )
+    }
+  })
+
+  it("accepts whitespace and Markdown emphasis without losing action scope", () => {
+    const violations = findParentPermissionViolations(
+      "**Parent**   writes   **the**   Task code"
+    )
+    assert.ok(
+      violations.some((v) => /Task code/i.test(v)),
+      `emphasized affirmative permission must fail; got: ${violations.join("; ")}`
+    )
+
+    assert.deepEqual(
+      findParentPermissionViolations(
+        "**Parent** must **not** write **the** Task code"
+      ),
+      []
+    )
+  })
+
   it("passes clean Author-owned skill without parent write permission", () => {
     const skill = baseValidSkill()
     const { failures } = validateParentOwnership(skill)
