@@ -2584,6 +2584,25 @@
         "openSession": "Unterhaltung öffnen",
         "estimatedNonActionable": "Geschätzt — noch keine Sitzung",
         "optionalReviewer": "Optional",
+        "reviewerCohort": "Prüfergruppe",
+        "riskLevel": {
+          "normal": "Normales Risiko",
+          "high": "Hohes Risiko"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "Nebenläufigkeit oder Lebenszyklus",
+          "security_trust_boundary": "Sicherheits- oder Vertrauensgrenze",
+          "migration_destructive_persistence": "Migration oder destruktive Persistenz",
+          "public_compatibility": "Öffentliche Kompatibilität",
+          "unsafe_ffi": "Unsicheres FFI",
+          "update_rollback": "Update oder Rollback",
+          "cross_runtime_or_process": "Laufzeit- oder Prozessgrenze",
+          "broad_production_surface": "Breite Produktionsoberfläche",
+          "multiple_ownership_modules": "Mehrere Zuständigkeitsmodule",
+          "shared_interface": "Gemeinsame Schnittstelle",
+          "dependency_or_build": "Abhängigkeit oder Build",
+          "multi_layer_without_test_seam": "Mehrere Schichten ohne Testgrenze"
+        },
         "roleLabel": "Rolle: {role}",
         "agentLabel": "Agent: {agent}",
         "currentWork": "Aktuell: {title}",

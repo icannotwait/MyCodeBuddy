@@ -2584,6 +2584,25 @@
         "openSession": "会話を開く",
         "estimatedNonActionable": "推定ノード — セッションなし",
         "optionalReviewer": "任意",
+        "reviewerCohort": "レビュー担当グループ",
+        "riskLevel": {
+          "normal": "通常リスク",
+          "high": "高リスク"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "並行処理またはライフサイクル",
+          "security_trust_boundary": "セキュリティまたは信頼境界",
+          "migration_destructive_persistence": "移行または破壊的な永続化",
+          "public_compatibility": "公開互換性",
+          "unsafe_ffi": "安全でない FFI",
+          "update_rollback": "更新またはロールバック",
+          "cross_runtime_or_process": "ランタイム間またはプロセス間",
+          "broad_production_surface": "広範な本番影響範囲",
+          "multiple_ownership_modules": "複数の担当モジュール",
+          "shared_interface": "共有インターフェース",
+          "dependency_or_build": "依存関係またはビルド",
+          "multi_layer_without_test_seam": "テスト境界のない複数レイヤー"
+        },
         "roleLabel": "役割: {role}",
         "agentLabel": "エージェント: {agent}",
         "currentWork": "現在: {title}",

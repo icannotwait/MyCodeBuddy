@@ -56,6 +56,14 @@ export type PhaseRailItem = {
     blocked: number
   } | null
   taskProgress: { current: number; total: number } | null
+  nodeRows: WorkflowNodeRow[]
+}
+
+export type WorkflowNodeRow = {
+  id: string
+  taskIndex: number | null
+  nodes: WorkflowNodeSnapshot[]
+  reviewerProgress: { returned: number; required: number } | null
 }
 
 type ConversationGraphEntry = {
@@ -528,6 +536,122 @@ function phaseHasActive(nodes: WorkflowNodeSnapshot[]): boolean {
   )
 }
 
+function reviewerProgressForNodes(
+  nodes: WorkflowNodeSnapshot[]
+): WorkflowNodeRow["reviewerProgress"] {
+  const source = nodes.find(
+    (node) =>
+      node.required_reviewer_count != null &&
+      node.returned_reviewer_count != null
+  )
+  if (!source) return null
+
+  const required = source.required_reviewer_count as number
+  const returned = source.returned_reviewer_count as number
+  if (
+    !Number.isSafeInteger(required) ||
+    !Number.isSafeInteger(returned) ||
+    required < 0 ||
+    returned < 0
+  ) {
+    return null
+  }
+
+  return {
+    returned: Math.min(returned, required),
+    required,
+  }
+}
+
+function orderedCohort(
+  nodes: WorkflowNodeSnapshot[],
+  primaryRole: "author" | "implementer"
+): WorkflowNodeSnapshot[] {
+  const primary = nodes.filter((node) => node.role === primaryRole)
+  const reviewers = nodes.filter((node) => node.role === "reviewer")
+  const remaining = nodes.filter(
+    (node) => node.role !== primaryRole && node.role !== "reviewer"
+  )
+  return [...primary, ...reviewers, ...remaining]
+}
+
+/** Stable graph rows; source order is the authoritative reviewer policy order. */
+export function buildWorkflowNodeRows(
+  nodes: WorkflowNodeSnapshot[],
+  phaseKind: PhaseRailKind
+): WorkflowNodeRow[] {
+  if (phaseKind === "tasks") {
+    const indexed = new Map<number, WorkflowNodeSnapshot[]>()
+    const unindexed: WorkflowNodeSnapshot[] = []
+
+    for (const node of nodes) {
+      if (node.task_index == null) {
+        unindexed.push(node)
+        continue
+      }
+      const cohort = indexed.get(node.task_index) ?? []
+      cohort.push(node)
+      indexed.set(node.task_index, cohort)
+    }
+
+    const rows = Array.from(indexed.entries())
+      .sort(([left], [right]) => left - right)
+      .map(([taskIndex, cohort]) => {
+        const ordered = orderedCohort(cohort, "implementer")
+        return {
+          id: `tasks-${taskIndex}`,
+          taskIndex,
+          nodes: ordered,
+          reviewerProgress: reviewerProgressForNodes(ordered),
+        }
+      })
+
+    return [
+      ...rows,
+      ...unindexed.map((node) => ({
+        id: `tasks-${node.node_id}`,
+        taskIndex: null,
+        nodes: [node],
+        reviewerProgress: null,
+      })),
+    ]
+  }
+
+  if (phaseKind === "plan") {
+    const cohort = nodes.filter(
+      (node) => node.role === "author" || node.role === "reviewer"
+    )
+    const remaining = nodes.filter(
+      (node) => node.role !== "author" && node.role !== "reviewer"
+    )
+    const rows: WorkflowNodeRow[] = []
+    if (cohort.length > 0) {
+      rows.push({
+        id: "plan",
+        taskIndex: null,
+        nodes: orderedCohort(cohort, "author"),
+        reviewerProgress: null,
+      })
+    }
+    rows.push(
+      ...remaining.map((node) => ({
+        id: `plan-${node.node_id}`,
+        taskIndex: null,
+        nodes: [node],
+        reviewerProgress: null,
+      }))
+    )
+    return rows
+  }
+
+  return nodes.map((node) => ({
+    id: `${phaseKind}-${node.node_id}`,
+    taskIndex: null,
+    nodes: [node],
+    reviewerProgress: null,
+  }))
+}
+
 export function buildPhaseRail(
   snapshot: WorkflowGraphSnapshot
 ): PhaseRailItem[] {
@@ -586,6 +710,7 @@ export function buildPhaseRail(
       status,
       gate: compactRequiredGateCounts(snapshot, kind),
       taskProgress,
+      nodeRows: buildWorkflowNodeRows(nodes, kind),
     }
   })
 }

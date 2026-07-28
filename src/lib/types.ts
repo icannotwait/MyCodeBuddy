@@ -722,6 +722,10 @@ export interface WorkflowNodeSnapshot {
   agent_type?: string | null
   profile_id?: string | null
   task_index?: number | null
+  task_risk_level?: "normal" | "high" | null
+  task_risk_reason_codes: string[]
+  required_reviewer_count?: number | null
+  returned_reviewer_count?: number | null
   title?: string | null
   status: ProjectedNodeStatus
   status_reason?: string | null

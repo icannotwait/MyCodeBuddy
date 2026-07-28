@@ -2584,6 +2584,25 @@
         "openSession": "대화 열기",
         "estimatedNonActionable": "예상 노드 — 세션 없음",
         "optionalReviewer": "선택",
+        "reviewerCohort": "검토자 그룹",
+        "riskLevel": {
+          "normal": "일반 위험",
+          "high": "고위험"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "동시성 또는 수명 주기",
+          "security_trust_boundary": "보안 또는 신뢰 경계",
+          "migration_destructive_persistence": "마이그레이션 또는 파괴적 영속성",
+          "public_compatibility": "공개 호환성",
+          "unsafe_ffi": "안전하지 않은 FFI",
+          "update_rollback": "업데이트 또는 롤백",
+          "cross_runtime_or_process": "런타임 또는 프로세스 간",
+          "broad_production_surface": "광범위한 프로덕션 영향",
+          "multiple_ownership_modules": "여러 담당 모듈",
+          "shared_interface": "공유 인터페이스",
+          "dependency_or_build": "종속성 또는 빌드",
+          "multi_layer_without_test_seam": "테스트 경계가 없는 다중 계층"
+        },
         "roleLabel": "역할: {role}",
         "agentLabel": "에이전트: {agent}",
         "currentWork": "현재: {title}",

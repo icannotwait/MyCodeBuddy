@@ -2584,6 +2584,25 @@
         "openSession": "فتح المحادثة",
         "estimatedNonActionable": "مقدّر — لا توجد جلسة بعد",
         "optionalReviewer": "اختياري",
+        "reviewerCohort": "مجموعة المراجعين",
+        "riskLevel": {
+          "normal": "مخاطر عادية",
+          "high": "مخاطر عالية"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "التزامن أو دورة الحياة",
+          "security_trust_boundary": "حدود الأمان أو الثقة",
+          "migration_destructive_persistence": "الترحيل أو التخزين الدائم التدميري",
+          "public_compatibility": "التوافق العام",
+          "unsafe_ffi": "واجهة FFI غير آمنة",
+          "update_rollback": "التحديث أو التراجع",
+          "cross_runtime_or_process": "عبر بيئات التشغيل أو العمليات",
+          "broad_production_surface": "نطاق إنتاج واسع",
+          "multiple_ownership_modules": "وحدات مسؤولية متعددة",
+          "shared_interface": "واجهة مشتركة",
+          "dependency_or_build": "التبعية أو البناء",
+          "multi_layer_without_test_seam": "طبقات متعددة دون نقطة اختبار"
+        },
         "roleLabel": "الدور: {role}",
         "agentLabel": "الوكيل: {agent}",
         "currentWork": "الحالي: {title}",

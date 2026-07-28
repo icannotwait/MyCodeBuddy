@@ -1,9 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
+import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
 import { __resetWorkflowGraphStoreForTests } from "@/lib/workflow-graph-store"
 
@@ -50,6 +52,10 @@ function node(
     agent_type: null,
     profile_id: null,
     task_index: null,
+    task_risk_level: null,
+    task_risk_reason_codes: [],
+    required_reviewer_count: null,
+    returned_reviewer_count: null,
     title: overrides.node_id,
     status: "estimated",
     status_reason: null,
@@ -139,6 +145,107 @@ function skeletonGraph(): WorkflowGraphSnapshot {
   }
 }
 
+function adaptiveTaskGraph(
+  returnedReviewerCount: number,
+  riskLevel: "normal" | "high" = "high"
+): WorkflowGraphSnapshot {
+  const reviewerCount = riskLevel === "high" ? 2 : 1
+  const reviewers = [
+    node({
+      node_id: "task-review-grok",
+      phase_id: "tasks",
+      role: "reviewer",
+      task_index: 1,
+      status: "completed",
+      title: "Grok reviewer with a deliberately long operational title",
+      agent_type: "grok",
+      is_observed: true,
+      latest_child_conversation_id: 92,
+      task_risk_level: riskLevel,
+      task_risk_reason_codes:
+        riskLevel === "high"
+          ? ["security_trust_boundary", "shared_interface"]
+          : ["shared_interface"],
+      required_reviewer_count: reviewerCount,
+      returned_reviewer_count: returnedReviewerCount,
+    }),
+    ...(riskLevel === "high"
+      ? [
+          node({
+            node_id: "task-review-codex",
+            phase_id: "tasks",
+            role: "reviewer",
+            task_index: 1,
+            status: returnedReviewerCount === 2 ? "completed" : "running",
+            title: "Codex reviewer",
+            agent_type: "codex",
+            is_observed: true,
+            latest_child_conversation_id: 93,
+            task_risk_level: riskLevel,
+            task_risk_reason_codes: [
+              "security_trust_boundary",
+              "shared_interface",
+            ],
+            required_reviewer_count: reviewerCount,
+            returned_reviewer_count: returnedReviewerCount,
+          }),
+        ]
+      : []),
+  ]
+
+  return {
+    ...skeletonGraph(),
+    schema_version: 2,
+    graph_revision: returnedReviewerCount + 1,
+    current_phase_id: "tasks",
+    current_node_ids:
+      returnedReviewerCount === reviewerCount ? [] : ["task-review-codex"],
+    nodes: [
+      node({
+        node_id: "plan-review-grok",
+        phase_id: "plan",
+        role: "reviewer",
+        title: "Plan reviewer",
+      }),
+      node({
+        node_id: "plan-author",
+        phase_id: "plan",
+        role: "author",
+        title: "Plan Author",
+      }),
+      node({
+        node_id: "task-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+        title: "Adaptive routing implementation",
+        is_observed: true,
+        latest_child_conversation_id: 91,
+        task_risk_level: riskLevel,
+        task_risk_reason_codes:
+          riskLevel === "high"
+            ? [
+                "security_trust_boundary",
+                "shared_interface",
+                "src/security-boundary.ts",
+              ]
+            : ["shared_interface"],
+        required_reviewer_count: reviewerCount,
+        returned_reviewer_count: returnedReviewerCount,
+        ...({
+          task_risk_reason:
+            "Touches D:/private/project/src/security-boundary.ts",
+          task_risk_evidence: ["src/security-boundary.ts"],
+        } as Record<string, unknown>),
+      }),
+      ...reviewers,
+    ],
+    edges: [],
+    gates: [],
+  }
+}
+
 function renderWithIntl(ui: React.ReactElement) {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -149,6 +256,7 @@ function renderWithIntl(ui: React.ReactElement) {
 
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
+  vi.mocked(openDelegatedChildSession).mockClear()
 })
 
 describe("SubAgentOverlay A13 workflow mount", () => {
@@ -263,5 +371,135 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       screen.getByTestId("workflow-node-replacement-count")
     ).toHaveTextContent("0")
     expect(screen.getByTestId("workflow-node-b12")).toBeInTheDocument()
+  })
+
+  it("renders one normal-risk Task row with one reviewer branch", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={43}
+        workflowGraph={adaptiveTaskGraph(1, "normal")}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    const row = screen.getByTestId("workflow-graph-row-tasks-1")
+    expect(row).toHaveAttribute("data-reviewer-count", "1")
+    expect(screen.getAllByTestId(/^workflow-task-reviewer-node-/)).toHaveLength(
+      1
+    )
+    expect(
+      screen.getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("1 / 1")
+    fireEvent.click(screen.getByTestId("workflow-graph-node-task-impl"))
+    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
+      "Normal risk"
+    )
+  })
+
+  it("renders a high-risk reviewer fan-out and updates returned count", () => {
+    const graph = adaptiveTaskGraph(1)
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={44}
+        workflowGraph={graph}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    const row = screen.getByTestId("workflow-graph-row-tasks-1")
+    expect(row).toHaveAttribute("data-reviewer-count", "2")
+    expect(screen.getAllByTestId(/^workflow-task-reviewer-node-/)).toHaveLength(
+      2
+    )
+    expect(
+      screen.getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("1 / 2")
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={44}
+          workflowGraph={adaptiveTaskGraph(2)}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+    expect(
+      screen.getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("2 / 2")
+  })
+
+  it("shows localized risk metadata without free-form evidence paths", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={45}
+        workflowGraph={adaptiveTaskGraph(1)}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    fireEvent.click(screen.getByTestId("workflow-graph-node-task-impl"))
+
+    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
+      "High risk"
+    )
+    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
+      "Security or trust boundary"
+    )
+    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
+      "Shared interface"
+    )
+    expect(screen.queryByText(/security-boundary\.ts/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/Touches D:\/private\/project/i)
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps plan and Task cohorts ordered, keyboard-accessible, and contained", async () => {
+    const user = userEvent.setup()
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={46}
+        workflowGraph={adaptiveTaskGraph(1)}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    const planRow = screen.getByTestId("workflow-graph-row-plan")
+    const planNodes = planRow.querySelectorAll("button")
+    expect(planNodes[0]).toHaveAttribute(
+      "data-testid",
+      "workflow-graph-node-plan-author"
+    )
+    expect(planNodes[1]).toHaveAttribute(
+      "data-testid",
+      "workflow-graph-node-plan-review-grok"
+    )
+
+    const taskRow = screen.getByTestId("workflow-graph-row-tasks-1")
+    expect(taskRow).toHaveClass("min-w-0", "overflow-hidden")
+    expect(screen.getByTestId("workflow-task-reviewers-1")).toHaveClass(
+      "min-w-0"
+    )
+
+    const reviewer = screen.getByTestId("workflow-graph-node-task-review-codex")
+    reviewer.focus()
+    await user.keyboard("{Enter}")
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({ childConversationId: 93 })
+    )
   })
 })

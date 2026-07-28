@@ -107,6 +107,10 @@ function node(
     agent_type: null,
     profile_id: null,
     task_index: null,
+    task_risk_level: null,
+    task_risk_reason_codes: [],
+    required_reviewer_count: null,
+    returned_reviewer_count: null,
     title: overrides.node_id,
     status: "estimated",
     status_reason: null,
@@ -527,6 +531,206 @@ describe("task position (implementer-only / distinct task_index)", () => {
       current: 1,
       total: 2,
     })
+  })
+})
+
+describe("deterministic workflow lane rows", () => {
+  it("keeps one Task row for an implementer and one reviewer", () => {
+    const rail = buildPhaseRail(
+      baseSnapshot({
+        current_phase_id: "tasks",
+        current_node_ids: ["task-1-review"],
+        nodes: [
+          node({
+            node_id: "task-1-impl",
+            phase_id: "tasks",
+            role: "implementer",
+            task_index: 1,
+            status: "completed",
+            task_risk_level: "normal",
+            required_reviewer_count: 1,
+            returned_reviewer_count: 0,
+          }),
+          node({
+            node_id: "task-1-review",
+            phase_id: "tasks",
+            role: "reviewer",
+            task_index: 1,
+            status: "running",
+            task_risk_level: "normal",
+            required_reviewer_count: 1,
+            returned_reviewer_count: 0,
+          }),
+        ],
+        gates: [],
+      })
+    )
+
+    const tasks = rail.find((phase) => phase.kind === "tasks")
+    expect(tasks?.nodeRows).toHaveLength(1)
+    expect(tasks?.nodeRows[0].nodes.map((item) => item.node_id)).toEqual([
+      "task-1-impl",
+      "task-1-review",
+    ])
+    expect(tasks?.nodeRows[0].reviewerProgress).toEqual({
+      returned: 0,
+      required: 1,
+    })
+  })
+
+  it("preserves policy order for a two-reviewer Task cohort", () => {
+    const nodes = [
+      node({
+        node_id: "task-2-grok",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 2,
+        status: "completed",
+        task_risk_level: "high",
+        required_reviewer_count: 2,
+        returned_reviewer_count: 1,
+      }),
+      node({
+        node_id: "task-2-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 2,
+        status: "completed",
+        task_risk_level: "high",
+        required_reviewer_count: 2,
+        returned_reviewer_count: 1,
+      }),
+      node({
+        node_id: "task-2-codex",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 2,
+        status: "running",
+        task_risk_level: "high",
+        required_reviewer_count: 2,
+        returned_reviewer_count: 1,
+      }),
+    ]
+    const tasks = buildPhaseRail(
+      baseSnapshot({
+        current_phase_id: "tasks",
+        current_node_ids: ["task-2-codex"],
+        nodes,
+        gates: [],
+      })
+    ).find((phase) => phase.kind === "tasks")
+
+    expect(tasks?.taskProgress).toEqual({ current: 1, total: 1 })
+    expect(tasks?.nodeRows).toHaveLength(1)
+    expect(tasks?.nodeRows[0].nodes.map((item) => item.node_id)).toEqual([
+      "task-2-impl",
+      "task-2-grok",
+      "task-2-codex",
+    ])
+    expect(tasks?.nodeRows[0].reviewerProgress).toEqual({
+      returned: 1,
+      required: 2,
+    })
+  })
+
+  it("holds progress on an earlier Task until both reviewers return", () => {
+    const nodes = [
+      node({
+        node_id: "task-1-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "task-1-review-a",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "task-1-review-b",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 1,
+        status: "running",
+      }),
+      node({
+        node_id: "task-2-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 2,
+        status: "running",
+      }),
+    ]
+
+    expect(computeTaskPhaseProgress(nodes, ["task-2-impl"])).toEqual({
+      current: 1,
+      total: 2,
+    })
+  })
+
+  it("places the Plan Author before its reviewer cohort", () => {
+    const plan = buildPhaseRail(
+      baseSnapshot({
+        nodes: [
+          node({
+            node_id: "plan-review-grok",
+            phase_id: "plan",
+            role: "reviewer",
+          }),
+          node({
+            node_id: "plan-author",
+            phase_id: "plan",
+            role: "author",
+          }),
+          node({
+            node_id: "plan-review-codex",
+            phase_id: "plan",
+            role: "reviewer",
+          }),
+        ],
+      })
+    ).find((phase) => phase.kind === "plan")
+
+    expect(plan?.nodeRows).toHaveLength(1)
+    expect(plan?.nodeRows[0].nodes.map((item) => item.node_id)).toEqual([
+      "plan-author",
+      "plan-review-grok",
+      "plan-review-codex",
+    ])
+  })
+
+  it("does not invent reviewer counts for older observed-only snapshots", () => {
+    const tasks = buildPhaseRail(
+      baseSnapshot({
+        schema_version: 1,
+        compatibility: "observed_only",
+        nodes: [
+          node({
+            node_id: "observed-impl",
+            phase_id: "tasks",
+            role: "implementer",
+            task_index: 1,
+            status: "completed",
+            is_observed: true,
+          }),
+          node({
+            node_id: "observed-review",
+            phase_id: "tasks",
+            role: "reviewer",
+            task_index: 1,
+            status: "completed",
+            is_observed: true,
+          }),
+        ],
+        gates: [],
+      })
+    ).find((phase) => phase.kind === "tasks")
+
+    expect(tasks?.nodeRows).toHaveLength(1)
+    expect(tasks?.nodeRows[0].reviewerProgress).toBeNull()
   })
 })
 

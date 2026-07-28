@@ -2584,6 +2584,25 @@
         "openSession": "Open conversation",
         "estimatedNonActionable": "Estimated — no session yet",
         "optionalReviewer": "Optional",
+        "reviewerCohort": "Reviewer cohort",
+        "riskLevel": {
+          "normal": "Normal risk",
+          "high": "High risk"
+        },
+        "riskReason": {
+          "concurrency_lifecycle": "Concurrency or lifecycle",
+          "security_trust_boundary": "Security or trust boundary",
+          "migration_destructive_persistence": "Migration or destructive persistence",
+          "public_compatibility": "Public compatibility",
+          "unsafe_ffi": "Unsafe FFI",
+          "update_rollback": "Update or rollback",
+          "cross_runtime_or_process": "Cross-runtime or process",
+          "broad_production_surface": "Broad production surface",
+          "multiple_ownership_modules": "Multiple ownership modules",
+          "shared_interface": "Shared interface",
+          "dependency_or_build": "Dependency or build",
+          "multi_layer_without_test_seam": "Multiple layers without a test seam"
+        },
         "roleLabel": "Role: {role}",
         "agentLabel": "Agent: {agent}",
         "currentWork": "Current: {title}",
