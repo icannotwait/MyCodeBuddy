@@ -12,6 +12,7 @@ import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { isHomeRelativePath } from "@/lib/file-open-target"
 import { isAbsoluteFilePath } from "@/lib/file-path-display"
+import { isLocalPathLike } from "@/lib/markdown/local-path-links"
 import { cn } from "@/lib/utils"
 
 interface LocalFileTarget {
@@ -96,22 +97,6 @@ function splitPathAndLine(rawPath: string): LocalFileTarget {
   }
 
   return { path: maybePath, line }
-}
-
-function isLocalPathLike(path: string): boolean {
-  // "//host/…" (forward slashes) is protocol-relative — a WEB url, not a
-  // local path. It must fall through to the external-URL route, never into
-  // local file IO. A "\\server\share" (backslashes) IS a local UNC path
-  // (a web url never uses backslashes) — the form remark-file-uri-links
-  // emits for file://server/share URIs.
-  return (
-    (path.startsWith("/") && !path.startsWith("//")) ||
-    path.startsWith("\\\\") ||
-    path.startsWith("./") ||
-    path.startsWith("../") ||
-    path.startsWith("~/") ||
-    WINDOWS_ABSOLUTE_PATH.test(path)
-  )
 }
 
 function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {

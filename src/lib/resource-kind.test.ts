@@ -26,9 +26,17 @@ describe("classifyResourceKind", () => {
     ["./relative.md", "file"],
     ["../up/one.md", "file"],
     ["~/home/config.toml", "file"],
+    // Bare relative with whitelisted extension / location suffix (shared gate)
+    ["src/main.rs", "file"],
+    ["docs/a.md", "file"],
+    ["docs/a.md:12", "file"],
+    ["docs/a.md#L12", "file"],
+    // Explicit relative stays openable even without extension
+    ["./src/app", "file"],
     // Protocol-relative URLs resolve against the page protocol — link-safety
     // routes them to the browser, so the web icon matches that behavior.
     ["//cdn.example.com/app.js", "web"],
+    ["//cdn.example.com/a.md", "web"],
     // Web
     ["http://example.com", "web"],
     ["https://example.com/docs?q=1#frag", "web"],
@@ -48,10 +56,12 @@ describe("classifyResourceKind", () => {
     ["streamdown:incomplete-link"],
     // in-page fragment
     ["#section"],
-    // bare-relative targets the click handler can't resolve
-    ["src/main.rs"],
+    // bare-relative without separator / extension gate fails
+    ["src/app"],
     ["README.md"],
+    ["README.md:12"],
     ["www.example.com"],
+    ["www.example.com/docs/a.md"],
     // "name.ext:line" parses as a (bogus) scheme, matching link-safety which
     // also declines to open it
     ["app.ts:12"],

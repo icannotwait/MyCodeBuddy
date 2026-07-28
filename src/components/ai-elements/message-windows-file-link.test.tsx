@@ -195,22 +195,25 @@ describe("MessageResponse — Windows local file links (issue #362, real Streamd
 
   it("documents the known UNC end-to-end limitation (out of scope for #362)", async () => {
     // remark rewrites file://server/share/doc.md to the backslash UNC form
-    // `\\server\share\doc.md` (the correct LOCAL signal for link-safety). But
-    // rehype-harden re-parses hrefs with `new URL` and only retries relatives
-    // starting with `/` `./` `../`, so a backslash href fails to parse and is
-    // blocked — while a forward-slash `//server/share` would be collapsed to a
-    // hostless `/share/…` (losing the server). UNC therefore can't be expressed
-    // as a harden-surviving relative URL without inventing a scheme, which #362
-    // forbids. This test pins the CURRENT behavior so a future UNC fix updates
-    // it deliberately. The remark layer + the click routing of the backslash
-    // form stay covered by their own unit tests (no regression there).
+    // `\\server\share\doc.md` (the correct LOCAL signal for link-safety).
+    // rehype-harden alone would block bare-backslash hrefs (only `/` `./` `../`
+    // relatives are retried), but our harden wrapper preserves isLocalPathLike
+    // hrefs — including raw UNC — so the link is no longer replaced with
+    // `[blocked]`. The remaining gap is encoding: remark/rehype percent-encodes
+    // the backslashes (`%5C%5Cserver…`), so classifyResourceKind does not see a
+    // raw UNC prefix and the chip is not a file badge. Forward-slash
+    // `//server/share` would still collapse to a hostless path. Full UNC
+    // end-to-end open remains out of scope; remark + click routing of the raw
+    // backslash form stay covered by unit tests.
     const { container } = render(
       <MessageResponse>{"[doc](file://server/share/doc.md)"}</MessageResponse>
     )
 
     await waitFor(() => {
-      expect(container.textContent).toContain("[blocked]")
+      expect(container.textContent).toContain("doc")
+      expect(container.textContent).not.toContain("[blocked]")
     })
+    // Not a file chip: encoded backslashes lose the raw UNC openability signal.
     expect(container.querySelector("button[data-resource-kind]")).toBeNull()
     expect(mocks.openFilePreview).not.toHaveBeenCalled()
   })

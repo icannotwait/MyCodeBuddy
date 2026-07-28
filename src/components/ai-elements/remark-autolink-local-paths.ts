@@ -1,5 +1,5 @@
 import {
-  findAbsoluteLocalPathRanges,
+  findLocalPathRanges,
   toSafeLocalPathHref,
 } from "@/lib/markdown/local-path-links"
 
@@ -48,7 +48,7 @@ function linkifyTextNode(
 ): MdastNodeLike[] {
   if (typeof node.value !== "string") return [node]
   if (!hasExactSourceMapping(node, source)) return [node]
-  const matches = findAbsoluteLocalPathRanges(node.value)
+  const matches = findLocalPathRanges(node.value)
   if (matches.length === 0) return [node]
 
   const replacement: MdastNodeLike[] = []

@@ -171,4 +171,118 @@ describe("MessageResponse local-path autolinking", () => {
       container.querySelector("[data-reference-badge][data-ref-type='file']")
     ).toBeNull()
   })
+
+  it("autolinks bare relative prose when enabled and opens via openFilePreview", async () => {
+    const rel =
+      "docs/superpowers/plans/2026-07-27-empty-folder-workspace-visibility.md"
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>{`see ${rel} now`}</MessageResponse>
+    )
+    const button = await waitFor(() => {
+      const el = container.querySelector<HTMLButtonElement>(
+        "button[data-resource-kind='file']"
+      )
+      expect(el).not.toBeNull()
+      return el!
+    })
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(rel, {
+        line: undefined,
+      })
+    })
+  })
+
+  it.each([
+    ["./src/a.ts", "src/a.ts"],
+    ["../plans/x.md", "../plans/x.md"],
+  ])("opens relative prose %s as %s", async (prose, expectedPath) => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>{`see ${prose} now`}</MessageResponse>
+    )
+    const button = await waitFor(() => {
+      const el = container.querySelector<HTMLButtonElement>(
+        "button[data-resource-kind='file']"
+      )
+      expect(el).not.toBeNull()
+      return el!
+    })
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(expectedPath, {
+        line: undefined,
+      })
+    })
+  })
+
+  it("does not autolink relative prose when flag off", async () => {
+    const { container } = render(
+      <MessageResponse>{"see docs/a.md now"}</MessageResponse>
+    )
+    await waitFor(() => expect(container.textContent).toContain("docs/a.md"))
+    expect(
+      container.querySelector("[data-reference-badge][data-ref-type='file']")
+    ).toBeNull()
+  })
+
+  it("does not autolink relative path in inline code", async () => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>{"`docs/a.md`"}</MessageResponse>
+    )
+    await waitFor(() => expect(container.querySelector("code")).not.toBeNull())
+    expect(
+      container.querySelector("[data-reference-badge][data-ref-type='file']")
+    ).toBeNull()
+  })
+
+  it("opens explicit bare relative markdown link [x](docs/a.md)", async () => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>{"[x](docs/a.md)"}</MessageResponse>
+    )
+    const button = await waitFor(() => {
+      const el = container.querySelector<HTMLButtonElement>(
+        "button[data-resource-kind='file']"
+      )
+      expect(el).not.toBeNull()
+      return el!
+    })
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("docs/a.md", {
+        line: undefined,
+      })
+    })
+  })
+
+  it("keeps extensionless explicit relative markdown [app](./src/app) as file", async () => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>{"[app](./src/app)"}</MessageResponse>
+    )
+    await waitFor(() => {
+      expect(
+        container.querySelector("button[data-resource-kind='file']")
+      ).not.toBeNull()
+    })
+  })
+
+  it("quoted relative with spaces and line suffix round-trips", async () => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>
+        {'see "docs/My File.md:12" now'}
+      </MessageResponse>
+    )
+    const button = await waitFor(() => {
+      const el = container.querySelector<HTMLButtonElement>(
+        "button[data-resource-kind='file']"
+      )
+      expect(el).not.toBeNull()
+      return el!
+    })
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("docs/My File.md", {
+        line: 12,
+      })
+    })
+  })
 })

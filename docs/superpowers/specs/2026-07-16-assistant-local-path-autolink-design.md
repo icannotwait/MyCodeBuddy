@@ -60,6 +60,8 @@ handler remain the only presentation and navigation path.
 
 - Home-relative (`~/...`), UNC, explicitly relative (`./...`, `../...`), or
   bare relative (`src/app.ts`) paths.
+  > Relative workspace-path autolinking is specified in
+  > `docs/superpowers/specs/2026-07-27-assistant-relative-path-autolink-design.md`.
 - Paths embedded in inline code, fenced code, or raw HTML.
 - Paths whose Markdown source is not a one-to-one text-node slice, including
   Windows separators consumed as CommonMark escapes before punctuation such as
