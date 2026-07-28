@@ -790,6 +790,82 @@ describe("DelegatedSubThread", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("renders one sticky work-unit card with stats aggregated across runs", () => {
+    const stats = (startedAt: string, toolCallCount: number) => ({
+      started_at: startedAt,
+      tool_call_count: toolCallCount,
+      edit_tool_call_count: 0,
+      touched_files: [],
+      touched_files_truncated: false,
+      line_counts_complete: false,
+    })
+    const firstStartedAt = "2026-07-27T00:00:00.000Z"
+    const secondStartedAt = "2026-07-27T00:05:00.000Z"
+    const workUnitSources = [
+      {
+        parentToolUseId: "pt-1",
+        parentConversationId: 10,
+        input: JSON.stringify({
+          agent_type: "codex",
+          task: "First run",
+          work_unit_key: "unit-a",
+        }),
+        meta: {
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-1",
+            child_conversation_id: 99,
+            started_at: firstStartedAt,
+            finished_at: secondStartedAt,
+            runtime_stats: {
+              ...stats(firstStartedAt, 5),
+              finished_at: secondStartedAt,
+            },
+          },
+        },
+      },
+      {
+        parentToolUseId: "pt-2",
+        parentConversationId: 10,
+        input: JSON.stringify({
+          agent_type: "codex",
+          task: "Continued run",
+          work_unit_key: "unit-a",
+        }),
+        meta: {
+          "codeg.delegation": {
+            status: "running",
+            task_id: "run-2",
+            child_conversation_id: 99,
+            started_at: secondStartedAt,
+            runtime_stats: stats(secondStartedAt, 2),
+          },
+        },
+      },
+    ]
+    const latest = workUnitSources[1]
+
+    renderWithIntl(
+      <DelegatedSubThread
+        {...latest}
+        workUnitKey="unit-a"
+        workUnitSources={workUnitSources}
+      />
+    )
+
+    expect(screen.getAllByTestId("delegated-sub-thread")).toHaveLength(1)
+    expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
+      "data-work-unit-key",
+      "unit-a"
+    )
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "Streaming |"
+    )
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "7 tool uses"
+    )
+  })
+
   it("does not show a files toggle when only edit-call counts exist (no paths)", () => {
     mockedHook.mockReturnValue({
       binding: bindingOf({

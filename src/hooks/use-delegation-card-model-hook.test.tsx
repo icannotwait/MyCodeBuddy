@@ -121,4 +121,43 @@ describe("useDelegationCardModel ticker lifecycle", () => {
     expect(result.current.lifecycleStatus).toBe("ok")
     expect(ticker.release).toHaveBeenCalledTimes(1)
   })
+
+  it("retains the ticker while a recent recoverable run awaits continuation", () => {
+    const startedAt = new Date(Date.now() - 60_000).toISOString()
+    const { result } = renderHook(() =>
+      useDelegationCardModel({
+        parentToolUseId: "pt-recoverable",
+        parentConversationId: PARENT_ID,
+        input: JSON.stringify({
+          agent_type: "codex",
+          task: "continue after parent turn",
+          work_unit_key: "unit-recoverable",
+        }),
+        meta: {
+          "codeg.delegation": {
+            status: "failed",
+            task_id: "run-recoverable",
+            child_conversation_id: 99,
+            error_code: "parent_turn_failed",
+            started_at: startedAt,
+            finished_at: startedAt,
+            runtime_stats: {
+              started_at: startedAt,
+              finished_at: startedAt,
+              tool_call_count: 3,
+              edit_tool_call_count: 0,
+              touched_files: [],
+              touched_files_truncated: false,
+              line_counts_complete: false,
+            },
+          },
+        },
+      })
+    )
+
+    expect(result.current.lifecycleStatus).toBe("running")
+    expect(result.current.errorCode).toBeUndefined()
+    expect(result.current.showGeneratingSegment).toBe(true)
+    expect(ticker.retain).toHaveBeenCalledTimes(1)
+  })
 })

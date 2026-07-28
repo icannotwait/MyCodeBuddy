@@ -2185,6 +2185,7 @@ export const ConversationSessionSurface = memo(
           initialHistoryScrollEligible={initialHistoryScrollEligible}
           historyLoadComplete={detail != null}
           focusTurnAnchor={focusTurnAnchor}
+          isDelegatedChild={detail?.summary.parent_id != null}
         />
       </GoalControlProvider>
     )

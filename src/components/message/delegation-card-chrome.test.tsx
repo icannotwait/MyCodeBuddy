@@ -370,6 +370,28 @@ describe("DelegationCardChrome", () => {
     )
   })
 
+  it("prepends the localized generating segment to operational stats", () => {
+    renderWithIntl(
+      <DelegationCardChrome
+        displaySecondary={null}
+        elapsedMs={90_000}
+        toolCallCount={2}
+        editRollup={omitRollup}
+        attentionRequest={null}
+        runtimeStats={statsOf({ tool_call_count: 2 })}
+        filesExpanded={false}
+        onToggleFilesExpanded={() => {}}
+        showGeneratingSegment
+      />
+    )
+
+    const operational = screen.getByTestId("delegation-operational")
+    expect(operational).toHaveTextContent("Streaming")
+    expect(operational.querySelector("[title]")?.getAttribute("title")).toBe(
+      "Streaming | 1m 30s | 2 tool uses"
+    )
+  })
+
   it("omits the entire operational row when every segment is absent", () => {
     renderWithIntl(
       <DelegationCardChrome

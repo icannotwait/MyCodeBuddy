@@ -592,7 +592,8 @@ const EMPTY_STATUS_REPORT: StatusReport = {
  * poll) never collapse into one row. First-appearance order is preserved.
  */
 export function buildDelegationTaskRows(
-  polls: AdaptedToolCallPart[]
+  polls: AdaptedToolCallPart[],
+  visibleTaskIds?: ReadonlySet<string>
 ): DelegationTaskRow[] {
   const order: string[] = []
   const byKey = new Map<
@@ -643,18 +644,31 @@ export function buildDelegationTaskRows(
       entry.polls.push({ poll, report })
     }
   }
-  return order.map((key) => {
-    const entry = byKey.get(key)!
-    const latest = entry.polls[entry.polls.length - 1]
-    const badge = deriveBadge(
-      "status",
-      latest.report,
-      latest.poll.state,
-      !!latest.poll.errorText
+  return order
+    .map((key) => {
+      const entry = byKey.get(key)!
+      const latest = entry.polls[entry.polls.length - 1]
+      const badge = deriveBadge(
+        "status",
+        latest.report,
+        latest.poll.state,
+        !!latest.poll.errorText
+      )
+      // One entry per poll, in order — so `×N` and the pager total both equal the
+      // number of times this task was actually checked.
+      const results = entry.polls.map(({ report }) => report.text)
+      return {
+        key,
+        taskId: entry.taskId,
+        report: latest.report,
+        badge,
+        results,
+      }
+    })
+    .filter(
+      (row) =>
+        visibleTaskIds === undefined ||
+        row.taskId === null ||
+        visibleTaskIds.has(row.taskId)
     )
-    // One entry per poll, in order — so `×N` and the pager total both equal the
-    // number of times this task was actually checked.
-    const results = entry.polls.map(({ report }) => report.text)
-    return { key, taskId: entry.taskId, report: latest.report, badge, results }
-  })
 }

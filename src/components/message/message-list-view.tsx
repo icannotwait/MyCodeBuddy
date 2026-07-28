@@ -61,6 +61,8 @@ import {
   dedupeDelegationActivities,
   deriveNativeActivitiesFromToolCalls,
 } from "@/lib/delegation-activity"
+import { projectDelegationTranscript } from "@/lib/delegation-transcript-projection"
+import { filterDelegatedInterruptParts } from "@/lib/delegation-conversation-interrupted"
 import type { DelegationActivityView } from "@/lib/types"
 import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
@@ -140,6 +142,8 @@ interface MessageListViewProps {
   historyLoadComplete?: boolean
   /** Optional durable child turn id to reveal after the transcript loads. */
   focusTurnAnchor?: string | null
+  /** Display-only filtering for delegated child conversation artifacts. */
+  isDelegatedChild?: boolean
 }
 
 export function canReloadSessionLoadError(
@@ -256,7 +260,7 @@ export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
 // standalone part — `isAgentLikeToolName` keeps it out of tool-groups — but we
 // scan nested containers defensively so a delegation is never missed).
 function collectDelegationSources(
-  parts: AdaptedContentPart[],
+  parts: readonly AdaptedContentPart[],
   out: DelegationCardSource[],
   parentConversationId: number
 ): void {
@@ -276,6 +280,8 @@ function collectDelegationSources(
           meta: part.meta ?? null,
         })
       }
+    } else if (part.type === "delegation-work-unit") {
+      collectDelegationSources(part.sources, out, parentConversationId)
     } else if (part.type === "tool-group") {
       collectDelegationSources(part.items, out, parentConversationId)
     } else if (part.type === "goal-run") {
@@ -1020,6 +1026,7 @@ export function MessageListView({
   initialHistoryScrollEligible = false,
   historyLoadComplete = false,
   focusTurnAnchor = null,
+  isDelegatedChild = false,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -1155,7 +1162,7 @@ export function MessageListView({
     () => new WeakMap()
   )
 
-  const { threadItems, nonStreamingAdapted } = useMemo(() => {
+  const adaptedThread = useMemo(() => {
     const allTurns = timelineTurns.map((item) => item.turn)
     const streamingIndices = new Set<number>()
     const inProgressToolCallIdsByIndex = new Map<number, Set<string>>()
@@ -1180,10 +1187,21 @@ export function MessageListView({
     const nonStreaming = allAdapted.filter(
       (_, index) => timelineTurns[index].phase !== "streaming"
     )
+    const displayAdapted = isDelegatedChild
+      ? allAdapted.map((message) => {
+          if (message.role !== "assistant") return message
+          const content = filterDelegatedInterruptParts(message.content, true)
+          return content === message.content ? message : { ...message, content }
+        })
+      : allAdapted
+    const projected = projectDelegationTranscript(
+      displayAdapted,
+      conversationId
+    )
 
     // Map each adapted message directly to a render item (1:1).
     // Backend group_into_turns() already ensures each turn is a complete unit.
-    const rawItems: ThreadRenderItem[] = allAdapted.map((msg, i) => {
+    const rawItems: ThreadRenderItem[] = projected.messages.map((msg, i) => {
       const phase = timelineTurns[i].phase
       const role = msg.role === "tool" ? "assistant" : msg.role
       let group = groupCache.get(msg)
@@ -1278,7 +1296,11 @@ export function MessageListView({
       items.push({ key: "pending-typing", kind: "typing" })
     }
 
-    return { threadItems: items, nonStreamingAdapted: nonStreaming }
+    return {
+      threadItems: items,
+      nonStreamingAdapted: nonStreaming,
+      delegationIdentityIndex: projected.identityIndex,
+    }
   }, [
     adapterText,
     connStatus,
@@ -1288,7 +1310,11 @@ export function MessageListView({
     groupCache,
     useIncrementalLive,
     mergedRunCache,
+    conversationId,
+    isDelegatedChild,
   ])
+  const { threadItems, nonStreamingAdapted, delegationIdentityIndex } =
+    adaptedThread
 
   const lastTimelinePhase =
     timelineTurns[timelineTurns.length - 1]?.phase ?? null
@@ -1305,9 +1331,18 @@ export function MessageListView({
         conversationId={conversationId}
         agentType={agentType}
         showThinking={showThinking}
+        isDelegatedChild={isDelegatedChild}
+        delegationIdentityIndex={delegationIdentityIndex}
       />
     )
-  }, [showLiveFooter, conversationId, agentType, showThinking])
+  }, [
+    showLiveFooter,
+    conversationId,
+    agentType,
+    showThinking,
+    isDelegatedChild,
+    delegationIdentityIndex,
+  ])
 
   const historicalPlanEntries = useMemo(
     () => extractLatestPlanEntriesFromMessages(nonStreamingAdapted),
@@ -1418,7 +1453,7 @@ export function MessageListView({
       status?: string | null
       meta?: Record<string, unknown> | null
     }> = []
-    const walk = (parts: AdaptedContentPart[]) => {
+    const walk = (parts: readonly AdaptedContentPart[]) => {
       for (const part of parts) {
         if (part.type === "tool-call" && part.toolCallId) {
           tools.push({
@@ -1434,6 +1469,8 @@ export function MessageListView({
                   : "in_progress",
             meta: part.meta ?? null,
           })
+        } else if (part.type === "delegation-work-unit") {
+          walk(part.sources)
         } else if (part.type === "tool-group") {
           walk(part.items)
         } else if (part.type === "goal-run") {

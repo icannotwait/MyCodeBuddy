@@ -4,6 +4,7 @@ import {
   buildEditRollupViewModel,
   computeDelegationElapsedMs,
   formatDelegationDisplaySecondary,
+  parseDelegateRunIdentity,
   parseDelegateTaskId,
   parseDelegationMeta,
   parseInput,
@@ -826,6 +827,9 @@ describe("parseInput — correlation_id is transport-only", () => {
       profileLabel: null,
       task: "ship the fix",
       workingDir: null,
+      workUnitKey: null,
+      targetTaskId: null,
+      replacesTaskId: null,
     })
     expect(JSON.stringify(parsed)).not.toContain("corr-never-display-me")
   })
@@ -845,6 +849,37 @@ describe("parseInput wrapper peeling", () => {
     expect(parsed.workingDir).toBeNull()
   })
 
+  it("reads structured work-unit and continuation identity fields", () => {
+    expect(
+      parseInput(
+        JSON.stringify({
+          task: "continue",
+          task_id: "run-1",
+          work_unit_key: "task|1|implementer|grok|none",
+          replaces_task_id: "run-0",
+        })
+      )
+    ).toMatchObject({
+      targetTaskId: "run-1",
+      workUnitKey: "task|1|implementer|grok|none",
+      replacesTaskId: "run-0",
+    })
+  })
+
+  it("does not infer identity fields from arbitrary task text", () => {
+    expect(
+      parseInput(
+        JSON.stringify({
+          task: "use work_unit_key=fake and task_id=also-fake",
+        })
+      )
+    ).toMatchObject({
+      targetTaskId: null,
+      workUnitKey: null,
+      replacesTaskId: null,
+    })
+  })
+
   it("returns empty fields for a non-delegation payload", () => {
     const parsed = parseInput(JSON.stringify({ command: "ls -la" }))
     expect(parsed.agentType).toBeNull()
@@ -859,6 +894,82 @@ describe("parseInput wrapper peeling", () => {
       JSON.stringify({ agent_type: agentType, task: "do the thing" })
     )
     expect(parsed.agentType).toBe(agentType)
+  })
+})
+
+describe("parseDelegateRunIdentity", () => {
+  it("links a continued output run to its structured target task", () => {
+    expect(
+      parseDelegateRunIdentity({
+        parentConversationId: 2075,
+        parentToolUseId: "tool-2",
+        input: JSON.stringify({ task: "continue", task_id: "run-1" }),
+        output: JSON.stringify({
+          structuredContent: {
+            task_id: "run-2",
+            continued_from_task_id: "run-1",
+            child_conversation_id: 3001,
+            status: "running",
+          },
+        }),
+        errorText: null,
+        meta: null,
+      })
+    ).toMatchObject({
+      parentConversationId: 2075,
+      parentToolUseId: "tool-2",
+      taskId: "run-2",
+      childConversationId: 3001,
+      linkedTaskIds: ["run-1"],
+    })
+  })
+
+  it("uses metadata as a durable identity fallback", () => {
+    expect(
+      parseDelegateRunIdentity({
+        parentConversationId: 2075,
+        parentToolUseId: "tool-history",
+        input: null,
+        output: null,
+        errorText: null,
+        meta: {
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-history",
+            child_conversation_id: 3002,
+          },
+        },
+      })
+    ).toMatchObject({
+      taskId: "run-history",
+      childConversationId: 3002,
+      linkedTaskIds: [],
+    })
+  })
+
+  it("does not group an uncorrelated failed run by an echoed child id", () => {
+    expect(
+      parseDelegateRunIdentity({
+        parentConversationId: 2075,
+        parentToolUseId: "tool-failed",
+        input: JSON.stringify({ task: "continue" }),
+        output: JSON.stringify({
+          content: [{ type: "text", text: "Continuation admission failed" }],
+          structuredContent: {
+            status: "failed",
+            child_conversation_id: 3001,
+            error_code: "continuation_admission_failed",
+            message: "Continuation admission failed",
+          },
+          isError: true,
+        }),
+        errorText: null,
+        meta: null,
+      })
+    ).toMatchObject({
+      taskId: null,
+      childConversationId: null,
+    })
   })
 })
 

@@ -6,6 +6,7 @@ import {
   DelegationProvider,
   useDelegation,
 } from "@/contexts/delegation-context"
+import { useDelegatedSubSession } from "@/hooks/use-delegated-sub-session"
 import { emptyRuntimeStats, type EventEnvelope } from "@/lib/types"
 
 const STARTED_AT = "2026-07-19T00:00:00.000Z"
@@ -118,6 +119,38 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
   )
 }
 
+function ChildBindingProbe({
+  childConversationId,
+}: {
+  childConversationId: number
+}) {
+  const { findByChildConversationId } = useDelegation()
+  const binding = findByChildConversationId(childConversationId)
+  return (
+    <div data-testid="child-binding-tool-id">
+      {binding?.parentToolUseId ?? "none"}
+    </div>
+  )
+}
+
+function SubSessionProbe({
+  parentToolUseId,
+  childConversationId,
+}: {
+  parentToolUseId: string
+  childConversationId: number
+}) {
+  const { binding } = useDelegatedSubSession(parentToolUseId, {
+    enabled: false,
+    fallbackChildConversationId: childConversationId,
+  })
+  return (
+    <div data-testid="sub-session-tool-id">
+      {binding?.parentToolUseId ?? "none"}
+    </div>
+  )
+}
+
 function renderProvider(children: ReactNode = null) {
   return render(
     <DelegationProvider>
@@ -193,6 +226,51 @@ describe("DelegationProvider", () => {
       vi.advanceTimersByTime(2_000)
     })
     expect(mockDetach).toHaveBeenCalledWith("c1")
+  })
+
+  it("selects the newest running binding for a shared child session", async () => {
+    renderProvider(
+      <>
+        <ChildBindingProbe childConversationId={99} />
+        <SubSessionProbe parentToolUseId="pt-old" childConversationId={99} />
+      </>
+    )
+    await awaitHandlerCaptured()
+
+    dispatch(
+      startedEvent({
+        parent_tool_use_id: "pt-old",
+        child_connection_id: "c-old",
+        task_id: "task-old",
+        started_at: "2026-07-19T00:00:00.000Z",
+      })
+    )
+    vi.useFakeTimers()
+    dispatch(
+      completedEvent(
+        { kind: "ok", duration_ms: 100 },
+        {
+          parent_tool_use_id: "pt-old",
+          child_connection_id: "c-old",
+          task_id: "task-old",
+        }
+      )
+    )
+    dispatch(
+      startedEvent({
+        parent_tool_use_id: "pt-new",
+        child_connection_id: "c-new",
+        task_id: "task-new",
+        started_at: "2026-07-19T00:05:00.000Z",
+      })
+    )
+
+    expect(screen.getByTestId("child-binding-tool-id")).toHaveTextContent(
+      "pt-new"
+    )
+    expect(screen.getByTestId("sub-session-tool-id")).toHaveTextContent(
+      "pt-new"
+    )
   })
 
   it("flips binding to ok and detaches when delegation_completed arrives with kind=ok", async () => {

@@ -95,6 +95,13 @@ export type AdaptedGoalRunPart = {
   isRunning: boolean
 }
 
+export type AdaptedDelegationWorkUnitPart = {
+  type: "delegation-work-unit"
+  key: string
+  sources: AdaptedToolCallPart[]
+  explicitUserCancel: boolean
+}
+
 /**
  * A plan / todo checklist, rendered by the dedicated `<PlanCard>` instead of
  * the generic tool card (and never as a `reasoning`/thinking block). Produced
@@ -151,6 +158,7 @@ export type AdaptedContentPart =
   | {
       type: "delegation-status-group"
       polls: AdaptedToolCallPart[]
+      visibleTaskIds?: string[]
     }
   /**
    * A run of consecutive Claude Code background-task polls (`TaskOutput`),
@@ -164,6 +172,7 @@ export type AdaptedContentPart =
       polls: AdaptedToolCallPart[]
     }
   | AdaptedGoalRunPart
+  | AdaptedDelegationWorkUnitPart
   | AdaptedGeneratedImagePart
   | AdaptedPlanPart
   | AdaptedProposedPlanPart

@@ -72,10 +72,13 @@ import {
 } from "@/lib/types"
 import {
   isUncorrelatedDelegationFailure,
+  parseDelegateRunIdentity,
   parseDelegateTaskId,
+  parseDelegationMeta,
   parseToolOutput,
 } from "@/lib/delegation-card"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import { groupDelegationRuns } from "@/lib/delegation-work-unit"
 import {
   buildPhaseRail,
   selectCurrentNodes,
@@ -146,10 +149,18 @@ type DelegationOverlayGroup = {
   key: string
   childConversationId: number | null
   latestSource: DelegationCardSource
+  sources: DelegationCardSource[]
   latestIndex: number
   latestGeneration: number | null
   runCount: number
   isReplacement: boolean
+}
+
+type OverlayRunValue = {
+  source: DelegationCardSource
+  index: number
+  generation: number | null
+  replacement: boolean
 }
 
 function rawDelegationMeta(
@@ -191,12 +202,34 @@ function sourceSnapshot(source: DelegationCardSource, taskId: string | null) {
   return delegationRunSnapshotCache.get(source.parentConversationId, taskId)
 }
 
-/** Group only durable child identities; unknown/live cards remain independent. */
+function sourceExplicitUserCancel(source: DelegationCardSource): boolean {
+  const parsedMeta = parseDelegationMeta(source.meta)
+  if (parsedMeta?.errorCode === "user_cancelled") return true
+  const output =
+    (source.errorText ? parseToolOutput(source.errorText, true) : null) ??
+    parseToolOutput(source.output)
+  return output?.kind === "outcome" && output.errorCode === "user_cancelled"
+}
+
+function structuredIdentityInput(
+  input: string | null | undefined
+): string | null | undefined {
+  if (!input) return input
+  try {
+    JSON.parse(input)
+    return input
+  } catch {
+    // parseInput would return an empty identity after logging; the row model
+    // owns that diagnostic, so grouping skips the duplicate parse.
+    return null
+  }
+}
+
+/** Group overlay rows with the same work-unit identity rules as history. */
 export function groupDelegationSourcesForOverlay(
   delegations: DelegationCardSource[]
 ): DelegationOverlayGroup[] {
-  const groups = new Map<string, DelegationOverlayGroup>()
-  delegations.forEach((source, index) => {
+  const records = delegations.map((source, index) => {
     const meta = rawDelegationMeta(source)
     const taskId = sourceBrokerTaskId(source, meta)
     const snapshot = sourceSnapshot(source, taskId)
@@ -207,54 +240,89 @@ export function groupDelegationSourcesForOverlay(
       toolOutput,
       taskId
     )
-    const fromMeta = meta?.child_conversation_id
-    const fromOutput = toolOutput?.childConversationId
-    const childConversationId = uncorrelatedFailure
-      ? null
-      : typeof fromMeta === "number" && Number.isInteger(fromMeta)
-        ? fromMeta
-        : (fromOutput ?? snapshot?.child_conversation_id ?? null)
+    const parsedIdentity = parseDelegateRunIdentity({
+      parentConversationId: source.parentConversationId ?? 0,
+      parentToolUseId: source.parentToolUseId,
+      input: structuredIdentityInput(source.input),
+      output: source.output,
+      errorText: source.errorText,
+      meta: source.meta,
+    })
+    const linkedTaskIds = new Set(parsedIdentity.linkedTaskIds)
+    for (const linked of [
+      snapshot?.previous_task_id,
+      snapshot?.root_task_id,
+      snapshot?.replaced_task_id,
+    ]) {
+      if (linked && linked !== (snapshot?.task_id ?? parsedIdentity.taskId)) {
+        linkedTaskIds.add(linked)
+      }
+    }
     const generation =
       typeof meta?.generation === "number" && Number.isInteger(meta.generation)
         ? meta.generation
         : (snapshot?.generation ?? null)
-    const key =
-      childConversationId == null
-        ? `source:${taskId ?? source.parentToolUseId}`
-        : `child:${childConversationId}`
     const replacement =
       sourceReplacementMarker(source) || Boolean(snapshot?.replaced_task_id)
-    const existing = groups.get(key)
-    if (!existing) {
-      groups.set(key, {
-        key,
-        childConversationId,
-        latestSource: source,
-        latestIndex: index,
-        latestGeneration: generation,
-        runCount: 1,
-        isReplacement: replacement,
-      })
-      return
-    }
-    existing.runCount += 1
-    existing.isReplacement ||= replacement
-    const isNewer =
-      generation != null &&
-      (existing.latestGeneration == null ||
-        generation >= existing.latestGeneration)
-    if (
-      isNewer ||
-      (generation == null &&
-        existing.latestGeneration == null &&
-        index > existing.latestIndex)
-    ) {
-      existing.latestSource = source
-      existing.latestIndex = index
-      existing.latestGeneration = generation
+    return {
+      value: { source, index, generation, replacement },
+      identity: uncorrelatedFailure
+        ? {
+            ...parsedIdentity,
+            workUnitKey: null,
+            taskId: null,
+            childConversationId: null,
+            linkedTaskIds: [],
+          }
+        : {
+            ...parsedIdentity,
+            taskId: snapshot?.task_id ?? parsedIdentity.taskId,
+            childConversationId:
+              parsedIdentity.childConversationId ??
+              snapshot?.child_conversation_id ??
+              null,
+            linkedTaskIds: [...linkedTaskIds],
+          },
     }
   })
-  return Array.from(groups.values())
+
+  return groupDelegationRuns<OverlayRunValue>(records).units.map((unit) => {
+    let latest = unit.runs[0].value
+    for (const run of unit.runs.slice(1)) {
+      const candidate = run.value
+      const isNewerGeneration =
+        candidate.generation != null &&
+        (latest.generation == null || candidate.generation >= latest.generation)
+      if (
+        isNewerGeneration ||
+        (candidate.generation == null && candidate.index > latest.index)
+      ) {
+        latest = candidate
+      }
+    }
+    const onlyIdentity = unit.runs.length === 1 ? unit.runs[0].identity : null
+    const key =
+      onlyIdentity &&
+      !onlyIdentity.workUnitKey &&
+      onlyIdentity.childConversationId == null &&
+      !onlyIdentity.taskId &&
+      onlyIdentity.linkedTaskIds.length === 0
+        ? `source:${onlyIdentity.parentToolUseId}`
+        : unit.key
+
+    return {
+      key,
+      childConversationId:
+        unit.runs.find((run) => run.value === latest)?.identity
+          .childConversationId ?? null,
+      latestSource: latest.source,
+      sources: unit.runs.map((run) => run.value.source),
+      latestIndex: latest.index,
+      latestGeneration: latest.generation,
+      runCount: unit.runs.length,
+      isReplacement: unit.runs.some((run) => run.value.replacement),
+    }
+  })
 }
 
 export const SubAgentOverlay = memo(function SubAgentOverlay({
@@ -649,6 +717,8 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                     >
                       <SubAgentOverlayRow
                         source={group.latestSource}
+                        sources={group.sources}
+                        stickyKey={group.key}
                         runCount={group.runCount}
                         replacement={group.isReplacement}
                         groupChildConversationId={group.childConversationId}
@@ -739,11 +809,15 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
 
 const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   source,
+  sources,
+  stickyKey,
   runCount,
   replacement,
   groupChildConversationId,
 }: {
   source: DelegationCardSource
+  sources: readonly DelegationCardSource[]
+  stickyKey: string
   runCount: number
   replacement: boolean
   groupChildConversationId: number | null
@@ -767,7 +841,12 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     runtimeStats,
     isReplacement,
     childTurnAnchor,
-  } = useDelegationCardModel(source)
+    showGeneratingSegment,
+  } = useDelegationCardModel(source, {
+    workUnitSources: sources,
+    stickyKey,
+    explicitUserCancel: sourceExplicitUserCancel(source),
+  })
 
   // Unlike the inline DelegatedSubThread (which falls through to the generic
   // tool renderer when nothing resolves), the overlay always renders one row
@@ -797,6 +876,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     <div
       data-testid="sub-agent-row"
       data-origin="codeg"
+      data-work-unit-key={stickyKey}
       data-child-conversation-id={groupChildConversationId ?? undefined}
       className="flex w-full items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
     >
@@ -845,6 +925,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           runtimeStats={runtimeStats}
           filesExpanded={filesExpanded}
           onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+          showGeneratingSegment={showGeneratingSegment}
           compact
         />
       </div>

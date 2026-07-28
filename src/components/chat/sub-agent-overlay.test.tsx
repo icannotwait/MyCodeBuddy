@@ -252,6 +252,183 @@ describe("SubAgentOverlay", () => {
     expect(groups[0].latestSource.parentToolUseId).toBe("pt-3")
   })
 
+  it("binds to a newer live run before its generation metadata arrives", () => {
+    const groups = groupDelegationSourcesForOverlay([
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Historical run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        meta: {
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-2",
+            child_conversation_id: 77,
+            generation: 2,
+          },
+        },
+      },
+      {
+        ...source("pt-live", {
+          agent_type: "codex",
+          task: "Live continuation",
+          work_unit_key: "unit-a",
+          task_id: "run-2",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({ status: "running", task_id: "run-3" }),
+      },
+    ])
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({
+      latestIndex: 1,
+      latestGeneration: null,
+    })
+    expect(groups[0].latestSource.parentToolUseId).toBe("pt-live")
+  })
+
+  it("groups different child sessions when their explicit work key matches", () => {
+    const groups = groupDelegationSourcesForOverlay([
+      {
+        ...source("pt-1", {
+          agent_type: "codex",
+          task: "Initial run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({
+          status: "completed",
+          task_id: "run-1",
+          child_conversation_id: 77,
+        }),
+      },
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Replacement run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({
+          status: "running",
+          task_id: "run-2",
+          child_conversation_id: 88,
+        }),
+      },
+    ])
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0].key).toBe("unit-a")
+    expect(groups[0].runCount).toBe(2)
+    expect(groups[0].sources).toHaveLength(2)
+  })
+
+  it("keeps conflicting explicit work keys separate on the same child", () => {
+    const groups = groupDelegationSourcesForOverlay([
+      {
+        ...source("pt-1", {
+          agent_type: "codex",
+          task: "Parallel A",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({
+          status: "running",
+          task_id: "run-a",
+          child_conversation_id: 77,
+        }),
+      },
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Parallel B",
+          work_unit_key: "unit-b",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({
+          status: "running",
+          task_id: "run-b",
+          child_conversation_id: 77,
+        }),
+      },
+    ])
+
+    expect(groups.map((group) => group.key)).toEqual(["unit-a", "unit-b"])
+  })
+
+  it("renders aggregated sticky runtime for a grouped work unit", () => {
+    const startedAt = "2026-07-27T00:00:00.000Z"
+    const continuedAt = "2026-07-27T00:05:00.000Z"
+    const runtimeStats = (start: string, count: number) => ({
+      started_at: start,
+      tool_call_count: count,
+      edit_tool_call_count: 0,
+      touched_files: [],
+      touched_files_truncated: false,
+      line_counts_complete: false,
+    })
+    const delegations: DelegationCardSource[] = [
+      {
+        ...source("pt-1", {
+          agent_type: "codex",
+          task: "Initial run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        meta: {
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-1",
+            child_conversation_id: 77,
+            generation: 1,
+            started_at: startedAt,
+            finished_at: continuedAt,
+            runtime_stats: {
+              ...runtimeStats(startedAt, 5),
+              finished_at: continuedAt,
+            },
+          },
+        },
+      },
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Continued run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        meta: {
+          "codeg.delegation": {
+            status: "running",
+            task_id: "run-2",
+            child_conversation_id: 77,
+            generation: 2,
+            started_at: continuedAt,
+            runtime_stats: runtimeStats(continuedAt, 2),
+          },
+        },
+      },
+    ]
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={delegations}
+        overlayKey="k-sticky-runtime"
+      />
+    )
+
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(1)
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "Streaming |"
+    )
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "7 tool uses"
+    )
+  })
+
   it("does not group an uncorrelated failed continuation with its old child", () => {
     const groups = groupDelegationSourcesForOverlay([
       {

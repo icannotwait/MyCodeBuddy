@@ -141,7 +141,15 @@ vi.mock("./content-parts-renderer", () => ({
     parts,
     autolinkLocalPathParts,
   }: {
-    parts: Array<{ type: string; text?: string }>
+    parts: Array<{
+      type: string
+      text?: string
+      key?: string
+      sources?: Array<{
+        meta?: Record<string, unknown> | null
+      }>
+      visibleTaskIds?: string[]
+    }>
     autolinkLocalPathParts?: ReadonlySet<{
       type: string
       text?: string
@@ -159,6 +167,26 @@ vi.mock("./content-parts-renderer", () => ({
           >
             {part.text}
           </span>
+        ) : part.type === "delegation-work-unit" ? (
+          <span
+            key={index}
+            data-testid="delegation-work-unit"
+            data-work-unit-key={part.key}
+            data-source-count={part.sources?.length ?? 0}
+            data-latest-status={String(
+              (
+                part.sources?.[part.sources.length - 1]?.meta?.[
+                  "codeg.delegation"
+                ] as Record<string, unknown> | undefined
+              )?.status ?? "unknown"
+            )}
+          />
+        ) : part.type === "delegation-status-group" ? (
+          <span
+            key={index}
+            data-testid="delegation-status-residual"
+            data-visible-task-ids={part.visibleTaskIds?.join(",") ?? "all"}
+          />
         ) : (
           <span key={index} data-part={part.type} />
         )
@@ -338,6 +366,110 @@ function codegDelegateAssistantTurn(
       },
     ],
     timestamp,
+  }
+}
+
+function workUnitRunTurn(
+  id: string,
+  toolCallId: string,
+  taskId: string,
+  options: {
+    toolName?: "delegate_to_agent" | "continue_delegation"
+    targetTaskId?: string
+    workUnitKey?: string
+    childConversationId?: number
+    generation?: number
+    terminal?: boolean
+  } = {}
+): MessageTurn {
+  const targetTaskId = options.targetTaskId
+  const workUnitKey = options.workUnitKey ?? "unit-a"
+  const childConversationId = options.childConversationId ?? 3001
+  const generation = options.generation ?? 1
+  const terminal = options.terminal === true
+  const startedAt = "2026-07-27T00:00:00.000Z"
+  const finishedAt = terminal ? "2026-07-27T00:30:00.000Z" : null
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: toolCallId,
+        tool_name: options.toolName ?? "delegate_to_agent",
+        input_preview: JSON.stringify({
+          agent_type: "codex",
+          task: "implement",
+          work_unit_key: workUnitKey,
+          ...(targetTaskId ? { task_id: targetTaskId } : {}),
+        }),
+        meta: {
+          "codeg.delegation": {
+            status: terminal ? "completed" : "running",
+            task_id: taskId,
+            child_conversation_id: childConversationId,
+            generation,
+            started_at: startedAt,
+            finished_at: finishedAt,
+            runtime_stats: {
+              started_at: startedAt,
+              finished_at: finishedAt,
+              tool_call_count: generation,
+              edit_tool_call_count: 0,
+              touched_files: [],
+              touched_files_truncated: false,
+              line_counts_complete: false,
+            },
+          },
+        },
+      },
+      {
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        output_preview: JSON.stringify({
+          content: [{ type: "text", text: `Delegated ${taskId}` }],
+          structuredContent: {
+            status: terminal ? "completed" : "running",
+            task_id: taskId,
+            child_conversation_id: childConversationId,
+            ...(targetTaskId ? { continued_from_task_id: targetTaskId } : {}),
+          },
+        }),
+        is_error: false,
+      },
+    ],
+    timestamp: "2026-05-28T00:00:01.000Z",
+  }
+}
+
+function workUnitStatusTurn(id: string, taskIds: string[]): MessageTurn {
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: `poll-${id}`,
+        tool_name: "get_delegation_status",
+        input_preview: JSON.stringify({ task_ids: taskIds }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: `poll-${id}`,
+        output_preview: JSON.stringify({
+          content: [{ type: "text", text: "status batch" }],
+          structuredContent: {
+            tasks: taskIds.map((taskId) => ({
+              task_id: taskId,
+              status: "running",
+              message: "Running.",
+            })),
+          },
+        }),
+        is_error: false,
+      },
+    ],
+    timestamp: "2026-05-28T00:00:02.000Z",
   }
 }
 
@@ -534,8 +666,8 @@ function enableIncremental() {
   })
 }
 
-function renderMessageList() {
-  return render(
+function messageListUi(isDelegatedChild = false) {
+  return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
         conversationId={CID}
@@ -543,9 +675,14 @@ function renderMessageList() {
         connStatus="prompting"
         isActive
         showMessageNav={false}
+        isDelegatedChild={isDelegatedChild}
       />
     </NextIntlClientProvider>
   )
+}
+
+function renderMessageList(isDelegatedChild = false) {
+  return render(messageListUi(isDelegatedChild))
 }
 
 function assistantTexts(): string[] {
@@ -959,6 +1096,181 @@ describe("MessageListView live footer isolation", () => {
 
     expect(screen.queryByTestId("live-transcript-row")).not.toBeInTheDocument()
     expect(screen.getByTestId("live-turn-stats")).toBeInTheDocument()
+  })
+})
+
+describe("MessageListView delegation work-unit projection", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    subAgentOverlayPropsSpy.mockClear()
+    enableIncremental()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("renders one historical card and one residual status row across continuations", () => {
+    seedHistory([
+      userTurn("u1", "start"),
+      workUnitRunTurn("a1", "tool-1", "run-1"),
+      workUnitStatusTurn("a2", ["run-1"]),
+      assistantTurn("a3", "checkpoint explanation"),
+      workUnitRunTurn("a4", "tool-2", "run-2", {
+        toolName: "continue_delegation",
+        targetTaskId: "run-1",
+      }),
+      assistantTurn("a5", "still working"),
+      workUnitStatusTurn("a6", ["run-2", "unknown-run"]),
+    ])
+
+    renderMessageList()
+
+    expect(screen.getAllByTestId("delegation-work-unit")).toHaveLength(1)
+    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
+      "data-work-unit-key",
+      "wu:unit-a"
+    )
+    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
+      "data-source-count",
+      "2"
+    )
+    expect(screen.getByText("checkpoint explanation")).toBeInTheDocument()
+    expect(screen.getByText("still working")).toBeInTheDocument()
+    expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
+      "data-visible-task-ids",
+      "unknown-run"
+    )
+    expect(
+      (lastOverlayProps().delegations ?? []).map(
+        (delegation) => delegation.parentToolUseId
+      )
+    ).toEqual(["tool-1", "tool-2"])
+  })
+
+  it("projects a 2075-like persisted session to one card per work unit", () => {
+    const checkpoints = [
+      "checkpoint 01",
+      "checkpoint 02",
+      "checkpoint 03",
+      "checkpoint 04",
+      "checkpoint 05",
+      "checkpoint 06",
+      "checkpoint 07",
+      "checkpoint 08",
+      "checkpoint 09",
+      "checkpoint 10",
+    ]
+    const turns: MessageTurn[] = [
+      userTurn("u1", "start parallel work"),
+      workUnitRunTurn("a-unit-a-1", "tool-a-1", "run-a-1", {
+        workUnitKey: "unit-a",
+        childConversationId: 3001,
+        generation: 1,
+      }),
+      workUnitRunTurn("a-unit-b-1", "tool-b-1", "run-b-1", {
+        workUnitKey: "unit-b",
+        childConversationId: 4002,
+        generation: 1,
+      }),
+    ]
+    let currentTaskId = "run-a-1"
+    for (let index = 0; index < checkpoints.length; index++) {
+      turns.push(
+        workUnitStatusTurn(
+          `status-${index + 1}`,
+          index === checkpoints.length - 1
+            ? [currentTaskId, "orphan-run"]
+            : [currentTaskId]
+        ),
+        assistantTurn(`checkpoint-${index + 1}`, checkpoints[index])
+      )
+      if (index === 2 || index === 5) {
+        const generation = index === 2 ? 2 : 3
+        const nextTaskId = `run-a-${generation}`
+        turns.push(
+          workUnitRunTurn(
+            `a-unit-a-${generation}`,
+            `tool-a-${generation}`,
+            nextTaskId,
+            {
+              toolName: "continue_delegation",
+              targetTaskId: currentTaskId,
+              workUnitKey: "unit-a",
+              childConversationId: 3001,
+              generation,
+            }
+          )
+        )
+        currentTaskId = nextTaskId
+      }
+    }
+    turns.push(
+      workUnitRunTurn("a-unit-a-4", "tool-a-4", "run-a-4", {
+        toolName: "continue_delegation",
+        targetTaskId: currentTaskId,
+        workUnitKey: "unit-a",
+        childConversationId: 3001,
+        generation: 4,
+        terminal: true,
+      })
+    )
+    const original = JSON.parse(JSON.stringify(turns)) as MessageTurn[]
+
+    seedHistory(turns)
+    renderMessageList()
+
+    const cards = screen.getAllByTestId("delegation-work-unit")
+    expect(cards).toHaveLength(2)
+    const unitA = cards.find(
+      (card) => card.getAttribute("data-work-unit-key") === "wu:unit-a"
+    )
+    const unitB = cards.find(
+      (card) => card.getAttribute("data-work-unit-key") === "wu:unit-b"
+    )
+    expect(unitA).toHaveAttribute("data-source-count", "4")
+    expect(unitA).toHaveAttribute("data-latest-status", "completed")
+    expect(unitB).toHaveAttribute("data-source-count", "1")
+    expect(screen.getAllByTestId("delegation-status-residual")).toHaveLength(1)
+    expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
+      "data-visible-task-ids",
+      "orphan-run"
+    )
+    for (const checkpoint of checkpoints) {
+      expect(screen.getByText(checkpoint)).toBeInTheDocument()
+    }
+    expect(turns).toEqual(original)
+  })
+})
+
+describe("MessageListView delegated interruption marker", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    seedHistory([assistantTurn("a1", " **Conversation interrupted** \n")])
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("hides the exact historical marker only for delegated children", () => {
+    const { rerender } = renderMessageList(true)
+    expect(
+      screen.queryByText(/Conversation interrupted/)
+    ).not.toBeInTheDocument()
+
+    rerender(messageListUi(false))
+    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
   })
 })
 

@@ -48,6 +48,27 @@ export type ParsedInput = {
   profileLabel: string | null
   task: string | null
   workingDir: string | null
+  workUnitKey: string | null
+  targetTaskId: string | null
+  replacesTaskId: string | null
+}
+
+export interface DelegationRunIdentityInput {
+  parentConversationId: number
+  parentToolUseId: string
+  input?: string | null
+  output?: string | null
+  errorText?: string | null
+  meta?: Record<string, unknown> | null
+}
+
+export interface DelegationRunIdentity {
+  parentConversationId: number
+  parentToolUseId: string
+  workUnitKey: string | null
+  taskId: string | null
+  childConversationId: number | null
+  linkedTaskIds: string[]
 }
 
 // Derived from the canonical `ALL_AGENT_TYPES` so a newly added agent is
@@ -281,6 +302,9 @@ const EMPTY_PARSED_INPUT: ParsedInput = {
   profileLabel: null,
   task: null,
   workingDir: null,
+  workUnitKey: null,
+  targetTaskId: null,
+  replacesTaskId: null,
 }
 
 // Wrapper keys that hosts use to nest the actual tool arguments. JSON-RPC
@@ -323,7 +347,10 @@ function findDelegationArgs(
     typeof obj.task === "string" ||
     typeof obj.agent_type === "string" ||
     typeof obj.profile_label === "string" ||
-    typeof obj.working_dir === "string"
+    typeof obj.working_dir === "string" ||
+    typeof obj.work_unit_key === "string" ||
+    typeof obj.task_id === "string" ||
+    typeof obj.replaces_task_id === "string"
   ) {
     return obj
   }
@@ -409,6 +436,21 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
       typeof obj.profile_label === "string" ? obj.profile_label : null,
     task: typeof obj.task === "string" ? obj.task : null,
     workingDir: typeof obj.working_dir === "string" ? obj.working_dir : null,
+    workUnitKey: readNonEmptyString(obj.work_unit_key),
+    targetTaskId: readNonEmptyString(obj.task_id),
+    replacesTaskId: readNonEmptyString(obj.replaces_task_id),
+  }
+}
+
+export function parseCancelDelegationReason(
+  raw: string | null | undefined
+): string | null {
+  if (!raw || typeof raw !== "string") return null
+  try {
+    const obj = findDelegationArgs(JSON.parse(raw))
+    return obj ? readNonEmptyString(obj.reason) : null
+  } catch {
+    return null
   }
 }
 
@@ -794,6 +836,100 @@ export function parseDelegateTaskId(
     if (m) return m[1]
   }
   return null
+}
+
+function parseStructuredDelegateReport(
+  raw: string | null | undefined
+): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "string") return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+
+  let obj: Record<string, unknown> | null = null
+  try {
+    const value = JSON.parse(trimmed) as unknown
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      obj = value as Record<string, unknown>
+    }
+  } catch {
+    obj = extractEmbeddedJsonObject(trimmed)
+  }
+  if (!obj) return null
+
+  const { obj: result } = peelMcpResultEnvelope(obj, isResolvableDelegateResult)
+  const structured = result.structuredContent
+  if (
+    structured &&
+    typeof structured === "object" &&
+    !Array.isArray(structured)
+  ) {
+    return structured as Record<string, unknown>
+  }
+  if (typeof result.status === "string" || typeof result.kind === "string") {
+    return result
+  }
+  if (!Array.isArray(result.content)) return null
+  const first = result.content[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return null
+  const json = (first as Record<string, unknown>).json
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null
+  return json as Record<string, unknown>
+}
+
+export function parseDelegateRunIdentity(
+  input: DelegationRunIdentityInput
+): DelegationRunIdentity {
+  const parsedInput = parseInput(input.input)
+  const parsedMeta = parseDelegationMeta(input.meta)
+  const taskId =
+    parseDelegateTaskId(input.output, input.errorText) ??
+    parsedMeta?.taskId ??
+    null
+
+  const outputCandidates = [
+    parseToolOutput(input.output),
+    parseToolOutput(input.errorText, true),
+  ]
+  const structuredReports = [input.output, input.errorText]
+    .map(parseStructuredDelegateReport)
+    .filter((report): report is Record<string, unknown> => report !== null)
+  const uncorrelatedFailure = outputCandidates.some((candidate) =>
+    isUncorrelatedDelegationFailure(candidate, taskId)
+  )
+  const childConversationId = uncorrelatedFailure
+    ? null
+    : (outputCandidates.find(
+        (candidate) => candidate?.childConversationId != null
+      )?.childConversationId ??
+      structuredReports
+        .map((report) => readChildConversationId(report))
+        .find((id) => id != null) ??
+      parsedMeta?.childConversationId ??
+      null)
+
+  const linkedTaskIds: string[] = []
+  const linked = new Set<string>()
+  const addLinked = (value: unknown) => {
+    const id = readNonEmptyString(value)
+    if (!id || id === taskId || linked.has(id)) return
+    linked.add(id)
+    linkedTaskIds.push(id)
+  }
+  addLinked(parsedInput.targetTaskId)
+  addLinked(parsedInput.replacesTaskId)
+  for (const report of structuredReports) {
+    addLinked(report.continued_from_task_id)
+    addLinked(report.replaces_task_id)
+  }
+
+  return {
+    parentConversationId: input.parentConversationId,
+    parentToolUseId: input.parentToolUseId,
+    workUnitKey: parsedInput.workUnitKey,
+    taskId,
+    childConversationId,
+    linkedTaskIds,
+  }
 }
 
 /**

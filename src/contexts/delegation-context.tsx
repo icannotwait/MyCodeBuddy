@@ -50,6 +50,30 @@ interface DelegationContextValue {
   findByChildConversationId(id: number): DelegationBinding | undefined
 }
 
+function bindingStartedAtMs(binding: DelegationBinding): number {
+  const value = Date.parse(binding.startedAt)
+  return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY
+}
+
+/** Running wins over terminal; otherwise newest start and stable id win. */
+export function selectPreferredDelegationBinding(
+  left: DelegationBinding | undefined,
+  right: DelegationBinding | undefined
+): DelegationBinding | undefined {
+  if (!left) return right
+  if (!right) return left
+  const leftRunning = left.status === "running"
+  const rightRunning = right.status === "running"
+  if (leftRunning !== rightRunning) return rightRunning ? right : left
+
+  const leftStartedAt = bindingStartedAtMs(left)
+  const rightStartedAt = bindingStartedAtMs(right)
+  if (leftStartedAt !== rightStartedAt) {
+    return rightStartedAt > leftStartedAt ? right : left
+  }
+  return right.parentToolUseId > left.parentToolUseId ? right : left
+}
+
 const DelegationContext = createContext<DelegationContextValue | null>(null)
 
 export function useDelegation(): DelegationContextValue {
@@ -178,10 +202,12 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
 
   const findByChildConversationId = useCallback(
     (id: number): DelegationBinding | undefined => {
+      let selected: DelegationBinding | undefined
       for (const b of byToolUseId.values()) {
-        if (b.childConversationId === id) return b
+        if (b.childConversationId !== id) continue
+        selected = selectPreferredDelegationBinding(selected, b)
       }
-      return undefined
+      return selected
     },
     [byToolUseId]
   )

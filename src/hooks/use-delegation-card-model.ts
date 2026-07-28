@@ -47,6 +47,10 @@ import {
   type ParsedMeta,
   type ParsedToolOutput,
 } from "@/lib/delegation-card"
+import {
+  buildDelegationWorkUnitRuntime,
+  type WorkUnitRunObservation,
+} from "@/lib/delegation-work-unit-runtime"
 import type { DelegationBinding } from "@/lib/delegation-binding-reduce"
 import {
   delegationChildProjectionCache,
@@ -113,6 +117,10 @@ export interface DelegationCardModel {
   /** A replacement belongs to another child session and remains a separate row. */
   isReplacement: boolean
   childTurnAnchor: string | null
+  /** Active work units prepend the localized generating/streaming segment. */
+  showGeneratingSegment: boolean
+  /** Stable canonical work-unit identity shared by inline and overlay cards. */
+  stickyKey: string | null
 }
 
 function parseTimestampMs(value: string | null | undefined): number | null {
@@ -636,6 +644,124 @@ export function buildDelegationCardModel(input: {
     cardSummary: binding?.cardSummary ?? runSnapshot?.card_summary ?? null,
     isReplacement: Boolean(runSnapshot?.replaced_task_id),
     childTurnAnchor: runSnapshot?.child_turn_anchor ?? null,
+    showGeneratingSegment: false,
+    stickyKey: null,
+  }
+}
+
+function rawDelegationMeta(
+  source: DelegationCardSource
+): Record<string, unknown> | null {
+  const value = source.meta?.["codeg.delegation"]
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function sourceToolOutput(
+  source: DelegationCardSource
+): ParsedToolOutput | null {
+  if (source.errorText) {
+    const parsedError = parseToolOutput(source.errorText, true)
+    if (parsedError) return parsedError
+  }
+  return parseToolOutput(source.output)
+}
+
+function sourceObservation(
+  source: DelegationCardSource
+): WorkUnitRunObservation {
+  const parsedMeta = parseDelegationMeta(source.meta)
+  const toolOutput = sourceToolOutput(source)
+  const taskId =
+    parseDelegateTaskId(source.output, source.errorText) ??
+    parsedMeta?.taskId ??
+    null
+  const runtimeStats = parsedMeta?.runtimeStats ?? null
+  const rawMeta = rawDelegationMeta(source)
+  const rawLastAgentActivityAt = rawMeta?.last_agent_activity_at
+
+  return {
+    identity: taskId ?? source.parentToolUseId,
+    taskId,
+    lifecycleStatus: resolveLifecycleStatus({
+      binding: undefined,
+      parsedMeta,
+      runSnapshot: null,
+      childProjection: null,
+      toolOutput,
+      state: source.state,
+      errorText: source.errorText,
+    }),
+    errorCode:
+      parsedMeta?.errorCode ??
+      (toolOutput?.kind === "outcome" ? toolOutput.errorCode : null),
+    startedAt: parsedMeta?.startedAt ?? runtimeStats?.started_at ?? null,
+    finishedAt: parsedMeta?.finishedAt ?? runtimeStats?.finished_at ?? null,
+    lastAgentActivityAt:
+      typeof rawLastAgentActivityAt === "string"
+        ? rawLastAgentActivityAt
+        : null,
+    runtimeStats,
+    current: false,
+  }
+}
+
+export function mergeDelegationWorkUnitModel(input: {
+  model: DelegationCardModel
+  sources: readonly DelegationCardSource[]
+  stickyKey: string | null
+  nowMs: number
+  hasLiveBinding: boolean
+  explicitUserCancel: boolean
+}): DelegationCardModel {
+  const currentTaskId = input.model.brokerTaskId ?? input.model.taskId
+  const currentIdentity =
+    currentTaskId ??
+    input.sources[input.sources.length - 1]?.parentToolUseId ??
+    input.stickyKey ??
+    "current"
+  const runs = input.sources.map(sourceObservation)
+  runs.push({
+    identity: currentIdentity,
+    taskId: currentTaskId,
+    lifecycleStatus: input.model.lifecycleStatus,
+    errorCode: input.model.errorCode ?? null,
+    startedAt: input.model.startedAt,
+    finishedAt: input.model.finishedAt,
+    lastAgentActivityAt: null,
+    runtimeStats: input.model.runtimeStats,
+    current: true,
+  })
+
+  const projection = buildDelegationWorkUnitRuntime({
+    runs,
+    nowMs: input.nowMs,
+    hasLiveBinding: input.hasLiveBinding,
+    explicitUserCancel: input.explicitUserCancel,
+  })
+  const runtimeStats = projection.runtimeStats ?? input.model.runtimeStats
+  const status =
+    projection.statusOverride && input.model.status === "err"
+      ? projection.statusOverride
+      : input.model.status
+
+  return {
+    ...input.model,
+    status,
+    lifecycleStatus:
+      projection.lifecycleOverride ?? input.model.lifecycleStatus,
+    errorCode: projection.suppressErrorCode ? undefined : input.model.errorCode,
+    startedAt: projection.startedAt ?? input.model.startedAt,
+    finishedAt: projection.activeSticky
+      ? null
+      : (projection.finishedAt ?? input.model.finishedAt),
+    elapsedMs: projection.elapsedMs ?? input.model.elapsedMs,
+    runtimeStats,
+    toolCallCount: projection.toolCallCount ?? input.model.toolCallCount,
+    editRollup: buildEditRollupViewModel(runtimeStats),
+    showGeneratingSegment: projection.activeSticky,
+    stickyKey: input.stickyKey,
   }
 }
 
@@ -718,7 +844,12 @@ function useDelegationRunSnapshot(
 }
 
 export function useDelegationCardModel(
-  source: DelegationCardSource
+  source: DelegationCardSource,
+  options?: {
+    workUnitSources?: readonly DelegationCardSource[]
+    stickyKey?: string | null
+    explicitUserCancel?: boolean
+  }
 ): DelegationCardModel {
   const {
     parentToolUseId,
@@ -737,10 +868,28 @@ export function useDelegationCardModel(
     [output, errorText]
   )
 
+  const toolOutput = useMemo<ParsedToolOutput | null>(() => {
+    if (errorText) {
+      const parsedError = parseToolOutput(errorText, true)
+      if (parsedError) return parsedError
+    }
+    return parseToolOutput(output)
+  }, [output, errorText])
+  const fallbackUncorrelatedFailure = isUncorrelatedDelegationFailure(
+    toolOutput,
+    parsedMeta?.taskId ?? displayTaskId
+  )
+  const fallbackChildConversationId = fallbackUncorrelatedFailure
+    ? null
+    : (parsedMeta?.childConversationId ??
+      toolOutput?.childConversationId ??
+      null)
+
   // `enabled: false` — the model never fetches the child's persisted detail
   // here; cold title/stats come from `delegationChildProjectionCache`.
   const { binding } = useDelegatedSubSession(parentToolUseId, {
     enabled: false,
+    fallbackChildConversationId,
   })
 
   const snapshotTaskId = binding?.taskId ?? parsedMeta?.taskId ?? displayTaskId
@@ -748,14 +897,6 @@ export function useDelegationCardModel(
     parentConversationId,
     snapshotTaskId
   )
-
-  const toolOutput = useMemo<ParsedToolOutput | null>(() => {
-    if (errorText) {
-      const parsedErr = parseToolOutput(errorText, true)
-      if (parsedErr) return parsedErr
-    }
-    return parseToolOutput(output)
-  }, [output, errorText])
 
   const currentTaskId =
     binding?.taskId ??
@@ -783,31 +924,56 @@ export function useDelegationCardModel(
   const childLive = useDelegationChildLive(childConnectionId)
   const childAwaitingPermission = childLive?.pendingPermission != null
 
-  // Eligibility without building the full model (avoids ticker chicken-egg).
-  const knownTaskId = currentTaskId
-  const tickerMeta = effectiveDelegationMeta(parsedMeta, runSnapshot)
-  const runScopedProjection = runScopedChildProjection(
-    childProjection,
-    knownTaskId
+  const defaultWorkUnitSources = useMemo<readonly DelegationCardSource[]>(
+    () => [
+      {
+        parentToolUseId,
+        parentConversationId,
+        input,
+        output,
+        errorText,
+        state,
+        meta,
+      },
+    ],
+    [
+      parentToolUseId,
+      parentConversationId,
+      input,
+      output,
+      errorText,
+      state,
+      meta,
+    ]
   )
-  const lifecyclePreview = resolveLifecycleStatus({
-    binding,
-    parsedMeta: tickerMeta,
-    runSnapshot,
-    childProjection: runScopedProjection,
-    toolOutput,
-    state,
-    errorText,
+  const workUnitSources = options?.workUnitSources ?? defaultWorkUnitSources
+  const stickyKey = options?.stickyKey ?? null
+  const explicitUserCancel = options?.explicitUserCancel ?? false
+
+  // Build the same sticky merge used by the final model before subscribing;
+  // recoverable terminal records must keep the shared ticker alive.
+  const previewNowMs = Date.now()
+  const previewModel = mergeDelegationWorkUnitModel({
+    model: buildDelegationCardModel({
+      parsedInput,
+      parsedMeta,
+      toolOutput,
+      binding,
+      runSnapshot,
+      childProjection,
+      childAwaitingPermission,
+      state,
+      errorText,
+      nowMs: previewNowMs,
+      displayTaskId,
+    }),
+    sources: workUnitSources,
+    stickyKey,
+    nowMs: previewNowMs,
+    hasLiveBinding: binding != null,
+    explicitUserCancel,
   })
-  const startedAtPreview = pickStartedAt(
-    binding,
-    tickerMeta,
-    runSnapshot,
-    runScopedProjection,
-    pickRuntimeStats(binding, tickerMeta, runSnapshot, runScopedProjection)
-  )
-  const tickerEligible =
-    lifecyclePreview === "running" && parseTimestampMs(startedAtPreview) != null
+  const tickerEligible = isTickerEligible(previewModel)
 
   useEffect(() => {
     if (!tickerEligible) return
@@ -828,20 +994,29 @@ export function useDelegationCardModel(
   )
 
   return useMemo(
-    () =>
-      buildDelegationCardModel({
-        parsedInput,
-        parsedMeta,
-        toolOutput,
-        binding,
-        runSnapshot,
-        childProjection,
-        childAwaitingPermission,
-        state,
-        errorText,
-        nowMs: Date.now(),
-        displayTaskId,
-      }),
+    () => {
+      const nowMs = Date.now()
+      return mergeDelegationWorkUnitModel({
+        model: buildDelegationCardModel({
+          parsedInput,
+          parsedMeta,
+          toolOutput,
+          binding,
+          runSnapshot,
+          childProjection,
+          childAwaitingPermission,
+          state,
+          errorText,
+          nowMs,
+          displayTaskId,
+        }),
+        sources: workUnitSources,
+        stickyKey,
+        nowMs,
+        hasLiveBinding: binding != null,
+        explicitUserCancel,
+      })
+    },
     // tickerVersion forces elapsed recompute while running.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tickerVersion is intentional
     [
@@ -855,6 +1030,9 @@ export function useDelegationCardModel(
       state,
       errorText,
       displayTaskId,
+      workUnitSources,
+      stickyKey,
+      explicitUserCancel,
       tickerVersion,
     ]
   )

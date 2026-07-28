@@ -15,6 +15,7 @@ import {
   liveTranscriptStore,
   selectRunningOutputTail,
 } from "@/stores/live-transcript-store"
+import type { DelegationIdentityIndex } from "@/lib/delegation-work-unit"
 
 // Streamdown / markdown stack is heavy in unit tests.
 vi.mock("@/components/ai-elements/message", () => ({
@@ -225,7 +226,11 @@ function publishToolAppend(
   })
 }
 
-function renderRow(onToolRender?: (id: string) => void, showThinking = true) {
+function renderRow(
+  onToolRender?: (id: string) => void,
+  showThinking = true,
+  delegationIdentityIndex?: DelegationIdentityIndex | null
+) {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <LiveTranscriptRow
@@ -233,6 +238,7 @@ function renderRow(onToolRender?: (id: string) => void, showThinking = true) {
         agentType="codex"
         showThinking={showThinking}
         onToolRender={onToolRender}
+        delegationIdentityIndex={delegationIdentityIndex}
       />
     </NextIntlClientProvider>
   )
@@ -280,6 +286,50 @@ describe("LiveTranscriptRow", () => {
     )
   })
 
+  it("hides a mapped continuation while keeping an unrelated shell tool", () => {
+    seedLiveTools(CID, [
+      tool("continue", {
+        title: "continue_delegation",
+        raw_input: JSON.stringify({ task_id: "run-1", task: "continue" }),
+      }),
+      tool("shell", {
+        title: "shell",
+        kind: "execute",
+        raw_input: JSON.stringify({ command: "git status" }),
+      }),
+    ])
+    const index: DelegationIdentityIndex = {
+      taskToUnitKey: new Map([["run-1", "unit-a"]]),
+      workUnitToUnitKey: new Map(),
+      knownTaskIds: new Set(["run-1"]),
+      knownWorkUnitKeys: new Set(),
+    }
+
+    renderRow(undefined, true, index)
+
+    expect(screen.queryByTestId("tool-part-continue")).not.toBeInTheDocument()
+    expect(screen.getByTestId("tool-part-shell")).toBeInTheDocument()
+  })
+
+  it("keeps an identity-free initial delegation visible", () => {
+    seedLiveTools(CID, [
+      tool("initial", {
+        title: "delegate_to_agent",
+        raw_input: JSON.stringify({ task: "new independent work" }),
+      }),
+    ])
+    const index: DelegationIdentityIndex = {
+      taskToUnitKey: new Map([["run-1", "unit-a"]]),
+      workUnitToUnitKey: new Map(),
+      knownTaskIds: new Set(["run-1"]),
+      knownWorkUnitKeys: new Set(),
+    }
+
+    renderRow(undefined, true, index)
+
+    expect(screen.getByTestId("tool-part-initial")).toBeInTheDocument()
+  })
+
   it("shows a typing indicator when the live snapshot has no segments yet", () => {
     liveTranscriptStore.rebuild(
       CID,
@@ -303,6 +353,33 @@ describe("LiveTranscriptRow", () => {
     renderRow()
     expect(screen.getByTestId("live-transcript-row")).toBeInTheDocument()
     expect(screen.getByTestId("message-response")).toHaveTextContent("hello")
+  })
+
+  it("hides the exact live marker only for delegated children", () => {
+    liveTranscriptStore.rebuild(
+      CID,
+      "c1",
+      liveMessage("*Conversation interrupted*"),
+      1
+    )
+    const ui = (isDelegatedChild: boolean) => (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTranscriptRow
+          conversationId={CID}
+          agentType="codex"
+          showThinking
+          isDelegatedChild={isDelegatedChild}
+        />
+      </NextIntlClientProvider>
+    )
+    const { rerender } = render(ui(true))
+
+    expect(
+      screen.queryByText(/Conversation interrupted/)
+    ).not.toBeInTheDocument()
+
+    rerender(ui(false))
+    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
   })
 
   it("updates text without remounting the row when chunks append", () => {
