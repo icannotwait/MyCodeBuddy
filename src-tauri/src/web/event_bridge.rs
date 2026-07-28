@@ -221,10 +221,20 @@ pub enum ConversationChange {
 /// emitter never steals the user's focus.
 pub const FOLDER_CHANGED_EVENT: &str = "folder://changed";
 
-/// Payload for [`FOLDER_CHANGED_EVENT`]. The full [`FolderDetail`] rides on the
-/// event so clients apply it without a re-fetch (matching
-/// [`ConversationChange::Upsert`]). `folder` is boxed to keep the enum small and
-/// to leave room for a future `Deleted { id }` variant.
+/// Why a folder left the open workspace list (`FolderChange::Close`).
+/// Wire values are snake_case (`auto_empty` | `user_remove`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderCloseCause {
+    /// Empty auto-close / visibility-only conditional close.
+    AutoEmpty,
+    /// Explicit user "remove from workspace" (sticky until re-open).
+    UserRemove,
+}
+
+/// Payload for [`FOLDER_CHANGED_EVENT`]. The full [`FolderDetail`] rides on
+/// Upsert so clients apply it without a re-fetch (matching
+/// [`ConversationChange::Upsert`]). `folder` is boxed to keep the enum small.
 ///
 /// [`FolderDetail`]: crate::models::FolderDetail
 #[derive(Debug, Clone, Serialize)]
@@ -233,6 +243,11 @@ pub enum FolderChange {
     /// Insert-or-replace by id (create / reopen / field update).
     Upsert {
         folder: Box<crate::models::FolderDetail>,
+    },
+    /// Workspace membership closed (`is_open = false`); history row may remain.
+    Close {
+        folder_id: i32,
+        cause: FolderCloseCause,
     },
 }
 
@@ -886,5 +901,40 @@ mod tests {
         assert_eq!(p["folder"]["id"], 42);
         assert_eq!(p["folder"]["parent_id"], 7);
         assert_eq!(p["folder"]["kind"], "regular");
+    }
+
+    #[test]
+    fn folder_change_close_serializes_cause_snake_case() {
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+
+        emit_event(
+            &emitter,
+            FOLDER_CHANGED_EVENT,
+            FolderChange::Close {
+                folder_id: 12,
+                cause: FolderCloseCause::AutoEmpty,
+            },
+        );
+
+        let evt = rx.try_recv().expect("folder close should broadcast");
+        let p = &*evt.payload;
+        assert_eq!(evt.channel, FOLDER_CHANGED_EVENT);
+        assert_eq!(p["kind"], "close");
+        assert_eq!(p["folder_id"], 12);
+        assert_eq!(p["cause"], "auto_empty");
+
+        emit_event(
+            &emitter,
+            FOLDER_CHANGED_EVENT,
+            FolderChange::Close {
+                folder_id: 99,
+                cause: FolderCloseCause::UserRemove,
+            },
+        );
+        let evt2 = rx.try_recv().expect("user_remove close should broadcast");
+        assert_eq!((&*evt2.payload)["cause"], "user_remove");
+        assert_eq!((&*evt2.payload)["folder_id"], 99);
     }
 }

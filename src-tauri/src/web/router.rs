@@ -273,6 +273,10 @@ pub fn build_router(
             post(handlers::folders::open_folder_by_id),
         )
         .route(
+            "/close_folder_if_empty",
+            post(handlers::folders::close_folder_if_empty),
+        )
+        .route(
             "/remove_folder_from_workspace",
             post(handlers::folders::remove_folder_from_workspace),
         )

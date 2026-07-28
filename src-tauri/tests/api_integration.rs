@@ -1007,3 +1007,115 @@ async fn regex_helper_http_route_accepts_a_valid_body_above_axum_default() {
     let matches: Vec<Value> = resp.json();
     assert!(matches.is_empty(), "non-matching regex yields empty result");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// close_folder_if_empty — dual-runtime Axum surface
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn close_folder_if_empty_route_flips_empty_open_and_emits_auto_empty() {
+    use codeg_lib::db::service::folder_service;
+    use codeg_lib::db::test_helpers::seed_folder;
+    use codeg_lib::web::event_bridge::FOLDER_CHANGED_EVENT;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+    let db = fresh_in_memory_db().await;
+    let folder_id = seed_folder(&db, "/tmp/codeg-close-if-empty-http").await;
+
+    let state = Arc::new(AppState::new_for_test(db, data_dir.path().to_path_buf()));
+    let mut rx = state.event_broadcaster.subscribe();
+    let shutdown = Arc::new(ShutdownSignal::new());
+    let router = build_router(
+        Arc::clone(&state),
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+    let server = TestServer::new(router).expect("test server");
+
+    let resp = server
+        .post("/api/close_folder_if_empty")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "folderId": folder_id }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "body={}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["closed"], true);
+
+    // DB membership closed.
+    let detail = folder_service::get_folder_by_id(&state.db.conn, folder_id)
+        .await
+        .expect("get")
+        .expect("exists");
+    // FolderDetail may not expose is_open; list open details must exclude it.
+    let open = folder_service::list_open_folder_details(&state.db.conn)
+        .await
+        .expect("list open");
+    assert!(
+        open.iter().all(|f| f.id != folder_id),
+        "closed folder must leave open list; still in open: {open:?}"
+    );
+    let _ = detail;
+
+    // Emit AutoEmpty only on flip.
+    let evt = rx.try_recv().expect("must broadcast folder://changed");
+    assert_eq!(evt.channel, FOLDER_CHANGED_EVENT);
+    let p = &*evt.payload;
+    assert_eq!(p["kind"], "close");
+    assert_eq!(p["folder_id"], folder_id);
+    assert_eq!(p["cause"], "auto_empty");
+
+    // Second call: already closed → closed:false, no emit.
+    let resp2 = server
+        .post("/api/close_folder_if_empty")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "folderId": folder_id }))
+        .await;
+    assert_eq!(resp2.status_code(), 200);
+    let body2: Value = resp2.json();
+    assert_eq!(body2["closed"], false);
+    assert!(
+        rx.try_recv().is_err(),
+        "idempotent close must not re-emit AutoEmpty"
+    );
+}
+
+#[tokio::test]
+async fn close_folder_if_empty_route_returns_false_for_nonempty_without_emit() {
+    use codeg_lib::db::service::conversation_service::create;
+    use codeg_lib::db::test_helpers::seed_folder;
+    use codeg_lib::models::agent::AgentType;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+    let db = fresh_in_memory_db().await;
+    let folder_id = seed_folder(&db, "/tmp/codeg-close-nonempty-http").await;
+    create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("live conv");
+
+    let state = Arc::new(AppState::new_for_test(db, data_dir.path().to_path_buf()));
+    let mut rx = state.event_broadcaster.subscribe();
+    let shutdown = Arc::new(ShutdownSignal::new());
+    let router = build_router(
+        Arc::clone(&state),
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+    let server = TestServer::new(router).expect("test server");
+
+    let resp = server
+        .post("/api/close_folder_if_empty")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "folderId": folder_id }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "body={}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["closed"], false);
+    assert!(
+        rx.try_recv().is_err(),
+        "non-empty conditional close must not emit"
+    );
+}

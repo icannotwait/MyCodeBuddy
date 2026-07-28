@@ -343,6 +343,26 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
+                // Empty-open reconcile: **readiness barrier** (block_on), NOT
+                // fire-and-forget like chat-dir GC. Must finish immediately after
+                // DB is managed and **before** `do_start_web_server_tauri` (or any
+                // other open-folder-serving surface) and before the main webview
+                // loads workspace data. Failure degrades (log only; no crash).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    match tauri::async_runtime::block_on(
+                        crate::commands::folders::reconcile_empty_open_folders_core(&db),
+                    ) {
+                        Ok(ids) if !ids.is_empty() => tracing::info!(
+                            "[folders] empty-open reconcile: closed {}",
+                            ids.len()
+                        ),
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::error!("[folders] empty-open reconcile failed: {err}")
+                        }
+                    }
+                }
                 // Process AppHandle for lifecycle badge paths that lack a live emitter.
                 #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
                 {
@@ -902,6 +922,9 @@ mod tauri_app {
                 // Workspace state (open folders, opened tabs, active tab) is
                 // restored by the frontend via `list_open_folder_details` /
                 // `list_opened_tabs` inside the main window.
+                // Empty-open reconcile already ran as a readiness barrier
+                // immediately after `app.manage(database)` (before embedded web
+                // server auto-start and this webview).
                 if app.get_webview_window("main").is_none() {
                     let url = tauri::WebviewUrl::App("workspace".into());
                     let builder = tauri::WebviewWindowBuilder::new(app, "main", url)
@@ -1152,6 +1175,7 @@ mod tauri_app {
                 folders::resolve_worktree_folder,
                 folders::open_folder_in_workspace,
                 folders::open_folder_by_id,
+                folders::close_folder_if_empty,
                 folders::remove_folder_from_workspace,
                 folders::reorder_folders,
                 folders::update_folder_color,

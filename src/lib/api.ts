@@ -1604,6 +1604,18 @@ export async function removeFolderFromWorkspace(
   return getTransport().call("remove_folder_from_workspace", { folderId })
 }
 
+/**
+ * Visibility-only conditional close: flips `is_open` false only when the folder
+ * is open, regular, not deleted, and has zero live conversations. Never cascades
+ * tabs/watches (unlike `removeFolderFromWorkspace`). Returns whether the flip
+ * happened; clients drop locally on `closed: true` or on `folder://changed` close.
+ */
+export async function closeFolderIfEmpty(
+  folderId: number
+): Promise<{ closed: boolean }> {
+  return getTransport().call("close_folder_if_empty", { folderId })
+}
+
 export async function reorderFolders(ids: number[]): Promise<void> {
   return getTransport().call("reorder_folders", { ids })
 }

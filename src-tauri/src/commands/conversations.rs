@@ -946,6 +946,23 @@ pub(crate) async fn import_selected_from_summaries(
                 if let Ok(Some(detail)) = folder_service::get_folder_by_id(conn, folder_id).await {
                     crate::commands::folders::emit_folder_upsert(emitter, detail);
                 }
+                // `add_folder` always opens the row. When the group imported
+                // zero live conversations (all skipped/failed, or only
+                // soft-deleted matches), close immediately so the sidebar does
+                // not keep an empty open folder. Close is atomic (NOT EXISTS
+                // live); emit AutoEmpty only on flip, and always *after* the
+                // Upsert above so clients see membership then correct it.
+                match folder_service::close_folder_if_no_live_conversations(conn, folder_id).await {
+                    Ok(true) => crate::commands::folders::emit_folder_close(
+                        emitter,
+                        folder_id,
+                        crate::web::event_bridge::FolderCloseCause::AutoEmpty,
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::error!(
+                        "[conversations] empty-folder close after import failed (folder {folder_id}): {e}"
+                    ),
+                }
             }
             // The folder itself could not be created/reopened — the whole group
             // produced nothing, so there is no folder to broadcast.
@@ -2720,9 +2737,11 @@ pub async fn cleanup_chat_folder_for_deleted_conversation(
 
 /// Full conversation-delete orchestration shared by the Tauri command and the web
 /// handler: capture the backing folder BEFORE the soft-delete (so a hidden chat
-/// folder can be retired afterward), soft-delete, broadcast the deletion, then run
-/// the tab + chat-folder cleanups. The thin `delete_conversation_core` primitive
-/// stays event-free for internal/test callers, so the orchestration lives here.
+/// folder can be retired afterward), soft-delete, broadcast the deletion, run the
+/// tab + chat-folder cleanups, then visibility-close an empty regular folder with
+/// `Close{AutoEmpty}` when live count hits zero. The thin `delete_conversation_core`
+/// primitive stays event-free for internal/test callers, so the orchestration lives
+/// here.
 pub async fn delete_conversation_with_cleanup_core(
     emitter: &EventEmitter,
     conn: &sea_orm::DatabaseConnection,
@@ -2750,6 +2769,20 @@ pub async fn delete_conversation_with_cleanup_core(
     cleanup_tabs_for_deleted_conversation(emitter, conn, conversation_id).await;
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
+        // Visibility-only: when a regular folder now has zero live conversations,
+        // flip is_open and broadcast Close{AutoEmpty}. Draft re-open is client-side
+        // (Task 5/2); chat-kind folders are no-ops inside the service primitive.
+        match folder_service::close_folder_if_no_live_conversations(conn, folder_id).await {
+            Ok(true) => crate::commands::folders::emit_folder_close(
+                emitter,
+                folder_id,
+                crate::web::event_bridge::FolderCloseCause::AutoEmpty,
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                "[conversations] empty-folder close after delete failed (folder {folder_id}): {e}"
+            ),
+        }
     }
     Ok(())
 }
@@ -5613,6 +5646,65 @@ Call get_delegation_status with the returned task_id to collect the result.";
         );
     }
 
+    #[tokio::test]
+    async fn delete_last_conversation_closes_empty_regular_folder() {
+        // Deleting the sole live conversation of an open regular folder must
+        // visibility-close the folder and broadcast Close{AutoEmpty} so every
+        // client drops it from the workspace open list.
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-delete-last-closes-folder").await;
+        let conv_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create sole conversation");
+
+        // Precondition: folder is open while it still has a live conversation.
+        let open_before = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open before");
+        assert!(
+            open_before.iter().any(|f| f.id == folder_id),
+            "seeded regular folder must start open"
+        );
+
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut rx = broadcaster.subscribe();
+        delete_conversation_with_cleanup_core(
+            &emitter,
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            conv_id,
+        )
+        .await
+        .expect("delete last conversation");
+
+        let open_after = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open after");
+        assert!(
+            open_after.iter().all(|f| f.id != folder_id),
+            "empty regular folder must leave list_open_folders after last delete"
+        );
+
+        let mut saw_auto_empty_close = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.channel != crate::web::event_bridge::FOLDER_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "close"
+                && p["folder_id"] == folder_id
+                && p["cause"] == "auto_empty"
+            {
+                saw_auto_empty_close = true;
+            }
+        }
+        assert!(
+            saw_auto_empty_close,
+            "last delete on empty regular folder must emit Close{{AutoEmpty}}"
+        );
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // Project Last Agent Recall — normal project create records recency only
     // after a successful insert; generic create / failed insert do not.
@@ -6233,6 +6325,119 @@ Call get_delegation_status with the returned task_id to collect the result.";
         }
         assert_eq!(folder_events, 2, "one folder upsert per touched folder");
         assert_eq!(bulk_events, 1, "exactly one bulk nudge, never per-row spam");
+    }
+
+    #[tokio::test]
+    async fn batch_import_closes_folder_left_empty_after_zero_live_import() {
+        // Import can reopen/create a folder via add_folder even when every
+        // selected session is skipped (soft-deleted never resurrects). The
+        // group must not stay open with zero live conversations: flip is_open
+        // and broadcast Close{AutoEmpty} after the folder Upsert.
+        use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
+
+        // First import creates a live conversation, then soft-delete both the
+        // conversation and the folder so the next batch reopens an empty shell.
+        let make = || {
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-empty-import"),
+                at(0),
+            )]
+        };
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("seed import");
+
+        let conv = conversation::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("seeded conversation");
+        let mut conv_active = conv.into_active_model();
+        conv_active.deleted_at = Set(Some(chrono::Utc::now()));
+        conv_active.update(&db.conn).await.unwrap();
+
+        let folder_row = crate::db::entities::folder::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut folder_active = folder_row.into_active_model();
+        folder_active.deleted_at = Set(Some(chrono::Utc::now()));
+        folder_active.is_open = Set(false);
+        folder_active.update(&db.conn).await.unwrap();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &emitter,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("empty-group import");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(
+            result.created_folders, 1,
+            "reopening soft-deleted folder counts as created"
+        );
+
+        let open = folder_service::list_open_folders(&db.conn)
+            .await
+            .expect("list open");
+        assert!(
+            open.iter().all(|f| f.id != folder_id),
+            "folder reopened by import with zero live sessions must not stay open"
+        );
+
+        let mut saw_upsert = false;
+        let mut saw_auto_empty_close = false;
+        let mut upsert_before_close = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.channel != FOLDER_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "upsert" && p["folder"]["id"] == folder_id {
+                saw_upsert = true;
+                if !saw_auto_empty_close {
+                    upsert_before_close = true;
+                }
+            }
+            if p["kind"] == "close"
+                && p["folder_id"] == folder_id
+                && p["cause"] == "auto_empty"
+            {
+                saw_auto_empty_close = true;
+            }
+        }
+        assert!(saw_upsert, "empty-group import still Upserts the reopened folder");
+        assert!(
+            saw_auto_empty_close,
+            "zero-live import group must emit Close{{AutoEmpty}}"
+        );
+        assert!(
+            upsert_before_close,
+            "Close{{AutoEmpty}} must follow Upsert for the same folder in the batch"
+        );
     }
 
     #[tokio::test]

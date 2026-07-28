@@ -13,6 +13,7 @@ import {
   acpPrompt,
   cancelReferenceSearch,
   cancelToolWatchdogLease,
+  closeFolderIfEmpty,
   extendToolWatchdogLease,
   getToolWatchdogSettings,
   setToolWatchdogSettings,
@@ -92,6 +93,34 @@ describe("tool-watchdog lease control transport payloads", () => {
     const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
     expect(args).not.toHaveProperty("warning_after_seconds")
     expect(args).not.toHaveProperty("grace_seconds")
+  })
+})
+
+describe("closeFolderIfEmpty transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+  })
+
+  it("calls close_folder_if_empty with camelCase folderId and typed closed:true", async () => {
+    mockTransport.call.mockResolvedValue({ closed: true })
+    const result = await closeFolderIfEmpty(42)
+    expect(mockTransport.call).toHaveBeenCalledWith("close_folder_if_empty", {
+      folderId: 42,
+    })
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("folder_id")
+    expect(result).toEqual({ closed: true })
+    expect(result.closed).toBe(true)
+  })
+
+  it("returns typed closed:false when the folder is non-empty or already closed", async () => {
+    mockTransport.call.mockResolvedValue({ closed: false })
+    const result = await closeFolderIfEmpty(7)
+    expect(mockTransport.call).toHaveBeenCalledWith("close_folder_if_empty", {
+      folderId: 7,
+    })
+    expect(result).toEqual({ closed: false })
+    expect(result.closed).toBe(false)
   })
 })
 

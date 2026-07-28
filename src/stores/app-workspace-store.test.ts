@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
+  getFolderEventGeneration,
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "./app-workspace-store"
@@ -8,15 +9,18 @@ import type { DbConversationSummary, FolderDetail } from "@/lib/types"
 const api = vi.hoisted(() => ({
   getFolder: vi.fn(),
   listAllConversations: vi.fn(),
+  listOpenFolderDetails: vi.fn(async () => [] as FolderDetail[]),
+  listAllFolderDetails: vi.fn(async () => [] as FolderDetail[]),
+  openFolderById: vi.fn(),
 }))
 
 vi.mock("@/lib/api", () => ({
   getFolder: api.getFolder,
   listAllConversations: api.listAllConversations,
-  listAllFolderDetails: vi.fn(async () => []),
-  listOpenFolderDetails: vi.fn(async () => []),
+  listAllFolderDetails: api.listAllFolderDetails,
+  listOpenFolderDetails: api.listOpenFolderDetails,
   openFolder: vi.fn(),
-  openFolderById: vi.fn(),
+  openFolderById: api.openFolderById,
   openWorktreeFolder: vi.fn(),
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
@@ -67,6 +71,11 @@ beforeEach(() => {
   resetAppWorkspaceStore()
   api.getFolder.mockReset()
   api.listAllConversations.mockReset()
+  api.listOpenFolderDetails.mockReset()
+  api.listOpenFolderDetails.mockResolvedValue([])
+  api.listAllFolderDetails.mockReset()
+  api.listAllFolderDetails.mockResolvedValue([])
+  api.openFolderById.mockReset()
 })
 
 describe("updateConversationLocal — stats reference stability", () => {
@@ -603,5 +612,179 @@ describe("refreshFolder — branch null-guard", () => {
     await useAppWorkspaceStore.getState().refreshFolder(1)
 
     expect(useAppWorkspaceStore.getState().branches.get(1)).toBe("main")
+  })
+})
+
+describe("folder membership generation fence", () => {
+  it("dropFolderFromOpenList removes open membership only and advances generation", () => {
+    const f12 = makeFolder({ id: 12 })
+    const f13 = makeFolder({ id: 13 })
+    useAppWorkspaceStore.setState({
+      folders: [f12, f13],
+      allFolders: [f12, f13],
+    })
+    const genBefore = getFolderEventGeneration()
+
+    useAppWorkspaceStore.getState().dropFolderFromOpenList(12)
+
+    const st = useAppWorkspaceStore.getState()
+    expect(st.folders.map((f) => f.id)).toEqual([13])
+    expect(st.allFolders.map((f) => f.id)).toEqual([12, 13])
+    expect(getFolderEventGeneration()).toBeGreaterThan(genBefore)
+  })
+
+  it("discards an in-flight refetch when Close applies during the fetch", async () => {
+    const open = makeFolder({ id: 1 })
+    const staleOpen = deferred<FolderDetail[]>()
+    const all = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(staleOpen.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(all.promise)
+
+    useAppWorkspaceStore.setState({
+      folders: [open, makeFolder({ id: 12 })],
+      allFolders: [open, makeFolder({ id: 12 })],
+    })
+
+    const fetchPromise = useAppWorkspaceStore.getState().fetchFolders()
+    // Close during in-flight refetch — must not be overwritten by stale open list.
+    useAppWorkspaceStore.getState().dropFolderFromOpenList(12)
+
+    staleOpen.resolve([open, makeFolder({ id: 12 })])
+    all.resolve([open, makeFolder({ id: 12 })])
+    await fetchPromise
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+  })
+
+  it("discards an in-flight refetch when Upsert applies during the fetch", async () => {
+    const open = makeFolder({ id: 1 })
+    const fresh = makeFolder({ id: 99, name: "fresh" })
+    const staleOpen = deferred<FolderDetail[]>()
+    const all = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(staleOpen.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(all.promise)
+
+    useAppWorkspaceStore.setState({ folders: [open], allFolders: [open] })
+
+    const fetchPromise = useAppWorkspaceStore.getState().fetchFolders()
+    useAppWorkspaceStore.getState().upsertFolder(fresh)
+
+    // Stale snapshot without folder 99 must not wipe the concurrent upsert.
+    staleOpen.resolve([open])
+    all.resolve([open])
+    await fetchPromise
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 99)
+    ).toBe(true)
+  })
+
+  it("overlapping refetches: only the latest generation-matching commit wins", async () => {
+    const a = deferred<FolderDetail[]>()
+    const aAll = deferred<FolderDetail[]>()
+    const b = deferred<FolderDetail[]>()
+    const bAll = deferred<FolderDetail[]>()
+
+    api.listOpenFolderDetails
+      .mockReturnValueOnce(a.promise)
+      .mockReturnValueOnce(b.promise)
+    api.listAllFolderDetails
+      .mockReturnValueOnce(aAll.promise)
+      .mockReturnValueOnce(bAll.promise)
+
+    const p1 = useAppWorkspaceStore.getState().fetchFolders()
+    const p2 = useAppWorkspaceStore.getState().fetchFolders()
+
+    // First (stale) returns an empty open list; second returns folder 5.
+    a.resolve([])
+    aAll.resolve([])
+    b.resolve([makeFolder({ id: 5 })])
+    bAll.resolve([makeFolder({ id: 5 })])
+    await Promise.all([p1, p2])
+
+    expect(useAppWorkspaceStore.getState().folders.map((f) => f.id)).toEqual([
+      5,
+    ])
+  })
+
+  it("stale closed snapshot after newer open is discarded by the fence", async () => {
+    const closedSnap = deferred<FolderDetail[]>()
+    const closedAll = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(closedSnap.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(closedAll.promise)
+
+    const fetchPromise = useAppWorkspaceStore.getState().fetchFolders()
+    // User re-opened (or AutoEmpty re-open) while the closed snapshot was in flight.
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 12, name: "reopened" }))
+
+    closedSnap.resolve([]) // stale: server still thinks 12 is closed
+    closedAll.resolve([makeFolder({ id: 12 })])
+    await fetchPromise
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(true)
+  })
+
+  it("Upsert first then Close then open snapshot: fenced refetch restores membership", async () => {
+    // Same order as the context-level claim: open FIRST, then Close drop,
+    // then authoritative open-list commit restores (not Close-first + Upsert).
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 12, name: "open-first" }))
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(true)
+
+    // Stale Close after newer open — local membership drop only.
+    useAppWorkspaceStore.getState().dropFolderFromOpenList(12)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+
+    // Post-close fenced refetch returns authoritative open snapshot (server
+    // still/already has the folder open after the newer open won).
+    api.listOpenFolderDetails.mockResolvedValueOnce([
+      makeFolder({ id: 12, name: "authoritative-open" }),
+    ])
+    api.listAllFolderDetails.mockResolvedValueOnce([
+      makeFolder({ id: 12, name: "authoritative-open" }),
+    ])
+    await useAppWorkspaceStore.getState().fetchFolders()
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(true)
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("authoritative-open")
+  })
+
+  it("reconnect-style refetch fence keeps concurrent Upsert over stale empty list", async () => {
+    // Mirrors onTransportReconnect → fetchFolders while a membership Upsert
+    // lands mid-flight (same fence as Close).
+    const staleOpen = deferred<FolderDetail[]>()
+    const staleAll = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(staleOpen.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(staleAll.promise)
+
+    useAppWorkspaceStore.setState({ folders: [], allFolders: [] })
+    const reconnectFetch = useAppWorkspaceStore.getState().fetchFolders()
+
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 7, name: "live-upsert" }))
+
+    staleOpen.resolve([])
+    staleAll.resolve([])
+    await reconnectFetch
+
+    expect(useAppWorkspaceStore.getState().folders.map((f) => f.id)).toEqual([
+      7,
+    ])
   })
 })

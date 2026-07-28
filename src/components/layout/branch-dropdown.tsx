@@ -58,6 +58,7 @@ import { ConflictDialog } from "@/components/layout/conflict-dialog"
 import { StashDialog } from "@/components/layout/stash-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 import { toErrorMessage } from "@/lib/app-error"
+import { openWorktreeFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { useSwitchToBranch } from "@/hooks/use-switch-to-branch"
 import {
   buildBranchTree,
@@ -72,7 +73,6 @@ import type {
 import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import type { FolderDetail, GitBranchList, GitConflictInfo } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
-import { useTabActions } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useAlertContext } from "@/contexts/alert-context"
@@ -119,8 +119,6 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
   const tCommon = useTranslations("Folder.common")
   const activeFolder = folder
   const refreshFolder = useAppWorkspaceStore((s) => s.refreshFolder)
-  const openWorktreeFolder = useAppWorkspaceStore((s) => s.openWorktreeFolder)
-  const { openNewConversationTab } = useTabActions()
   const { openConversations } = useWorkbenchRoute()
   const { addTask, updateTask, removeTask } = useTaskContext()
   const { pushAlert } = useAlertContext()
@@ -416,11 +414,10 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       // merged under their parent in the sidebar, a worktree with no
       // conversations would otherwise be unreachable; this also lands the new
       // session with its cwd set to the worktree directory (detail.path).
-      const detail = await openWorktreeFolder(wtPath, folderId)
       // Return to the conversation workspace if a route (e.g. Automations)
       // was covering the content region, else the new tab opens unseen.
       openConversations()
-      openNewConversationTab(detail.id, detail.path)
+      await openWorktreeFolderWithDraft(wtPath, folderId)
     })
   }
 

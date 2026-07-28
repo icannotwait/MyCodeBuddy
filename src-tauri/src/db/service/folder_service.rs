@@ -60,7 +60,7 @@ pub async fn get_folder_by_id(
     Ok(row.map(to_detail))
 }
 
-/// How [`add_folder_inner`] writes the `parent_id` column. The two callers want
+/// How [`ensure_folder_inner`] writes the `parent_id` column. The two callers want
 /// different semantics on reopen of an existing path, which a bare `Option<i32>`
 /// could not express (it conflates "no parent" with "don't touch the parent").
 enum ParentWrite {
@@ -73,24 +73,66 @@ enum ParentWrite {
     Set(Option<i32>),
 }
 
+/// Visibility mode for path registration / open.
+///
+/// Replaces a bare `open: bool` which could be misread as ForceClosed. Delegation
+/// and other FK-only registration use [`RegistrationOnly`]; explicit user open
+/// paths use [`ForceOpen`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureFolderMode {
+    /// Register or revive a path without changing workspace membership of an
+    /// already-live row. Existing live `is_open` is **preserved**; new and
+    /// soft-deleted→revived rows get `is_open = false` and do not masquerade as
+    /// user-open timestamps.
+    RegistrationOnly,
+    /// Explicit open (user open, worktree mint, add-to-workspace): always set
+    /// `is_open = true` and update open timestamps as today.
+    ForceOpen,
+}
+
+/// Ensure a folder row exists for `path` with the given visibility mode.
+///
+/// See [`EnsureFolderMode`] for RegistrationOnly vs ForceOpen write semantics.
+pub async fn ensure_folder(
+    conn: &DatabaseConnection,
+    path: &str,
+    mode: EnsureFolderMode,
+) -> Result<FolderHistoryEntry, DbError> {
+    ensure_folder_inner(conn, path, ParentWrite::Preserve, mode).await
+}
+
+/// Force-open a folder path (user open / history add). Equivalent to
+/// [`ensure_folder`] with [`EnsureFolderMode::ForceOpen`].
 pub async fn add_folder(
     conn: &DatabaseConnection,
     path: &str,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Preserve).await
+    ensure_folder_inner(
+        conn,
+        path,
+        ParentWrite::Preserve,
+        EnsureFolderMode::ForceOpen,
+    )
+    .await
 }
 
 /// Like [`add_folder`] but authoritatively sets `parent_id` — the *root* folder
 /// this path was created under (used by the worktree flow so a worktree folder
 /// remembers its originating repo folder). The value is written on both insert
 /// and reopen, so it always reflects the latest worktree relationship and never
-/// a stale one.
+/// a stale one. Always ForceOpen (user-visible worktree open).
 pub async fn add_folder_with_parent(
     conn: &DatabaseConnection,
     path: &str,
     parent_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Set(parent_id)).await
+    ensure_folder_inner(
+        conn,
+        path,
+        ParentWrite::Set(parent_id),
+        EnsureFolderMode::ForceOpen,
+    )
+    .await
 }
 
 fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
@@ -101,57 +143,172 @@ fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
         || msg.contains("1555") // SQLITE_CONSTRAINT_PRIMARYKEY
 }
 
-/// Test-only: next N `add_folder` calls skip a successful existing-row find so
-/// concurrent callers both reach INSERT and exercise UNIQUE recovery.
+/// Test-only: per-path remaining skip-find budget for UNIQUE recovery tests.
+///
+/// Keyed by folder `path` so only matching [`ensure_folder`] / [`add_folder`]
+/// calls consume budget. Unguarded parallel work on other paths cannot steal
+/// another test's skips. Use [`ForceSkipExistingGuard`] so Drop always clears
+/// the path entry (including panic).
 #[cfg(test)]
-static FORCE_ADD_FOLDER_SKIP_EXISTING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SKIP_EXISTING_BY_PATH: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn take_force_skip_existing() -> bool {
-    use std::sync::atomic::Ordering;
-    FORCE_ADD_FOLDER_SKIP_EXISTING
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            if n > 0 {
-                Some(n - 1)
-            } else {
-                None
+fn skip_existing_map() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, usize>> {
+    SKIP_EXISTING_BY_PATH
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Consume one skip for `path` if budget remains. Other paths are unaffected.
+#[cfg(test)]
+fn take_force_skip_existing(path: &str) -> bool {
+    let mut map = skip_existing_map();
+    match map.get_mut(path) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(path);
             }
-        })
-        .is_ok()
+            true
+        }
+        _ => false,
+    }
 }
 
-/// Arm the skip-existing race for tests (see `FORCE_ADD_FOLDER_SKIP_EXISTING`).
+/// RAII arm of the path-scoped UNIQUE-recovery skip inject.
+///
+/// - Only `ensure_folder`/`add_folder` calls for this exact `path` skip find
+/// - Parallel unguarded calls for other paths never consume this budget
+/// - Drop removes the path entry so panics cannot leak armed state
 #[cfg(test)]
-pub fn force_add_folder_skip_existing_for_test(n: usize) {
-    FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, std::sync::atomic::Ordering::SeqCst);
+pub struct ForceSkipExistingGuard {
+    path: String,
 }
 
-async fn reopen_folder_row(
+#[cfg(test)]
+impl ForceSkipExistingGuard {
+    /// Arm the next `n` find-skips for `path` only.
+    pub fn arm(path: impl Into<String>, n: usize) -> Self {
+        let path = path.into();
+        skip_existing_map().insert(path.clone(), n);
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceSkipExistingGuard {
+    fn drop(&mut self) {
+        skip_existing_map().remove(&self.path);
+    }
+}
+
+/// Arm path-scoped skip-existing race for tests. Keep the guard live for the
+/// full armed interval (including concurrent tasks that consume this path).
+#[cfg(test)]
+pub fn force_add_folder_skip_existing_for_test(path: &str, n: usize) -> ForceSkipExistingGuard {
+    ForceSkipExistingGuard::arm(path, n)
+}
+
+/// Test helper: remaining skip budget for `path` (0 if unarmed).
+#[cfg(test)]
+fn remaining_skip_budget_for_test(path: &str) -> usize {
+    skip_existing_map().get(path).copied().unwrap_or(0)
+}
+
+/// Test-only: when armed with a folder id, the next
+/// [`close_folder_if_no_live_conversations`] call inserts one live conversation
+/// for that folder **immediately before** the conditional UPDATE — a
+/// deterministic race hook proving live rows cannot lose to a successful close.
+#[cfg(test)]
+static FORCE_LIVE_INSERT_BEFORE_CLOSE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// Arm the pre-close live-insert race for tests (0 = disarmed).
+#[cfg(test)]
+pub fn force_live_insert_before_close_for_test(folder_id: i32) {
+    FORCE_LIVE_INSERT_BEFORE_CLOSE.store(folder_id, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn take_force_live_insert_before_close() -> Option<i32> {
+    use std::sync::atomic::Ordering;
+    let id = FORCE_LIVE_INSERT_BEFORE_CLOSE.swap(0, Ordering::SeqCst);
+    if id == 0 {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Apply mode-specific write to an existing path row (live or soft-deleted).
+async fn apply_existing_folder_row(
     conn: &DatabaseConnection,
     row: folder::Model,
     name: String,
     now: chrono::DateTime<Utc>,
     parent: ParentWrite,
+    mode: EnsureFolderMode,
 ) -> Result<folder::Model, DbError> {
-    let mut active = row.into_active_model();
-    active.name = Set(name);
-    active.last_opened_at = Set(now);
-    active.updated_at = Set(now);
-    active.deleted_at = Set(None);
-    active.is_open = Set(true);
-    // Plain reopen leaves the relationship as-is; the worktree flow writes
-    // the authoritative value (including NULL) so it can never go stale.
-    if let ParentWrite::Set(parent_id) = parent {
-        active.parent_id = Set(parent_id);
+    match mode {
+        EnsureFolderMode::ForceOpen => {
+            let mut active = row.into_active_model();
+            active.name = Set(name);
+            active.last_opened_at = Set(now);
+            active.updated_at = Set(now);
+            active.deleted_at = Set(None);
+            active.is_open = Set(true);
+            // Plain reopen leaves the relationship as-is; the worktree flow writes
+            // the authoritative value (including NULL) so it can never go stale.
+            if let ParentWrite::Set(parent_id) = parent {
+                active.parent_id = Set(parent_id);
+            }
+            Ok(active.update(conn).await?)
+        }
+        EnsureFolderMode::RegistrationOnly => {
+            let was_deleted = row.deleted_at.is_some();
+            if !was_deleted {
+                // Live existing: preserve is_open and last_opened_at. Only touch
+                // name / parent / updated_at when something actually changes.
+                let parent_change = match parent {
+                    ParentWrite::Preserve => false,
+                    ParentWrite::Set(pid) => row.parent_id != pid,
+                };
+                let name_change = row.name != name;
+                if !parent_change && !name_change {
+                    return Ok(row);
+                }
+                let mut active = row.into_active_model();
+                if name_change {
+                    active.name = Set(name);
+                }
+                if let ParentWrite::Set(parent_id) = parent {
+                    active.parent_id = Set(parent_id);
+                }
+                active.updated_at = Set(now);
+                return Ok(active.update(conn).await?);
+            }
+            // Soft-deleted → revive closed; do not bump last_opened_at.
+            let mut active = row.into_active_model();
+            active.name = Set(name);
+            active.deleted_at = Set(None);
+            active.is_open = Set(false);
+            active.updated_at = Set(now);
+            if let ParentWrite::Set(parent_id) = parent {
+                active.parent_id = Set(parent_id);
+            }
+            Ok(active.update(conn).await?)
+        }
     }
-    Ok(active.update(conn).await?)
 }
 
-async fn add_folder_inner(
+async fn ensure_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
     parent: ParentWrite,
+    mode: EnsureFolderMode,
 ) -> Result<FolderHistoryEntry, DbError> {
     let now = Utc::now();
     let name = std::path::Path::new(path)
@@ -165,14 +322,14 @@ async fn add_folder_inner(
         .await?;
 
     #[cfg(test)]
-    let existing = if take_force_skip_existing() {
+    let existing = if take_force_skip_existing(path) {
         None
     } else {
         existing
     };
 
     let model = if let Some(row) = existing {
-        reopen_folder_row(conn, row, name, now, parent).await?
+        apply_existing_folder_row(conn, row, name, now, parent, mode).await?
     } else {
         let max_order = folder::Entity::find()
             .order_by_desc(folder::Column::SortOrder)
@@ -180,6 +337,8 @@ async fn add_folder_inner(
             .await?
             .map(|m| m.sort_order)
             .unwrap_or(0);
+        // RegistrationOnly inserts closed; ForceOpen inserts open with open timestamps.
+        let is_open = matches!(mode, EnsureFolderMode::ForceOpen);
         let active = folder::ActiveModel {
             id: NotSet,
             name: Set(name.clone()),
@@ -187,11 +346,13 @@ async fn add_folder_inner(
             git_branch: Set(None),
             default_agent_type: Set(None),
             last_agent_type: Set(None),
+            // Column is NOT NULL; RegistrationOnly still needs a value but
+            // is_open=false is the visibility signal (not a user open).
             last_opened_at: Set(now),
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
-            is_open: Set(true),
+            is_open: Set(is_open),
             sort_order: Set(max_order + 1),
             color: Set(DEFAULT_FOLDER_COLOR.to_string()),
             parent_id: Set(match parent {
@@ -204,14 +365,14 @@ async fn add_folder_inner(
         match active.insert(conn).await {
             Ok(model) => model,
             // Concurrent open of the same path: loser lost the UNIQUE race —
-            // reopen the winner instead of surfacing spawn_failed to callers.
+            // re-apply mode semantics on the winner instead of surfacing error.
             Err(e) if is_unique_path_violation(&e) => {
                 let winner = folder::Entity::find()
                     .filter(folder::Column::Path.eq(path))
                     .one(conn)
                     .await?
                     .ok_or_else(|| DbError::from(e))?;
-                reopen_folder_row(conn, winner, name, now, parent).await?
+                apply_existing_folder_row(conn, winner, name, now, parent, mode).await?
             }
             Err(e) => return Err(e.into()),
         }
@@ -408,6 +569,97 @@ pub async fn set_folder_open(
     Ok(())
 }
 
+/// Count live conversations for a folder (`deleted_at IS NULL`).
+///
+/// Diagnostic / import decision aid only — **never** use this count alone as
+/// the auto-close guard (TOCTOU). Close uses
+/// [`close_folder_if_no_live_conversations`]'s atomic `NOT EXISTS` UPDATE.
+pub async fn count_live_conversations_for_folder(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<u64, DbError> {
+    use crate::db::entities::conversation;
+    use sea_orm::PaginatorTrait;
+
+    let n = conversation::Entity::find()
+        .filter(conversation::Column::FolderId.eq(folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .count(conn)
+        .await?;
+    Ok(n)
+}
+
+/// Visibility-only auto-close for one folder when it is still open, regular,
+/// not soft-deleted, and has zero live conversations.
+///
+/// Atomic: a single conditional `UPDATE` with `NOT EXISTS` live conversations.
+/// Returns `true` only when this statement flipped `is_open` true→false.
+/// No-op (`false`) for missing, chat kind, already closed, soft-deleted, or
+/// non-empty folders — never touches `deleted_at`.
+pub async fn close_folder_if_no_live_conversations(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    // Deterministic race hook (tests only): insert a live conversation after
+    // the call starts but before the atomic UPDATE evaluates NOT EXISTS.
+    #[cfg(test)]
+    if let Some(hook_id) = take_force_live_insert_before_close() {
+        if hook_id == folder_id {
+            crate::db::service::conversation_service::create(
+                conn,
+                folder_id,
+                AgentType::ClaudeCode,
+                None,
+                None,
+            )
+            .await?;
+        }
+    }
+
+    let now = Utc::now();
+    let result = folder::Entity::update_many()
+        .col_expr(folder::Column::IsOpen, Expr::value(false))
+        .col_expr(folder::Column::UpdatedAt, Expr::value(now))
+        .filter(folder::Column::Id.eq(folder_id))
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::Kind.eq(FolderKind::Regular))
+        .filter(folder::Column::IsOpen.eq(true))
+        .filter(Expr::cust(
+            "NOT EXISTS (SELECT 1 FROM conversation c \
+             WHERE c.folder_id = folder.id AND c.deleted_at IS NULL)",
+        ))
+        .exec(conn)
+        .await?;
+
+    Ok(result.rows_affected == 1)
+}
+
+/// Bulk reconcile: close every open regular folder that currently has zero live
+/// conversations. Returns the ids that were closed (caller derives count).
+///
+/// Each close uses the same atomic [`close_folder_if_no_live_conversations`]
+/// primitive (`WHERE NOT EXISTS` live), not a pre-count then set.
+pub async fn close_open_folders_with_no_live_conversations(
+    conn: &DatabaseConnection,
+) -> Result<Vec<i32>, DbError> {
+    let candidates = folder::Entity::find()
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::IsOpen.eq(true))
+        .filter(folder::Column::Kind.eq(FolderKind::Regular))
+        .all(conn)
+        .await?;
+
+    let mut closed = Vec::new();
+    for row in candidates {
+        if close_folder_if_no_live_conversations(conn, row.id).await? {
+            closed.push(row.id);
+        }
+    }
+    Ok(closed)
+}
+
 pub async fn list_open_folders(
     conn: &DatabaseConnection,
 ) -> Result<Vec<FolderHistoryEntry>, DbError> {
@@ -500,22 +752,319 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        add_chat_folder, add_folder, force_add_folder_skip_existing_for_test, get_folder_by_id,
-        update_folder_last_agent,
+        add_chat_folder, add_folder, close_folder_if_no_live_conversations,
+        close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
+        ensure_folder, force_add_folder_skip_existing_for_test,
+        force_live_insert_before_close_for_test, get_folder_by_id, list_open_folder_details,
+        list_open_folders, remaining_skip_budget_for_test, set_folder_open,
+        update_folder_last_agent, EnsureFolderMode,
     };
     use crate::db::entities::folder;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::db::service::conversation_service;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::agent::AgentType;
+    use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
     use std::sync::Arc;
     use tokio::sync::Barrier;
+
+    async fn raw_folder(conn: &sea_orm::DatabaseConnection, id: i32) -> folder::Model {
+        folder::Entity::find_by_id(id)
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("folder row")
+    }
+
+    #[tokio::test]
+    async fn close_open_folders_with_no_live_conversations_closes_empty_regular() {
+        let db = fresh_in_memory_db().await;
+        let empty_id = seed_folder(&db, "/tmp/codeg-empty-open").await;
+        let kept_id = seed_folder(&db, "/tmp/codeg-kept-open").await;
+        seed_conversation(&db, kept_id, AgentType::ClaudeCode).await;
+
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("reconcile");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0], empty_id);
+
+        let open = list_open_folders(&db.conn).await.expect("list");
+        let open_ids: Vec<i32> = open.iter().map(|f| f.id).collect();
+        assert!(!open_ids.contains(&empty_id));
+        assert!(open_ids.contains(&kept_id));
+    }
+
+    /// Sequencing proof for the startup readiness barrier: after bulk reconcile
+    /// completes, `list_open_folder_details` (the client open-list surface) must
+    /// not include any regular folder with zero live conversations.
+    #[tokio::test]
+    async fn reconcile_then_list_open_folder_details_has_no_empty_regular() {
+        let db = fresh_in_memory_db().await;
+        let empty_id = seed_folder(&db, "/tmp/codeg-barrier-empty").await;
+        let kept_id = seed_folder(&db, "/tmp/codeg-barrier-kept").await;
+        seed_conversation(&db, kept_id, AgentType::ClaudeCode).await;
+
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("barrier reconcile completes");
+        assert_eq!(closed, vec![empty_id]);
+
+        let details = list_open_folder_details(&db.conn)
+            .await
+            .expect("list_open_folder_details after barrier");
+        let ids: Vec<i32> = details.iter().map(|d| d.id).collect();
+        assert!(!ids.contains(&empty_id));
+        assert!(ids.contains(&kept_id));
+        for d in details {
+            let live = count_live_conversations_for_folder(&db.conn, d.id)
+                .await
+                .expect("count");
+            assert!(live > 0, "open detail id={} must have live convs", d.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_open_folders_skips_chat_kind() {
+        let db = fresh_in_memory_db().await;
+        let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-scratch/x")
+            .await
+            .expect("chat folder");
+        // ensure is_open true (add_chat_folder already opens)
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("reconcile");
+        assert!(closed.is_empty());
+        let still = get_folder_by_id(&db.conn, chat.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        // chat still exists and was not soft-deleted; open flag may remain true
+        // (list_open_folder_details excludes chat regardless)
+        let _ = still;
+        let raw = raw_folder(&db.conn, chat.id).await;
+        assert!(raw.is_open, "chat is_open must remain true");
+        assert!(raw.deleted_at.is_none(), "chat must not be soft-deleted");
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_is_idempotent() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-once").await;
+        assert!(close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_noops_without_touching_deleted_at() {
+        let db = fresh_in_memory_db().await;
+
+        // --- already closed ---
+        let closed_id = seed_folder(&db, "/tmp/codeg-already-closed").await;
+        set_folder_open(&db.conn, closed_id, false)
+            .await
+            .expect("close");
+        let before = raw_folder(&db.conn, closed_id).await;
+        assert!(!before.is_open);
+        assert!(before.deleted_at.is_none());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, closed_id)
+            .await
+            .unwrap());
+        let after = raw_folder(&db.conn, closed_id).await;
+        assert!(!after.is_open);
+        assert_eq!(after.deleted_at, before.deleted_at);
+
+        // --- missing id ---
+        assert!(!close_folder_if_no_live_conversations(&db.conn, 9_999_999)
+            .await
+            .unwrap());
+
+        // --- chat kind: false, is_open unchanged, deleted_at unchanged ---
+        let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-noop")
+            .await
+            .expect("chat");
+        let chat_before = raw_folder(&db.conn, chat.id).await;
+        assert!(chat_before.is_open);
+        assert!(chat_before.deleted_at.is_none());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, chat.id)
+            .await
+            .unwrap());
+        let chat_after = raw_folder(&db.conn, chat.id).await;
+        assert!(
+            chat_after.is_open,
+            "chat is_open must stay true after no-op close"
+        );
+        assert_eq!(chat_after.deleted_at, chat_before.deleted_at);
+
+        // --- soft-deleted regular folder ---
+        let deleted_id = seed_folder(&db, "/tmp/codeg-soft-deleted").await;
+        let mut del = raw_folder(&db.conn, deleted_id).await.into_active_model();
+        let del_at = Utc::now();
+        del.deleted_at = Set(Some(del_at));
+        del.is_open = Set(true); // still marked open but soft-deleted
+        del.update(&db.conn).await.expect("soft-delete folder");
+        let del_before = raw_folder(&db.conn, deleted_id).await;
+        assert!(del_before.deleted_at.is_some());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, deleted_id)
+            .await
+            .unwrap());
+        let del_after = raw_folder(&db.conn, deleted_id).await;
+        assert_eq!(
+            del_after.deleted_at.map(|t| t.timestamp()),
+            del_before.deleted_at.map(|t| t.timestamp()),
+            "deleted_at must not change on no-op close"
+        );
+        assert!(del_after.is_open, "soft-deleted row is_open left alone");
+
+        // --- non-empty (live conversation) ---
+        let nonempty_id = seed_folder(&db, "/tmp/codeg-nonempty").await;
+        seed_conversation(&db, nonempty_id, AgentType::ClaudeCode).await;
+        let ne_before = raw_folder(&db.conn, nonempty_id).await;
+        assert!(ne_before.is_open);
+        assert!(ne_before.deleted_at.is_none());
+        assert!(
+            !close_folder_if_no_live_conversations(&db.conn, nonempty_id)
+                .await
+                .unwrap()
+        );
+        let ne_after = raw_folder(&db.conn, nonempty_id).await;
+        assert!(ne_after.is_open, "non-empty folder must stay open");
+        assert_eq!(ne_after.deleted_at, ne_before.deleted_at);
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_loses_to_live_insert_race_hook() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-race-hook").await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Insert lands after call entry, before the atomic UPDATE NOT EXISTS.
+        force_live_insert_before_close_for_test(id);
+        let closed = close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .expect("close");
+        force_live_insert_before_close_for_test(0); // disarm if unused
+
+        assert!(
+            !closed,
+            "live insert before UPDATE must prevent a successful close"
+        );
+        let row = raw_folder(&db.conn, id).await;
+        assert!(row.is_open, "folder must remain open when race insert wins");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_concurrent_live_insert() {
+        // Concurrent insert + close: successful close must never leave a
+        // still-open folder; live present with open stays open (insert won).
+        for _ in 0..8 {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let id = seed_folder(&db, "/tmp/codeg-concurrent-close").await;
+            let barrier = Arc::new(Barrier::new(2));
+
+            let b1 = barrier.clone();
+            let db1 = db.clone();
+            let close_task = tokio::spawn(async move {
+                b1.wait().await;
+                close_folder_if_no_live_conversations(&db1.conn, id).await
+            });
+            let b2 = barrier.clone();
+            let db2 = db.clone();
+            let insert_task = tokio::spawn(async move {
+                b2.wait().await;
+                seed_conversation(&db2, id, AgentType::ClaudeCode).await
+            });
+
+            let closed = close_task.await.expect("join close").expect("close result");
+            let _conv_id = insert_task.await.expect("join insert");
+
+            let row = raw_folder(&db.conn, id).await;
+            let live = count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .expect("count");
+            assert!(live >= 1, "insert must have landed");
+            assert!(row.deleted_at.is_none(), "deleted_at never touched");
+            if closed {
+                assert!(!row.is_open, "successful close must flip is_open false");
+            } else {
+                assert!(
+                    row.is_open,
+                    "failed close (live present at UPDATE) must leave open"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn count_live_conversations_for_folder_live_vs_soft_deleted() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-count-live").await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let live_a = seed_conversation(&db, id, AgentType::ClaudeCode).await;
+        let live_b = seed_conversation(&db, id, AgentType::Codex).await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            2
+        );
+
+        conversation_service::soft_delete(&db.conn, live_a)
+            .await
+            .expect("soft delete one");
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            1,
+            "soft-deleted conversation must not count as live"
+        );
+
+        conversation_service::soft_delete(&db.conn, live_b)
+            .await
+            .expect("soft delete remaining");
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Soft-deleted-only folder is eligible for visibility close.
+        assert!(close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn concurrent_add_folder_same_path_converges_without_unique_error() {
         let db = Arc::new(fresh_in_memory_db().await);
         let path = "/tmp/codeg-folder-unique-race";
         // Force both callers past find → INSERT so one hits UNIQUE recovery.
-        force_add_folder_skip_existing_for_test(2);
+        // Path-keyed: only this path's ensure/add calls consume budget.
+        let _skip = force_add_folder_skip_existing_for_test(path, 2);
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
         let db1 = db.clone();
@@ -540,7 +1089,7 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(rows.len(), 1, "exactly one row for path");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
     }
 
     /// Deterministic UNIQUE recovery: pre-insert the winner, then force
@@ -550,11 +1099,11 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let path = "/tmp/codeg-folder-unique-recovery";
         let first = add_folder(&db.conn, path).await.expect("seed winner");
-        force_add_folder_skip_existing_for_test(1);
+        let _skip = force_add_folder_skip_existing_for_test(path, 1);
         let second = add_folder(&db.conn, path)
             .await
             .expect("UNIQUE recovery must reopen winner");
-        force_add_folder_skip_existing_for_test(0);
+        drop(_skip);
         assert_eq!(first.id, second.id);
         assert_eq!(second.path, path);
         let rows = folder::Entity::find()
@@ -565,9 +1114,237 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    // --- ensure_folder RegistrationOnly matrix (Task 8) ---
+
+    #[tokio::test]
+    async fn registration_only_new_path_is_closed() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-new";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        let row = raw_folder(&db.conn, entry.id).await;
+        assert!(!row.is_open, "new RegistrationOnly row must stay closed");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(row.path, path);
+    }
+
+    #[tokio::test]
+    async fn registration_only_preserves_existing_open() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-preserve-open";
+        let id = seed_folder(&db, path).await;
+        let before = raw_folder(&db.conn, id).await;
+        assert!(before.is_open);
+        let opened_at = before.last_opened_at;
+
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        assert_eq!(entry.id, id);
+        let after = raw_folder(&db.conn, id).await;
+        assert!(after.is_open, "must not force-close an already-open row");
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            opened_at.timestamp_millis(),
+            "must not masquerade as a user open (last_opened_at)"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_preserves_existing_closed() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-preserve-closed";
+        let id = seed_folder(&db, path).await;
+        set_folder_open(&db.conn, id, false).await.expect("close");
+        let before = raw_folder(&db.conn, id).await;
+        assert!(!before.is_open);
+        let opened_at = before.last_opened_at;
+
+        ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        let after = raw_folder(&db.conn, id).await;
+        assert!(!after.is_open, "must not force-open a closed row");
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            opened_at.timestamp_millis(),
+            "must not bump last_opened_at for RegistrationOnly"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_revives_soft_deleted_closed_without_open_timestamps() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-revive";
+        let id = seed_folder(&db, path).await;
+        let mut active = raw_folder(&db.conn, id).await.into_active_model();
+        let past = Utc::now() - chrono::Duration::days(7);
+        active.last_opened_at = Set(past);
+        active.is_open = Set(true); // stale open flag on deleted row
+        active.deleted_at = Set(Some(Utc::now()));
+        active.update(&db.conn).await.expect("soft-delete");
+
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("revive");
+        assert_eq!(entry.id, id);
+        let after = raw_folder(&db.conn, id).await;
+        assert!(after.deleted_at.is_none(), "must clear soft-delete");
+        assert!(
+            !after.is_open,
+            "revived RegistrationOnly row must be closed"
+        );
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            past.timestamp_millis(),
+            "must not masquerade revival as user open timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_recovers_from_unique_constraint_without_opening() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-unique-recovery";
+        // Winner inserted closed via RegistrationOnly.
+        let first = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("seed winner");
+        assert!(!raw_folder(&db.conn, first.id).await.is_open);
+        let _skip = force_add_folder_skip_existing_for_test(path, 1);
+        let second = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("UNIQUE recovery must re-resolve winner");
+        drop(_skip);
+        assert_eq!(first.id, second.id);
+        let row = raw_folder(&db.conn, first.id).await;
+        assert!(
+            !row.is_open,
+            "UNIQUE recovery under RegistrationOnly must not ForceOpen"
+        );
+        let rows = folder::Entity::find()
+            .filter(folder::Column::Path.eq(path))
+            .all(&db.conn)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_only_same_path_converges_closed() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let path = "/tmp/codeg-reg-only-concurrent";
+        let _skip = force_add_folder_skip_existing_for_test(path, 2);
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let db1 = db.clone();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            ensure_folder(&db1.conn, path, EnsureFolderMode::RegistrationOnly).await
+        });
+        let b2 = barrier.clone();
+        let db2 = db.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            ensure_folder(&db2.conn, path, EnsureFolderMode::RegistrationOnly).await
+        });
+        let (a, b) = tokio::join!(t1, t2);
+        let a = a.expect("join a").expect("reg a");
+        let b = b.expect("join b").expect("reg b");
+        assert_eq!(a.id, b.id);
+        let row = raw_folder(&db.conn, a.id).await;
+        assert!(!row.is_open, "concurrent RegistrationOnly must stay closed");
+        drop(_skip);
+    }
+
+    /// Path-keyed inject: unguarded ensure_folder on another path must not
+    /// consume the armed path's skip budget (parallel-cargo safety).
+    #[tokio::test]
+    async fn skip_existing_inject_is_path_scoped_not_stolen_by_other_paths() {
+        let db = fresh_in_memory_db().await;
+        let armed = "/tmp/codeg-skip-inject-armed";
+        let other = "/tmp/codeg-skip-inject-other";
+        let _skip = force_add_folder_skip_existing_for_test(armed, 2);
+        assert_eq!(remaining_skip_budget_for_test(armed), 2);
+
+        // Distraction traffic on a different path (would steal a process-global
+        // counter; must leave armed budget untouched).
+        ensure_folder(&db.conn, other, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("other path");
+        ensure_folder(&db.conn, other, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("other path again");
+        assert_eq!(
+            remaining_skip_budget_for_test(armed),
+            2,
+            "other-path ensure/add must not steal path-keyed skip budget"
+        );
+
+        // Seed winner, then force UNIQUE recovery — each armed-path call may
+        // consume one skip when find would otherwise hit the row.
+        let first = ensure_folder(&db.conn, armed, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("seed armed (consumes one skip on fresh insert path)");
+        assert_eq!(remaining_skip_budget_for_test(armed), 1);
+        let second = ensure_folder(&db.conn, armed, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("UNIQUE recovery with remaining path-scoped skip");
+        assert_eq!(remaining_skip_budget_for_test(armed), 0);
+        assert_eq!(first.id, second.id);
+        drop(_skip);
+        assert_eq!(remaining_skip_budget_for_test(armed), 0);
+    }
+
+    #[tokio::test]
+    async fn force_open_still_opens_new_and_closed_rows() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-force-open-new";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("force open new");
+        assert!(raw_folder(&db.conn, entry.id).await.is_open);
+
+        set_folder_open(&db.conn, entry.id, false)
+            .await
+            .expect("close");
+        ensure_folder(&db.conn, path, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("force re-open");
+        assert!(
+            raw_folder(&db.conn, entry.id).await.is_open,
+            "ForceOpen must re-open a closed row"
+        );
+    }
+
+    /// Service-level composition only. Production call sites are covered by
+    /// `manager_legacy_delegation_child_keeps_working_dir_folder_closed` and
+    /// `durable_reserve_registers_working_dir_folder_closed`.
+    #[tokio::test]
+    async fn registration_only_does_not_open_when_hidden_child_would_use_path() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-hidden-child";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register working_dir");
+        let _child = conversation_service::create(
+            &db.conn,
+            entry.id,
+            AgentType::ClaudeCode,
+            Some("delegated task".into()),
+            None,
+        )
+        .await
+        .expect("hidden child conversation");
+        let row = raw_folder(&db.conn, entry.id).await;
+        assert!(
+            !row.is_open,
+            "creating a hidden child must not ForceOpen the folder"
+        );
+    }
+
     #[tokio::test]
     async fn last_agent_round_trips_only_for_regular_folders() {
-        force_add_folder_skip_existing_for_test(0);
         let db = fresh_in_memory_db().await;
         let regular_id = seed_folder(&db, "/tmp/codeg-last-agent").await;
         let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-last-agent")

@@ -244,6 +244,18 @@ async fn async_main() -> ExitCode {
         });
     }
 
+    // Empty-open reconcile: **readiness barrier** (awaited), NOT fire-and-forget
+    // like chat-dir GC above. Must complete before AppState/router bind so the
+    // first client `list_open_folder_details` has no junk empty regular opens.
+    // Failure degrades (log only; do not crash).
+    match codeg_lib::commands::folders::reconcile_empty_open_folders_core(&db).await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!("[folders] empty-open reconcile: closed {}", ids.len())
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!("[folders] empty-open reconcile failed: {err}"),
+    }
+
     // Create shared broadcaster + internal ACP event bus.
     let broadcaster = Arc::new(WebEventBroadcaster::new());
     let event_bus_metrics = Arc::new(codeg_lib::acp::EventBusMetrics::default());

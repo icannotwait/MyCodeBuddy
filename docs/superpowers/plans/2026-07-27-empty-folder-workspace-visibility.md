@@ -4,21 +4,25 @@
 
 **Goal:** Stop the workspace sidebar from long-lived open folders that have zero live conversations, while keeping path registration/history and open-project → chat flows working.
 
-**Architecture:** Backend owns “zero live conversations ⇒ `is_open = false`” for regular folders (startup reconcile, delete last conversation, empty import, automation cancel-before-conversation, delegation path ensure-without-open). Frontend owns draft protection: open folder always ensures the singleton new-conversation draft targets that folder; when the draft leaves a folder that still has zero conversations, call remove-from-workspace (silent). Multi-client sync uses a new `folder://changed` `close` variant so sidebars drop auto-closed rows without a full refetch.
+**Architecture:** Backend owns headless empty-close on zero live conversations (startup barrier reconcile, delete last conversation, empty import, automation early-exit, delegation RegistrationOnly). Frontend owns singleton-draft protection and leave transitions (including last-tab replacement order). Multi-client sync uses `FolderChange::Close { folder_id, cause }` (`AutoEmpty` | `UserRemove`) with fenced open-list refetch; AutoEmpty may re-open when local draft still targets the folder; UserRemove never re-opens and disposes the draft binding. Auto-close uses a **visibility-only conditional** transport (Tauri + Axum), never the user-remove cascade.
 
 **Tech Stack:** Rust (SeaORM, Tauri commands, Axum handlers), TypeScript/React (Zustand stores, event subscriptions), Vitest + `cargo test --features test-utils`.
 
-**Spec:** `docs/superpowers/specs/2026-07-27-empty-folder-workspace-visibility-design.md`
+**Spec:** `docs/superpowers/specs/2026-07-27-empty-folder-workspace-visibility-design.md` (post design-review R4; approved)
 
 ## Global Constraints
 
 - Workspace visibility only: set `is_open = false`; do **not** soft-delete history rows, delete disk paths, or `git worktree remove`.
 - Apply auto-close only to `FolderKind::Regular`; skip `FolderKind::Chat` (chat-dir GC owns scratch lifecycle).
-- Live conversation = row with `deleted_at` null for that `folder_id`.
-- New-conversation drafts are a **client-side singleton** (`conversationId == null`, at most one tab) retargeted across folders — not per-folder draft rows.
+- Live conversation = row with `deleted_at` null for that `folder_id` (includes hidden delegation children / loops for close predicate — design v1).
+- New-conversation drafts are a **client-side singleton** (`conversationId == null`, at most one tab) retargeted across folders — not per-folder draft rows; **not** persisted across restart.
 - Auto-close is **silent** (no confirm dialog, no required toast).
-- Prefer reusing `set_folder_open` / `remove_folder_from_workspace_core` patterns; emit folder events when closing from headless/backend paths so clients converge.
+- **Two close paths:** (1) User remove = cascade + `Close{UserRemove}`; (2) Empty auto-close = conditional visibility-only + `Close{AutoEmpty}` — no tab wipe / no office-watch stop / no disk touch.
+- Explicit user remove remains allowed for non-empty folders and is sticky until explicit re-open.
+- Startup empty-open reconcile is a **readiness barrier** (not fire-and-forget like chat GC).
+- Required dual-runtime conditional-close API for frontend draft leave.
 - No schema migration.
+- Design deferred minors: last-tab unbind preference, fence store detail, refetch volume — implement conservatively.
 
 ---
 
@@ -26,19 +30,22 @@
 
 | File | Responsibility |
 |------|----------------|
-| `src-tauri/src/db/service/folder_service.rs` | Count live convs; close empty open regular folders (bulk + single); optional `ensure_folder` that can leave `is_open` false |
-| `src-tauri/src/web/event_bridge.rs` | `FolderChange::Close { folder_id }` |
-| `src-tauri/src/commands/folders.rs` | `emit_folder_close`; wire close into remove/reconcile helpers that need broadcast |
-| `src-tauri/src/commands/conversations.rs` | After delete cleanup: maybe-close regular folder if zero live convs; import: close empty groups |
-| `src-tauri/src/lib.rs` | Desktop startup: run empty-folder reconcile next to chat-dir GC |
-| `src-tauri/src/bin/codeg_server.rs` | Server startup: same reconcile |
-| `src-tauri/src/automation/engine.rs` | Cancel-before-conversation: close empty worktree folder + emit close |
-| `src-tauri/src/acp/manager.rs` | Delegation path: ensure folder without forcing permanent open when no conversation yet |
-| `src/lib/types.ts` | `FolderChange` union adds `close` |
-| `src/contexts/app-workspace-context.tsx` | Handle `close` → drop from `folders` list |
-| `src/stores/app-workspace-store.ts` | `openFolder` / open-by-id helpers may stay thin; draft orchestration in tab store / open call sites |
-| `src/stores/tab-store.ts` | On draft retarget/close: maybe remove empty folder from workspace; restore draft re-opens folder |
-| Call sites that open folders without draft | Ensure draft after open (sidebar, clone, dropdown, store if centralized) |
+| `src-tauri/src/db/service/folder_service.rs` | Count live convs; conditional close (bulk returns closed ids); `ensure_folder` RegistrationOnly \| ForceOpen |
+| `src-tauri/src/web/event_bridge.rs` | `FolderChange::Close { folder_id, cause }` |
+| `src-tauri/src/commands/folders.rs` | `emit_folder_close(cause)`; user remove → UserRemove; conditional-close command/core; Upsert on open-by-id |
+| `src-tauri/src/web/handlers/` (folders) | Axum route for conditional close (same core) |
+| `src-tauri/src/commands/conversations.rs` | After delete: maybe-close + AutoEmpty; import: close empty groups + Close-wins |
+| `src-tauri/src/lib.rs` | Desktop: **await** empty-folder reconcile before workspace data ready |
+| `src-tauri/src/bin/codeg_server.rs` | Server: **await** reconcile before serving open-folder APIs |
+| `src-tauri/src/automation/engine.rs` | All early exits before conversation: close empty worktree + AutoEmpty |
+| `src-tauri/src/acp/manager.rs` + `acp/delegation/broker.rs` | RegistrationOnly ensure; ForceOpen+Upsert after user-visible conv create |
+| `src/lib/types.ts` | `FolderChange` close + `FolderCloseCause` |
+| `src/lib/api.ts` / transport | Conditional-close client API `{ closed: boolean }` |
+| `src/contexts/app-workspace-context.tsx` | Handle close + fenced refetch + cause-aware draft guard |
+| `src/stores/app-workspace-store.ts` | drop open list; generation fence on fetch; open emits path stays thin |
+| `src/stores/tab-store.ts` | Draft leave → conditional close; last-tab order; retarget leave |
+| `src/lib/open-folder-with-draft.ts` (or equiv) | User-open choke point |
+| Call sites | Route user opens through choke point |
 
 ---
 
@@ -52,7 +59,7 @@
 - Produces:
   - `pub async fn count_live_conversations_for_folder(conn: &DatabaseConnection, folder_id: i32) -> Result<u64, DbError>`
   - `pub async fn close_folder_if_no_live_conversations(conn: &DatabaseConnection, folder_id: i32) -> Result<bool, DbError>` — returns `true` if it flipped `is_open` from true to false; no-op for missing, chat kind, already closed, or count > 0
-  - `pub async fn close_open_folders_with_no_live_conversations(conn: &DatabaseConnection) -> Result<usize, DbError>` — bulk reconcile; returns number of folders closed
+  - `pub async fn close_open_folders_with_no_live_conversations(conn: &DatabaseConnection) -> Result<Vec<i32>, DbError>` — bulk reconcile; returns **closed folder ids** (caller derives count)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -67,10 +74,11 @@ async fn close_open_folders_with_no_live_conversations_closes_empty_regular() {
     let kept_id = seed_folder(&db, "/tmp/codeg-kept-open").await;
     seed_conversation(&db, kept_id, AgentType::ClaudeCode).await;
 
-    let n = folder_service::close_open_folders_with_no_live_conversations(&db.conn)
+    let closed = folder_service::close_open_folders_with_no_live_conversations(&db.conn)
         .await
         .expect("reconcile");
-    assert_eq!(n, 1);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0], empty_id);
 
     let open = folder_service::list_open_folders(&db.conn).await.expect("list");
     let open_ids: Vec<i32> = open.iter().map(|f| f.id).collect();
@@ -86,10 +94,10 @@ async fn close_open_folders_skips_chat_kind() {
         .await
         .expect("chat folder");
     // ensure is_open true (add_chat_folder already opens)
-    let n = folder_service::close_open_folders_with_no_live_conversations(&db.conn)
+    let closed = folder_service::close_open_folders_with_no_live_conversations(&db.conn)
         .await
         .expect("reconcile");
-    assert_eq!(n, 0);
+    assert!(closed.is_empty());
     let still = folder_service::get_folder_by_id(&db.conn, chat.id)
         .await
         .expect("get")
@@ -125,55 +133,38 @@ Expected: FAIL (function not found or link error).
 
 - [ ] **Step 3: Implement helpers**
 
-Implementation sketch (place near other folder open helpers in `folder_service.rs`):
+Implementation sketch — **atomic conditional UPDATE only** (no count-then-set TOCTOU):
 
 ```rust
-pub async fn count_live_conversations_for_folder(
-    conn: &DatabaseConnection,
-    folder_id: i32,
-) -> Result<u64, DbError> {
-    use crate::db::entities::conversation;
-    Ok(conversation::Entity::find()
-        .filter(conversation::Column::FolderId.eq(folder_id))
-        .filter(conversation::Column::DeletedAt.is_null())
-        .count(conn)
-        .await?)
-}
-
+/// Returns true only when this statement flipped is_open true→false.
 pub async fn close_folder_if_no_live_conversations(
     conn: &DatabaseConnection,
     folder_id: i32,
 ) -> Result<bool, DbError> {
-    let row = folder::Entity::find_by_id(folder_id)
-        .filter(folder::Column::DeletedAt.is_null())
-        .one(conn)
-        .await?;
-    let Some(row) = row else { return Ok(false) };
-    if row.kind != FolderKind::Regular || !row.is_open {
-        return Ok(false);
-    }
-    if count_live_conversations_for_folder(conn, folder_id).await? > 0 {
-        return Ok(false);
-    }
-    set_folder_open(conn, folder_id, false).await?;
-    Ok(true)
+    // Prefer raw SQL / SeaORM update with rows_affected == 1:
+    // UPDATE folder SET is_open = 0, ...
+    // WHERE id = ? AND deleted_at IS NULL AND kind = 'regular' AND is_open = 1
+    //   AND NOT EXISTS (
+    //     SELECT 1 FROM conversation c
+    //     WHERE c.folder_id = folder.id AND c.deleted_at IS NULL
+    //   )
+    // Return rows_affected == 1. Never call set_folder_open after a separate count.
+    todo!()
+}
+
+pub async fn count_live_conversations_for_folder(...) -> Result<u64, DbError> {
+    // Optional diagnostics / import decision aid — NEVER used as the close guard alone.
 }
 
 pub async fn close_open_folders_with_no_live_conversations(
     conn: &DatabaseConnection,
-) -> Result<usize, DbError> {
-    let open = list_open_folder_details(conn).await?; // regular + is_open only
-    let mut closed = 0usize;
-    for f in open {
-        if close_folder_if_no_live_conversations(conn, f.id).await? {
-            closed += 1;
-        }
-    }
-    Ok(closed)
+) -> Result<Vec<i32>, DbError> {
+    // Prefer set-based UPDATE ... RETURNING id / or select candidate ids then
+    // call the same atomic primitive per id (still uses WHERE NOT EXISTS, not pre-count).
 }
 ```
 
-Use SeaORM `count` (import `sea_orm::PaginatorTrait` if required by project edition).
+Tests must assert: concurrent live insert cannot win a successful close (or equivalent race hook); already-closed / missing / chat / deleted / non-empty → `false` without changing `deleted_at`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -193,35 +184,42 @@ git commit -m "feat(folders): close open regular folders with no live conversati
 
 ---
 
-### Task 2: FolderChange::Close + emit helpers
+### Task 2: FolderChange::Close + dual-runtime conditional-close + fenced store
 
 **Files:**
-- Modify: `src-tauri/src/web/event_bridge.rs` (`FolderChange` enum)
-- Modify: `src-tauri/src/commands/folders.rs` (`emit_folder_close`, optionally enhance remove path)
-- Modify: `src/lib/types.ts` (`FolderChange` type)
-- Modify: `src/contexts/app-workspace-context.tsx` (handle close)
-- Test: `src/contexts/app-workspace-context.test.tsx` (extend folder://changed suite)
-- Test: existing Rust test `emit_folder_upsert_broadcasts_on_folder_channel` pattern in `folders.rs` — add close emit test
+- Modify: `src-tauri/src/web/event_bridge.rs` (`FolderChange` + `FolderCloseCause`)
+- Modify: `src-tauri/src/commands/folders.rs` (`emit_folder_close`, remove→UserRemove, open cores gain emitter + Upsert, **register Tauri command** for conditional close)
+- Modify: `src-tauri/src/lib.rs` (invoke handler registration for conditional close)
+- Modify: `src-tauri/src/web/handlers/folders.rs` + `src-tauri/src/web/router.rs` (Axum route same core)
+- Modify: `src/lib/types.ts`, `src/lib/api.ts` / transport (`closeFolderIfEmpty` → `{ closed: boolean }`)
+- Modify: `src/stores/app-workspace-store.ts` — **folder-event generation fence** on `fetchFolders` / membership apply
+- Modify: `src/contexts/app-workspace-context.tsx` (handle close + fenced refetch + cause-aware draft hooks stub)
+- Test: context + store fence tests; Rust emit + conditional-close core
 
 **Interfaces:**
 - Consumes: Task 1 close helpers (optional at emit call sites later)
 - Produces:
-  - Rust: `FolderChange::Close { folder_id: i32 }` with serde `kind: "close"`
-  - TS: `{ kind: "close"; folder_id: number }` (camelCase if project serializes camelCase — **match existing Upsert field naming**. Today Upsert uses `folder` nested object; check wire format. Prefer `folder_id` snake in Rust + serde rename if frontend already uses camelCase via a global rename. Inspect a live payload or existing serde attrs on sibling events. If Upsert arrives as `{ kind: "upsert", folder: {...} }` with camelCase `folderId` inside FolderDetail, use `#[serde(rename_all = "camelCase")]` only if the enum already does — **FolderChange currently has no rename_all on the enum; tag is snake_case kind**. Nested FolderDetail likely uses camelCase via its own derives. For Close, use `folder_id` in Rust and map in TS as `folder_id` **or** `folderId` consistently with other events — grep `conversation://` delete payload. Prefer:
+  - Rust:
 
 ```rust
-Close { folder_id: i32 }
+#[serde(rename_all = "snake_case")]
+pub enum FolderCloseCause { AutoEmpty, UserRemove }
+
+// FolderChange tag kind = "close"
+Close { folder_id: i32, cause: FolderCloseCause }
 ```
 
 ```ts
+export type FolderCloseCause = "auto_empty" | "user_remove"
 export type FolderChange =
   | { kind: "upsert"; folder: FolderDetail }
-  | { kind: "close"; folder_id: number }
+  | { kind: "close"; folder_id: number; cause: FolderCloseCause }
 ```
 
-If the transport camelCases all JSON keys, TypeScript may need `folderId`. Align with how other `{ id }` events deserialize in this app (check `ConversationChange` delete).
-
-  - `pub(crate) fn emit_folder_close(emitter: &EventEmitter, folder_id: i32)`
+  - `pub(crate) fn emit_folder_close(emitter: &EventEmitter, folder_id: i32, cause: FolderCloseCause)`
+  - **Required** command/handler: `close_folder_if_empty_core` → Tauri + Axum + TS `{ closed: boolean }`; emit AutoEmpty only when flipped.
+  - User `remove_folder_from_workspace_core` must emit `Close{UserRemove}` after success.
+  - Open/open-by-id paths that set `is_open=true` must emit Upsert (if not already).
 
 - [ ] **Step 1: Write failing frontend test**
 
@@ -236,7 +234,7 @@ it("removes a folder from the open list on folder://changed close", async () => 
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
     ).toBe(true)
   })
-  emitFolder({ kind: "close", folder_id: 12 })
+  emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
   await waitFor(() => {
     expect(
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
@@ -245,7 +243,7 @@ it("removes a folder from the open list on folder://changed close", async () => 
 })
 ```
 
-(Adjust property name if wire format uses `folderId`.)
+Also add: AutoEmpty + draft still targeting 12 → re-open; UserRemove + draft → no re-open / draft disposed.
 
 - [ ] **Step 2: Run frontend test — expect fail**
 
@@ -265,111 +263,118 @@ pub enum FolderChange {
     /// Workspace membership closed (`is_open = false`); row may remain in history.
     Close {
         folder_id: i32,
+        cause: FolderCloseCause,
     },
 }
 
-pub(crate) fn emit_folder_close(emitter: &EventEmitter, folder_id: i32) {
+pub(crate) fn emit_folder_close(
+    emitter: &EventEmitter,
+    folder_id: i32,
+    cause: FolderCloseCause,
+) {
     crate::web::event_bridge::emit_event(
         emitter,
         crate::web::event_bridge::FOLDER_CHANGED_EVENT,
-        crate::web::event_bridge::FolderChange::Close { folder_id },
+        crate::web::event_bridge::FolderChange::Close { folder_id, cause },
     );
 }
 ```
 
-Also call `emit_folder_close` at the end of `remove_folder_from_workspace_core` after successful `set_folder_open(..., false)` so remote clients drop the row (local store already filters; idempotent).
+Call `emit_folder_close(..., UserRemove)` at the end of `remove_folder_from_workspace_core`. Auto-close paths use `AutoEmpty`.
 
-Frontend handler:
+**Fenced membership (store — required before handler is correct):**
+
+- Monotonic `folderEventGeneration` (or latest-request id) advanced on every Close/Upsert apply, user open, reconnect, and before each open-list refetch.
+- `fetchFolders` captures generation at start; **discard** response if generation advanced before commit (do not blindly replace). Retry optional.
+- Serialize Close / Upsert / refetch application through one path.
+- After non-stale refetch, re-apply AutoEmpty draft re-open guard if draft still targets a missing folder.
+- Tests (deferred promises): Close during in-flight refetch; Upsert during in-flight refetch; stale Close after newer open; overlapping refetches; reconnect fence; AutoEmpty guard after closed snapshot.
+
+**Close handler:**
 
 ```ts
-if (change.kind === "upsert") { /* existing */ }
-else if (change.kind === "close") {
-  const store = useAppWorkspaceStore.getState()
-  // Prefer a small store method if cleaner; inline filter is OK:
-  void store.removeFolderFromWorkspaceLocal?.(change.folder_id)
-}
+// 1) local drop open membership only (no re-API close). v1: do NOT prune all-history branch cache.
+// 2) bump folderEventGeneration
+// 3) cause=user_remove → tab-store dispose/retarget draft (Task 5) — never re-open
+// 4) cause=auto_empty + draft targets → schedule silent re-open
+// 5) fenced refetch; re-apply AutoEmpty guard after non-stale
 ```
 
-**Do not** call the API again from the event handler (that would double-close). Only update local state:
-
 ```ts
-// app-workspace-store.ts
 dropFolderFromOpenList: (folderId: number) => {
-  const { folders, branches } = get()
-  const patch: Partial<AppWorkspaceStoreState> = {
-    folders: folders.filter((f) => f.id !== folderId),
-  }
-  if (branches.has(folderId)) {
-    const next = new Map(branches)
-    next.delete(folderId)
-    patch.branches = next
-  }
-  set(patch)
+  set({ folders: get().folders.filter((f) => f.id !== folderId) })
+  // keep branches (all-history default per design)
 },
 ```
 
-`removeFolderFromWorkspace` keeps API call + local drop; event handler uses `dropFolderFromOpenList` only.
+**Dual-runtime steps (explicit):**
 
-- [ ] **Step 4: Run tests**
+1. `close_folder_if_empty_core(conn, emitter, folder_id) -> bool` — atomic service + emit AutoEmpty if true.
+2. Tauri `#[tauri::command]` + register in `lib.rs`.
+3. Axum handler + router path (mirror other folder routes).
+4. TS `api.closeFolderIfEmpty(folderId): Promise<{ closed: boolean }>`.
+5. Open/open-by-id/worktree open wrappers pass `emitter` and emit Upsert when membership becomes open.
+
+Cause-aware draft dispose/re-open may stub-call tab store; full last-tab semantics complete in Task 5.
+
+- [ ] **Step 4: Surface tests (required — not only core)**
+
+- Tauri: command registration / wrapper test (or existing command-surface pattern) for conditional-close name + `{ closed }`.
+- Axum: integration via `build_router` pattern (`src-tauri/tests/api_integration.rs` style) — route, request body, HTTP status, `{ "closed": true|false }`, DB `is_open`, emit AutoEmpty **only** on flip.
+- TS: transport/api test — command name, payload, typed `{ closed: boolean }` for true and false.
+- Core: emit once only on successful flip; no emit when non-empty/already-closed.
 
 ```powershell
-pnpm exec vitest run src/contexts/app-workspace-context.test.tsx
+pnpm exec vitest run src/contexts/app-workspace-context.test.tsx src/stores src/lib
 cargo test --features test-utils emit_folder -- --nocapture
+cargo test --features test-utils --test api_integration -- --nocapture
 ```
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add src-tauri/src/web/event_bridge.rs src-tauri/src/commands/folders.rs src/lib/types.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/stores/app-workspace-store.ts
+git add src-tauri/src/web/event_bridge.rs src-tauri/src/commands/folders.rs src-tauri/src/lib.rs src-tauri/src/web/handlers/folders.rs src-tauri/src/web/router.rs src/lib/types.ts src/lib/api.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/stores/app-workspace-store.ts
 git commit -m "feat(folders): broadcast workspace close on folder://changed"
 ```
 
 ---
 
-### Task 3: Startup reconcile (desktop + server)
+### Task 3: Startup reconcile with readiness barrier (desktop + server)
 
 **Files:**
-- Modify: `src-tauri/src/lib.rs` (desktop setup, near chat-dir GC ~line 536)
-- Modify: `src-tauri/src/bin/codeg_server.rs` (near existing `gc_orphan_chat_dirs_core` ~line 232)
-- Optional thin wrapper in `commands/folders.rs`: `pub async fn reconcile_empty_open_folders_core(conn) -> Result<usize, AppCommandError>`
+- Modify: `src-tauri/src/lib.rs` (desktop setup — **await** before workspace data / first open-folder fetch, not fire-and-forget like chat GC)
+- Modify: `src-tauri/src/bin/codeg_server.rs` (**await** after DB ready, **before** serving routes that return open folders)
+- Thin wrapper in `commands/folders.rs` if useful: `reconcile_empty_open_folders_core`
 
 **Interfaces:**
-- Consumes: `folder_service::close_open_folders_with_no_live_conversations`
-- Produces: startup side effect only (no new public API required)
+- Consumes: `folder_service::close_open_folders_with_no_live_conversations` → `Vec<i32>`
+- Produces: startup side effect; optional emit AutoEmpty Close if clients may already be connected (server)
 
-- [ ] **Step 1: Wire desktop startup**
+- [ ] **Step 1: Desktop — exact placement**
 
-Spawn the same style async task as chat-dir GC:
+In `src-tauri/src/lib.rs`, immediately after DB readiness `block_on` path (~339–345 area) and **before** main webview creation (~901+), run:
 
 ```rust
-{
-    let conn = app.state::<db::AppDatabase>().conn.clone();
-    tauri::async_runtime::spawn(async move {
-        match folder_service::close_open_folders_with_no_live_conversations(&conn).await {
-            Ok(n) if n > 0 => tracing::info!(
-                "[folders] empty-open reconcile: closed {n} folder(s)"
-            ),
-            Ok(_) => {}
-            Err(err) => tracing::error!("[folders] empty-open reconcile failed: {err}"),
-        }
-    });
+// block_on / sequential await — NOT spawn-and-forget like chat-dir GC
+match folder_service::close_open_folders_with_no_live_conversations(&conn).await {
+    Ok(ids) if !ids.is_empty() => tracing::info!("[folders] empty-open reconcile: closed {}", ids.len()),
+    Ok(_) => {}
+    Err(err) => tracing::error!("[folders] empty-open reconcile failed: {err}"), // degrade; do not crash
 }
 ```
 
-Import `folder_service` via existing module paths (`crate::db::service::folder_service`).
+- [ ] **Step 2: Server — exact placement**
 
-- [ ] **Step 2: Wire server startup** (same call + log after DB ready, next to chat-dir GC).
+In `codeg_server.rs`, after DB init (~191–194) and **before** AppState/router/listener bind (~591–602), `await` the same reconcile. Chat GC may stay background.
 
-- [ ] **Step 3: Manual sanity**
+- [ ] **Step 3: Sequencing proof**
+
+Prefer a unit/integration test that reconcile helper runs to completion and subsequent `list_open_folder_details` has no empty regular opens. `cargo check` alone is insufficient for the barrier claim.
 
 ```powershell
 cargo check
 cargo check --no-default-features --bin codeg-server
 ```
-
-Expected: compile OK.
-
-Note: startup reconcile does not emit per-folder close events (no clients connected yet). Clients load open list after reconcile — correct by design.
 
 - [ ] **Step 4: Commit**
 
@@ -414,7 +419,11 @@ After chat-folder cleanup:
 if let Some(folder_id) = folder_id {
     cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     match folder_service::close_folder_if_no_live_conversations(conn, folder_id).await {
-        Ok(true) => crate::commands::folders::emit_folder_close(emitter, folder_id),
+        Ok(true) => crate::commands::folders::emit_folder_close(
+            emitter,
+            folder_id,
+            FolderCloseCause::AutoEmpty,
+        ),
         Ok(false) => {}
         Err(e) => tracing::error!(
             "[conversations] empty-folder close after delete failed (folder {folder_id}): {e}"
@@ -423,9 +432,7 @@ if let Some(folder_id) = folder_id {
 }
 ```
 
-**Draft protection is client-only:** backend may close while a draft still targets the folder. Spec accepts this on pure backend paths; frontend Task 5 re-opens if a draft is retargeted back / restore. Prefer order: if user still has a draft on that folder in the same window, Task 5’s draft-close is the primary empty-path closer; backend close on delete is still required for “delete last chat and leave” without draft.
-
-If product wants “delete last conversation but keep draft folder open”: frontend must **re-open** the folder when it still has a singleton draft pointing at `folderId` after receiving `close`. Add that guard in Task 5.
+**Draft protection is client-only:** backend closes on zero live count. Frontend Task 5/2 handler re-opens only on `cause=auto_empty` when singleton draft still targets the folder (fenced). No cold-start draft restore.
 
 - [ ] **Step 4: Tests pass + commit**
 
@@ -443,10 +450,10 @@ git commit -m "feat(conversations): close empty regular folder after last delete
 - Modify: `src/stores/tab-store.ts` (`closeTab`, `openNewConversationTab` retarget path)
 - Modify: `src/stores/app-workspace-store.ts` (`openFolder`, `openWorktreeFolder`, `addFolderToWorkspaceById` — ensure draft via tab store without circular import hell)
 - Possibly: `src/components/conversations/sidebar-conversation-list.tsx`, `src/components/layout/new-folder-dropdown.tsx`, `src/components/layout/clone-dialog.tsx` if draft ensure is not centralized
-- Test: `src/stores/tab-store` tests if present; else add focused unit tests with mocked `removeFolderFromWorkspace`
+- Test: `src/stores/tab-store` tests if present; else add focused unit tests with mocked conditional-close API
 
 **Interfaces:**
-- Consumes: `useAppWorkspaceStore.getState().removeFolderFromWorkspace` / conversations list for count
+- Consumes: conditional-close transport + conversations list for count
 - Produces: invariant open empty folder ⇔ singleton draft targets it (or ≥1 live conversation)
 
 **Draft singleton rules (existing):** `openNewConversationTab` reuses the single `conversationId == null` tab and retargets `folderId`.
@@ -454,75 +461,75 @@ git commit -m "feat(conversations): close empty regular folder after last delete
 - [ ] **Step 1: Helper (tab-store or small util)**
 
 ```ts
-function maybeCloseEmptyFolder(folderId: number) {
-  const ws = useAppWorkspaceStore.getState()
-  const live = ws.conversations.filter(
-    (c) => c.folder_id === folderId && /* not deleted — store only has live */
-  )
-  // If store uses a different field for soft-deleted, skip those.
-  if (live.length > 0) return
-  if (!ws.folders.some((f) => f.id === folderId)) return
-  const draftsPointingHere = useTabStore
-    .getState()
-    .rawTabs.filter((t) => t.conversationId == null && t.folderId === folderId)
-  if (draftsPointingHere.length > 0) return
-  void ws.removeFolderFromWorkspace(folderId)
+**Last-tab ordering (synchronous local first — required):**
+
+`closeTab` is currently synchronous and immediately calls `makeReplacementDraftTab`. Do **not** wait for network before replacement selection.
+
+```ts
+// When closing a draft for folder F with zero local live conversations:
+// 1. Remove draft tab from state (as today).
+// 2. Optimistically drop F from open list (local) BEFORE makeReplacementDraftTab.
+// 3. Select replacement draft against UPDATED folders (must not rebind F).
+// 4. Fire apiCloseFolderIfEmpty(F) and apply result table below.
+// Tests: control deferred API promise; while in flight, replacement must not bind F.
+```
+
+**Draft-leave API result table (all leave paths, including last-tab):**
+
+| Result | Client action |
+|--------|----------------|
+| `closed: true` | Idempotently drop F from open list (if not already); optional fenced refetch. |
+| `closed: false` | F non-empty / already closed / concurrent change — **fenced membership refetch**; do **not** recreate a draft solely because close was false. |
+| transport/error | Fenced reconciliation; if non-stale result says F still open **and** leave predicate still holds (zero local live, no draft on F), **retry** conditional close once; **never** re-open F just to compensate. |
+
+Last-tab: keep F excluded during replacement selection; restore membership only when authoritative open list requires it (e.g. live conv appeared); must not rebind replacement draft to F.
+
+```ts
+async function maybeCloseEmptyFolder(folderId: number) {
+  // pre-check only; call apiCloseFolderIfEmpty — NEVER user-remove cascade
+  // apply result table above for true / false / error
 }
 ```
+
+Tests: `closed:true` with suppressed event still drops; `false`; rejected request; stale completion after newer folder event.
 
 Call when:
 
-1. `closeTab` removes a draft tab (`conversationId == null`) — after state update, `maybeCloseEmptyFolder(closingTab.folderId)`.
-2. `openNewConversationTab` **retargets** draft from `oldFolderId` to `newFolderId` — after update, `maybeCloseEmptyFolder(oldFolderId)`.
-3. **Do not** call when merely switching active tab among conversation tabs.
+1. Draft close / last-tab path (order above).
+2. Retarget A→B after commit → maybeCloseEmptyFolder(A).
+3. close-other/all, chat retarget, detach paths that leave a folder without draft.
+4. **Do not** on mere active-tab switch.
 
-- [ ] **Step 2: Open folder ensures draft**
+- [ ] **Step 2: User-intent open+draft choke point (not low-level store)**
 
-Centralize in store methods after successful open:
+Add `src/lib/open-folder-with-draft.ts` (or equivalent mediator):
 
 ```ts
-openFolder: async (path) => {
-  const detail = await apiOpenFolder(path)
-  // upsert + branch + refresh (existing)
-  // Ensure draft — import tab store getState carefully (existing cross-store pattern in tab-store)
-  useTabStore.getState().openNewConversationTab(detail.id, detail.path, {
-    folderDefaultAgent: detail.default_agent_type,
-    folderRecentAgent: detail.last_agent_type,
-  })
+export async function openFolderWithDraft(path: string) {
+  const detail = await useAppWorkspaceStore.getState().openFolder(path) // silent membership
+  useTabStore.getState().openNewConversationTab(detail.id, detail.path, { ... })
   return detail
-},
-```
-
-Same for `openWorktreeFolder` and `addFolderToWorkspaceById` if they leave the user on an empty folder without a draft. `use-switch-to-branch` already opens a draft — ensure no double-broken state (singleton retarget is fine).
-
-Avoid circular import: if `app-workspace-store` cannot import `tab-store`, keep draft ensure at call sites (sidebar, dropdown, clone) **and** `WorkspaceOpenFolderListener` (already opens draft). Prefer a tiny mediator function in e.g. `src/lib/open-folder-with-draft.ts` both can call.
-
-- [ ] **Step 3: On `folder://changed` close while draft still targets folder**
-
-In app-workspace-context close handler **or** tab-store subscription:
-
-```ts
-// After dropFolderFromOpenList:
-const draft = useTabStore.getState().rawTabs.find(
-  (t) => t.conversationId == null && t.folderId === closedId
-)
-if (draft) {
-  void useAppWorkspaceStore.getState().addFolderToWorkspaceById(closedId)
 }
 ```
 
-Prevents backend delete-last-conversation close from yanking a folder the user is still drafting in.
+**User-intent call sites** (must use mediator): sidebar history open, new-folder-dropdown, workspace chrome open, clone/project-boot that leaves empty regular folder, WorkspaceOpenFolderListener, use-switch-to-branch (if not already correct).
 
-- [ ] **Step 4: Tab restore**
+**Keep silent (no draft):** low-level `openFolder` / `openWorktreeFolder` / `addFolderToWorkspaceById` used by deep-link, pet-focus, system registration. Tests: user open ensures one draft; deep-link membership open does **not** create/focus draft.
 
-Where tabs are restored on load (search `rawTabs` hydration / `loadTabs` / remote tabs sync in `tab-store.ts`): for each restored draft with `conversationId == null`, if folder not in `folders`, `addFolderToWorkspaceById(folderId)`.
+- [ ] **Step 3: On `folder://changed` close (cause-aware)** — implemented primarily in Task 2 handler; Task 5 ensures tab-store dispose/retarget for `user_remove` and last-tab order.
+
+- [ ] **Step 4: Cold start**
+
+Drafts are **not** in `opened_tabs`. **Do not** invent draft restore-on-load. Startup barrier + no draft is enough.
 
 - [ ] **Step 5: Tests**
 
-- Retarget draft A→B with A empty → `removeFolderFromWorkspace(A)` called.
-- Close draft with empty folder → remove called.
-- Close draft with folder that has conversations → remove **not** called.
+- Retarget draft A→B with A empty → conditional-close API for A called (not user-remove cascade).
+- Close draft with empty folder → conditional-close called.
+- Close draft with folder that has conversations → not called.
+- Last-tab close sole empty folder → closes F; replacement draft does not rebind F.
 - Open folder invokes draft open (mock).
+- AutoEmpty close with draft → re-open; UserRemove with draft → no re-open.
 
 - [ ] **Step 6: Commit**
 
@@ -549,17 +556,16 @@ Import path that creates/opens a folder but imports zero sessions (all skipped/f
 - [ ] **Step 2: After each successful `add_folder` + import tally**
 
 ```rust
-if tally.imported + tally.updated == 0 {
+// Prefer authoritative live count, not only tally.
+if folder_service::count_live_conversations_for_folder(conn, folder_id).await? == 0 {
     if folder_service::close_folder_if_no_live_conversations(conn, folder_id).await? {
-        emit_folder_close(emitter, folder_id);
-        // do not emit upsert for an empty open; if upsert already emitted, emit close after
+        emit_folder_close(emitter, folder_id, FolderCloseCause::AutoEmpty);
+        // Close must be emitted AFTER any Upsert for this folder in the same batch
     }
 } else {
-    // existing upsert emit
+    // existing upsert emit for open-with-conversations
 }
 ```
-
-Order carefully: existing code emits upsert after every touch. Prefer: upsert only when staying open with conversations; if empty, close + emit close (and skip upsert or upsert then close — close must win for clients).
 
 - [ ] **Step 3: Tests pass + commit**
 
@@ -570,35 +576,33 @@ git commit -m "fix(import): close folders left empty after import"
 
 ---
 
-### Task 7: Automation cancel-before-conversation + optional settle
+### Task 7: Automation pre-conversation exits → empty-close
 
 **Files:**
-- Modify: `src-tauri/src/automation/engine.rs` (cancel path ~lines 429–444 where worktree already minted)
-- Test: automation tests if any cover cancel; else unit-test close helper invocation via extracting a small fn
+- Modify: `src-tauri/src/automation/engine.rs` after `resolve_cwd` opens worktree (~395–484)
+- Extract small helper e.g. `close_empty_worktree_folder_if_needed(db, emitter, worktree_folder_id)`
 
 **Interfaces:**
-- Consumes: `close_folder_if_no_live_conversations`, `emit_folder_close`, `EventEmitter` on engine
+- After folder opened and **before** live conversation: every exit path uses the helper (launch-input fail, disabled/missing agent, concurrent cancel, spawn fail, conversation insert fail, settle with no conversation).
 
-- [ ] **Step 1: On cancel-before-spawn after worktree folder created**
+- [ ] **Step 1: Helper**
 
 ```rust
-if let Some(wt_id) = cwd.worktree_folder_id {
-    let _ = automation_service::attach_run_runtime(/* ... */).await;
-    if let Ok(true) =
-        folder_service::close_folder_if_no_live_conversations(&self.db.conn, wt_id).await
-    {
-        emit_folder_close(&self.emitter, wt_id);
+async fn close_empty_worktree_folder_if_needed(...) {
+    if let Some(wt_id) = worktree_folder_id {
+        if close_folder_if_no_live_conversations(conn, wt_id).await? {
+            emit_folder_close(emitter, wt_id, FolderCloseCause::AutoEmpty);
+        }
     }
-    return Ok(());
 }
 ```
 
-- [ ] **Step 2: Prefer also on settle paths where conversation never created** (grep attach_run_runtime / failed launch). Keep disk worktree (non-goal). Startup reconcile covers stragglers.
+- [ ] **Step 2: Call from every pre-conversation exit** (single boundary preferred). Keep disk worktree.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Tests** — inject cancel / agent fail / spawn fail / insert fail; assert `is_open=false`, disk worktree remains, AutoEmpty emitted when flipped.
 
 ```powershell
-git commit -m "fix(automation): close empty per-run worktree folder when cancelled early"
+git commit -m "fix(automation): close empty per-run worktree folder on early exits"
 ```
 
 ---
@@ -606,25 +610,26 @@ git commit -m "fix(automation): close empty per-run worktree folder when cancell
 ### Task 8: Delegation ensure folder without forcing open
 
 **Files:**
-- Modify: `src-tauri/src/db/service/folder_service.rs` — `ensure_folder_path(conn, path, open: bool)` or `add_folder_unopened`
-- Modify: `src-tauri/src/acp/manager.rs` (~5862) to use ensure that does **not** set `is_open = true` when only deriving `folder_id` for send; after conversation is created, folder can be opened if product needs sidebar placement (conversation upsert already needs folder known — `emit_folder_upsert` if conversation is visible)
+- Modify: `src-tauri/src/db/service/folder_service.rs` — `ensure_folder(conn, path, mode: RegistrationOnly | ForceOpen)`
+- Modify: `src-tauri/src/acp/manager.rs` (~5862) **and** `src-tauri/src/acp/delegation/broker.rs` reserve path (~5539)
 
 **Interfaces:**
-- Produces: `pub async fn ensure_folder(conn, path, open: bool) -> Result<FolderHistoryEntry, DbError>`
-  - `open == true` → current `add_folder` behavior
-  - `open == false` → insert with `is_open = false`, or on existing row **do not force open** (leave `is_open` as-is unless reopening deleted)
+- `RegistrationOnly`: existing live row **preserve** `is_open`; new/revived row `is_open = false` (do not masquerade as user open timestamps if avoidable)
+- `ForceOpen`: current `add_folder` open behavior + Upsert when used from open commands
 
-- [ ] **Step 1: Tests for ensure_folder open false**
+- [ ] **Step 1: Tests for RegistrationOnly**
 
-- New path → row exists, `is_open == false`, not in `list_open_folders`
-- Existing open path → stays open
-- Existing closed path → stays closed
+- New path → `is_open == false`
+- Existing open → **preserve open**
+- Existing closed → stay closed
+- Soft-deleted/revived → revive **closed** (not user-open timestamps masquerade)
+- Concurrent unique-path race still recovers (existing UNIQUE recovery)
+- Hidden delegation child create (manager + broker) does **not** ForceOpen
+- Only an explicitly **user-visible top-level** conversation path (if any on these call sites) ForceOpen+Upsert — if both sites only create hidden children, document **no ForceOpen on child create**; open only when product already surfaces the folder another way
 
-- [ ] **Step 2: Implement by generalizing `add_folder_inner`**
+- [ ] **Step 2: Implement by generalizing `add_folder_inner`** with `RegistrationOnly | ForceOpen`.
 
-Avoid duplicating UNIQUE recovery logic — add an `OpenWrite { ForceOpen, PreserveOpen, ForceClosed }` or boolean `open_on_write`.
-
-- [ ] **Step 3: Manager uses `ensure_folder(..., false)` then create/link conversation; if conversation is user-visible and folder should appear, `set_folder_open(true)` + `emit_folder_upsert` when conversation is created (send success path). If conversation is always created in same call path, open after create is fine.
+- [ ] **Step 3:** Manager + broker → RegistrationOnly; never ForceOpen solely because a hidden child conversation row exists.
 
 - [ ] **Step 4: Commit**
 
@@ -642,15 +647,20 @@ git commit -m "fix(delegation): register working_dir folders without bare open"
 
 ```powershell
 cd src-tauri
-cargo test --features test-utils close_open_folders close_folder_if_no_live delete_last_conversation batch_import emit_folder
+# Cargo accepts one TESTNAME filter per invocation — use full suite or separate runs
+cargo test --features test-utils
+cargo test --no-default-features --bin codeg-server --lib
 cargo clippy --all-targets --features test-utils -- -D warnings
+cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
 ```
+
+Negative side-effect tests (must exist from Tasks 1–2): AutoEmpty does not delete tabs/stop watches/soft-delete/disk; UserRemove still cascades and emits UserRemove for non-empty.
 
 - [ ] **Step 2: Frontend**
 
 ```powershell
-pnpm exec vitest run src/contexts/app-workspace-context.test.tsx src/stores
-pnpm eslint src/stores/tab-store.ts src/stores/app-workspace-store.ts src/contexts/app-workspace-context.tsx src/lib/types.ts
+pnpm test
+pnpm eslint src/stores/tab-store.ts src/stores/app-workspace-store.ts src/contexts/app-workspace-context.tsx src/lib/types.ts src/lib/api.ts
 ```
 
 - [ ] **Step 3: Manual QA checklist**
@@ -685,12 +695,19 @@ pnpm eslint src/stores/tab-store.ts src/stores/app-workspace-store.ts src/contex
 | No disk/worktree delete | Global constraints |
 | Multi-client close signal | 2 |
 | Silent auto-close | 5, 4 |
-| Draft restore re-open | 5 |
+| Mid-session AutoEmpty re-open (not cold draft restore) | 2, 5 |
+| Atomic conditional close | 1 |
+| Dual-runtime conditional-close API | 2 |
+| Fenced refetch | 2 |
+| Startup barrier placement | 3 |
+| User-intent open+draft choke point | 5 |
 
 ## Known v1 limitations (do not expand scope)
 
-- Multi-window: two windows with drafts on different empty folders — singleton draft is per-window client; backend close on delete may race; re-open-on-draft guard mitigates same-window cases only.
-- File-tree-only browsing without a draft is unsupported by product decision (open always creates draft).
+- Multi-window: drafts are per-window; backend AutoEmpty close may race; same-window re-open guard only; UserRemove is sticky across clients.
+- File-tree-only browsing without a draft is unsupported (open always creates draft).
+- Live count includes hidden children — may leave visually sparse folders open.
+- Parent folder with only worktree-child conversations may auto-close (per-folder rule).
 
 ---
 

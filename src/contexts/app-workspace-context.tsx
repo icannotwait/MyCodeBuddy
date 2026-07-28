@@ -14,6 +14,7 @@ import {
   useDelegationProfileStore,
 } from "@/stores/delegation-profile-store"
 import { useConversationRuntimeStore } from "@/stores/conversation-runtime-store"
+import { useTabStore } from "@/stores/tab-store"
 import {
   CONVERSATIONS_BULK_CHANGED_EVENT,
   CONVERSATION_CHANGED_EVENT,
@@ -21,6 +22,7 @@ import {
   type ConversationChange,
   type ConversationsBulkChanged,
   type FolderChange,
+  type FolderCloseCause,
 } from "@/lib/types"
 
 interface AppWorkspaceProviderProps {
@@ -80,6 +82,59 @@ function syncTerminalDelegateSummary(summary: {
       .getState()
       .actions.syncDelegateTerminalDetail(summary.id)
   }
+}
+
+/** True when the singleton new-conversation draft still targets `folderId`. */
+function draftTargetsFolder(folderId: number): boolean {
+  return useTabStore
+    .getState()
+    .rawTabs.some(
+      (t) => t.conversationId == null && t.folderId === folderId && !t.isChat
+    )
+}
+
+/**
+ * AutoEmpty re-open guard: if local draft still targets a folder missing from
+ * the open list, silently re-open membership (no focus steal; no second draft).
+ */
+async function ensureOpenIfDraftTargets(folderId: number): Promise<void> {
+  if (!draftTargetsFolder(folderId)) return
+  const store = useAppWorkspaceStore.getState()
+  if (store.folders.some((f) => f.id === folderId)) return
+  try {
+    await store.addFolderToWorkspaceById(folderId)
+  } catch (err) {
+    console.error(
+      "[AppWorkspace] silent re-open after auto_empty close failed:",
+      err
+    )
+  }
+}
+
+/**
+ * Apply `folder://changed` close: local membership drop only, cause-aware draft
+ * hooks, then fenced refetch. Re-applies AutoEmpty re-open after non-stale.
+ */
+function handleFolderClose(folderId: number, cause: FolderCloseCause): void {
+  const store = useAppWorkspaceStore.getState()
+  // 1–2) local drop + generation bump (inside dropFolderFromOpenList)
+  store.dropFolderFromOpenList(folderId)
+
+  // 3–4) cause-aware draft effects
+  if (cause === "user_remove") {
+    // Must go through tab-store action so decorated `tabs` is recomputed.
+    useTabStore.getState().disposeDraftBindingForRemovedFolder(folderId)
+  } else if (cause === "auto_empty") {
+    void ensureOpenIfDraftTargets(folderId)
+  }
+
+  // 5) fenced refetch; re-apply AutoEmpty guard after commit path returns
+  void (async () => {
+    await store.fetchFolders()
+    if (cause === "auto_empty") {
+      await ensureOpenIfDraftTargets(folderId)
+    }
+  })()
 }
 
 /**
@@ -243,6 +298,10 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
             if (change.folder.git_branch) {
               store.setBranch(change.folder.id, change.folder.git_branch)
             }
+            return
+          }
+          if (change.kind === "close") {
+            handleFolderClose(change.folder_id, change.cause)
           }
         }
       )
@@ -253,6 +312,7 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     // A folder created while the WS was disconnected is dropped by the
     // broadcaster (receiver_count == 0); a full folder re-fetch on reconnect
     // reconciles. Returns null on desktop IPC (no disconnect window) → no-op.
+    // Same membership generation fence as Close/Upsert paths.
     const offReconnect = onTransportReconnect(() => {
       void useAppWorkspaceStore.getState().fetchFolders()
     })

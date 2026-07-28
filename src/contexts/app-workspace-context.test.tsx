@@ -5,6 +5,7 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
+import { resetTabStore, useTabStore } from "@/stores/tab-store"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type {
   ConversationChange,
@@ -31,6 +32,20 @@ const h = vi.hoisted(() => ({
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
+  openFolderById: vi.fn(async (folderId: number) => ({
+    id: folderId,
+    name: `folder-${folderId}`,
+    path: `/repo/folder-${folderId}`,
+    git_branch: null,
+    default_agent_type: null,
+    last_agent_type: null,
+    last_opened_at: "2026-01-01T00:00:00.000Z",
+    sort_order: folderId,
+    color: "inherit",
+    parent_id: null,
+    kind: "regular",
+    alias: null,
+  })),
   getGitHead: vi.fn(async () => ({
     is_repo: false,
     branch: null,
@@ -101,7 +116,7 @@ vi.mock("@/lib/api", () => ({
   getGitBranch: vi.fn(async () => null),
   getGitHead: h.getGitHead,
   openFolder: vi.fn(),
-  openFolderById: vi.fn(),
+  openFolderById: h.openFolderById,
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
   getFolder: vi.fn(),
@@ -243,6 +258,10 @@ beforeEach(() => {
   h.listOpenFolders.mockResolvedValue([])
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
+  h.openFolderById.mockClear()
+  h.openFolderById.mockImplementation(async (folderId: number) =>
+    makeFolder({ id: folderId })
+  )
   h.getGitHead.mockReset()
   h.getGitHead.mockResolvedValue({
     is_repo: false,
@@ -261,6 +280,7 @@ beforeEach(() => {
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
+  resetTabStore()
 })
 
 describe("AppWorkspaceProvider active-folder Git HEAD sync", () => {
@@ -767,6 +787,308 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(h.listAllFolders).toHaveBeenCalledTimes(2)
   })
 
+  it("removes a folder from the open list on folder://changed close", async () => {
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    // Closed snapshot must not resurrect membership after local drop.
+    h.listOpenFolders.mockResolvedValue([])
+    h.listAllFolders.mockResolvedValue([makeFolder({ id: 12 })])
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+    // all-history row may remain (v1: Close does not prune history cache).
+    expect(
+      useAppWorkspaceStore.getState().allFolders.some((f) => f.id === 12)
+    ).toBe(true)
+  })
+
+  it("auto_empty close re-opens when a draft still targets the folder", async () => {
+    await mountProvider()
+    const folder = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "draft-12",
+          kind: "conversation",
+          conversationId: null,
+          folderId: 12,
+          agentType: "claude_code",
+          title: "New",
+          isPinned: false,
+          workingDir: folder.path,
+        },
+      ],
+      activeTabId: "draft-12",
+    })
+
+    h.listOpenFolders.mockResolvedValue([])
+    h.listAllFolders.mockResolvedValue([folder])
+    h.openFolderById.mockResolvedValue(folder)
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledWith(12)
+    })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    // Draft binding is preserved (not disposed).
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(true)
+  })
+
+  it("user_remove close never re-opens and disposes the draft binding", async () => {
+    await mountProvider()
+    const keep = makeFolder({ id: 3 })
+    const gone = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder: keep })
+    emitFolder({ kind: "upsert", folder: gone })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    const draftTab = {
+      id: "draft-12",
+      kind: "conversation" as const,
+      conversationId: null,
+      folderId: 12,
+      agentType: "claude_code" as const,
+      title: "New",
+      isPinned: false,
+      workingDir: gone.path,
+    }
+    // Seed both projections so a rawTabs-only patch would leave `tabs` stale.
+    useTabStore.setState({
+      rawTabs: [draftTab],
+      tabs: [draftTab],
+      activeTabId: "draft-12",
+    })
+
+    h.listOpenFolders.mockResolvedValue([keep])
+    h.listAllFolders.mockResolvedValue([keep, gone])
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "user_remove" })
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+    expect(h.openFolderById).not.toHaveBeenCalled()
+    // Draft must not keep targeting the user-removed folder on EITHER projection
+    // (tab-store action must recompute `tabs` from `rawTabs`).
+    await waitFor(() => {
+      const st = useTabStore.getState()
+      expect(
+        st.rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+      ).toBe(false)
+      expect(
+        st.tabs.some((t) => t.conversationId == null && t.folderId === 12)
+      ).toBe(false)
+    })
+    const st = useTabStore.getState()
+    const rawDraft = st.rawTabs.find((t) => t.id === "draft-12")
+    const tabsDraft = st.tabs.find((t) => t.id === "draft-12")
+    expect(rawDraft?.folderId).toBe(3)
+    expect(tabsDraft?.folderId).toBe(3)
+    expect(rawDraft?.workingDir).toBe(keep.path)
+    expect(tabsDraft?.workingDir).toBe(keep.path)
+  })
+
+  it("stale Close after newer Upsert: close drops then authoritative open snapshot restores membership", async () => {
+    // Required order: Upsert/open FIRST, then stale Close, then open-list
+    // snapshot restores — not Close-first then Upsert.
+    await mountProvider()
+    const folder = makeFolder({ id: 12, name: "authoritative-open" })
+
+    // 1) Newer open first.
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    // Close-triggered fenced refetch is deferred so we control when the
+    // authoritative open snapshot commits (server already re-opened).
+    const openSnap = deferred<FolderDetail[]>()
+    const allSnap = deferred<FolderDetail[]>()
+    h.listOpenFolders.mockReturnValueOnce(openSnap.promise)
+    h.listAllFolders.mockReturnValueOnce(allSnap.promise)
+
+    // 2) Stale Close after the newer open — local drop only.
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+
+    // 3) Authoritative open snapshot from fenced refetch restores membership.
+    await act(async () => {
+      openSnap.resolve([folder])
+      allSnap.resolve([folder])
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("authoritative-open")
+  })
+
+  it("auto_empty post-refetch guard restores membership after first reopen fails", async () => {
+    // First ensureOpen (pre-refetch) fails; second ensureOpen (post-refetch)
+    // is what restores membership — not merely that openFolderById was called.
+    await mountProvider()
+    const folder = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "draft-12",
+          kind: "conversation",
+          conversationId: null,
+          folderId: 12,
+          agentType: "claude_code",
+          title: "New",
+          isPinned: false,
+          workingDir: folder.path,
+        },
+      ],
+      activeTabId: "draft-12",
+    })
+
+    // Defer closed-snapshot refetch so the post-refetch guard cannot run until
+    // after we observe the failed first attempt leaving membership closed.
+    const closedOpen = deferred<FolderDetail[]>()
+    const closedAll = deferred<FolderDetail[]>()
+    h.listOpenFolders.mockReturnValueOnce(closedOpen.promise)
+    h.listAllFolders.mockReturnValueOnce(closedAll.promise)
+
+    // First call = pre-refetch ensureOpen (fails). Second = post-refetch guard.
+    h.openFolderById
+      .mockRejectedValueOnce(new Error("first pre-refetch reopen fails"))
+      .mockResolvedValueOnce(
+        makeFolder({ id: 12, name: "restored-by-second-guard" })
+      )
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+
+    // First attempt ran and failed — membership still closed; second not yet.
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledTimes(1)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(h.openFolderById).toHaveBeenCalledTimes(1)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+
+    // Commit non-stale closed snapshot → post-refetch second guard runs.
+    await act(async () => {
+      closedOpen.resolve([])
+      closedAll.resolve([folder])
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledTimes(2)
+    })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("restored-by-second-guard")
+  })
+
+  it("reconnect fence discards a stale open list after a concurrent membership event", async () => {
+    await mountProvider()
+    const keep = makeFolder({ id: 1 })
+    emitFolder({ kind: "upsert", folder: keep })
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    const staleOpen = deferred<FolderDetail[]>()
+    const staleAll = deferred<FolderDetail[]>()
+    // First call = reconnect in-flight; subsequent close-handler refetch sees
+    // post-close membership (keep only).
+    h.listOpenFolders
+      .mockReturnValueOnce(staleOpen.promise)
+      .mockResolvedValue([keep])
+    h.listAllFolders
+      .mockReturnValueOnce(staleAll.promise)
+      .mockResolvedValue([keep, makeFolder({ id: 12 })])
+
+    await act(async () => {
+      h.folderReconnect?.()
+    })
+
+    // Membership event while reconnect refetch is in flight.
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+
+    // Stale reconnect snapshot still lists folder 12 — must not resurrect it.
+    await act(async () => {
+      staleOpen.resolve([keep, makeFolder({ id: 12 })])
+      staleAll.resolve([keep, makeFolder({ id: 12 })])
+      await Promise.resolve()
+    })
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 1)
+    ).toBe(true)
+  })
+
   it("disposes the folder subscription + reconnect handler on unmount", async () => {
     const { unmount } = await mountProvider()
     unmount()
@@ -774,3 +1096,14 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(h.folderReconnectUnsubSpy).toHaveBeenCalledTimes(1)
   })
 })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  void promise.catch(() => {})
+  return { promise, resolve, reject }
+}
