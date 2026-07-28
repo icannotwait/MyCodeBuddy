@@ -86,7 +86,12 @@ function copySeed(version) {
   mkdirSync(SEED_DIR, { recursive: true })
 
   // Installable local package tree: package metadata + lock + built bin entry.
-  for (const name of ["package.json", "package-lock.json", "README.md", "LICENSE"]) {
+  for (const name of [
+    "package.json",
+    "package-lock.json",
+    "README.md",
+    "LICENSE",
+  ]) {
     const src = join(VENDOR_DIR, name)
     if (existsSync(src)) {
       cpSync(src, join(SEED_DIR, name))
@@ -96,11 +101,7 @@ function copySeed(version) {
 
   // Stamp so runtime integrity can cross-check the locked pin without reading
   // a nested node_modules path before install.
-  writeFileSync(
-    join(SEED_DIR, ".codeg-seed-version"),
-    `${version}\n`,
-    "utf8"
-  )
+  writeFileSync(join(SEED_DIR, ".codeg-seed-version"), `${version}\n`, "utf8")
 
   if (!existsSync(join(SEED_DIR, "package.json"))) {
     die("seed package.json missing after copy")
