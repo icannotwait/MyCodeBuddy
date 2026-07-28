@@ -10,6 +10,8 @@ import { describe, it } from "node:test"
 import { fileURLToPath } from "node:url"
 import {
   extractTaskRouteSection,
+  findParentPermissionViolations,
+  parseExactAgentIdentity,
   parseMarkdownTablesByHeading,
   validateParentOwnership,
   validateRouteTables,
@@ -326,6 +328,49 @@ describe("validateRouteTables", () => {
 `
     assert.deepEqual(validateRouteTables(section), [])
   })
+
+  it("rejects parentheticals that smuggle alternative agent identities", () => {
+    // Reviewer example 1: Grok (or Codex)
+    const mixedOr = parseExactAgentIdentity("Grok (or Codex)")
+    assert.equal(mixedOr.ok, false, "Grok (or Codex) must fail closed")
+
+    // Reviewer example 2: Codex (Grok fallback)
+    const fallback = parseExactAgentIdentity("Codex (Grok fallback)")
+    assert.equal(fallback.ok, false, "Codex (Grok fallback) must fail closed")
+
+    // Harmless annotation control: still allowed
+    const harmless = parseExactAgentIdentity(
+      "Codex (≠ implementer, ≠ Author)"
+    )
+    assert.deepEqual(harmless, { ok: true, agent: "codex" })
+
+    const child = parseExactAgentIdentity("Grok (independent child)")
+    assert.deepEqual(child, { ok: true, agent: "grok" })
+
+    // Table-level: smuggled identity must fail route validation
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok (or Codex) |
+| Independent reviewer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Codex (Grok fallback) |
+| Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| Independent reviewer 2 | Grok (independent child) |
+`
+    const failures = validateRouteTables(section)
+    assert.ok(
+      failures.some((f) => /parenthetical|mixed|exact|identity|fallback/i.test(f)),
+      `parenthetical identity smuggling must fail; got: ${failures.join("; ")}`
+    )
+  })
 })
 
 describe("validateParentOwnership", () => {
@@ -391,6 +436,31 @@ Parent does not implement Task code.
 `
     const { failures } = validateParentOwnership(skill)
     assert.deepEqual(failures, [])
+  })
+
+  it("does not let an unrelated prohibition mask an affirmative parent permission clause", () => {
+    // Reviewer example: unrelated negative clause + affirmative Task-code write
+    const mixed =
+      "Parent must not wait; Parent writes Task code when urgency requires it"
+    const violations = findParentPermissionViolations(mixed)
+    assert.ok(
+      violations.some((v) => /Task code/i.test(v)),
+      `mixed prohibition+permission must fail; got: ${violations.join("; ")}`
+    )
+
+    // Direct relevant prohibition control: still allowed (no violation)
+    const banOnly = "Parent must not write Task code"
+    assert.deepEqual(findParentPermissionViolations(banOnly), [])
+
+    const skill = `Codex Plan Author owns every Plan. Author owns the Plan.
+Parent must not implement Task code. Parent must not write or rewrite the Plan.
+Parent must not wait; Parent writes Task code when urgency requires it.
+`
+    const { failures } = validateParentOwnership(skill)
+    assert.ok(
+      failures.some((f) => /Task code|parent authorship|permission/i.test(f)),
+      `line-level prohibition must not mask permission; got: ${failures.join("; ")}`
+    )
   })
 
   it("passes clean Author-owned skill without parent write permission", () => {

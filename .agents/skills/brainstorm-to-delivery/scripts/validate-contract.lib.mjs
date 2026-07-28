@@ -94,14 +94,66 @@ function agentCell(cells) {
 }
 
 /**
- * Strip harmless Markdown annotations/punctuation, then require exactly one
+ * Explicitly harmless parenthetical annotations only (fail closed otherwise).
+ * Reject agent identities, alternatives, fallbacks, or unknown notes.
+ */
+export function isHarmlessAgentParenthetical(inner) {
+  const t = String(inner ?? "")
+    .replace(/[*_`~]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+  if (!t) return false
+
+  // Never allow a second identity or alternative/fallback semantics inside notes.
+  if (/\bgrok\b|\bcodex\b/.test(t)) return false
+  if (
+    /\b(or|and|\/|fallback|alternative|instead|either|optional|prefer|else|otherwise)\b/.test(
+      t
+    )
+  ) {
+    return false
+  }
+
+  // Allowlist only the annotations used by the Skill route tables.
+  if (/^independent(?:\s+child)?$/.test(t)) return true
+  // e.g. ≠ implementer, ≠ Author  (unicode or ascii not-equal)
+  if (/^[≠!=]+\s*implementer(?:\s*[,;]\s*[≠!=]+\s*author)?$/.test(t)) {
+    return true
+  }
+  if (/^[≠!=]+\s*author(?:\s*[,;]\s*[≠!=]+\s*implementer)?$/.test(t)) {
+    return true
+  }
+  if (
+    /^[≠!=]+\s*implementer\s*[,;]\s*[≠!=]+\s*author$/.test(t) ||
+    /^[≠!=]+\s*author\s*[,;]\s*[≠!=]+\s*implementer$/.test(t)
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Strip only allowed annotations/punctuation, then require exactly one
  * canonical agent identity (`grok` | `codex`). No substring membership.
  * @returns {{ ok: true, agent: "grok"|"codex" } | { ok: false, reason: string }}
  */
 export function parseExactAgentIdentity(raw) {
   let s = String(raw ?? "")
-  // Drop parenthetical annotations: (≠ implementer, ≠ Author), (independent child)
+
+  // Validate each parenthetical before stripping; only harmless annotations drop.
+  const parenRe = /\(([^)]*)\)/g
+  let m
+  while ((m = parenRe.exec(s)) !== null) {
+    if (!isHarmlessAgentParenthetical(m[1])) {
+      return {
+        ok: false,
+        reason: `disallowed parenthetical annotation: (${m[1].trim()})`,
+      }
+    }
+  }
   s = s.replace(/\([^)]*\)/g, " ")
+
   // Drop Markdown emphasis
   s = s.replace(/[*_`~]+/g, " ")
   // Normalize separators that signal alternatives / lists
@@ -305,18 +357,29 @@ export function validateRouteTables(taskRouteSection) {
 }
 
 /**
- * True when a line is a legitimate prohibition (not a permission grant).
- * Same-line negation only — do not treat unrelated Author-owns text as a ban.
+ * True when a clause is a legitimate prohibition (not a permission grant).
+ * Scoped to the clause only — an unrelated negative must not mask another action.
  */
-function lineIsProhibition(line) {
+function clauseIsProhibition(clause) {
   return /\b(must not|may not|cannot|can not|never|forbid|forbidden|do not|don't|does not|doesn't|不得|禁止|不要|不得亲自)\b/i.test(
-    line
+    clause
   )
+}
+
+/**
+ * Split a line into independent clauses so prohibition scopes per action.
+ */
+export function splitPermissionClauses(line) {
+  return String(line ?? "")
+    .split(/;\s*|\.\s+/)
+    .map((c) => c.trim())
+    .filter(Boolean)
 }
 
 /**
  * Detect direct Plan/Task authoring or implementation permission statements.
  * Independent of modal verbs. Urgency clauses do not exempt.
+ * Prohibition is evaluated per clause, not per whole line.
  */
 export function findParentPermissionViolations(skill) {
   const found = []
@@ -349,7 +412,7 @@ export function findParentPermissionViolations(skill) {
       "parent instructed to invoke writing-plans itself",
     ],
     [
-      /\bparent\b[^\n]{0,40}\binvoke(?:s|ing)?\s+`?writing-plans`?/i,
+      /\bparent\b[^\n;.]{0,40}\binvoke(?:s|ing)?\s+`?writing-plans`?/i,
       "parent invokes writing-plans (Author must)",
     ],
     [
@@ -364,10 +427,13 @@ export function findParentPermissionViolations(skill) {
 
   for (const line of lines) {
     if (!line.trim()) continue
-    if (lineIsProhibition(line)) continue
-    for (const [re, label] of direct) {
-      if (re.test(line)) {
-        found.push(`parent authorship permission present: ${label}`)
+    const clauses = splitPermissionClauses(line)
+    for (const clause of clauses) {
+      if (clauseIsProhibition(clause)) continue
+      for (const [re, label] of direct) {
+        if (re.test(clause)) {
+          found.push(`parent authorship permission present: ${label}`)
+        }
       }
     }
   }
