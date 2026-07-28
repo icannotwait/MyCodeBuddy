@@ -584,6 +584,31 @@ describe("validateParentOwnership", () => {
       "Parent dispatches the Reviewer to invoke writing-plans",
       null,
     ],
+    [
+      "modal delegated child",
+      "Parent must dispatch Author to write the Plan",
+      null,
+    ],
+    [
+      "modal delegated child",
+      "Parent may ask the Reviewer to edit the Plan file",
+      null,
+    ],
+    [
+      "modal delegated child",
+      "Parent should instruct Implementer to write Task code",
+      null,
+    ],
+    [
+      "modal delegated child",
+      "Parent can require Author to invoke writing-plans",
+      null,
+    ],
+    [
+      "modal delegated child",
+      "Parent will tell Reviewer to edit the Plan file",
+      null,
+    ],
 
     // Delegation must not weaken direct or later explicit Parent ownership.
     ["direct Parent control", "Parent edits Plan file", "Parent writes Plan"],
@@ -596,6 +621,31 @@ describe("validateParentOwnership", () => {
       "direct Parent control",
       "Parent implements Task",
       "Parent implements Task",
+    ],
+    [
+      "direct modal Parent control",
+      "Parent may write the Plan",
+      "Parent writes Plan",
+    ],
+    [
+      "direct modal Parent control",
+      "Parent must edit Plan file",
+      "Parent writes Plan",
+    ],
+    [
+      "direct modal Parent control",
+      "Parent should write Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "direct modal Parent control",
+      "Parent can implement the Task",
+      "Parent implements Task",
+    ],
+    [
+      "direct modal Parent control",
+      "Parent will invoke writing-plans",
+      "parent invokes writing-plans (Author must)",
     ],
     [
       "delegation contrast",

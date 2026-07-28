@@ -389,12 +389,17 @@ const ACTION_FORMS = new Map([
 
 const CONTENT_ACTIONS = new Set(["write", "author", "rewrite", "edit"])
 const CONTRAST_BOUNDARIES = new Set(["but", "however", "yet", "then"])
-const DELEGATION_CONTROL_VERBS = new Set([
-  "asks",
-  "dispatches",
-  "instructs",
-  "requires",
-  "tells",
+const DELEGATION_CONTROL_FORMS = new Map([
+  ["ask", "ask"],
+  ["asks", "ask"],
+  ["dispatch", "dispatch"],
+  ["dispatches", "dispatch"],
+  ["instruct", "instruct"],
+  ["instructs", "instruct"],
+  ["require", "require"],
+  ["requires", "require"],
+  ["tell", "tell"],
+  ["tells", "tell"],
 ])
 const DELEGATED_CHILD_SUBJECTS = new Set(["author", "implementer", "reviewer"])
 const NON_PARENT_SUBJECTS = new Set([
@@ -582,7 +587,8 @@ function tokenStartsProhibition(token) {
 }
 
 function startsDelegatedChildComplement(tokens, controlIndex) {
-  if (!DELEGATION_CONTROL_VERBS.has(tokens[controlIndex]?.value)) return false
+  const controlVerb = DELEGATION_CONTROL_FORMS.get(tokens[controlIndex]?.value)
+  if (!controlVerb) return false
 
   let childIndex = controlIndex + 1
   if (tokens[childIndex]?.value === "the") childIndex += 1
