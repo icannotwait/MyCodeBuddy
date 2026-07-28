@@ -106,7 +106,7 @@ serde_yaml = "0.9"
 notify = "6"
 base64 = "0.22"
 agent-client-protocol-schema = { version = "0.11", features = ["unstable_session_usage", "unstable_session_fork", "unstable_session_resume", "unstable_elicitation"] }
-kill_tree = { version = "0.2", features = ["tokio"] }
+kill_tree = { version = "=0.2.4", features = ["tokio"] }
 which = "7"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }
@@ -163,3 +163,4 @@ axum-test = { version = "17", features = ["ws"] }
 
 [patch.crates-io]
 sacp-tokio = { path = "vendor/sacp-tokio" }
+kill_tree = { path = "vendor/kill_tree" }

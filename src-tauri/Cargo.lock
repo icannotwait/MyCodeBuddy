@@ -3266,8 +3266,6 @@ dependencies = [
 [[package]]
 name = "kill_tree"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3879339076ac4da142cc852d91693462927cbc99773b5ea422e4834e68c4ff2"
 dependencies = [
  "bindgen",
  "nix 0.27.1",
