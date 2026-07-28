@@ -90,7 +90,78 @@ function roleCell(cells) {
 }
 
 function agentCell(cells) {
-  return (cells[1] || "").toLowerCase()
+  return cells[1] || ""
+}
+
+/**
+ * Strip harmless Markdown annotations/punctuation, then require exactly one
+ * canonical agent identity (`grok` | `codex`). No substring membership.
+ * @returns {{ ok: true, agent: "grok"|"codex" } | { ok: false, reason: string }}
+ */
+export function parseExactAgentIdentity(raw) {
+  let s = String(raw ?? "")
+  // Drop parenthetical annotations: (≠ implementer, ≠ Author), (independent child)
+  s = s.replace(/\([^)]*\)/g, " ")
+  // Drop Markdown emphasis
+  s = s.replace(/[*_`~]+/g, " ")
+  // Normalize separators that signal alternatives / lists
+  s = s.replace(/[/|,;&]+/g, " ")
+  s = s.replace(/\b(?:or|and|\/)\b/gi, " ")
+  s = s.replace(/\s+/g, " ").trim().toLowerCase()
+
+  if (!s) {
+    return { ok: false, reason: "empty agent cell" }
+  }
+
+  // Tokenize on whitespace; only exact tokens "grok" and "codex" count.
+  const tokens = s.split(" ").filter(Boolean)
+  const agents = []
+  const unknown = []
+  for (const t of tokens) {
+    // Allow benign role words that sometimes appear after stripping notes
+    if (
+      /^(?:agent|type|independent|child|implementer|fixer|reviewer|author|profile|none)$/.test(
+        t
+      )
+    ) {
+      continue
+    }
+    if (t === "grok" || t === "codex") {
+      agents.push(t)
+      continue
+    }
+    unknown.push(t)
+  }
+
+  if (unknown.length) {
+    return {
+      ok: false,
+      reason: `non-canonical agent token(s): ${unknown.join(" ")}`,
+    }
+  }
+  const unique = [...new Set(agents)]
+  if (unique.length === 0) {
+    return { ok: false, reason: "no canonical agent identity" }
+  }
+  if (unique.length > 1) {
+    return {
+      ok: false,
+      reason: `mixed agent identities: ${unique.join(" / ")}`,
+    }
+  }
+  return { ok: true, agent: unique[0] }
+}
+
+function classifyRole(roleRaw) {
+  const role = String(roleRaw || "")
+    .toLowerCase()
+    .replace(/[*_`~]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!role || role === "role") return null
+  if (/implementer/.test(role)) return "implementer"
+  if (/reviewer/.test(role)) return "reviewer"
+  return "other"
 }
 
 /**
@@ -115,24 +186,51 @@ export function validateRouteTables(taskRouteSection) {
   if (!normalKey) {
     failures.push("Task route missing `### Normal route` table")
   } else {
-    const rows = tables.get(normalKey).filter((r) => {
-      const role = roleCell(r.cells)
-      return role && role !== "role"
-    })
-    const impl = rows.find((r) => /implementer/.test(roleCell(r.cells)))
-    const rev = rows.find((r) => /reviewer/.test(roleCell(r.cells)))
-    if (!impl || !/\bgrok\b/i.test(agentCell(impl.cells))) {
+    const rows = tables.get(normalKey).filter((r) => classifyRole(roleCell(r.cells)))
+    const impls = []
+    const revs = []
+    const extras = []
+    for (const r of rows) {
+      const kind = classifyRole(roleCell(r.cells))
+      const parsed = parseExactAgentIdentity(agentCell(r.cells))
+      if (kind === "implementer") {
+        if (!parsed.ok) {
+          failures.push(
+            `normal route implementer cell is not exact: ${parsed.reason}`
+          )
+        } else {
+          impls.push(parsed.agent)
+        }
+      } else if (kind === "reviewer") {
+        if (!parsed.ok) {
+          failures.push(
+            `normal route reviewer cell is not exact: ${parsed.reason}`
+          )
+        } else {
+          revs.push(parsed.agent)
+        }
+      } else {
+        extras.push(roleCell(r.cells))
+      }
+    }
+
+    if (impls.length !== 1 || revs.length !== 1 || extras.length > 0) {
       failures.push(
-        "normal route table must map Implementer/fixer to Grok"
+        `normal route must have exactly one implementer row and one reviewer row (got implementer=${impls.length}, reviewer=${revs.length}, extra=${extras.length})`
       )
     }
-    if (!rev || !/\bcodex\b/i.test(agentCell(rev.cells))) {
+    if (impls.length === 1 && impls[0] !== "grok") {
       failures.push(
-        "normal route table must map Independent reviewer to Codex"
+        "normal route table must map Implementer/fixer exactly to Grok"
       )
     }
-    // Reject wrong agents even if labels exist
-    if (impl && /\bcodex\b/i.test(agentCell(impl.cells)) && !/\bgrok\b/i.test(agentCell(impl.cells))) {
+    if (revs.length === 1 && revs[0] !== "codex") {
+      failures.push(
+        "normal route table must map Independent reviewer exactly to Codex"
+      )
+    }
+    // Keep legacy-style message for pure wrong-agent single-token failures
+    if (impls.length === 1 && impls[0] === "codex") {
       failures.push("normal route implementer must be Grok, not Codex")
     }
   }
@@ -140,45 +238,141 @@ export function validateRouteTables(taskRouteSection) {
   if (!highKey) {
     failures.push("Task route missing `### High route` table")
   } else {
-    const rows = tables.get(highKey).filter((r) => {
-      const role = roleCell(r.cells)
-      return role && role !== "role"
-    })
-    const impl = rows.find((r) => /implementer/.test(roleCell(r.cells)))
-    const reviewers = rows.filter((r) => /reviewer/.test(roleCell(r.cells)))
-    if (!impl || !/\bcodex\b/i.test(agentCell(impl.cells))) {
+    const rows = tables.get(highKey).filter((r) => classifyRole(roleCell(r.cells)))
+    const impls = []
+    const revs = []
+    const extras = []
+    for (const r of rows) {
+      const kind = classifyRole(roleCell(r.cells))
+      const parsed = parseExactAgentIdentity(agentCell(r.cells))
+      if (kind === "implementer") {
+        if (!parsed.ok) {
+          failures.push(
+            `high route implementer cell is not exact: ${parsed.reason}`
+          )
+        } else {
+          impls.push(parsed.agent)
+        }
+      } else if (kind === "reviewer") {
+        if (!parsed.ok) {
+          failures.push(
+            `high route reviewer cell is not exact: ${parsed.reason}`
+          )
+        } else {
+          revs.push(parsed.agent)
+        }
+      } else {
+        extras.push(roleCell(r.cells))
+      }
+    }
+
+    if (impls.length !== 1) {
       failures.push(
-        "high route table must map Implementer/fixer to Codex"
+        `high route must have exactly one implementer row (got ${impls.length})`
+      )
+    } else if (impls[0] !== "codex") {
+      failures.push(
+        "high route table must map Implementer/fixer exactly to Codex"
       )
     }
-    if (reviewers.length < 2) {
+
+    if (revs.length !== 2) {
       failures.push(
-        "high route table must list two distinct Independent reviewer rows"
+        `high route table must list exactly two distinct Independent reviewer rows (got ${revs.length})`
       )
     } else {
-      const agents = reviewers.map((r) => agentCell(r.cells))
-      const hasCodex = agents.some((a) => /\bcodex\b/i.test(a))
-      const hasGrok = agents.some((a) => /\bgrok\b/i.test(a))
-      if (!hasCodex || !hasGrok) {
+      const set = new Set(revs)
+      if (!(set.has("codex") && set.has("grok"))) {
         failures.push(
-          "high route table must assign independent Codex AND Grok reviewers"
+          "high route table must assign exactly independent Codex AND Grok reviewers"
         )
       }
-      // Distinct agents across the two reviewer rows (not both same single agent)
-      const primary = agents.map((a) => {
-        if (/\bcodex\b/i.test(a)) return "codex"
-        if (/\bgrok\b/i.test(a)) return "grok"
-        return a
-      })
-      if (primary[0] && primary[0] === primary[1]) {
+      if (revs[0] === revs[1]) {
         failures.push(
           "high route must use two distinct reviewer agents (not the same agent twice)"
         )
       }
     }
+
+    if (extras.length > 0) {
+      failures.push(
+        `high route has unexpected extra role row(s): ${extras.join(", ")}`
+      )
+    }
   }
 
   return failures
+}
+
+/**
+ * True when a line is a legitimate prohibition (not a permission grant).
+ * Same-line negation only — do not treat unrelated Author-owns text as a ban.
+ */
+function lineIsProhibition(line) {
+  return /\b(must not|may not|cannot|can not|never|forbid|forbidden|do not|don't|does not|doesn't|不得|禁止|不要|不得亲自)\b/i.test(
+    line
+  )
+}
+
+/**
+ * Detect direct Plan/Task authoring or implementation permission statements.
+ * Independent of modal verbs. Urgency clauses do not exempt.
+ */
+export function findParentPermissionViolations(skill) {
+  const found = []
+  const lines = skill.split(/\r?\n/)
+
+  // Direct affirmative permission / action patterns (no modal required).
+  const direct = [
+    [
+      /\bparent\s+writes\s+(?:the\s+)?plan\b/i,
+      "Parent writes Plan",
+    ],
+    [
+      /\bparent\s+writes\s+task\s+code\b/i,
+      "Parent writes Task code",
+    ],
+    [
+      /\bparent\s+implements\s+tasks?\b/i,
+      "Parent implements Task",
+    ],
+    [
+      /\bparent\s+(?:authors|rewrites|edits)\s+(?:the\s+)?plan\b/i,
+      "Parent authors/rewrites/edits Plan",
+    ],
+    [
+      /\bparent\s+(?:may|can|should|must)\s+(?:write|author|rewrite|implement|edit)\s+(?:the\s+)?(?:plan|task)\b/i,
+      "parent modal permission to write/implement Plan or Task",
+    ],
+    [
+      /使用\s*`writing-plans`\s*编写任何实施计划/,
+      "parent instructed to invoke writing-plans itself",
+    ],
+    [
+      /\bparent\b[^\n]{0,40}\binvoke(?:s|ing)?\s+`?writing-plans`?/i,
+      "parent invokes writing-plans (Author must)",
+    ],
+    [
+      /父会话(?:可以|可|应当|应|必须).*(?:编写|撰写|改写|实现|修复).*(?:计划|Plan|Task|代码)/i,
+      "parent Chinese permission to author Plan/Task",
+    ],
+    [
+      /父会话.*`writing-plans`/,
+      "parent Chinese writing-plans ownership",
+    ],
+  ]
+
+  for (const line of lines) {
+    if (!line.trim()) continue
+    if (lineIsProhibition(line)) continue
+    for (const [re, label] of direct) {
+      if (re.test(line)) {
+        found.push(`parent authorship permission present: ${label}`)
+      }
+    }
+  }
+
+  return [...new Set(found)]
 }
 
 /**
@@ -189,43 +383,22 @@ export function validateParentOwnership(skill) {
   const failures = []
   const notes = []
 
-  const parentPermissionPatterns = [
-    [
-      /parent\s+(?:may|can|should|must)\s+(?:write|author|rewrite|implement|edit)\s+(?:the\s+)?(?:Plan|Task)/i,
-      "parent permission to write/implement Plan or Task",
-    ],
-    [
-      /父会话(?:可以|可|应当|应|必须).*(?:编写|撰写|改写|实现|修复).*(?:计划|Plan|Task|代码)/i,
-      "parent Chinese permission to author Plan/Task",
-    ],
-    [
-      /使用\s*`writing-plans`\s*编写任何实施计划/,
-      "parent instructed to invoke writing-plans itself",
-    ],
-    [
-      /parent.*invoke(?:s|ing)?\s+`?writing-plans`?/i,
-      "parent invokes writing-plans (Author must)",
-    ],
-    [
-      /父会话.*`writing-plans`/,
-      "parent Chinese writing-plans ownership",
-    ],
-  ]
+  for (const msg of findParentPermissionViolations(skill)) {
+    failures.push(msg)
+  }
 
-  for (const [re, label] of parentPermissionPatterns) {
-    // Ignore lines that only ban the behavior
-    const lines = skill.split(/\r?\n/)
-    for (const line of lines) {
-      if (!re.test(line)) continue
-      const isBan =
-        /\b(must not|may not|cannot|can not|never|forbid|forbidden|do not|don't|不得|禁止|不要)\b/i.test(
-          line
-        )
-      if (!isBan) {
-        failures.push(`parent authorship permission present: ${label}`)
-        break
-      }
-    }
+  // Author-owns alone must never mask a permission violation already collected.
+  const authorOwns =
+    /Author owns the Plan/i.test(skill) ||
+    /Codex Plan Author owns every Plan/i.test(skill)
+
+  if (
+    authorOwns &&
+    failures.some((f) => /parent authorship permission present/i.test(f))
+  ) {
+    failures.push(
+      "contradictory parent Plan/Task authorship: Author-owns cannot mask parent write/implement permission"
+    )
   }
 
   const parentNoTaskCode =
@@ -244,10 +417,6 @@ export function validateParentOwnership(skill) {
     /Parent must not write or rewrite the Plan/i.test(skill) ||
     /父会话不得(?:直接)?(?:改写|编写|撰写|重写)(?:实施)?计划/i.test(skill)
 
-  const authorOwns =
-    /Author owns the Plan/i.test(skill) ||
-    /Codex Plan Author owns every Plan/i.test(skill)
-
   if (!parentNoPlanWrite) {
     failures.push(
       "missing ban: parent must not write/rewrite the Plan (Author owns it)"
@@ -258,17 +427,6 @@ export function validateParentOwnership(skill) {
 
   if (!authorOwns) {
     failures.push("missing statement that Codex Plan Author owns the Plan")
-  }
-
-  // Author-owns alone must not mask contradictory parent authoring
-  const contradictoryParentAuthoring =
-    (/parent\s+(?:writes|authors|rewrites)\s+(?:the\s+)?plan/i.test(skill) ||
-      /使用\s*`writing-plans`\s*编写任何实施计划/.test(skill)) &&
-    authorOwns
-  if (contradictoryParentAuthoring) {
-    failures.push(
-      "contradictory parent Plan authorship: Author-owns cannot mask parent write permission"
-    )
   }
 
   return { failures, notes }

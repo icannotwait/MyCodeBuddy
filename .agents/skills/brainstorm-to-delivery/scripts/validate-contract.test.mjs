@@ -203,6 +203,129 @@ describe("validateRouteTables", () => {
     const failures = validateRouteTables(section)
     assert.deepEqual(failures, [])
   })
+
+  it("fails when normal implementer cell mixes alternative identities", () => {
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok or Codex |
+| Independent reviewer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Codex |
+| Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| Independent reviewer 2 | Grok (independent child) |
+`
+    const failures = validateRouteTables(section)
+    assert.ok(
+      failures.some((f) => /normal|exact|mixed|identity|implementer/i.test(f)),
+      `mixed normal implementer must fail; got: ${failures.join("; ")}`
+    )
+  })
+
+  it("fails when high implementer or reviewer cells mix identities", () => {
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok |
+| Independent reviewer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Codex or Grok |
+| Independent reviewer 1 | Codex or Grok |
+| Independent reviewer 2 | Grok |
+`
+    const failures = validateRouteTables(section)
+    assert.ok(
+      failures.some((f) => /high|exact|mixed|identity|implementer|reviewer/i.test(f)),
+      `mixed high cells must fail; got: ${failures.join("; ")}`
+    )
+  })
+
+  it("fails when normal table has extra implementer or reviewer mapping", () => {
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok |
+| Independent reviewer | Codex |
+| Extra implementer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Codex |
+| Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| Independent reviewer 2 | Grok (independent child) |
+`
+    const failures = validateRouteTables(section)
+    assert.ok(
+      failures.some((f) => /extra|exact|unexpected|row|mapping/i.test(f)),
+      `extra normal row must fail; got: ${failures.join("; ")}`
+    )
+  })
+
+  it("fails when high table is not exactly Codex implementer plus Codex and Grok reviewers", () => {
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok |
+| Independent reviewer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Grok |
+| Independent reviewer 1 | Codex |
+| Independent reviewer 2 | Grok |
+| Independent reviewer 3 | Codex |
+`
+    const failures = validateRouteTables(section)
+    assert.ok(
+      failures.some((f) => /high/i.test(f)),
+      `non-exact high mapping must fail; got: ${failures.join("; ")}`
+    )
+  })
+
+  it("accepts parenthetical annotations but still requires one exact agent identity", () => {
+    const section = `## 4. Task route
+
+### Normal route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | **Grok** |
+| Independent reviewer | Codex |
+
+### High route
+
+| Role | Agent |
+| --- | --- |
+| Implementer / fixer | Codex |
+| Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| Independent reviewer 2 | Grok (independent child) |
+`
+    assert.deepEqual(validateRouteTables(section), [])
+  })
 })
 
 describe("validateParentOwnership", () => {
@@ -213,7 +336,7 @@ Parent writes the Plan when urgency requires it.
 `
     const { failures } = validateParentOwnership(skill)
     assert.ok(
-      failures.some((f) => /contradictory parent Plan authorship/i.test(f)),
+      failures.some((f) => /parent|Plan|authorship|permission/i.test(f)),
       `expected contradictory ownership failure, got: ${failures.join("; ")}`
     )
   })
@@ -228,6 +351,46 @@ Parent must not implement Task code. Parent must not write or rewrite the Plan.
       failures.some((f) => /writing-plans|parent authorship/i.test(f)),
       `expected parent writing-plans failure, got: ${failures.join("; ")}`
     )
+  })
+
+  it("rejects Parent writes Task code with urgency clause despite Author-owns", () => {
+    const skill = `Codex Plan Author owns every Plan. Author owns the Plan.
+Parent must not implement Task code. Parent must not write or rewrite the Plan.
+Parent writes Task code when urgency requires it.
+`
+    const { failures } = validateParentOwnership(skill)
+    assert.ok(
+      failures.some((f) => /Task code|parent authorship|permission/i.test(f)),
+      `expected Task code permission failure, got: ${failures.join("; ")}`
+    )
+  })
+
+  it("rejects Parent implements Task and Parent writes Plan without modal verbs", () => {
+    const skill = `Codex Plan Author owns every Plan. Author owns the Plan.
+Parent must not implement Task code. Parent must not write or rewrite the Plan.
+Parent implements Task.
+Parent writes Plan.
+`
+    const { failures } = validateParentOwnership(skill)
+    assert.ok(
+      failures.some((f) => /parent/i.test(f)),
+      `expected direct parent permission failures, got: ${failures.join("; ")}`
+    )
+    assert.ok(
+      failures.length >= 1,
+      `expected at least one ownership failure, got: ${failures.join("; ")}`
+    )
+  })
+
+  it("preserves legitimate prohibition text without treating it as permission", () => {
+    const skill = `Codex Plan Author owns every Plan. Author owns the Plan.
+Parent must not implement Task code.
+Parent must not write or rewrite the Plan.
+Parent never writes the Plan.
+Parent does not implement Task code.
+`
+    const { failures } = validateParentOwnership(skill)
+    assert.deepEqual(failures, [])
   })
 
   it("passes clean Author-owned skill without parent write permission", () => {
