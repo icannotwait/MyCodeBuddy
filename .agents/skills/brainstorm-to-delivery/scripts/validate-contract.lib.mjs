@@ -389,6 +389,14 @@ const ACTION_FORMS = new Map([
 
 const CONTENT_ACTIONS = new Set(["write", "author", "rewrite", "edit"])
 const CONTRAST_BOUNDARIES = new Set(["but", "however", "yet", "then"])
+const DELEGATION_CONTROL_VERBS = new Set([
+  "asks",
+  "dispatches",
+  "instructs",
+  "requires",
+  "tells",
+])
+const DELEGATED_CHILD_SUBJECTS = new Set(["author", "implementer", "reviewer"])
 const NON_PARENT_SUBJECTS = new Set([
   "author",
   "child",
@@ -573,15 +581,44 @@ function tokenStartsProhibition(token) {
   )
 }
 
+function startsDelegatedChildComplement(tokens, controlIndex) {
+  if (!DELEGATION_CONTROL_VERBS.has(tokens[controlIndex]?.value)) return false
+
+  let childIndex = controlIndex + 1
+  if (tokens[childIndex]?.value === "the") childIndex += 1
+  return (
+    DELEGATED_CHILD_SUBJECTS.has(tokens[childIndex]?.value) &&
+    tokens[childIndex + 1]?.value === "to"
+  )
+}
+
 function scanParentSpan(tokens, found) {
   let pendingProhibition = false
   let sharedProhibition = false
   let pendingCoordinate = false
   let clauseStart = false
+  let delegatedChildComplement = false
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index].value
 
+    if (delegatedChildComplement) {
+      if (!CONTRAST_BOUNDARIES.has(token)) continue
+      delegatedChildComplement = false
+      pendingProhibition = false
+      sharedProhibition = false
+      pendingCoordinate = false
+      clauseStart = true
+      continue
+    }
+    if (startsDelegatedChildComplement(tokens, index)) {
+      delegatedChildComplement = true
+      pendingProhibition = false
+      sharedProhibition = false
+      pendingCoordinate = false
+      clauseStart = false
+      continue
+    }
     if (clauseStart && NON_PARENT_SUBJECTS.has(token)) break
     if (token === ".") break
     if (token === ",") {

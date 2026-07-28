@@ -563,6 +563,50 @@ describe("validateParentOwnership", () => {
       "Parent writes Task brief, but Implementer writes Task code",
       null,
     ],
+
+    // Explicit delegation assigns the infinitive action to the named child.
+    ["delegated child", "Parent dispatches Author to write the Plan", null],
+    ["delegated child", "Parent asks the Author to edit the Plan file", null],
+    [
+      "delegated child",
+      "Parent instructs Implementer to write Task code",
+      null,
+    ],
+    ["delegated child", "Parent requires Author to invoke writing-plans", null],
+    ["delegated child", "Parent tells Reviewer to edit the Plan file", null],
+    [
+      "delegated child",
+      "Parent tells the Reviewer to write the Task code",
+      null,
+    ],
+    [
+      "delegated child",
+      "Parent dispatches the Reviewer to invoke writing-plans",
+      null,
+    ],
+
+    // Delegation must not weaken direct or later explicit Parent ownership.
+    ["direct Parent control", "Parent edits Plan file", "Parent writes Plan"],
+    [
+      "direct Parent control",
+      "Parent writes Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "direct Parent control",
+      "Parent implements Task",
+      "Parent implements Task",
+    ],
+    [
+      "delegation contrast",
+      "Parent dispatches Author to write the Plan, but Parent writes Task code",
+      "Parent writes Task code",
+    ],
+    [
+      "delegation contrast",
+      "Parent requires Reviewer to invoke writing-plans; however, Parent edits Plan file",
+      "Parent writes Plan",
+    ],
   ]
 
   for (const [category, sentence, expectedLabel] of ownershipGrammarCases) {
