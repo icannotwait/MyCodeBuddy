@@ -6702,11 +6702,7 @@ earlier terminal context records.\n\
             .expect("phase A parse ok");
 
         let outcomes_a = interrupted_outcomes(&detail_a);
-        assert_eq!(
-            outcomes_a.len(),
-            1,
-            "Phase A must expose a matchable fence"
-        );
+        assert_eq!(outcomes_a.len(), 1, "Phase A must expose a matchable fence");
         assert_eq!(
             outcomes_a[0].provider_turn_id.as_deref(),
             Some("turn-residual-fence"),
@@ -6715,7 +6711,9 @@ earlier terminal context records.\n\
 
         let texts_a = assistant_text_blocks(&detail_a);
         assert!(
-            texts_a.iter().any(|t| t.contains("Found the project root.")),
+            texts_a
+                .iter()
+                .any(|t| t.contains("Found the project root.")),
             "Phase A pre-abort content must survive: {texts_a:?}"
         );
         assert!(

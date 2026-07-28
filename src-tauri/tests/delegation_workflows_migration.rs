@@ -78,10 +78,7 @@ async fn count_table(db: &DatabaseConnection, table: &str) -> i64 {
     row.try_get::<i64>("", "c").unwrap()
 }
 
-async fn table_columns(
-    db: &DatabaseConnection,
-    table: &str,
-) -> Vec<(String, Option<String>)> {
+async fn table_columns(db: &DatabaseConnection, table: &str) -> Vec<(String, Option<String>)> {
     db.query_all(sql(format!("PRAGMA table_info({table})")))
         .await
         .unwrap()
@@ -250,8 +247,7 @@ async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
         .unwrap();
     seed_folder_and_parent(&db).await;
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflows ( \
+    db.execute(sql("INSERT INTO delegation_workflows ( \
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
            publication_token, created_at, updated_at \
@@ -259,12 +255,10 @@ async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
            'wf-v2-migration', 1, 'brainstorm_to_delivery', 1, \
            1, 1, 'estimated', 'workflow_manifest_v1', \
            'pub-v2-migration', '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z' \
-         )",
-    ))
-    .await
-    .unwrap();
-    db.execute(sql(
-        "INSERT INTO delegation_workflow_node_bindings ( \
+         )"))
+        .await
+        .unwrap();
+    db.execute(sql("INSERT INTO delegation_workflow_node_bindings ( \
            workflow_id, node_id, work_unit_key, role, agent_type, phase_id, \
            introduced_revision, is_observed, retained_observed, pair_frozen, \
            created_at, updated_at \
@@ -272,28 +266,29 @@ async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
            'wf-v2-migration', 'task-1-impl', 'task|1|implementer|codex|none', \
            'implementer', 'codex', 'tasks', 1, 0, 0, 1, \
            '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z' \
-         )",
-    ))
-    .await
-    .unwrap();
-    db.execute(sql(
-        "INSERT INTO delegation_workflow_gate_settlements ( \
+         )"))
+        .await
+        .unwrap();
+    db.execute(sql("INSERT INTO delegation_workflow_gate_settlements ( \
            workflow_id, gate_id, gate_cycle, manifest_revision, structural_revision, \
            content_fingerprint, outcome, critical_count, important_count, minor_count, \
            summary, graph_revision_at_settle, created_at \
          ) VALUES ( \
            'wf-v2-migration', 'design_gate', 1, 1, 1, 'design-digest', 'approved', \
            0, 0, 0, 'approved', 1, '2026-07-27T00:00:00Z' \
-         )",
-    ))
-    .await
-    .unwrap();
+         )"))
+        .await
+        .unwrap();
 
     Migrator::up(&db, None).await.unwrap();
 
     let binding_columns = table_columns(&db, "delegation_workflow_node_bindings").await;
-    assert!(binding_columns.iter().any(|(name, _)| name == "cohort_frozen"));
-    assert!(!binding_columns.iter().any(|(name, _)| name == "pair_frozen"));
+    assert!(binding_columns
+        .iter()
+        .any(|(name, _)| name == "cohort_frozen"));
+    assert!(!binding_columns
+        .iter()
+        .any(|(name, _)| name == "pair_frozen"));
     let row = db
         .query_one(sql(
             "SELECT cohort_frozen FROM delegation_workflow_node_bindings \
@@ -327,18 +322,16 @@ async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
         assert_eq!(actual.1.as_deref(), default, "default for {name}");
     }
 
-    let row = db
-        .query_one(sql(
-            "SELECT review_scope, revision_kind, scope_reason, \
+    let row =
+        db.query_one(sql("SELECT review_scope, revision_kind, scope_reason, \
                     required_reviewer_node_ids_json, covered_author_task_id, \
                     covered_plan_digest, finding_ledger_json, net_improvement, \
                     stagnation_count, rewrite_used, next_action, report_files_json \
              FROM delegation_workflow_gate_settlements \
-             WHERE workflow_id = 'wf-v2-migration' AND gate_id = 'design_gate'",
-        ))
-        .await
-        .unwrap()
-        .unwrap();
+             WHERE workflow_id = 'wf-v2-migration' AND gate_id = 'design_gate'"))
+            .await
+            .unwrap()
+            .unwrap();
     for name in [
         "review_scope",
         "revision_kind",
