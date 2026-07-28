@@ -585,6 +585,10 @@ const surfaceH = vi.hoisted(() => ({
   shellProps: null as CapturedShellProps | null,
   /** Lifecycle mock `conn.supportsFork` (fork affordance wiring). */
   supportsFork: false,
+  /** Broker-known delegated-child identity before detail hydration. */
+  isDelegationChild: false,
+  /** Last delegated-child display flag passed to MessageListView. */
+  messageListIsDelegatedChild: null as boolean | null,
   /** Notify workspace-store mock subscribers (Zustand-like). */
   notifyWorkspace: null as null | (() => void),
   /** Render root for querying topBanner DOM (delegate status row). */
@@ -645,6 +649,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
         supportsFork: surfaceH.supportsFork,
+        isDelegationChild: surfaceH.isDelegationChild,
         backgroundOutstanding: 0,
       },
       modeLoading: false,
@@ -882,7 +887,10 @@ vi.mock("zustand/react/shallow", () => ({
 }))
 
 vi.mock("@/components/message/message-list-view", () => ({
-  MessageListView: () => null,
+  MessageListView: (props: { isDelegatedChild?: boolean }) => {
+    surfaceH.messageListIsDelegatedChild = props.isDelegatedChild ?? false
+    return null
+  },
 }))
 
 vi.mock("@/components/message/initial-history-scroll-controller", () => ({
@@ -1095,6 +1103,8 @@ function resetSurfaceHarness() {
   surfaceH.shellProps = null
   surfaceH.renderRoot = null
   surfaceH.supportsFork = false
+  surfaceH.isDelegationChild = false
+  surfaceH.messageListIsDelegatedChild = null
 }
 
 function turnCompleteEndTurn(connectionId: string): EventEnvelope {
@@ -2317,5 +2327,36 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
     })
     expect(surfaceH.shellProps?.error).toBeNull()
     expect(delegateStatus()).toBe("waiting")
+  })
+})
+
+describe("ConversationSessionSurface delegated-child transcript display", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetSurfaceHarness()
+  })
+
+  it("uses broker child identity before detail parent_id hydrates", () => {
+    surfaceH.conversations = [
+      {
+        id: 42,
+        status: "in_progress",
+        updated_at: BASELINE,
+      },
+    ]
+    surfaceH.connStatus = "prompting"
+    surfaceH.isDelegationChild = true
+    surfaceH.detailLoading = true
+    surfaceH.detailParentId = null
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(surfaceH.messageListIsDelegatedChild).toBe(true)
   })
 })
