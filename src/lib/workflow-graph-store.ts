@@ -80,6 +80,12 @@ type ConversationGraphEntry = {
   error: string | null
 }
 
+type ActiveConversationRecord = {
+  count: number
+  epoch: number
+  fallbackTimer: ReturnType<typeof setTimeout> | null
+}
+
 type WorkflowGraphState = {
   byConversationId: Map<number, ConversationGraphEntry>
   /**
@@ -99,8 +105,8 @@ type WorkflowGraphState = {
   ) => void
   handleGraphChanged: (payload: WorkflowGraphChangedPayload) => void
   handleCompatibilityNudge: (payload: WorkflowCompatibilityNudgePayload) => void
-  /** Ensure global event listeners + interest in this conversation. */
-  mountConversation: (conversationId: number) => () => void
+  /** Acquire live workflow interest and return an idempotent cleanup lease. */
+  activateConversation: (conversationId: number) => () => void
   refresh: (conversationId: number) => Promise<void>
   getEntry: (conversationId: number) => ConversationGraphEntry | undefined
   getSnapshot: (conversationId: number) => WorkflowGraphSnapshot | null
@@ -110,6 +116,7 @@ type WorkflowGraphState = {
 }
 
 const FIXED_PHASES: PhaseRailKind[] = ["design", "plan", "tasks", "final"]
+const EVENT_READINESS_TIMEOUT_MS = 5_000
 
 function emptyEntry(): ConversationGraphEntry {
   return {
@@ -170,14 +177,31 @@ let eventInstallGeneration = 0
 let activeEventInstallGeneration = 0
 let graphChangedUnsub: (() => void) | null = null
 let nudgeUnsub: (() => void) | null = null
-const mountedConversations = new Set<number>()
+let eventReadinessPromise: Promise<void> | null = null
+let eventReadinessDeadline: ReturnType<typeof setTimeout> | null = null
+const activeConversations = new Map<number, ActiveConversationRecord>()
+let activationEpochCounter = 0
 
-function installEventListeners(get: () => WorkflowGraphState): void {
-  if (activeEventInstallGeneration !== 0) return
+function isActiveEpoch(conversationId: number, epoch: number): boolean {
+  const active = activeConversations.get(conversationId)
+  return active != null && active.count > 0 && active.epoch === epoch
+}
+
+function clearFallbackTimer(active: ActiveConversationRecord): void {
+  if (active.fallbackTimer != null) {
+    clearTimeout(active.fallbackTimer)
+    active.fallbackTimer = null
+  }
+}
+
+function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
+  if (activeEventInstallGeneration !== 0 && eventReadinessPromise != null) {
+    return eventReadinessPromise
+  }
   const generation = ++eventInstallGeneration
   activeEventInstallGeneration = generation
 
-  void subscribeWorkflowGraphChanged((payload) => {
+  const changedAttempt = subscribeWorkflowGraphChanged((payload) => {
     get().handleGraphChanged(payload)
   })
     .then((dispose) => {
@@ -191,7 +215,7 @@ function installEventListeners(get: () => WorkflowGraphState): void {
       // Transport without subscribe — refresh-only path.
     })
 
-  void subscribeWorkflowCompatibilityNudge((payload) => {
+  const nudgeAttempt = subscribeWorkflowCompatibilityNudge((payload) => {
     get().handleCompatibilityNudge(payload)
   })
     .then((dispose) => {
@@ -204,6 +228,24 @@ function installEventListeners(get: () => WorkflowGraphState): void {
     .catch(() => {
       // Transport without subscribe — refresh-only path.
     })
+
+  const attemptsSettled = Promise.allSettled([
+    changedAttempt,
+    nudgeAttempt,
+  ]).then(() => undefined)
+  const deadline = new Promise<void>((resolve) => {
+    eventReadinessDeadline = setTimeout(resolve, EVENT_READINESS_TIMEOUT_MS)
+  })
+  eventReadinessPromise = Promise.race([attemptsSettled, deadline]).finally(
+    () => {
+      if (activeEventInstallGeneration !== generation) return
+      if (eventReadinessDeadline != null) {
+        clearTimeout(eventReadinessDeadline)
+        eventReadinessDeadline = null
+      }
+    }
+  )
+  return eventReadinessPromise
 }
 
 function disposeEventListeners(): void {
@@ -211,10 +253,26 @@ function disposeEventListeners(): void {
   // monotonic forever — never decremented or zeroed — so in-flight `.then`
   // callbacks from a disposed install still see `active !== their generation`.
   activeEventInstallGeneration = 0
+  if (eventReadinessDeadline != null) {
+    clearTimeout(eventReadinessDeadline)
+    eventReadinessDeadline = null
+  }
+  eventReadinessPromise = null
   graphChangedUnsub?.()
   nudgeUnsub?.()
   graphChangedUnsub = null
   nudgeUnsub = null
+}
+
+function releaseConversation(conversationId: number, epoch: number): void {
+  const active = activeConversations.get(conversationId)
+  if (!active || active.epoch !== epoch) return
+  active.count -= 1
+  if (active.count > 0) return
+  clearFallbackTimer(active)
+  activationEpochCounter += 1
+  activeConversations.delete(conversationId)
+  if (activeConversations.size === 0) disposeEventListeners()
 }
 
 async function fetchAndApply(
@@ -304,11 +362,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
 
   handleGraphChanged: (payload) => {
     const conversationId = payload.parent_conversation_id
-    if (!mountedConversations.has(conversationId)) {
-      // Still accept if we already have an entry (detail-installed, not yet
-      // mounted overlay) so live clock stays warm for open conversations.
-      if (!get().byConversationId.has(conversationId)) return
-    }
+    if (!activeConversations.has(conversationId)) return
     const current = get().getEntry(conversationId) ?? emptyEntry()
     const eventRev = Number(payload.graph_revision)
     if (
@@ -332,12 +386,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
 
   handleCompatibilityNudge: (payload) => {
     const conversationId = payload.parent_conversation_id
-    if (
-      !mountedConversations.has(conversationId) &&
-      !get().byConversationId.has(conversationId)
-    ) {
-      return
-    }
+    if (!activeConversations.has(conversationId)) return
     const current = get().getEntry(conversationId) ?? emptyEntry()
     const nextGen = current.requestGeneration + 1
     set((state) => ({
@@ -352,9 +401,31 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
     void fetchAndApply(get, conversationId, nextGen)
   },
 
-  mountConversation: (conversationId) => {
-    installEventListeners(get)
-    mountedConversations.add(conversationId)
+  activateConversation: (conversationId) => {
+    if (!Number.isSafeInteger(conversationId) || conversationId <= 0) {
+      return () => {}
+    }
+
+    const existing = activeConversations.get(conversationId)
+    if (existing) {
+      existing.count += 1
+      const epoch = existing.epoch
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        releaseConversation(conversationId, epoch)
+      }
+    }
+
+    const epoch = ++activationEpochCounter
+    const active: ActiveConversationRecord = {
+      count: 1,
+      epoch,
+      fallbackTimer: null,
+    }
+    activeConversations.set(conversationId, active)
+
     const current = get().getEntry(conversationId)
     if (!current) {
       set((state) => ({
@@ -365,16 +436,25 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
         ),
       }))
     }
+
+    const readiness = installEventListeners(get)
+    void readiness.then(() => {
+      if (!isActiveEpoch(conversationId, epoch)) return
+      void get().refresh(conversationId)
+    })
+
+    let released = false
     return () => {
-      mountedConversations.delete(conversationId)
-      if (mountedConversations.size === 0) {
-        // Keep entries (detail may re-open); only tear down listeners when idle.
-        disposeEventListeners()
-      }
+      if (released) return
+      released = true
+      releaseConversation(conversationId, epoch)
     }
   },
 
   refresh: async (conversationId) => {
+    const active = activeConversations.get(conversationId)
+    if (!active || active.count <= 0) return
+    clearFallbackTimer(active)
     const current = get().getEntry(conversationId) ?? emptyEntry()
     const nextGen = current.requestGeneration + 1
     set((state) => ({
@@ -404,7 +484,11 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   },
 
   reset: () => {
-    mountedConversations.clear()
+    for (const active of activeConversations.values()) {
+      clearFallbackTimer(active)
+    }
+    activeConversations.clear()
+    activationEpochCounter += 1
     disposeEventListeners()
     // Do not reset `eventInstallGeneration` — monotonic for process lifetime.
     // disposeEventListeners already clears the active reference only.
