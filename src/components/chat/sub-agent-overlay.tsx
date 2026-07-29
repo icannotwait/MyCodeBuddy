@@ -103,13 +103,15 @@ interface SubAgentOverlayProps {
   /** Expanded by default so the full sub-agent history is visible. */
   defaultExpanded?: boolean
   /**
-   * Parent conversation id — wires live workflow graph store subscriptions
-   * and seeds when `workflowGraph` is also provided.
+   * Parent conversation id — seeds the workflow graph store and, only when the
+   * overlay is expanded on the workflow segment with the full graph open,
+   * acquires active expanded-graph refresh interest.
    */
   conversationId?: number | null
   /**
-   * Optional cold-detail seed. Store remains source of truth once mounted
-   * for `conversationId`. A13: presence mounts overlay even with zero sessions.
+   * Optional cold-detail seed. Store remains source of truth once seeded for
+   * `conversationId`. A13: presence mounts overlay even with zero sessions.
+   * Detail reseeds do not reinstall active refresh interest.
    */
   workflowGraph?: WorkflowGraphSnapshot | null
 }
@@ -345,17 +347,6 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const listRef = useRef<HTMLDivElement | null>(null)
   const sizeRef = useRef(size)
 
-  // Seed + subscribe workflow graph store for this parent conversation.
-  useEffect(() => {
-    if (conversationId == null || conversationId <= 0) return
-    if (workflowGraph !== undefined) {
-      useWorkflowGraphStore
-        .getState()
-        .applyFromDetail(conversationId, workflowGraph)
-    }
-    return useWorkflowGraphStore.getState().mountConversation(conversationId)
-  }, [conversationId, workflowGraph])
-
   const storeSnapshot = useWorkflowGraphStore((s) =>
     conversationId != null && conversationId > 0
       ? (s.byConversationId.get(conversationId)?.snapshot ?? null)
@@ -364,6 +355,35 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const graph: WorkflowGraphSnapshot | null =
     storeSnapshot ?? workflowGraph ?? null
   const hasGraph = graph != null
+  const activeSegment: WorkflowSegment =
+    segment ?? (hasGraph ? "workflow" : "sessions")
+  const userCollapsed = collapsedByKey[stateKey]
+  const isExpanded =
+    userCollapsed !== undefined ? !userCollapsed : defaultExpanded
+  const workflowRefreshActive =
+    conversationId != null &&
+    conversationId > 0 &&
+    isExpanded &&
+    activeSegment === "workflow" &&
+    graphExpanded
+
+  // Detail seed only — never installs listener/activation cleanup.
+  useEffect(() => {
+    if (conversationId == null || conversationId <= 0) return
+    if (workflowGraph !== undefined) {
+      useWorkflowGraphStore
+        .getState()
+        .applyFromDetail(conversationId, workflowGraph)
+    }
+  }, [conversationId, workflowGraph])
+
+  // Active expanded-graph refresh interest; React runs the lease cleanup.
+  useEffect(() => {
+    if (!workflowRefreshActive || conversationId == null) return
+    return useWorkflowGraphStore
+      .getState()
+      .activateConversation(conversationId)
+  }, [conversationId, workflowRefreshActive])
 
   useEffect(() => {
     sizeRef.current = size
@@ -492,13 +512,6 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   if (!hasGraph && count === 0) {
     return null
   }
-
-  const activeSegment: WorkflowSegment =
-    segment ?? (hasGraph ? "workflow" : "sessions")
-
-  const userCollapsed = collapsedByKey[stateKey]
-  const isExpanded =
-    userCollapsed !== undefined ? !userCollapsed : defaultExpanded
 
   if (!isExpanded) {
     const summary = hasGraph
