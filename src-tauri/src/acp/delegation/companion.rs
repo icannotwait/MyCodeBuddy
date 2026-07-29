@@ -1078,14 +1078,13 @@ fn render_get_workflow_state_outcome_with_budget(
     outcome: Value,
     max_bytes: usize,
 ) -> Result<JsonRpcResponse, serde_json::Error> {
-    let is_error = outcome
-        .get("error")
-        .is_some_and(|error| error.is_object() || error.is_string());
-    if is_error {
+    if outcome.get("error").is_some() {
         let stable_code = workflow_state_stable_error_code(&outcome);
-        let response = ok(id.clone(), render_workflow_result(&outcome));
-        if serialize_jsonrpc_line(&response)?.len() <= max_bytes {
-            return Ok(response);
+        if stable_code != "internal_error" {
+            let response = ok(id.clone(), render_workflow_result(&outcome));
+            if serialize_jsonrpc_line(&response)?.len() <= max_bytes {
+                return Ok(response);
+            }
         }
         let fallback = render_bounded_workflow_error(id, stable_code);
         let _fallback_bytes = serialize_jsonrpc_line(&fallback)?.len();
@@ -4009,6 +4008,99 @@ mod tests {
         assert!(
             serialize_jsonrpc_line(&response).unwrap().len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES
         );
+    }
+
+    #[test]
+    fn get_workflow_state_untrusted_error_shapes_use_bounded_internal_error() {
+        let cases = [
+            (
+                "unknown code",
+                json!({
+                    "error": {
+                        "code": "injected_unknown_code",
+                        "message": "untrusted-unknown-code-message"
+                    }
+                }),
+                "untrusted-unknown-code-message",
+            ),
+            (
+                "missing code",
+                json!({ "error": { "message": "untrusted-missing-code-message" } }),
+                "untrusted-missing-code-message",
+            ),
+            (
+                "non-string code",
+                json!({
+                    "error": {
+                        "code": 7,
+                        "message": "untrusted-non-string-code-message"
+                    }
+                }),
+                "untrusted-non-string-code-message",
+            ),
+            (
+                "string error",
+                json!({ "error": "untrusted-string-error" }),
+                "untrusted-string-error",
+            ),
+            (
+                "null error",
+                json!({ "error": null, "source": "untrusted-null-error" }),
+                "untrusted-null-error",
+            ),
+            (
+                "numeric error",
+                json!({ "error": 9, "source": "untrusted-numeric-error" }),
+                "untrusted-numeric-error",
+            ),
+            (
+                "array error",
+                json!({ "error": ["untrusted-array-error"] }),
+                "untrusted-array-error",
+            ),
+            (
+                "boolean error",
+                json!({ "error": true, "source": "untrusted-boolean-error" }),
+                "untrusted-boolean-error",
+            ),
+        ];
+
+        for (label, outcome, untrusted) in cases {
+            let id = ascii_string_id_with_serialized_len(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES);
+            let response = render_get_workflow_state_outcome_with_budget(
+                id,
+                outcome,
+                GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{label} returned JSON-RPC serialization error: {error}")
+            });
+            let result = response.result.as_ref().expect("bounded tool result");
+            assert_eq!(result["isError"], true, "{label}");
+            assert_eq!(
+                result["content"][0]["text"],
+                "get_workflow_state failed; inspect structuredContent.error.code",
+                "{label}"
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["code"], "internal_error",
+                "{label}"
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["message"], "get_workflow_state failed",
+                "{label}"
+            );
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(
+                line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                "{label} emitted {} bytes",
+                line.len()
+            );
+            assert!(
+                !String::from_utf8(line).unwrap().contains(untrusted),
+                "{label} echoed untrusted broker bytes"
+            );
+        }
     }
 
     #[tokio::test]
