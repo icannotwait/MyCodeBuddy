@@ -52,9 +52,11 @@ required-features = ["tauri-runtime"]
 
 [[bin]]
 name = "codeg-server"
-# File stem must match `name` so Tauri's bundler can map
-# required-features gating (src/bin auto-discovery uses the stem).
-path = "src/bin/codeg-server.rs"
+# Keep this OUT of `src/bin/`: Tauri CLI 2.10 auto-discovers every file under
+# `src/bin/` and re-adds it to the NSIS file list even when
+# `required-features` skips the Cargo target (desktop builds must not ship
+# the remote HTTP server process). Path is outside that scan.
+path = "src/server_bin/main.rs"
 required-features = ["server"]
 
 [[bin]]
