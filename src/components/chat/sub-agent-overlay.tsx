@@ -380,9 +380,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   // Active expanded-graph refresh interest; React runs the lease cleanup.
   useEffect(() => {
     if (!workflowRefreshActive || conversationId == null) return
-    return useWorkflowGraphStore
-      .getState()
-      .activateConversation(conversationId)
+    return useWorkflowGraphStore.getState().activateConversation(conversationId)
   }, [conversationId, workflowRefreshActive])
 
   useEffect(() => {

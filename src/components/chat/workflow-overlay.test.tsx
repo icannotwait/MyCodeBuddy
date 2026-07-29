@@ -564,7 +564,9 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(activate).not.toHaveBeenCalled()
     fireEvent.click(screen.getByTestId("workflow-segment-sessions"))
     expect(activate).not.toHaveBeenCalled()
-    expect(screen.queryByTestId("workflow-expand-toggle")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-expand-toggle")
+    ).not.toBeInTheDocument()
   })
 
   it("collapsing the full workflow graph releases its active lease", () => {
