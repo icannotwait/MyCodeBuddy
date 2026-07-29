@@ -928,6 +928,45 @@ describe("active workflow refresh scheduling", () => {
     release()
   })
 
+  it("retains the exact cached snapshot while an accepted refresh is loading", async () => {
+    const seeded = baseSnapshot({
+      graph_revision: 3,
+      workflow_id: "wf-seed-loading",
+    })
+    useWorkflowGraphStore.getState().applyFromDetail(86, seeded)
+    const retainedBeforeRefresh = useWorkflowGraphStore
+      .getState()
+      .getSnapshot(86)
+
+    const pending = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot.mockReturnValueOnce(pending.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(86)
+    await flushMicrotasks()
+
+    const loading = useWorkflowGraphStore.getState().getEntry(86)
+    expect(loading?.loading).toBe(true)
+    expect(loading?.snapshot).toBe(retainedBeforeRefresh)
+    expect(loading?.snapshot).toBe(seeded)
+    expect(loading?.snapshot?.graph_revision).toBe(3)
+    expect(loading?.snapshot?.workflow_id).toBe("wf-seed-loading")
+    expect(loading?.error).toBeNull()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(86)
+
+    pending.resolve(
+      baseSnapshot({ graph_revision: 4, workflow_id: "wf-fresh-loading" })
+    )
+    await flushMicrotasks()
+
+    const done = useWorkflowGraphStore.getState().getEntry(86)
+    expect(done?.loading).toBe(false)
+    expect(done?.snapshot?.graph_revision).toBe(4)
+    expect(done?.snapshot?.workflow_id).toBe("wf-fresh-loading")
+    expect(done?.error).toBeNull()
+    release()
+  })
+
   it("failed and stale compatibility completions follow the common scheduler", async () => {
     const stale = deferred<WorkflowGraphSnapshot | null>()
     const current = deferred<WorkflowGraphSnapshot | null>()
