@@ -276,32 +276,22 @@ cargo insta review                                              # accepter les m
 
 Codeg peut fonctionner comme un serveur web autonome sans environnement de bureau.
 
-#### Option 1 : Installation en une ligne (Windows PowerShell)
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-Ou installer une version spécifique :
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### Option 2 : Télécharger depuis GitHub Releases
-
-Les binaires Windows pré-compilés (avec les ressources web incluses) sont disponibles sur la page [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) :
-
-| Plateforme  | Fichier                         |
-| ----------- | ------------------------------- |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Les mises à niveau du serveur Windows précompilé sont manuelles. Relancez
-`install.ps1` ou remplacez l'installation existante avec les fichiers du
-prochain `codeg-server-windows-x64.zip`. Ce fork ne publie aucun artefact de
-serveur Linux/macOS précompilé dans GitHub Releases. La mise à jour de version
-sur place du serveur autonome n'est disponible sur aucune plateforme de ce
-fork.
 
 #### Option 3 : Docker
 
@@ -316,7 +306,7 @@ Docker Compose construit l'image localement depuis ce dépôt. Le build multi-st
 ```bash
 pnpm install && pnpm build          # compiler le frontend
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # compagnon de délégation
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp est détecté comme fichier voisin
 ```
@@ -329,7 +319,7 @@ Si vous conservez les deux binaires dans des répertoires séparés, définissez
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # Arrêtez le service, redéployez les deux binaires et les ressources web, puis redémarrez.
 ```

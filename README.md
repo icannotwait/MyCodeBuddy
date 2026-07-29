@@ -87,7 +87,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 - Skills management (global and project scope)
 - Git remote account management (GitHub and other Git servers)
 - Web service mode — access Codeg from any browser for remote work
-- **Standalone server deployment** — run `codeg-server` on any Linux/macOS server, access via browser
+- **Optional standalone server** — opt-in `codeg-server` (Docker or source build with `--features server`) for self-hosted browser access; **not** shipped in desktop GitHub Releases
 - **Docker support** — local builds with `docker compose up -d`, with custom token, port, and volume mounts for data persistence and project directories
 - Runtime Logs — a live in-app log viewer with filtering and per-module log levels
 - Integrated engineering loop (file tree, diff, git changes, commit, terminal)
@@ -215,11 +215,11 @@ sudo apt-get install -y \
 
 Codeg ships three Rust binaries from a single workspace:
 
-| Binary         | Role                                                                                                         | Build                                                                       |
-| -------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `codeg`        | Tauri desktop app (window, tray, updater)                                                                    | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                       |
-| `codeg-server` | Standalone HTTP + WebSocket server for browser/headless deployments                                          | `pnpm server:build` / `pnpm server:dev`                                     |
-| `codeg-mcp`    | Per-launch stdio MCP companion that surfaces the `delegate_to_agent` tool to agent CLIs (multi-agent collab) | `pnpm tauri:prepare-sidecars` (auto-invoked by `tauri dev` / `tauri build`) |
+| Binary         | Role                                                                                                         | Build                                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `codeg`        | Tauri desktop app (window, tray, updater)                                                                    | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                                          |
+| `codeg-server` | Opt-in standalone HTTP + WebSocket server (self-host only; gated by Cargo feature `server`)                  | `pnpm server:build` / `pnpm server:dev` (passes `--features server`)                           |
+| `codeg-mcp`    | Per-launch stdio MCP companion that surfaces the `delegate_to_agent` tool to agent CLIs (multi-agent collab) | `pnpm tauri:prepare-sidecars` (auto-invoked by `tauri dev` / `tauri build`)                    |
 
 `codeg-mcp` must sit next to its parent binary at runtime — installers, the Docker image, and the Tauri sidecar bundler all place it next to `codeg` / `codeg-server`. Source builds and custom layouts can override the lookup with the `CODEG_MCP_BIN=/abs/path/codeg-mcp` env var. If the companion is missing, delegation is skipped (a single warning is logged) and the rest of the agent session keeps working.
 
@@ -240,9 +240,10 @@ pnpm tauri dev
 # Desktop release build (bundles codeg-mcp as externalBin)
 pnpm tauri build
 
-# Standalone server (no Tauri/GUI required)
+# Optional standalone server (opt-in; not in desktop releases)
 pnpm server:dev
 pnpm server:build                  # release binary at src-tauri/target/release/codeg-server
+                                   # (requires Cargo feature `server`)
 
 # Build the codeg-mcp companion explicitly (for the host triple)
 pnpm tauri:prepare-sidecars        # output: src-tauri/binaries/codeg-mcp-<triple>
@@ -259,63 +260,63 @@ pnpm test:watch
 pnpm test:coverage
 
 # Rust checks (run in src-tauri/)
-cargo check                                                     # desktop (default features)
-cargo check --no-default-features --bin codeg-server            # server mode
+cargo check                                                     # desktop (default features; no codeg-server bin)
+cargo check --no-default-features --features server --bin codeg-server  # server mode
 cargo check --no-default-features --bin codeg-mcp               # MCP companion
 cargo clippy --all-targets --features test-utils -- -D warnings
 
 # Rust tests
 cargo test --features test-utils                                # desktop (incl. integration)
-cargo test --no-default-features --bin codeg-server --lib       # server mode
+cargo test --no-default-features --features server --bin codeg-server --lib  # server mode
 cargo insta review                                              # accept parser snapshot updates
 ```
 
 > Tip: when you have a fresh `codeg-mcp` build under `src-tauri/target/release/` and want to point a manually-launched `codeg-server` at it without reinstalling, export `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
-### Server Deployment
+### Server Deployment (opt-in self-host)
 
-Codeg can run as a standalone web server without a desktop environment.
+GitHub Releases for this fork ship **desktop DrawCode (NSIS) only**. They do
+**not** attach `codeg-server-windows-x64.zip`. The standalone process is a
+long-lived network listener plus agent control surface; shipping it to every
+desktop user caused antivirus false positives (remote-control / “claw” class).
 
-#### Option 1: One-line install (Windows PowerShell)
+Use the standalone server only when you deliberately self-host.
+
+#### Remove a leftover Windows install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-Or install a specific version:
+`install.ps1` remains for operators who already have a server zip (older
+release or a zip you packaged yourself). Current releases no longer provide
+that asset; if download fails, use Docker or source build instead.
 
 ```powershell
+# Only works when a matching zip still exists (legacy / self-packaged):
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
 
-#### Option 2: Download from GitHub Releases
-
-Pre-built Windows binaries (with bundled web assets) are available on the [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) page:
-
-| Platform    | File                           |
-| ----------- | ------------------------------ |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Windows prebuilt server upgrades are manual. Rerun `install.ps1`, or replace
-the existing installation with files from the next
-`codeg-server-windows-x64.zip`. This fork publishes no prebuilt Linux/macOS
-server artifacts in GitHub Releases. No in-place standalone server release
-updater is available on any platform in this fork.
-
-#### Option 3: Docker
+#### Option 1: Docker
 
 ```bash
 docker compose up -d
 ```
 
-Docker Compose builds the image locally from this repository. The multi-stage build (Node.js + Rust → slim Debian runtime) includes `git` and `ssh` for repository operations. Data is persisted in the `/data` volume. You can optionally configure token, port, and project-directory mounts in `docker-compose.yml`.
+Docker Compose builds the image locally from this repository (enables Cargo
+feature `server` in the image build). The multi-stage build (Node.js + Rust →
+slim Debian runtime) includes `git` and `ssh` for repository operations. Data
+is persisted in the `/data` volume. You can optionally configure token, port,
+and project-directory mounts in `docker-compose.yml`.
 
-#### Option 4: Build from source
+#### Option 2: Build from source
 
 ```bash
 pnpm install && pnpm build          # build frontend
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # delegation companion
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp is picked up as a sibling
 ```
@@ -328,7 +329,7 @@ If you keep the two binaries in separate directories, set `CODEG_MCP_BIN=/abs/pa
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # Stop the service, redeploy both binaries and the web assets, then restart it.
 ```

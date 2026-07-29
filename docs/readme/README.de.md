@@ -276,32 +276,22 @@ cargo insta review                                              # Parser-Snapsho
 
 Codeg kann als eigenständiger Webserver ohne Desktop-Umgebung betrieben werden.
 
-#### Option 1: Ein-Zeilen-Installation (Windows PowerShell)
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-Oder eine bestimmte Version installieren:
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### Option 2: Von GitHub Releases herunterladen
-
-Vorkompilierte Windows-Binärdateien (mit gebündelten Web-Assets) sind auf der [Releases](https://github.com/icannotwait/MyCodeBuddy/releases)-Seite verfügbar:
-
-| Plattform   | Datei                           |
-| ----------- | ------------------------------ |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Upgrades des vorkompilierten Windows-Servers erfolgen manuell. Führen Sie
-`install.ps1` erneut aus oder ersetzen Sie die bestehende Installation durch
-die Dateien aus der nächsten `codeg-server-windows-x64.zip`. Dieser Fork
-veröffentlicht keine vorkompilierten Linux/macOS-Serverartefakte in GitHub
-Releases. Ein direktes Release-Update des Standalone-Servers ist in diesem Fork
-auf keiner Plattform verfügbar.
 
 #### Option 3: Docker
 
@@ -316,7 +306,7 @@ Docker Compose baut das Image lokal aus diesem Repository. Der Multi-Stage-Build
 ```bash
 pnpm install && pnpm build          # Frontend kompilieren
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # Delegations-Begleiter
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp wird als Geschwisterdatei erkannt
 ```
@@ -329,7 +319,7 @@ Wenn Sie die beiden Binärdateien in getrennten Verzeichnissen halten, setzen Si
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # Dienst stoppen, beide Binärdateien und Web-Assets neu bereitstellen, dann neu starten.
 ```

@@ -276,30 +276,22 @@ cargo insta review                                              # 接受解析�
 
 Codeg 可以作为独立 Web 服务器运行，无需桌面环境。
 
-#### 方式一：一键安装（Windows PowerShell）
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-或安装指定版本：
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### 方式二：从 GitHub Releases 下载
-
-预构建 Windows 二进制文件（已打包 Web 前端资源）可在 [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) 页面下载：
-
-| 平台        | 文件                            |
-| ----------- | ------------------------------- |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Windows 预构建服务器需要手动升级：重新运行 `install.ps1`，或使用下一版
-`codeg-server-windows-x64.zip` 中的文件替换现有安装。本分支不会在 GitHub
-Releases 发布预构建 Linux/macOS 服务器产物。本分支在所有平台都不提供独立
-服务器原地发布更新器。
 
 #### 方式三：Docker
 
@@ -314,7 +306,7 @@ Docker Compose 会从本仓库在本地构建镜像。多阶段构建（Node.js 
 ```bash
 pnpm install && pnpm build          # 构建前端
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # 委托协作进程
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp 会作为同级二进制被自动发现
 ```
@@ -327,7 +319,7 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp 会�
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # 停止现有服务，重新部署两个二进制文件和 Web 资源，然后重启。
 ```

@@ -276,31 +276,22 @@ cargo insta review                                              # 파서 스냅�
 
 Codeg는 데스크톱 환경 없이 독립형 웹 서버로 실행할 수 있습니다.
 
-#### 옵션 1: 원라인 설치 (Windows PowerShell)
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-또는 특정 버전 설치:
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### 옵션 2: GitHub Releases에서 다운로드
-
-사전 빌드된 Windows 바이너리(웹 에셋 포함)는 [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) 페이지에서 다운로드할 수 있습니다:
-
-| 플랫폼      | 파일                            |
-| ----------- | ------------------------------- |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Windows 사전 빌드 서버 업그레이드는 수동으로 진행합니다. `install.ps1`을
-다시 실행하거나 다음 `codeg-server-windows-x64.zip`의 파일로 기존 설치를
-교체하세요. 이 포크는 GitHub Releases에 사전 빌드된 Linux/macOS 서버
-아티팩트를 게시하지 않습니다. 이 포크에서는 모든 플랫폼에서 독립 실행형
-서버의 인플레이스 릴리스 업데이트를 사용할 수 없습니다.
 
 #### 옵션 3: Docker
 
@@ -315,7 +306,7 @@ Docker Compose는 이 저장소에서 이미지를 로컬로 빌드합니다. �
 ```bash
 pnpm install && pnpm build          # 프론트엔드 빌드
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # 위임 컴패니언
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp는 형제 파일로 인식됨
 ```
@@ -328,7 +319,7 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp는 �
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # 실행 중인 서비스를 중지하고 두 바이너리와 웹 자산을 다시 배포한 뒤 재시작합니다.
 ```

@@ -146,16 +146,17 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
   assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
 })
 
-test("release workflow publishes only Windows MyCodeBuddy artifacts", () => {
+test("release workflow publishes only Windows MyCodeBuddy desktop artifacts", () => {
   const workflowText = readRepositoryFile(".github/workflows/release.yml")
   const desktopJob = workflowText.match(
-    /^  build-desktop:\n([\s\S]*?)(?=^  build-server:)/m
+    /^  build-desktop:\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:)/m
   )?.[1]
 
   assertWindowsReleaseWorkflow(workflowText)
   assert.match(workflowText, /MyCodeBuddy \$\{tag\}/)
   assert.match(workflowText, /prerelease:\s*false/)
-  assert.match(workflowText, /codeg-server-windows-x64/)
+  assert.doesNotMatch(workflowText, /^  build-server:/m)
+  assert.doesNotMatch(workflowText, /codeg-server-windows-x64/)
   assert.doesNotMatch(workflowText, /includeUpdaterJson:\s*false/)
   assert.ok(desktopJob, "build-desktop job is missing")
   assert.doesNotMatch(desktopJob, /Windows ARM64/)
@@ -173,7 +174,7 @@ test("uses updater artifacts only through the release Tauri config", () => {
   )
   const workflowText = readRepositoryFile(".github/workflows/release.yml")
   const desktopJob = workflowText.match(
-    /^  build-desktop:\n([\s\S]*?)(?=^  build-server:)/m
+    /^  build-desktop:\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:)/m
   )?.[1]
 
   assert.equal(defaultConfig.bundle.createUpdaterArtifacts, false)
@@ -321,15 +322,7 @@ test("server installer validates and copies compliance files before install writ
   )
 })
 
-test("server READMEs require manual Windows upgrades and current examples", () => {
-  const packageJson = JSON.parse(readRepositoryFile("package.json"))
-  const version = packageJson.version
-  const installerExample = new RegExp(
-    String.raw`\.\\install\.ps1 -Version v${version.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    )}`
-  )
+test("documents desktop-only releases and opt-in server self-host", () => {
   const paths = [
     "README.md",
     "docs/readme/README.ar.md",
@@ -345,26 +338,11 @@ test("server READMEs require manual Windows upgrades and current examples", () =
 
   for (const path of paths) {
     const text = readRepositoryFile(path)
-    const releaseSectionStart = text.indexOf("codeg-server-windows-x64.zip")
-
-    assert.notEqual(
-      releaseSectionStart,
-      -1,
-      `${path} lacks the Windows server artifact`
-    )
     assert.doesNotMatch(text, /v0\.5\.2/, `${path} has the old version`)
     assert.match(
       text,
-      installerExample,
-      `${path} lacks the current installer example`
-    )
-    assert.ok(
-      text.split("install.ps1").length - 1 >= 3,
-      `${path} must tell Windows users to rerun install.ps1`
-    )
-    assert.ok(
-      text.split("codeg-server-windows-x64.zip").length - 1 >= 2,
-      `${path} must describe replacement from the next Windows ZIP`
+      /uninstall-server\.ps1/,
+      `${path} must document removing leftover codeg-server installs`
     )
     assert.match(
       text,
@@ -373,8 +351,8 @@ test("server READMEs require manual Windows upgrades and current examples", () =
     )
     assert.match(
       text,
-      /cargo build --release --bin codeg-server --no-default-features/,
-      `${path} must tell source-built deployments to rebuild`
+      /cargo build --release --bin codeg-server --no-default-features --features server/,
+      `${path} must tell source-built deployments to rebuild with --features server`
     )
     assert.match(
       text,
@@ -382,6 +360,12 @@ test("server READMEs require manual Windows upgrades and current examples", () =
       `${path} must describe Linux/macOS source-built upgrades`
     )
     assert.match(text, /GitHub\s+Releases/)
+    // Must not present prebuilt server zips as a current consumer download.
+    assert.doesNotMatch(
+      text,
+      /\| Windows x64 \| `codeg-server-windows-x64\.zip` \|/,
+      `${path} must not list codeg-server-windows-x64.zip as a release artifact`
+    )
     assert.doesNotMatch(
       text,
       /--supervise/,
@@ -420,19 +404,27 @@ test("requires recursive checkout in the desktop job itself", () => {
   )
 })
 
-test("requires recursive checkout when the server job generates licenses", () => {
-  const serverWithoutSubmodules = `${validWindowsWorkflow}
+test("rejects publishing the standalone codeg-server binary from release", () => {
+  const withServerJob = `${validWindowsWorkflow}
   build-server:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Generate third-party licenses
-        run: pnpm licenses:generate
+        with:
+          submodules: recursive
+      - run: cargo build --release --bin codeg-server --no-default-features --features server
 `
 
   assert.throws(
-    () => assertWindowsReleaseWorkflow(serverWithoutSubmodules),
-    /server release must checkout submodules recursively/
+    () => assertWindowsReleaseWorkflow(withServerJob),
+    /must not include a build-server job/
+  )
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow}\nrun: echo codeg-server-windows-x64.zip\n`
+      ),
+    /must not publish codeg-server-windows-x64/
   )
 })
 

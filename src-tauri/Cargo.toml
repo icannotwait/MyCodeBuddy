@@ -33,6 +33,12 @@ tauri-runtime = [
     "dep:tauri-plugin-single-instance",
     "dep:keyring",
 ]
+# Opt-in standalone HTTP/WebSocket binary (`codeg-server`). Not in `default`
+# so desktop / default cargo builds never produce that process — antivirus
+# heuristics often treat a long-lived remote listener + agent control surface
+# as RAT/"claw"-class software. Enable only for Docker/self-hosted server
+# builds: `cargo build --no-default-features --features server --bin codeg-server`.
+server = []
 # Exposes test scaffolding (`AppState::new_for_test`, `EventEmitter::test_web_only`,
 # `ConnectionManager::insert_test_connection`, parser `with_base_dir`, the
 # `db::test_helpers` module) for integration tests in `tests/*.rs`. Without
@@ -47,7 +53,7 @@ required-features = ["tauri-runtime"]
 [[bin]]
 name = "codeg-server"
 path = "src/bin/codeg_server.rs"
-required-features = []
+required-features = ["server"]
 
 [[bin]]
 name = "codeg-mcp"

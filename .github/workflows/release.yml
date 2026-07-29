@@ -227,129 +227,17 @@ jobs:
           includeUpdaterJson: true
           retryAttempts: 2
 
-  build-server:
-    needs: create-draft-release
-    name: Server Windows x64
-    runs-on: windows-2022
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-          shared-key: server-x86_64-pc-windows-msvc
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Generate third-party licenses
-        run: pnpm licenses:generate
-
-      - name: Build frontend
-        run: pnpm build
-
-      - name: Build server executables
-        working-directory: src-tauri
-        run: |
-          cargo build --release --bin codeg-server --no-default-features --target x86_64-pc-windows-msvc
-          cargo build --release --bin codeg-mcp --no-default-features --target x86_64-pc-windows-msvc
-
-      - name: Package server bundle
-        shell: pwsh
-        run: |
-          $artifact = "codeg-server-windows-x64"
-          $bundleDir = "dist/$artifact"
-          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
-          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe" "$bundleDir/codeg-server.exe"
-          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe" "$bundleDir/codeg-mcp.exe"
-          Copy-Item -Recurse "out" "$bundleDir/web"
-          Copy-Item "LICENSE" "$bundleDir/LICENSE"
-          Copy-Item "NOTICE" "$bundleDir/NOTICE"
-          Copy-Item "src-tauri/resources/THIRD_PARTY_LICENSES.txt" "$bundleDir/THIRD_PARTY_LICENSES.txt"
-
-          foreach ($required in @(
-            "$bundleDir/codeg-server.exe",
-            "$bundleDir/codeg-mcp.exe",
-            "$bundleDir/web",
-            "$bundleDir/LICENSE",
-            "$bundleDir/NOTICE",
-            "$bundleDir/THIRD_PARTY_LICENSES.txt"
-          )) {
-            if (-not (Test-Path -LiteralPath $required)) {
-              throw "Missing server bundle entry: $required"
-            }
-          }
-
-          Compress-Archive -Path $bundleDir -DestinationPath "dist/$artifact.zip"
-
-      - name: Smoke test codeg-mcp
-        shell: pwsh
-        run: |
-          $help = & "dist/codeg-server-windows-x64/codeg-mcp.exe" --help
-          if ($LASTEXITCODE -ne 0) {
-            throw "codeg-mcp.exe --help failed with exit code $LASTEXITCODE"
-          }
-          if ($help -notlike "*codeg-mcp --parent-connection-id*") {
-            throw "codeg-mcp.exe --help returned unexpected output"
-          }
-
-      - name: Sign and checksum server bundle
-        shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          $zip = "dist/codeg-server-windows-x64.zip"
-          pnpm tauri signer sign $zip
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tauri signer failed with exit code $LASTEXITCODE"
-          }
-          if (-not (Test-Path -LiteralPath "$zip.sig" -PathType Leaf)) {
-            throw "Tauri signer did not produce $zip.sig"
-          }
-
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-          "$hash  codeg-server-windows-x64.zip" |
-            Out-File -Encoding ascii "dist/codeg-server-windows-x64.zip.sha256"
-
-      - name: Upload server release assets
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "$env:GITHUB_REF_NAME" `
-            "dist/codeg-server-windows-x64.zip" `
-            "dist/codeg-server-windows-x64.zip.sig" `
-            "dist/codeg-server-windows-x64.zip.sha256" `
-            --clobber
+  # NOTE: codeg-server is intentionally NOT published from this workflow.
+  # Consumer GitHub Releases ship desktop (DrawCode/NSIS) only. The standalone
+  # server binary is opt-in (`--features server`) and meant for Docker/source
+  # self-hosting — publishing it as a prebuilt remote-control-like process
+  # triggers antivirus false positives on end-user machines.
 
   publish-release:
     needs:
       - create-draft-release
       - build-desktop
-      - build-server
-    if: ${{ needs.build-desktop.result == 'success' && needs.build-server.result == 'success' }}
+    if: ${{ needs.build-desktop.result == 'success' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write

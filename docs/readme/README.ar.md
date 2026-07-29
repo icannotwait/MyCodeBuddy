@@ -276,30 +276,21 @@ cargo insta review                                              # قبول تح�
 
 يمكن تشغيل Codeg كخادم ويب مستقل بدون بيئة سطح مكتب.
 
-#### الخيار 1: التثبيت بسطر واحد (Windows PowerShell)
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-أو تثبيت إصدار محدد:
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### الخيار 2: التنزيل من GitHub Releases
-
-ملفات Windows التنفيذية المُعدّة مسبقًا (مع موارد الويب المضمّنة) متاحة في صفحة [Releases](https://github.com/icannotwait/MyCodeBuddy/releases):
-
-| المنصة      | الملف                           |
-| ----------- | ------------------------------ |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-ترقيات خادم Windows الجاهز تتم يدويًا. أعد تشغيل `install.ps1`، أو استبدل
-التثبيت الحالي بملفات `codeg-server-windows-x64.zip` التالية. لا ينشر هذا
-التفرع حزم خادم Linux/macOS جاهزة ضمن GitHub Releases. لا يتوفر محدّث إصدارات
-موضعي للخادم المستقل على أي منصة في هذا التفرع.
 
 #### الخيار 3: Docker
 
@@ -314,7 +305,7 @@ docker compose up -d
 ```bash
 pnpm install && pnpm build          # بناء الواجهة الأمامية
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # رفيق التفويض
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # يتم التقاط codeg-mcp بوصفه ملفًا شقيقًا
 ```
@@ -327,7 +318,7 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # يتم التق
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # أوقف الخدمة، وأعد نشر الملفين التنفيذيين وموارد الويب، ثم أعد التشغيل.
 ```

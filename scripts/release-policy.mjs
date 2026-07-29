@@ -179,18 +179,25 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
     throw new Error("checkout step must contain exactly one with block")
   }
-  const serverJob = policyText.match(
-    /^  build-server:\s*\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:\s*$|(?![\s\S]))/m
-  )?.[0]
-  if (serverJob?.includes("licenses:generate")) {
-    const serverCheckout = workflowStepBlocks(serverJob).find(
-      (stepText) =>
-        /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
-        /submodules\s*:\s*recursive/i.test(stepText)
+  // Desktop-only consumer releases: never publish the standalone codeg-server
+  // binary (antivirus false-positive surface for remote-control-like listeners).
+  if (/^  build-server:\s*$/m.test(policyText)) {
+    throw new Error(
+      "release workflow must not include a build-server job (desktop-only releases)"
     )
-    if (!serverCheckout) {
-      throw new Error("server release must checkout submodules recursively")
-    }
+  }
+  if (/codeg-server-windows-x64/i.test(policyText)) {
+    throw new Error(
+      "release workflow must not publish codeg-server-windows-x64 artifacts"
+    )
+  }
+  if (
+    /--bin\s+codeg-server\b/i.test(policyText) ||
+    /cargo\s+build[^\n]*codeg-server/i.test(policyText)
+  ) {
+    throw new Error(
+      "release workflow must not build the codeg-server binary"
+    )
   }
   // Codex ACP ships via npm (`@agentclientprotocol/codex-acp`); desktop
   // release must not re-introduce a Windows sidecar or its Bun compile pin.

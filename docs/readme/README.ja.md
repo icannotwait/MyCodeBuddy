@@ -276,32 +276,22 @@ cargo insta review                                              # パーサス�
 
 Codeg はデスクトップ環境なしでスタンドアロン Web サーバーとして実行できます。
 
-#### オプション 1: ワンラインインストール（Windows PowerShell）
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-または特定のバージョンをインストール:
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### オプション 2: GitHub Releases からダウンロード
-
-ビルド済み Windows バイナリ（Web アセットをバンドル済み）は [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) ページからダウンロードできます:
-
-| プラットフォーム | ファイル                        |
-| ---------------- | ------------------------------- |
-| Windows x64      | `codeg-server-windows-x64.zip` |
-
-Windows のビルド済みサーバーは手動でアップグレードします。
-`install.ps1` を再実行するか、次の `codeg-server-windows-x64.zip` の
-ファイルで既存のインストールを置き換えてください。このフォークは
-GitHub Releases でビルド済み Linux/macOS サーバー成果物を公開しません。
-このフォークでは、どのプラットフォームでもスタンドアロンサーバーの
-インプレースリリース更新は利用できません。
 
 #### オプション 3: Docker
 
@@ -316,7 +306,7 @@ Docker Compose はこのリポジトリからイメージをローカルビル�
 ```bash
 pnpm install && pnpm build          # フロントエンドをビルド
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # デリゲートコンパニオン
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp は同階層のバイナリとして検出されます
 ```
@@ -329,7 +319,7 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp は�
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # 稼働中のサービスを停止し、両方のバイナリと Web アセットを再配置して再起動します。
 ```

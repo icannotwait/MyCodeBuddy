@@ -276,30 +276,22 @@ cargo insta review                                              # 接受解析�
 
 Codeg 可以作為獨立 Web 伺服器執行，無需桌面環境。
 
-#### 方式一：一鍵安裝（Windows PowerShell）
+
+#### Remove a leftover Windows `codeg-server` install
 
 ```powershell
-irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+.\uninstall-server.ps1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-或安裝指定版本：
+GitHub Releases for this fork ship **desktop only**. They do **not** attach
+`codeg-server-windows-x64.zip`. Self-host with Docker or source build
+(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
 .\install.ps1 -Version v0.21.9-mycodebuddy.1
 ```
-
-#### 方式二：從 GitHub Releases 下載
-
-預建置 Windows 二進位檔（已打包 Web 前端資源）可在 [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) 頁面下載：
-
-| 平台        | 檔案                            |
-| ----------- | ------------------------------- |
-| Windows x64 | `codeg-server-windows-x64.zip` |
-
-Windows 預建置伺服器需要手動升級：重新執行 `install.ps1`，或使用下一版
-`codeg-server-windows-x64.zip` 中的檔案取代現有安裝。本分支不會在 GitHub
-Releases 發布預建置 Linux/macOS 伺服器產物。本分支在所有平台都不提供獨立
-伺服器原地發行更新器。
 
 #### 方式三：Docker
 
@@ -314,7 +306,7 @@ Docker Compose 會從本倉庫在本地建置映像。多階段建置（Node.js 
 ```bash
 pnpm install && pnpm build          # 建置前端
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features    # 委派協作行程
 CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp 會作為同級二進位被自動探測
 ```
@@ -327,7 +319,7 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp 會�
 git pull
 pnpm install && pnpm build
 cd src-tauri
-cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features
 # 停止現有服務，重新部署兩個二進位檔與 Web 資源，然後重新啟動。
 ```
