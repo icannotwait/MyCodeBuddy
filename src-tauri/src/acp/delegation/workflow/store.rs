@@ -36,8 +36,8 @@ use super::plan_review::{
 };
 use super::project::evidence_from_run_and_binding;
 use super::state_dto::{
-    project_workflow_state_index, WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto,
-    WorkflowStateIndexDto,
+    project_workflow_state_index, PlanRecoverySourceDto, WorkflowGateStateDto,
+    WorkflowNodeStateDto, WorkflowStateDto, WorkflowStateIndexDto,
 };
 use super::types::{
     DocumentGateKind, ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeOutcome,
@@ -916,11 +916,13 @@ pub async fn get_workflow_state_core(
                     latest_plan_review,
                     evidence_truncated: false,
                 };
-                Ok(project_workflow_state_index(
+                let mut index = project_workflow_state_index(
                     full_state,
                     &active_manifest_node_ids,
                     &task_gate_passed,
-                ))
+                );
+                constrain_plan_recovery_sources(&mut index);
+                Ok(index)
             })
         })
         .await;
@@ -2651,6 +2653,55 @@ fn recovery_card_fields(
     }
 }
 
+fn constrain_plan_recovery_sources(index: &mut WorkflowStateIndexDto) {
+    let required_reviewer_node_ids = index
+        .gates
+        .iter()
+        .find(|gate| gate.gate_kind == "plan")
+        .map(|gate| gate.required_reviewer_node_ids.clone())
+        .unwrap_or_default();
+    let Some(review) = index.latest_plan_review.as_mut() else {
+        return;
+    };
+
+    let fallback = review
+        .recovery_sources
+        .iter()
+        .find(|source| {
+            !required_reviewer_node_ids.contains(&source.node_id)
+                && (source.report_file.is_some() || source.latest_task_id.is_some())
+        })
+        .cloned();
+    let mut authoritative_sources = required_reviewer_node_ids
+        .iter()
+        .map(|node_id| {
+            review
+                .recovery_sources
+                .iter()
+                .find(|source| source.node_id == *node_id)
+                .cloned()
+                .unwrap_or_else(|| PlanRecoverySourceDto {
+                    node_id: node_id.clone(),
+                    report_file: None,
+                    latest_task_id: None,
+                    child_conversation_id: None,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let has_current_pointer = authoritative_sources
+        .iter()
+        .any(|source| source.report_file.is_some() || source.latest_task_id.is_some());
+    if !has_current_pointer {
+        if let (Some(fallback), Some(first)) = (fallback, authoritative_sources.first_mut()) {
+            first.report_file = fallback.report_file;
+            first.latest_task_id = fallback.latest_task_id;
+            first.child_conversation_id = fallback.child_conversation_id;
+        }
+    }
+    review.recovery_sources = authoritative_sources;
+}
+
 fn review_verdict_str(verdict: ReviewVerdict) -> &'static str {
     match verdict {
         ReviewVerdict::Approve => "approve",
@@ -4218,13 +4269,23 @@ mod tests {
         fixture
             .materially_republish_plan_with_reviewers(["plan-reviewer-codex", "plan-reviewer-grok"])
             .await;
-        fixture.record_current_reviewer_pointers().await;
 
+        let expected = vec!["plan-reviewer-codex", "plan-reviewer-grok"];
+        let mut without_current_pointers =
+            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
+                .await
+                .unwrap();
+        assert_eq!(recovery_source_ids(&without_current_pointers), expected);
+        for step in WorkflowIndexOmissionStep::ALL {
+            without_current_pointers.apply_omission_step(step);
+            assert_eq!(recovery_source_ids(&without_current_pointers), expected);
+        }
+
+        fixture.record_current_reviewer_pointers().await;
         let mut index =
             get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
                 .await
                 .unwrap();
-        let expected = vec!["plan-reviewer-codex", "plan-reviewer-grok"];
         assert_eq!(recovery_source_ids(&index), expected);
         for step in WorkflowIndexOmissionStep::ALL {
             index.apply_omission_step(step);
