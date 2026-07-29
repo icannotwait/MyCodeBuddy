@@ -710,8 +710,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           isConversationDetachedCache(conversationId)
 
         if (shouldSkipMainTab()) {
-          // Best-effort focus; do not block openTab on a second await.
-          void focusDetachedConversation(conversationId).catch(() => {})
+          // Still await focus so a sidebar click brings the pop-out window
+          // forward and lands the composer caret (OS focus alone is not enough).
+          await focusDetachedConversation(conversationId).catch(() => false)
           return false
         }
 
@@ -721,7 +722,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
 
         // Post-await barrier: transfer started/ended or still fenced/detached.
         if (shouldSkipMainTab()) {
-          void focusDetachedConversation(conversationId).catch(() => {})
+          await focusDetachedConversation(conversationId).catch(() => false)
           return false
         }
       } catch {

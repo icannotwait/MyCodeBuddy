@@ -153,6 +153,7 @@ import {
   saveMessageInputDraft,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
+import { FOCUS_COMPOSER_EVENT } from "@/lib/conversation-popout-detached-bootstrap"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
 import {
   RichComposer,
@@ -900,6 +901,23 @@ export function MessageInput({
       requestAnimationFrame(() => {
         editorRef.current?.focus()
       })
+    }
+  }, [isActive, composerReady, isPrompting])
+
+  // External activate (e.g. sidebar click → focus_conversation_window → eval
+  // dispatches FOCUS_COMPOSER_EVENT in the detached webview). Re-focus the
+  // composer when this surface is active; ignore when another tab owns focus
+  // or a prompt is in flight (same gates as the open-focus effect above).
+  useEffect(() => {
+    if (!isActive || !composerReady || isPrompting) return
+    const onFocusComposer = () => {
+      requestAnimationFrame(() => {
+        editorRef.current?.focus()
+      })
+    }
+    window.addEventListener(FOCUS_COMPOSER_EVENT, onFocusComposer)
+    return () => {
+      window.removeEventListener(FOCUS_COMPOSER_EVENT, onFocusComposer)
     }
   }, [isActive, composerReady, isPrompting])
 

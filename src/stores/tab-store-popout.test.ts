@@ -198,6 +198,7 @@ describe("openTab focus-before-open", () => {
 
     expect(openedMain).toBe(false)
     expect(isTransferringOut).toHaveBeenCalledWith(77)
+    expect(focusDetachedConversation).toHaveBeenCalledWith(77)
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
 
@@ -211,17 +212,38 @@ describe("openTab focus-before-open", () => {
 
     expect(openedMain).toBe(false)
     expect(isPopOutInFlight).toHaveBeenCalledWith(88)
+    expect(focusDetachedConversation).toHaveBeenCalledWith(88)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("awaits focus when detached cache already hits (sidebar re-click)", async () => {
+    isConversationDetachedCache.mockReturnValue(true)
+    focusDetachedConversation.mockResolvedValue(true)
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 55, "claude_code", false, "AlreadyPopped")
+
+    expect(openedMain).toBe(false)
+    expect(focusDetachedConversation).toHaveBeenCalledWith(55)
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
 
   it("after focus miss, re-checks fence and does not create main tab if transfer ran", async () => {
     let resolveFocus!: (v: boolean) => void
+    let focusCalls = 0
     const focusStarted = new Promise<void>((resolveStarted) => {
       focusDetachedConversation.mockImplementation(
         () =>
           new Promise<boolean>((resolve) => {
-            resolveFocus = resolve
-            resolveStarted()
+            focusCalls += 1
+            if (focusCalls === 1) {
+              resolveFocus = resolve
+              resolveStarted()
+              return
+            }
+            // Post-barrier re-focus must settle (openTab now awaits it).
+            resolve(false)
           })
       )
     })
@@ -237,6 +259,7 @@ describe("openTab focus-before-open", () => {
 
     await expect(pending).resolves.toBe(false)
     expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(focusCalls).toBe(2)
   })
 
   it("after focus miss, epoch advanced by completed transfer skips main tab", async () => {
@@ -244,12 +267,18 @@ describe("openTab focus-before-open", () => {
     // completes, caches detached, and clears fence (epoch start+end).
     // Stale false must not create a main tab beside the detached window.
     let resolveFocus!: (v: boolean) => void
+    let focusCalls = 0
     const focusStarted = new Promise<void>((resolveStarted) => {
       focusDetachedConversation.mockImplementation(
         () =>
           new Promise<boolean>((resolve) => {
-            resolveFocus = resolve
-            resolveStarted()
+            focusCalls += 1
+            if (focusCalls === 1) {
+              resolveFocus = resolve
+              resolveStarted()
+              return
+            }
+            resolve(true)
           })
       )
     })
@@ -268,6 +297,7 @@ describe("openTab focus-before-open", () => {
 
     await expect(pending).resolves.toBe(false)
     expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(focusCalls).toBe(2)
   })
 
   it("stale third-probe-style false after transfer still blocked by epoch", async () => {
@@ -275,12 +305,18 @@ describe("openTab focus-before-open", () => {
     // transfer; epoch change alone must prevent main-tab create (no reliance
     // on a later successful probe).
     let resolveFocus!: (v: boolean) => void
+    let focusCalls = 0
     const focusStarted = new Promise<void>((resolveStarted) => {
       focusDetachedConversation.mockImplementation(
         () =>
           new Promise<boolean>((resolve) => {
-            resolveFocus = resolve
-            resolveStarted()
+            focusCalls += 1
+            if (focusCalls === 1) {
+              resolveFocus = resolve
+              resolveStarted()
+              return
+            }
+            resolve(false)
           })
       )
     })
@@ -299,6 +335,7 @@ describe("openTab focus-before-open", () => {
 
     await expect(pending).resolves.toBe(false)
     expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(focusCalls).toBe(2)
   })
 
   it("detached cache set after focus miss skips main tab", async () => {

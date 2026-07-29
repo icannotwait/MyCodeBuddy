@@ -224,6 +224,32 @@ pub(crate) fn try_focus_existing_conversation_window(
     Ok(Some(OpenConversationResult::FocusedExisting))
 }
 
+/// Script run after OS focus so the webview caret lands in the composer.
+/// `set_focus` alone often only activates the window chrome (especially on
+/// Windows WebView2); the contenteditable stays blurred until something in
+/// the page takes focus.
+#[cfg(feature = "tauri-runtime")]
+const REQUEST_COMPOSER_FOCUS_JS: &str = r#"(function(){
+  try { window.focus(); } catch (_) {}
+  try {
+    window.dispatchEvent(new CustomEvent("codeg:focus-composer"));
+  } catch (_) {}
+})();"#;
+
+/// Show + unminimize + focus + ask the page to focus the composer.
+/// Used by both `focus_conversation_window` and the open-idempotent path.
+#[cfg(feature = "tauri-runtime")]
+fn activate_conversation_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    // show() is required when the window was hidden; unminimize alone does not
+    // restore visibility on every platform. Order: show → unminimize → focus.
+    let _ = window.show();
+    let _ = window.unminimize();
+    window.set_focus().map_err(|e| e.to_string())?;
+    // Best-effort: never fail the focus command if the eval is unavailable.
+    let _ = window.eval(REQUEST_COMPOSER_FOCUS_JS);
+    Ok(())
+}
+
 /// Tauri-backed window ops for the open/focus path (desktop only).
 /// Only get/unminimize/focus are used on the production early-return path;
 /// insert/create stay in `open_conversation_window` after `None`.
@@ -240,6 +266,8 @@ impl ConversationWindowOps for TauriConversationWindowOps<'_> {
 
     fn unminimize(&self, label: &str) {
         if let Some(existing) = self.app.get_webview_window(label) {
+            // Pair with set_focus: ensure the window is visible before focus.
+            let _ = existing.show();
             let _ = existing.unminimize();
         }
     }
@@ -249,7 +277,9 @@ impl ConversationWindowOps for TauriConversationWindowOps<'_> {
             .app
             .get_webview_window(label)
             .ok_or_else(|| format!("window {label} disappeared before focus"))?;
-        existing.set_focus().map_err(|e| e.to_string())
+        existing.set_focus().map_err(|e| e.to_string())?;
+        let _ = existing.eval(REQUEST_COMPOSER_FOCUS_JS);
+        Ok(())
     }
 
     fn insert_op(
@@ -1160,9 +1190,8 @@ pub async fn focus_conversation_window(
 ) -> Result<bool, AppCommandError> {
     let label = conversation_window_label(conversation_id);
     if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.unminimize();
-        existing.set_focus().map_err(|e| {
-            AppCommandError::window("Failed to focus conversation window", e.to_string())
+        activate_conversation_window(&existing).map_err(|e| {
+            AppCommandError::window("Failed to focus conversation window", e)
         })?;
         return Ok(true);
     }

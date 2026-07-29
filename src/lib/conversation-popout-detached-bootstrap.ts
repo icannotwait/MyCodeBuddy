@@ -10,6 +10,14 @@ export const CONVERSATION_WINDOW_READY_EVENT = "conversation-window://ready"
 export const CONVERSATION_WINDOW_COMMIT_ACK_EVENT =
   "conversation-window://commit-ack"
 
+/**
+ * Dispatched inside a detached conversation webview after OS window focus
+ * (see Rust `activate_conversation_window` / `REQUEST_COMPOSER_FOCUS_JS`).
+ * MessageInput listens and focuses the TipTap composer so the caret is ready
+ * when the user re-activates a pop-out from the sidebar.
+ */
+export const FOCUS_COMPOSER_EVENT = "codeg:focus-composer"
+
 export type ParsedPopoutQuery = {
   conversationId: number
   folderId: number

@@ -5,6 +5,7 @@ import {
   classifyDiscoveryResult,
   conversationWindowLabel,
   decideLiveHandoffResult,
+  FOCUS_COMPOSER_EVENT,
   isAbortedPhase,
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
@@ -14,6 +15,13 @@ import {
   shouldMountDetachedSurface,
   shouldReverseRebindAfterLiveFailure,
 } from "@/lib/conversation-popout-detached-bootstrap"
+
+describe("FOCUS_COMPOSER_EVENT", () => {
+  it("matches the Rust eval CustomEvent name for pop-out activate", () => {
+    // Keep in sync with REQUEST_COMPOSER_FOCUS_JS in conversation_popout.rs
+    expect(FOCUS_COMPOSER_EVENT).toBe("codeg:focus-composer")
+  })
+})
 
 describe("parseConversationPopoutQuery", () => {
   it("returns null for missing operationId", () => {
