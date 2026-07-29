@@ -52,7 +52,9 @@ required-features = ["tauri-runtime"]
 
 [[bin]]
 name = "codeg-server"
-path = "src/bin/codeg_server.rs"
+# File stem must match `name` so Tauri's bundler can map
+# required-features gating (src/bin auto-discovery uses the stem).
+path = "src/bin/codeg-server.rs"
 required-features = ["server"]
 
 [[bin]]
