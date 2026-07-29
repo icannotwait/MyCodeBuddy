@@ -32,7 +32,7 @@ subscription, creating avoidable event gaps.
   expanded.
 - While expanded, converge through newer `workflow_graph://changed` events and
   a ten-minute fallback refresh.
-- Reset the ten-minute fallback after a successful event-driven refresh.
+- Reset the ten-minute fallback after a converged event-driven refresh.
 - Preserve the last graph while a refresh is in flight or fails.
 - Preserve request-generation and graph-revision protections so stale responses
   cannot overwrite newer state.
@@ -89,7 +89,8 @@ workflow-panel snapshot request.
 
 The workflow graph store owns all live refresh mechanics:
 
-- a reference-counted active-conversation registry;
+- a reference-counted active-conversation registry whose records contain an
+  activation count and a monotonic activation epoch;
 - one global pair of workflow event listeners per webview while at least one
   workflow graph is active;
 - one fallback timer per active conversation;
@@ -106,25 +107,44 @@ entry and timer. Only the zero-to-one activation transition performs the initial
 refresh, and only the one-to-zero transition stops the timer. Each webview still
 operates independently.
 
+Each activation returns an idempotent lease cleanup. The conversation epoch
+changes at each real zero-to-one and one-to-zero lifecycle boundary; releasing
+the lease that created an epoch does not invalidate the epoch while another
+lease keeps the activation count above zero. Initial-refresh callbacks, request
+completions, and timer scheduling capture the conversation epoch and may act
+only while that epoch is current and the activation count remains positive.
+This conversation epoch is independent of the global listener-installation
+generation.
+
 ## Refresh Sequence
 
 On the first activation of a conversation:
 
 1. Register the conversation as active.
 2. Install the global workflow listeners if they are not already installed.
-3. Wait for listener registration to settle.
+3. Wait for both listener registration attempts to settle, or for a five-second
+   store-level readiness deadline.
 4. If the same activation is still current, immediately request the
    authoritative workflow snapshot.
 5. Continue displaying the previous snapshot throughout the request.
 
-Subscription readiness precedes the initial snapshot request so a mutation that
-commits after readiness cannot fall into a listener-before-fetch gap. If
-subscription setup fails, the initial request still runs and the graph degrades
-to refresh-only operation.
+Subscription readiness uses all-settled semantics: one early rejection does not
+make the pair ready while the other attempt is pending. Readiness precedes the
+initial snapshot request so a mutation that commits after readiness cannot fall
+into a listener-before-fetch gap. At the five-second deadline, the initial
+request runs in refresh-only mode even if an attempt remains pending. A late
+subscription handle must still pass the listener-installation generation check
+or be disposed immediately. Partial success keeps the successful listener until
+normal global cleanup while fallback refresh covers the failed channel.
 
-After an accepted successful snapshot response, schedule the next fallback
-refresh for ten minutes later. A fallback request follows the same application
-and scheduling path.
+Starting any accepted refresh clears the existing fallback timer, so at most one
+timer exists per active conversation. A transport-successful response from the
+current request generation and activation epoch is converged when it either
+applies or is rejected only because the cache already has a newer graph
+revision. Either converged outcome schedules the next fallback refresh for ten
+minutes later. A stale request generation, stale activation epoch, or inactive
+conversation never schedules a timer. A fallback request follows the same
+application and scheduling path.
 
 ## Event Handling
 
@@ -133,8 +153,9 @@ revision greater than the applied revision:
 
 1. cancels the pending fallback timer;
 2. starts an immediate authoritative snapshot request; and
-3. schedules a fresh ten-minute fallback after the new snapshot is successfully
-   applied.
+3. schedules a fresh ten-minute fallback after the current request converges by
+   applying its snapshot or finding that the cache already has a newer
+   revision.
 
 Equal or lower revisions remain ignored and do not alter the timer. Events for
 inactive conversations are ignored without fetching, even if the store contains
@@ -142,8 +163,8 @@ a detail-seeded snapshot.
 
 `workflow_graph://compatibility_nudge` has no durable revision. While the
 conversation is active, it starts the same immediate authoritative refresh and
-resets the fallback after success. While inactive, it is ignored without
-fetching.
+uses the same converged, failed, and stale completion rules for fallback
+scheduling. While inactive, it is ignored without fetching.
 
 The event remains a live clock notification rather than graph data. The
 authoritative snapshot request is still the only event-driven source of the full
@@ -155,6 +176,8 @@ Existing request-generation and graph-revision checks remain authoritative:
 
 - a newer request generation supersedes older requests;
 - an older graph revision cannot overwrite a newer applied snapshot; and
+- request completion must match the captured activation epoch before it can
+  schedule a fallback timer; and
 - late subscription completions from a disposed Strict Mode mount are disposed
   through the existing event-install generation token.
 
@@ -173,6 +196,15 @@ deactivates, the global listeners are disposed.
 A failed snapshot request retains the previous snapshot and records the existing
 store error state. It must not clear the graph or enter a tight retry loop.
 
+Within the no-Rust-change scope, a `null` authoritative response is treated as
+soft absence when the cache already contains a non-null graph. The store retains
+the cached graph, records failure-like state, and schedules the next allowed
+retry. A `null` response with no cached graph remains a successful empty initial
+result. This deliberately favors preserving a visible observed-only graph over
+interpreting the current backend's ambiguous `null` as an instruction to clear;
+an explicit clear would require a future protocol that distinguishes absence
+from projection failure.
+
 If the conversation remains active after failure, schedule the next fallback
 attempt ten minutes after that failed attempt completes. A newer graph event may
 retry sooner. Collapsing and expanding also triggers an immediate retry.
@@ -187,16 +219,32 @@ Focused store tests use fake timers and controllable subscription/request
 promises to verify:
 
 - activation waits for subscription readiness and then fetches immediately;
+- duplicate activation leases share one conversation epoch, initial fetch, and
+  timer even when the lease that caused zero-to-one is released first;
+- releasing one of two leases preserves event/timer eligibility, while releasing
+  the final lease stops both;
+- old-epoch request completion cannot arm a reactivated epoch's timer;
+- listeners remain installed until the last of two different active
+  conversations deactivates;
 - inactive or detail-seeded conversations do not fetch on graph events;
 - an active conversation fetches every ten minutes;
-- a successful event-driven refresh resets the ten-minute timer;
+- a converged event-driven refresh resets the ten-minute timer;
 - equal and lower event revisions neither fetch nor reset the timer;
-- compatibility nudges fetch only while active and reset the timer on success;
+- compatibility nudges fetch only while active and use the same converged,
+  failed, and stale timer rules;
 - deactivation clears the timer and prevents late responses from rearming it;
 - rapid deactivate/reactivate and Strict Mode subscription completion do not
   leak listeners or run stale activation callbacks;
 - request-generation and graph-revision races still reject stale responses;
+- a current response rejected only by a newer cached revision rearms the timer,
+  while stale-generation and stale-epoch responses do not;
+- a `null` refresh retains an existing observed-only graph and rearms retry, but
+  remains empty when no graph was cached;
 - failed subscription setup retains initial and periodic refresh behavior; and
+- one rejected and one pending subscription delays the initial fetch until the
+  second settles or the readiness deadline expires;
+- a never-settling subscription cannot block the initial fetch past the
+  readiness deadline, and a late stale handle is disposed;
 - failed requests retain the old graph and retry only at the next allowed time.
 
 Focused overlay tests verify:
