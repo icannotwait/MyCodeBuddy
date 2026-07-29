@@ -5840,7 +5840,8 @@ mod tests {
 
     /// Startup barrier contract: the reconcile helper must run to completion
     /// before any open-folder list surface; after it finishes,
-    /// `list_open_folder_details` must contain no empty regular opens.
+    /// `list_open_folder_details` must contain no regular opens without
+    /// sidebar-visible root conversations.
     #[tokio::test]
     async fn reconcile_empty_open_folders_core_then_list_has_no_empty_regular() {
         use crate::db::service::conversation_service;
@@ -5879,15 +5880,16 @@ mod tests {
         );
         assert!(
             after_ids.contains(&kept.id),
-            "folder with live conversations must stay open"
+            "folder with sidebar root conversations must stay open"
         );
         for detail in &after {
-            let live = folder_service::count_live_conversations_for_folder(&db.conn, detail.id)
-                .await
-                .expect("count");
+            let roots =
+                folder_service::count_sidebar_root_conversations_for_folder(&db.conn, detail.id)
+                    .await
+                    .expect("count roots");
             assert!(
-                live > 0,
-                "post-reconcile open list must not include zero-live regular folder {}",
+                roots > 0,
+                "post-reconcile open list must not include zero-root regular folder {}",
                 detail.id
             );
         }

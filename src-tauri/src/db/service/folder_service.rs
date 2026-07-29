@@ -15,6 +15,77 @@ use crate::models::{FolderDetail, FolderHistoryEntry};
 /// unscoped so it inherits the app-wide appearance theme color.
 pub const DEFAULT_FOLDER_COLOR: &str = "inherit";
 
+/// Normalize a path for folder `UNIQUE(path)` storage and lookup.
+///
+/// Strips Windows extended-length prefixes (`\\?\`, `//?/`, and UNC forms) so
+/// the same physical directory is not registered twice (`D:\proj` vs
+/// `\\?\D:\proj`). Does **not** canonicalize or change casing — those would
+/// break missing paths and non-Windows trees.
+pub fn normalize_folder_storage_path(path: &str) -> String {
+    let t = path.trim();
+    if let Some(rest) = t.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(unc) = rest.strip_prefix("UNC/") {
+            return format!(r"\\{unc}");
+        }
+        return rest.to_string();
+    }
+    if let Some(rest) = t.strip_prefix("//?/") {
+        if let Some(unc) = rest.strip_prefix("UNC/") {
+            return format!("//{unc}");
+        }
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return format!("//{unc}");
+        }
+        return rest.to_string();
+    }
+    t.to_string()
+}
+
+/// Alternate path spellings that may already exist as legacy rows (before
+/// storage normalization). Used only for lookup — new inserts always write
+/// [`normalize_folder_storage_path`].
+fn folder_path_lookup_aliases(storage_path: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    // Legacy extended-length form for drive paths (`C:\...` → `\\?\C:\...`).
+    let bytes = storage_path.as_bytes();
+    let is_drive = bytes.len() >= 2 && bytes[1] == b':' && !storage_path.starts_with(r"\\");
+    if is_drive && !storage_path.starts_with(r"\\?\") {
+        aliases.push(format!(r"\\?\{storage_path}"));
+    }
+    // Forward-slash extended form.
+    if is_drive && !storage_path.starts_with("//?/") {
+        let fwd = storage_path.replace('\\', "/");
+        aliases.push(format!("//?/{fwd}"));
+    }
+    aliases
+}
+
+async fn find_folder_row_by_path(
+    conn: &DatabaseConnection,
+    storage_path: &str,
+) -> Result<Option<folder::Model>, DbError> {
+    if let Some(row) = folder::Entity::find()
+        .filter(folder::Column::Path.eq(storage_path))
+        .one(conn)
+        .await?
+    {
+        return Ok(Some(row));
+    }
+    for alt in folder_path_lookup_aliases(storage_path) {
+        if let Some(row) = folder::Entity::find()
+            .filter(folder::Column::Path.eq(&alt))
+            .one(conn)
+            .await?
+        {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 fn to_entry(m: folder::Model) -> FolderHistoryEntry {
     FolderHistoryEntry {
         id: m.id,
@@ -244,14 +315,32 @@ fn take_force_live_insert_before_close() -> Option<i32> {
 }
 
 /// Apply mode-specific write to an existing path row (live or soft-deleted).
+///
+/// `storage_path` is the canonical path from [`normalize_folder_storage_path`].
+/// When the row still carries a legacy extended-length spelling and no other
+/// row owns `storage_path`, rewrite `path` so future lookups hit the canonical
+/// key.
 async fn apply_existing_folder_row(
     conn: &DatabaseConnection,
     row: folder::Model,
+    storage_path: &str,
     name: String,
     now: chrono::DateTime<Utc>,
     parent: ParentWrite,
     mode: EnsureFolderMode,
 ) -> Result<folder::Model, DbError> {
+    let path_rewrite = if row.path != storage_path {
+        // Only rewrite when the canonical key is free (no other row).
+        folder::Entity::find()
+            .filter(folder::Column::Path.eq(storage_path))
+            .filter(folder::Column::Id.ne(row.id))
+            .one(conn)
+            .await?
+            .is_none()
+    } else {
+        false
+    };
+
     match mode {
         EnsureFolderMode::ForceOpen => {
             let mut active = row.into_active_model();
@@ -260,6 +349,9 @@ async fn apply_existing_folder_row(
             active.updated_at = Set(now);
             active.deleted_at = Set(None);
             active.is_open = Set(true);
+            if path_rewrite {
+                active.path = Set(storage_path.to_string());
+            }
             // Plain reopen leaves the relationship as-is; the worktree flow writes
             // the authoritative value (including NULL) so it can never go stale.
             if let ParentWrite::Set(parent_id) = parent {
@@ -271,18 +363,21 @@ async fn apply_existing_folder_row(
             let was_deleted = row.deleted_at.is_some();
             if !was_deleted {
                 // Live existing: preserve is_open and last_opened_at. Only touch
-                // name / parent / updated_at when something actually changes.
+                // name / parent / path / updated_at when something actually changes.
                 let parent_change = match parent {
                     ParentWrite::Preserve => false,
                     ParentWrite::Set(pid) => row.parent_id != pid,
                 };
                 let name_change = row.name != name;
-                if !parent_change && !name_change {
+                if !parent_change && !name_change && !path_rewrite {
                     return Ok(row);
                 }
                 let mut active = row.into_active_model();
                 if name_change {
                     active.name = Set(name);
+                }
+                if path_rewrite {
+                    active.path = Set(storage_path.to_string());
                 }
                 if let ParentWrite::Set(parent_id) = parent {
                     active.parent_id = Set(parent_id);
@@ -296,6 +391,9 @@ async fn apply_existing_folder_row(
             active.deleted_at = Set(None);
             active.is_open = Set(false);
             active.updated_at = Set(now);
+            if path_rewrite {
+                active.path = Set(storage_path.to_string());
+            }
             if let ParentWrite::Set(parent_id) = parent {
                 active.parent_id = Set(parent_id);
             }
@@ -310,26 +408,24 @@ async fn ensure_folder_inner(
     parent: ParentWrite,
     mode: EnsureFolderMode,
 ) -> Result<FolderHistoryEntry, DbError> {
+    let path = normalize_folder_storage_path(path);
     let now = Utc::now();
-    let name = std::path::Path::new(path)
+    let name = std::path::Path::new(&path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+        .unwrap_or_else(|| path.clone());
 
-    let existing = folder::Entity::find()
-        .filter(folder::Column::Path.eq(path))
-        .one(conn)
-        .await?;
+    let existing = find_folder_row_by_path(conn, &path).await?;
 
     #[cfg(test)]
-    let existing = if take_force_skip_existing(path) {
+    let existing = if take_force_skip_existing(&path) {
         None
     } else {
         existing
     };
 
     let model = if let Some(row) = existing {
-        apply_existing_folder_row(conn, row, name, now, parent, mode).await?
+        apply_existing_folder_row(conn, row, &path, name, now, parent, mode).await?
     } else {
         let max_order = folder::Entity::find()
             .order_by_desc(folder::Column::SortOrder)
@@ -342,7 +438,7 @@ async fn ensure_folder_inner(
         let active = folder::ActiveModel {
             id: NotSet,
             name: Set(name.clone()),
-            path: Set(path.to_string()),
+            path: Set(path.clone()),
             git_branch: Set(None),
             default_agent_type: Set(None),
             last_agent_type: Set(None),
@@ -367,12 +463,10 @@ async fn ensure_folder_inner(
             // Concurrent open of the same path: loser lost the UNIQUE race —
             // re-apply mode semantics on the winner instead of surfacing error.
             Err(e) if is_unique_path_violation(&e) => {
-                let winner = folder::Entity::find()
-                    .filter(folder::Column::Path.eq(path))
-                    .one(conn)
+                let winner = find_folder_row_by_path(conn, &path)
                     .await?
                     .ok_or_else(|| DbError::from(e))?;
-                apply_existing_folder_row(conn, winner, name, now, parent, mode).await?
+                apply_existing_folder_row(conn, winner, &path, name, now, parent, mode).await?
             }
             Err(e) => return Err(e.into()),
         }
@@ -538,18 +632,17 @@ pub async fn list_folders(conn: &DatabaseConnection) -> Result<Vec<FolderHistory
 
 pub async fn remove_folder(conn: &DatabaseConnection, path: &str) -> Result<(), DbError> {
     let now = Utc::now();
-    let row = folder::Entity::find()
-        .filter(folder::Column::Path.eq(path))
-        .filter(folder::Column::DeletedAt.is_null())
-        .one(conn)
-        .await?;
-
-    if let Some(row) = row {
-        let mut active = row.into_active_model();
-        active.deleted_at = Set(Some(now));
-        active.updated_at = Set(now);
-        active.update(conn).await?;
-    }
+    let path = normalize_folder_storage_path(path);
+    let row = find_folder_row_by_path(conn, &path).await?;
+    // Soft-delete only live (non-deleted) rows; alias lookup may surface a
+    // soft-deleted twin — ignore those.
+    let Some(row) = row.filter(|r| r.deleted_at.is_none()) else {
+        return Ok(());
+    };
+    let mut active = row.into_active_model();
+    active.deleted_at = Set(Some(now));
+    active.updated_at = Set(now);
+    active.update(conn).await?;
     Ok(())
 }
 
@@ -574,6 +667,9 @@ pub async fn set_folder_open(
 /// Diagnostic / import decision aid only — **never** use this count alone as
 /// the auto-close guard (TOCTOU). Close uses
 /// [`close_folder_if_no_live_conversations`]'s atomic `NOT EXISTS` UPDATE.
+///
+/// Includes delegation children. For sidebar-aligned emptiness use
+/// [`count_sidebar_root_conversations_for_folder`].
 pub async fn count_live_conversations_for_folder(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -589,21 +685,58 @@ pub async fn count_live_conversations_for_folder(
     Ok(n)
 }
 
+/// Count conversations that keep a regular folder visible in the workspace
+/// sidebar folder groups: live roots only (`parent_id IS NULL`), excluding
+/// `chat` / `loop` kinds (those never render under a folder header).
+pub async fn count_sidebar_root_conversations_for_folder(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<u64, DbError> {
+    use crate::db::entities::conversation;
+    use crate::db::entities::conversation::ConversationKind;
+    use sea_orm::PaginatorTrait;
+
+    let n = conversation::Entity::find()
+        .filter(conversation::Column::FolderId.eq(folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::ParentId.is_null())
+        .filter(conversation::Column::Kind.ne(ConversationKind::Chat))
+        .filter(conversation::Column::Kind.ne(ConversationKind::Loop))
+        .count(conn)
+        .await?;
+    Ok(n)
+}
+
+/// SQL predicate: no sidebar-visible root conversations on this folder.
+/// Matches [`count_sidebar_root_conversations_for_folder`] / list_all defaults
+/// (`include_children = false`, no chat/loop under folder headers).
+const NO_SIDEBAR_ROOT_CONVERSATIONS_SQL: &str = "NOT EXISTS (\
+    SELECT 1 FROM conversation c \
+    WHERE c.folder_id = folder.id \
+      AND c.deleted_at IS NULL \
+      AND c.parent_id IS NULL \
+      AND c.kind NOT IN ('chat', 'loop')\
+)";
+
 /// Visibility-only auto-close for one folder when it is still open, regular,
-/// not soft-deleted, and has zero live conversations.
+/// not soft-deleted, and has **no sidebar-visible root conversations**.
 ///
-/// Atomic: a single conditional `UPDATE` with `NOT EXISTS` live conversations.
+/// Delegation children alone do **not** keep the folder open — the sidebar
+/// never lists them under the folder header (`include_children = false`), so
+/// counting them left worktree folders stuck as "暂无会话".
+///
+/// Atomic: a single conditional `UPDATE` with `NOT EXISTS` sidebar roots.
 /// Returns `true` only when this statement flipped `is_open` true→false.
 /// No-op (`false`) for missing, chat kind, already closed, soft-deleted, or
-/// non-empty folders — never touches `deleted_at`.
+/// folders with at least one root conversation — never touches `deleted_at`.
 pub async fn close_folder_if_no_live_conversations(
     conn: &DatabaseConnection,
     folder_id: i32,
 ) -> Result<bool, DbError> {
     use sea_orm::sea_query::Expr;
 
-    // Deterministic race hook (tests only): insert a live conversation after
-    // the call starts but before the atomic UPDATE evaluates NOT EXISTS.
+    // Deterministic race hook (tests only): insert a live **root** conversation
+    // after the call starts but before the atomic UPDATE evaluates NOT EXISTS.
     #[cfg(test)]
     if let Some(hook_id) = take_force_live_insert_before_close() {
         if hook_id == folder_id {
@@ -626,21 +759,18 @@ pub async fn close_folder_if_no_live_conversations(
         .filter(folder::Column::DeletedAt.is_null())
         .filter(folder::Column::Kind.eq(FolderKind::Regular))
         .filter(folder::Column::IsOpen.eq(true))
-        .filter(Expr::cust(
-            "NOT EXISTS (SELECT 1 FROM conversation c \
-             WHERE c.folder_id = folder.id AND c.deleted_at IS NULL)",
-        ))
+        .filter(Expr::cust(NO_SIDEBAR_ROOT_CONVERSATIONS_SQL))
         .exec(conn)
         .await?;
 
     Ok(result.rows_affected == 1)
 }
 
-/// Bulk reconcile: close every open regular folder that currently has zero live
-/// conversations. Returns the ids that were closed (caller derives count).
+/// Bulk reconcile: close every open regular folder with no sidebar-visible
+/// root conversations. Returns the ids that were closed (caller derives count).
 ///
 /// Each close uses the same atomic [`close_folder_if_no_live_conversations`]
-/// primitive (`WHERE NOT EXISTS` live), not a pre-count then set.
+/// primitive, not a pre-count then set.
 pub async fn close_open_folders_with_no_live_conversations(
     conn: &DatabaseConnection,
 ) -> Result<Vec<i32>, DbError> {
@@ -754,9 +884,10 @@ mod tests {
     use super::{
         add_chat_folder, add_folder, close_folder_if_no_live_conversations,
         close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
-        ensure_folder, force_add_folder_skip_existing_for_test,
-        force_live_insert_before_close_for_test, get_folder_by_id, list_open_folder_details,
-        list_open_folders, remaining_skip_budget_for_test, set_folder_open,
+        count_sidebar_root_conversations_for_folder, ensure_folder,
+        force_add_folder_skip_existing_for_test, force_live_insert_before_close_for_test,
+        get_folder_by_id, list_open_folder_details, list_open_folders,
+        normalize_folder_storage_path, remaining_skip_budget_for_test, set_folder_open,
         update_folder_last_agent, EnsureFolderMode,
     };
     use crate::db::entities::folder;
@@ -797,7 +928,7 @@ mod tests {
 
     /// Sequencing proof for the startup readiness barrier: after bulk reconcile
     /// completes, `list_open_folder_details` (the client open-list surface) must
-    /// not include any regular folder with zero live conversations.
+    /// not include any regular folder with zero sidebar-visible root conversations.
     #[tokio::test]
     async fn reconcile_then_list_open_folder_details_has_no_empty_regular() {
         let db = fresh_in_memory_db().await;
@@ -817,11 +948,129 @@ mod tests {
         assert!(!ids.contains(&empty_id));
         assert!(ids.contains(&kept_id));
         for d in details {
-            let live = count_live_conversations_for_folder(&db.conn, d.id)
+            let roots = count_sidebar_root_conversations_for_folder(&db.conn, d.id)
                 .await
-                .expect("count");
-            assert!(live > 0, "open detail id={} must have live convs", d.id);
+                .expect("count roots");
+            assert!(
+                roots > 0,
+                "open detail id={} must have sidebar root convs",
+                d.id
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn close_folder_with_only_delegate_children_is_closed() {
+        use crate::acp::delegation::spawner::DelegationLink;
+
+        let db = fresh_in_memory_db().await;
+        let parent_folder = seed_folder(&db, "/tmp/codeg-parent-repo").await;
+        let worktree_folder = seed_folder(&db, r"\\?\D:\codeg-worktree-only-children").await;
+        let parent_conv = seed_conversation(&db, parent_folder, AgentType::ClaudeCode).await;
+
+        conversation_service::create_with_delegation(
+            &db.conn,
+            worktree_folder,
+            AgentType::ClaudeCode,
+            Some("child review".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_conv,
+                parent_tool_use_id: "tu-1".into(),
+                delegation_call_id: "dc-1".into(),
+            }),
+        )
+        .await
+        .expect("delegate child");
+
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, worktree_folder)
+                .await
+                .unwrap(),
+            1,
+            "child rows still count as live"
+        );
+        assert_eq!(
+            count_sidebar_root_conversations_for_folder(&db.conn, worktree_folder)
+                .await
+                .unwrap(),
+            0,
+            "no sidebar roots"
+        );
+
+        assert!(
+            close_folder_if_no_live_conversations(&db.conn, worktree_folder)
+                .await
+                .unwrap(),
+            "delegate-only folder must auto-close"
+        );
+        let row = raw_folder(&db.conn, worktree_folder).await;
+        assert!(!row.is_open);
+        // Parent with a root stays open.
+        assert!(
+            !close_folder_if_no_live_conversations(&db.conn, parent_folder)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_folder_storage_path_strips_extended_prefix() {
+        assert_eq!(
+            normalize_folder_storage_path(r"\\?\D:\MyCodeBuddy"),
+            r"D:\MyCodeBuddy"
+        );
+        assert_eq!(
+            normalize_folder_storage_path(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        assert_eq!(
+            normalize_folder_storage_path("//?/C:/work"),
+            "C:/work"
+        );
+        assert_eq!(
+            normalize_folder_storage_path(r"D:\MyCodeBuddy"),
+            r"D:\MyCodeBuddy"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_folder_collapses_extended_length_alias_to_existing() {
+        let db = fresh_in_memory_db().await;
+        let first = add_folder(&db.conn, r"D:\codeg-alias-collapse")
+            .await
+            .expect("add plain");
+        let second = add_folder(&db.conn, r"\\?\D:\codeg-alias-collapse")
+            .await
+            .expect("add extended");
+        assert_eq!(
+            first.id, second.id,
+            "extended-length path must not mint a second folder row"
+        );
+        let row = raw_folder(&db.conn, first.id).await;
+        assert_eq!(row.path, r"D:\codeg-alias-collapse");
+    }
+
+    #[tokio::test]
+    async fn add_folder_rewrites_legacy_extended_path_when_safe() {
+        let db = fresh_in_memory_db().await;
+        // Insert legacy spelling without going through normalize (direct SQL path
+        // would be heavy; use seed then force path via ActiveModel).
+        let id = seed_folder(&db, r"D:\codeg-legacy-rewrite-tmp").await;
+        let mut active = raw_folder(&db.conn, id).await.into_active_model();
+        active.path = Set(r"\\?\D:\codeg-legacy-rewrite".to_string());
+        active.update(&db.conn).await.expect("legacy path");
+
+        let opened = add_folder(&db.conn, r"\\?\D:\codeg-legacy-rewrite")
+            .await
+            .expect("open via extended");
+        assert_eq!(opened.id, id);
+        let row = raw_folder(&db.conn, id).await;
+        assert_eq!(
+            row.path,
+            r"D:\codeg-legacy-rewrite",
+            "safe rewrite to storage-normalized path"
+        );
     }
 
     #[tokio::test]
