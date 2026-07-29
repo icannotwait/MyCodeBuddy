@@ -936,3 +936,41 @@ describe("real SKILL.md", () => {
     )
   })
 })
+
+describe("phase-transition pressure reference", () => {
+  it("requires automatic continuation after approved gates and names the only pause conditions", () => {
+    const quickReference = realSkill.match(
+      /^## Quick reference under pressure\s*$([\s\S]*?)(?=^## |(?![\s\S]))/im
+    )?.[1]
+
+    assert.ok(
+      quickReference,
+      "must include a Quick reference under pressure section"
+    )
+    assert.match(quickReference, /Design Gate approved[\s\S]*?Plan Author/i)
+    assert.match(
+      quickReference,
+      /Plan Gate approved[\s\S]*?Workspace gate[\s\S]*?Task/i
+    )
+    assert.match(
+      quickReference,
+      /Task Gate passed[\s\S]*?(?:next eligible Task|Final)/i
+    )
+    assert.match(
+      quickReference,
+      /Final review approved[\s\S]*?verify[\s\S]*?commit[\s\S]*?report/i
+    )
+    assert.match(
+      quickReference,
+      /Only pause[\s\S]*?hard block[\s\S]*?user_decision_required[\s\S]*?requirements, scope, architecture, or user data handling/i
+    )
+    assert.match(
+      quickReference,
+      /stale[\s\S]*?get_workflow_state[\s\S]*?continue/i
+    )
+    assert.match(
+      quickReference,
+      /do not request[\s\S]*?(?:extra )?user approval/i
+    )
+  })
+})

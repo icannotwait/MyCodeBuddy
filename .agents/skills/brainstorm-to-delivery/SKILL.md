@@ -49,15 +49,15 @@ id / publication_token / revisions / gate settlements / plan path+digest.
 
 Keys are workspace-relative, NFC/B1-normalized, `|`-separated, ≤200 scalars:
 
-| Unit | Materials |
-| --- | --- |
-| Design reviewer | `design\|{rel}\|reviewer\|{agent}\|{profile\|none}` |
-| Plan Author | `plan\|{rel}\|author\|codex\|{profile\|none}` |
-| Plan reviewer | `plan\|{rel}\|reviewer\|{agent}\|{profile\|none}` |
-| Task implementer | `task\|{n}\|implementer\|{agent}\|{profile\|none}` |
-| Task reviewer | `task\|{n}\|reviewer\|{agent}\|{profile\|none}` |
-| Final reviewer | `final_review\|reviewer\|{agent}\|{profile\|none}` |
-| Final fixer | `final_review\|fixer\|{agent}\|{profile\|none}` |
+| Unit             | Materials                                           |
+| ---------------- | --------------------------------------------------- |
+| Design reviewer  | `design\|{rel}\|reviewer\|{agent}\|{profile\|none}` |
+| Plan Author      | `plan\|{rel}\|author\|codex\|{profile\|none}`       |
+| Plan reviewer    | `plan\|{rel}\|reviewer\|{agent}\|{profile\|none}`   |
+| Task implementer | `task\|{n}\|implementer\|{agent}\|{profile\|none}`  |
+| Task reviewer    | `task\|{n}\|reviewer\|{agent}\|{profile\|none}`     |
+| Final reviewer   | `final_review\|reviewer\|{agent}\|{profile\|none}`  |
+| Final fixer      | `final_review\|fixer\|{agent}\|{profile\|none}`     |
 
 Prefer `continue_delegation` when the ledger shows a recoverable thread. Same
 key cold `delegate_to_agent` without `replaces_task_id` is invalid once lineage
@@ -241,6 +241,12 @@ worktree, blockers.
 | Post-admission risk looks wrong | Block + escalate; do not mutate `cohort_frozen` |
 | Urgency / small Task | Still Author + Plan review + risk route + SDD |
 | Agent unavailable | Hard block; no agent substitution |
+| Design Gate approved | In the same parent turn, dispatch the fresh Codex Plan Author. Do not request extra user approval. |
+| Plan Gate approved | Immediately run the Workspace gate, then dispatch the first eligible Task. Do not request extra user approval. |
+| Task Gate passed | Immediately dispatch the next eligible Task; after all active Task gates pass, dispatch a new Final reviewer. Do not request extra user approval. |
+| Final review approved | Immediately verify, commit, and report. Do not request extra user approval. |
+| Any phase could continue | Only pause for a platform hard block, `user_decision_required`, or a change to requirements, scope, architecture, or user data handling; otherwise continue. |
+| Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
 
 ## Rationalizations
 
@@ -256,6 +262,8 @@ worktree, blockers.
 | “Reset stagnation after compaction.” | Ledger + platform state are durable; only user-approved requirements change with persisted reason resets lineage. |
 | “Direct parent implement is faster.” | Parent only orchestrates. |
 | “`spawn_agent` can’t pick Grok.” | Use Codeg `delegate_to_agent`. |
+| “The Gate is approved, but I should ask the user to confirm the next phase.” | An approved Gate is not a user gate. Dispatch the next admissible work unit in the same parent turn. |
+| “A ledger or document still says pending, so I should stop.” | Reconcile with `get_workflow_state`; only its hard block or an explicit pause condition may stop advancement. |
 
 ## Red flags — stop
 
