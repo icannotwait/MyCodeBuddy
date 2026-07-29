@@ -7,7 +7,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::db::entities::conversation;
 use crate::db::entities::delegation_task_run::{self, DelegationRunStatus};
@@ -27,24 +27,27 @@ use super::super::card_summary::{
 };
 use super::error::WorkflowStoreError;
 use super::events::emit_workflow_graph_changed;
+use super::gates::{
+    evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, RequiredReviewerEvidence,
+};
 use super::plan_review::{
     derive_plan_review_round, PlanFindingUpdate, PlanReviewError, PlanReviewNextAction,
     PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
 };
-use super::state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
+use super::project::evidence_from_run_and_binding;
+use super::state_dto::{
+    project_workflow_state_index, WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto,
+    WorkflowStateIndexDto,
+};
 use super::types::{
     DocumentGateKind, ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeOutcome,
     ManifestNodeRole, ManifestWorkflowState, NormalizedGate, NormalizedManifest, NormalizedNode,
-    ResolutionMode, MAX_ADJUDICATION_SUMMARY_BYTES, MAX_NODES,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    ResolutionMode, MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
 pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v2";
-
-/// Soft evidence budget for `get_workflow_state` (A15 class: same as MAX_NODES).
-const MAX_STATE_NODE_EVIDENCE: usize = MAX_NODES;
 
 const MAX_PERSISTED_PLAN_EVIDENCE_BYTES: usize = 1024 * 1024;
 
@@ -639,18 +642,18 @@ pub async fn settle_workflow_gate_core(
     Ok(result)
 }
 
-/// Agent-facing recovery read (A5 + B4). Never returns frontend-redacted shape.
+/// Agent-facing compact recovery read (A5 + B4).
 ///
 /// Entire snapshot is loaded in a single SQLite read transaction for consistency.
 pub async fn get_workflow_state_core(
     db: &AppDatabase,
     parent_conversation_id: i32,
     workflow_id: Option<&str>,
-) -> Result<WorkflowStateDto, WorkflowStoreError> {
+) -> Result<WorkflowStateIndexDto, WorkflowStoreError> {
     let workflow_id_owned = workflow_id.map(|s| s.to_string());
     let result = db
         .conn
-        .transaction::<_, WorkflowStateDto, WorkflowStoreError>(|txn| {
+        .transaction::<_, WorkflowStateIndexDto, WorkflowStoreError>(|txn| {
             Box::pin(async move {
                 let header = match workflow_id_owned.as_deref() {
                     Some(id) => {
@@ -760,7 +763,7 @@ pub async fn get_workflow_state_core(
                     .map(|node| node.id.clone())
                     .collect();
 
-                let mut nodes: Vec<WorkflowNodeStateDto> = bindings
+                let nodes: Vec<WorkflowNodeStateDto> = bindings
                     .iter()
                     .map(|b| {
                         let latest = latest_by_node.get(&b.node_id);
@@ -801,12 +804,6 @@ pub async fn get_workflow_state_core(
                         }
                     })
                     .collect();
-
-                let evidence_truncated = truncate_node_evidence(
-                    &mut nodes,
-                    MAX_STATE_NODE_EVIDENCE,
-                    &active_manifest_node_ids,
-                );
 
                 let mut gates = Vec::with_capacity(normalized.gates.len());
                 for g in &normalized.gates {
@@ -868,7 +865,38 @@ pub async fn get_workflow_state_core(
                     .transpose()?
                     .map(|evidence| evidence.state);
 
-                Ok(WorkflowStateDto {
+                let mut task_gate_passed = BTreeMap::new();
+                for policy in &normalized.task_policies {
+                    let implementer_or_fixer = latest_by_node
+                        .get(&policy.route.implementer_node_id)
+                        .and_then(|binding| {
+                            run_by_id.get(&binding.task_id).map(|run| {
+                                evidence_from_run_and_binding(run, binding)
+                            })
+                        });
+                    let required_reviewers = policy
+                        .route
+                        .reviewer_node_ids
+                        .iter()
+                        .map(|node_id| RequiredReviewerEvidence {
+                            node_id: node_id.clone(),
+                            evidence: latest_by_node.get(node_id).and_then(|binding| {
+                                run_by_id.get(&binding.task_id).map(|run| {
+                                    evidence_from_run_and_binding(run, binding)
+                                })
+                            }),
+                        })
+                        .collect();
+                    let evaluation = evaluate_execution_gate(&ExecutionGateInput {
+                        kind: ExecutionGateKind::Task,
+                        implementer_or_fixer,
+                        required_reviewers,
+                        branch_tip_digest: None,
+                    });
+                    task_gate_passed.insert(policy.task_index, evaluation.passed);
+                }
+
+                let full_state = WorkflowStateDto {
                     workflow_id: header.workflow_id,
                     parent_conversation_id: header.parent_conversation_id,
                     workflow_kind: header.workflow_kind,
@@ -886,8 +914,13 @@ pub async fn get_workflow_state_core(
                     nodes,
                     gates,
                     latest_plan_review,
-                    evidence_truncated,
-                })
+                    evidence_truncated: false,
+                };
+                Ok(project_workflow_state_index(
+                    full_state,
+                    &active_manifest_node_ids,
+                    &task_gate_passed,
+                ))
             })
         })
         .await;
@@ -2627,73 +2660,6 @@ fn review_verdict_str(verdict: ReviewVerdict) -> &'static str {
     }
 }
 
-fn is_completed_evidence(n: &WorkflowNodeStateDto) -> bool {
-    matches!(
-        n.latest_status.as_deref(),
-        Some("completed") | Some("failed") | Some("canceled")
-    )
-}
-
-/// Truncate oldest completed non-required nodes first under A15 size class.
-/// Ordering uses completion/admission timestamps (`evidence_time`), not generation
-/// across unrelated nodes. Required-gate nodes are preferred; returns whether
-/// any evidence was dropped.
-fn truncate_node_evidence(
-    nodes: &mut Vec<WorkflowNodeStateDto>,
-    max: usize,
-    active_manifest_node_ids: &HashSet<String>,
-) -> bool {
-    nodes.sort_by(|a, b| {
-        let a_protected = a.required_for_gate || active_manifest_node_ids.contains(&a.node_id);
-        let b_protected = b.required_for_gate || active_manifest_node_ids.contains(&b.node_id);
-        b_protected
-            .cmp(&a_protected)
-            .then_with(|| {
-                let a_done = is_completed_evidence(a);
-                let b_done = is_completed_evidence(b);
-                a_done.cmp(&b_done)
-            })
-            .then_with(|| a.node_id.cmp(&b.node_id))
-    });
-
-    if nodes.len() <= max {
-        return false;
-    }
-
-    let mut evidence_truncated = false;
-    let mut kept = Vec::with_capacity(max);
-    let mut completed_drop_queue: Vec<WorkflowNodeStateDto> = Vec::new();
-    for n in nodes.drain(..) {
-        if n.required_for_gate
-            || active_manifest_node_ids.contains(&n.node_id)
-            || !is_completed_evidence(&n)
-        {
-            kept.push(n);
-        } else {
-            completed_drop_queue.push(n);
-        }
-    }
-    // Keep more recent completions (by finished_at / admission time); drop oldest first.
-    completed_drop_queue.sort_by(|a, b| {
-        b.evidence_time
-            .cmp(&a.evidence_time)
-            .then_with(|| b.node_id.cmp(&a.node_id))
-    });
-    for n in completed_drop_queue {
-        if kept.len() < max {
-            kept.push(n);
-        } else {
-            evidence_truncated = true;
-        }
-    }
-    if kept.len() > max {
-        evidence_truncated = true;
-        kept.truncate(max);
-    }
-    *nodes = kept;
-    evidence_truncated
-}
-
 // ---------------------------------------------------------------------------
 // Tests (B10 owned by Task 3)
 // ---------------------------------------------------------------------------
@@ -2712,7 +2678,8 @@ mod tests {
     };
     use crate::acp::delegation::workflow::{
         FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewNextAction,
-        PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
+        PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind, WorkflowIndexOmissionStep,
+        WorkflowStateDetail, WorkflowStateIndexDto,
     };
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -3578,6 +3545,693 @@ mod tests {
         child_conversation_id
     }
 
+    fn high_risk(task_index: u32) -> ManifestTaskRisk {
+        ManifestTaskRisk {
+            level: TaskRiskLevel::High,
+            hard_triggers: vec![ManifestTaskHardTrigger {
+                kind: TaskHardTriggerKind::ConcurrencyLifecycle,
+                evidence: vec![format!("Task {task_index} has durable serial gate state")],
+            }],
+            soft_signals: vec![],
+            score: 0,
+            reason: format!("Task {task_index} requires dual independent review"),
+        }
+    }
+
+    fn rename_node_id(doc: &mut ManifestDocument, old: &str, new: &str) {
+        doc.nodes.iter_mut().find(|node| node.id == old).unwrap().id = new.into();
+        for node in &mut doc.nodes {
+            for dep in &mut node.deps {
+                if dep == old {
+                    *dep = new.into();
+                }
+            }
+        }
+        for edge in &mut doc.edges {
+            if edge.from == old {
+                edge.from = new.into();
+            }
+            if edge.to == old {
+                edge.to = new.into();
+            }
+        }
+    }
+
+    fn current_plan_cohort_doc(token: &str) -> ManifestDocument {
+        let mut doc = two_reviewer_plan_doc(token);
+        rename_node_id(&mut doc, "plan-reviewer-1", "plan-reviewer-codex");
+        rename_node_id(&mut doc, "plan-reviewer-2", "plan-reviewer-grok");
+        let gate = doc
+            .gates
+            .iter_mut()
+            .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
+            .unwrap();
+        gate.reviewer_cohort_node_ids =
+            vec!["plan-reviewer-codex".into(), "plan-reviewer-grok".into()];
+        gate.required_reviewer_node_ids = gate.reviewer_cohort_node_ids.clone();
+        doc
+    }
+
+    fn two_task_index_doc(token: &str) -> ManifestDocument {
+        let mut doc = design_plan_doc(token);
+        rename_node_id(&mut doc, "task-1-rev", "task-1-review-codex");
+        let task_1_impl = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "task-1-impl")
+            .unwrap();
+        task_1_impl.agent_type = Some("codex".into());
+        task_1_impl.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: 1,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+        );
+        let task_1_grok_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.push(wu(
+            "task-1-review-grok",
+            PHASE_TASKS,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            Some(1),
+            task_1_grok_key,
+            vec!["task-1-impl".into()],
+        ));
+        doc.task_policies[0] = ManifestTaskPolicy {
+            task_index: 1,
+            risk: high_risk(1),
+            route: ManifestTaskRoute {
+                implementer_node_id: "task-1-impl".into(),
+                reviewer_node_ids: vec!["task-1-review-codex".into(), "task-1-review-grok".into()],
+            },
+        };
+
+        let task_2_impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 2,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_2_codex_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 2,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_2_grok_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 2,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.extend([
+            wu(
+                "task-2-impl",
+                PHASE_TASKS,
+                ManifestNodeRole::Implementer,
+                "codex",
+                None,
+                Some(2),
+                task_2_impl_key,
+                vec!["task-1-review-codex".into(), "task-1-review-grok".into()],
+            ),
+            wu(
+                "task-2-review-codex",
+                PHASE_TASKS,
+                ManifestNodeRole::Reviewer,
+                "codex",
+                None,
+                Some(2),
+                task_2_codex_key,
+                vec!["task-2-impl".into()],
+            ),
+            wu(
+                "task-2-review-grok",
+                PHASE_TASKS,
+                ManifestNodeRole::Reviewer,
+                "grok",
+                None,
+                Some(2),
+                task_2_grok_key,
+                vec!["task-2-impl".into()],
+            ),
+        ]);
+        doc.task_policies.push(ManifestTaskPolicy {
+            task_index: 2,
+            risk: high_risk(2),
+            route: ManifestTaskRoute {
+                implementer_node_id: "task-2-impl".into(),
+                reviewer_node_ids: vec!["task-2-review-codex".into(), "task-2-review-grok".into()],
+            },
+        });
+        doc
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_task_route_evidence(
+        db: &AppDatabase,
+        parent: i32,
+        workflow_id: &str,
+        node_id: &str,
+        task_id: &str,
+        agent_type: &str,
+        artifact_digest: &str,
+        reviewed_task_id: Option<&str>,
+        lineage_ordinal: i64,
+    ) {
+        let now = Utc::now() + chrono::Duration::seconds(lineage_ordinal);
+        let child = seed_conversation(
+            db,
+            seed_folder(db, &format!("/tmp/{task_id}")).await,
+            AgentType::Codex,
+        )
+        .await;
+        let card_summary_json = if reviewed_task_id.is_some() {
+            serde_json::json!({
+                "kind": "review",
+                "verdict": "approve",
+                "critical": 0,
+                "important": 0,
+                "minor": 0,
+                "summary": "Task review completed",
+                "report_file": format!("reports/{task_id}.md"),
+            })
+        } else {
+            serde_json::json!({
+                "kind": "implementation",
+                "phase": "implementation",
+                "status": "done",
+                "summary": "Task implementation completed",
+                "commits": [],
+                "tests": null,
+                "concerns": [],
+                "report_file": format!("reports/{task_id}.md"),
+            })
+        };
+        delegation_task_run::ActiveModel {
+            task_id: Set(task_id.into()),
+            root_task_id: Set(task_id.into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(parent),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(child),
+            agent_type: Set(agent_type.into()),
+            profile_id: Set(None),
+            workspace_path: Set(None),
+            route_fingerprint: Set(None),
+            launch_snapshot_version: Set(None),
+            mode_id: Set(None),
+            config_values_json: Set(None),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            reached_running_at: Set(Some(now)),
+            lineage_root_task_id: Set(task_id.into()),
+            work_unit_key: Set(None),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Completed),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(Some(now)),
+            tool_call_count: Set(None),
+            edit_tool_call_count: Set(None),
+            touched_files_json: Set(None),
+            touched_files_truncated: Set(None),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(None),
+            card_summary_json: Set(Some(card_summary_json.to_string())),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow_run_binding::ActiveModel {
+            task_id: Set(task_id.into()),
+            workflow_id: Set(workflow_id.into()),
+            node_id: Set(node_id.into()),
+            gate_id: Set(None),
+            gate_cycle: Set(None),
+            manifest_revision: Set(1),
+            content_fingerprint: Set(None),
+            artifact_digest: Set(Some(artifact_digest.into())),
+            reviewed_task_id: Set(reviewed_task_id.map(str::to_string)),
+            reviewed_implementer_generation: Set(reviewed_task_id.map(|_| 1)),
+            lineage_ordinal: Set(lineage_ordinal),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    struct IndexWorkflowFixture {
+        db: AppDatabase,
+        parent: i32,
+        workflow_id: String,
+        publication_token: String,
+    }
+
+    impl IndexWorkflowFixture {
+        async fn complete_task_1_implementer_only(&self) {
+            insert_task_route_evidence(
+                &self.db,
+                self.parent,
+                &self.workflow_id,
+                "task-1-impl",
+                "task-1-implementation",
+                "codex",
+                "sha256:task-1",
+                None,
+                1,
+            )
+            .await;
+        }
+
+        async fn complete_both_task_1_reviews_against_latest_artifact(&self) {
+            for (node_id, task_id, agent_type, ordinal) in [
+                ("task-1-review-codex", "task-1-codex-review", "codex", 2),
+                ("task-1-review-grok", "task-1-grok-review", "grok", 3),
+            ] {
+                insert_task_route_evidence(
+                    &self.db,
+                    self.parent,
+                    &self.workflow_id,
+                    node_id,
+                    task_id,
+                    agent_type,
+                    "sha256:task-1",
+                    Some("task-1-implementation"),
+                    ordinal,
+                )
+                .await;
+            }
+        }
+
+        async fn materially_republish_plan_with_reviewers(&self, reviewer_ids: [&str; 2]) {
+            let (emitter, _) = emitter_with_rx();
+            let mut doc = current_plan_cohort_doc(&self.publication_token);
+            assert_eq!(reviewer_ids, ["plan-reviewer-codex", "plan-reviewer-grok"]);
+            let historical_profile = "11111111-1111-4111-8111-111111111111";
+            let historical_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+                rel_plan_path: &doc.plan_target_rel_path,
+                agent_type: "code_buddy",
+                profile_id: Some(historical_profile),
+            })
+            .unwrap();
+            doc.nodes.push(wu(
+                "plan-reviewer-old",
+                PHASE_PLAN,
+                ManifestNodeRole::Reviewer,
+                "code_buddy",
+                Some(historical_profile),
+                None,
+                historical_key,
+                vec!["plan-author".into()],
+            ));
+            let plan_gate = doc
+                .gates
+                .iter_mut()
+                .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
+                .unwrap();
+            plan_gate
+                .reviewer_cohort_node_ids
+                .insert(0, "plan-reviewer-old".into());
+            doc.workflow_id = Some(self.workflow_id.clone());
+            doc.expected_manifest_revision = Some(1);
+            doc.plan.as_mut().unwrap().digest = "sha256:plan-v2".into();
+            publish_workflow_manifest_core(
+                &self.db,
+                &emitter,
+                self.parent,
+                PublishWorkflowRequest { document: doc },
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn record_current_reviewer_pointers(&self) {
+            for (node_id, task_id, report_file, ordinal) in [
+                (
+                    "plan-reviewer-codex",
+                    "current-plan-review-codex",
+                    "reports/current-plan-review-codex.md",
+                    10,
+                ),
+                (
+                    "plan-reviewer-grok",
+                    "current-plan-review-grok",
+                    "reports/current-plan-review-grok.md",
+                    11,
+                ),
+            ] {
+                insert_plan_reviewer_evidence(
+                    &self.db,
+                    self.parent,
+                    &self.workflow_id,
+                    node_id,
+                    task_id,
+                    2,
+                    2,
+                    "sha256:plan-v2",
+                    "historical-plan-author",
+                    "request_changes",
+                    report_file,
+                    ordinal,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn seed_two_task_index_workflow() -> IndexWorkflowFixture {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let publication_token = "tok-two-task-index".to_string();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: two_task_index_doc(&publication_token),
+            },
+        )
+        .await
+        .unwrap();
+        IndexWorkflowFixture {
+            db,
+            parent,
+            workflow_id: published.workflow_id,
+            publication_token,
+        }
+    }
+
+    async fn seed_open_plan_findings_with_reviewer_runs() -> IndexWorkflowFixture {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let publication_token = "tok-open-plan-sources".to_string();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: current_plan_cohort_doc(&publication_token),
+            },
+        )
+        .await
+        .unwrap();
+        insert_plan_author_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "current-plan-author",
+            1,
+            "sha256:plan",
+            "reports/current-plan-author.md",
+            0,
+        )
+        .await;
+        for (node_id, task_id, report, ordinal) in [
+            (
+                "plan-reviewer-codex",
+                "current-plan-codex",
+                "reports/current-plan-codex.md",
+                1,
+            ),
+            (
+                "plan-reviewer-grok",
+                "current-plan-grok",
+                "reports/current-plan-grok.md",
+                2,
+            ),
+        ] {
+            insert_plan_reviewer_evidence(
+                &db,
+                parent,
+                &published.workflow_id,
+                node_id,
+                task_id,
+                1,
+                1,
+                "sha256:plan",
+                "current-plan-author",
+                "request_changes",
+                report,
+                ordinal,
+            )
+            .await;
+        }
+        settle_for_test(
+            &db,
+            &emitter,
+            parent,
+            &published.workflow_id,
+            "plan",
+            1,
+            published.graph_revision,
+            1,
+            GateSettlementOutcome::ChangesRequested,
+            TestGateEvidence::Plan(plan_submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &["plan-reviewer-codex", "plan-reviewer-grok"],
+                vec![
+                    finding(
+                        "F-codex",
+                        FindingSeverity::Important,
+                        FindingStatus::Open,
+                        &["plan-reviewer-codex"],
+                    ),
+                    finding(
+                        "F-grok",
+                        FindingSeverity::Important,
+                        FindingStatus::Open,
+                        &["plan-reviewer-grok"],
+                    ),
+                ],
+                "current-plan-author",
+                "sha256:plan",
+            )),
+            "current Plan findings",
+        )
+        .await
+        .unwrap();
+        IndexWorkflowFixture {
+            db,
+            parent,
+            workflow_id: published.workflow_id,
+            publication_token,
+        }
+    }
+
+    async fn seed_historical_plan_round_with_required_reviewers(
+        reviewer_ids: [&str; 1],
+    ) -> IndexWorkflowFixture {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let publication_token = "tok-historical-plan-cohort".to_string();
+        let mut doc = design_plan_doc(&publication_token);
+        rename_node_id(&mut doc, "plan-reviewer-1", reviewer_ids[0]);
+        let historical_profile = "11111111-1111-4111-8111-111111111111";
+        let historical = doc
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == reviewer_ids[0])
+            .unwrap();
+        historical.agent_type = Some("code_buddy".into());
+        historical.profile_id = Some(historical_profile.into());
+        historical.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+                rel_plan_path: &doc.plan_target_rel_path,
+                agent_type: "code_buddy",
+                profile_id: Some(historical_profile),
+            })
+            .unwrap(),
+        );
+        let gate = doc
+            .gates
+            .iter_mut()
+            .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
+            .unwrap();
+        gate.reviewer_cohort_node_ids = vec![reviewer_ids[0].into()];
+        gate.required_reviewer_node_ids = gate.reviewer_cohort_node_ids.clone();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+        insert_plan_author_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "historical-plan-author",
+            1,
+            "sha256:plan",
+            "reports/historical-plan-author.md",
+            0,
+        )
+        .await;
+        insert_plan_reviewer_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            reviewer_ids[0],
+            "historical-plan-review",
+            1,
+            1,
+            "sha256:plan",
+            "historical-plan-author",
+            "request_changes",
+            "reports/historical-plan-review.md",
+            1,
+        )
+        .await;
+        settle_for_test(
+            &db,
+            &emitter,
+            parent,
+            &published.workflow_id,
+            "plan",
+            1,
+            published.graph_revision,
+            1,
+            GateSettlementOutcome::ChangesRequested,
+            TestGateEvidence::Plan(plan_submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &[reviewer_ids[0]],
+                vec![finding(
+                    "F-historical",
+                    FindingSeverity::Important,
+                    FindingStatus::Open,
+                    &[reviewer_ids[0]],
+                )],
+                "historical-plan-author",
+                "sha256:plan",
+            )),
+            "historical Plan findings",
+        )
+        .await
+        .unwrap();
+        IndexWorkflowFixture {
+            db,
+            parent,
+            workflow_id: published.workflow_id,
+            publication_token,
+        }
+    }
+
+    fn recovery_source_ids(index: &WorkflowStateIndexDto) -> Vec<&str> {
+        index
+            .latest_plan_review
+            .as_ref()
+            .unwrap()
+            .recovery_sources
+            .iter()
+            .map(|source| source.node_id.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn index_routes_use_manifest_authority_and_durable_gate_state() {
+        let fixture = seed_two_task_index_workflow().await;
+        fixture.complete_task_1_implementer_only().await;
+        let active =
+            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
+                .await
+                .unwrap();
+        assert_eq!(
+            active
+                .actionable_task_routes
+                .iter()
+                .map(|route| route.task_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            active.actionable_task_routes[0].reviewer_node_ids,
+            vec!["task-1-review-codex", "task-1-review-grok"]
+        );
+
+        fixture
+            .complete_both_task_1_reviews_against_latest_artifact()
+            .await;
+        let next = get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.actionable_task_routes
+                .iter()
+                .map(|route| route.task_index)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[tokio::test]
+    async fn index_recovery_sources_cover_each_required_plan_reviewer() {
+        let fixture = seed_open_plan_findings_with_reviewer_runs().await;
+        let index =
+            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
+                .await
+                .unwrap();
+        let review = index.latest_plan_review.unwrap();
+        assert_eq!(
+            review
+                .recovery_sources
+                .iter()
+                .map(|source| source.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plan-reviewer-codex", "plan-reviewer-grok"]
+        );
+        assert!(review
+            .recovery_sources
+            .iter()
+            .all(|source| source.report_file.is_some() || source.latest_task_id.is_some()));
+    }
+
+    #[tokio::test]
+    async fn material_republish_uses_current_plan_gate_cohort_through_omission() {
+        let fixture =
+            seed_historical_plan_round_with_required_reviewers(["plan-reviewer-old"]).await;
+        fixture
+            .materially_republish_plan_with_reviewers(["plan-reviewer-codex", "plan-reviewer-grok"])
+            .await;
+        fixture.record_current_reviewer_pointers().await;
+
+        let mut index =
+            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
+                .await
+                .unwrap();
+        let expected = vec!["plan-reviewer-codex", "plan-reviewer-grok"];
+        assert_eq!(recovery_source_ids(&index), expected);
+        for step in WorkflowIndexOmissionStep::ALL {
+            index.apply_omission_step(step);
+            assert_eq!(recovery_source_ids(&index), expected);
+        }
+    }
+
     #[tokio::test]
     async fn publish_create_and_idempotent_token_replay() {
         let (db, parent) = seed_parent().await;
@@ -4351,10 +5005,13 @@ mod tests {
             .iter()
             .find(|n| n.node_id == "task-1-rev")
             .unwrap();
-        assert_eq!(impl_n.node_outcome.as_deref(), Some("canceled"));
-        assert_eq!(rev_n.node_outcome.as_deref(), Some("canceled"));
-        assert!(impl_n.cohort_frozen);
-        assert!(rev_n.cohort_frozen);
+        assert_eq!(state.workflow_state, ManifestWorkflowState::Blocked);
+        assert!(state.actionable_task_routes.is_empty());
+        assert_eq!(impl_n.task_index, Some(1));
+        assert_eq!(rev_n.task_index, Some(1));
+        let state_json = serde_json::to_value(state).unwrap();
+        assert!(state_json.pointer("/nodes/0/node_outcome").is_none());
+        assert!(state_json.pointer("/nodes/0/cohort_frozen").is_none());
     }
 
     #[tokio::test]
@@ -4453,7 +5110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_workflow_state_b4_fields() {
+    async fn get_workflow_state_index_preserves_recovery_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let r = publish_workflow_manifest_core(
@@ -4474,7 +5131,8 @@ mod tests {
             .unwrap();
         assert_eq!(state.workflow_id, r.workflow_id);
         assert_eq!(state.manifest_revision, 1);
-        assert!(!state.nodes.is_empty());
+        assert_eq!(state.detail, WorkflowStateDetail::Index);
+        assert!(!state.inline_findings);
         let design = state
             .nodes
             .iter()
@@ -4482,143 +5140,10 @@ mod tests {
             .unwrap();
         assert_eq!(design.latest_task_id.as_deref(), Some("task-state-1"));
         assert_eq!(design.latest_status.as_deref(), Some("completed"));
-        assert_eq!(design.latest_generation, Some(1));
-        assert_eq!(design.summary_validated, Some(true));
-        assert_eq!(design.artifact_digest.as_deref(), Some(DESIGN_DOC_DIGEST));
-        assert_eq!(design.gate_cycle, Some(1));
-        assert!(design.required_for_gate);
-        assert!(!design.work_unit_key.is_empty());
-
-        let gate = state.gates.iter().find(|g| g.gate_id == "design").unwrap();
-        assert_eq!(gate.next_gate_cycle, 1);
-        assert_eq!(gate.gate_kind, "design");
-    }
-
-    #[test]
-    fn truncate_drops_oldest_completed_keeps_required_and_active_manifest_nodes() {
-        let t_active = Utc::now() - chrono::Duration::hours(3);
-        let t_old = Utc::now() - chrono::Duration::hours(2);
-        let t_new = Utc::now() - chrono::Duration::minutes(5);
-        let t_req = Utc::now() - chrono::Duration::hours(1);
-        let mut nodes = vec![
-            WorkflowNodeStateDto {
-                node_id: "req".into(),
-                work_unit_key: "k-req".into(),
-                role: "reviewer".into(),
-                agent_type: "codex".into(),
-                profile_id: None,
-                phase_id: "design".into(),
-                task_index: None,
-                is_observed: true,
-                retained_observed: false,
-                cohort_frozen: false,
-                node_outcome: None,
-                latest_task_id: Some("t-req".into()),
-                latest_status: Some("completed".into()),
-                latest_generation: Some(1),
-                summary_validated: Some(true),
-                artifact_digest: None,
-                child_conversation_id: None,
-                reviewed_task_id: None,
-                verdict: None,
-                report_file: None,
-                gate_id: Some("design".into()),
-                gate_cycle: Some(1),
-                replaced_task_id: None,
-                required_for_gate: true,
-                evidence_time: Some(t_req),
-            },
-            WorkflowNodeStateDto {
-                node_id: "old-done".into(),
-                work_unit_key: "k-old".into(),
-                role: "implementer".into(),
-                agent_type: "grok".into(),
-                profile_id: None,
-                phase_id: "tasks".into(),
-                task_index: Some(1),
-                is_observed: true,
-                retained_observed: false,
-                cohort_frozen: false,
-                node_outcome: None,
-                latest_task_id: Some("t-old".into()),
-                latest_status: Some("completed".into()),
-                // Higher generation must not keep this over newer evidence_time.
-                latest_generation: Some(99),
-                summary_validated: Some(true),
-                artifact_digest: None,
-                child_conversation_id: None,
-                reviewed_task_id: None,
-                verdict: None,
-                report_file: None,
-                gate_id: None,
-                gate_cycle: None,
-                replaced_task_id: None,
-                required_for_gate: false,
-                evidence_time: Some(t_old),
-            },
-            WorkflowNodeStateDto {
-                node_id: "new-done".into(),
-                work_unit_key: "k-new".into(),
-                role: "implementer".into(),
-                agent_type: "grok".into(),
-                profile_id: None,
-                phase_id: "tasks".into(),
-                task_index: Some(2),
-                is_observed: true,
-                retained_observed: false,
-                cohort_frozen: false,
-                node_outcome: None,
-                latest_task_id: Some("t-new".into()),
-                latest_status: Some("completed".into()),
-                latest_generation: Some(1),
-                summary_validated: Some(true),
-                artifact_digest: None,
-                child_conversation_id: None,
-                reviewed_task_id: None,
-                verdict: None,
-                report_file: None,
-                gate_id: None,
-                gate_cycle: None,
-                replaced_task_id: None,
-                required_for_gate: false,
-                evidence_time: Some(t_new),
-            },
-            WorkflowNodeStateDto {
-                node_id: "active".into(),
-                work_unit_key: "k-act".into(),
-                role: "reviewer".into(),
-                agent_type: "codex".into(),
-                profile_id: None,
-                phase_id: "tasks".into(),
-                task_index: Some(3),
-                is_observed: true,
-                retained_observed: false,
-                cohort_frozen: false,
-                node_outcome: None,
-                latest_task_id: Some("t-act".into()),
-                latest_status: Some("completed".into()),
-                latest_generation: Some(1),
-                summary_validated: Some(false),
-                artifact_digest: None,
-                child_conversation_id: None,
-                reviewed_task_id: None,
-                verdict: None,
-                report_file: None,
-                gate_id: None,
-                gate_cycle: None,
-                replaced_task_id: None,
-                required_for_gate: false,
-                evidence_time: Some(t_active),
-            },
-        ];
-        let active_node_ids = HashSet::from(["active".to_string()]);
-        let truncated = truncate_node_evidence(&mut nodes, 3, &active_node_ids);
-        assert!(truncated);
-        assert_eq!(nodes.len(), 3);
-        assert!(nodes.iter().any(|n| n.node_id == "req"));
-        assert!(nodes.iter().any(|n| n.node_id == "active"));
-        assert!(nodes.iter().any(|n| n.node_id == "new-done"));
-        assert!(!nodes.iter().any(|n| n.node_id == "old-done"));
+        assert!(serde_json::to_value(state)
+            .unwrap()
+            .pointer("/nodes/0/latest_generation")
+            .is_none());
     }
 
     #[tokio::test]
@@ -5751,36 +6276,25 @@ mod tests {
             .await
             .expect("recover score-3 high-risk workflow from the real store");
         assert_eq!(recovery.publication_token, PUBLICATION_TOKEN);
+        assert_eq!(recovery.workflow_state, ManifestWorkflowState::Estimated);
         assert_eq!(recovery.risk_policy_version, "b2d_task_risk_v1");
         assert_eq!(recovery.task_policies.len(), 1);
-
         let policy = &recovery.task_policies[0];
         assert_eq!(policy.task_index, 1);
-        assert_eq!(policy.risk.level, TaskRiskLevel::High);
-        assert!(policy.risk.hard_triggers.is_empty());
-        assert_eq!(policy.risk.score, 3);
-        assert_eq!(policy.risk.reason, RISK_REASON);
+        assert_eq!(policy.level, TaskRiskLevel::High);
+        assert_eq!(recovery.actionable_task_routes.len(), 1);
+        let route = &recovery.actionable_task_routes[0];
+        assert_eq!(route.task_index, 1);
+        assert_eq!(route.level, TaskRiskLevel::High);
+        assert_eq!(route.implementer_node_id, IMPLEMENTER_NODE_ID);
         assert_eq!(
-            policy
-                .risk
-                .soft_signals
-                .iter()
-                .map(|signal| (signal.kind, signal.score))
-                .collect::<Vec<_>>(),
-            vec![
-                (TaskSoftSignalKind::CrossRuntimeOrProcess, 2),
-                (TaskSoftSignalKind::SharedInterface, 1),
-            ]
-        );
-        assert_eq!(policy.route.implementer_node_id, IMPLEMENTER_NODE_ID);
-        assert_eq!(
-            policy.route.reviewer_node_ids,
+            route.reviewer_node_ids,
             vec![CODEX_REVIEWER_NODE_ID, GROK_REVIEWER_NODE_ID]
         );
     }
 
     #[tokio::test]
-    async fn task4_plan_initial_round_persists_derived_state_and_full_recovery() {
+    async fn task4_plan_initial_round_persists_derived_state_and_index_recovery() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = two_reviewer_plan_doc("tok-task4-recovery");
@@ -5989,42 +6503,66 @@ mod tests {
         let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
             .await
             .unwrap();
+        assert_eq!(recovery.workflow_state, ManifestWorkflowState::Estimated);
+        assert_eq!(recovery.detail, WorkflowStateDetail::Index);
         let recovery_json = serde_json::to_value(&recovery).unwrap();
         assert_eq!(
             recovery_json["plan_target_rel_path"],
             serde_json::json!("docs/superpowers/plans/p.md")
         );
         assert_eq!(recovery_json["risk_policy_version"], "b2d_task_risk_v1");
+        assert_eq!(recovery.task_policies.len(), 1);
+        assert_eq!(recovery.task_policies[0].task_index, 1);
+        assert_eq!(recovery.task_policies[0].level, TaskRiskLevel::High);
+        assert_eq!(recovery.actionable_task_routes.len(), 1);
+        assert_eq!(recovery.actionable_task_routes[0].task_index, 1);
         assert_eq!(
-            recovery_json["task_policies"][0]["risk"]["hard_triggers"][0]["evidence"][0],
-            "CAS and gate ordering"
+            recovery.actionable_task_routes[0].implementer_node_id,
+            "task-1-impl"
         );
         assert_eq!(
-            recovery_json["task_policies"][0]["risk"]["soft_signals"][0]["score"],
-            1
+            recovery.actionable_task_routes[0].reviewer_node_ids,
+            vec!["task-1-rev", "task-1-rev-grok"]
+        );
+        let review = recovery.latest_plan_review.as_ref().unwrap();
+        assert_eq!(
+            (
+                review.critical_count,
+                review.important_count,
+                review.minor_count
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(review.next_action, PlanReviewNextAction::ContinueReview);
+        assert_eq!(
+            review.reviewed_reviewer_node_ids,
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
         );
         assert_eq!(
-            recovery_json["task_policies"][0]["route"]["reviewer_node_ids"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
+            review.next_required_reviewer_node_ids,
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
+        );
+        assert_eq!(review.finding_total_count, 3);
+        assert_eq!(review.finding_returned_count, 3);
+        assert!(recovery_json
+            .pointer("/latest_plan_review/findings/0/summary")
+            .is_none());
+        assert_eq!(
+            review
+                .recovery_sources
+                .iter()
+                .map(|source| source.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
         );
         assert_eq!(
-            recovery_json["latest_plan_review"]["findings"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
+            review.recovery_sources[0].child_conversation_id,
+            Some(reviewer_child)
         );
-        assert_eq!(recovery_json["latest_plan_review"]["stagnation_count"], 0);
-        assert_eq!(
-            recovery_json["latest_plan_review"]["reviewed_reviewer_node_ids"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
+        assert!(review
+            .recovery_sources
+            .iter()
+            .all(|source| { source.report_file.is_some() || source.latest_task_id.is_some() }));
         let plan_gate = recovery_json["gates"]
             .as_array()
             .unwrap()
@@ -6045,29 +6583,16 @@ mod tests {
                 .len(),
             2
         );
-        let author = recovery_json["nodes"]
-            .as_array()
-            .unwrap()
+        let author = recovery
+            .nodes
             .iter()
-            .find(|node| node["node_id"] == "plan-author")
+            .find(|node| node.node_id == "plan-author")
             .unwrap();
-        assert_eq!(author["child_conversation_id"], author_child);
-        assert_eq!(author["report_file"], "reports/author-recovery.md");
-        let reviewer = recovery_json["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|node| node["node_id"] == "plan-reviewer-1")
-            .unwrap();
-        assert_eq!(reviewer["child_conversation_id"], reviewer_child);
-        assert_eq!(reviewer["reviewed_task_id"], "author-task-recovery");
-        assert_eq!(reviewer["verdict"], "request_changes");
-        assert_eq!(reviewer["report_file"], "reports/reviewer-1.md");
-        assert!(recovery_json["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|node| node["cohort_frozen"] == true));
+        assert_eq!(author.child_conversation_id, Some(author_child));
+        assert_eq!(
+            author.report_file.as_deref(),
+            Some("reports/author-recovery.md")
+        );
 
         let graph = crate::acp::delegation::workflow::project_workflow_graph_core(&db, parent)
             .await
