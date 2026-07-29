@@ -86,6 +86,13 @@ type ActiveConversationRecord = {
   fallbackTimer: ReturnType<typeof setTimeout> | null
 }
 
+type RefreshApplyOutcome =
+  | "applied"
+  | "newer_revision"
+  | "soft_absent"
+  | "failed"
+  | "stale_generation"
+
 type WorkflowGraphState = {
   byConversationId: Map<number, ConversationGraphEntry>
   /**
@@ -102,7 +109,7 @@ type WorkflowGraphState = {
     conversationId: number,
     snapshot: WorkflowGraphSnapshot | null,
     requestGeneration: number
-  ) => void
+  ) => RefreshApplyOutcome
   handleGraphChanged: (payload: WorkflowGraphChangedPayload) => void
   handleCompatibilityNudge: (payload: WorkflowCompatibilityNudgePayload) => void
   /** Acquire live workflow interest and return an idempotent cleanup lease. */
@@ -117,6 +124,8 @@ type WorkflowGraphState = {
 
 const FIXED_PHASES: PhaseRailKind[] = ["design", "plan", "tasks", "final"]
 const EVENT_READINESS_TIMEOUT_MS = 5_000
+const FALLBACK_REFRESH_MS = 10 * 60 * 1_000
+const SOFT_ABSENCE_ERROR = "Workflow graph snapshot unavailable"
 
 function emptyEntry(): ConversationGraphEntry {
   return {
@@ -139,8 +148,8 @@ function revisionOf(snapshot: WorkflowGraphSnapshot | null): number | null {
  * Whether `incoming` should replace `current` under the graph_revision clock.
  * Observed-only (null revision) always replaces when the apply is generation-
  * gated by the caller; here null vs number: a numbered revision wins over null
- * only when applying a numbered snapshot; a null snapshot clears only if the
- * caller is authoritative (detail clear / successful empty fetch).
+ * only when applying a numbered snapshot. Null transport responses are
+ * classified separately so an existing graph can be retained as soft-absent.
  */
 function isStaleByRevision(
   currentRev: number | null,
@@ -279,13 +288,19 @@ async function fetchAndApply(
   get: () => WorkflowGraphState,
   conversationId: number,
   requestGeneration: number
-): Promise<void> {
+): Promise<RefreshApplyOutcome> {
   try {
     const snapshot = await getWorkflowGraphSnapshot(conversationId)
-    get().applyFetchedSnapshot(conversationId, snapshot, requestGeneration)
+    return get().applyFetchedSnapshot(
+      conversationId,
+      snapshot,
+      requestGeneration
+    )
   } catch (err: unknown) {
     const entry = get().getEntry(conversationId) ?? emptyEntry()
-    if (entry.requestGeneration !== requestGeneration) return
+    if (entry.requestGeneration !== requestGeneration) {
+      return "stale_generation"
+    }
     const message =
       err instanceof Error ? err.message : "Failed to load workflow graph"
     useWorkflowGraphStore.setState((state) => ({
@@ -296,7 +311,49 @@ async function fetchAndApply(
         error: message,
       }),
     }))
+    return "failed"
   }
+}
+
+async function runRefresh(
+  get: () => WorkflowGraphState,
+  conversationId: number,
+  activationEpoch: number
+): Promise<void> {
+  if (!isActiveEpoch(conversationId, activationEpoch)) return
+  const active = activeConversations.get(conversationId)
+  if (!active) return
+
+  clearFallbackTimer(active)
+  const current = get().getEntry(conversationId) ?? emptyEntry()
+  const requestGeneration = current.requestGeneration + 1
+  useWorkflowGraphStore.setState((state) => ({
+    byConversationId: mapSetEntry(state.byConversationId, conversationId, {
+      ...current,
+      requestGeneration,
+      inFlightGeneration: requestGeneration,
+      loading: true,
+      error: null,
+    }),
+  }))
+
+  const outcome = await fetchAndApply(get, conversationId, requestGeneration)
+  if (outcome === "stale_generation") return
+
+  const completed = get().getEntry(conversationId)
+  if (
+    completed?.requestGeneration !== requestGeneration ||
+    !isActiveEpoch(conversationId, activationEpoch)
+  ) {
+    return
+  }
+
+  const currentActive = activeConversations.get(conversationId)
+  if (!currentActive || currentActive.epoch !== activationEpoch) return
+  currentActive.fallbackTimer = setTimeout(() => {
+    if (!isActiveEpoch(conversationId, activationEpoch)) return
+    void get().refresh(conversationId)
+  }, FALLBACK_REFRESH_MS)
 }
 
 export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
@@ -315,7 +372,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
       return
     }
     // Soft-fail / projector omission on detail must not wipe a live numbered
-    // graph. Explicit empty fetches go through applyFetchedSnapshot instead.
+    // graph. Transport absence is classified by applyFetchedSnapshot instead.
     if (snapshot == null && current.snapshot != null) {
       return
     }
@@ -334,7 +391,21 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   applyFetchedSnapshot: (conversationId, snapshot, requestGeneration) => {
     const current = get().getEntry(conversationId) ?? emptyEntry()
     // Discard if a newer request superseded this one (nudge / graph-changed).
-    if (requestGeneration !== current.requestGeneration) return
+    if (requestGeneration !== current.requestGeneration) {
+      return "stale_generation"
+    }
+
+    if (snapshot == null && current.snapshot != null) {
+      set((state) => ({
+        byConversationId: mapSetEntry(state.byConversationId, conversationId, {
+          ...current,
+          inFlightGeneration: null,
+          loading: false,
+          error: SOFT_ABSENCE_ERROR,
+        }),
+      }))
+      return "soft_absent"
+    }
 
     const incomingRev = revisionOf(snapshot)
     if (isStaleByRevision(current.appliedGraphRevision, incomingRev)) {
@@ -343,9 +414,10 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
           ...current,
           inFlightGeneration: null,
           loading: false,
+          error: null,
         }),
       }))
-      return
+      return "newer_revision"
     }
 
     set((state) => ({
@@ -358,6 +430,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
         error: null,
       }),
     }))
+    return "applied"
   },
 
   handleGraphChanged: (payload) => {
@@ -371,34 +444,13 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
     ) {
       return
     }
-    const nextGen = current.requestGeneration + 1
-    set((state) => ({
-      byConversationId: mapSetEntry(state.byConversationId, conversationId, {
-        ...current,
-        requestGeneration: nextGen,
-        inFlightGeneration: nextGen,
-        loading: true,
-        error: null,
-      }),
-    }))
-    void fetchAndApply(get, conversationId, nextGen)
+    void get().refresh(conversationId)
   },
 
   handleCompatibilityNudge: (payload) => {
     const conversationId = payload.parent_conversation_id
     if (!activeConversations.has(conversationId)) return
-    const current = get().getEntry(conversationId) ?? emptyEntry()
-    const nextGen = current.requestGeneration + 1
-    set((state) => ({
-      byConversationId: mapSetEntry(state.byConversationId, conversationId, {
-        ...current,
-        requestGeneration: nextGen,
-        inFlightGeneration: nextGen,
-        loading: true,
-        error: null,
-      }),
-    }))
-    void fetchAndApply(get, conversationId, nextGen)
+    void get().refresh(conversationId)
   },
 
   activateConversation: (conversationId) => {
@@ -454,19 +506,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   refresh: async (conversationId) => {
     const active = activeConversations.get(conversationId)
     if (!active || active.count <= 0) return
-    clearFallbackTimer(active)
-    const current = get().getEntry(conversationId) ?? emptyEntry()
-    const nextGen = current.requestGeneration + 1
-    set((state) => ({
-      byConversationId: mapSetEntry(state.byConversationId, conversationId, {
-        ...current,
-        requestGeneration: nextGen,
-        inFlightGeneration: nextGen,
-        loading: true,
-        error: null,
-      }),
-    }))
-    await fetchAndApply(get, conversationId, nextGen)
+    await runRefresh(get, conversationId, active.epoch)
   },
 
   getEntry: (conversationId) => get().byConversationId.get(conversationId),
