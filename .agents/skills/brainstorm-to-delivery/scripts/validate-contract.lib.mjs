@@ -22,6 +22,18 @@ const REQUIRED = [
   [/artifact_digest/, "artifact_digest"],
 ]
 
+const RECOVERY_REQUIRED = [
+  [/recovery_sources/, "recovery_sources"],
+  [/actionable_task_routes/, "actionable_task_routes"],
+  [/report_file/, "report_file"],
+  [/get_session_info/, "get_session_info"],
+  [/get_delegation_status/, "get_delegation_status"],
+  [
+    /inline finding summaries/i,
+    "inline finding summaries compatibility warning",
+  ],
+]
+
 /**
  * Isolate the numbered Task route section (`## 4. Task route` or `## Task route`).
  * Returns null when the section is missing.
@@ -843,6 +855,14 @@ export function validateSkillMarkdown(skill) {
   for (const [re, label] of REQUIRED) {
     if (!re.test(skill)) {
       fail(`missing required term: ${label}`)
+    } else {
+      pass(`has ${label}`)
+    }
+  }
+
+  for (const [re, label] of RECOVERY_REQUIRED) {
+    if (!re.test(skill)) {
+      fail(`missing required recovery term: ${label}`)
     } else {
       pass(`has ${label}`)
     }

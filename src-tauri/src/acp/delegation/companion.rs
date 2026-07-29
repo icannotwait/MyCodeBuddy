@@ -4413,6 +4413,37 @@ mod tests {
             .any(|value| value == "evidence"));
     }
 
+    #[test]
+    fn get_workflow_state_schema_describes_index_recovery() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+        let state = schema
+            .as_array()
+            .expect("tool catalog array")
+            .iter()
+            .find(|tool| tool["name"] == "get_workflow_state")
+            .expect("get_workflow_state tool");
+
+        assert_eq!(
+            state["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string" },
+                    "detail": { "type": "string", "enum": ["index"], "default": "index" }
+                }
+            })
+        );
+        let description = state["description"].as_str().expect("tool description");
+        for phrase in [
+            "compact workflow index",
+            "report_file",
+            "get_session_info",
+            "get_delegation_status",
+        ] {
+            assert!(description.contains(phrase), "missing {phrase}");
+        }
+    }
+
     #[tokio::test]
     async fn tools_list_hides_feedback_when_disabled() {
         // Default ctx is delegation-only: check_user_feedback must not appear.

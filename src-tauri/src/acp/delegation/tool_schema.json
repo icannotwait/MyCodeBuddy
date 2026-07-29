@@ -62,7 +62,7 @@
   },
   {
     "name": "continue_delegation",
-    "description": "Continue a prior terminal child run on the same external session. ASYNCHRONOUS: returns a new task_id immediately. Provide prior task_id and full revision prompt. Never creates a new child; resume/load only. Join with get_delegation_status like delegate_to_agent.",
+    "description": "Continue a terminal child asynchronously. Pass prior task_id and full revision context; never creates a child. Join with get_delegation_status.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "task", "correlation_id"],
@@ -254,22 +254,23 @@
   },
   {
     "name": "get_workflow_capabilities",
-    "description": "Local workflow_manifest_v2 discovery.",
+    "description": "Discover workflow_manifest_v2.",
     "inputSchema": { "type": "object", "properties": {} }
   },
   {
     "name": "get_workflow_state",
-    "description": "Load durable workflow recovery state. Optional workflow_id.",
+    "description": "Load compact workflow index. Read plan/design/report_file for prose; use get_session_info/get_delegation_status for child/run detail.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "workflow_id": { "type": "string" }
+        "workflow_id": { "type": "string" },
+        "detail": { "type": "string", "enum": ["index"], "default": "index" }
       }
     }
   },
   {
     "name": "publish_workflow_manifest",
-    "description": "Publish/CAS v2 brainstorm_to_delivery; Rust validates nested fields.",
+    "description": "Publish/CAS v2 workflow manifest; Rust validates nested fields.",
     "inputSchema": {
       "type": "object",
       "required": [
