@@ -57,6 +57,36 @@
 - `StatusBarSessionModel` at `src/components/layout/status-bar-session-model.tsx:108` renders the resolved values as `model · thinkingLevel`; no display-layer code is missing.
 - Baseline focused verification on 2026-07-30: `pnpm exec vitest run src/stores/turn-metadata-patches.test.ts src/components/conversations/active-session-details.test.ts src/lib/status-bar-session-model.test.ts` passes 35 tests across 3 files.
 
+## Risk Policy
+
+Policy version: `b2d_task_risk_v1`
+
+Hard triggers always route high: `concurrency_lifecycle`,
+`security_trust_boundary`, `migration_destructive_persistence`,
+`public_compatibility`, `unsafe_ffi`, `update_rollback`.
+
+When no hard trigger is active, sum distinct evidence-backed soft signals:
+`cross_runtime_or_process=2`; `broad_production_surface=1`;
+`multiple_ownership_modules=1`; `shared_interface=1`;
+`dependency_or_build=1`; `multi_layer_without_test_seam=1`. A total of 3 or
+more routes high; 0-2 routes normal.
+
+Plan reviewer cohort for the material revision's later plan-review gate (the
+author does not self-review):
+
+`plan|docs/superpowers/plans/2026-07-28-codex-archived-turn-effort-status.md|reviewer|codex|none`
+
+## Task Routing Matrix
+
+| Task | Planned production surface / files-modules | Hard triggers (evidence) | Soft signals (score parts) | Soft total | Final level + reason | Implementer | Reviewer set | Policy version |
+|---|---|---|---|---:|---|---|---|---|
+| 1 | One frontend module: `src/stores/conversation-runtime-store.ts` patch type + pure alignment helper; one colocated store test file | None: no scheduling, cancellation, retry lifecycle, trust boundary, persistence, FFI, updater, or rollback behavior changes; history slicing and timer control flow remain unchanged. `public_compatibility` is not active because `TurnMetadataPatch` is an in-repository helper/test export, the new field is optional and additive, and no package, transport, parser, database, or serialized contract changes. | `shared_interface=1`: adds one optional field to exported `TurnMetadataPatch` and its internal action mirror. `cross_runtime_or_process=0`: parsed data is already in frontend memory. `broad_production_surface=0`: one helper branch. `multiple_ownership_modules=0`: one production module. `dependency_or_build=0`: no package/config change. `multi_layer_without_test_seam=0`: `computeTurnMetadataPatches` is directly unit tested. | 1 | normal: no hard trigger and soft total 1 | Grok | Independent Codex reviewer (not the author) | `b2d_task_risk_v1` |
+| 2 | One frontend module: `src/stores/conversation-runtime-store.ts` reducer branch; integration assertions in `src/stores/turn-metadata-patches.test.ts`; existing status resolvers are read-only consumers | None: the existing post-turn timer/retry lifecycle is invoked by tests but not modified; no security, persistence, compatibility, FFI, update, or rollback surface changes. | `shared_interface=1`: the reducer consumes Task 1's optional patch field and updates the shared `ConversationRuntimeSession.localTurns` turn shape. `cross_runtime_or_process=0`: mocked archive results enter through the existing API. `broad_production_surface=0`: only `PATCH_TURN_METADATA`. `multiple_ownership_modules=0`: no status production module edit. `dependency_or_build=0`: no dependency/config change. `multi_layer_without_test_seam=0`: the public `syncTurnMetadata` action plus pure status resolvers form an existing test seam. | 1 | normal: no hard trigger and soft total 1 | Grok | Independent Codex reviewer (not the author) | `b2d_task_risk_v1` |
+
+Implementation admission rule: classify each task from this matrix before work
+begins. A task reviewer must be independent of both the Plan Author and that
+task's implementer.
+
 ---
 
 ### Task 1: Carry Archived Effort Through Turn Alignment
@@ -587,6 +617,7 @@ Grok bridge design edit recorded in Global Constraints.
 - [x] Placeholder scan: every code-changing step contains concrete TypeScript, exact paths, commands, expected outcomes, and commit commands.
 - [x] Type consistency: `reasoning_effort?: string | null` matches `MessageTurn`, `TurnMetadataPatch`, the internal action payload, reducer input, and local turn output.
 - [x] Scope consistency: no parser, ACP selector, summary, status component, visual, layout, localization, Rust, dependency, or build configuration edit is planned.
+- [x] Routing consistency: both tasks have no hard trigger, soft total 1, Grok implementer, and independent Codex reviewer under `b2d_task_risk_v1`.
 
 This plan ends at the implementation boundary. Execute it using the
 user-selected workflow from the handoff: subagent-driven task execution or
