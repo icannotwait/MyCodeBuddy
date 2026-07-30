@@ -22,7 +22,9 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::types::{cold_task_report_message, DelegationTaskReport, TaskStatus};
+use crate::acp::termination::DelegationTerminationAuditV1;
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
+use crate::db::entities::delegation_task_run::DelegationRunStatus;
 use crate::db::AppDatabase;
 use crate::models::AgentType;
 
@@ -111,8 +113,9 @@ pub struct TerminalTaskWrite {
     pub runtime_stats: Option<DelegationRuntimeStats>,
     /// Optional validated card summary JSON (frontend display only).
     pub card_summary_json: Option<String>,
-    /// Optional structured termination audit JSON (host_restarted provenance).
-    pub termination_audit_json: Option<String>,
+    /// Typed termination evidence. Serialization is owned by RunStore while
+    /// the terminal CAS transaction is active.
+    termination_evidence: Option<DelegationTerminationAuditV1>,
 }
 
 impl TerminalTaskWrite {
@@ -124,40 +127,76 @@ impl TerminalTaskWrite {
             conversation_status,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: None,
         }
     }
 
     pub fn failed(
         error_code: impl Into<String>,
         finished_at: DateTime<Utc>,
-        conversation_status: ConversationStatus,
+        _conversation_status: ConversationStatus,
+    ) -> Self {
+        let error_code = error_code.into();
+        let evidence = DelegationTerminationAuditV1::for_terminal_code(
+            &error_code,
+            DelegationRunStatus::Running,
+            true,
+            finished_at,
+        );
+        Self::failed_with_evidence(error_code, finished_at, evidence)
+    }
+
+    pub fn failed_with_evidence(
+        error_code: impl Into<String>,
+        finished_at: DateTime<Utc>,
+        evidence: DelegationTerminationAuditV1,
     ) -> Self {
         Self {
             status: TaskStatus::Failed,
             error_code: Some(error_code.into()),
             finished_at,
-            conversation_status,
+            conversation_status: ConversationStatus::Cancelled,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: Some(evidence),
         }
     }
 
     pub fn canceled(
         error_code: impl Into<String>,
         finished_at: DateTime<Utc>,
-        conversation_status: ConversationStatus,
+        evidence: DelegationTerminationAuditV1,
     ) -> Self {
         Self {
             status: TaskStatus::Canceled,
             error_code: Some(error_code.into()),
             finished_at,
-            conversation_status,
+            conversation_status: ConversationStatus::Cancelled,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: Some(evidence),
         }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn legacy_without_audit(status: TaskStatus, error_code: Option<String>) -> Self {
+        Self {
+            status,
+            error_code,
+            finished_at: Utc::now(),
+            conversation_status: if status == TaskStatus::Completed {
+                ConversationStatus::PendingReview
+            } else {
+                ConversationStatus::Cancelled
+            },
+            runtime_stats: None,
+            card_summary_json: None,
+            termination_evidence: None,
+        }
+    }
+
+    pub fn termination_evidence(&self) -> Option<&DelegationTerminationAuditV1> {
+        self.termination_evidence.as_ref()
     }
 
     pub fn with_runtime_stats(mut self, stats: DelegationRuntimeStats) -> Self {
@@ -168,22 +207,6 @@ impl TerminalTaskWrite {
     pub fn with_card_summary_json(mut self, json: impl Into<String>) -> Self {
         self.card_summary_json = Some(json.into());
         self
-    }
-
-    pub fn with_termination_audit_json(mut self, json: impl Into<String>) -> Self {
-        self.termination_audit_json = Some(json.into());
-        self
-    }
-
-    fn to_persisted_status(&self) -> Result<DelegationTaskStatus, TaskStoreError> {
-        match self.status {
-            TaskStatus::Completed => Ok(DelegationTaskStatus::Completed),
-            TaskStatus::Failed => Ok(DelegationTaskStatus::Failed),
-            TaskStatus::Canceled => Ok(DelegationTaskStatus::Canceled),
-            TaskStatus::Running | TaskStatus::Unknown => Err(TaskStoreError::Permanent(
-                "terminal write must not use running/unknown status".into(),
-            )),
-        }
     }
 }
 
@@ -862,90 +885,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         }
 
         // Legacy conversation-only CAS (gen-1 before live run inserts).
-        let persisted_status = terminal.to_persisted_status()?;
-        let mut update = conversation::Entity::update_many()
-            .col_expr(
-                conversation::Column::DelegationTaskStatus,
-                sea_orm::sea_query::Expr::value(persisted_status),
-            )
-            .col_expr(
-                conversation::Column::DelegationErrorCode,
-                sea_orm::sea_query::Expr::value(terminal.error_code.clone()),
-            )
-            .col_expr(
-                conversation::Column::DelegationFinishedAt,
-                sea_orm::sea_query::Expr::value(terminal.finished_at),
-            )
-            .col_expr(
-                conversation::Column::Status,
-                sea_orm::sea_query::Expr::value(terminal.conversation_status.clone()),
-            )
-            .col_expr(
-                conversation::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
-            );
+        let won = self
+            .runs
+            .settle_legacy_conversation_terminal(task_id, &terminal)
+            .await?;
 
-        // Optional final runtime snapshot in the same CAS update.
-        if let Some(ref stats) = terminal.runtime_stats {
-            let tool_call_count = i64::try_from(stats.tool_call_count).map_err(|_| {
-                TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into())
-            })?;
-            let edit_tool_call_count = i64::try_from(stats.edit_tool_call_count).map_err(|_| {
-                TaskStoreError::Permanent("runtime edit_tool_call_count exceeds i64".into())
-            })?;
-            let additions = stats
-                .additions
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| TaskStoreError::Permanent("runtime additions exceeds i64".into()))?;
-            let deletions = stats
-                .deletions
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| TaskStoreError::Permanent("runtime deletions exceeds i64".into()))?;
-            let touched_files_json =
-                serde_json::to_string(&stats.touched_files).map_err(|err| {
-                    TaskStoreError::Permanent(format!("serialize touched_files failed: {err}"))
-                })?;
-            update = update
-                .col_expr(
-                    conversation::Column::DelegationToolCallCount,
-                    sea_orm::sea_query::Expr::value(tool_call_count),
-                )
-                .col_expr(
-                    conversation::Column::DelegationEditToolCallCount,
-                    sea_orm::sea_query::Expr::value(edit_tool_call_count),
-                )
-                .col_expr(
-                    conversation::Column::DelegationTouchedFilesJson,
-                    sea_orm::sea_query::Expr::value(touched_files_json),
-                )
-                .col_expr(
-                    conversation::Column::DelegationTouchedFilesTruncated,
-                    sea_orm::sea_query::Expr::value(stats.touched_files_truncated),
-                )
-                .col_expr(
-                    conversation::Column::DelegationAdditions,
-                    sea_orm::sea_query::Expr::value(additions),
-                )
-                .col_expr(
-                    conversation::Column::DelegationDeletions,
-                    sea_orm::sea_query::Expr::value(deletions),
-                )
-                .col_expr(
-                    conversation::Column::DelegationLineCountsComplete,
-                    sea_orm::sea_query::Expr::value(stats.line_counts_complete),
-                );
-        }
-
-        let result = update
-            .filter(conversation::Column::DelegationCallId.eq(task_id))
-            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
-            .exec(&self.db().conn)
-            .await
-            .map_err(Self::map_db_err)?;
-
-        if result.rows_affected > 0 {
+        if won {
             let row = self
                 .load(task_id)
                 .await?
@@ -970,7 +915,6 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         use crate::db::entities::conversation::ConversationKind;
         use crate::db::entities::delegation_task_run;
         use crate::db::service::conversation_service;
-        use sea_orm::sea_query::Expr;
 
         // Authoritative: settle non-terminal run rows (+ monotonic projection).
         let from_runs = self.runs.reconcile_non_terminal(at).await?;
@@ -1041,32 +985,38 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         // Live rows only: never rewrite soft-deleted historical orphans (e.g.
         // pre-Task-5 provisional shells still projecting `running`) to
         // `host_restarted`. Runtime compensation and Task 6 migration own those.
-        let result = conversation::Entity::update_many()
-            .col_expr(
-                conversation::Column::DelegationTaskStatus,
-                Expr::value(DelegationTaskStatus::Failed),
-            )
-            .col_expr(
-                conversation::Column::DelegationErrorCode,
-                Expr::value("host_restarted"),
-            )
-            .col_expr(conversation::Column::DelegationFinishedAt, Expr::value(at))
-            .col_expr(
-                conversation::Column::Status,
-                Expr::value(ConversationStatus::Cancelled),
-            )
-            .col_expr(conversation::Column::UpdatedAt, Expr::value(at))
+        let remaining = conversation::Entity::find()
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
             .filter(conversation::Column::DeletedAt.is_null())
-            .exec(&self.db().conn)
+            .all(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
+        let mut legacy_settled = 0u64;
+        for row in remaining {
+            let Some(task_id) = row.delegation_call_id.as_deref() else {
+                continue;
+            };
+            let audit = DelegationTerminationAuditV1::for_terminal_code(
+                "host_restarted",
+                DelegationRunStatus::Running,
+                row.external_id.is_some(),
+                at,
+            );
+            let terminal = TerminalTaskWrite::failed_with_evidence("host_restarted", at, audit);
+            if self
+                .runs
+                .settle_legacy_conversation_terminal(task_id, &terminal)
+                .await?
+            {
+                legacy_settled = legacy_settled.saturating_add(1);
+            }
+        }
 
         // Conversation fallback may re-touch rows already projected by run
         // settle; count only run settlements as authoritative increments and
         // still report conversation rows_affected + provisional cleanups.
         Ok(from_runs
-            .saturating_add(result.rows_affected)
+            .saturating_add(legacy_settled)
             .saturating_add(provisional_cleaned))
     }
 
@@ -1912,10 +1862,9 @@ mod tests {
                         Utc::now(),
                         ConversationStatus::Cancelled,
                     ),
-                    DelegationTaskStatus::Canceled => TerminalTaskWrite::canceled(
-                        "usercancel",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                    DelegationTaskStatus::Canceled => TerminalTaskWrite::legacy_without_audit(
+                        TaskStatus::Canceled,
+                        Some("usercancel".into()),
                     ),
                     DelegationTaskStatus::Running => unreachable!(),
                 };
@@ -1930,8 +1879,10 @@ mod tests {
         let db = test_store_with_running_task("task-1").await;
         let store = DbDelegationTaskStore::new(db.clone());
         let completed = TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview);
-        let canceled =
-            TerminalTaskWrite::canceled("usercancel", Utc::now(), ConversationStatus::Cancelled);
+        let canceled = TerminalTaskWrite::legacy_without_audit(
+            TaskStatus::Canceled,
+            Some("usercancel".into()),
+        );
 
         let (a, b) = tokio::join!(
             store.settle("task-1", completed),

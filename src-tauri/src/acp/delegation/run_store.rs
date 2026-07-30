@@ -36,6 +36,11 @@ use crate::acp::delegation::workflow::{
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
     WorkflowTxnSideEffect,
 };
+use crate::acp::termination::{
+    parse_delegation_termination, AcpTerminationClassification, AcpTerminationReason,
+    AcpTerminationSource, AcpTerminationSummaryV1, DelegationTerminationAuditV1,
+    ParsedDelegationTermination, TERMINATION_AUDIT_VERSION,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::entities::delegation_lineage_budget::{self, Entity as LineageBudget};
 use crate::db::entities::delegation_task_run::{
@@ -65,45 +70,50 @@ fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Minimal structured termination audit for startup host_restarted settlement.
-/// Preserves enough provenance for continuability: prior non-terminal status
-/// and admission_class (reserving inherits class; running → unexpected_continue).
 fn host_restarted_termination_audit(
-    prior_status: &DelegationRunStatus,
-    admission_class: AdmissionClass,
-) -> String {
-    let prior = match prior_status {
-        DelegationRunStatus::Reserving => "reserving",
-        DelegationRunStatus::Running => "running",
-        DelegationRunStatus::Completed => "completed",
-        DelegationRunStatus::Failed => "failed",
-        DelegationRunStatus::Canceled => "canceled",
-    };
-    let class = match admission_class {
-        AdmissionClass::NormalRevision => "normal_revision",
-        AdmissionClass::UnexpectedContinue => "unexpected_continue",
-        AdmissionClass::Replacement => "replacement",
-    };
-    serde_json::json!({
-        "version": 1,
-        "source": "host_restart",
-        "reason": "host_restarted",
-        "prior_status": prior,
-        "admission_class": class,
-    })
-    .to_string()
+    row: &delegation_task_run::Model,
+    reason: AcpTerminationReason,
+    classification: AcpTerminationClassification,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+) -> DelegationTerminationAuditV1 {
+    DelegationTerminationAuditV1::new(
+        AcpTerminationSummaryV1::new(
+            AcpTerminationSource::HostRestart,
+            reason,
+            classification,
+            prompt_may_have_executed,
+            observed_at,
+        ),
+        row.status.clone(),
+        row.admission_class.clone(),
+        row.parent_tool_use_id.clone(),
+        row.child_connection_id.clone(),
+    )
 }
 
-fn host_restarted_bound_reserving_audit() -> String {
-    serde_json::json!({
-        "version": 1,
-        "source": "host_restart",
-        "reason": "admission_unknown",
-        "prior_status": "reserving",
-        "restart_provenance": "bound_reserving",
-        "note": "child_connection_id was bound; prompt may have been accepted before restart"
-    })
-    .to_string()
+fn serialize_termination_evidence(
+    evidence: Option<&DelegationTerminationAuditV1>,
+    row: &delegation_task_run::Model,
+    prior_status: DelegationRunStatus,
+) -> Result<Option<String>, TaskStoreError> {
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    if evidence.termination.version != TERMINATION_AUDIT_VERSION {
+        return Err(TaskStoreError::Permanent(format!(
+            "termination audit version {} is unsupported",
+            evidence.termination.version
+        )));
+    }
+    let mut canonical = evidence.clone();
+    canonical.prior_status = prior_status;
+    canonical.admission_class = row.admission_class.clone();
+    canonical.parent_tool_use_id = row.parent_tool_use_id.clone();
+    canonical.child_connection_id = row.child_connection_id.clone();
+    serde_json::to_string(&canonical)
+        .map(Some)
+        .map_err(|err| TaskStoreError::Permanent(format!("serialize termination audit: {err}")))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -249,6 +259,8 @@ pub struct ConversationProjection {
     /// Nested Option: outer Some = write; inner Some = value, inner None = clear / NULL.
     pub finished_at: Option<Option<DateTime<Utc>>>,
     pub conversation_status: Option<ConversationStatus>,
+    /// Typed terminal audit serialized by RunStore inside the terminal transaction.
+    pub last_termination_audit_json: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     /// Optional runtime rollup fields projected onto conversation columns.
     pub tool_call_count: Option<i64>,
@@ -598,14 +610,7 @@ pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision 
             }
         }
         DelegationRunStatus::Canceled => {
-            if e.reached_running
-                && (is_unexpected_cancellation_audit(e.termination_audit_json.as_deref())
-                    // Parent connection loss is not an explicit cancel of the
-                    // work unit. Parent-end cascade historically leaves
-                    // termination_audit_json NULL, so match the durable
-                    // error_code (see is_recoverable_parent_disconnect).
-                    || is_recoverable_parent_disconnect(e.error_code.as_deref()))
-            {
+            if e.reached_running && is_unexpected_cancellation(e) {
                 ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
             } else {
                 ContinueDecision::NotContinuable
@@ -665,39 +670,35 @@ fn is_noncontinuable_lineage_stuck_code(code: Option<&str>) -> bool {
 }
 
 fn is_host_restarted_reserving_audit(audit: Option<&str>) -> bool {
-    let Some(raw) = audit else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    v.get("source").and_then(|s| s.as_str()) == Some("host_restart")
-        && v.get("reason").and_then(|s| s.as_str()) == Some("host_restarted")
-        && v.get("prior_status").and_then(|s| s.as_str()) == Some("reserving")
+    matches!(
+        parse_delegation_termination(
+            DelegationRunStatus::Failed,
+            Some("host_restarted"),
+            false,
+            audit,
+        ),
+        ParsedDelegationTermination::Typed(DelegationTerminationAuditV1 {
+            termination: AcpTerminationSummaryV1 {
+                source: AcpTerminationSource::HostRestart,
+                reason: AcpTerminationReason::HostRestarted,
+                ..
+            },
+            prior_status: DelegationRunStatus::Reserving,
+            ..
+        })
+    )
 }
 
 /// Structured termination audit identifies unexpected cancel/recovery.
-fn is_unexpected_cancellation_audit(audit: Option<&str>) -> bool {
-    let Some(raw) = audit else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    let source = v.get("source").and_then(|s| s.as_str()).unwrap_or("");
-    let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-    let prior = v.get("prior_status").and_then(|s| s.as_str()).unwrap_or("");
-    // Host restart is recoverable only after the prior prompt was durable-running.
-    if source == "host_restart" && prior == "running" && reason == "host_restarted" {
-        return true;
-    }
-    matches!(
-        source,
-        "transport_disconnect" | "process_exit" | "session_loss" | "interrupted"
-    ) && matches!(
-        reason,
-        "transport_disconnect" | "session_loss" | "interrupted" | "process_exit"
-    )
+fn is_unexpected_cancellation(e: &ContinueEligibility) -> bool {
+    let parsed = parse_delegation_termination(
+        e.run_status.clone(),
+        e.error_code.as_deref(),
+        e.reached_running,
+        e.termination_audit_json.as_deref(),
+    );
+    matches!(parsed, ParsedDelegationTermination::LegacyParentDisconnect)
+        || parsed.is_automatic_unexpected_termination()
 }
 
 /// Allowed `replacement_reason` values for `delegate_to_agent` recovery.
@@ -1628,6 +1629,9 @@ pub struct RunStore {
     /// BUSY). Observability only — does **not** gate promote admission.
     #[cfg(any(test, feature = "test-utils"))]
     identity_load_fail: std::sync::atomic::AtomicBool,
+    /// Test-only: fail after the run CAS write and before child projection.
+    #[cfg(any(test, feature = "test-utils"))]
+    terminal_transaction_fail: std::sync::atomic::AtomicBool,
 }
 
 /// Bound for test-only RunStore settle / continue-admission gate release waits.
@@ -1663,6 +1667,8 @@ impl RunStore {
             promote_claim_gate: tokio::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             identity_load_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            terminal_transaction_fail: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1696,6 +1702,12 @@ impl RunStore {
 
     pub fn db(&self) -> &Arc<AppDatabase> {
         &self.db
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn inject_terminal_transaction_failure(&self, fail: bool) {
+        self.terminal_transaction_fail
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test-only settle race gate.
@@ -2597,7 +2609,7 @@ impl RunStore {
         let error_code = terminal.error_code.clone();
         let conversation_status = terminal.conversation_status.clone();
         let card_summary_json = terminal.card_summary_json.clone();
-        let termination_audit_json = terminal.termination_audit_json.clone();
+        let termination_evidence = terminal.termination_evidence().cloned();
         let expected = expected_child_connection_id.to_string();
         let final_stats = match terminal.runtime_stats.as_ref() {
             Some(stats) => Some(encoded_runtime_stats(stats)?),
@@ -2612,7 +2624,7 @@ impl RunStore {
                 let error_code = error_code.clone();
                 let conversation_status = conversation_status.clone();
                 let card_summary_json = card_summary_json.clone();
-                let termination_audit_json = termination_audit_json.clone();
+                let termination_evidence = termination_evidence.clone();
                 let final_stats = final_stats.clone();
                 let expected = expected.clone();
                 Box::pin(async move {
@@ -2633,12 +2645,6 @@ impl RunStore {
                         update = update.col_expr(
                             delegation_task_run::Column::CardSummaryJson,
                             Expr::value(summary.clone()),
-                        );
-                    }
-                    if let Some(ref audit) = termination_audit_json {
-                        update = update.col_expr(
-                            delegation_task_run::Column::TerminationAuditJson,
-                            Expr::value(audit.clone()),
                         );
                     }
                     if let Some(ref stats) = final_stats {
@@ -2691,6 +2697,22 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?
                         .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                    let termination_audit_json = serialize_termination_evidence(
+                        termination_evidence.as_ref(),
+                        &won,
+                        DelegationRunStatus::Reserving,
+                    )?;
+                    if let Some(ref audit) = termination_audit_json {
+                        DelegationTaskRun::update_many()
+                            .col_expr(
+                                delegation_task_run::Column::TerminationAuditJson,
+                                Expr::value(audit.clone()),
+                            )
+                            .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                            .exec(txn)
+                            .await
+                            .map_err(map_db_err)?;
+                    }
                     let generation = won.generation;
                     let child_id = won.child_conversation_id;
                     let mut projection = ConversationProjection {
@@ -2699,6 +2721,7 @@ impl RunStore {
                         error_code: Some(error_code.clone()),
                         finished_at: Some(Some(finished_at)),
                         conversation_status: Some(conversation_status),
+                        last_termination_audit_json: termination_audit_json,
                         started_at: None,
                         tool_call_count: None,
                         edit_tool_call_count: None,
@@ -3122,6 +3145,7 @@ impl RunStore {
                         error_code: Some(None),
                         finished_at: Some(None),
                         conversation_status: Some(ConversationStatus::InProgress),
+                        last_termination_audit_json: None,
                         started_at: Some(prompt_accepted_at),
                         tool_call_count: None,
                         edit_tool_call_count: None,
@@ -3361,11 +3385,17 @@ impl RunStore {
         let error_code = terminal.error_code.clone();
         let conversation_status = terminal.conversation_status.clone();
         let card_summary_json = terminal.card_summary_json.clone();
-        let termination_audit_json = terminal.termination_audit_json.clone();
+        let termination_evidence = terminal.termination_evidence().cloned();
         let final_stats = match terminal.runtime_stats.as_ref() {
             Some(stats) => Some(encoded_runtime_stats(stats)?),
             None => None,
         };
+        #[cfg(any(test, feature = "test-utils"))]
+        let inject_terminal_transaction_failure = self
+            .terminal_transaction_fail
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let inject_terminal_transaction_failure = false;
 
         let outcome = self
             .db
@@ -3375,7 +3405,7 @@ impl RunStore {
                 let error_code = error_code.clone();
                 let conversation_status = conversation_status.clone();
                 let card_summary_json = card_summary_json.clone();
-                let termination_audit_json = termination_audit_json.clone();
+                let termination_evidence = termination_evidence.clone();
                 let final_stats = final_stats.clone();
                 Box::pin(async move {
                     let row = DelegationTaskRun::find_by_id(&task_id)
@@ -3401,6 +3431,12 @@ impl RunStore {
                         DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
                     }
 
+                    let prior_status = row.status.clone();
+                    let termination_audit_json = serialize_termination_evidence(
+                        termination_evidence.as_ref(),
+                        &row,
+                        prior_status,
+                    )?;
                     let generation = row.generation;
                     let child_id = row.child_conversation_id;
                     let parent_id = row.parent_conversation_id;
@@ -3478,12 +3514,19 @@ impl RunStore {
                         ));
                     }
 
+                    if inject_terminal_transaction_failure {
+                        return Err(TaskStoreError::Permanent(
+                            "injected terminal transaction failure".into(),
+                        ));
+                    }
+
                     let mut projection = ConversationProjection {
                         generation,
                         task_status: Some(proj_status),
                         error_code: Some(error_code.clone()),
                         finished_at: Some(Some(finished_at)),
                         conversation_status: Some(conversation_status),
+                        last_termination_audit_json: termination_audit_json.clone(),
                         started_at: None,
                         tool_call_count: None,
                         edit_tool_call_count: None,
@@ -3618,33 +3661,41 @@ impl RunStore {
             .map_err(map_db_err)?;
         let mut n = 0u64;
         for row in rows {
-            let audit = host_restarted_termination_audit(&row.status, row.admission_class);
             let write = match row.status {
                 DelegationRunStatus::Reserving => {
                     if row.child_connection_id.is_some() {
                         // Bound reserving — prompt may have been accepted.
                         // Classify as admission_unknown; explicit replacement
                         // only, never auto-continuable.
-                        let admission_unknown_audit = host_restarted_bound_reserving_audit();
-                        TerminalTaskWrite::failed(
-                            "admission_unknown",
+                        let audit = host_restarted_termination_audit(
+                            &row,
+                            AcpTerminationReason::AdmissionUnknown,
+                            AcpTerminationClassification::AutomatedAmbiguous,
+                            true,
                             at,
-                            ConversationStatus::Cancelled,
-                        )
-                        .with_termination_audit_json(admission_unknown_audit)
+                        );
+                        TerminalTaskWrite::failed_with_evidence("admission_unknown", at, audit)
                     } else {
                         // Unbound reserving — pre-send, safe host_restarted.
-                        TerminalTaskWrite::failed(
-                            "host_restarted",
+                        let audit = host_restarted_termination_audit(
+                            &row,
+                            AcpTerminationReason::HostRestarted,
+                            AcpTerminationClassification::Unexpected,
+                            false,
                             at,
-                            ConversationStatus::Cancelled,
-                        )
-                        .with_termination_audit_json(audit)
+                        );
+                        TerminalTaskWrite::failed_with_evidence("host_restarted", at, audit)
                     }
                 }
                 DelegationRunStatus::Running => {
-                    TerminalTaskWrite::canceled("host_restarted", at, ConversationStatus::Cancelled)
-                        .with_termination_audit_json(audit)
+                    let audit = host_restarted_termination_audit(
+                        &row,
+                        AcpTerminationReason::HostRestarted,
+                        AcpTerminationClassification::Unexpected,
+                        true,
+                        at,
+                    );
+                    TerminalTaskWrite::canceled("host_restarted", at, audit)
                 }
                 _ => continue,
             };
@@ -3794,6 +3845,7 @@ impl RunStore {
                         error_code: None,
                         finished_at: None,
                         conversation_status: None,
+                        last_termination_audit_json: None,
                         started_at: None,
                         tool_call_count: None,
                         edit_tool_call_count: None,
@@ -3817,6 +3869,119 @@ impl RunStore {
             Ok(()) => Ok(()),
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
+        }
+    }
+}
+
+impl RunStore {
+    /// Legacy gen-1 conversation-only settlement. Typed evidence is serialized
+    /// here, while the same transaction owns the terminal CAS and projection.
+    pub async fn settle_legacy_conversation_terminal(
+        &self,
+        task_id: &str,
+        terminal: &TerminalTaskWrite,
+    ) -> Result<bool, TaskStoreError> {
+        let task_status = task_status_to_delegation_task_status(terminal.status)?;
+        let task_id = task_id.to_string();
+        let error_code = terminal.error_code.clone();
+        let finished_at = terminal.finished_at;
+        let conversation_status = terminal.conversation_status.clone();
+        let termination_evidence = terminal.termination_evidence().cloned();
+        let final_stats = terminal
+            .runtime_stats
+            .as_ref()
+            .map(encoded_runtime_stats)
+            .transpose()?;
+
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, bool, TaskStoreError>(|txn| {
+                let task_id = task_id.clone();
+                let error_code = error_code.clone();
+                let conversation_status = conversation_status.clone();
+                let termination_evidence = termination_evidence.clone();
+                let final_stats = final_stats.clone();
+                Box::pin(async move {
+                    let Some(row) = conversation::Entity::find()
+                        .filter(conversation::Column::DelegationCallId.eq(&task_id))
+                        .filter(
+                            conversation::Column::DelegationTaskStatus
+                                .eq(DelegationTaskStatus::Running),
+                        )
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                    else {
+                        return Ok(false);
+                    };
+
+                    let termination_audit_json = match termination_evidence {
+                        Some(mut audit) => {
+                            if audit.termination.version != TERMINATION_AUDIT_VERSION {
+                                return Err(TaskStoreError::Permanent(format!(
+                                    "termination audit version {} is unsupported",
+                                    audit.termination.version
+                                )));
+                            }
+                            audit.prior_status = DelegationRunStatus::Running;
+                            audit.admission_class = AdmissionClass::NormalRevision;
+                            audit.parent_tool_use_id = row.parent_tool_use_id.clone();
+                            audit.child_connection_id = None;
+                            Some(serde_json::to_string(&audit).map_err(|err| {
+                                TaskStoreError::Permanent(format!(
+                                    "serialize termination audit: {err}"
+                                ))
+                            })?)
+                        }
+                        None => None,
+                    };
+
+                    let mut update = conversation::Entity::update_many()
+                        .col_expr(
+                            conversation::Column::DelegationTaskStatus,
+                            Expr::value(task_status),
+                        )
+                        .col_expr(
+                            conversation::Column::DelegationErrorCode,
+                            Expr::value(error_code),
+                        )
+                        .col_expr(
+                            conversation::Column::DelegationFinishedAt,
+                            Expr::value(finished_at),
+                        )
+                        .col_expr(
+                            conversation::Column::Status,
+                            Expr::value(conversation_status),
+                        )
+                        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()));
+                    if let Some(audit) = termination_audit_json {
+                        update = update.col_expr(
+                            conversation::Column::LastTerminationAuditJson,
+                            Expr::value(audit),
+                        );
+                    }
+                    if let Some(ref stats) = final_stats {
+                        update = apply_encoded_runtime_stats_to_conversation_update(update, stats);
+                    }
+                    let result = update
+                        .filter(conversation::Column::Id.eq(row.id))
+                        .filter(
+                            conversation::Column::DelegationTaskStatus
+                                .eq(DelegationTaskStatus::Running),
+                        )
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    Ok(result.rows_affected == 1)
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(won) => Ok(won),
+            Err(sea_orm::TransactionError::Connection(err)) => Err(map_db_err(err)),
+            Err(sea_orm::TransactionError::Transaction(err)) => Err(err),
         }
     }
 }
@@ -4246,6 +4411,12 @@ async fn project_conversation_in_txn(
         update = update.col_expr(
             conversation::Column::Status,
             sea_orm::sea_query::Expr::value(status.clone()),
+        );
+    }
+    if let Some(ref audit) = projection.last_termination_audit_json {
+        update = update.col_expr(
+            conversation::Column::LastTerminationAuditJson,
+            sea_orm::sea_query::Expr::value(audit.clone()),
         );
     }
     if projection.tool_call_count.is_some() {
@@ -4882,10 +5053,9 @@ mod tests {
         store
             .settle_terminal(
                 task_id,
-                TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("parent_canceled".into()),
                 ),
             )
             .await
@@ -4929,10 +5099,9 @@ mod tests {
         store
             .settle_terminal(
                 task_id,
-                TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("parent_canceled".into()),
                 ),
             )
             .await
@@ -5041,10 +5210,9 @@ mod tests {
             ),
             store.settle_terminal(
                 task_id,
-                TerminalTaskWrite::canceled(
-                    "usercancel",
-                    Utc::now(),
-                    ConversationStatus::Cancelled
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("usercancel".into()),
                 ),
             ),
         );
@@ -5071,6 +5239,7 @@ mod tests {
                     error_code: None,
                     finished_at: None,
                     conversation_status: Some(ConversationStatus::InProgress),
+                    last_termination_audit_json: None,
                     started_at: Some(Utc::now()),
                     tool_call_count: None,
                     edit_tool_call_count: None,
@@ -5096,6 +5265,7 @@ mod tests {
                     error_code: Some(Some("stale".into())),
                     finished_at: Some(Some(Utc::now())),
                     conversation_status: Some(ConversationStatus::Cancelled),
+                    last_termination_audit_json: None,
                     started_at: None,
                     tool_call_count: None,
                     edit_tool_call_count: None,
@@ -5133,6 +5303,7 @@ mod tests {
                     error_code: None,
                     finished_at: Some(Some(Utc::now())),
                     conversation_status: Some(ConversationStatus::PendingReview),
+                    last_termination_audit_json: None,
                     started_at: None,
                     tool_call_count: None,
                     edit_tool_call_count: None,
@@ -5599,6 +5770,7 @@ mod tests {
                     error_code: None,
                     finished_at: None,
                     conversation_status: None,
+                    last_termination_audit_json: None,
                     started_at: None,
                     tool_call_count: Some(999),
                     edit_tool_call_count: Some(999),
@@ -6230,7 +6402,10 @@ mod tests {
         store
             .settle_terminal(
                 "nr-1",
-                TerminalTaskWrite::canceled("canceled", Utc::now(), ConversationStatus::Cancelled),
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("canceled".into()),
+                ),
             )
             .await
             .unwrap();
@@ -10169,8 +10344,7 @@ mod tests {
         use crate::db::service::conversation_service;
 
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) =
-            seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
+        let (parent_id, child_id) = seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let root = "pd-root-4111-8111-111111111111";
         store
@@ -10187,10 +10361,9 @@ mod tests {
         store
             .settle_terminal(
                 root,
-                TerminalTaskWrite::canceled(
-                    "parent_disconnected",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("parent_disconnected".into()),
                 ),
             )
             .await
@@ -12005,6 +12178,7 @@ mod tests {
             error_code: Some(None),
             finished_at: Some(None),
             conversation_status: Some(ConversationStatus::InProgress),
+            last_termination_audit_json: None,
             started_at: Some(Utc::now()),
             tool_call_count: None,
             edit_tool_call_count: None,
@@ -12035,6 +12209,7 @@ mod tests {
             error_code: Some(Some("stale".into())),
             finished_at: Some(Some(Utc::now())),
             conversation_status: Some(ConversationStatus::Cancelled),
+            last_termination_audit_json: None,
             started_at: None,
             tool_call_count: None,
             edit_tool_call_count: None,
@@ -12148,6 +12323,7 @@ mod tests {
             error_code: Some(None),
             finished_at: Some(Some(Utc::now())),
             conversation_status: Some(ConversationStatus::PendingReview),
+            last_termination_audit_json: None,
             started_at: None,
             tool_call_count: None,
             edit_tool_call_count: None,
@@ -12172,6 +12348,316 @@ mod tests {
         assert_eq!(
             child.delegation_task_status,
             Some(DelegationTaskStatus::Completed)
+        );
+    }
+}
+
+fn apply_encoded_runtime_stats_to_conversation_update(
+    update: sea_orm::UpdateMany<conversation::Entity>,
+    stats: &EncodedRuntimeStats,
+) -> sea_orm::UpdateMany<conversation::Entity> {
+    update
+        .col_expr(
+            conversation::Column::DelegationToolCallCount,
+            Expr::value(stats.tool_call_count),
+        )
+        .col_expr(
+            conversation::Column::DelegationEditToolCallCount,
+            Expr::value(stats.edit_tool_call_count),
+        )
+        .col_expr(
+            conversation::Column::DelegationTouchedFilesJson,
+            Expr::value(stats.touched_files_json.clone()),
+        )
+        .col_expr(
+            conversation::Column::DelegationTouchedFilesTruncated,
+            Expr::value(stats.touched_files_truncated),
+        )
+        .col_expr(
+            conversation::Column::DelegationAdditions,
+            Expr::value(stats.additions),
+        )
+        .col_expr(
+            conversation::Column::DelegationDeletions,
+            Expr::value(stats.deletions),
+        )
+        .col_expr(
+            conversation::Column::DelegationLineCountsComplete,
+            Expr::value(stats.line_counts_complete),
+        )
+}
+
+#[cfg(test)]
+mod termination_audit {
+    use super::*;
+    use crate::acp::delegation::spawner::DelegationLink;
+    use crate::acp::termination::{
+        parse_delegation_termination, AcpTerminationClassification, AcpTerminationReason,
+        AcpTerminationSource, AcpTerminationSummaryV1, DelegationTerminationAuditV1,
+        ParsedDelegationTermination, TERMINATION_AUDIT_VERSION,
+    };
+    use crate::db::service::conversation_service;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+    fn cancellation_audit(reason: AcpTerminationReason) -> DelegationTerminationAuditV1 {
+        DelegationTerminationAuditV1 {
+            termination: AcpTerminationSummaryV1 {
+                version: TERMINATION_AUDIT_VERSION,
+                source: AcpTerminationSource::Frontend,
+                reason,
+                classification: AcpTerminationClassification::Explicit,
+                frontend_origin: None,
+                prompt_may_have_executed: true,
+                requested_at: Some(Utc::now()),
+                observed_at: Utc::now(),
+            },
+            prior_status: DelegationRunStatus::Running,
+            admission_class: AdmissionClass::NormalRevision,
+            parent_tool_use_id: Some("tu-termination-audit".into()),
+            child_connection_id: Some("termination-child".into()),
+        }
+    }
+
+    #[test]
+    fn canceled_terminal_write_serializes_typed_evidence() {
+        let evidence = cancellation_audit(AcpTerminationReason::UserCancelled);
+        let write = TerminalTaskWrite::canceled("user_cancelled", Utc::now(), evidence.clone());
+        assert_eq!(write.termination_evidence(), Some(&evidence));
+    }
+
+    #[test]
+    fn null_parent_disconnect_maps_to_legacy_confirmation_cause() {
+        let parsed = parse_delegation_termination(
+            DelegationRunStatus::Canceled,
+            Some("parent_disconnected"),
+            true,
+            None,
+        );
+        assert_eq!(parsed, ParsedDelegationTermination::LegacyParentDisconnect);
+    }
+
+    #[test]
+    fn malformed_audit_hashes_raw_bytes_and_never_becomes_unexpected() {
+        let raw = "{not-json";
+        let parsed = parse_delegation_termination(
+            DelegationRunStatus::Canceled,
+            Some("parent_disconnected"),
+            true,
+            Some(raw),
+        );
+        let ParsedDelegationTermination::Malformed { raw_sha256 } = &parsed else {
+            panic!("malformed evidence must fail closed: {parsed:?}");
+        };
+        assert_eq!(raw_sha256.len(), 64);
+        assert!(!format!("{parsed:?}").contains(raw));
+        assert!(!parsed.is_automatic_unexpected_termination());
+    }
+
+    #[test]
+    fn malformed_parent_disconnect_evidence_is_not_continuable() {
+        let eligibility = ContinueEligibility {
+            history_only: false,
+            is_latest: true,
+            has_active_run: false,
+            child_superseded: false,
+            child_ownership_valid: true,
+            agent_type_matches: true,
+            snapshot_complete: true,
+            external_id_present: true,
+            run_status: DelegationRunStatus::Canceled,
+            error_code: Some("parent_disconnected".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            reached_running: true,
+            termination_audit_json: Some("{not-json".into()),
+        };
+
+        assert_eq!(
+            decide_continue_eligibility(&eligibility),
+            ContinueDecision::NotContinuable
+        );
+    }
+
+    struct TerminationFixture {
+        db: Arc<AppDatabase>,
+        store: RunStore,
+        task_id: String,
+        child_id: i32,
+    }
+
+    impl TerminationFixture {
+        fn audit(
+            &self,
+            source: AcpTerminationSource,
+            reason: AcpTerminationReason,
+            classification: AcpTerminationClassification,
+        ) -> DelegationTerminationAuditV1 {
+            DelegationTerminationAuditV1 {
+                termination: AcpTerminationSummaryV1 {
+                    version: TERMINATION_AUDIT_VERSION,
+                    source,
+                    reason,
+                    classification,
+                    frontend_origin: None,
+                    prompt_may_have_executed: true,
+                    requested_at: None,
+                    observed_at: Utc::now(),
+                },
+                prior_status: DelegationRunStatus::Running,
+                admission_class: AdmissionClass::NormalRevision,
+                parent_tool_use_id: Some(format!("tu-{}", self.task_id)),
+                child_connection_id: Some("termination-child".into()),
+            }
+        }
+
+        async fn settle_child_process_exit(&self) -> Result<Settlement, TaskStoreError> {
+            self.store
+                .settle_terminal(
+                    &self.task_id,
+                    TerminalTaskWrite::failed_with_evidence(
+                        "process_exited",
+                        Utc::now(),
+                        self.audit(
+                            AcpTerminationSource::Process,
+                            AcpTerminationReason::ProcessExited,
+                            AcpTerminationClassification::Unexpected,
+                        ),
+                    ),
+                )
+                .await
+        }
+
+        async fn settle_parent_disconnect(&self) -> Result<Settlement, TaskStoreError> {
+            self.store
+                .settle_terminal(
+                    &self.task_id,
+                    TerminalTaskWrite::canceled(
+                        "parent_disconnected",
+                        Utc::now(),
+                        self.audit(
+                            AcpTerminationSource::ParentTurn,
+                            AcpTerminationReason::ParentCanceled,
+                            AcpTerminationClassification::Intentional,
+                        ),
+                    ),
+                )
+                .await
+        }
+
+        async fn load_run(&self) -> delegation_task_run::Model {
+            DelegationTaskRun::find_by_id(&self.task_id)
+                .one(&self.db.conn)
+                .await
+                .expect("load run")
+                .expect("run")
+        }
+
+        async fn load_child(&self) -> conversation::Model {
+            conversation::Entity::find_by_id(self.child_id)
+                .one(&self.db.conn)
+                .await
+                .expect("load child")
+                .expect("child")
+        }
+
+        fn inject_terminal_transaction_failure(&self, fail: bool) {
+            self.store.inject_terminal_transaction_failure(fail);
+        }
+    }
+
+    async fn seeded_running_delegation() -> TerminationFixture {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-termination-audit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("termination parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let task_id = "a2000000-0000-4000-8000-000000000002".to_string();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("termination child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: format!("tu-{task_id}"),
+                delegation_call_id: task_id.clone(),
+            }),
+        )
+        .await
+        .expect("child");
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some(format!("tu-{task_id}")),
+                child_conversation_id: child.id,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some("/tmp/codeg-termination-audit".into()),
+                route_fingerprint: Some("aabbccdd".into()),
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: Some("default".into()),
+                config_values_json: Some("{}".into()),
+                task_preview: Some("termination audit".into()),
+                request_fingerprint: Some("termination-request".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: Some("termination-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("insert run");
+        store
+            .bind_child_connection_while_reserving(&task_id, "termination-child")
+            .await
+            .expect("bind child connection");
+        store
+            .promote_running(&task_id, "termination-child", Utc::now())
+            .await
+            .expect("promote running");
+        TerminationFixture {
+            db,
+            store,
+            task_id,
+            child_id: child.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn later_parent_end_cannot_replace_winning_child_terminal_audit() {
+        let fixture = seeded_running_delegation().await;
+        fixture.settle_child_process_exit().await.unwrap();
+        let winning = fixture.load_run().await.termination_audit_json;
+        assert!(winning.is_some());
+        fixture.settle_parent_disconnect().await.unwrap();
+        assert_eq!(fixture.load_run().await.termination_audit_json, winning);
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_updates_run_and_child_projection_together() {
+        let fixture = seeded_running_delegation().await;
+        fixture.inject_terminal_transaction_failure(true);
+        assert!(fixture.settle_child_process_exit().await.is_err());
+        assert_eq!(
+            fixture.load_run().await.status,
+            DelegationRunStatus::Running
+        );
+        assert_eq!(
+            fixture.load_child().await.delegation_task_status,
+            Some(DelegationTaskStatus::Running)
         );
     }
 }

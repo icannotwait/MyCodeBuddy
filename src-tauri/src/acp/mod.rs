@@ -36,6 +36,7 @@ pub mod terminal_adapter;
 pub mod terminal_assoc;
 pub mod terminal_context;
 pub mod terminal_runtime;
+pub mod termination;
 pub mod tool_watchdog;
 pub mod types;
 pub mod xai_session_notification;

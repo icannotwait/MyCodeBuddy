@@ -103,9 +103,13 @@ use crate::acp::delegation::types::{
     DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ObservationSnapshot,
     ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
 };
+use crate::acp::termination::{
+    AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
+    AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
+};
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
-use crate::db::entities::delegation_task_run::AdmissionClass;
+use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
 use crate::models::AgentType;
 
 /// Coalesced runtime-stats write window (one worker sleep per flush cycle).
@@ -537,10 +541,10 @@ struct PendingInner {
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct InflightParentEnd {
     stamp: u64,
-    reason: ParentTurnEndReason,
+    context: ParentEndContext,
 }
 
 /// One in-flight `handle_request` setup tracked for parent-cancel coverage.
@@ -573,7 +577,7 @@ struct InflightSetup {
 #[derive(Debug, Clone)]
 enum ReservingHandoffDisposition {
     /// Parent end won first-terminal-wins (or no earlier child terminal).
-    ParentEnded(ParentTurnEndReason),
+    ParentEnded(ParentEndContext),
     /// A buffered child terminal stamped earlier than the parent end.
     ChildTerminal(DelegationOutcome),
 }
@@ -602,8 +606,8 @@ impl TerminalIntent {
             completed_report(task_id, completed)
         } else {
             match &self.disposition {
-                ReservingHandoffDisposition::ParentEnded(reason) => {
-                    parent_end_setup_report(agent_type, *reason, Some(child_conversation_id))
+                ReservingHandoffDisposition::ParentEnded(context) => {
+                    parent_end_setup_report(agent_type, context, Some(child_conversation_id))
                 }
                 ReservingHandoffDisposition::ChildTerminal(outcome) => {
                     report_from_outcome(Some(task_id.to_string()), Some(agent_type), outcome, None)
@@ -703,7 +707,9 @@ pub(crate) fn sanitize_bootstrap_unresumable_message(message: &str) -> String {
 
 fn disposition_error_code(disposition: &ReservingHandoffDisposition) -> Option<String> {
     match disposition {
-        ReservingHandoffDisposition::ParentEnded(reason) => Some(reason.error_code().to_string()),
+        ReservingHandoffDisposition::ParentEnded(context) => {
+            Some(context.reason.error_code().to_string())
+        }
         ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
             DelegationOutcome::Err { code, .. } => Some(code.clone()),
             DelegationOutcome::Ok(_) => None,
@@ -732,7 +738,7 @@ struct ReservingHandoffEnd {
 /// pre-send bind fails closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionFenceReject {
-    ParentEnd(ParentTurnEndReason),
+    ParentEnd(ParentEndContext),
     ExternalCanceled,
     /// Durable bind lost to a different already-bound connection. Live state
     /// was unwound and the challenger disconnected; **do not** settle the
@@ -1110,7 +1116,7 @@ impl PendingInner {
     /// to order the parent end against a buffered child terminal and to settle
     /// with the stable root code.
     fn inflight_parent_end(&self, id: u64) -> Option<InflightParentEnd> {
-        self.inflight.get(&id).and_then(|s| s.parent_end)
+        self.inflight.get(&id).and_then(|s| s.parent_end.clone())
     }
 
     /// Flag every in-flight setup owned by `parent_connection_id` as ended,
@@ -1128,12 +1134,16 @@ impl PendingInner {
     fn mark_inflight_canceled_for_parent(
         &mut self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: impl ParentEndContextArg,
     ) -> u64 {
+        let context = context.into_parent_end_context();
         let stamp = self.tick();
         for setup in self.inflight.values_mut() {
             if setup.parent_connection_id == parent_connection_id && setup.parent_end.is_none() {
-                setup.parent_end = Some(InflightParentEnd { stamp, reason });
+                setup.parent_end = Some(InflightParentEnd {
+                    stamp,
+                    context: context.clone(),
+                });
             }
         }
         stamp
@@ -1177,7 +1187,7 @@ impl PendingInner {
     fn take_reserving_handoffs_for_parent_end(
         &mut self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: &ParentEndContext,
         parent_end_stamp: u64,
     ) -> Vec<ReservingHandoffEnd> {
         let child_ids: Vec<String> = self
@@ -1238,7 +1248,7 @@ impl PendingInner {
                     Some((child_stamp, outcome)) if child_stamp < parent_end_stamp => {
                         ReservingHandoffDisposition::ChildTerminal(outcome)
                     }
-                    _ => ReservingHandoffDisposition::ParentEnded(reason),
+                    _ => ReservingHandoffDisposition::ParentEnded(context.clone()),
                 };
                 match self
                     .closed_handoff_dispositions
@@ -1681,11 +1691,35 @@ impl SettleContext {
 /// Setup-window terminal report for a parent turn/connection end (no durable
 /// row yet when `task_id` is absent). Uses stable parent-end codes — never
 /// generic `"canceled"`.
+trait ParentEndContextArg {
+    fn into_parent_end_context(self) -> ParentEndContext;
+}
+
+impl ParentEndContextArg for ParentTurnEndReason {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        ParentEndContext::legacy(self, Utc::now())
+    }
+}
+
+impl ParentEndContextArg for ParentEndContext {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        self
+    }
+}
+
+impl ParentEndContextArg for &ParentEndContext {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        self.clone()
+    }
+}
+
 fn parent_end_setup_report(
     agent_type: AgentType,
-    reason: ParentTurnEndReason,
+    context: impl ParentEndContextArg,
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
+    let context = context.into_parent_end_context();
+    let reason = context.reason;
     DelegationTaskReport {
         task_id: None,
         continued_from_task_id: None,
@@ -1703,6 +1737,34 @@ fn parent_end_setup_report(
     }
 }
 
+fn terminal_audit_for_code(
+    code: &str,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+) -> DelegationTerminationAuditV1 {
+    DelegationTerminationAuditV1::for_terminal_code(
+        code,
+        prior_status,
+        prompt_may_have_executed,
+        observed_at,
+    )
+}
+
+fn canceled_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+) -> TerminalTaskWrite {
+    let code = code.into();
+    let observed_at = Utc::now();
+    TerminalTaskWrite::canceled(
+        code.clone(),
+        observed_at,
+        terminal_audit_for_code(&code, prior_status, prompt_may_have_executed, observed_at),
+    )
+}
+
 /// Map a resolved outcome onto a durable terminal write + optional result text.
 fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Option<String>) {
     let now = Utc::now();
@@ -1712,11 +1774,19 @@ fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Opt
             Some(ok.text.clone()),
         ),
         DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => (
-            TerminalTaskWrite::canceled(code.clone(), now, ConversationStatus::Cancelled),
+            TerminalTaskWrite::canceled(
+                code.clone(),
+                now,
+                terminal_audit_for_code(code, DelegationRunStatus::Running, true, now),
+            ),
             None,
         ),
         DelegationOutcome::Err { code, .. } => (
-            TerminalTaskWrite::failed(code.clone(), now, ConversationStatus::Cancelled),
+            TerminalTaskWrite::failed_with_evidence(
+                code.clone(),
+                now,
+                terminal_audit_for_code(code, DelegationRunStatus::Running, true, now),
+            ),
             None,
         ),
     }
@@ -1800,14 +1870,27 @@ fn terminal_from_handoff_disposition(
     disposition: &ReservingHandoffDisposition,
 ) -> TerminalTaskWrite {
     match disposition {
-        ReservingHandoffDisposition::ParentEnded(reason) => TerminalTaskWrite::canceled(
-            reason.error_code(),
-            Utc::now(),
-            ConversationStatus::Cancelled,
-        ),
+        ReservingHandoffDisposition::ParentEnded(context) => {
+            let now = Utc::now();
+            TerminalTaskWrite::canceled(
+                context.reason.error_code(),
+                now,
+                context.audit(
+                    DelegationRunStatus::Reserving,
+                    AdmissionClass::NormalRevision,
+                    None,
+                    None,
+                ),
+            )
+        }
         ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
             DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
-                TerminalTaskWrite::canceled(code.clone(), Utc::now(), ConversationStatus::Cancelled)
+                let now = Utc::now();
+                TerminalTaskWrite::canceled(
+                    code.clone(),
+                    now,
+                    terminal_audit_for_code(code, DelegationRunStatus::Reserving, true, now),
+                )
             }
             other => terminal_from_outcome(other).0,
         },
@@ -3832,7 +3915,7 @@ impl DelegationBroker {
         runs: &RunStore,
         task_id: &str,
         child_conversation_id: i32,
-        reason: ParentTurnEndReason,
+        context: ParentEndContext,
         agent_type: AgentType,
         inflight_id: u64,
         abandon_context: &'static str,
@@ -3844,8 +3927,14 @@ impl DelegationBroker {
             agent_type,
             inflight_id,
             abandon_context,
-            reason.error_code(),
-            |agent, child| parent_end_setup_report(agent, reason, child),
+            context.reason.error_code(),
+            context.audit(
+                DelegationRunStatus::Reserving,
+                AdmissionClass::NormalRevision,
+                None,
+                None,
+            ),
+            |agent, child| parent_end_setup_report(agent, &context, child),
         )
         .await
     }
@@ -3869,6 +3958,12 @@ impl DelegationBroker {
             inflight_id,
             abandon_context,
             "canceled",
+            terminal_audit_for_code(
+                "canceled",
+                DelegationRunStatus::Reserving,
+                false,
+                Utc::now(),
+            ),
             |agent, child| {
                 report_err(
                     agent,
@@ -3892,6 +3987,7 @@ impl DelegationBroker {
         inflight_id: u64,
         abandon_context: &'static str,
         settle_error_code: &str,
+        termination_audit: DelegationTerminationAuditV1,
         success_report: impl FnOnce(AgentType, Option<i32>) -> DelegationTaskReport,
     ) -> DelegationTaskReport {
         match runs.abandon_reserving_claim(task_id).await {
@@ -3936,7 +4032,7 @@ impl DelegationBroker {
                             TerminalTaskWrite::canceled(
                                 settle_error_code,
                                 Utc::now(),
-                                ConversationStatus::Cancelled,
+                                termination_audit,
                             ),
                         )
                         .await
@@ -5071,13 +5167,15 @@ impl DelegationBroker {
     /// If this in-flight setup has been flagged by a parent end, deregister it
     /// and return the stable root reason. One lock acquisition; used at the
     /// pre-spawn / post-spawn checkpoints in `handle_request`.
-    async fn take_inflight_cancel(&self, inflight_id: u64) -> Option<ParentTurnEndReason> {
+    async fn take_inflight_cancel(&self, inflight_id: u64) -> Option<ParentEndContext> {
         let mut inner = self.pending.inner.lock().await;
-        let reason = inner.inflight_parent_end(inflight_id).map(|end| end.reason);
-        if reason.is_some() {
+        let context = inner
+            .inflight_parent_end(inflight_id)
+            .map(|end| end.context);
+        if context.is_some() {
             inner.deregister_inflight(inflight_id);
         }
-        reason
+        context
     }
 
     /// Drop this setup's in-flight record. Called on each `handle_request`
@@ -5919,9 +6017,14 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            "parent_ended",
+                            reason.reason.error_code(),
                             Utc::now(),
-                            ConversationStatus::Cancelled,
+                            reason.audit(
+                                DelegationRunStatus::Reserving,
+                                AdmissionClass::NormalRevision,
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await;
@@ -6007,9 +6110,14 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            "parent_ended",
+                            reason.reason.error_code(),
                             Utc::now(),
-                            ConversationStatus::Cancelled,
+                            reason.audit(
+                                DelegationRunStatus::Reserving,
+                                AdmissionClass::NormalRevision,
+                                Some(req.parent_tool_use_id.clone()),
+                                Some(child_connection_id.clone()),
+                            ),
                         ),
                     )
                     .await;
@@ -6047,11 +6155,7 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &call_id,
-                        TerminalTaskWrite::canceled(
-                            "canceled",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
+                        canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
                     )
                     .await;
             }
@@ -6230,13 +6334,13 @@ impl DelegationBroker {
             LiveRuntimeState::honor_gate(&self.gen1_pre_send_fence_gate).await;
         }
         enum PreSendCancel {
-            Parent(ParentTurnEndReason),
+            Parent(ParentEndContext),
             External,
         }
         let pre_send_cancel = {
             let mut inner = self.pending.inner.lock().await;
             if let Some(end) = inner.inflight_parent_end(inflight_id) {
-                Some(PreSendCancel::Parent(end.reason))
+                Some(PreSendCancel::Parent(end.context))
             } else if inner.inflight_external_canceled(inflight_id) {
                 Some(PreSendCancel::External)
             } else {
@@ -6257,7 +6361,7 @@ impl DelegationBroker {
             }
             let _ = self.spawner.disconnect(&child_connection_id).await;
             match cancel {
-                PreSendCancel::Parent(reason) => {
+                PreSendCancel::Parent(context) => {
                     if let (Some(runs), Some((child_id, _))) =
                         (self.run_store.as_ref(), prebound_child.as_ref())
                     {
@@ -6266,7 +6370,7 @@ impl DelegationBroker {
                                 runs,
                                 &call_id,
                                 *child_id,
-                                reason,
+                                context.clone(),
                                 req.agent_type,
                                 inflight_id,
                                 "parent cancel at pre-send fence before prompt",
@@ -6278,9 +6382,14 @@ impl DelegationBroker {
                             .settle_terminal(
                                 &call_id,
                                 TerminalTaskWrite::canceled(
-                                    reason.error_code(),
+                                    context.reason.error_code(),
                                     Utc::now(),
-                                    ConversationStatus::Cancelled,
+                                    context.audit(
+                                        DelegationRunStatus::Reserving,
+                                        AdmissionClass::NormalRevision,
+                                        Some(req.parent_tool_use_id.clone()),
+                                        Some(child_connection_id.clone()),
+                                    ),
                                 ),
                             )
                             .await;
@@ -6288,7 +6397,7 @@ impl DelegationBroker {
                     self.drop_inflight(inflight_id).await;
                     return parent_end_setup_report(
                         req.agent_type,
-                        reason,
+                        &context,
                         prebound_child.map(|(cid, _)| cid),
                     );
                 }
@@ -6311,10 +6420,10 @@ impl DelegationBroker {
                         let _ = runs
                             .settle_terminal(
                                 &call_id,
-                                TerminalTaskWrite::canceled(
+                                canceled_terminal(
                                     "canceled",
-                                    Utc::now(),
-                                    ConversationStatus::Cancelled,
+                                    DelegationRunStatus::Reserving,
+                                    false,
                                 ),
                             )
                             .await;
@@ -6572,7 +6681,7 @@ impl DelegationBroker {
         // out a double-finalize.
         enum Disposition {
             ChildTerminal(DelegationOutcome),
-            ParentEnded(ParentTurnEndReason),
+            ParentEnded(ParentEndContext),
             /// Sticky external cancel observed under the park lock (setup-to-
             /// running handoff). Must not insert `running` or publish start.
             ExternalCanceled,
@@ -6624,7 +6733,7 @@ impl DelegationBroker {
                     if child_stamp < end.stamp {
                         Disposition::ChildTerminal(outcome)
                     } else {
-                        Disposition::ParentEnded(end.reason)
+                        Disposition::ParentEnded(end.context)
                     }
                 }
                 // Only a child terminal fired.
@@ -6635,7 +6744,7 @@ impl DelegationBroker {
                 // Only a parent end fired.
                 (None, Some(end)) => {
                     inner.deregister_inflight(inflight_id);
-                    Disposition::ParentEnded(end.reason)
+                    Disposition::ParentEnded(end.context)
                 }
                 // Nothing beat us — mark admission, then re-drain any terminal
                 // that landed in the admission buffer under this same lock
@@ -6710,8 +6819,7 @@ impl DelegationBroker {
             // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
                 let (terminal, result_text) = terminal_from_outcome(&outcome);
-                let (extra_paths, workspace) =
-                    report_harvest_context_from_runtime(Some(&runtime));
+                let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
                 let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                     terminal,
                     result_text,
@@ -6740,11 +6848,16 @@ impl DelegationBroker {
             // A parent end reached this delegation mid-setup — after the
             // prompt was sent, before we registered. Preserve the stable root
             // code (do not collapse via DelegationError::Canceled).
-            Disposition::ParentEnded(reason) => {
+            Disposition::ParentEnded(parent_end) => {
                 let terminal = TerminalTaskWrite::canceled(
-                    reason.error_code(),
+                    parent_end.reason.error_code(),
                     Utc::now(),
-                    ConversationStatus::Cancelled,
+                    parent_end.audit(
+                        DelegationRunStatus::Running,
+                        AdmissionClass::NormalRevision,
+                        Some(req.parent_tool_use_id.clone()),
+                        Some(child_connection_id.clone()),
+                    ),
                 );
                 let ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
@@ -6756,8 +6869,8 @@ impl DelegationBroker {
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
                     disconnect_on_loss: true,
-                    message: Some(reason.message().to_string()),
-                    attention_resolution: reason.attention_code(),
+                    message: Some(parent_end.reason.message().to_string()),
+                    attention_resolution: parent_end.reason.attention_code(),
                     runtime: Some(runtime),
                     card_summary: None,
                 };
@@ -7794,7 +7907,7 @@ impl DelegationBroker {
             if let Some(inflight_id) = transfer_inflight_id {
                 if let Some(end) = inner.inflight_parent_end(inflight_id) {
                     inner.deregister_inflight(inflight_id);
-                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                    return Err(AdmissionFenceReject::ParentEnd(end.context));
                 }
                 if inner.inflight_external_canceled(inflight_id) {
                     inner.deregister_inflight(inflight_id);
@@ -7833,7 +7946,7 @@ impl DelegationBroker {
                     inner.unreserve(&handoff.task_id, &child_connection_id);
                     inner.unregister_live_run(&child_connection_id);
                     inner.deregister_inflight(inflight_id);
-                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                    return Err(AdmissionFenceReject::ParentEnd(end.context));
                 }
                 if inner.inflight_external_canceled(inflight_id) {
                     inner.unreserve(&handoff.task_id, &child_connection_id);
@@ -8201,14 +8314,19 @@ impl DelegationBroker {
         // Post-reserve cancel check (does not drop the fence on None — the
         // Created path transfers it atomically into the handoff below).
         let reserved = match (admitted, self.take_inflight_cancel(inflight_id).await) {
-            (Ok(ContinueAdmitOutcome::Created(run)), Some(reason)) => {
+            (Ok(ContinueAdmitOutcome::Created(run)), Some(parent_end)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &run.task_id,
                         TerminalTaskWrite::canceled(
-                            reason.error_code(),
+                            parent_end.reason.error_code(),
                             Utc::now(),
-                            ConversationStatus::Cancelled,
+                            parent_end.audit(
+                                DelegationRunStatus::Reserving,
+                                run.admission_class.clone(),
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await
@@ -8222,7 +8340,7 @@ impl DelegationBroker {
                 return with_continuation_run_identity(
                     parent_end_setup_report(
                         run.agent_type,
-                        reason,
+                        &parent_end,
                         Some(run.child_conversation_id),
                     ),
                     &run.task_id,
@@ -8281,14 +8399,19 @@ impl DelegationBroker {
             .await
         {
             Ok(registration) => registration,
-            Err(AdmissionFenceReject::ParentEnd(reason)) => {
+            Err(AdmissionFenceReject::ParentEnd(parent_end)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
                         TerminalTaskWrite::canceled(
-                            reason.error_code(),
+                            parent_end.reason.error_code(),
                             Utc::now(),
-                            ConversationStatus::Cancelled,
+                            parent_end.audit(
+                                DelegationRunStatus::Reserving,
+                                reserved.admission_class.clone(),
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await
@@ -8302,7 +8425,7 @@ impl DelegationBroker {
                 return with_continuation_run_identity(
                     parent_end_setup_report(
                         reserved.agent_type,
-                        reason,
+                        &parent_end,
                         Some(reserved.child_conversation_id),
                     ),
                     &reserved.task_id,
@@ -8313,11 +8436,7 @@ impl DelegationBroker {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::canceled(
-                            "canceled",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
+                        canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
                     )
                     .await
                 {
@@ -8559,11 +8678,7 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
-                        "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
+                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
                 )
                 .await;
             {
@@ -8674,11 +8789,7 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
-                        "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
+                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
                 )
                 .await;
             {
@@ -8784,11 +8895,7 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
-                        "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
+                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
                 )
                 .await;
             {
@@ -9150,8 +9257,7 @@ impl DelegationBroker {
                 }
             }
             let (terminal, result_text) = terminal_from_outcome(&outcome);
-            let (extra_paths, workspace) =
-                report_harvest_context_from_runtime(Some(&runtime));
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
                 result_text,
@@ -11672,8 +11778,7 @@ impl DelegationBroker {
             let (terminal, result_text) = terminal_from_outcome(&outcome);
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
-            let (extra_paths, workspace) =
-                report_harvest_context_from_runtime(Some(&task.runtime));
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
                 result_text,
@@ -11885,7 +11990,8 @@ impl DelegationBroker {
             return;
         }
         // A turn is in flight, so cancel + disconnect after durable settle.
-        self.settle_drained_canceled(drained, &reason, true).await;
+        self.settle_drained_canceled(drained, &reason, true, false)
+            .await;
     }
 
     /// Resolve the pending delegation whose child matches
@@ -11976,7 +12082,8 @@ impl DelegationBroker {
             }
         };
         // Child already disconnected/errored — disconnect-only after settle.
-        self.settle_drained_canceled(drained, &reason, false).await;
+        self.settle_drained_canceled(drained, &reason, false, true)
+            .await;
         {
             let mut inner = self.pending.inner.lock().await;
             inner.unregister_live_run(child_connection_id);
@@ -11990,34 +12097,27 @@ impl DelegationBroker {
     /// since those connections are going away. Runs fully inline — the
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
+        let context = ParentEndContext::legacy(ParentTurnEndReason::ParentDisconnected, Utc::now());
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(
-                parent_connection_id,
-                ParentTurnEndReason::ParentDisconnected,
-                false,
-            )
+            .drain_parent_tree(parent_connection_id, &context, false)
             .await;
         // Reserving handoffs settle inline before running teardown so a later
         // bootstrap refuse cannot relabel parent_disconnected → unresumable.
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(
-            reserving,
-            ParentTurnEndReason::ParentDisconnected,
-        )
-        .await;
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
+            .await;
         // Durable non-terminal runs (post-reserve, pre-handoff) settle even
         // when no in-memory coordination entry exists yet. Exclude task ids
         // already owned by reserving-handoff or drained-running settlement so
         // this DB-only path cannot steal their CAS win and skip side effects.
         self.settle_durable_non_terminal_for_parent_end(
             parent_conversation_ids,
-            ParentTurnEndReason::ParentDisconnected,
+            &context,
             &exclude,
         )
         .await;
-        self.settle_drained_for_parent_end(drained, ParentTurnEndReason::ParentDisconnected)
-            .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Cascade-cancel every live descendant under `parent_connection_id` for a
@@ -12049,18 +12149,19 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
+        let context = ParentEndContext::legacy(reason, Utc::now());
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         // Pre-bootstrap handoffs have no running entry: settle them *inline*
         // before returning so a sequential later refuse cannot win unresumable
         // over parent_canceled. Running-task teardown stays backgrounded.
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
         if !reserving.is_empty() {
-            self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+            self.settle_reserving_handoffs_for_parent_end(reserving, &context)
                 .await;
         }
         // Durable non-terminal runs must settle even when the in-memory maps
@@ -12068,7 +12169,7 @@ impl DelegationBroker {
         if !parent_conversation_ids.is_empty() {
             self.settle_durable_non_terminal_for_parent_end(
                 parent_conversation_ids,
-                reason,
+                &context,
                 &exclude,
             )
             .await;
@@ -12080,7 +12181,9 @@ impl DelegationBroker {
         // turn); background only the slow child teardown.
         let broker = self.clone();
         tokio::spawn(async move {
-            broker.settle_drained_for_parent_end(drained, reason).await;
+            broker
+                .settle_drained_for_parent_end(drained, &context)
+                .await;
         });
     }
 
@@ -12094,16 +12197,21 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
+        let context = ParentEndContext::legacy(reason, Utc::now());
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason, &exclude)
-            .await;
-        self.settle_drained_for_parent_end(drained, reason).await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            &context,
+            &exclude,
+        )
+        .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Fast, lock-guarded part of a parent end: BFS the full descendant tree
@@ -12132,7 +12240,7 @@ impl DelegationBroker {
     async fn drain_parent_tree(
         &self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: &ParentEndContext,
         keep_consumed: bool,
     ) -> (
         Vec<(String, RunningTask, u64)>,
@@ -12154,7 +12262,7 @@ impl DelegationBroker {
                 if !visited.insert(conn_id.clone()) {
                     continue;
                 }
-                let parent_end_stamp = inner.mark_inflight_canceled_for_parent(&conn_id, reason);
+                let parent_end_stamp = inner.mark_inflight_canceled_for_parent(&conn_id, context);
 
                 // Coordination identities exist before running registration, so
                 // include their child connections in the traversal even during
@@ -12180,7 +12288,7 @@ impl DelegationBroker {
                 // handoffs that have setups+live/coord but no inflight.
                 reserving_handoffs.extend(inner.take_reserving_handoffs_for_parent_end(
                     &conn_id,
-                    reason,
+                    context,
                     parent_end_stamp,
                 ));
 
@@ -12250,17 +12358,22 @@ impl DelegationBroker {
     async fn settle_drained_for_parent_end(
         &self,
         drained: Vec<(String, RunningTask, u64)>,
-        reason: ParentTurnEndReason,
+        parent_end: &ParentEndContext,
     ) {
         for (task_id, task, duration_ms) in drained {
             let terminal = TerminalTaskWrite::canceled(
-                reason.error_code(),
+                parent_end.reason.error_code(),
                 Utc::now(),
-                ConversationStatus::Cancelled,
+                parent_end.audit(
+                    DelegationRunStatus::Running,
+                    AdmissionClass::NormalRevision,
+                    Some(task.parent_tool_use_id.clone()),
+                    Some(task.child_connection_id.clone()),
+                ),
             );
             let mut context = SettleContext::from_running(&task, duration_ms, true);
-            context.message = Some(reason.message().to_string());
-            context.attention_resolution = reason.attention_code();
+            context.message = Some(parent_end.reason.message().to_string());
+            context.attention_resolution = parent_end.reason.attention_code();
             self.settle_task(&task_id, terminal, None, context).await;
         }
     }
@@ -12275,7 +12388,7 @@ impl DelegationBroker {
     async fn settle_reserving_handoffs_for_parent_end(
         &self,
         handoffs: Vec<ReservingHandoffEnd>,
-        fallback_reason: ParentTurnEndReason,
+        fallback: &ParentEndContext,
     ) {
         let Some(runs) = self.run_store.as_ref() else {
             return;
@@ -12330,7 +12443,7 @@ impl DelegationBroker {
                             task_id = %handoff.task_id,
                             child_connection_id = %handoff.child_connection_id,
                             child_conversation_id = handoff.child_conversation_id,
-                            reason = fallback_reason.error_code(),
+                            reason = fallback.reason.error_code(),
                             "[delegation] reserving handoff settled on parent end"
                         );
                     } else {
@@ -12366,7 +12479,7 @@ impl DelegationBroker {
     async fn settle_durable_non_terminal_for_parent_end(
         &self,
         parent_conversation_ids: HashSet<i32>,
-        reason: ParentTurnEndReason,
+        parent_end: &ParentEndContext,
         exclude_task_ids: &HashSet<String>,
     ) {
         let Some(runs) = self.run_store.as_ref() else {
@@ -12407,7 +12520,7 @@ impl DelegationBroker {
                     tracing::info!(
                         task_id = %row.task_id,
                         parent_conversation_id,
-                        reason = reason.error_code(),
+                        reason = parent_end.reason.error_code(),
                         "[delegation] durable non-terminal skip pure gen1 reserving; inflight owns compensate"
                     );
                     continue;
@@ -12415,7 +12528,7 @@ impl DelegationBroker {
                 // Honor process-local bootstrap (or other) claim: never invent
                 // parent_canceled over an earlier ChildTerminal park. Claim
                 // selection is serialized with permanent PE finalize.
-                let fallback = ReservingHandoffDisposition::ParentEnded(reason);
+                let fallback = ReservingHandoffDisposition::ParentEnded(parent_end.clone());
                 let (claimed, terminal) = self
                     .take_parent_end_cas_selection(&row.task_id, fallback)
                     .await;
@@ -12445,7 +12558,7 @@ impl DelegationBroker {
                             tracing::info!(
                                 task_id = %row.task_id,
                                 parent_conversation_id,
-                                reason = reason.error_code(),
+                                reason = parent_end.reason.error_code(),
                                 "[delegation] durable non-terminal settled on parent end"
                             );
                         } else {
@@ -12478,10 +12591,36 @@ impl DelegationBroker {
         drained: Vec<(String, RunningTask, u64)>,
         reason: &str,
         cancel_turn: bool,
+        child_connection_termination: bool,
     ) {
         for (task_id, task, duration_ms) in drained {
             let outcome = canceled_outcome(task.child_conversation_id, reason);
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let (terminal, result_text) = if child_connection_termination {
+                let observed_at = Utc::now();
+                let termination = AcpTerminationSummaryV1::new(
+                    AcpTerminationSource::ChildConnection,
+                    AcpTerminationReason::ChildTerminal,
+                    AcpTerminationClassification::Unexpected,
+                    true,
+                    observed_at,
+                );
+                (
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        observed_at,
+                        DelegationTerminationAuditV1::new(
+                            termination,
+                            DelegationRunStatus::Running,
+                            AdmissionClass::NormalRevision,
+                            Some(task.parent_tool_use_id.clone()),
+                            Some(task.child_connection_id.clone()),
+                        ),
+                    ),
+                    None,
+                )
+            } else {
+                terminal_from_outcome(&outcome)
+            };
             let mut ctx = SettleContext::from_running(&task, duration_ms, cancel_turn);
             let (_, _, _, message) = terminal_fields(&outcome);
             ctx.message = message;
@@ -12513,16 +12652,21 @@ impl DelegationBroker {
             self.cancel_by_parent(parent_connection_id).await;
             return;
         }
+        let context = ParentEndContext::legacy(reason, Utc::now());
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason, &exclude)
-            .await;
-        self.settle_drained_for_parent_end(drained, reason).await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            &context,
+            &exclude,
+        )
+        .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Test-only: hold `continue_delegation` after durable reserve commit and
@@ -22609,11 +22753,7 @@ mod tests {
         };
         runs.settle_terminal(
             &task_id,
-            TerminalTaskWrite::canceled(
-                "parent_canceled",
-                Utc::now(),
-                ConversationStatus::Cancelled,
-            ),
+            canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
         )
         .await
         .expect("terminal winner");
@@ -22704,10 +22844,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -22961,11 +23101,7 @@ mod tests {
         };
         runs.settle_terminal(
             &task_id,
-            TerminalTaskWrite::canceled(
-                "parent_canceled",
-                Utc::now(),
-                ConversationStatus::Cancelled,
-            ),
+            canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
         )
         .await
         .expect("terminal winner");
@@ -23194,11 +23330,7 @@ mod tests {
         let owned = flaky
             .put_retry(PendingTerminalRetry {
                 task_id: task_id.clone(),
-                terminal: TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                terminal: canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
                 child_conversation_id: 0,
                 frozen: false,
             })
@@ -23522,10 +23654,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -23686,10 +23818,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -23811,7 +23943,10 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 task_id.clone(),
-                ReservingHandoffDisposition::ParentEnded(ParentTurnEndReason::ParentCanceled),
+                ReservingHandoffDisposition::ParentEnded(ParentEndContext::legacy(
+                    ParentTurnEndReason::ParentCanceled,
+                    Utc::now(),
+                )),
             );
         }
         let _ = send_gate.send(());
@@ -23926,10 +24061,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: continued_task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: child_id,
                     frozen: false,
@@ -31686,11 +31821,9 @@ mod tests {
                     Utc::now(),
                     ConversationStatus::Cancelled,
                 ),
-                "canceled" => TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                "canceled" => {
+                    canceled_terminal("parent_canceled", DelegationRunStatus::Running, true)
+                }
                 _ => unreachable!(),
             };
             runs.settle_terminal(&task_id, terminal)
@@ -31775,11 +31908,9 @@ mod tests {
                     Utc::now(),
                     ConversationStatus::Cancelled,
                 ),
-                "canceled" => TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                "canceled" => {
+                    canceled_terminal("parent_canceled", DelegationRunStatus::Running, true)
+                }
                 _ => unreachable!(),
             };
             let child_id = seed_terminal_gen1_replay_run(
@@ -33361,6 +33492,7 @@ mod tests {
                     error_code: None,
                     finished_at: None,
                     conversation_status: None,
+                    last_termination_audit_json: None,
                     started_at: None,
                     tool_call_count: Some(999),
                     edit_tool_call_count: Some(999),
