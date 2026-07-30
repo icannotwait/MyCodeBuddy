@@ -542,6 +542,9 @@ pub struct ContinueEligibility {
     pub child_ownership_valid: bool,
     pub agent_type_matches: bool,
     pub snapshot_complete: bool,
+    pub launch_snapshot_version: Option<String>,
+    pub mode_id: Option<String>,
+    pub config_values_json: Option<String>,
     pub external_id_present: bool,
     pub external_session_identity_hash: Option<String>,
     pub run_status: DelegationRunStatus,
@@ -645,6 +648,9 @@ fn recovery_source_from_continue_eligibility(e: &ContinueEligibility) -> Recover
         ),
         reached_running: e.reached_running,
         launch_snapshot_complete: e.snapshot_complete,
+        launch_snapshot_version: e.launch_snapshot_version.clone(),
+        mode_id: e.mode_id.clone(),
+        config_values_json: e.config_values_json.clone(),
         external_session_identity_hash: e
             .external_id_present
             .then(|| e.external_session_identity_hash.clone())
@@ -749,6 +755,9 @@ fn recovery_source_from_persisted_run(
         launch_snapshot_complete: launch_snapshot_from_run(source)
             .as_ref()
             .is_some_and(snapshot_is_complete),
+        launch_snapshot_version: source.launch_snapshot_version.clone(),
+        mode_id: source.mode_id.clone(),
+        config_values_json: source.config_values_json.clone(),
         external_session_identity_hash,
         replaced_task_id: source.replaced_task_id.clone(),
         replacement_reason: source
@@ -1422,6 +1431,9 @@ async fn build_continue_eligibility_txn(
         child_ownership_valid,
         agent_type_matches,
         snapshot_complete,
+        launch_snapshot_version: target.launch_snapshot_version.clone(),
+        mode_id: target.mode_id.clone(),
+        config_values_json: target.config_values_json.clone(),
         external_id_present: external_session_identity_hash.is_some(),
         external_session_identity_hash,
         run_status: target.run_status.clone(),
@@ -2530,6 +2542,9 @@ impl RunStore {
             child_ownership_valid,
             agent_type_matches,
             snapshot_complete,
+            launch_snapshot_version: target.launch_snapshot_version.clone(),
+            mode_id: target.mode_id.clone(),
+            config_values_json: target.config_values_json.clone(),
             external_id_present,
             external_session_identity_hash,
             run_status: target.run_status.clone(),
@@ -8257,6 +8272,9 @@ mod tests {
             child_ownership_valid: true,
             agent_type_matches: true,
             snapshot_complete: true,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: Some("default".into()),
+            config_values_json: Some("{}".into()),
             external_id_present: true,
             external_session_identity_hash: Some(hash_external_session_identity(
                 "eligible-session",
@@ -9556,10 +9574,19 @@ mod tests {
             .expect("admission source reserve");
         // No bind/promote: reached_running_at stays NULL (pre-running failure).
         store
-            .settle_terminal(
-                source_task_id,
-                TerminalTaskWrite::failed(error_code, Utc::now(), ConversationStatus::Cancelled),
-            )
+            .settle_terminal(source_task_id, {
+                let finished_at = Utc::now();
+                TerminalTaskWrite::failed_with_evidence(
+                    error_code,
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        error_code,
+                        DelegationRunStatus::Reserving,
+                        error_code == "admission_unknown",
+                        finished_at,
+                    ),
+                )
+            })
             .await
             .expect("admission source terminal");
         let loaded = store
@@ -12789,6 +12816,9 @@ mod termination_audit {
             child_ownership_valid: true,
             agent_type_matches: true,
             snapshot_complete: true,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: Some("default".into()),
+            config_values_json: Some("{}".into()),
             external_id_present: true,
             external_session_identity_hash: Some(hash_external_session_identity(
                 "malformed-session",

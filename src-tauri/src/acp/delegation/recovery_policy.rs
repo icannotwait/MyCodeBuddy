@@ -35,6 +35,9 @@ pub struct RecoverySourceSnapshot {
     pub parsed_termination: ParsedDelegationTermination,
     pub reached_running: bool,
     pub launch_snapshot_complete: bool,
+    pub launch_snapshot_version: Option<String>,
+    pub mode_id: Option<String>,
+    pub config_values_json: Option<String>,
     /// SHA-256 of the external session identity. Raw session ids never enter
     /// the policy snapshot or its canonical fingerprint input.
     pub external_session_identity_hash: Option<String>,
@@ -150,6 +153,7 @@ pub enum RecoveryCauseCode {
     UserCancelled,
     ToolStalledTimeout,
     LegacyParentDisconnect,
+    IntentionalParentDisconnect,
     MalformedTerminationAudit,
     PreAdmissionRetry,
     PreAdmissionAbort,
@@ -366,30 +370,106 @@ fn inconsistent_durable_state(source: &RecoverySourceSnapshot) -> bool {
     {
         return true;
     }
+    let typed_termination = match &source.parsed_termination {
+        ParsedDelegationTermination::Typed(audit) => Some(&audit.termination),
+        _ => None,
+    };
+    let protected_error = protected_cancellation_error(source.error_code.as_deref());
+    let typed_protected = typed_termination
+        .is_some_and(|termination| protected_cancellation_reason(termination.reason));
     if source.run_status == DelegationRunStatus::Failed
-        && source.error_code.as_deref() == Some("parent_disconnected")
-        && matches!(
-            source.parsed_termination,
-            ParsedDelegationTermination::LegacyUnspecified
-                | ParsedDelegationTermination::Malformed { .. }
-        )
+        && (protected_error.is_some() || typed_protected)
     {
         return true;
     }
-    if source.reached_running
-        && matches!(
-            &source.parsed_termination,
-            ParsedDelegationTermination::Typed(DelegationTerminationAuditV1 {
-                prior_status: DelegationRunStatus::Reserving,
-                termination,
-                ..
-            }) if !termination.prompt_may_have_executed
-        )
-        && source.error_code.as_deref() == Some("host_restarted")
-    {
+    if source.error_code.as_deref() == Some("unresumable") && typed_protected {
         return true;
+    }
+    if let (Some(expected), Some(termination)) = (protected_error, typed_termination) {
+        if (termination.source, termination.reason) != expected.0 {
+            return true;
+        }
+    }
+    if let ParsedDelegationTermination::Typed(audit) = &source.parsed_termination {
+        if (audit.prior_status == DelegationRunStatus::Running && !source.reached_running)
+            || (audit.prior_status == DelegationRunStatus::Reserving && source.reached_running)
+        {
+            return true;
+        }
     }
     false
+}
+
+fn protected_cancellation_error(
+    error_code: Option<&str>,
+) -> Option<(
+    (AcpTerminationSource, AcpTerminationReason),
+    RecoveryCauseCode,
+    RecoveryRiskClass,
+)> {
+    Some(match error_code? {
+        "parent_disconnected" => (
+            (
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+            ),
+            RecoveryCauseCode::LegacyParentDisconnect,
+            RecoveryRiskClass::LegacyUnknownOrigin,
+        ),
+        "parent_canceled" => (
+            (
+                AcpTerminationSource::ParentTurn,
+                AcpTerminationReason::ParentCanceled,
+            ),
+            RecoveryCauseCode::ParentCanceled,
+            RecoveryRiskClass::ExplicitUserStop,
+        ),
+        "parent_turn_failed" => (
+            (
+                AcpTerminationSource::ParentTurn,
+                AcpTerminationReason::ParentTurnFailed,
+            ),
+            RecoveryCauseCode::ParentTurnFailed,
+            RecoveryRiskClass::ExecutionMayHaveOccurred,
+        ),
+        "join_abandoned" => (
+            (
+                AcpTerminationSource::ParentTurn,
+                AcpTerminationReason::JoinAbandoned,
+            ),
+            RecoveryCauseCode::JoinAbandoned,
+            RecoveryRiskClass::ExecutionMayHaveOccurred,
+        ),
+        "user_cancelled" => (
+            (
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::UserCancelled,
+            ),
+            RecoveryCauseCode::UserCancelled,
+            RecoveryRiskClass::ExplicitUserStop,
+        ),
+        "tool_stalled_timeout" => (
+            (
+                AcpTerminationSource::Watchdog,
+                AcpTerminationReason::ToolStalledTimeout,
+            ),
+            RecoveryCauseCode::ToolStalledTimeout,
+            RecoveryRiskClass::ExecutionMayHaveOccurred,
+        ),
+        _ => return None,
+    })
+}
+
+fn protected_cancellation_reason(reason: AcpTerminationReason) -> bool {
+    matches!(
+        reason,
+        AcpTerminationReason::FrontendDisconnected
+            | AcpTerminationReason::ParentCanceled
+            | AcpTerminationReason::ParentTurnFailed
+            | AcpTerminationReason::JoinAbandoned
+            | AcpTerminationReason::UserCancelled
+            | AcpTerminationReason::ToolStalledTimeout
+    )
 }
 
 fn assess_cause(source: &RecoverySourceSnapshot) -> CauseAssessment {
@@ -457,10 +537,16 @@ fn assess_cause(source: &RecoverySourceSnapshot) -> CauseAssessment {
         ParsedDelegationTermination::LegacyUnspecified
             if source.run_status == DelegationRunStatus::Canceled =>
         {
-            CauseAssessment::confirmation_required(
-                RecoveryCauseCode::LegacyParentDisconnect,
-                RecoveryRiskClass::LegacyUnknownOrigin,
-            )
+            let (_, cause_code, risk_class) =
+                protected_cancellation_error(source.error_code.as_deref()).unwrap_or((
+                    (
+                        AcpTerminationSource::Legacy,
+                        AcpTerminationReason::LegacyUnspecified,
+                    ),
+                    RecoveryCauseCode::LegacyParentDisconnect,
+                    RecoveryRiskClass::LegacyUnknownOrigin,
+                ));
+            CauseAssessment::confirmation_required(cause_code, risk_class)
         }
         ParsedDelegationTermination::LegacyUnspecified => match source.run_status {
             DelegationRunStatus::Completed => CauseAssessment::normal(
@@ -485,7 +571,8 @@ fn assess_typed_termination(
     source: &RecoverySourceSnapshot,
 ) -> CauseAssessment {
     let termination = &audit.termination;
-    let automatic_running_loss = audit.prior_status == DelegationRunStatus::Running
+    let automatic_running_loss = source.reached_running
+        && audit.prior_status == DelegationRunStatus::Running
         && termination.prompt_may_have_executed
         && termination.classification == AcpTerminationClassification::Unexpected;
     let automatic_cause = match (termination.source, termination.reason) {
@@ -544,8 +631,16 @@ fn assess_typed_termination(
                     RecoveryCauseCode::LegacyParentDisconnect,
                     RecoveryRiskClass::LegacyUnknownOrigin,
                 ),
-                Some(_) => (
-                    RecoveryCauseCode::UserCancelled,
+                Some(AcpDisconnectOrigin::ProviderUnmount)
+                | Some(AcpDisconnectOrigin::DisconnectAll)
+                | Some(AcpDisconnectOrigin::ApplicationShutdown)
+                | Some(AcpDisconnectOrigin::ConnectionSuperseded)
+                | Some(AcpDisconnectOrigin::IdleTimeout)
+                | Some(AcpDisconnectOrigin::ConfigReapply)
+                | Some(AcpDisconnectOrigin::DraftRetarget)
+                | Some(AcpDisconnectOrigin::AbandonedConnect)
+                | Some(AcpDisconnectOrigin::InternalJobComplete) => (
+                    RecoveryCauseCode::IntentionalParentDisconnect,
                     RecoveryRiskClass::ExecutionMayHaveOccurred,
                 ),
             };
@@ -767,6 +862,9 @@ struct CanonicalRecoverySource<'a> {
     parsed_termination: serde_json::Value,
     reached_running: bool,
     launch_snapshot_complete: bool,
+    launch_snapshot_version: &'a Option<String>,
+    mode_id: &'a Option<String>,
+    config_values: serde_json::Value,
     external_session_identity_hash: &'a Option<String>,
     replaced_task_id: &'a Option<String>,
     replacement_reason: &'a Option<ReplacementReason>,
@@ -804,6 +902,9 @@ fn source_state_fingerprint(
         parsed_termination: canonical_termination(&source.parsed_termination),
         reached_running: source.reached_running,
         launch_snapshot_complete: source.launch_snapshot_complete,
+        launch_snapshot_version: &source.launch_snapshot_version,
+        mode_id: &source.mode_id,
+        config_values: canonical_config_values(&source.config_values_json),
         external_session_identity_hash: &source.external_session_identity_hash,
         replaced_task_id: &source.replaced_task_id,
         replacement_reason: &source.replacement_reason,
@@ -815,6 +916,40 @@ fn source_state_fingerprint(
         "{FINGERPRINT_VERSION}:{}",
         hex_lower(&Sha256::digest(bytes))
     )
+}
+
+fn canonical_config_values(raw: &Option<String>) -> serde_json::Value {
+    match raw {
+        None => serde_json::Value::Null,
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(value) => serde_json::json!({
+                "kind": "structured",
+                "value": canonical_json(value),
+            }),
+            Err(_) => serde_json::json!({
+                "kind": "malformed",
+                "raw_sha256": hex_lower(&Sha256::digest(raw.as_bytes())),
+            }),
+        },
+    }
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries: Vec<_> = values.into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonical_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar,
+    }
 }
 
 fn canonical_termination(parsed: &ParsedDelegationTermination) -> serde_json::Value {
@@ -918,6 +1053,9 @@ mod delegation_recovery_policy {
             parsed_termination: ParsedDelegationTermination::LegacyUnspecified,
             reached_running: true,
             launch_snapshot_complete: true,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: Some("default".into()),
+            config_values_json: Some(r#"{"effort":"high","model":"gpt-5"}"#.into()),
             external_session_identity_hash: Some(hash_external_session_identity("session-1")),
             replaced_task_id: None,
             replacement_reason: None,
@@ -1501,19 +1639,14 @@ mod delegation_recovery_policy {
             let mut retry = source();
             retry.generation = 3;
             retry.run_status = DelegationRunStatus::Failed;
-            retry.error_code = Some(
-                if class == AdmissionClass::UnexpectedContinue {
-                    "parent_disconnected"
-                } else {
-                    "host_restarted"
-                }
-                .into(),
-            );
+            retry.error_code = Some("host_restarted".into());
             retry.admission_class = class.clone();
             retry.reached_running = false;
             retry.child_connection_id = None;
             retry.parsed_termination = if class == AdmissionClass::UnexpectedContinue {
-                ParsedDelegationTermination::LegacyParentDisconnect
+                ParsedDelegationTermination::Malformed {
+                    raw_sha256: "c".repeat(64),
+                }
             } else {
                 typed_termination(
                     AcpTerminationSource::HostRestart,
@@ -1682,6 +1815,291 @@ mod delegation_recovery_policy {
     }
 
     #[test]
+    fn protected_status_error_and_audit_reconciliation_matrix() {
+        let protected = [
+            (
+                "parent_disconnected",
+                RecoveryCauseCode::LegacyParentDisconnect,
+                RecoveryRiskClass::LegacyUnknownOrigin,
+            ),
+            (
+                "parent_canceled",
+                RecoveryCauseCode::ParentCanceled,
+                RecoveryRiskClass::ExplicitUserStop,
+            ),
+            (
+                "parent_turn_failed",
+                RecoveryCauseCode::ParentTurnFailed,
+                RecoveryRiskClass::ExecutionMayHaveOccurred,
+            ),
+            (
+                "join_abandoned",
+                RecoveryCauseCode::JoinAbandoned,
+                RecoveryRiskClass::ExecutionMayHaveOccurred,
+            ),
+            (
+                "user_cancelled",
+                RecoveryCauseCode::UserCancelled,
+                RecoveryRiskClass::ExplicitUserStop,
+            ),
+            (
+                "tool_stalled_timeout",
+                RecoveryCauseCode::ToolStalledTimeout,
+                RecoveryRiskClass::ExecutionMayHaveOccurred,
+            ),
+        ];
+
+        for (error_code, cause_code, risk_class) in protected {
+            let mut failed = source();
+            failed.run_status = DelegationRunStatus::Failed;
+            failed.error_code = Some(error_code.into());
+            failed.parsed_termination = ParsedDelegationTermination::LegacyUnspecified;
+            let decision =
+                decide_delegation_recovery(&failed, &rails(), RequestedRecoveryOperation::Inspect);
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::InconsistentDurableState,
+                "failed + {error_code} must be inconsistent"
+            );
+            assert_eq!(decision.proposed_action(), None);
+
+            let mut canceled = source();
+            canceled.run_status = DelegationRunStatus::Canceled;
+            canceled.error_code = Some(error_code.into());
+            canceled.parsed_termination = if error_code == "parent_disconnected" {
+                ParsedDelegationTermination::LegacyParentDisconnect
+            } else {
+                ParsedDelegationTermination::LegacyUnspecified
+            };
+            assert_decision(
+                canceled,
+                rails(),
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue,
+                },
+                RecoveryConfirmation::Required,
+                cause_code,
+                risk_class,
+            );
+        }
+
+        for (reason, source_kind) in [
+            (
+                AcpTerminationReason::ParentCanceled,
+                AcpTerminationSource::ParentTurn,
+            ),
+            (
+                AcpTerminationReason::ParentTurnFailed,
+                AcpTerminationSource::ParentTurn,
+            ),
+            (
+                AcpTerminationReason::JoinAbandoned,
+                AcpTerminationSource::ParentTurn,
+            ),
+            (
+                AcpTerminationReason::UserCancelled,
+                AcpTerminationSource::Frontend,
+            ),
+            (
+                AcpTerminationReason::ToolStalledTimeout,
+                AcpTerminationSource::Watchdog,
+            ),
+        ] {
+            let mut contradictory = source();
+            contradictory.run_status = DelegationRunStatus::Failed;
+            contradictory.error_code = Some("unresumable".into());
+            contradictory.parsed_termination = typed_termination(
+                source_kind,
+                reason,
+                AcpTerminationClassification::Intentional,
+                DelegationRunStatus::Running,
+                true,
+            );
+            let decision = decide_delegation_recovery(
+                &contradictory,
+                &rails(),
+                RequestedRecoveryOperation::Inspect,
+            );
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::InconsistentDurableState,
+                "unresumable + {reason:?} must be inconsistent"
+            );
+        }
+
+        let mut mismatched = source();
+        mismatched.run_status = DelegationRunStatus::Canceled;
+        mismatched.error_code = Some("parent_canceled".into());
+        mismatched.parsed_termination = typed_termination(
+            AcpTerminationSource::Watchdog,
+            AcpTerminationReason::ToolStalledTimeout,
+            AcpTerminationClassification::AutomatedAmbiguous,
+            DelegationRunStatus::Running,
+            true,
+        );
+        assert_eq!(
+            decide_delegation_recovery(&mismatched, &rails(), RequestedRecoveryOperation::Inspect,)
+                .disposition,
+            RecoveryDisposition::InconsistentDurableState,
+        );
+    }
+
+    #[test]
+    fn automatic_continue_requires_durable_reached_running() {
+        let mut missing_durable_running = source();
+        missing_durable_running.run_status = DelegationRunStatus::Canceled;
+        missing_durable_running.error_code = Some("transport_disconnected".into());
+        missing_durable_running.reached_running = false;
+        missing_durable_running.parsed_termination = typed_termination(
+            AcpTerminationSource::Transport,
+            AcpTerminationReason::TransportDisconnected,
+            AcpTerminationClassification::Unexpected,
+            DelegationRunStatus::Running,
+            true,
+        );
+        let decision = decide_delegation_recovery(
+            &missing_durable_running,
+            &rails(),
+            RequestedRecoveryOperation::Inspect,
+        );
+        assert_eq!(
+            decision.disposition,
+            RecoveryDisposition::InconsistentDurableState,
+        );
+        assert_eq!(decision.proposed_action(), None);
+
+        let mut stale_reserving_phase = source();
+        stale_reserving_phase.run_status = DelegationRunStatus::Failed;
+        stale_reserving_phase.error_code = Some("spawn_failed".into());
+        stale_reserving_phase.reached_running = true;
+        stale_reserving_phase.parsed_termination = typed_termination(
+            AcpTerminationSource::Admission,
+            AcpTerminationReason::AdmissionFailed,
+            AcpTerminationClassification::Intentional,
+            DelegationRunStatus::Reserving,
+            false,
+        );
+        let decision = decide_delegation_recovery(
+            &stale_reserving_phase,
+            &rails(),
+            RequestedRecoveryOperation::Inspect,
+        );
+        assert_eq!(
+            decision.disposition,
+            RecoveryDisposition::InconsistentDurableState,
+        );
+        assert_eq!(decision.proposed_action(), None);
+    }
+
+    #[test]
+    fn intentional_frontend_disconnect_origins_require_confirmation() {
+        let decision_for = |origin: Option<AcpDisconnectOrigin>| {
+            let mut disconnected = source();
+            disconnected.run_status = DelegationRunStatus::Canceled;
+            disconnected.error_code = Some("parent_disconnected".into());
+            disconnected.parsed_termination = typed_termination(
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                DelegationRunStatus::Running,
+                true,
+            );
+            let ParsedDelegationTermination::Typed(audit) = &mut disconnected.parsed_termination
+            else {
+                unreachable!()
+            };
+            audit.termination.frontend_origin = origin;
+            decide_delegation_recovery(&disconnected, &rails(), RequestedRecoveryOperation::Inspect)
+        };
+
+        let explicit = decision_for(Some(AcpDisconnectOrigin::ExplicitUser));
+        assert_eq!(explicit.confirmation, RecoveryConfirmation::Required);
+        assert_eq!(explicit.cause_code, RecoveryCauseCode::UserCancelled);
+        assert_eq!(explicit.risk_class, RecoveryRiskClass::ExplicitUserStop);
+
+        for origin in [None, Some(AcpDisconnectOrigin::LegacyUnspecified)] {
+            let legacy = decision_for(origin);
+            assert_eq!(legacy.confirmation, RecoveryConfirmation::Required);
+            assert_eq!(legacy.cause_code, RecoveryCauseCode::LegacyParentDisconnect);
+            assert_eq!(legacy.risk_class, RecoveryRiskClass::LegacyUnknownOrigin);
+        }
+
+        for origin in [
+            AcpDisconnectOrigin::ProviderUnmount,
+            AcpDisconnectOrigin::DisconnectAll,
+            AcpDisconnectOrigin::ApplicationShutdown,
+            AcpDisconnectOrigin::ConnectionSuperseded,
+            AcpDisconnectOrigin::IdleTimeout,
+            AcpDisconnectOrigin::ConfigReapply,
+            AcpDisconnectOrigin::DraftRetarget,
+            AcpDisconnectOrigin::AbandonedConnect,
+            AcpDisconnectOrigin::InternalJobComplete,
+        ] {
+            let intentional = decision_for(Some(origin));
+            assert_eq!(
+                intentional.disposition,
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue,
+                }
+            );
+            assert_eq!(intentional.confirmation, RecoveryConfirmation::Required);
+            assert_eq!(
+                intentional.cause_code,
+                RecoveryCauseCode::IntentionalParentDisconnect,
+                "intentional origin {origin:?} must not become user cancellation"
+            );
+            assert_eq!(
+                intentional.risk_class,
+                RecoveryRiskClass::ExecutionMayHaveOccurred
+            );
+        }
+    }
+
+    #[test]
+    fn launch_snapshot_identity_fields_are_fingerprinted() {
+        let source = source();
+        let baseline =
+            decide_delegation_recovery(&source, &rails(), RequestedRecoveryOperation::Inspect)
+                .source_state_fingerprint;
+
+        let mut changed_version = source.clone();
+        changed_version.launch_snapshot_version = Some("v2".into());
+        let mut changed_mode = source.clone();
+        changed_mode.mode_id = Some("review".into());
+        let mut changed_config = source.clone();
+        changed_config.config_values_json = Some(r#"{"model":"gpt-5.1","effort":"high"}"#.into());
+
+        for mutation in [changed_version, changed_mode, changed_config] {
+            let fingerprint = decide_delegation_recovery(
+                &mutation,
+                &rails(),
+                RequestedRecoveryOperation::Inspect,
+            )
+            .source_state_fingerprint;
+            assert_ne!(baseline, fingerprint);
+            assert!(fingerprint.starts_with("delegation_recovery_v1:"));
+            assert_eq!(fingerprint.len(), 87);
+            assert!(fingerprint[23..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+
+        let mut reordered_config = source.clone();
+        reordered_config.config_values_json =
+            Some(r#"{ "model": "gpt-5", "effort": "high" }"#.into());
+        let reordered = decide_delegation_recovery(
+            &reordered_config,
+            &rails(),
+            RequestedRecoveryOperation::Inspect,
+        )
+        .source_state_fingerprint;
+        assert_eq!(
+            baseline, reordered,
+            "JSON object order is not snapshot identity"
+        );
+    }
+
+    #[test]
     fn fingerprints_exclude_prompt_raw_external_session_id_and_budgets() {
         let source = source();
         let base_rails = rails();
@@ -1754,6 +2172,9 @@ mod delegation_recovery_policy {
         );
         mutated!(reached_running = false);
         mutated!(launch_snapshot_complete = false);
+        mutated!(launch_snapshot_version = Some("v2".into()));
+        mutated!(mode_id = Some("review".into()));
+        mutated!(config_values_json = Some(r#"{"model":"gpt-5.1"}"#.into()));
         mutated!(
             external_session_identity_hash = Some(hash_external_session_identity("session-2"))
         );
