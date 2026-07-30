@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog suave (segundos)",
-      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). No cancela ni cambia la ruta."
+      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). 0 desactiva el marcado de estancamiento. No cancela ni cambia la ruta."
     },
     "actions": {
       "dragSort": "Arrastrar para reordenar",

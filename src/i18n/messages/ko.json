@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "소프트 워치독(초)",
-      "softWatchdogHint": "관찰 전용 정체 임계값({min}–{max}). 취소하거나 라우트를 바꾸지 않습니다."
+      "softWatchdogHint": "관찰 전용 정체 임계값({min}–{max}). 0이면 정체 표시 비활성. 취소하거나 라우트를 바꾸지 않습니다."
     },
     "actions": {
       "dragSort": "드래그하여 순서 변경",

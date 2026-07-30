@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "ソフトウォッチドッグ（秒）",
-      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。キャンセルやルート変更はしません。"
+      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。0 で停滞表示を無効化。キャンセルやルート変更はしません。"
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",

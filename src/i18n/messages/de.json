@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "Soft-Watchdog (Sekunden)",
-      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). Bricht nicht ab und wechselt die Route nicht."
+      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). 0 deaktiviert Stall-Markierung. Bricht nicht ab und wechselt die Route nicht."
     },
     "actions": {
       "dragSort": "Zum Neuordnen ziehen",

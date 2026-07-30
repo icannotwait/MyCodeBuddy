@@ -88,8 +88,10 @@ impl SupervisorWake {
 
 /// Derive observation for a running task.
 ///
-/// Precedence: `waiting_input` wins over stall. `stalled_since` is exactly
-/// `last_agent_activity_at + threshold`, never the scan time.
+/// Precedence: `waiting_input` wins over stall. `threshold_secs == 0` disables
+/// stall observation entirely (always Active unless waiting). Otherwise
+/// `stalled_since` is exactly `last_agent_activity_at + threshold`, never the
+/// scan time.
 pub fn derive_observation(
     now: DateTime<Utc>,
     last_agent_activity_at: DateTime<Utc>,
@@ -99,6 +101,14 @@ pub fn derive_observation(
     if waiting_input {
         return ObservationSnapshot {
             observation: TaskObservation::WaitingInput,
+            last_agent_activity_at,
+            stalled_since: None,
+        };
+    }
+    // Soft-watchdog kill switch: 0 means observe activity/waiting only.
+    if threshold_secs == 0 {
+        return ObservationSnapshot {
+            observation: TaskObservation::Active,
             last_agent_activity_at,
             stalled_since: None,
         };
@@ -453,6 +463,14 @@ mod tests {
             exact.stalled_since,
             Some(last + chrono::Duration::seconds(300))
         );
+
+        // threshold 0 = soft-watchdog off: never stalled, even far past activity.
+        let disabled = derive_observation(last + chrono::Duration::seconds(10_000), last, false, 0);
+        assert_eq!(disabled.observation, TaskObservation::Active);
+        assert_eq!(disabled.stalled_since, None);
+        let disabled_waiting =
+            derive_observation(last + chrono::Duration::seconds(10_000), last, true, 0);
+        assert_eq!(disabled_waiting.observation, TaskObservation::WaitingInput);
     }
 
     #[tokio::test]

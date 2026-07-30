@@ -182,16 +182,17 @@ describe("DelegationSettingsSection", () => {
     expect(await screen.findByRole("button", { name: "Codeg" })).toBeDisabled()
     expect(screen.getByText(/effective.*Native/i)).toBeInTheDocument()
 
-    // Enable to edit watchdog, then save an out-of-range value.
+    // Enable to edit watchdog, then save an out-of-range high value (clamps to max).
+    // 0 is legal (disables stall observation); under-floor clamp no longer applies.
     const enableSwitch = screen.getByLabelText("Enable delegation")
     fireEvent.click(enableSwitch)
     const watchdog = screen.getByLabelText(/soft watchdog/i)
-    fireEvent.change(watchdog, { target: { value: "10" } })
+    fireEvent.change(watchdog, { target: { value: "9999" } })
     fireEvent.click(screen.getByRole("button", { name: /save/i }))
     await waitFor(() => {
       expect(mockSetDelegationBundle).toHaveBeenCalledWith(
         expect.objectContaining({
-          settings: expect.objectContaining({ stalled_after_seconds: 60 }),
+          settings: expect.objectContaining({ stalled_after_seconds: 3600 }),
         })
       )
     })

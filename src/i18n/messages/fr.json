@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog soft (secondes)",
-      "softWatchdogHint": "Seuil d’inactivité en observation seule ({min}–{max}). N’annule ni ne change la route."
+      "softWatchdogHint": "Seuil d’inactivité en observation seule ({min}–{max}). 0 désactive le marquage d’attente. N’annule ni ne change la route."
     },
     "actions": {
       "dragSort": "Glisser pour réordonner",

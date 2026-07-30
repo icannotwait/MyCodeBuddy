@@ -595,7 +595,7 @@
         "native": "Native"
       },
       "softWatchdog": "Soft watchdog (seconds)",
-      "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). Does not cancel or change route."
+      "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). 0 disables stall marking. Does not cancel or change route."
     },
     "actions": {
       "dragSort": "Drag to reorder",

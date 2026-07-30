@@ -51,7 +51,8 @@ const DEPTH_MAX = 8
 const DEFAULT_CACHE_MB = 512
 const DEFAULT_ROUTE: DelegationRoutePolicy = "codeg"
 const DEFAULT_STALLED_AFTER = 300
-const STALLED_MIN = 60
+/** 0 disables soft-watchdog stall observation (never marks stalled). */
+const STALLED_MIN = 0
 const STALLED_MAX = 3600
 
 function clamp(n: number, lo: number, hi: number): number {

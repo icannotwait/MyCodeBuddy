@@ -595,7 +595,7 @@
         "native": "Native"
       },
       "softWatchdog": "软看门狗（秒）",
-      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。不会取消或切换路由。"
+      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。0 表示关闭停滞标记。不会取消或切换路由。"
     },
     "actions": {
       "dragSort": "拖拽排序",

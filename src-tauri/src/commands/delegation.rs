@@ -82,7 +82,9 @@ pub const DEFAULT_COMPLETED_CACHE_MB: u32 = 512;
 
 /// Product default for the soft-watchdog stall threshold (seconds).
 pub const DEFAULT_STALLED_AFTER_SECONDS: u32 = 300;
-pub const STALLED_AFTER_MIN: u32 = 60;
+/// Soft-watchdog stall threshold bounds. `0` disables stall observation
+/// (never emits `stalled`; waiting_input is still reported).
+pub const STALLED_AFTER_MIN: u32 = 0;
 pub const STALLED_AFTER_MAX: u32 = 3600;
 
 fn default_completed_cache_max_mb() -> u32 {
@@ -164,6 +166,7 @@ pub struct DelegationSettings {
     pub route_policy: DelegationRoutePolicy,
     /// Soft-watchdog stall threshold (seconds). Absent in a legacy payload →
     /// product default; clamped to `STALLED_AFTER_MIN..=STALLED_AFTER_MAX`.
+    /// `0` disables stall observation (never marks tasks stalled).
     #[serde(default = "default_stalled_after_seconds")]
     pub stalled_after_seconds: u32,
     /// Per-agent default overrides applied by the delegation broker when
@@ -1373,12 +1376,20 @@ mod tests {
         app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_ROUTE_POLICY, "broken")
             .await
             .unwrap();
+        // Below the old 60s floor is now legal (0 = disabled); tiny positives
+        // stay as-is rather than clamping up.
         app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_STALLED_AFTER_SECONDS, "9")
             .await
             .unwrap();
-        let malformed = load_delegation_settings(&db.conn).await;
-        assert_eq!(malformed.route_policy, DelegationRoutePolicy::Codeg);
-        assert_eq!(malformed.stalled_after_seconds, 60);
+        let small = load_delegation_settings(&db.conn).await;
+        assert_eq!(small.route_policy, DelegationRoutePolicy::Codeg);
+        assert_eq!(small.stalled_after_seconds, 9);
+
+        app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_STALLED_AFTER_SECONDS, "0")
+            .await
+            .unwrap();
+        let disabled = load_delegation_settings(&db.conn).await;
+        assert_eq!(disabled.stalled_after_seconds, 0);
 
         app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_ROUTE_POLICY, "native")
             .await

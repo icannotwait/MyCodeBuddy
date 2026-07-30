@@ -594,7 +594,7 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog suave (segundos)",
-      "softWatchdogHint": "Limite de inatividade somente observacao ({min}–{max}). Nao cancela nem altera a rota."
+      "softWatchdogHint": "Limite de inatividade somente observacao ({min}–{max}). 0 desativa a marcacao de parada. Nao cancela nem altera a rota."
     },
     "actions": {
       "dragSort": "Arraste para reordenar",
