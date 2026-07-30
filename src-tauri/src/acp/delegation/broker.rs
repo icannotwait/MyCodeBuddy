@@ -31282,11 +31282,13 @@ mod tests {
             .expect("canonical workspace")
             .to_string_lossy()
             .into_owned();
+        let storage_path =
+            crate::db::service::folder_service::normalize_folder_storage_path(&canonical);
 
         // Prove path was not open in DB before reserve.
         assert!(
             folder::Entity::find()
-                .filter(folder::Column::Path.eq(&canonical))
+                .filter(folder::Column::Path.eq(&storage_path))
                 .one(&db.conn)
                 .await
                 .expect("pre-query")
@@ -31304,7 +31306,7 @@ mod tests {
         );
 
         let row = folder::Entity::find()
-            .filter(folder::Column::Path.eq(&canonical))
+            .filter(folder::Column::Path.eq(&storage_path))
             .one(&db.conn)
             .await
             .expect("query folder")
