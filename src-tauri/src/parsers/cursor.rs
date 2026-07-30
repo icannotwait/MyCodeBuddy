@@ -12,7 +12,7 @@ use crate::models::{
 use crate::parsers::{
     compute_session_stats, folder_name_from_path, merge_context_window_stats,
     relocate_orphaned_tool_results, structurize_read_tool_output, title_from_user_text,
-    truncate_str, AgentParser, ParseError,
+    truncate_str, visible_user_text, AgentParser, ParseError,
 };
 
 /// Caps mirroring the Grok parser: bound a single tool output / input preview
@@ -338,8 +338,7 @@ fn first_user_text(conn: &Connection, state: &DecodedState) -> Option<String> {
     let agent_turn = wire::first_message(&turn_bytes, 1)?;
     let user_ref = wire::first_bytes(&agent_turn, 1)?;
     let msg = read_user_message(conn, &user_ref);
-    let text = decode_user_text(conn, &msg)?;
-    (!text.trim().is_empty()).then_some(text)
+    decode_user_text(conn, &msg).and_then(|text| visible_user_text(&text))
 }
 
 // ---------------------------------------------------------------------------
@@ -967,10 +966,10 @@ fn build_turns(
             if let Some(user_ref) = wire::first_bytes(&agent_turn, 1) {
                 let msg = read_user_message(conn, &user_ref);
                 let mut user_blocks: Vec<ContentBlock> = Vec::new();
-                if let Some(text) = decode_user_text(conn, &msg) {
-                    if !text.trim().is_empty() {
-                        user_blocks.push(ContentBlock::Text { text });
-                    }
+                if let Some(text) =
+                    decode_user_text(conn, &msg).and_then(|text| visible_user_text(&text))
+                {
+                    user_blocks.push(ContentBlock::Text { text });
                 }
                 // Text first, then attachments — matching the composer's
                 // send order. An image-only prompt still produces the turn.

@@ -1852,6 +1852,74 @@ earlier terminal context records.\n\
     }
 
     #[test]
+    fn hides_mandatory_route_chunk_and_keeps_one_grok_user_block() {
+        let route = "Codeg mandatory delegation route: call delegate_to_agent exactly once";
+        let prose = "Please implement the approved workflow plan";
+        let summary = serde_json::json!({
+            "info": {
+                "id": "019f45e3-e1ef-7690-a29f-fe2554382b49",
+                "cwd": "/Users/me/proj"
+            },
+            "session_summary": route,
+            "generated_title": route,
+            "created_at": "2026-07-09T07:59:50.598122Z",
+            "updated_at": "2026-07-09T08:02:09.789572Z",
+            "num_messages": 3,
+            "current_model_id": "grok-4.5",
+            "head_branch": "main"
+        })
+        .to_string();
+        let updates = [
+            serde_json::json!({
+                "method": "session/update",
+                "params": {"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": route},
+                    "_meta": {"modelId": "grok-4.5", "promptIndex": 0}
+                }},
+                "timestamp": 1783584019_i64
+            }),
+            serde_json::json!({
+                "method": "session/update",
+                "params": {"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": prose},
+                    "_meta": {"promptIndex": 0}
+                }},
+                "timestamp": 1783584020_i64
+            }),
+            serde_json::json!({
+                "method": "session/update",
+                "params": {"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": test_codeg_terminal_context()},
+                    "_meta": {"promptIndex": 0}
+                }},
+                "timestamp": 1783584021_i64
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let (_tmp, sessions) = fixture(&summary, &updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .expect("detail");
+
+        assert_eq!(detail.summary.title.as_deref(), Some(prose));
+        let user_turns = detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::User))
+            .collect::<Vec<_>>();
+        assert_eq!(user_turns.len(), 1);
+        assert_eq!(user_turns[0].blocks.len(), 1);
+        assert_eq!(user_turn_texts(&detail), vec![prose.to_string()]);
+    }
+
+    #[test]
     fn hides_codeg_terminal_context_from_history_and_title() {
         let ctx = test_codeg_terminal_context();
         let real_plus = format!("real prompt\n\n{ctx}");
