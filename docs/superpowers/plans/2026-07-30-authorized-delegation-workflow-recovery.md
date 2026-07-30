@@ -13,7 +13,9 @@
 - Approved delegation Design baseline: `docs/superpowers/specs/2026-07-30-delegation-recovery-authorization-design.md`, SHA-256 `b8b04fb31daafd275d24fd8f712ff488d9a7429e7a3b9cd6a7f38c7b4cf0401d`. Do not modify it during implementation.
 - Approved workflow Design baseline: `docs/superpowers/specs/2026-07-30-workflow-blocked-recovery-design.md`, SHA-256 `632d2c74a27fcff4c01b274b8b2bfb54fed35ea767cc2c39f5d0035352c87ce9`. Do not modify it during implementation.
 - Keep Task execution serial. Tasks 1-8 establish persistence, evidence, state authority, policies, and authorization interfaces consumed by Tasks 9-12.
+- **Workspace Gate before Task 1:** run `git status --short` and require a clean implementation worktree. At plan-review time the main worktree contains unrelated edits in `src/components/message/live-transcript-row.test.tsx`, `src/components/message/message-list-view.test.tsx`, `src/hooks/use-delegation-card-model.test.ts`, `src/hooks/use-delegation-card-model.ts`, `src/lib/delegation-transcript-projection.test.ts`, and `src/lib/delegation-transcript-projection.ts`. Do not start Task 1 or run the final matrix over those edits. Their owner must first commit/stash them, or the executor must use a clean isolated worktree; never stage, stash, revert, or overwrite them implicitly.
 - Follow RED-GREEN-REFACTOR for every Task. Observe each focused test fail for the intended missing behavior before production edits.
+- **Focused Test Filter Gate:** every new Rust test group must be nested under the exact module name specified by its Task so the documented `cargo test <filter>` command matches its module path. Immediately before every filtered GREEN run, run the same command with `-- --list`; it must list at least one test. The GREEN output must report `N passed` with `N > 0`; `running 0 tests` is a hard failure even when Cargo exits 0. Record the listed and passed counts in the Task evidence.
 - Do not delete or rewrite historical delegation runs, manifests, settlements, run bindings, or retired node bindings. The migration is additive and fabricates no historical provenance.
 - Do not create a replacement workflow, new parent session, or cleanup command as the product fix. Session recreation remains only an old-binary operational workaround.
 - Delegation recovery is resume-first. A valid established resume identity with available budget can authorize only `continue`; replacement needs current durable structural or attempted-resume `unresumable` evidence.
@@ -36,6 +38,7 @@
 - Keep Next.js static export compatibility; do not introduce dynamic routes or server-only frontend code.
 - During Tasks 1-11 run only focused tests. Run the full long-running repository validation matrix once in Task 12 after implementation, migration, docs, schema, Skill, and focused acceptance tests are complete.
 - Use PowerShell syntax for commands. Run Rust commands from `src-tauri/`. Stage only Task-owned files, use local commits, and do not push, merge, or open a PR.
+- Task 4's fail-closed adapter commit through Task 8 is an implementation-only transition and is not independently shippable. The Task 1-11 commit series is delivered atomically: do not expose either the old broad matcher as an alternative to the new policy or the temporary no-authorization adapter behavior to users.
 
 ## File Map
 
@@ -345,6 +348,8 @@ pub struct ParentEndContext {
 
 - [ ] **Step 1: Write typed audit, legacy parse, and first-terminal-wins tests**
 
+Place the following tests under `#[cfg(test)] mod termination_audit`; the separate `parent_end` GREEN filter must also list at least the `later_parent_end_cannot_replace_winning_child_terminal_audit` regression.
+
 ```rust
 #[test]
 fn canceled_terminal_write_serializes_typed_evidence() {
@@ -512,6 +517,8 @@ TypeScript mirrors the same snake-case union in `AcpDisconnectLease.origin` and 
 
 - [ ] **Step 1: Write backend intent-registry and frontend call-site tests**
 
+Place all new Rust tests in this Step under `#[cfg(test)] mod disconnect_origin`.
+
 ```rust
 #[test]
 fn observed_transport_loss_outranks_legacy_unspecified_but_not_recorded_user_intent() {
@@ -666,11 +673,16 @@ Serialize the canonical fingerprint as `delegation_recovery_v1:<lowercase_sha256
 
 - [ ] **Step 1: Write the complete table-driven decision matrix**
 
+Place all tests in this Step under `#[cfg(test)] mod delegation_recovery_policy`.
+
 Implement the following named tests and assertions:
 
 | Test | Exact assertions |
 | --- | --- |
-| `delegation_recovery_decision_matrix` | Cover completed; revision-eligible failed; unexpected transport/process; NULL, malformed, and intentional parent disconnect; explicit cancel; parent-turn failure; join abandonment; stall; pure pre-admission infrastructure and explicit abort; established pre-admission retry; host restart; `admission_failed`; `admission_unknown`; missing resume identity; persisted `unresumable` both with and without authorized-continue provenance; continue-budget exhaustion; unsupported reuse; replacement exhaustion; stale; busy; route rejection; and contradictory evidence. For every row assert the exact disposition, action payload, confirmation, cause, risk, and stop code; only the exact authorized-continue follow-on row waives a second confirmation. |
+| `delegation_recovery_decision_matrix` | Cover completed; revision-eligible failed; unexpected transport/process; NULL, malformed, and intentional parent disconnect; explicit cancel; parent-turn failure; join abandonment; stall; pure pre-admission infrastructure and explicit abort; `admission_failed`; `admission_unknown`; missing resume identity; persisted `unresumable` both with and without authorized-continue provenance; continue-budget exhaustion; unsupported reuse; replacement exhaustion; stale; busy; route rejection; and contradictory evidence. For every row assert the exact disposition, action payload, confirmation, cause, risk, and stop code; only the exact authorized-continue follow-on row waives a second confirmation. |
+| `post_running_and_pre_admission_host_restart_use_distinct_rails` | Assert post-running host restart with running audit derives `Continue(UnexpectedContinue)` without confirmation. Separately assert a pre-admission host restart with complete resume identity and a non-replacement admission class retries continue while preserving `NormalRevision` or `UnexpectedContinue`; an incomplete/bound execution-ambiguous row becomes `AdmissionUnknown` rather than a fresh abort. |
+| `established_pre_admission_continue_retry_preserves_rail_and_confirmation` | Build a later-generation continue attempt in an established lineage that provably admitted no prompt. Assert retry remains continue, preserves its original admission class and cause-derived confirmation, does not become generation-1 fresh dispatch, and does not charge budget before running promotion. |
+| `established_pre_admission_replacement_retry_never_switches_to_continue` | Build a pre-running replacement attempt in an established lineage with complete resume identity. Assert retry remains replacement with the same reason and inherited confirmation/provenance; it never switches to continue or fresh dispatch, and execution ambiguity instead derives authorized `AdmissionUnknown` replacement. |
 | `busy_precedes_every_authorization_and_has_no_detach_action` | Evaluate a reserving and a running source with valid continue and replace rails and with a matching approved authorization available. Both decisions are `Stop(BusyThread)`, expose no proposed action, set authorization-required false, and never return a detach, expire, supersede, or cancel operation. |
 | `parent_cancel_with_missing_resume_identity_still_requires_confirmation_for_replace` | Build an explicit-parent-cancel source with no resume identity and a valid replacement rail. Assert `Replace(NotSupported)` inherits `confirmation=Required`, the cause remains explicit cancel, and risk remains explicit-user-stop rather than becoming an automatic structural replacement. |
 | `failed_parent_disconnected_is_inconsistent_not_legacy_compatible` | Pair `status=failed` with `error_code=parent_disconnected` and both NULL and malformed audits. Assert `InconsistentDurableState`; do not project continue, replacement, or a compatibility exception. |
@@ -700,6 +712,14 @@ impl RecoveryDecision {
 
 Move policy meaning out of `decide_continue_eligibility`, `is_noncontinuable_lineage_stuck_code`, `is_unexpected_cancellation_audit`, and `replacement_reason_matches_source`. Keep temporary adapters only to compile existing admission until Task 9; adapters must delegate to `decide_delegation_recovery` and cannot retain the broad parent-end-to-`unresumable` matcher.
 
+The Task 4-8 adapter contract is deliberately fail-closed because no authorization input exists yet: `RecoveryConfirmation::Required` maps to the existing `ContinueDecision::NotContinuable`/replacement rejection and creates no run. Automatic `NotRequired` decisions may keep their derived legacy admission result. Task 9 removes this temporary mapping and returns `recovery_confirmation_required` plus the typed projection or consumes an exact authorization.
+
+Rewrite the cc55cf57-era assertions in `run_store.rs` during Task 4, not Task 9:
+
+- In `continue_eligibility_decision_table_obeys_precedence_and_recovery_rules`, the NULL-audit post-running `parent_disconnected` subcase must assert the central decision is confirmation-required continue while the temporary adapter returns `NotContinuable`.
+- Replace `parent_end_and_explicit_cancel_codes_match_unresumable_replacement` with the negative assertion that parent-end, explicit-cancel, and stall codes never directly match `replacement_reason=unresumable`.
+- Replace `parent_disconnected_source_admits_unresumable_replacement` with a rejection/no-run regression for the temporary adapter. Task 9 adds the authorized continue and durable follow-on `failed/unresumable` replacement acceptance path.
+
 - [ ] **Step 4: Run policy and existing run-store tests and verify GREEN**
 
 Run: `cargo test delegation_recovery_policy --lib -- --nocapture`
@@ -708,7 +728,7 @@ Expected: PASS for every decision row, precedence rule, confirmation inheritance
 
 Run: `cargo test acp::delegation::run_store::tests --lib -- --nocapture`
 
-Expected: PASS through the temporary central-policy adapters.
+Expected: PASS through the explicit fail-closed adapters, including the three rewritten cc55cf57 regressions; the test summary must show `N passed` with `N > 0`.
 
 - [ ] **Step 5: Commit Task 4**
 
@@ -733,6 +753,8 @@ git commit -m "refactor: centralize delegation recovery policy"
 Exact reactivation compares workflow id, node id, work-unit key, role, agent type, profile id, phase id, and Task index. Any mismatch requires a new node id and normal topology validation.
 
 - [ ] **Step 1: Write lifecycle matrix and frozen-cohort regression tests**
+
+Place all tests in this Step under `#[cfg(test)] mod binding_lifecycle`.
 
 Implement the following named tests and assertions:
 
@@ -822,12 +844,14 @@ pub async fn append_state_only_revision_txn(
 
 - [ ] **Step 1: Write state-authority and Plan settlement tests**
 
+Place all tests in this Step under `#[cfg(test)] mod workflow_state_authority`.
+
 Implement the following named tests and assertions:
 
 | Test | Exact assertions |
 | --- | --- |
 | `ordinary_publication_cannot_leave_blocked_or_call_binding_diff_for_state_only_change` | Submit a document identical except for `blocked -> estimated`; assert `workflow_recovery_required`, no manifest/header/binding write, no revision increment, and no binding-diff invocation. |
-| `blocked_workflow_can_publish_real_plan_structure_but_effective_state_stays_blocked` | Change valid Plan structure while requesting a non-blocked state; assert a publication revision is appended with the new structure but effective document/header state remains blocked and block provenance is retained. |
+| `blocked_workflow_can_publish_real_plan_structure_but_effective_state_stays_blocked` | Change valid Plan structure while requesting a non-blocked state; assert the publication commits a revision with the new structure, effective document/header state remains blocked, block provenance is retained, and the successful response carries the typed `workflow_recovery_required` disposition and current read-only recovery projection rather than rolling back the structural change. |
 | `nonblocked_plan_approval_atomically_appends_approved_state_only_revision` | Settle an exact current Plan gate from estimated; assert gate settlement, `revision_kind=state_only`, approved document, header active revision/state, and source revision provenance commit together. Inject failure before commit and assert none persist. |
 | `approval_while_blocked_persists_gate_evidence_without_unblocking` | Settle an exact current Plan gate while blocked; assert approval evidence persists, no approved state-only revision is created, header/document remain blocked, and the later recovery snapshot can derive approved. |
 | `state_only_revision_preserves_structural_revision_and_fingerprints_across_restart` | Append a state-only transition, reopen the database, and assert structural revision, graph revision, Plan path/digest, nodes, routes, and structural fingerprints equal the source while manifest revision and state/provenance alone differ. |
@@ -938,6 +962,8 @@ Serialize the canonical fingerprint as `workflow_recovery_v1:<lowercase_sha256_h
 
 - [ ] **Step 1: Write policy, fingerprint, and projection tests**
 
+Place the pure policy/fingerprint tests under `#[cfg(test)] mod workflow_recovery_policy`. Name the admission regression exactly `task_first_dispatch_blocked_returns_typed_projection_without_authorization_id` so both documented filters list tests.
+
 Implement the following named tests and assertions:
 
 | Test | Exact assertions |
@@ -947,7 +973,7 @@ Implement the following named tests and assertions:
 | `user_decision_required_derives_only_reset_plan_lineage` | Supply a typed `PlanUserDecisionRequired` block and exact displayed reason. Assert only `ResetPlanLineage` is derivable, generic recover is unavailable, and the action payload contains the hash of the displayed reason rather than raw prose. |
 | `stale_gate_author_reviewer_or_digest_evidence_never_derives_approved` | Independently stale the Plan digest, gate cycle, Author identity, each reviewer identity, or zero-count evidence. Assert approved is never derived; derive estimated only when the current Plan remains otherwise valid, and stop on contradictory evidence. |
 | `workflow_fingerprint_changes_for_every_policy_relevant_evidence_change` | Change every enumerated snapshot field independently and assert a different lowercase `workflow_recovery_v1:<64 hex>` value; change Plan prose, prompts, raw external session ids, and unrelated UI fields and assert equality. |
-| `blocked_task_admission_returns_typed_projection_without_authorization_id` | Attempt Task admission on a recoverable blocked workflow and assert the original blocked rejection plus exact disposition/action/target/cause/risk/required/blockers projection; serialize it and assert neither an authorization id nor receipt-like field exists. |
+| `task_first_dispatch_blocked_returns_typed_projection_without_authorization_id` | Attempt Task admission on a recoverable blocked workflow and assert the original blocked rejection plus exact disposition/action/target/cause/risk/required/blockers projection; serialize it and assert neither an authorization id nor receipt-like field exists. |
 
 - [ ] **Step 2: Run workflow policy tests and verify RED**
 
@@ -1073,6 +1099,8 @@ pub async fn wait_for_resolution(
 
 - [ ] **Step 1: Write lifecycle, dedupe, reconnect, and transaction tests**
 
+Place all new authorization tests under `#[cfg(test)] mod recovery_authorization`; generic question regressions remain under the existing `question` module path.
+
 Implement the following named tests and assertions:
 
 | Test | Exact assertions |
@@ -1172,6 +1200,8 @@ pub struct DelegationRecoveryProjection {
 
 - [ ] **Step 1: Write broker/run-store recovery acceptance tests**
 
+Place all new integration tests in this Step under `#[cfg(test)] mod authorized_delegation_recovery`.
+
 Implement the following named tests and assertions:
 
 | Test | Exact assertions |
@@ -1207,7 +1237,7 @@ async fn authorize_recovery_admission_txn(
 ) -> Result<RecoveryDecision, TaskStoreError>;
 ```
 
-Call this helper after existing parent-tool idempotency and ownership checks but before budget/fence mutation. Return `recovery_confirmation_required` with the typed projection when a required receipt is absent. Insert no synthetic failed child for setup/policy rejection. Persist `recovery_authorization_id` on the admitted run, consume only after every existing conditional preflight succeeds, and keep it consumed after post-commit spawn/resume failure. When that exact authorized continue becomes the latest durable `failed/unresumable` run, let the central policy derive its separate replacement as confirmation-inherited from run provenance; do not reuse or consume the old receipt a second time.
+Call this helper after existing parent-tool idempotency and ownership checks but before budget/fence mutation. Remove the Task 4 fail-closed `Required -> NotContinuable` adapter mapping at this point. Return `recovery_confirmation_required` with the typed projection when a required receipt is absent. Insert no synthetic failed child for setup/policy rejection. Persist `recovery_authorization_id` on the admitted run, consume only after every existing conditional preflight succeeds, and keep it consumed after post-commit spawn/resume failure. When that exact authorized continue becomes the latest durable `failed/unresumable` run, let the central policy derive its separate replacement as confirmation-inherited from run provenance; do not reuse or consume the old receipt a second time.
 
 Emit `recovery.decision`, `recovery.confirmation_requested`, `recovery.confirmation_approved`, `recovery.confirmation_declined`, `recovery.authorization_consumed`, `recovery.authorization_rejected`, `recovery.resume_failed`, and `recovery.replacement_admitted` through `DelegationMetrics`. Structured logs may include stable task/authorization/parent/child ids, action, cause, risk class, and rejection code; never include prompts, arbitrary error/answer prose, display reasons, or raw external session ids.
 
@@ -1274,6 +1304,8 @@ pub async fn recover_workflow_core(
 `SettleWorkflowRequest` gains `recovery_authorization_id: Option<String>`. It is required only for `lineage_reset_reason`, rejected when unrelated, and stored as `lineage_reset_authorization_id` on the immutable settlement.
 
 - [ ] **Step 1: Write workflow transaction, replay, race, and reset tests**
+
+Place all new integration tests in this Step under `#[cfg(test)] mod authorized_workflow_recovery`.
 
 Implement the following named tests and assertions:
 
@@ -1375,6 +1407,8 @@ pub struct BrokerRecoverWorkflowRequest {
 Add `BrokerMessage::RequestRecoveryAuthorization` and `BrokerMessage::RecoverWorkflow`. `recover_workflow` is root-only and joins the complete workflow tool catalog; `request_recovery_authorization` is available for owned delegation tasks and root workflows when the corresponding feature is enabled.
 
 - [ ] **Step 1: Write schema/catalog/listener/card/Skill contract tests**
+
+Place all new Rust contract tests in this Step under `#[cfg(test)] mod recovery_tool_contract`.
 
 Implement the following Rust contract tests and assertions:
 
@@ -1505,6 +1539,8 @@ Expected: PASS with no authorization id in status snapshots and no stale recover
 
 - [ ] **Step 4: Run the full repository validation matrix once**
 
+Repeat the Workspace Gate immediately before this matrix. `git status --short` must be empty; if unrelated or unstaged files are present, stop and isolate them instead of attributing their failures to this implementation.
+
 From repository root:
 
 ```powershell
@@ -1533,12 +1569,15 @@ Expected: all commands exit 0. If a command fails, fix the concrete failure, rer
 - [ ] **Step 5: Review the final diff against both Designs**
 
 ```powershell
-git diff --check
+$task1Commit = git log --format=%H --fixed-strings --grep="feat: add shared recovery authorization persistence" -n 1
+if ([string]::IsNullOrWhiteSpace($task1Commit)) { throw "Task 1 commit not found" }
+$implementationBaseCommit = git rev-parse "$task1Commit^"
+git diff --check "$implementationBaseCommit..HEAD"
 git status --short
-git diff --stat d8525888c2c75162a0b30da1733533dd334eb63b..HEAD
+git diff --stat "$implementationBaseCommit..HEAD"
 ```
 
-Confirm: one authorization table; separate policy modules; no deleted evidence; no broad parent-end `unresumable`; no ordinary unblock; no active/busy detach; no authorization id in projections; exact session-2566 in-place recovery; all new state transitions have immutable provenance.
+Confirm the computed base is the parent of Task 1, so the diff excludes both approved Design files, this implementation plan, and any owner-resolved pre-existing edits. Then confirm: one authorization table; separate policy modules; no deleted evidence; no broad parent-end `unresumable`; no ordinary unblock; no active/busy detach; no authorization id in projections; exact session-2566 in-place recovery; all new state transitions have immutable provenance.
 
 - [ ] **Step 6: Commit Task 12**
 
