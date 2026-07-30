@@ -110,6 +110,10 @@ pub struct Model {
     /// monotonically with the authoritative `delegation_task_runs.generation`.
     /// Null for pre-migration / non-delegate rows.
     pub delegation_run_generation: Option<i64>,
+    /// Latest typed termination audit projected from the authoritative run.
+    /// Historical and non-delegation conversations remain null.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_termination_audit_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -120,11 +124,19 @@ pub enum Relation {
         to = "super::folder::Column::Id"
     )]
     Folder,
+    #[sea_orm(has_many = "super::recovery_authorization::Entity")]
+    RecoveryAuthorization,
 }
 
 impl Related<super::folder::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Folder.def()
+    }
+}
+
+impl Related<super::recovery_authorization::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::RecoveryAuthorization.def()
     }
 }
 

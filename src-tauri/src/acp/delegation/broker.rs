@@ -32111,6 +32111,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };

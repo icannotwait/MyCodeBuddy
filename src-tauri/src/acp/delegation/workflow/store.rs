@@ -581,6 +581,7 @@ pub async fn settle_workflow_gate_core(
                     rewrite_used: Set(rewrite_used),
                     next_action: Set(plan_next_action.map(plan_next_action_to_db)),
                     report_files_json: Set(report_files_json),
+                    lineage_reset_authorization_id: Set(None),
                     created_at: Set(now),
                 };
                 row.insert(txn).await.map_err(db_err)?;
@@ -1278,6 +1279,11 @@ async fn publish_in_txn(
         manifest_state: Set(manifest_state_str(effective_state).into()),
         document_json: Set(document_json.to_string()),
         document_digest: Set(document_digest.to_string()),
+        revision_kind: Set(None),
+        source_manifest_revision: Set(None),
+        recovery_authorization_id: Set(None),
+        transition_reason_code: Set(None),
+        consumer_correlation_id: Set(None),
         created_at: Set(now),
     };
     rev_row.insert(txn).await.map_err(db_err)?;
@@ -1354,6 +1360,8 @@ async fn insert_header_create_or_reclassify(
         structural_revision: Set(next_manifest_rev),
         design_fingerprint: Set(design_fingerprint_hash(normalized)),
         plan_fingerprint: Set(plan_fingerprint_hash(normalized)),
+        block_cause_code: Set(None),
+        block_source_manifest_revision: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -3415,6 +3423,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -3827,6 +3836,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4679,6 +4689,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(old),
             updated_at: Set(old),
         };

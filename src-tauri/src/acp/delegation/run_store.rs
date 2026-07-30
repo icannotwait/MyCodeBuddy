@@ -1236,6 +1236,7 @@ async fn insert_reserving_txn(
         child_connection_id: Set(None),
         replaced_task_id: Set(insert.replaced_task_id.clone()),
         replacement_reason: Set(insert.replacement_reason.clone()),
+        recovery_authorization_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -4675,6 +4676,8 @@ mod tests {
             structural_revision: Set(1),
             design_fingerprint: Set("design-fingerprint".into()),
             plan_fingerprint: Set("plan-fingerprint".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }

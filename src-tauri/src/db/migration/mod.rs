@@ -42,6 +42,7 @@ mod m20260726_000001_delegation_workflows;
 mod m20260727_000001_workflow_structural_revision;
 mod m20260727_000002_workflow_gate_fingerprints;
 mod m20260727_000003_workflow_manifest_v2;
+mod m20260730_000001_recovery_authorizations;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -90,6 +91,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260727_000001_workflow_structural_revision::Migration),
             Box::new(m20260727_000002_workflow_gate_fingerprints::Migration),
             Box::new(m20260727_000003_workflow_manifest_v2::Migration),
+            Box::new(m20260730_000001_recovery_authorizations::Migration),
         ]
     }
 }
