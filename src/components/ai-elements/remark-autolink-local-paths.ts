@@ -19,7 +19,6 @@ type VFileLike = { value?: unknown }
 const SKIP_SUBTREES = new Set([
   "link",
   "linkReference",
-  "inlineCode",
   "code",
   "html",
   "image",
@@ -78,6 +77,27 @@ function linkifyTextNode(
   return replacement
 }
 
+/**
+ * Agents often wrap a single file path in backticks. Convert only when the
+ * entire inlineCode value is one local-path match (same gates as prose) so
+ * snippets like `const x = src/app.ts` stay code.
+ */
+function linkifyInlineCodeNode(node: MdastNodeLike): MdastNodeLike {
+  if (typeof node.value !== "string") return node
+  const value = node.value
+  const matches = findLocalPathRanges(value)
+  if (matches.length !== 1) return node
+  const match = matches[0]
+  if (match.start !== 0 || match.end !== value.length) return node
+  const href = toSafeLocalPathHref(match)
+  if (!href) return node
+  return {
+    type: "link",
+    url: href,
+    children: [{ type: "text", value: match.label }],
+  }
+}
+
 function transformChildren(
   node: MdastNodeLike,
   source: string | null | undefined
@@ -87,6 +107,10 @@ function transformChildren(
   for (const child of node.children) {
     if (child.type === "text") {
       nextChildren.push(...linkifyTextNode(child, source))
+      continue
+    }
+    if (child.type === "inlineCode") {
+      nextChildren.push(linkifyInlineCodeNode(child))
       continue
     }
     transformChildren(child, source)

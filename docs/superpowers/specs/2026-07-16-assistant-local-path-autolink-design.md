@@ -62,7 +62,10 @@ handler remain the only presentation and navigation path.
   bare relative (`src/app.ts`) paths.
   > Relative workspace-path autolinking is specified in
   > `docs/superpowers/specs/2026-07-27-assistant-relative-path-autolink-design.md`.
-- Paths embedded in inline code, fenced code, or raw HTML.
+- Paths embedded in fenced code or raw HTML. Path-**only** inline code
+  (the entire `` `…` `` token is one local-path match) is autolinked so agent
+  habit of wrapping file paths in backticks still yields a file badge; mixed
+  snippets like `` `const x = src/app.ts` `` stay code.
 - Paths whose Markdown source is not a one-to-one text-node slice, including
   Windows separators consumed as CommonMark escapes before punctuation such as
   `\[`, `\#`, or `\_`.
@@ -418,7 +421,8 @@ Verify:
 - visible text is unchanged;
 - a text node changed by CommonMark backslash escaping is left unchanged;
 - existing links and link references are not nested;
-- inline code, fenced code, HTML, image, and definition nodes are unchanged;
+- fenced code, HTML, image, and definition nodes are unchanged; path-only
+  inline code becomes a link (mixed/non-path inline code stays code);
   and
 - applying the transform twice is idempotent.
 
