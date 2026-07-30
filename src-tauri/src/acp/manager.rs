@@ -1415,10 +1415,10 @@ impl ConnectionManager {
             Ok(d) => d,
             Err(_) => return 0,
         };
-        // Snapshot lease (id, owner_label, operation_id, generation) then
+        // Snapshot lease (id, owner_label, operation_id, generation, incarnation) then
         // re-validate under the same lock before remove so a concurrent rebind
         // cannot be killed by a stale idle selection.
-        let candidates: Vec<(String, String, Option<String>, u64)> = {
+        let candidates: Vec<(String, String, Option<String>, u64, String)> = {
             let connections = self.connections.lock().await;
             let mut victims = Vec::new();
             for (id, conn) in connections.iter() {
@@ -1444,46 +1444,28 @@ impl ConnectionManager {
                         conn.owner_window_label.clone(),
                         conn.owner_operation_id.clone(),
                         conn.ownership_generation,
+                        conn.connection_incarnation.clone(),
                     ));
                 }
             }
             victims
         };
         let mut disconnected = 0;
-        for (id, expected_owner, expected_op, expected_gen) in candidates {
-            // Phase 1: ownership CAS + idle re-check; capture incarnation while
-            // the connection is still in the routing map.
-            let incarnation = {
-                let connections = self.connections.lock().await;
-                let Some(conn) = connections.get(&id) else {
-                    continue;
-                };
-                if conn.owner_window_label != expected_owner
-                    || conn.owner_operation_id != expected_op
-                    || conn.ownership_generation != expected_gen
-                {
-                    tracing::info!("[ACP] idle sweep skipped rebinding connection={}", id);
-                    continue;
+        for (id, expected_owner, expected_op, expected_gen, expected_incarnation) in candidates {
+            #[cfg(test)]
+            {
+                let hook = self
+                    .disconnect_final_cas_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if let Some(hook) = hook {
+                    hook.reached.notify_one();
+                    hook.resume.notified().await;
                 }
-                let Ok(state) = conn.state.try_read() else {
-                    continue;
-                };
-                if state.status != ConnectionStatus::Connected
-                    || state.pending_permission.is_some()
-                    || state.has_active_background_work(now)
-                {
-                    continue;
-                }
-                let elapsed = now.signed_duration_since(state.last_activity_at);
-                if elapsed < timeout {
-                    continue;
-                }
-                drop(state);
-                conn.connection_incarnation.clone()
-            };
-            // Phase 2: registry-first — leases must be gone before map drop.
-            self.clear_tool_leases(&id, &incarnation).await;
-            // Phase 3: re-CAS and remove only if the same owner/incarnation remains.
+            }
+            // Final ownership and idle validation is exclusive with removal.
+            // A survivor must never be fenced because it lost this final CAS.
             let removed = {
                 let mut connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
@@ -1492,14 +1474,29 @@ impl ConnectionManager {
                 if conn.owner_window_label != expected_owner
                     || conn.owner_operation_id != expected_op
                     || conn.ownership_generation != expected_gen
-                    || conn.connection_incarnation != incarnation
+                    || conn.connection_incarnation != expected_incarnation
+                {
+                    continue;
+                }
+                let state_arc = Arc::clone(&conn.state);
+                let Ok(state) = state_arc.try_write() else {
+                    continue;
+                };
+                if state.status != ConnectionStatus::Connected
+                    || state.pending_permission.is_some()
+                    || state.has_active_background_work(now)
+                    || now.signed_duration_since(state.last_activity_at) < timeout
                 {
                     continue;
                 }
                 self.record_disconnect_intent(&id, AcpDisconnectOrigin::IdleTimeout);
-                connections.remove(&id)
+                let removed = connections.remove(&id);
+                drop(state);
+                removed
             };
             if let Some(conn) = removed {
+                self.clear_tool_leases(&id, &conn.connection_incarnation)
+                    .await;
                 tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
                 let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
                 disconnected += 1;
@@ -3316,11 +3313,8 @@ impl ConnectionManager {
         conn_id: &str,
         origin: AcpDisconnectOrigin,
     ) -> Result<(), AcpError> {
-        // Admission fence → clear leases → final incarnation CAS + intent + map
-        // remove → Disconnect control.
-        // Fencing first closes register_tool/start_turn for this incarnation so
-        // a still-running connection loop cannot recreate leases in the gap
-        // before it receives Disconnect.
+        // Final incarnation CAS + intent + map remove → admission fence + clear
+        // leases → Disconnect control. A lost CAS must leave the survivor routable.
         let incarnation = {
             let connections = self.connections.lock().await;
             match connections.get(conn_id) {
@@ -3328,7 +3322,6 @@ impl ConnectionManager {
                 None => return Err(AcpError::ConnectionNotFound(conn_id.into())),
             }
         };
-        self.clear_tool_leases(conn_id, &incarnation).await;
         #[cfg(test)]
         {
             let hook = self
@@ -3352,6 +3345,8 @@ impl ConnectionManager {
             }
         };
         if let Some(conn) = removed {
+            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
+                .await;
             tracing::info!("[ACP] disconnect connection={}", conn_id);
             // Bound control-lane admit so a saturated/stalled receiver cannot
             // hang escalation after leases are already cleared and the map
@@ -3363,22 +3358,13 @@ impl ConnectionManager {
             .await;
             Ok(())
         } else {
-            // Leases for this incarnation are already cleared; map entry was
-            // already gone or replaced by a newer incarnation.
             Ok(())
         }
     }
 
-    /// Fence admission then drop all tool-watchdog leases for a connection
-    /// incarnation. Invoked from manager disconnect paths **before** map
-    /// removal so (1) late tool events cannot re-register and (2) a concurrent
-    /// scan cannot observe orphaned leases once routing is gone.
+    /// Atomically fence admission and drop all tool-watchdog leases for an exact
+    /// connection incarnation after its routing-map entry has been removed.
     async fn clear_tool_leases(&self, connection_id: &str, incarnation: &str) {
-        // Order: fence admission → clear leases (remove_connection also fences
-        // under its mutex for Drop/idempotent paths).
-        self.tool_lease_registry
-            .fence_connection(connection_id, incarnation)
-            .await;
         let _ = self
             .tool_lease_registry
             .remove_connection(connection_id, incarnation)
@@ -4164,18 +4150,13 @@ impl DisconnectSelection {
 }
 
 impl ConnectionManager {
-    /// Clear selected lease incarnations first, then revalidate each captured
-    /// selection fence and return removed connections for Disconnect delivery.
+    /// Revalidate each captured selection fence, remove winners, then fence and
+    /// clear only those removed incarnations before returning them for control.
     async fn take_connections_for_disconnect(
         &self,
         planned: Vec<DisconnectSelection>,
         origin: AcpDisconnectOrigin,
     ) -> Vec<(String, crate::acp::connection::AgentConnection)> {
-        // Phase 1: registry-first for each originally selected incarnation.
-        for selected in &planned {
-            self.clear_tool_leases(&selected.connection_id, &selected.connection_incarnation)
-                .await;
-        }
         #[cfg(test)]
         {
             let hook = self
@@ -4188,8 +4169,8 @@ impl ConnectionManager {
                 hook.resume.notified().await;
             }
         }
-        // Phase 2: author intent and remove only while the captured selection
-        // fence still matches under the final connection-map lock.
+        // Author intent and remove only while the captured selection fence
+        // still matches under the final connection-map lock.
         let mut removed = Vec::with_capacity(planned.len());
         {
             let mut connections = self.connections.lock().await;
@@ -4204,6 +4185,10 @@ impl ConnectionManager {
                     }
                 }
             }
+        }
+        for (connection_id, connection) in &removed {
+            self.clear_tool_leases(connection_id, &connection.connection_incarnation)
+                .await;
         }
         removed
     }
@@ -4236,8 +4221,8 @@ impl ConnectionManager {
             return self.disconnect_with_origin(conn_id, origin).await;
         }
 
-        // Ownership CAS under the lock, then registry-first clear, then map
-        // remove with re-CAS. Drop cleanup remains an idempotent backstop.
+        // Snapshot the matching ownership incarnation, then revalidate and
+        // remove under the final map lock. Drop cleanup remains an idempotent backstop.
         let incarnation = {
             let connections = self.connections.lock().await;
             let Some(conn) = connections.get(conn_id) else {
@@ -4279,7 +4264,6 @@ impl ConnectionManager {
             }
             conn.connection_incarnation.clone()
         };
-        self.clear_tool_leases(conn_id, &incarnation).await;
         #[cfg(test)]
         {
             let hook = self
@@ -4319,6 +4303,8 @@ impl ConnectionManager {
             connections.remove(conn_id)
         };
         if let Some(conn) = removed {
+            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
+                .await;
             tracing::info!(
                 "[ACP] disconnect_if_owner connection={} window={:?} op={:?} gen={:?}",
                 conn_id,
@@ -6318,6 +6304,7 @@ mod disconnect_origin {
     use crate::acp::plan_approval::{RegisteredPlanApproval, SessionPlanApprovalAccess};
     use crate::acp::question::{QuestionSpec, RegisteredQuestion, SessionQuestionAccess};
     use crate::acp::termination::AcpDisconnectOrigin;
+    use crate::acp::tool_watchdog::{RegisterTool, ToolCategory, TurnStamp, WatchdogInstant};
 
     struct EmptyDepth;
 
@@ -6415,6 +6402,67 @@ mod disconnect_origin {
         control_rx
     }
 
+    async fn connection_incarnation(manager: &ConnectionManager, connection_id: &str) -> String {
+        manager
+            .connections
+            .lock()
+            .await
+            .get(connection_id)
+            .expect("test connection")
+            .connection_incarnation
+            .clone()
+    }
+
+    async fn admit_registry_tool(
+        manager: &ConnectionManager,
+        connection_id: &str,
+        incarnation: &str,
+        turn_generation: u64,
+    ) -> String {
+        let turn = TurnStamp {
+            connection_id: connection_id.into(),
+            connection_incarnation: incarnation.into(),
+            session_id: format!("session-{connection_id}-{turn_generation}"),
+            turn_generation,
+        };
+        let at = WatchdogInstant::now();
+        manager
+            .tool_lease_registry
+            .start_turn(turn.clone(), at)
+            .await;
+        assert!(
+            manager.tool_lease_registry.has_fallback(&turn).await,
+            "start_turn must admit a fallback lease"
+        );
+        manager
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn,
+                tool_call_id: format!("tool-{connection_id}-{turn_generation}"),
+                category: ToolCategory::Other,
+                at,
+            })
+            .await
+            .expect("register_tool must admit a routable incarnation")
+            .stamp
+            .lease_id
+    }
+
+    async fn assert_registry_remains_routable(
+        manager: &ConnectionManager,
+        connection_id: &str,
+        incarnation: &str,
+    ) {
+        assert!(
+            !manager
+                .tool_lease_registry
+                .is_fenced(connection_id, incarnation)
+                .await,
+            "a surviving disconnect loser must not be fenced"
+        );
+        let _ = admit_registry_tool(manager, connection_id, incarnation, 99).await;
+    }
+
     #[tokio::test]
     async fn manager_records_origin_before_map_removal_and_disconnect_control() {
         let manager = Arc::new(ConnectionManager::new());
@@ -6422,6 +6470,9 @@ mod disconnect_origin {
             .insert_test_connection("c1", AgentType::Codex, None, EventEmitter::Noop)
             .await;
         let evidence = install_exit_evidence(&manager);
+        let incarnation = connection_incarnation(&manager, "c1").await;
+        let lease_id = admit_registry_tool(&manager, "c1", &incarnation, 1).await;
+        let mut control_rx = install_live_disconnect_control(&manager, "c1").await;
 
         let reached = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
@@ -6448,7 +6499,29 @@ mod disconnect_origin {
             "intent must wait for the final incarnation CAS"
         );
         assert!(manager.connections.lock().await.contains_key("c1"));
+        assert!(
+            !manager
+                .tool_lease_registry
+                .is_fenced("c1", &incarnation)
+                .await,
+            "winner must remain unfenced until its final map CAS succeeds"
+        );
         resume.notify_one();
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(ConnectionControl::Disconnect)
+        ));
+        assert!(
+            manager
+                .tool_lease_registry
+                .is_fenced("c1", &incarnation)
+                .await,
+            "removed winner must be fenced before Disconnect delivery"
+        );
+        assert!(
+            !manager.tool_lease_registry.is_live(&lease_id).await,
+            "removed winner leases must be cleared before Disconnect delivery"
+        );
         disconnect.await.expect("disconnect join").unwrap();
 
         assert_eq!(
@@ -6555,6 +6628,7 @@ mod disconnect_origin {
         manager
             .insert_test_connection("replaced", AgentType::Codex, None, EventEmitter::Noop)
             .await;
+        let gone_incarnation = connection_incarnation(&manager, "gone").await;
         let original_incarnation = manager
             .connections
             .lock()
@@ -6603,6 +6677,8 @@ mod disconnect_origin {
                 .connection_incarnation,
             replacement_incarnation
         );
+        assert_registry_remains_routable(&manager, "gone", &gone_incarnation).await;
+        assert_registry_remains_routable(&manager, "replaced", &original_incarnation).await;
     }
 
     #[tokio::test]
@@ -6645,6 +6721,8 @@ mod disconnect_origin {
         assert_eq!(survivor.connection_incarnation, original_incarnation);
         assert_eq!(survivor.owner_window_label, "main");
         assert_eq!(evidence.peek("window"), None);
+        drop(connections);
+        assert_registry_remains_routable(&manager, "window", &original_incarnation).await;
     }
 
     #[tokio::test]
@@ -6653,7 +6731,7 @@ mod disconnect_origin {
         manager
             .insert_test_connection("operation", AgentType::Codex, None, EventEmitter::Noop)
             .await;
-        {
+        let original_incarnation = {
             let mut connections = manager.connections.lock().await;
             let connection = connections
                 .get_mut("operation")
@@ -6661,7 +6739,8 @@ mod disconnect_origin {
             connection.owner_window_label = "conversation-1".into();
             connection.owner_operation_id = Some("op-a".into());
             connection.ownership_generation = 1;
-        }
+            connection.connection_incarnation.clone()
+        };
         let evidence = install_exit_evidence(&manager);
         let (reached, resume) = install_disconnect_final_cas_hook(&manager);
         let disconnect = {
@@ -6690,6 +6769,8 @@ mod disconnect_origin {
             .expect("generation rebound survives");
         assert_eq!(survivor.ownership_generation, 2);
         assert_eq!(evidence.peek("operation"), None);
+        drop(connections);
+        assert_registry_remains_routable(&manager, "operation", &original_incarnation).await;
     }
 
     #[tokio::test]
@@ -6699,6 +6780,8 @@ mod disconnect_origin {
             .insert_test_connection("bulk", AgentType::Codex, None, EventEmitter::Noop)
             .await;
         let evidence = install_exit_evidence(&manager);
+        let incarnation = connection_incarnation(&manager, "bulk").await;
+        let lease_id = admit_registry_tool(&manager, "bulk", &incarnation, 1).await;
         let mut control_rx = install_live_disconnect_control(&manager, "bulk").await;
         let (reached, resume) = install_disconnect_final_cas_hook(&manager);
         let disconnect = {
@@ -6717,6 +6800,13 @@ mod disconnect_origin {
             "bulk intent must wait for the final selection fence"
         );
         assert!(manager.connections.lock().await.contains_key("bulk"));
+        assert!(
+            !manager
+                .tool_lease_registry
+                .is_fenced("bulk", &incarnation)
+                .await,
+            "bulk winner must not be fenced before final selection validation"
+        );
         {
             let mut connections = manager.connections.lock().await;
             let connection = connections
@@ -6731,6 +6821,13 @@ mod disconnect_origin {
             control_rx.recv().await,
             Some(ConnectionControl::Disconnect)
         ));
+        assert!(
+            manager
+                .tool_lease_registry
+                .is_fenced("bulk", &incarnation)
+                .await
+        );
+        assert!(!manager.tool_lease_registry.is_live(&lease_id).await);
         assert_eq!(
             evidence
                 .peek("bulk")
@@ -6756,6 +6853,8 @@ mod disconnect_origin {
             connection.ownership_generation = 1;
         }
         let evidence = install_exit_evidence(&manager);
+        let incarnation = connection_incarnation(&manager, "window").await;
+        let lease_id = admit_registry_tool(&manager, "window", &incarnation, 1).await;
         let mut control_rx = install_live_disconnect_control(&manager, "window").await;
         let (reached, resume) = install_disconnect_final_cas_hook(&manager);
         let disconnect = {
@@ -6770,11 +6869,25 @@ mod disconnect_origin {
             "window intent must wait for the final ownership fence"
         );
         assert!(manager.connections.lock().await.contains_key("window"));
+        assert!(
+            !manager
+                .tool_lease_registry
+                .is_fenced("window", &incarnation)
+                .await,
+            "window winner must not be fenced before final ownership validation"
+        );
         resume.notify_one();
         assert!(matches!(
             control_rx.recv().await,
             Some(ConnectionControl::Disconnect)
         ));
+        assert!(
+            manager
+                .tool_lease_registry
+                .is_fenced("window", &incarnation)
+                .await
+        );
+        assert!(!manager.tool_lease_registry.is_live(&lease_id).await);
         assert_eq!(
             evidence
                 .peek("window")
@@ -6793,10 +6906,24 @@ mod disconnect_origin {
             .insert_test_connection("idle", AgentType::Codex, None, EventEmitter::Noop)
             .await;
         let evidence = install_exit_evidence(&manager);
+        let incarnation = connection_incarnation(&manager, "idle").await;
+        let lease_id = admit_registry_tool(&manager, "idle", &incarnation, 1).await;
+        let mut control_rx = install_live_disconnect_control(&manager, "idle").await;
         let state = manager.get_state("idle").await.expect("idle connection");
         state.write().await.last_activity_at = chrono::Utc::now() - chrono::Duration::minutes(10);
 
         assert_eq!(manager.sweep_idle(Duration::from_secs(300)).await, 1);
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(ConnectionControl::Disconnect)
+        ));
+        assert!(
+            manager
+                .tool_lease_registry
+                .is_fenced("idle", &incarnation)
+                .await
+        );
+        assert!(!manager.tool_lease_registry.is_live(&lease_id).await);
         assert_eq!(
             evidence
                 .peek("idle")
@@ -6804,6 +6931,35 @@ mod disconnect_origin {
                 .frontend_origin,
             Some(AcpDisconnectOrigin::IdleTimeout)
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_idle_sweep_busy_transition_remains_routable() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("idle-busy", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let evidence = install_exit_evidence(&manager);
+        let incarnation = connection_incarnation(&manager, "idle-busy").await;
+        let state = manager
+            .get_state("idle-busy")
+            .await
+            .expect("idle-busy connection");
+        state.write().await.last_activity_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let (reached, resume) = install_disconnect_final_cas_hook(&manager);
+        let sweep = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.sweep_idle(Duration::from_secs(300)).await })
+        };
+
+        reached.notified().await;
+        state.write().await.status = ConnectionStatus::Prompting;
+        resume.notify_one();
+
+        assert_eq!(sweep.await.expect("idle sweep join"), 0);
+        assert!(manager.connections.lock().await.contains_key("idle-busy"));
+        assert_eq!(evidence.peek("idle-busy"), None);
+        assert_registry_remains_routable(&manager, "idle-busy", &incarnation).await;
     }
 
     #[tokio::test]
@@ -6857,6 +7013,7 @@ mod disconnect_origin {
             connection.owner_operation_id = Some("op-a".into());
             connection.ownership_generation = 1;
         }
+        let incarnation = connection_incarnation(&manager, "leased").await;
 
         let reached = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
@@ -6898,6 +7055,7 @@ mod disconnect_origin {
             None,
             "a stale disconnect that loses the final CAS must not classify the survivor"
         );
+        assert_registry_remains_routable(&manager, "leased", &incarnation).await;
     }
 }
 
