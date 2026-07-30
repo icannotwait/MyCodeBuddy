@@ -421,9 +421,11 @@ fn parse_user_message_parts(content: &serde_json::Value) -> UserMessageParts {
                 images: Vec::new(),
             });
 
-            // If the tool result also contains <feedback>, extract it
+            // If the tool result also contains <feedback>, extract it.
+            // Do not left-trim before visible_user_text: leading whitespace is
+            // load-bearing for column-zero mandatory-route classification.
             if let Some(feedback) = extract_feedback(&text) {
-                if let Some(fb) = visible_user_text(feedback.trim()) {
+                if let Some(fb) = visible_user_text(feedback.trim_end()) {
                     user_blocks.push(ContentBlock::Text { text: fb });
                 }
             }
@@ -436,7 +438,7 @@ fn parse_user_message_parts(content: &serde_json::Value) -> UserMessageParts {
 
         // Pure feedback without tool result prefix
         if let Some(feedback) = extract_feedback(&cleaned) {
-            if let Some(fb) = visible_user_text(feedback.trim()) {
+            if let Some(fb) = visible_user_text(feedback.trim_end()) {
                 user_blocks.push(ContentBlock::Text { text: fb });
             }
             continue;
@@ -673,7 +675,13 @@ fn strip_environment_details(text: &str) -> String {
         return String::new();
     }
 
-    result.trim().to_string()
+    // Preserve leading whitespace so pure mandatory-route classification still
+    // sees column-zero correctly (indented user quotations must remain visible).
+    if result.trim().is_empty() {
+        String::new()
+    } else {
+        result.trim_end().to_string()
+    }
 }
 
 #[cfg(test)]
@@ -766,5 +774,55 @@ earlier terminal context records.\n\
         assert!(visible_user_texts
             .iter()
             .any(|text| text.contains("partial")));
+    }
+
+    #[test]
+    fn indented_mandatory_route_survives_strip_environment_user_path() {
+        use crate::parsers::visible_user_text;
+
+        // Final Important: pre-trim must not hide indented exact-prefix quotes.
+        let route = "Codeg mandatory delegation route: profile_id=\"a\"";
+        let indented = format!("  {route}");
+        let cleaned = strip_environment_details(&indented);
+        assert!(
+            cleaned.starts_with(' '),
+            "strip_environment_details must preserve leading whitespace, got {cleaned:?}"
+        );
+        assert_eq!(visible_user_text(&cleaned).as_deref(), Some(route));
+
+        let parts = parse_user_message_parts(&serde_json::json!(indented));
+        assert!(parts.tool_results.is_empty());
+        assert_eq!(parts.user_blocks.len(), 1);
+        assert!(matches!(
+            &parts.user_blocks[0],
+            ContentBlock::Text { text } if text == route
+        ));
+    }
+
+    #[test]
+    fn indented_mandatory_route_survives_cline_feedback_path() {
+        let route = "Codeg mandatory delegation route: profile_id=\"a\"";
+        // Pure feedback path (no tool-result prefix).
+        let pure_feedback = format!("<feedback>\n  {route}\n</feedback>");
+        let pure_parts = parse_user_message_parts(&serde_json::json!(pure_feedback));
+        assert_eq!(pure_parts.user_blocks.len(), 1);
+        assert!(matches!(
+            &pure_parts.user_blocks[0],
+            ContentBlock::Text { text } if text == route
+        ));
+
+        // Feedback nested after a tool result (extract_feedback from raw text).
+        let with_tool =
+            format!("[read_file for 'x'] Result:\nok\n<feedback>\n  {route}\n</feedback>");
+        let tool_parts = parse_user_message_parts(&serde_json::json!(with_tool));
+        assert_eq!(tool_parts.tool_results.len(), 1);
+        assert!(
+            tool_parts.user_blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == route
+            )),
+            "expected indented route feedback to remain visible, got {:?}",
+            tool_parts.user_blocks
+        );
     }
 }
