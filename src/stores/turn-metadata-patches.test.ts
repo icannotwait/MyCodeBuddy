@@ -226,6 +226,74 @@ describe("computeTurnMetadataPatches", () => {
 
     expect(patches).toEqual([])
   })
+
+  it("copies reasoning effort from the matched archived assistant turn", () => {
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1],
+      parsedAssistantTurns: [asst({ id: "new", reasoning_effort: "high" })],
+      persistedAssistantCount: 0,
+    })
+
+    expect(patches).toEqual([
+      {
+        index: 1,
+        usage: undefined,
+        duration_ms: undefined,
+        model: undefined,
+        completed_at: undefined,
+        reasoning_effort: "high",
+      },
+    ])
+  })
+
+  it("does not cross the history boundary for reasoning effort", () => {
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1],
+      parsedAssistantTurns: [
+        asst({ id: "history", reasoning_effort: "high" }),
+        asst({ id: "new", model: "gpt-5.6-sol" }),
+      ],
+      persistedAssistantCount: 1,
+    })
+
+    expect(patches).toHaveLength(1)
+    expect(patches[0]).toMatchObject({ index: 1, model: "gpt-5.6-sol" })
+    expect(patches[0]?.reasoning_effort).toBeUndefined()
+  })
+
+  it("uses the latest aligned sub-turn effort when parser sub-turns are folded", () => {
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [0],
+      parsedAssistantTurns: [
+        asst({ id: "s0", reasoning_effort: "low" }),
+        asst({ id: "s1", reasoning_effort: "medium" }),
+        asst({ id: "s2", reasoning_effort: "high" }),
+      ],
+      persistedAssistantCount: 0,
+    })
+
+    expect(patches).toHaveLength(1)
+    expect(patches[0]?.reasoning_effort).toBe("high")
+  })
+
+  it("uses model-style folded fallback when the aligned sub-turn has no effort", () => {
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [0],
+      parsedAssistantTurns: [
+        asst({ id: "s0", reasoning_effort: "low" }),
+        asst({ id: "s1", reasoning_effort: "medium" }),
+        asst({ id: "s2", model: "gpt-5.6-sol" }),
+      ],
+      persistedAssistantCount: 0,
+    })
+
+    expect(patches).toHaveLength(1)
+    expect(patches[0]).toMatchObject({
+      index: 0,
+      model: "gpt-5.6-sol",
+      reasoning_effort: "low",
+    })
+  })
 })
 
 // The boundary `syncTurnMetadata` feeds into the helper above is the session's

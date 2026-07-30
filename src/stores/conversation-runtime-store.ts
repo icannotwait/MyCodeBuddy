@@ -519,6 +519,7 @@ type Action =
         usage?: TurnUsage | null
         duration_ms?: number | null
         model?: string | null
+        reasoning_effort?: string | null
         completed_at?: string | null
         tool_meta?: Array<{
           tool_use_id: string
@@ -1391,6 +1392,7 @@ export interface TurnMetadataPatch {
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
+  reasoning_effort?: string | null
   completed_at?: string | null
   tool_meta?: Array<{
     tool_use_id: string
@@ -1401,7 +1403,7 @@ export interface TurnMetadataPatch {
 /**
  * Align a fresh parse's assistant turns onto this session's completed local
  * assistant turns and emit the metadata (usage / duration / model /
- * completed_at) to backfill onto each.
+ * reasoning effort / completed_at) to backfill onto each.
  *
  * The subtlety is history. `localTurns` holds ONLY turns completed in the
  * current session; persisted history lives in `detail`. The fresh parse
@@ -1461,6 +1463,7 @@ export function computeTurnMetadataPatches(params: {
     let usageToApply: TurnUsage | null | undefined
     let durationToApply: number | null | undefined
     let modelToApply: string | null | undefined
+    let reasoningEffortToApply: string | null | undefined
     // For the merged-sub-turn case (offset > 0), the latest completion is
     // sessionParsedTurns[parsedIdx] (the sub-turn we matched); earlier
     // rolled-in parsed turns precede it in time, so we don't aggregate
@@ -1472,6 +1475,7 @@ export function computeTurnMetadataPatches(params: {
       usageToApply = pt.usage
       durationToApply = pt.duration_ms
       modelToApply = pt.model
+      reasoningEffortToApply = pt.reasoning_effort
       completedAtToApply = pt.completed_at
     }
 
@@ -1507,6 +1511,9 @@ export function computeTurnMetadataPatches(params: {
         if (!modelToApply && extra.model) {
           modelToApply = extra.model
         }
+        if (!reasoningEffortToApply && extra.reasoning_effort) {
+          reasoningEffortToApply = extra.reasoning_effort
+        }
       }
     }
 
@@ -1514,6 +1521,7 @@ export function computeTurnMetadataPatches(params: {
       !usageToApply &&
       !durationToApply &&
       !modelToApply &&
+      !reasoningEffortToApply &&
       !completedAtToApply
     )
       continue
@@ -1522,6 +1530,7 @@ export function computeTurnMetadataPatches(params: {
       usage: usageToApply,
       duration_ms: durationToApply,
       model: modelToApply,
+      reasoning_effort: reasoningEffortToApply,
       completed_at: completedAtToApply,
     })
   }
