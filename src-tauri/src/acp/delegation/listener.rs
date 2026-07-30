@@ -6558,6 +6558,49 @@ mod tests {
             .expect("published workflow id")
             .to_string();
 
+        let outcome = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "workflow-v2-token".into(),
+                workflow_id: Some(workflow_id.clone()),
+            })
+            .await;
+        assert_eq!(outcome["detail"], "index");
+        assert!(outcome.get("_codeg_omission_state").is_some());
+        assert!(outcome
+            .pointer("/latest_plan_review/findings/0/summary")
+            .is_none());
+
+        let not_found = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "workflow-v2-token".into(),
+                workflow_id: Some("missing-workflow".into()),
+            })
+            .await;
+        assert_eq!(not_found["error"]["code"], "not_found");
+
+        let foreign_folder = seed_folder(&db, "/tmp/workflow-v2-listener-foreign").await;
+        let foreign_parent = seed_conversation(&db, foreign_folder, AgentType::Codex).await;
+        let mut foreign_document: ManifestDocument =
+            serde_json::from_value(manifest.clone()).unwrap();
+        foreign_document.publication_token = "listener-v2-foreign".into();
+        let foreign = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            foreign_parent,
+            PublishWorkflowRequest {
+                document: foreign_document,
+            },
+        )
+        .await
+        .unwrap();
+        let cross_parent = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "workflow-v2-token".into(),
+                workflow_id: Some(foreign.workflow_id),
+            })
+            .await;
+        assert_eq!(cross_parent["error"]["code"], "cross_parent");
+
         let mut v1 = manifest;
         v1["schema_version"] = json!(1);
         v1["publication_token"] = json!("listener-v1-rejected");

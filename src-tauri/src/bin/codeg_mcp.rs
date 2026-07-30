@@ -34,8 +34,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use codeg_lib::acp::delegation::companion::{
-    dispatch_line, drain_and_cancel_all, CompanionContext, CompanionFeatures, InflightCalls,
-    JsonRpcResponse, LineAction, SpawnResult,
+    dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, CompanionContext,
+    CompanionFeatures, InflightCalls, JsonRpcResponse, LineAction, SpawnResult,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
 use codeg_lib::acp::delegation::transport::{client_establish_ready_lease, CompanionRole};
@@ -148,10 +148,9 @@ async fn write_response<W: AsyncWrite + Unpin>(
     stdout: &Arc<Mutex<W>>,
     resp: &JsonRpcResponse,
 ) -> std::io::Result<()> {
-    let mut frame = serde_json::to_vec(resp).map_err(|e| {
+    let frame = serialize_jsonrpc_line(resp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
     })?;
-    frame.push(b'\n');
     let mut guard = stdout.lock().await;
     guard.write_all(&frame).await?;
     guard.flush().await?;
@@ -320,7 +319,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::io::AsyncWrite;
 
     use super::*;
@@ -354,21 +353,149 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn workflow_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use codeg_lib::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-writer-parity-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut server).await.unwrap();
+            assert!(matches!(message, BrokerMessage::GetWorkflowState(_)));
+            write_frame(&mut server, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (pipe_name, task)
+    }
+
+    #[cfg(unix)]
+    fn workflow_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use codeg_lib::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("writer-parity.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(message, BrokerMessage::GetWorkflowState(_)));
+            write_frame(&mut stream, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (socket, task)
+    }
+
+    async fn dispatched_workflow_response(outcome: Value, id: Value) -> JsonRpcResponse {
+        let (socket_path, server) = workflow_broker_with_outcome(outcome);
+        let context = CompanionContext {
+            parent_connection_id: "parent".into(),
+            socket_path,
+            token: "token".into(),
+            features: CompanionFeatures::parse(Some("workflow_v2")),
+            role: CompanionRole::Root,
+        };
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": "get_workflow_state", "arguments": {} }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) =
+            dispatch_line(&context, Arc::new(InflightCalls::new()), &line).await
+        else {
+            panic!("expected get_workflow_state spawn");
+        };
+        let response = spawned.future.await.response.unwrap();
+        server.await.unwrap();
+        response
+    }
+
     #[tokio::test]
     async fn write_response_emits_one_complete_jsonl_write() {
-        let stdout = Arc::new(Mutex::new(RecordingWriter::default()));
-        let response =
-            codeg_lib::acp::delegation::companion::ok(json!(7), json!({ "ready": true }));
+        use codeg_lib::acp::delegation::companion::{
+            GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES, GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        };
 
-        write_response(&stdout, &response).await.unwrap();
+        let request_id = Value::String("x".repeat(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES - 2));
+        let synthetic_message = "deterministic persistence failure ".repeat(512);
+        let oversized_workflow_id = "missing-workflow-quote\"slash\\界".repeat(600);
+        let large_success = dispatched_workflow_response(
+            json!({
+                "workflow_id": format!("wf-{}", "x".repeat(5_000)),
+                "parent_conversation_id": 42,
+                "workflow_kind": "brainstorm_to_delivery",
+                "capability_version": "workflow_manifest_v2",
+                "publication_token": "publication-token",
+                "workflow_state": "estimated",
+                "manifest_revision": 7,
+                "graph_revision": 11,
+                "schema_version": 2,
+                "plan_target_rel_path": "docs/plan.md",
+                "risk_policy_version": "b2d_task_risk_v1",
+                "detail": "index",
+                "inline_findings": false,
+                "payload_truncated": false,
+                "evidence_truncated": false,
+                "gates": [],
+                "actionable_task_routes": [],
+                "_codeg_omission_state": { "nodes": [] }
+            }),
+            request_id.clone(),
+        )
+        .await;
+        let bounded_error = dispatched_workflow_response(
+            json!({
+                "error": {
+                    "code": "persistence",
+                    "message": format!("{synthetic_message}: {oversized_workflow_id}")
+                }
+            }),
+            request_id,
+        )
+        .await;
 
-        let writer = stdout.lock().await;
-        assert_eq!(writer.writes.len(), 1, "response must use one write");
-        assert_eq!(writer.flushes, 1, "response must flush once");
-        let frame = &writer.writes[0];
-        assert_eq!(frame.last(), Some(&b'\n'));
-        let decoded: JsonRpcResponse = serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
-        assert_eq!(decoded.id, json!(7));
-        assert_eq!(decoded.result, Some(json!({ "ready": true })));
+        for (response, expected_is_error) in [(large_success, false), (bounded_error, true)] {
+            let stdout = Arc::new(Mutex::new(RecordingWriter::default()));
+            let measured = serialize_jsonrpc_line(&response).unwrap();
+            write_response(&stdout, &response).await.unwrap();
+
+            let writer = stdout.lock().await;
+            assert_eq!(writer.writes.len(), 1, "response must use one write");
+            assert_eq!(writer.flushes, 1, "response must flush once");
+            let frame = &writer.writes[0];
+            assert_eq!(frame.last(), Some(&b'\n'));
+            assert_eq!(frame, &measured, "writer bytes must equal measured bytes");
+            assert!(frame.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES);
+            let decoded: JsonRpcResponse =
+                serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
+            assert_eq!(decoded.id, response.id);
+            let result = decoded.result.unwrap();
+            assert_eq!(result["isError"], expected_is_error);
+            if expected_is_error {
+                assert_eq!(result["structuredContent"]["error"]["code"], "persistence");
+            }
+            let text = String::from_utf8(frame.clone()).unwrap();
+            assert!(!text.contains(&synthetic_message));
+            assert!(!text.contains(&oversized_workflow_id));
+        }
     }
 }

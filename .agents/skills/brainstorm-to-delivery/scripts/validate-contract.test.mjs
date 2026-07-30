@@ -21,6 +21,13 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const realSkill = readFileSync(join(__dirname, "..", "SKILL.md"), "utf8")
 
+const RECOVERY_PARAGRAPH = `Recovery is index-first. Treat recovery_sources and
+actionable_task_routes as authoritative. Read each workspace report_file before
+settlement, use get_session_info for bounded child transcripts, and use
+get_delegation_status for selected run outcomes. Never depend on
+inline finding summaries.
+`
+
 /** Minimal skill that satisfies all contracts (hand-maintained fixture). */
 function baseValidSkill(overrides = {}) {
   const route =
@@ -60,6 +67,8 @@ revisions. Invoke subagent-driven-development and writing-plans by name.
 
 Plan production uses reviewer_cohort_node_ids, cohort_frozen, holistic rewrite,
 user-approved requirements change, b2d_task_risk_v1.
+
+${RECOVERY_PARAGRAPH}
 
 Scoped re-review: owners of open Critical and Important findings only.
 Full-group reset for material changes. Two non-improving rounds trigger stagnation handling.
@@ -877,6 +886,32 @@ Parent must not wait; Parent writes Task code when urgency requires it.
     const skill = baseValidSkill()
     const { failures } = validateParentOwnership(skill)
     assert.deepEqual(failures, [])
+  })
+})
+
+describe("index-first recovery contract", () => {
+  it("accepts the complete recovery fixture", () => {
+    const { failures } = validateSkillMarkdown(baseValidSkill())
+    assert.deepEqual(failures, [])
+  })
+
+  it("reports every recovery requirement when the paragraph is removed", () => {
+    const mutated = baseValidSkill().replace(RECOVERY_PARAGRAPH, "")
+    const { failures } = validateSkillMarkdown(mutated)
+
+    for (const label of [
+      "recovery_sources",
+      "actionable_task_routes",
+      "report_file",
+      "get_session_info",
+      "get_delegation_status",
+      "inline finding summaries compatibility warning",
+    ]) {
+      assert.ok(
+        failures.some((failure) => failure.includes(label)),
+        `missing mutation failure for ${label}; got: ${failures.join("; ")}`
+      )
+    }
   })
 })
 

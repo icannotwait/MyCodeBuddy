@@ -60,7 +60,9 @@ use crate::acp::delegation::transport::{
     CompanionRole,
 };
 use crate::acp::delegation::types::DelegationReturnWhen;
-use crate::acp::delegation::workflow::store::WORKFLOW_CAPABILITY_VERSION;
+use crate::acp::delegation::workflow::{
+    WorkflowIndexOmissionStep, WorkflowStateIndexDto, WORKFLOW_CAPABILITY_VERSION,
+};
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -88,6 +90,9 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
 /// a single embedded copy — no runtime file IO, no version skew with the
 /// broker's [`super::types::DelegationRequest`].
 pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
+
+pub const GET_WORKFLOW_STATE_MAX_RESULT_BYTES: usize = 7_680;
+pub const GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES: usize = 256;
 
 /// Pre-coordination `delegate_to_agent` description restored when
 /// `coordination_v1` is off so old connections never see Join instructions.
@@ -132,6 +137,12 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+pub fn serialize_jsonrpc_line(response: &JsonRpcResponse) -> Result<Vec<u8>, serde_json::Error> {
+    let mut line = serde_json::to_vec(response)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 pub fn ok(id: Value, result: Value) -> JsonRpcResponse {
@@ -565,6 +576,17 @@ async fn build_tools_call_spawn(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if name == "get_workflow_state"
+        && serde_json::to_vec(&id)
+            .map(|serialized| serialized.len() > GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES)
+            .unwrap_or(true)
+    {
+        return LineAction::Respond(err(
+            Value::Null,
+            -32600,
+            "Invalid Request: get_workflow_state request id exceeds 256 serialized bytes",
+        ));
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     let socket = ctx.socket_path.clone();
     // Defense in depth: tools/list already hides tools whose feature group is
@@ -802,24 +824,15 @@ async fn build_tools_call_spawn(
             LineAction::Respond(ok(id, render_workflow_local_result(&caps)))
         }
         "get_workflow_state" => {
-            let workflow_id = match arguments.get("workflow_id") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-                Some(_) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        "get_workflow_state workflow_id must be a non-empty string when provided",
-                    ));
+            let req = match parse_get_workflow_state_args(&arguments, &ctx.token) {
+                Ok(req) => req,
+                Err(message) => {
+                    return LineAction::Respond(err(id, -32602, message));
                 }
-            };
-            let req = BrokerGetWorkflowStateRequest {
-                token: ctx.token.clone(),
-                workflow_id,
             };
             let round_trip =
                 Box::pin(async move { client_get_workflow_state_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
+            register_and_spawn_workflow_state(inflight, id, round_trip).await
         }
         "publish_workflow_manifest" => {
             let req = BrokerPublishWorkflowRequest {
@@ -841,6 +854,33 @@ async fn build_tools_call_spawn(
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn parse_get_workflow_state_args(
+    arguments: &Value,
+    token: &str,
+) -> Result<BrokerGetWorkflowStateRequest, String> {
+    match arguments.get("detail") {
+        None => {}
+        Some(Value::String(detail)) if detail == "index" => {}
+        Some(_) => {
+            return Err("get_workflow_state detail must be \"index\" when provided".to_string());
+        }
+    }
+    let workflow_id = match arguments.get("workflow_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(workflow_id)) if !workflow_id.is_empty() => Some(workflow_id.clone()),
+        Some(_) => {
+            return Err(
+                "get_workflow_state workflow_id must be a non-empty string when provided"
+                    .to_string(),
+            );
+        }
+    };
+    Ok(BrokerGetWorkflowStateRequest {
+        token: token.to_string(),
+        workflow_id,
+    })
 }
 
 fn parse_settle_workflow_args(
@@ -965,6 +1005,169 @@ fn render_workflow_result(outcome: &Value) -> Value {
     })
 }
 
+fn render_get_workflow_state_response(id: Value, index: WorkflowStateIndexDto) -> JsonRpcResponse {
+    let public_index = index
+        .public_value()
+        .expect("workflow state index is JSON serializable");
+    let text = serde_json::to_string(&public_index)
+        .expect("workflow state public JSON value is serializable");
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }),
+    )
+}
+
+fn render_get_workflow_state_response_with_budget(
+    id: Value,
+    mut index: WorkflowStateIndexDto,
+    max_bytes: usize,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    let workflow_id = index.workflow_id.clone();
+    let preferred = render_get_workflow_state_response(id.clone(), index.clone());
+    let preferred_bytes = serialize_jsonrpc_line(&preferred)?.len();
+    let mut applied_tokens = Vec::new();
+
+    for step in WorkflowIndexOmissionStep::ALL {
+        let response = render_get_workflow_state_response(id.clone(), index.clone());
+        let final_bytes = serialize_jsonrpc_line(&response)?.len();
+        if final_bytes <= max_bytes {
+            tracing::debug!(
+                preferred_bytes,
+                final_bytes,
+                workflow_id,
+                applied_omission_tokens = ?applied_tokens,
+                "rendered get_workflow_state response within line budget"
+            );
+            return Ok(response);
+        }
+        if index.apply_omission_step(step) {
+            applied_tokens.push(step.token());
+        }
+    }
+
+    let response = render_get_workflow_state_response(id.clone(), index.clone());
+    let final_bytes = serialize_jsonrpc_line(&response)?.len();
+    if index.validate_protected_minimum().is_ok() && final_bytes <= max_bytes {
+        tracing::debug!(
+            preferred_bytes,
+            final_bytes,
+            workflow_id,
+            applied_omission_tokens = ?applied_tokens,
+            "rendered get_workflow_state response within line budget"
+        );
+        return Ok(response);
+    }
+
+    let fallback = render_payload_too_large(id);
+    let fallback_bytes = serialize_jsonrpc_line(&fallback)?.len();
+    tracing::debug!(
+        preferred_bytes,
+        final_bytes = fallback_bytes,
+        workflow_id,
+        applied_omission_tokens = ?applied_tokens,
+        "get_workflow_state protected payload exceeded line budget"
+    );
+    Ok(fallback)
+}
+
+fn render_get_workflow_state_outcome_with_budget(
+    id: Value,
+    outcome: Value,
+    max_bytes: usize,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    if outcome.get("error").is_some() {
+        let stable_code = workflow_state_stable_error_code(&outcome);
+        if stable_code != "internal_error" {
+            let response = ok(id.clone(), render_workflow_result(&outcome));
+            if serialize_jsonrpc_line(&response)?.len() <= max_bytes {
+                return Ok(response);
+            }
+        }
+        let fallback = render_bounded_workflow_error(id, stable_code);
+        let _fallback_bytes = serialize_jsonrpc_line(&fallback)?.len();
+        return Ok(fallback);
+    }
+
+    let index = serde_json::from_value::<WorkflowStateIndexDto>(outcome)?;
+    render_get_workflow_state_response_with_budget(id, index, max_bytes)
+}
+
+fn render_bounded_workflow_error(id: Value, stable_code: &'static str) -> JsonRpcResponse {
+    ok(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "get_workflow_state failed; inspect structuredContent.error.code"
+            }],
+            "isError": true,
+            "structuredContent": {
+                "error": {
+                    "code": stable_code,
+                    "message": "get_workflow_state failed"
+                }
+            }
+        }),
+    )
+}
+
+fn workflow_state_stable_error_code(outcome: &Value) -> &'static str {
+    match outcome
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "risk_assessment_invalid" => "risk_assessment_invalid",
+        "task_route_mismatch" => "task_route_mismatch",
+        "validation" => "validation",
+        "reviewer_set_mismatch" => "reviewer_set_mismatch",
+        "plan_review" => "plan_review",
+        "not_found" => "not_found",
+        "cross_parent" => "cross_parent",
+        "stale_manifest_revision" => "stale_manifest_revision",
+        "stale_graph_revision" => "stale_graph_revision",
+        "publication_token_mismatch" => "publication_token_mismatch",
+        "publication_token_conflict" => "publication_token_conflict",
+        "admitted_node_identity_mutation" => "admitted_node_identity_mutation",
+        "cohort_frozen" => "cohort_frozen",
+        "reviewed_task_stale" => "reviewed_task_stale",
+        "artifact_digest_mismatch" => "artifact_digest_mismatch",
+        "gate_not_ready" => "gate_not_ready",
+        "gate_cycle_conflict" => "gate_cycle_conflict",
+        "execution_gate_settle_rejected" => "execution_gate_settle_rejected",
+        "approval_with_open_findings" => "approval_with_open_findings",
+        "approval_rejected_failed_reviewer" => "approval_rejected_failed_reviewer",
+        "summary_too_large" => "summary_too_large",
+        "negative_finding_counts" => "negative_finding_counts",
+        "parent_not_found" => "parent_not_found",
+        "busy" => "busy",
+        "persistence" => "persistence",
+        _ => "internal_error",
+    }
+}
+
+fn render_payload_too_large(id: Value) -> JsonRpcResponse {
+    ok(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "get_workflow_state payload exceeds the 7680-byte response budget"
+            }],
+            "isError": true,
+            "structuredContent": {
+                "error": {
+                    "code": "payload_too_large",
+                    "message": "get_workflow_state protected recovery index exceeds 7680 bytes"
+                }
+            }
+        }),
+    )
+}
+
 /// Register the inflight entry and build the [`SpawnedCall`] that races the
 /// broker round-trip against the cancel signal. `external_handle` is `Some` only
 /// for `delegate_to_agent` (so a cancel during setup tears the child down);
@@ -1021,6 +1224,87 @@ async fn register_and_spawn(
             }
         };
         // Delegation / status / cancel have no post-relay step.
+        SpawnResult {
+            response,
+            after_relay: None,
+        }
+    });
+
+    LineAction::Spawn(SpawnedCall {
+        request_id: id,
+        request_id_key: id_key,
+        future,
+    })
+}
+
+async fn register_and_spawn_workflow_state(
+    inflight: Arc<InflightCalls>,
+    id: Value,
+    round_trip: futures_util::future::BoxFuture<'static, std::io::Result<BrokerResponse>>,
+) -> LineAction {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let id_key = request_id_key(&id);
+    inflight
+        .register(
+            id_key.clone(),
+            InflightEntry {
+                external_handle: None,
+                cancel_tx,
+            },
+        )
+        .await;
+
+    let id_for_response = id.clone();
+    let id_key_for_task = id_key.clone();
+    let inflight_for_task = inflight.clone();
+    let future = Box::pin(async move {
+        let response = tokio::select! {
+            biased;
+            _ = cancel_rx => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                None
+            }
+            rt = round_trip => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                match rt {
+                    Ok(response) => {
+                        let rendered = render_get_workflow_state_outcome_with_budget(
+                            id_for_response.clone(),
+                            response.outcome,
+                            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                        )
+                        .unwrap_or_else(|_| {
+                            let internal_error = err(
+                                id_for_response.clone(),
+                                -32603,
+                                "get_workflow_state response serialization failed",
+                            );
+                            let internal_error_bytes = serialize_jsonrpc_line(&internal_error)
+                                .expect("fixed JSON-RPC error is serializable")
+                                .len();
+                            assert!(
+                                internal_error_bytes <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                                "bounded request id keeps fixed workflow error within budget"
+                            );
+                            internal_error
+                        });
+                        let rendered_bytes = serialize_jsonrpc_line(&rendered)
+                            .expect("workflow response was already serialized")
+                            .len();
+                        assert!(
+                            rendered_bytes <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                            "accepted workflow response must fit the line budget"
+                        );
+                        Some(rendered)
+                    }
+                    Err(_) => Some(err(
+                        id_for_response,
+                        -32603,
+                        "get_workflow_state broker round-trip failed",
+                    )),
+                }
+            }
+        };
         SpawnResult {
             response,
             after_relay: None,
@@ -1805,7 +2089,13 @@ pub fn render_task_report(report: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashSet};
+
     use super::*;
+    use crate::acp::delegation::workflow::{
+        project_workflow_state_index, WorkflowIndexOmissionStep, WorkflowStateDto,
+        WorkflowStateIndexDto,
+    };
 
     fn ctx() -> CompanionContext {
         // Delegation-only by default so the existing delegation-focused tests
@@ -1844,6 +2134,215 @@ mod tests {
             LineAction::Spawn(_) => panic!("expected Respond, got Spawn"),
             LineAction::Silent => panic!("expected Respond, got Silent"),
         }
+    }
+
+    fn ascii_string_id_with_serialized_len(bytes: usize) -> Value {
+        Value::String("x".repeat(bytes - 2))
+    }
+
+    fn representative_large_index() -> WorkflowStateIndexDto {
+        let nodes = (0..20)
+            .map(|index| {
+                let node_id = match index {
+                    0 => "plan-reviewer-quote\"slash\\界".to_string(),
+                    1 => "plan-reviewer-grok-界".to_string(),
+                    2 => "task-1-impl-界".to_string(),
+                    3 => "task-1-review-quote\"".to_string(),
+                    _ => format!("node-{index:02}-quote\"slash\\界"),
+                };
+                let required_for_gate = index < 2;
+                let (task_index, status) = match index {
+                    2 => (Some(1), "running"),
+                    3 => (Some(1), "pending"),
+                    4 => (None, "running"),
+                    _ => (None, "completed"),
+                };
+                json!({
+                    "node_id": node_id,
+                    "work_unit_key": format!("task|{index}|reviewer|quote\\\"界|none"),
+                    "role": if index == 2 { "implementer" } else { "reviewer" },
+                    "agent_type": if index % 2 == 0 { "codex" } else { "grok" },
+                    "profile_id": format!("private-profile-{index}"),
+                    "phase_id": if task_index.is_some() { "tasks" } else { "plan" },
+                    "task_index": task_index,
+                    "is_observed": true,
+                    "retained_observed": false,
+                    "cohort_frozen": true,
+                    "latest_task_id": format!("task-{index:02}-quote\"slash\\界"),
+                    "latest_status": status,
+                    "latest_generation": 7,
+                    "summary_validated": true,
+                    "artifact_digest": format!("sha256:{}", "abcdef0123456789".repeat(4)),
+                    "child_conversation_id": 900 + index,
+                    "reviewed_task_id": "private-reviewed-task",
+                    "verdict": "done",
+                    "report_file": format!("reports/界/quote\"slash\\node-{index:02}.md"),
+                    "replaced_task_id": "private-replaced-task",
+                    "required_for_gate": required_for_gate
+                })
+            })
+            .collect::<Vec<_>>();
+        let findings = (0..15)
+            .map(|index| {
+                json!({
+                    "finding_id": format!("finding-{index:02}-quote\"slash\\界"),
+                    "severity": match index % 3 { 0 => "critical", 1 => "important", _ => "minor" },
+                    "status": match index % 4 { 0 => "open", 1 => "new", 2 => "reopened", _ => "resolved" },
+                    "owner_reviewer_node_ids": ["plan-reviewer-quote\"slash\\界"],
+                    "summary": "S".repeat(4 * 1024),
+                    "evidence_ref": format!("docs/界/plan.md#finding-{index:02}-quote\""),
+                    "report_file": format!("reports/界/finding-{index:02}-quote\"slash\\.md")
+                })
+            })
+            .collect::<Vec<_>>();
+        let state: WorkflowStateDto = serde_json::from_value(json!({
+            "workflow_id": "wf-1",
+            "parent_conversation_id": 42,
+            "workflow_kind": "brainstorm_to_delivery",
+            "capability_version": "workflow_manifest_v2",
+            "workflow_state": "estimated",
+            "manifest_revision": 7,
+            "graph_revision": 11,
+            "schema_version": 2,
+            "publication_token": "publication-quote\"slash\\界",
+            "plan_target_rel_path": "docs/界/plan-quote\"slash\\.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "task_policies": [{
+                "task_index": 1,
+                "risk": {
+                    "level": "high",
+                    "hard_triggers": [],
+                    "soft_signals": [],
+                    "score": 3,
+                    "reason": "private risk prose"
+                },
+                "route": {
+                    "implementer_node_id": "task-1-impl-界",
+                    "reviewer_node_ids": ["task-1-review-quote\""]
+                }
+            }],
+            "design": {
+                "rel_path": "docs/界/design-quote\"slash\\.md",
+                "digest": format!("sha256:{}", "0123456789abcdef".repeat(4))
+            },
+            "plan": {
+                "rel_path": "docs/界/plan-quote\"slash\\.md",
+                "digest": format!("sha256:{}", "fedcba9876543210".repeat(4))
+            },
+            "nodes": nodes,
+            "gates": [{
+                "gate_id": "plan-gate-quote\"slash\\界",
+                "gate_kind": "plan",
+                "resolution_mode": "parent_adjudication",
+                "reviewer_cohort_node_ids": [
+                    "plan-reviewer-quote\"slash\\界",
+                    "plan-reviewer-grok-界"
+                ],
+                "required_reviewer_node_ids": [
+                    "plan-reviewer-quote\"slash\\界",
+                    "plan-reviewer-grok-界"
+                ],
+                "latest_gate_cycle": 2,
+                "latest_outcome": "changes_requested",
+                "next_gate_cycle": 3
+            }],
+            "latest_plan_review": {
+                "scope": "full",
+                "revision_kind": "material",
+                "scope_reason": "private scope prose",
+                "covered_author_task_id": "plan-author-task-quote\"slash\\界",
+                "covered_plan_digest": format!("sha256:{}", "13579bdf02468ace".repeat(4)),
+                "reviewed_reviewer_node_ids": [
+                    "plan-reviewer-quote\"slash\\界",
+                    "plan-reviewer-grok-界"
+                ],
+                "next_required_reviewer_node_ids": ["plan-reviewer-grok-界"],
+                "findings": findings,
+                "lineage_reset_reason": "private lineage prose",
+                "critical_count": 5,
+                "important_count": 8,
+                "minor_count": 2,
+                "net_improvement": true,
+                "stagnation_count": 0,
+                "rewrite_used": false,
+                "next_action": "continue_review"
+            },
+            "evidence_truncated": false
+        }))
+        .expect("representative source state");
+        assert_eq!(state.nodes.len(), 20);
+        assert_eq!(
+            state.latest_plan_review.as_ref().unwrap().findings.len(),
+            15
+        );
+        project_workflow_state_index(
+            state,
+            &HashSet::from([
+                "task-1-impl-界".to_string(),
+                "task-1-review-quote\"".to_string(),
+            ]),
+            &BTreeMap::from([(1, false)]),
+        )
+    }
+
+    fn response_index(response: &JsonRpcResponse) -> Value {
+        let result = response.result.as_ref().expect("tool result");
+        serde_json::from_str(result["content"][0]["text"].as_str().expect("index text"))
+            .expect("valid projected index JSON")
+    }
+
+    fn omission_candidate(index: &WorkflowStateIndexDto, id: Value) -> JsonRpcResponse {
+        render_get_workflow_state_response(id, index.clone())
+    }
+
+    #[cfg(windows)]
+    fn workflow_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-workflow-budget-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut server).await.unwrap();
+            assert!(matches!(message, BrokerMessage::GetWorkflowState(_)));
+            write_frame(&mut server, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (pipe_name, task)
+    }
+
+    #[cfg(unix)]
+    fn workflow_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("workflow-budget.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(message, BrokerMessage::GetWorkflowState(_)));
+            write_frame(&mut stream, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (socket, task)
     }
 
     #[tokio::test]
@@ -3246,6 +3745,495 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_workflow_state_detail_contract_rejects_before_inflight() {
+        let omitted = parse_get_workflow_state_args(&json!({}), "token").unwrap();
+        let explicit =
+            parse_get_workflow_state_args(&json!({ "detail": "index" }), "token").unwrap();
+        assert_eq!(
+            serde_json::to_value(omitted).unwrap(),
+            serde_json::to_value(explicit).unwrap()
+        );
+
+        for detail in [
+            Value::Null,
+            json!("full"),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!(true),
+            json!(false),
+        ] {
+            let inflight = Arc::new(InflightCalls::new());
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "get_workflow_state", "arguments": { "detail": detail } }
+            })
+            .to_string();
+            let response = unwrap_respond(
+                dispatch_line(&ctx_with(WORKFLOW_ROOT), inflight.clone(), &line).await,
+            );
+            assert_eq!(response.error.unwrap().code, -32602);
+            assert!(inflight.drain_all().await.is_empty());
+        }
+        assert!(matches!(
+            dispatch_with_features(WORKFLOW_ROOT, &call(2, "get_workflow_state", json!({}))).await,
+            LineAction::Spawn(_)
+        ));
+        assert!(matches!(
+            dispatch_with_features(
+                WORKFLOW_ROOT,
+                &call(3, "get_workflow_state", json!({ "detail": "index" }))
+            )
+            .await,
+            LineAction::Spawn(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_workflow_state_request_id_limit_is_pre_inflight_and_bounded() {
+        let accepted = ascii_string_id_with_serialized_len(256);
+        let accepted_line = json!({
+            "jsonrpc": "2.0", "id": accepted, "method": "tools/call",
+            "params": { "name": "get_workflow_state", "arguments": {} }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(WORKFLOW_ROOT, &accepted_line).await,
+            LineAction::Spawn(_)
+        ));
+
+        for rejected in [
+            ascii_string_id_with_serialized_len(257),
+            Value::String("\\".repeat(128)),
+            Value::String("界".repeat(85)),
+        ] {
+            let inflight = Arc::new(InflightCalls::new());
+            let line = json!({
+                "jsonrpc": "2.0", "id": rejected, "method": "tools/call",
+                "params": { "name": "get_workflow_state", "arguments": {} }
+            })
+            .to_string();
+            let response = unwrap_respond(
+                dispatch_line(&ctx_with(WORKFLOW_ROOT), inflight.clone(), &line).await,
+            );
+            assert_eq!(response.id, Value::Null);
+            assert_eq!(response.error.as_ref().unwrap().code, -32600);
+            assert!(inflight.drain_all().await.is_empty());
+            assert!(
+                serialize_jsonrpc_line(&response).unwrap().len()
+                    <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn get_workflow_state_index_jsonrpc_line_under_7680_bytes() {
+        for id in [json!(1), json!("quote\"slash\\界")] {
+            let response = render_get_workflow_state_response_with_budget(
+                id,
+                representative_large_index(),
+                GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+            )
+            .unwrap();
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(
+                line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                "{} bytes",
+                line.len()
+            );
+            let result = response.result.as_ref().unwrap();
+            assert_eq!(result["isError"], false);
+            assert!(result.get("structuredContent").is_none());
+            let index = response_index(&response);
+            assert_eq!(index["manifest_revision"], 7);
+            assert_eq!(index["graph_revision"], 11);
+            assert_eq!(index["gates"][0]["next_gate_cycle"], 3);
+            assert_eq!(
+                index["latest_plan_review"]["next_action"],
+                "continue_review"
+            );
+            assert_eq!(index["latest_plan_review"]["important_count"], 8);
+            assert!(index
+                .pointer("/latest_plan_review/findings/0/summary")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn get_workflow_state_packaging_text_equals_projected_index_without_structured_copy() {
+        let index = representative_large_index();
+        let expected = index.public_value().unwrap();
+        let response = render_get_workflow_state_response(json!(9), index);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["isError"], false);
+        assert!(result.get("structuredContent").is_none());
+        assert_eq!(response_index(&response), expected);
+    }
+
+    #[test]
+    fn get_workflow_state_each_budget_transition_appends_exact_ordered_token() {
+        let original = representative_large_index();
+        let id = json!("quote\"slash\\界");
+        let mut previous_len = serialize_jsonrpc_line(&omission_candidate(&original, id.clone()))
+            .unwrap()
+            .len();
+        for (target_index, target_step) in WorkflowIndexOmissionStep::ALL.into_iter().enumerate() {
+            let mut before_index = original.clone();
+            for preceding in WorkflowIndexOmissionStep::ALL
+                .into_iter()
+                .take(target_index)
+            {
+                before_index.apply_omission_step(preceding);
+            }
+            let before = serialize_jsonrpc_line(&omission_candidate(&before_index, id.clone()))
+                .unwrap()
+                .len();
+            assert_eq!(before, previous_len);
+
+            let mut after_index = before_index.clone();
+            assert!(
+                after_index.apply_omission_step(target_step),
+                "representative fixture must exercise {}",
+                target_step.token()
+            );
+            let after = serialize_jsonrpc_line(&omission_candidate(&after_index, id.clone()))
+                .unwrap()
+                .len();
+            assert!(
+                after < before,
+                "{} must reduce the line: before={before}, after={after}",
+                target_step.token()
+            );
+
+            let response =
+                render_get_workflow_state_response_with_budget(id.clone(), original.clone(), after)
+                    .unwrap();
+            assert_eq!(
+                response_index(&response),
+                after_index.public_value().unwrap()
+            );
+            assert_eq!(
+                response_index(&response)["omitted"],
+                after_index.public_value().unwrap()["omitted"],
+                "{} must preserve canonical omission order",
+                target_step.token()
+            );
+            previous_len = after;
+        }
+    }
+
+    #[test]
+    fn get_workflow_state_render_is_byte_deterministic() {
+        let id = json!("quote\"slash\\界");
+        let first = render_get_workflow_state_response_with_budget(
+            id.clone(),
+            representative_large_index(),
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let second = render_get_workflow_state_response_with_budget(
+            id,
+            representative_large_index(),
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_jsonrpc_line(&first).unwrap(),
+            serialize_jsonrpc_line(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn get_workflow_state_protected_oversize_returns_bounded_typed_error() {
+        let mut index = representative_large_index();
+        let pathological = "quote\"slash\\界".repeat(2_000);
+        index.workflow_id = pathological.clone();
+        index.plan_target_rel_path = pathological.clone();
+        if let Some(review) = index.latest_plan_review.as_mut() {
+            review.covered_author_task_id = pathological.clone();
+            for source in &mut review.recovery_sources {
+                source.report_file = Some(pathological.clone());
+                source.latest_task_id = None;
+            }
+        }
+        let id = ascii_string_id_with_serialized_len(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES);
+        let response = render_get_workflow_state_response_with_budget(
+            id,
+            index,
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "payload_too_large"
+        );
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES);
+        assert!(!String::from_utf8(line).unwrap().contains(&pathological));
+    }
+
+    #[test]
+    fn get_workflow_state_open_findings_never_lose_all_recovery_pointers() {
+        let mut index = representative_large_index();
+        for step in WorkflowIndexOmissionStep::ALL {
+            index.apply_omission_step(step);
+            index.validate_protected_minimum().unwrap();
+            let review = index.latest_plan_review.as_ref().unwrap();
+            assert!(review
+                .recovery_sources
+                .iter()
+                .any(|source| source.report_file.is_some() || source.latest_task_id.is_some()));
+        }
+    }
+
+    #[test]
+    fn get_workflow_state_broker_errors_keep_existing_typed_tool_error_shape() {
+        let outcome = json!({
+            "error": { "code": "validation", "message": "invalid workflow state" }
+        });
+        let response = render_get_workflow_state_outcome_with_budget(
+            json!(17),
+            outcome.clone(),
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["content"][0]["text"], "invalid workflow state");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"], outcome);
+        assert!(
+            serialize_jsonrpc_line(&response).unwrap().len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn get_workflow_state_untrusted_error_shapes_use_bounded_internal_error() {
+        let cases = [
+            (
+                "unknown code",
+                json!({
+                    "error": {
+                        "code": "injected_unknown_code",
+                        "message": "untrusted-unknown-code-message"
+                    }
+                }),
+                "untrusted-unknown-code-message",
+            ),
+            (
+                "missing code",
+                json!({ "error": { "message": "untrusted-missing-code-message" } }),
+                "untrusted-missing-code-message",
+            ),
+            (
+                "non-string code",
+                json!({
+                    "error": {
+                        "code": 7,
+                        "message": "untrusted-non-string-code-message"
+                    }
+                }),
+                "untrusted-non-string-code-message",
+            ),
+            (
+                "string error",
+                json!({ "error": "untrusted-string-error" }),
+                "untrusted-string-error",
+            ),
+            (
+                "null error",
+                json!({ "error": null, "source": "untrusted-null-error" }),
+                "untrusted-null-error",
+            ),
+            (
+                "numeric error",
+                json!({ "error": 9, "source": "untrusted-numeric-error" }),
+                "untrusted-numeric-error",
+            ),
+            (
+                "array error",
+                json!({ "error": ["untrusted-array-error"] }),
+                "untrusted-array-error",
+            ),
+            (
+                "boolean error",
+                json!({ "error": true, "source": "untrusted-boolean-error" }),
+                "untrusted-boolean-error",
+            ),
+        ];
+
+        for (label, outcome, untrusted) in cases {
+            let id = ascii_string_id_with_serialized_len(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES);
+            let response = render_get_workflow_state_outcome_with_budget(
+                id,
+                outcome,
+                GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{label} returned JSON-RPC serialization error: {error}")
+            });
+            let result = response.result.as_ref().expect("bounded tool result");
+            assert_eq!(result["isError"], true, "{label}");
+            assert_eq!(
+                result["content"][0]["text"],
+                "get_workflow_state failed; inspect structuredContent.error.code",
+                "{label}"
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["code"], "internal_error",
+                "{label}"
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["message"], "get_workflow_state failed",
+                "{label}"
+            );
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(
+                line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                "{label} emitted {} bytes",
+                line.len()
+            );
+            assert!(
+                !String::from_utf8(line).unwrap().contains(untrusted),
+                "{label} echoed untrusted broker bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_workflow_state_oversized_missing_workflow_id_error_uses_bounded_typed_fallback() {
+        let workflow_id = "missing-quote\"slash\\界".repeat(600);
+        let broker_message = format!("workflow not found: {workflow_id}");
+        let (socket_path, server) = workflow_broker_with_outcome(json!({
+            "error": { "code": "not_found", "message": broker_message }
+        }));
+        let mut context = ctx_with(WORKFLOW_ROOT);
+        context.socket_path = socket_path;
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": "short-id",
+            "method": "tools/call",
+            "params": {
+                "name": "get_workflow_state",
+                "arguments": { "workflow_id": workflow_id }
+            }
+        })
+        .to_string();
+        let action = dispatch_line(&context, Arc::new(InflightCalls::new()), &line).await;
+        let LineAction::Spawn(spawned) = action else {
+            panic!("expected workflow state spawn");
+        };
+        let response = spawned.future.await.response.unwrap();
+        server.await.unwrap();
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["error"]["code"], "not_found");
+        let serialized = serialize_jsonrpc_line(&response).unwrap();
+        let serialized_text = String::from_utf8(serialized.clone()).unwrap();
+        assert!(!serialized_text.contains(&workflow_id));
+        assert!(!serialized_text.contains(&broker_message));
+        assert!(serialized.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn get_workflow_state_synthetic_broker_error_uses_bounded_typed_fallback() {
+        let source_message = "deterministic persistence failure ".repeat(512);
+        let outcome = json!({
+            "error": { "code": "persistence", "message": source_message }
+        });
+        let id = ascii_string_id_with_serialized_len(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES);
+        let first = render_get_workflow_state_outcome_with_budget(
+            id.clone(),
+            outcome.clone(),
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let second = render_get_workflow_state_outcome_with_budget(
+            id,
+            outcome,
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let result = first.result.as_ref().unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["error"]["code"], "persistence");
+        assert_eq!(
+            result["content"][0]["text"],
+            "get_workflow_state failed; inspect structuredContent.error.code"
+        );
+        assert_eq!(
+            result["structuredContent"]["error"]["message"],
+            "get_workflow_state failed"
+        );
+        let first_line = serialize_jsonrpc_line(&first).unwrap();
+        assert_eq!(first_line, serialize_jsonrpc_line(&second).unwrap());
+        assert!(first_line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES);
+        assert!(!String::from_utf8(first_line)
+            .unwrap()
+            .contains(&source_message));
+    }
+
+    #[test]
+    fn get_workflow_state_all_known_bounded_error_codes_fit_with_max_request_id() {
+        let codes = [
+            "risk_assessment_invalid",
+            "task_route_mismatch",
+            "validation",
+            "reviewer_set_mismatch",
+            "plan_review",
+            "not_found",
+            "cross_parent",
+            "stale_manifest_revision",
+            "stale_graph_revision",
+            "publication_token_mismatch",
+            "publication_token_conflict",
+            "admitted_node_identity_mutation",
+            "cohort_frozen",
+            "reviewed_task_stale",
+            "artifact_digest_mismatch",
+            "gate_not_ready",
+            "gate_cycle_conflict",
+            "execution_gate_settle_rejected",
+            "approval_with_open_findings",
+            "approval_rejected_failed_reviewer",
+            "summary_too_large",
+            "negative_finding_counts",
+            "parent_not_found",
+            "busy",
+            "persistence",
+            "internal_error",
+        ];
+        for code in codes {
+            let id = ascii_string_id_with_serialized_len(GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES);
+            let response = render_bounded_workflow_error(id, code);
+            assert_eq!(
+                response.result.as_ref().unwrap()["structuredContent"]["error"]["code"],
+                code
+            );
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(
+                line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+                "bounded {code} line was {} bytes",
+                line.len()
+            );
+        }
+
+        for untrusted in [
+            json!({ "error": {} }),
+            json!({ "error": { "code": 7 } }),
+            json!({ "error": { "code": "unknown-injected-code" } }),
+        ] {
+            assert_eq!(
+                workflow_state_stable_error_code(&untrusted),
+                "internal_error"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn settle_workflow_gate_rejects_negative_finding_counts_synchronously() {
         // Defense at companion parse: no UDS spawn for negative counts.
         for (key, args) in [
@@ -3423,6 +4411,37 @@ mod tests {
             .expect("settle required")
             .iter()
             .any(|value| value == "evidence"));
+    }
+
+    #[test]
+    fn get_workflow_state_schema_describes_index_recovery() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+        let state = schema
+            .as_array()
+            .expect("tool catalog array")
+            .iter()
+            .find(|tool| tool["name"] == "get_workflow_state")
+            .expect("get_workflow_state tool");
+
+        assert_eq!(
+            state["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string" },
+                    "detail": { "type": "string", "enum": ["index"], "default": "index" }
+                }
+            })
+        );
+        let description = state["description"].as_str().expect("tool description");
+        for phrase in [
+            "compact workflow index",
+            "report_file",
+            "get_session_info",
+            "get_delegation_status",
+        ] {
+            assert!(description.contains(phrase), "missing {phrase}");
+        }
     }
 
     #[tokio::test]

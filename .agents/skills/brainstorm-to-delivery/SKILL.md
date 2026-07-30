@@ -85,8 +85,18 @@ digest mismatch → hard stop + `get_workflow_state`. CAS updates carry
 Lifecycle: skeleton (target path + Author work unit, no Plan digest yet) →
 estimated (digest, matrix, policies, routes, full initial required set) →
 parent `settle_workflow_gate` → approved. Material Plan change demotes to
-estimated and reopens Plan review. On recovery, read `get_workflow_state` +
-ledger; never invent a second active workflow from memory.
+estimated and reopens Plan review.
+
+Recovery is index-first. Call `get_workflow_state` with omitted `detail` or
+`detail=index`; one index read supplies authoritative gate cycles/outcomes,
+counts + `next_action`, full Plan reviewer cohort, `recovery_sources`, and
+current/next `actionable_task_routes`. Before settlement, the root reads each
+referenced workspace `report_file`; use `get_session_info` with bounded
+`max_messages` for a selected child transcript and `get_delegation_status` for
+selected `latest_task_id` outcomes. Never depend on inline finding summaries,
+full policy evidence/reasons, replacement chains, or
+complete historical node lists. Use the ledger for durable thread bookkeeping,
+and never invent a second active workflow from memory.
 
 Every Design/Plan/Task/Final child must emit one validated terminal
 `<!-- codeg-card-summary-v1 ... -->` block. Parent advances only on platform-
@@ -141,7 +151,9 @@ requirements, scope, architecture, or user data handling.
    automatic rewrite). Only a **user-approved requirements change** with a
    **persisted reason** resets Plan lineage and baseline.
 8. Persist finding ledger, prior counts, stagnation counter, and
-   `rewrite_used` in recovery state. Compaction must not erase them.
+   `rewrite_used` in recovery state. Compaction must not erase them. On Plan
+   recovery, use the index-first procedure above and verify referenced reports
+   before settlement.
 
 ## 3. Task risk policy (`b2d_task_risk_v1`)
 
@@ -247,6 +259,7 @@ worktree, blockers.
 | Final review approved | Immediately verify, commit, and report. Do not request extra user approval. |
 | Any phase could continue | Only pause for a platform hard block, `user_decision_required`, or a change to requirements, scope, architecture, or user data handling; otherwise continue. |
 | Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
+| Context compacted / recovery resumed | One index read for gates, counts, reviewer sets, and current/next routes; read referenced reports and bounded secondary detail before settle |
 
 ## Rationalizations
 
@@ -296,4 +309,5 @@ User: `Deliver from docs/brainstorm/payment.md. Parallel reviewers: @Code Buddy`
    approve same `reviewed_task_id`/`artifact_digest`; fixes re-open both.
 8. All Task gates pass → new Final Codex; on request_changes → Final fixer
    Grok then continue Final. Local commits + final report. Recovery always
-   `get_workflow_state` + ledger first.
+   starts with the compact index, then referenced workspace reports and bounded
+   child/run lookups before settlement.

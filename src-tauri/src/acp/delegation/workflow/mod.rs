@@ -43,7 +43,14 @@ pub use project::{
     evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,
     soft_attach_workflow_graph,
 };
-pub use state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
+pub use state_dto::{
+    project_workflow_state_index, ActionableTaskRouteDto, PlanFindingStubDto,
+    PlanRecoverySourceDto, PlanReviewIndexDto, TaskPolicyIndexDto, WorkflowGateStateDto,
+    WorkflowIndexNodeOmissionMeta, WorkflowIndexOmissionState, WorkflowIndexOmissionStep,
+    WorkflowIndexProtectedError, WorkflowNodeIndexDto, WorkflowNodeStateDto, WorkflowStateDetail,
+    WorkflowStateDto, WorkflowStateIndexDto, DIGEST_PREFIX_HEX_CHARS, INDEX_MAX_FINDING_STUBS,
+    INDEX_MAX_NODES,
+};
 pub use store::{
     get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
     PublishResult, PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
