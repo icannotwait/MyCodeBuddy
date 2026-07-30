@@ -105,6 +105,7 @@ describe("buildDelegationWorkUnitRuntime", () => {
       explicitUserCancel: false,
     })
 
+    // Continuous runs: run-1 [0,5m] + open run-2 [5m,6m] = 6m active sum.
     expect(result).toMatchObject({
       activeSticky: true,
       startedAt: START,
@@ -151,7 +152,8 @@ describe("buildDelegationWorkUnitRuntime", () => {
     expect(result.lifecycleOverride).toBe("running")
     expect(result.statusOverride).toBe("running")
     expect(result.suppressErrorCode).toBe(true)
-    expect(result.elapsedMs).toBe(beforeDeadline - Date.parse(START))
+    // Idle orphan wait is not billed — elapsed freezes at the run's own span.
+    expect(result.elapsedMs).toBe(300_000)
   })
 
   it("uses the latest completeness flag for repeated snapshots of one run", () => {
@@ -289,6 +291,45 @@ describe("buildDelegationWorkUnitRuntime", () => {
       expect(result.suppressErrorCode).toBe(true)
     }
   )
+
+  it("sums per-run active spans and excludes idle gaps between turns", () => {
+    // run-1: 0–2m, idle 2–10m, run-2: 10–12m → total active 4m, not wall 12m.
+    const result = buildDelegationWorkUnitRuntime({
+      runs: [
+        observed("run-1", {
+          lifecycleStatus: "ok",
+          errorCode: null,
+          startedAt: START,
+          finishedAt: "2026-07-27T00:02:00.000Z",
+          runtimeStats: runtimeStats({
+            finished_at: "2026-07-27T00:02:00.000Z",
+            tool_call_count: 1,
+          }),
+        }),
+        observed("run-2", {
+          lifecycleStatus: "ok",
+          errorCode: null,
+          startedAt: "2026-07-27T00:10:00.000Z",
+          finishedAt: "2026-07-27T00:12:00.000Z",
+          runtimeStats: runtimeStats({
+            started_at: "2026-07-27T00:10:00.000Z",
+            finished_at: "2026-07-27T00:12:00.000Z",
+            tool_call_count: 2,
+          }),
+          current: true,
+        }),
+      ],
+      nowMs: Date.parse("2026-07-27T00:12:00.000Z"),
+      hasLiveBinding: false,
+      explicitUserCancel: false,
+    })
+
+    expect(result.activeSticky).toBe(false)
+    expect(result.startedAt).toBe(START)
+    expect(result.finishedAt).toBe("2026-07-27T00:12:00.000Z")
+    expect(result.elapsedMs).toBe(240_000)
+    expect(result.toolCallCount).toBe(3)
+  })
 
   it("never invents a zero tool count when runtime stats are absent", () => {
     const result = buildDelegationWorkUnitRuntime({
