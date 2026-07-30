@@ -80,9 +80,13 @@ type ConversationGraphEntry = {
   error: string | null
 }
 
+type InterestMode = "overlay" | "expanded"
+
 type ActiveConversationRecord = {
-  count: number
+  overlayCount: number
+  expandedCount: number
   epoch: number
+  readinessSettled: boolean
   fallbackTimer: ReturnType<typeof setTimeout> | null
 }
 
@@ -112,6 +116,8 @@ type WorkflowGraphState = {
   ) => RefreshApplyOutcome
   handleGraphChanged: (payload: WorkflowGraphChangedPayload) => void
   handleCompatibilityNudge: (payload: WorkflowCompatibilityNudgePayload) => void
+  /** Acquire open-overlay interest and return an idempotent cleanup lease. */
+  activateOverlayInterest: (conversationId: number) => () => void
   /** Acquire live workflow interest and return an idempotent cleanup lease. */
   activateConversation: (conversationId: number) => () => void
   refresh: (conversationId: number) => Promise<void>
@@ -191,9 +197,21 @@ let eventReadinessDeadline: ReturnType<typeof setTimeout> | null = null
 const activeConversations = new Map<number, ActiveConversationRecord>()
 let activationEpochCounter = 0
 
+function totalInterest(active: ActiveConversationRecord): number {
+  return active.overlayCount + active.expandedCount
+}
+
 function isActiveEpoch(conversationId: number, epoch: number): boolean {
   const active = activeConversations.get(conversationId)
-  return active != null && active.count > 0 && active.epoch === epoch
+  return active != null && totalInterest(active) > 0 && active.epoch === epoch
+}
+
+function hasExpandedInterestEpoch(
+  conversationId: number,
+  epoch: number
+): boolean {
+  const active = activeConversations.get(conversationId)
+  return active != null && active.epoch === epoch && active.expandedCount > 0
 }
 
 function clearFallbackTimer(active: ActiveConversationRecord): void {
@@ -273,15 +291,86 @@ function disposeEventListeners(): void {
   nudgeUnsub = null
 }
 
-function releaseConversation(conversationId: number, epoch: number): void {
+function releaseConversation(
+  conversationId: number,
+  epoch: number,
+  mode: InterestMode
+): void {
   const active = activeConversations.get(conversationId)
   if (!active || active.epoch !== epoch) return
-  active.count -= 1
-  if (active.count > 0) return
+  if (mode === "overlay") {
+    if (active.overlayCount <= 0) return
+    active.overlayCount -= 1
+  } else {
+    if (active.expandedCount <= 0) return
+    active.expandedCount -= 1
+    if (active.expandedCount === 0) clearFallbackTimer(active)
+  }
+  if (totalInterest(active) > 0) return
   clearFallbackTimer(active)
   activationEpochCounter += 1
   activeConversations.delete(conversationId)
   if (activeConversations.size === 0) disposeEventListeners()
+}
+
+function activateInterest(
+  get: () => WorkflowGraphState,
+  conversationId: number,
+  mode: InterestMode
+): () => void {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) {
+    return () => {}
+  }
+
+  let active = activeConversations.get(conversationId)
+  const becameTotalActive = active == null
+  const wasExpanded = (active?.expandedCount ?? 0) > 0
+  if (!active) {
+    active = {
+      overlayCount: 0,
+      expandedCount: 0,
+      epoch: ++activationEpochCounter,
+      readinessSettled: false,
+      fallbackTimer: null,
+    }
+    activeConversations.set(conversationId, active)
+  }
+  if (mode === "overlay") active.overlayCount += 1
+  else active.expandedCount += 1
+  const epoch = active.epoch
+
+  if (!get().getEntry(conversationId)) {
+    useWorkflowGraphStore.setState((state) => ({
+      byConversationId: mapSetEntry(
+        state.byConversationId,
+        conversationId,
+        emptyEntry()
+      ),
+    }))
+  }
+
+  if (becameTotalActive) {
+    const readiness = installEventListeners(get)
+    void readiness.then(() => {
+      const currentActive = activeConversations.get(conversationId)
+      if (!currentActive || currentActive.epoch !== epoch) return
+      currentActive.readinessSettled = true
+      const appliedRevision =
+        get().getEntry(conversationId)?.appliedGraphRevision
+      if (currentActive.expandedCount > 0 || appliedRevision == null) {
+        void get().refresh(conversationId)
+      }
+    })
+  } else if (mode === "expanded" && !wasExpanded && active.readinessSettled) {
+    void get().refresh(conversationId)
+  }
+
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    releaseConversation(conversationId, epoch, mode)
+  }
 }
 
 async function fetchAndApply(
@@ -349,9 +438,14 @@ async function runRefresh(
   }
 
   const currentActive = activeConversations.get(conversationId)
-  if (!currentActive || currentActive.epoch !== activationEpoch) return
+  if (
+    !currentActive ||
+    !hasExpandedInterestEpoch(conversationId, activationEpoch)
+  ) {
+    return
+  }
   currentActive.fallbackTimer = setTimeout(() => {
-    if (!isActiveEpoch(conversationId, activationEpoch)) return
+    if (!hasExpandedInterestEpoch(conversationId, activationEpoch)) return
     void get().refresh(conversationId)
   }, FALLBACK_REFRESH_MS)
 }
@@ -453,59 +547,15 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
     void get().refresh(conversationId)
   },
 
-  activateConversation: (conversationId) => {
-    if (!Number.isSafeInteger(conversationId) || conversationId <= 0) {
-      return () => {}
-    }
+  activateOverlayInterest: (conversationId) =>
+    activateInterest(get, conversationId, "overlay"),
 
-    const existing = activeConversations.get(conversationId)
-    if (existing) {
-      existing.count += 1
-      const epoch = existing.epoch
-      let released = false
-      return () => {
-        if (released) return
-        released = true
-        releaseConversation(conversationId, epoch)
-      }
-    }
-
-    const epoch = ++activationEpochCounter
-    const active: ActiveConversationRecord = {
-      count: 1,
-      epoch,
-      fallbackTimer: null,
-    }
-    activeConversations.set(conversationId, active)
-
-    const current = get().getEntry(conversationId)
-    if (!current) {
-      set((state) => ({
-        byConversationId: mapSetEntry(
-          state.byConversationId,
-          conversationId,
-          emptyEntry()
-        ),
-      }))
-    }
-
-    const readiness = installEventListeners(get)
-    void readiness.then(() => {
-      if (!isActiveEpoch(conversationId, epoch)) return
-      void get().refresh(conversationId)
-    })
-
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      releaseConversation(conversationId, epoch)
-    }
-  },
+  activateConversation: (conversationId) =>
+    activateInterest(get, conversationId, "expanded"),
 
   refresh: async (conversationId) => {
     const active = activeConversations.get(conversationId)
-    if (!active || active.count <= 0) return
+    if (!active || totalInterest(active) <= 0) return
     await runRefresh(get, conversationId, active.epoch)
   },
 
