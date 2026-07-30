@@ -1737,20 +1737,90 @@ fn parent_end_setup_report(
     }
 }
 
-fn terminal_audit_for_code(
-    code: &str,
+fn termination_audit(
+    source: AcpTerminationSource,
+    reason: AcpTerminationReason,
+    classification: AcpTerminationClassification,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    requested_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+) -> DelegationTerminationAuditV1 {
+    let mut termination = AcpTerminationSummaryV1::new(
+        source,
+        reason,
+        classification,
+        prompt_may_have_executed,
+        observed_at,
+    );
+    termination.requested_at = requested_at;
+    if source == AcpTerminationSource::Frontend {
+        termination.frontend_origin =
+            Some(crate::acp::termination::AcpDisconnectOrigin::LegacyUnspecified);
+    }
+    DelegationTerminationAuditV1::new(
+        termination,
+        prior_status,
+        AdmissionClass::NormalRevision,
+        None,
+        None,
+    )
+}
+
+fn failed_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    source: AcpTerminationSource,
+    reason: AcpTerminationReason,
+    classification: AcpTerminationClassification,
+) -> TerminalTaskWrite {
+    let observed_at = Utc::now();
+    TerminalTaskWrite::failed_with_evidence(
+        code,
+        observed_at,
+        termination_audit(
+            source,
+            reason,
+            classification,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+    )
+}
+
+fn explicit_cancellation_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+) -> TerminalTaskWrite {
+    let observed_at = Utc::now();
+    TerminalTaskWrite::canceled(
+        code,
+        observed_at,
+        explicit_cancellation_audit(prior_status, prompt_may_have_executed, observed_at),
+    )
+}
+
+fn explicit_cancellation_audit(
     prior_status: DelegationRunStatus,
     prompt_may_have_executed: bool,
     observed_at: DateTime<Utc>,
 ) -> DelegationTerminationAuditV1 {
-    DelegationTerminationAuditV1::for_terminal_code(
-        code,
+    termination_audit(
+        AcpTerminationSource::Frontend,
+        AcpTerminationReason::UserCancelled,
+        AcpTerminationClassification::Explicit,
         prior_status,
         prompt_may_have_executed,
+        Some(observed_at),
         observed_at,
     )
 }
 
+#[cfg(test)]
 fn canceled_terminal(
     code: impl Into<String>,
     prior_status: DelegationRunStatus,
@@ -1761,34 +1831,131 @@ fn canceled_terminal(
     TerminalTaskWrite::canceled(
         code.clone(),
         observed_at,
-        terminal_audit_for_code(&code, prior_status, prompt_may_have_executed, observed_at),
+        DelegationTerminationAuditV1::for_terminal_code(
+            &code,
+            prior_status,
+            prompt_may_have_executed,
+            observed_at,
+        ),
     )
 }
 
 /// Map a resolved outcome onto a durable terminal write + optional result text.
-fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Option<String>) {
+fn terminal_from_outcome(
+    outcome: &DelegationOutcome,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+) -> (TerminalTaskWrite, Option<String>) {
     let now = Utc::now();
     match outcome {
         DelegationOutcome::Ok(ok) => (
             TerminalTaskWrite::completed(now, ConversationStatus::PendingReview),
             Some(ok.text.clone()),
         ),
-        DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => (
-            TerminalTaskWrite::canceled(
-                code.clone(),
+        DelegationOutcome::Err { code, .. } => {
+            let (source, reason, classification, requested) = match code.as_str() {
+                "parent_canceled" => (
+                    AcpTerminationSource::ParentTurn,
+                    AcpTerminationReason::ParentCanceled,
+                    AcpTerminationClassification::Explicit,
+                    true,
+                ),
+                "parent_turn_failed" => (
+                    AcpTerminationSource::ParentTurn,
+                    AcpTerminationReason::ParentTurnFailed,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+                "join_abandoned" => (
+                    AcpTerminationSource::ParentTurn,
+                    AcpTerminationReason::JoinAbandoned,
+                    AcpTerminationClassification::Intentional,
+                    true,
+                ),
+                "user_cancelled" | "canceled" => (
+                    AcpTerminationSource::Frontend,
+                    AcpTerminationReason::UserCancelled,
+                    AcpTerminationClassification::Explicit,
+                    true,
+                ),
+                "tool_stalled_timeout" => (
+                    AcpTerminationSource::Watchdog,
+                    AcpTerminationReason::ToolStalledTimeout,
+                    AcpTerminationClassification::AutomatedAmbiguous,
+                    true,
+                ),
+                "host_restarted" => (
+                    AcpTerminationSource::HostRestart,
+                    AcpTerminationReason::HostRestarted,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+                "process_exited" => (
+                    AcpTerminationSource::Process,
+                    AcpTerminationReason::ProcessExited,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+                "send_failed" | "transport_disconnected" => (
+                    AcpTerminationSource::Transport,
+                    AcpTerminationReason::TransportDisconnected,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+                "session_lost" | "unresumable" => (
+                    AcpTerminationSource::Session,
+                    AcpTerminationReason::SessionLost,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+                "admission_failed"
+                | "admission_unknown"
+                | "spawn_failed"
+                | "route_policy_rejected"
+                | "budget_exhausted"
+                | "not_supported" => (
+                    AcpTerminationSource::Admission,
+                    if code == "admission_unknown" {
+                        AcpTerminationReason::AdmissionUnknown
+                    } else {
+                        AcpTerminationReason::AdmissionFailed
+                    },
+                    if code == "admission_unknown" {
+                        AcpTerminationClassification::AutomatedAmbiguous
+                    } else {
+                        AcpTerminationClassification::Unexpected
+                    },
+                    false,
+                ),
+                "parent_disconnected" => (
+                    AcpTerminationSource::Legacy,
+                    AcpTerminationReason::LegacyUnspecified,
+                    AcpTerminationClassification::LegacyUnknown,
+                    false,
+                ),
+                _ => (
+                    AcpTerminationSource::ChildConnection,
+                    AcpTerminationReason::ChildTerminal,
+                    AcpTerminationClassification::Unexpected,
+                    false,
+                ),
+            };
+            let audit = termination_audit(
+                source,
+                reason,
+                classification,
+                prior_status,
+                prompt_may_have_executed,
+                requested.then_some(now),
                 now,
-                terminal_audit_for_code(code, DelegationRunStatus::Running, true, now),
-            ),
-            None,
-        ),
-        DelegationOutcome::Err { code, .. } => (
-            TerminalTaskWrite::failed_with_evidence(
-                code.clone(),
-                now,
-                terminal_audit_for_code(code, DelegationRunStatus::Running, true, now),
-            ),
-            None,
-        ),
+            );
+            let terminal = if is_canceled_error_code(code) {
+                TerminalTaskWrite::canceled(code.clone(), now, audit)
+            } else {
+                TerminalTaskWrite::failed_with_evidence(code.clone(), now, audit)
+            };
+            (terminal, None)
+        }
     }
 }
 
@@ -1883,17 +2050,9 @@ fn terminal_from_handoff_disposition(
                 ),
             )
         }
-        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
-            DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
-                let now = Utc::now();
-                TerminalTaskWrite::canceled(
-                    code.clone(),
-                    now,
-                    terminal_audit_for_code(code, DelegationRunStatus::Reserving, true, now),
-                )
-            }
-            other => terminal_from_outcome(other).0,
-        },
+        ReservingHandoffDisposition::ChildTerminal(outcome) => {
+            terminal_from_outcome(outcome, DelegationRunStatus::Reserving, true).0
+        }
     }
 }
 
@@ -3950,6 +4109,7 @@ impl DelegationBroker {
         inflight_id: u64,
         abandon_context: &'static str,
     ) -> DelegationTaskReport {
+        let observed_at = Utc::now();
         self.cancel_admitted_gen1_pre_spawn_with(
             runs,
             task_id,
@@ -3958,12 +4118,7 @@ impl DelegationBroker {
             inflight_id,
             abandon_context,
             "canceled",
-            terminal_audit_for_code(
-                "canceled",
-                DelegationRunStatus::Reserving,
-                false,
-                Utc::now(),
-            ),
+            explicit_cancellation_audit(DelegationRunStatus::Reserving, false, observed_at),
             |agent, child| {
                 report_err(
                     agent,
@@ -6082,10 +6237,13 @@ impl DelegationBroker {
                     let _ = runs
                         .settle_terminal(
                             &call_id,
-                            TerminalTaskWrite::failed(
+                            failed_terminal(
                                 "spawn_failed",
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
+                                DelegationRunStatus::Reserving,
+                                false,
+                                AcpTerminationSource::Admission,
+                                AcpTerminationReason::AdmissionFailed,
+                                AcpTerminationClassification::Unexpected,
                             ),
                         )
                         .await;
@@ -6155,7 +6313,11 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &call_id,
-                        canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
+                        explicit_cancellation_terminal(
+                            "canceled",
+                            DelegationRunStatus::Reserving,
+                            false,
+                        ),
                     )
                     .await;
             }
@@ -6283,10 +6445,13 @@ impl DelegationBroker {
                     .settle_pre_admission_failure_if_owned(
                         &call_id,
                         &child_connection_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await
@@ -6420,7 +6585,7 @@ impl DelegationBroker {
                         let _ = runs
                             .settle_terminal(
                                 &call_id,
-                                canceled_terminal(
+                                explicit_cancellation_terminal(
                                     "canceled",
                                     DelegationRunStatus::Reserving,
                                     false,
@@ -6487,10 +6652,13 @@ impl DelegationBroker {
                         inner.unreserve(&call_id, &child_connection_id);
                         inner.deregister_inflight(inflight_id);
                     }
-                    let terminal = TerminalTaskWrite::failed(
+                    let terminal = failed_terminal(
                         "spawn_failed",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        true,
+                        AcpTerminationSource::Transport,
+                        AcpTerminationReason::TransportDisconnected,
+                        AcpTerminationClassification::Unexpected,
                     );
                     let ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
@@ -6818,7 +6986,8 @@ impl DelegationBroker {
         match disposition {
             // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let (terminal, result_text) =
+                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
                 let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
                 let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                     terminal,
@@ -6881,7 +7050,8 @@ impl DelegationBroker {
             // and never return a running acknowledgement.
             Disposition::ExternalCanceled => {
                 let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let (terminal, result_text) =
+                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -6976,7 +7146,8 @@ impl DelegationBroker {
                 if removed {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let (terminal, result_text) =
+                        terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -7269,10 +7440,13 @@ impl DelegationBroker {
                 self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 // Preserve captured final stats for the eventual successful settle.
-                let mut retry_terminal = TerminalTaskWrite::failed(
+                let mut retry_terminal = failed_terminal(
                     "persistence_error",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
+                    DelegationRunStatus::Running,
+                    true,
+                    AcpTerminationSource::Legacy,
+                    AcpTerminationReason::LegacyUnspecified,
+                    AcpTerminationClassification::LegacyUnknown,
                 );
                 if let Some(stats) = final_runtime_stats {
                     retry_terminal = retry_terminal.with_runtime_stats(stats);
@@ -8436,7 +8610,11 @@ impl DelegationBroker {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
+                        explicit_cancellation_terminal(
+                            "canceled",
+                            DelegationRunStatus::Reserving,
+                            false,
+                        ),
                     )
                     .await
                 {
@@ -8496,10 +8674,13 @@ impl DelegationBroker {
                     .settle_pre_admission_failure_if_owned(
                         &reserved.task_id,
                         &challenger_connection_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await
@@ -8572,10 +8753,13 @@ impl DelegationBroker {
                     let _ = runs
                         .settle_terminal(
                             &reserved.task_id,
-                            TerminalTaskWrite::failed(
+                            failed_terminal(
                                 "unresumable",
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
+                                DelegationRunStatus::Reserving,
+                                false,
+                                AcpTerminationSource::Session,
+                                AcpTerminationReason::SessionLost,
+                                AcpTerminationClassification::Unexpected,
                             ),
                         )
                         .await;
@@ -8678,7 +8862,11 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
+                    explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Reserving,
+                        false,
+                    ),
                 )
                 .await;
             {
@@ -8789,7 +8977,11 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
+                    explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Reserving,
+                        false,
+                    ),
                 )
                 .await;
             {
@@ -8818,10 +9010,13 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::failed(
+                    failed_terminal(
                         "unresumable",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        false,
+                        AcpTerminationSource::Session,
+                        AcpTerminationReason::SessionLost,
+                        AcpTerminationClassification::Unexpected,
                     ),
                 )
                 .await;
@@ -8850,10 +9045,13 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await;
@@ -8895,7 +9093,11 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    canceled_terminal("canceled", DelegationRunStatus::Reserving, false),
+                    explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Reserving,
+                        false,
+                    ),
                 )
                 .await;
             {
@@ -8972,10 +9174,13 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            true,
+                            AcpTerminationSource::Transport,
+                            AcpTerminationReason::TransportDisconnected,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await;
@@ -9256,7 +9461,8 @@ impl DelegationBroker {
                     return continue_idempotent_ack(&existing, req.target_task_id);
                 }
             }
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let (terminal, result_text) =
+                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
@@ -9358,7 +9564,8 @@ impl DelegationBroker {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome =
                         canceled_outcome(reserved.child_conversation_id, "canceled before await");
-                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let (terminal, result_text) =
+                        terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -9941,7 +10148,7 @@ impl DelegationBroker {
             message: wire_message.clone(),
             child_conversation_id: Some(child_conversation_id),
         };
-        let (terminal, _) = terminal_from_outcome(&outcome);
+        let (terminal, _) = terminal_from_outcome(&outcome, DelegationRunStatus::Reserving, true);
 
         // 1) Claim local first-terminal disposition (insert-if-absent).
         // On Occupied: report from existing TerminalIntent / durable truth —
@@ -10708,7 +10915,7 @@ impl DelegationBroker {
         let stable_message = sanitize_bootstrap_unresumable_message(&raw_message);
         let outcome =
             DelegationOutcome::from_err(DelegationError::Unresumable(stable_message), None);
-        let (terminal, _) = terminal_from_outcome(&outcome);
+        let (terminal, _) = terminal_from_outcome(&outcome, DelegationRunStatus::Reserving, false);
 
         // Test-only / no durable store: buffer admission-window outcome.
         if self.run_store.is_none() {
@@ -11775,7 +11982,8 @@ impl DelegationBroker {
             }
         };
         if let Some((task, duration_ms)) = task {
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let (terminal, result_text) =
+                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
@@ -12619,7 +12827,7 @@ impl DelegationBroker {
                     None,
                 )
             } else {
-                terminal_from_outcome(&outcome)
+                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true)
             };
             let mut ctx = SettleContext::from_running(&task, duration_ms, cancel_turn);
             let (_, _, _, message) = terminal_fields(&outcome);
@@ -13527,7 +13735,8 @@ impl DelegationBroker {
         match drained {
             Some((_id, task, duration_ms)) => {
                 let outcome = canceled_outcome(task.child_conversation_id, reason);
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let (terminal, result_text) =
+                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
                 let mut ctx = SettleContext::from_running(&task, duration_ms, true);
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -22984,9 +23193,18 @@ mod tests {
         let mut root_run = root_run.into_active_model();
         root_run.status = Set(DelegationRunStatus::Canceled);
         root_run.error_code = Set(Some("host_restarted".into()));
+        let observed_at = Utc::now();
         root_run.termination_audit_json = Set(Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
+            serde_json::to_string(&termination_audit(
+                AcpTerminationSource::HostRestart,
+                AcpTerminationReason::HostRestarted,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Running,
+                true,
+                None,
+                observed_at,
+            ))
+            .expect("typed host-restart audit"),
         ));
         root_run.update(&db.conn).await.unwrap();
 
@@ -34455,9 +34673,18 @@ mod tests {
         let mut root_run = root_run.into_active_model();
         root_run.status = Set(DelegationRunStatus::Canceled);
         root_run.error_code = Set(Some("host_restarted".into()));
+        let observed_at = Utc::now();
         root_run.termination_audit_json = Set(Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
+            serde_json::to_string(&termination_audit(
+                AcpTerminationSource::HostRestart,
+                AcpTerminationReason::HostRestarted,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Running,
+                true,
+                None,
+                observed_at,
+            ))
+            .expect("typed host-restart audit"),
         ));
         root_run
             .update(&db.conn)

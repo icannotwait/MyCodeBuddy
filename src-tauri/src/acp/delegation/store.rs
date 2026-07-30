@@ -22,7 +22,10 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::types::{cold_task_report_message, DelegationTaskReport, TaskStatus};
-use crate::acp::termination::DelegationTerminationAuditV1;
+use crate::acp::termination::{
+    AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
+    AcpTerminationSummaryV1, DelegationTerminationAuditV1,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::entities::delegation_task_run::DelegationRunStatus;
 use crate::db::AppDatabase;
@@ -131,6 +134,7 @@ impl TerminalTaskWrite {
         }
     }
 
+    #[cfg(test)]
     pub fn failed(
         error_code: impl Into<String>,
         finished_at: DateTime<Utc>,
@@ -178,7 +182,7 @@ impl TerminalTaskWrite {
         }
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(test)]
     pub fn legacy_without_audit(status: TaskStatus, error_code: Option<String>) -> Self {
         Self {
             status,
@@ -996,11 +1000,18 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             let Some(task_id) = row.delegation_call_id.as_deref() else {
                 continue;
             };
-            let audit = DelegationTerminationAuditV1::for_terminal_code(
-                "host_restarted",
+            let audit = DelegationTerminationAuditV1::new(
+                AcpTerminationSummaryV1::new(
+                    AcpTerminationSource::HostRestart,
+                    AcpTerminationReason::HostRestarted,
+                    AcpTerminationClassification::Unexpected,
+                    true,
+                    at,
+                ),
                 DelegationRunStatus::Running,
-                row.external_id.is_some(),
-                at,
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+                row.parent_tool_use_id.clone(),
+                None,
             );
             let terminal = TerminalTaskWrite::failed_with_evidence("host_restarted", at, audit);
             if self

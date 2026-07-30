@@ -137,6 +137,7 @@ impl DelegationTerminationAuditV1 {
         }
     }
 
+    #[cfg(test)]
     pub fn for_terminal_code(
         error_code: &str,
         prior_status: DelegationRunStatus,
@@ -260,18 +261,39 @@ pub enum ParsedDelegationTermination {
 
 impl ParsedDelegationTermination {
     pub fn is_automatic_unexpected_termination(&self) -> bool {
-        matches!(
-            self,
-            Self::Typed(DelegationTerminationAuditV1 {
-                termination: AcpTerminationSummaryV1 {
-                    classification: AcpTerminationClassification::Unexpected,
-                    prompt_may_have_executed: true,
-                    ..
-                },
-                prior_status: DelegationRunStatus::Running,
-                ..
-            })
-        )
+        let Self::Typed(audit) = self else {
+            return false;
+        };
+        audit.prior_status == DelegationRunStatus::Running
+            && audit.termination.prompt_may_have_executed
+            && matches!(
+                (
+                    audit.termination.source,
+                    audit.termination.reason,
+                    audit.termination.classification,
+                ),
+                (
+                    AcpTerminationSource::Transport,
+                    AcpTerminationReason::TransportDisconnected,
+                    AcpTerminationClassification::Unexpected,
+                ) | (
+                    AcpTerminationSource::Process,
+                    AcpTerminationReason::ProcessExited,
+                    AcpTerminationClassification::Unexpected,
+                ) | (
+                    AcpTerminationSource::Session,
+                    AcpTerminationReason::SessionLost,
+                    AcpTerminationClassification::Unexpected,
+                ) | (
+                    AcpTerminationSource::HostRestart,
+                    AcpTerminationReason::HostRestarted,
+                    AcpTerminationClassification::Unexpected,
+                ) | (
+                    AcpTerminationSource::ChildConnection,
+                    AcpTerminationReason::ChildTerminal,
+                    AcpTerminationClassification::Unexpected,
+                )
+            )
     }
 }
 

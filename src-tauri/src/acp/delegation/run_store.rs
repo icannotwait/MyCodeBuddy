@@ -596,13 +596,6 @@ pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision 
                 }
                 return ContinueDecision::Admit(e.admission_class.clone());
             }
-            // Defensive: parent_disconnected is normally settled as Canceled.
-            // If a legacy/failed projection still carries the code after a
-            // prompt was admitted, treat it like unexpected interruption so
-            // the work unit is not permanently fenced.
-            if e.reached_running && is_recoverable_parent_disconnect(e.error_code.as_deref()) {
-                return ContinueDecision::Admit(AdmissionClass::UnexpectedContinue);
-            }
             if e.reached_running && is_revision_eligible_failure(e.error_code.as_deref()) {
                 ContinueDecision::Admit(AdmissionClass::NormalRevision)
             } else {
@@ -638,15 +631,6 @@ fn is_revision_eligible_failure(code: Option<&str>) -> bool {
         Some("admission_failed") | Some("admission_unknown") => false,
         Some(_) => true,
     }
-}
-
-/// Parent connection teardown (`parent_disconnected`) is not an explicit
-/// cancel of the delegated work. When the child had already reached running,
-/// the parent may recover via `continue_delegation` (`unexpected_continue`)
-/// even if structured termination audit is missing — parent-end cascade
-/// historically settles with `termination_audit_json = NULL`.
-fn is_recoverable_parent_disconnect(code: Option<&str>) -> bool {
-    code == Some("parent_disconnected")
 }
 
 /// Terminal codes that leave an established work-unit lineage non-continuable
@@ -697,8 +681,7 @@ fn is_unexpected_cancellation(e: &ContinueEligibility) -> bool {
         e.reached_running,
         e.termination_audit_json.as_deref(),
     );
-    matches!(parsed, ParsedDelegationTermination::LegacyParentDisconnect)
-        || parsed.is_automatic_unexpected_termination()
+    parsed.is_automatic_unexpected_termination()
 }
 
 /// Allowed `replacement_reason` values for `delegate_to_agent` recovery.
@@ -7173,9 +7156,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let audit = resv_row.termination_audit_json.expect("audit");
-        assert!(audit.contains("reserving"));
-        assert!(audit.contains("host_restart"));
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(resv_row.termination_audit_json.as_deref().expect("audit"))
+                .expect("typed audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert_eq!(audit.termination.source, AcpTerminationSource::HostRestart);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::HostRestarted
+        );
+        assert!(audit.child_connection_id.is_none());
         // reserving inherits admission_class eligibility (normal_revision here)
         assert_eq!(resv.admission_class, AdmissionClass::NormalRevision);
 
@@ -7187,8 +7177,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let audit2 = run_row.termination_audit_json.expect("audit");
-        assert!(audit2.contains("running"));
+        let audit2: DelegationTerminationAuditV1 =
+            serde_json::from_str(run_row.termination_audit_json.as_deref().expect("audit"))
+                .expect("typed audit");
+        assert_eq!(audit2.prior_status, DelegationRunStatus::Running);
+        assert_eq!(audit2.termination.source, AcpTerminationSource::HostRestart);
+        assert_eq!(
+            audit2.termination.reason,
+            AcpTerminationReason::HostRestarted
+        );
+        assert_eq!(audit2.child_connection_id.as_deref(), Some("conn-run"));
         // running was promoted → eligible for unexpected_continue recovery path
         assert!(run.reached_running_at.is_some());
 
@@ -7253,14 +7251,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let audit_raw = row.termination_audit_json.expect("audit");
-        let audit: serde_json::Value = serde_json::from_str(&audit_raw).expect("audit json");
-        assert_eq!(audit["source"], "host_restart");
-        assert_eq!(audit["reason"], "host_restarted");
-        assert_eq!(audit["prior_status"], "reserving");
-        assert!(
-            audit.get("restart_provenance").is_none(),
-            "unbound path must not carry bound restart_provenance"
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(&audit_raw).expect("typed audit");
+        assert_eq!(audit.termination.source, AcpTerminationSource::HostRestart);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::HostRestarted
         );
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(audit.child_connection_id.is_none());
 
         // Safe pre-admission host_restarted remains continuable (inherits class).
         let mut eligibility = eligible_continue();
@@ -7325,11 +7324,18 @@ mod tests {
             .unwrap()
             .unwrap();
         let audit_raw = row.termination_audit_json.expect("audit");
-        let audit: serde_json::Value = serde_json::from_str(&audit_raw).expect("audit json");
-        assert_eq!(audit["source"], "host_restart");
-        assert_eq!(audit["reason"], "admission_unknown");
-        assert_eq!(audit["prior_status"], "reserving");
-        assert_eq!(audit["restart_provenance"], "bound_reserving");
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(&audit_raw).expect("typed audit");
+        assert_eq!(audit.termination.source, AcpTerminationSource::HostRestart);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::AdmissionUnknown
+        );
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            audit.child_connection_id.as_deref(),
+            Some("conn-recon-bound")
+        );
 
         // Not continuable; not auto-replay (continue path deny-listed).
         let mut eligibility = eligible_continue();
@@ -7399,12 +7405,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let audit: serde_json::Value =
+        let audit: DelegationTerminationAuditV1 =
             serde_json::from_str(row.termination_audit_json.as_deref().expect("audit"))
-                .expect("audit json");
-        assert_eq!(audit["prior_status"], "reserving");
-        assert_eq!(audit["restart_provenance"], "bound_reserving");
-        assert_eq!(audit["reason"], "admission_unknown");
+                .expect("typed audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            audit.child_connection_id.as_deref(),
+            Some("conn-gen1-crash")
+        );
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::AdmissionUnknown
+        );
 
         let mut eligibility = eligible_continue();
         eligibility.run_status = run.run_status;
@@ -8041,6 +8053,32 @@ mod tests {
         }
     }
 
+    fn typed_termination_json(
+        source: AcpTerminationSource,
+        reason: AcpTerminationReason,
+        classification: AcpTerminationClassification,
+        prior_status: DelegationRunStatus,
+        prompt_may_have_executed: bool,
+    ) -> String {
+        serde_json::to_string(&DelegationTerminationAuditV1 {
+            termination: AcpTerminationSummaryV1 {
+                version: TERMINATION_AUDIT_VERSION,
+                source,
+                reason,
+                classification,
+                frontend_origin: None,
+                prompt_may_have_executed,
+                requested_at: None,
+                observed_at: Utc::now(),
+            },
+            prior_status,
+            admission_class: AdmissionClass::NormalRevision,
+            parent_tool_use_id: None,
+            child_connection_id: None,
+        })
+        .expect("typed termination audit json")
+    }
+
     #[test]
     fn continue_eligibility_decision_table_obeys_precedence_and_recovery_rules() {
         let normal = eligible_continue();
@@ -8061,10 +8099,13 @@ mod tests {
         restarted_reserving.error_code = Some("host_restarted".into());
         restarted_reserving.reached_running = false;
         restarted_reserving.admission_class = AdmissionClass::UnexpectedContinue;
-        restarted_reserving.termination_audit_json = Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"reserving"}"#
-                .into(),
-        );
+        restarted_reserving.termination_audit_json = Some(typed_termination_json(
+            AcpTerminationSource::HostRestart,
+            AcpTerminationReason::HostRestarted,
+            AcpTerminationClassification::Unexpected,
+            DelegationRunStatus::Reserving,
+            false,
+        ));
         assert_eq!(
             decide_continue_eligibility(&restarted_reserving),
             ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
@@ -8073,10 +8114,13 @@ mod tests {
         let mut unexpected_cancel = eligible_continue();
         unexpected_cancel.run_status = DelegationRunStatus::Canceled;
         unexpected_cancel.error_code = Some("host_restarted".into());
-        unexpected_cancel.termination_audit_json = Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
-        );
+        unexpected_cancel.termination_audit_json = Some(typed_termination_json(
+            AcpTerminationSource::HostRestart,
+            AcpTerminationReason::HostRestarted,
+            AcpTerminationClassification::Unexpected,
+            DelegationRunStatus::Running,
+            true,
+        ));
         assert_eq!(
             decide_continue_eligibility(&unexpected_cancel),
             ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
@@ -8089,8 +8133,8 @@ mod tests {
             ContinueDecision::NotContinuable
         );
 
-        // parent_disconnected with null audit must still be continuable after
-        // a prompt was admitted (parent reconnect recovery).
+        // Legacy NULL parent disconnect is confirmation-only. Task 2 must not
+        // infer an automatic retry from an ambiguous parent-end cause.
         let mut parent_disconnected = eligible_continue();
         parent_disconnected.run_status = DelegationRunStatus::Canceled;
         parent_disconnected.error_code = Some("parent_disconnected".into());
@@ -8098,8 +8142,8 @@ mod tests {
         parent_disconnected.reached_running = true;
         assert_eq!(
             decide_continue_eligibility(&parent_disconnected),
-            ContinueDecision::Admit(AdmissionClass::UnexpectedContinue),
-            "parent_disconnected after running is unexpected-continue eligible"
+            ContinueDecision::NotContinuable,
+            "legacy NULL parent_disconnected must require confirmation"
         );
         parent_disconnected.reached_running = false;
         assert_eq!(
@@ -8107,12 +8151,28 @@ mod tests {
             ContinueDecision::NotContinuable,
             "pre-running parent_disconnected remains non-continuable (cold re-dispatch)"
         );
-        // Failed projection of the same code (defensive).
+        // A legacy failed projection remains confirmation-only too.
         parent_disconnected.run_status = DelegationRunStatus::Failed;
         parent_disconnected.reached_running = true;
         assert_eq!(
             decide_continue_eligibility(&parent_disconnected),
-            ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
+            ContinueDecision::NotContinuable
+        );
+
+        let mut parent_turn_failed = eligible_continue();
+        parent_turn_failed.run_status = DelegationRunStatus::Canceled;
+        parent_turn_failed.error_code = Some("parent_turn_failed".into());
+        parent_turn_failed.termination_audit_json = Some(typed_termination_json(
+            AcpTerminationSource::ParentTurn,
+            AcpTerminationReason::ParentTurnFailed,
+            AcpTerminationClassification::Unexpected,
+            DelegationRunStatus::Running,
+            true,
+        ));
+        assert_eq!(
+            decide_continue_eligibility(&parent_turn_failed),
+            ContinueDecision::NotContinuable,
+            "typed parent_turn_failed must require confirmation"
         );
 
         // Explicit parent/user cancel still blocks continue (replace path only).
@@ -8136,8 +8196,9 @@ mod tests {
         }
 
         let mut unknown_origin_cancel = unexpected_cancel.clone();
-        unknown_origin_cancel.termination_audit_json =
-            Some(r#"{"reason":"host_restarted","prior_status":"running"}"#.into());
+        unknown_origin_cancel.termination_audit_json = Some(
+            r#"{"termination":{"version":1,"reason":"host_restarted","classification":"unexpected","frontend_origin":null,"prompt_may_have_executed":true,"requested_at":null,"observed_at":"2026-07-30T00:00:00Z"},"prior_status":"running","admission_class":"normal_revision","parent_tool_use_id":null,"child_connection_id":null}"#.into(),
+        );
         assert_eq!(
             decide_continue_eligibility(&unknown_origin_cancel),
             ContinueDecision::NotContinuable,
@@ -12475,6 +12536,103 @@ mod termination_audit {
             decide_continue_eligibility(&eligibility),
             ContinueDecision::NotContinuable
         );
+    }
+
+    #[test]
+    fn automatic_unexpected_termination_requires_allowlisted_typed_cause() {
+        let typed = |source, reason, classification| {
+            ParsedDelegationTermination::Typed(DelegationTerminationAuditV1 {
+                termination: AcpTerminationSummaryV1 {
+                    version: TERMINATION_AUDIT_VERSION,
+                    source,
+                    reason,
+                    classification,
+                    frontend_origin: None,
+                    prompt_may_have_executed: true,
+                    requested_at: None,
+                    observed_at: Utc::now(),
+                },
+                prior_status: DelegationRunStatus::Running,
+                admission_class: AdmissionClass::NormalRevision,
+                parent_tool_use_id: None,
+                child_connection_id: None,
+            })
+        };
+
+        for allowed in [
+            typed(
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+            ),
+            typed(
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+            ),
+            typed(
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+            ),
+            typed(
+                AcpTerminationSource::HostRestart,
+                AcpTerminationReason::HostRestarted,
+                AcpTerminationClassification::Unexpected,
+            ),
+            typed(
+                AcpTerminationSource::ChildConnection,
+                AcpTerminationReason::ChildTerminal,
+                AcpTerminationClassification::Unexpected,
+            ),
+        ] {
+            assert!(allowed.is_automatic_unexpected_termination());
+        }
+
+        for confirmation_only in [
+            typed(
+                AcpTerminationSource::ParentTurn,
+                AcpTerminationReason::ParentTurnFailed,
+                AcpTerminationClassification::Unexpected,
+            ),
+            typed(
+                AcpTerminationSource::Watchdog,
+                AcpTerminationReason::ToolStalledTimeout,
+                AcpTerminationClassification::AutomatedAmbiguous,
+            ),
+            typed(
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::UserCancelled,
+                AcpTerminationClassification::Explicit,
+            ),
+            typed(
+                AcpTerminationSource::Legacy,
+                AcpTerminationReason::LegacyUnspecified,
+                AcpTerminationClassification::LegacyUnknown,
+            ),
+            typed(
+                AcpTerminationSource::Admission,
+                AcpTerminationReason::AdmissionUnknown,
+                AcpTerminationClassification::AutomatedAmbiguous,
+            ),
+            typed(
+                AcpTerminationSource::ParentTurn,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+            ),
+        ] {
+            assert!(!confirmation_only.is_automatic_unexpected_termination());
+        }
+
+        assert!(!ParsedDelegationTermination::LegacyParentDisconnect
+            .is_automatic_unexpected_termination());
+        assert!(
+            !ParsedDelegationTermination::LegacyUnspecified.is_automatic_unexpected_termination()
+        );
+        assert!(!ParsedDelegationTermination::Malformed {
+            raw_sha256: "0".repeat(64),
+        }
+        .is_automatic_unexpected_termination());
     }
 
     struct TerminationFixture {
