@@ -584,6 +584,13 @@ pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision 
                 }
                 return ContinueDecision::Admit(e.admission_class.clone());
             }
+            // Defensive: parent_disconnected is normally settled as Canceled.
+            // If a legacy/failed projection still carries the code after a
+            // prompt was admitted, treat it like unexpected interruption so
+            // the work unit is not permanently fenced.
+            if e.reached_running && is_recoverable_parent_disconnect(e.error_code.as_deref()) {
+                return ContinueDecision::Admit(AdmissionClass::UnexpectedContinue);
+            }
             if e.reached_running && is_revision_eligible_failure(e.error_code.as_deref()) {
                 ContinueDecision::Admit(AdmissionClass::NormalRevision)
             } else {
@@ -592,7 +599,12 @@ pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision 
         }
         DelegationRunStatus::Canceled => {
             if e.reached_running
-                && is_unexpected_cancellation_audit(e.termination_audit_json.as_deref())
+                && (is_unexpected_cancellation_audit(e.termination_audit_json.as_deref())
+                    // Parent connection loss is not an explicit cancel of the
+                    // work unit. Parent-end cascade historically leaves
+                    // termination_audit_json NULL, so match the durable
+                    // error_code (see is_recoverable_parent_disconnect).
+                    || is_recoverable_parent_disconnect(e.error_code.as_deref()))
             {
                 ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
             } else {
@@ -621,6 +633,35 @@ fn is_revision_eligible_failure(code: Option<&str>) -> bool {
         Some("admission_failed") | Some("admission_unknown") => false,
         Some(_) => true,
     }
+}
+
+/// Parent connection teardown (`parent_disconnected`) is not an explicit
+/// cancel of the delegated work. When the child had already reached running,
+/// the parent may recover via `continue_delegation` (`unexpected_continue`)
+/// even if structured termination audit is missing — parent-end cascade
+/// historically settles with `termination_audit_json = NULL`.
+fn is_recoverable_parent_disconnect(code: Option<&str>) -> bool {
+    code == Some("parent_disconnected")
+}
+
+/// Terminal codes that leave an established work-unit lineage non-continuable
+/// under continue policy, but must still allow same-role replacement so the
+/// unit is not permanently fenced after parent-end / explicit cancel / stall.
+///
+/// Skill recovery uses `replacement_reason = unresumable` for these codes
+/// (existing enum surface; the durable code is not rewritten to
+/// `unresumable` on settle). Includes `parent_disconnected` as a replace
+/// escape hatch when continue is not chosen or resume later fails.
+fn is_noncontinuable_lineage_stuck_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("parent_disconnected")
+            | Some("parent_canceled")
+            | Some("parent_turn_failed")
+            | Some("join_abandoned")
+            | Some("user_cancelled")
+            | Some("tool_stalled_timeout")
+    )
 }
 
 fn is_host_restarted_reserving_audit(audit: Option<&str>) -> bool {
@@ -687,6 +728,10 @@ fn replacement_reason_matches_source(
                 return false;
             }
             source.error_code.as_deref() == Some("unresumable")
+                // Parent-end / explicit cancel / stall: continue is blocked
+                // (or optional) but lineage is established — allow same-role
+                // replace so work units are not permanently fenced.
+                || is_noncontinuable_lineage_stuck_code(source.error_code.as_deref())
                 || source
                     .workspace_path
                     .as_deref()
@@ -7866,6 +7911,52 @@ mod tests {
             ContinueDecision::NotContinuable
         );
 
+        // parent_disconnected with null audit must still be continuable after
+        // a prompt was admitted (parent reconnect recovery).
+        let mut parent_disconnected = eligible_continue();
+        parent_disconnected.run_status = DelegationRunStatus::Canceled;
+        parent_disconnected.error_code = Some("parent_disconnected".into());
+        parent_disconnected.termination_audit_json = None;
+        parent_disconnected.reached_running = true;
+        assert_eq!(
+            decide_continue_eligibility(&parent_disconnected),
+            ContinueDecision::Admit(AdmissionClass::UnexpectedContinue),
+            "parent_disconnected after running is unexpected-continue eligible"
+        );
+        parent_disconnected.reached_running = false;
+        assert_eq!(
+            decide_continue_eligibility(&parent_disconnected),
+            ContinueDecision::NotContinuable,
+            "pre-running parent_disconnected remains non-continuable (cold re-dispatch)"
+        );
+        // Failed projection of the same code (defensive).
+        parent_disconnected.run_status = DelegationRunStatus::Failed;
+        parent_disconnected.reached_running = true;
+        assert_eq!(
+            decide_continue_eligibility(&parent_disconnected),
+            ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
+        );
+
+        // Explicit parent/user cancel still blocks continue (replace path only).
+        for code in [
+            "parent_canceled",
+            "parent_turn_failed",
+            "join_abandoned",
+            "user_cancelled",
+            "tool_stalled_timeout",
+        ] {
+            let mut explicit = eligible_continue();
+            explicit.run_status = DelegationRunStatus::Canceled;
+            explicit.error_code = Some(code.into());
+            explicit.termination_audit_json = None;
+            explicit.reached_running = true;
+            assert_eq!(
+                decide_continue_eligibility(&explicit),
+                ContinueDecision::NotContinuable,
+                "{code} must remain non-continuable"
+            );
+        }
+
         let mut unknown_origin_cancel = unexpected_cancel.clone();
         unknown_origin_cancel.termination_audit_json =
             Some(r#"{"reason":"host_restarted","prior_status":"running"}"#.into());
@@ -9972,6 +10063,162 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn parent_end_and_explicit_cancel_codes_match_unresumable_replacement() {
+        // Full launch identity present — previously these were a recovery
+        // dead-end: not continuable (except parent_disconnected now) and not
+        // unresumable-replaceable, while established lineage blocked cold
+        // gen-1 re-dispatch on the same work_unit_key.
+        let mut source = PersistedRun {
+            task_id: "t".into(),
+            root_task_id: "t".into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: 1,
+            parent_tool_use_id: None,
+            child_conversation_id: 2,
+            agent_type: AgentType::Codex,
+            status: TaskStatus::Canceled,
+            run_status: DelegationRunStatus::Canceled,
+            error_code: Some("parent_disconnected".into()),
+            started_at: None,
+            finished_at: None,
+            reached_running_at: Some(Utc::now()),
+            child_connection_id: None,
+            request_fingerprint: None,
+            task_preview: None,
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: "t".into(),
+            work_unit_key: Some("plan|x|author|codex|none".into()),
+            history_only: false,
+            route_fingerprint: Some("routehex".into()),
+            workspace_path: Some(r"\\?\G:\ws".into()),
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: None,
+            config_values_json: Some("{}".into()),
+            profile_id: None,
+            runtime_stats: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+        };
+        for code in [
+            "parent_disconnected",
+            "parent_canceled",
+            "parent_turn_failed",
+            "join_abandoned",
+            "user_cancelled",
+            "tool_stalled_timeout",
+        ] {
+            source.error_code = Some(code.into());
+            assert!(
+                replacement_reason_matches_source(
+                    REPLACEMENT_REASON_UNRESUMABLE,
+                    &source,
+                    true,
+                    false,
+                    false, // external session present
+                ),
+                "{code} with intact launch identity must match unresumable replace"
+            );
+            // Dedicated reasons must not spuriously match.
+            assert!(!replacement_reason_matches_source(
+                REPLACEMENT_REASON_ADMISSION_FAILED,
+                &source,
+                true,
+                false,
+                false,
+            ));
+            assert!(!replacement_reason_matches_source(
+                REPLACEMENT_REASON_NOT_SUPPORTED,
+                &source,
+                true, // agent supports reuse
+                false,
+                false,
+            ));
+        }
+        // Ordinary canceled without a lineage-stuck code still fails closed
+        // when identity is intact (unknown-origin cancel).
+        source.error_code = Some("canceled".into());
+        assert!(!replacement_reason_matches_source(
+            REPLACEMENT_REASON_UNRESUMABLE,
+            &source,
+            true,
+            false,
+            false,
+        ));
+        // route_policy remains non-replaceable business refusal.
+        source.error_code = Some("route_policy_rejected".into());
+        source.run_status = DelegationRunStatus::Failed;
+        source.status = TaskStatus::Failed;
+        assert!(!replacement_reason_matches_source(
+            REPLACEMENT_REASON_UNRESUMABLE,
+            &source,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_disconnected_source_admits_unresumable_replacement() {
+        use crate::db::service::conversation_service;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let root = "pd-root-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        ensure_bound(&store, root, "conn-pd-root").await;
+        store
+            .promote_running(root, "conn-pd-root", Utc::now())
+            .await
+            .unwrap();
+        // Mirror production parent-end cascade: canceled + parent_disconnected,
+        // full launch identity, no termination audit.
+        store
+            .settle_terminal(
+                root,
+                TerminalTaskWrite::canceled(
+                    "parent_disconnected",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let folder = seed_folder(&db, "/tmp/codeg-pd-replacement").await;
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("pd-replacement".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-pd-replacement".into(),
+                delegation_call_id: "pd-replacement-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut replacement = sample_insert("pd-replacement-1", parent_id, child.id, 1, None);
+        replacement.lineage_root_task_id = root.into();
+        // Must match source work_unit_key (sample_insert default: unit-a).
+        replacement.work_unit_key = Some("unit-a".into());
+        replacement.admission_class = AdmissionClass::Replacement;
+        replacement.replaced_task_id = Some(root.into());
+        replacement.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
+        store
+            .admit_gen1_reserving(replacement)
+            .await
+            .expect("parent_disconnected established lineage must admit unresumable replace");
     }
 
     #[tokio::test]

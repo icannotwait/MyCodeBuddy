@@ -55,7 +55,7 @@
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "Required with replaces_task_id. admission_failed and admission_unknown: explicit replacement only (never continue)."
+          "description": "Required with replaces_task_id. admission_failed and admission_unknown: explicit replacement only (never continue). unresumable also matches parent_disconnected / parent_canceled / parent_turn_failed / join_abandoned / user_cancelled / tool_stalled_timeout so established work units are not permanently fenced. Prefer continue_delegation for parent_disconnected when the thread is still recoverable."
         }
       }
     }

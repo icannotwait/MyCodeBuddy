@@ -59,13 +59,18 @@ Keys are workspace-relative, NFC/B1-normalized, `|`-separated, ≤200 scalars:
 | Final reviewer   | `final_review\|reviewer\|{agent}\|{profile\|none}`  |
 | Final fixer      | `final_review\|fixer\|{agent}\|{profile\|none}`     |
 
-Prefer `continue_delegation` when the ledger shows a recoverable thread. Same
-key cold `delegate_to_agent` without `replaces_task_id` is invalid once lineage
-exists. Replacement only for `unresumable` | `budget_exhausted_continue` |
-`not_supported`, same key/role/profile, at most one replacement and two
-unexpected continues per work unit. Recovery is a **new turn**: re-inspect
-disk, treat prior reasoning as provisional, rebuild missing reports, re-run
-covering tests before claiming done.
+Prefer `continue_delegation` when the ledger shows a recoverable thread
+(including `canceled` + `parent_disconnected` after the child reached running).
+Same key cold `delegate_to_agent` without `replaces_task_id` is invalid once
+lineage exists. Replacement only for `unresumable` | `budget_exhausted_continue`
+| `not_supported` (and admission_* reasons), same key/role/profile, at most one
+replacement and two unexpected continues per work unit. Use
+`replacement_reason=unresumable` also for parent-end / explicit-cancel /
+stall codes that block continue (`parent_canceled`, `parent_turn_failed`,
+`join_abandoned`, `user_cancelled`, `tool_stalled_timeout`, and
+`parent_disconnected` when continue is not viable). Recovery is a **new turn**:
+re-inspect disk, treat prior reasoning as provisional, rebuild missing reports,
+re-run covering tests before claiming done.
 
 ## Workflow capability (v2 only)
 
