@@ -15,6 +15,8 @@ use crate::acp::manager::ConnectionManager;
 use crate::acp::opencode_plugins::{self, PluginCheckSummary};
 use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
     AcpAgentInfo, AgentDiagnosticsReport, AgentSkillContent, AgentSkillItem, AgentSkillLayout,
     AgentSkillLocation, AgentSkillScope, AgentSkillsListResult, CodexGranularApproval,
@@ -8488,6 +8490,7 @@ pub async fn acp_disconnect(
     expected_owner_window: Option<String>,
     expected_operation_id: Option<String>,
     expected_ownership_generation: Option<u64>,
+    origin: AcpDisconnectOrigin,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
     manager
@@ -8496,6 +8499,7 @@ pub async fn acp_disconnect(
             expected_owner_window.as_deref(),
             expected_operation_id.as_deref(),
             expected_ownership_generation,
+            origin,
         )
         .await
 }

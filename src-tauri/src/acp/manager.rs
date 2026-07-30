@@ -44,6 +44,7 @@ use crate::acp::question::{
 };
 use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
+use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
@@ -424,6 +425,13 @@ async fn wait_for_session_started(
     (outcome, start.elapsed())
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct DisconnectFinalCasHook {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Per-(agent, working_dir, session_id) async mutex. Held across the
@@ -485,6 +493,8 @@ pub struct ConnectionManager {
     /// touch the same map. At most one per connection (the agent is blocked in
     /// its `exit_plan_mode` call) — no cap, no cumulative growth.
     pending_plan_approvals: Arc<Mutex<HashMap<String, PendingPlanApprovalEntry>>>,
+    #[cfg(test)]
+    disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -548,6 +558,8 @@ impl ConnectionManager {
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -568,6 +580,8 @@ impl ConnectionManager {
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
+            #[cfg(test)]
+            disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
         }
     }
 
@@ -644,6 +658,7 @@ impl ConnectionManager {
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1286,6 +1301,8 @@ impl ConnectionManager {
             return Ok(());
         }
 
+        self.record_disconnect_intent(connection_id, AcpDisconnectOrigin::AbandonedConnect);
+
         // 1) Awaited token revoke (never try_read — must not skip under contention).
         if let Some(state) = state {
             let token = state.read().await.delegation_token.clone();
@@ -1479,6 +1496,7 @@ impl ConnectionManager {
                 {
                     continue;
                 }
+                self.record_disconnect_intent(&id, AcpDisconnectOrigin::IdleTimeout);
                 connections.remove(&id)
             };
             if let Some(conn) = removed {
@@ -3278,7 +3296,27 @@ impl ConnectionManager {
             .map_err(|e| AcpError::protocol(e.to_string()))
     }
 
+    fn record_disconnect_intent(&self, connection_id: &str, origin: AcpDisconnectOrigin) {
+        if let Some(injection) = self.delegation_snapshot() {
+            injection.parent_connection_exit_causes.record_intent(
+                connection_id,
+                origin,
+                chrono::Utc::now(),
+            );
+        }
+    }
+
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
+        self.disconnect_with_origin(conn_id, AcpDisconnectOrigin::LegacyUnspecified)
+            .await
+    }
+
+    pub async fn disconnect_with_origin(
+        &self,
+        conn_id: &str,
+        origin: AcpDisconnectOrigin,
+    ) -> Result<(), AcpError> {
+        self.record_disconnect_intent(conn_id, origin);
         // Admission fence → clear leases → map remove → Disconnect control.
         // Fencing first closes register_tool/start_turn for this incarnation so
         // a still-running connection loop cannot recreate leases in the gap
@@ -3901,7 +3939,9 @@ impl ConnectionManager {
                 return Err(());
             }
         }
-        self.disconnect(connection_id).await.map_err(|_| ())
+        self.disconnect_with_origin(connection_id, AcpDisconnectOrigin::IdleTimeout)
+            .await
+            .map_err(|_| ())
     }
 }
 
@@ -4119,6 +4159,7 @@ impl ConnectionManager {
         expected_owner_window: Option<&str>,
         expected_operation_id: Option<&str>,
         expected_generation: Option<u64>,
+        origin: AcpDisconnectOrigin,
     ) -> Result<(), AcpError> {
         let expect_window = expected_owner_window
             .map(str::trim)
@@ -4129,7 +4170,7 @@ impl ConnectionManager {
         let has_lease =
             expect_window.is_some() || expect_op.is_some() || expected_generation.is_some();
         if !has_lease {
-            return self.disconnect(conn_id).await;
+            return self.disconnect_with_origin(conn_id, origin).await;
         }
 
         // Ownership CAS under the lock, then registry-first clear, then map
@@ -4176,6 +4217,18 @@ impl ConnectionManager {
             conn.connection_incarnation.clone()
         };
         self.clear_tool_leases(conn_id, &incarnation).await;
+        #[cfg(test)]
+        {
+            let hook = self
+                .disconnect_final_cas_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook.reached.notify_one();
+                hook.resume.notified().await;
+            }
+        }
         let removed = {
             let mut connections = self.connections.lock().await;
             let Some(conn) = connections.get(conn_id) else {
@@ -4199,6 +4252,7 @@ impl ConnectionManager {
             if conn.connection_incarnation != incarnation {
                 return Ok(());
             }
+            self.record_disconnect_intent(conn_id, origin);
             connections.remove(conn_id)
         };
         if let Some(conn) = removed {
@@ -4314,7 +4368,9 @@ impl ConnectionManager {
         // Always disconnect — including on Err — so a failed probe doesn't
         // leak an agent process. Ignore disconnect errors (best-effort
         // cleanup; the agent will exit when its stdio is dropped anyway).
-        let _ = self.disconnect(&conn_id).await;
+        let _ = self
+            .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+            .await;
         snapshot
     }
 
@@ -4397,6 +4453,9 @@ impl ConnectionManager {
                 })
                 .collect()
         };
+        for id in &ids {
+            self.record_disconnect_intent(id, AcpDisconnectOrigin::ProviderUnmount);
+        }
         let removed = self.take_connections_for_disconnect(ids).await;
         let disconnected = removed.len();
         for (_id, conn) in removed {
@@ -4435,6 +4494,9 @@ impl ConnectionManager {
                 })
                 .collect()
         };
+        for id in &ids {
+            self.record_disconnect_intent(id, AcpDisconnectOrigin::ProviderUnmount);
+        }
         let removed = self.take_connections_for_disconnect(ids).await;
         let disconnected = removed.len();
         for (_id, conn) in removed {
@@ -4549,6 +4611,7 @@ impl ConnectionManager {
                 if !is_idle_for_residual(&state, now) {
                     continue;
                 }
+                self.record_disconnect_intent(&id, AcpDisconnectOrigin::IdleTimeout);
                 // Write lock still held — status cannot become Prompting here.
                 let removed = connections.remove(&id);
                 drop(state);
@@ -4835,11 +4898,14 @@ impl ConnectionManager {
         })
     }
 
-    pub async fn disconnect_all(&self) -> usize {
+    pub async fn disconnect_all(&self, origin: AcpDisconnectOrigin) -> usize {
         let ids: Vec<String> = {
             let connections = self.connections.lock().await;
             connections.keys().cloned().collect()
         };
+        for id in &ids {
+            self.record_disconnect_intent(id, origin);
+        }
         let removed = self.take_connections_for_disconnect(ids).await;
         let disconnected = removed.len();
         for (_id, conn) in removed {
@@ -5975,7 +6041,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         conn_id: &str,
     ) -> Result<(), crate::acp::delegation::spawner::SpawnerError> {
         self.manager
-            .disconnect(conn_id)
+            .disconnect_with_origin(conn_id, AcpDisconnectOrigin::InternalJobComplete)
             .await
             .map_err(|e| crate::acp::delegation::spawner::SpawnerError::Disconnect(e.to_string()))
     }
@@ -6176,6 +6242,236 @@ impl SessionPlanApprovalAccess for ConnectionManagerPlanApprovalLookup {
         self.manager
             .cancel_plan_approvals_by_parent(parent_connection_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod disconnect_origin {
+    use super::*;
+    use crate::acp::connection::{DelegationInjection, ParentConnectionExitEvidence};
+    use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
+    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+    use crate::acp::delegation::types::DelegationError;
+    use crate::acp::plan_approval::{RegisteredPlanApproval, SessionPlanApprovalAccess};
+    use crate::acp::question::{QuestionSpec, RegisteredQuestion, SessionQuestionAccess};
+    use crate::acp::termination::AcpDisconnectOrigin;
+
+    struct EmptyDepth;
+
+    #[async_trait::async_trait]
+    impl ConversationDepthLookup for EmptyDepth {
+        async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+            Ok(None)
+        }
+    }
+
+    struct NoQuestions;
+
+    #[async_trait::async_trait]
+    impl SessionQuestionAccess for NoQuestions {
+        async fn register_question(
+            &self,
+            _parent_connection_id: &str,
+            _questions: Vec<QuestionSpec>,
+        ) -> Option<RegisteredQuestion> {
+            None
+        }
+
+        async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+
+        async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+    }
+
+    struct NoPlanApprovals;
+
+    #[async_trait::async_trait]
+    impl SessionPlanApprovalAccess for NoPlanApprovals {
+        async fn register_plan_approval(
+            &self,
+            _parent_connection_id: &str,
+            _tool_call_id: String,
+            _plan_markdown: String,
+        ) -> Option<RegisteredPlanApproval> {
+            None
+        }
+
+        async fn cancel_plan_approvals_by_parent(&self, _parent_connection_id: &str) {}
+    }
+
+    fn install_exit_evidence(manager: &ConnectionManager) -> Arc<ParentConnectionExitEvidence> {
+        let evidence = Arc::new(ParentConnectionExitEvidence::default());
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        manager.install_delegation(DelegationInjection {
+            broker,
+            continuation_coordinator: std::sync::Weak::new(),
+            parent_connection_exit_causes: evidence.clone(),
+            tokens: Arc::new(crate::acp::delegation::listener::TokenRegistry::default()),
+            leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
+            socket_path: PathBuf::from("disconnect-origin.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            plan_approvals: Arc::new(NoPlanApprovals),
+        });
+        evidence
+    }
+
+    #[tokio::test]
+    async fn manager_records_origin_before_map_removal_and_disconnect_control() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("c1", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let evidence = install_exit_evidence(&manager);
+
+        let map_guard = manager.connections.lock().await;
+        let disconnect = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .disconnect_with_origin("c1", AcpDisconnectOrigin::DisconnectAll)
+                    .await
+            })
+        };
+        for _ in 0..20 {
+            if evidence.peek("c1").is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            evidence
+                .peek("c1")
+                .expect("intent must be recorded before waiting on map removal")
+                .frontend_origin,
+            Some(AcpDisconnectOrigin::DisconnectAll)
+        );
+        assert!(map_guard.contains_key("c1"));
+        assert!(!disconnect.is_finished());
+        drop(map_guard);
+
+        disconnect.await.expect("disconnect join").unwrap();
+        assert!(manager.get_state("c1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_idle_sweep_records_idle_timeout_before_teardown() {
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection("idle", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let evidence = install_exit_evidence(&manager);
+        let state = manager.get_state("idle").await.expect("idle connection");
+        state.write().await.last_activity_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+
+        assert_eq!(manager.sweep_idle(Duration::from_secs(300)).await, 1);
+        assert_eq!(
+            evidence
+                .peek("idle")
+                .expect("idle teardown must record intent")
+                .frontend_origin,
+            Some(AcpDisconnectOrigin::IdleTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_unexposed_teardown_records_abandoned_connect_before_abort() {
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection("abandoned", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let evidence = install_exit_evidence(&manager);
+        let connections = manager.connections.clone();
+        let evidence_watch = evidence.clone();
+        let cleanup = tokio::spawn(async move {
+            loop {
+                if evidence_watch.peek("abandoned").is_some() {
+                    connections.lock().await.remove("abandoned");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        manager
+            .teardown_unexposed_for_test_with_waits(
+                "abandoned",
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect("typed evidence should unblock simulated cleanup");
+        cleanup.await.expect("cleanup join");
+        assert_eq!(
+            evidence
+                .peek("abandoned")
+                .expect("abandoned teardown must record intent")
+                .frontend_origin,
+            Some(AcpDisconnectOrigin::AbandonedConnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_losing_final_owner_cas_does_not_poison_survivor_evidence() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("leased", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let evidence = install_exit_evidence(&manager);
+        {
+            let mut connections = manager.connections.lock().await;
+            let connection = connections.get_mut("leased").expect("leased connection");
+            connection.owner_window_label = "conversation-1".into();
+            connection.owner_operation_id = Some("op-a".into());
+            connection.ownership_generation = 1;
+        }
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *manager
+            .disconnect_final_cas_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(DisconnectFinalCasHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let disconnect = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .disconnect_if_owner(
+                        "leased",
+                        Some("conversation-1"),
+                        Some("op-a"),
+                        Some(1),
+                        AcpDisconnectOrigin::ProviderUnmount,
+                    )
+                    .await
+            })
+        };
+
+        reached.notified().await;
+        {
+            let mut connections = manager.connections.lock().await;
+            let connection = connections.get_mut("leased").expect("surviving connection");
+            connection.owner_operation_id = Some("op-b".into());
+            connection.ownership_generation = 2;
+        }
+        resume.notify_one();
+        disconnect.await.expect("disconnect join").unwrap();
+
+        assert!(manager.connections.lock().await.contains_key("leased"));
+        assert_eq!(
+            evidence.peek("leased"),
+            None,
+            "a stale disconnect that loses the final CAS must not classify the survivor"
+        );
     }
 }
 
@@ -8039,9 +8335,15 @@ mod tests {
         }
 
         // Matching lease disconnect removes the connection.
-        mgr.disconnect_if_owner("leased-conn", Some("conversation-1"), Some("opA"), Some(1))
-            .await
-            .expect("matching lease disconnect");
+        mgr.disconnect_if_owner(
+            "leased-conn",
+            Some("conversation-1"),
+            Some("opA"),
+            Some(1),
+            AcpDisconnectOrigin::LegacyUnspecified,
+        )
+        .await
+        .expect("matching lease disconnect");
         assert!(
             mgr.connections.lock().await.get("leased-conn").is_none(),
             "matching disconnect should remove"
@@ -8065,9 +8367,15 @@ mod tests {
         }
 
         // Stale disconnect from incarnation A must not kill owner B.
-        mgr.disconnect_if_owner("leased-conn", Some("conversation-1"), Some("opA"), Some(1))
-            .await
-            .expect("stale is success no-op");
+        mgr.disconnect_if_owner(
+            "leased-conn",
+            Some("conversation-1"),
+            Some("opA"),
+            Some(1),
+            AcpDisconnectOrigin::LegacyUnspecified,
+        )
+        .await
+        .expect("stale is success no-op");
         {
             let map = mgr.connections.lock().await;
             let conn = map.get("leased-conn").expect("still present");
@@ -8076,9 +8384,15 @@ mod tests {
         }
 
         // Bare disconnect (no lease) remains unconditional.
-        mgr.disconnect_if_owner("leased-conn", None, None, None)
-            .await
-            .expect("legacy disconnect");
+        mgr.disconnect_if_owner(
+            "leased-conn",
+            None,
+            None,
+            None,
+            AcpDisconnectOrigin::LegacyUnspecified,
+        )
+        .await
+        .expect("legacy disconnect");
         assert!(mgr.connections.lock().await.get("leased-conn").is_none());
     }
 
@@ -8819,9 +9133,15 @@ mod tests {
             conn.owner_window_label = "main".into();
             conn.owner_operation_id = None;
         }
-        mgr.disconnect_if_owner("main-reuse", Some("conversation-1"), Some("op-cold"), None)
-            .await
-            .expect("stale lease is success no-op");
+        mgr.disconnect_if_owner(
+            "main-reuse",
+            Some("conversation-1"),
+            Some("op-cold"),
+            None,
+            AcpDisconnectOrigin::LegacyUnspecified,
+        )
+        .await
+        .expect("stale lease is success no-op");
         assert!(
             mgr.connections.lock().await.get("main-reuse").is_some(),
             "main-owned connection must survive cold abort CAS"

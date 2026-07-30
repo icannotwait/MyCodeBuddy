@@ -12436,6 +12436,16 @@ impl DelegationBroker {
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
         let context =
             ParentEndContext::legacy(ParentTurnEndReason::ParentDisconnected, Utc::now(), true);
+        self.cancel_by_parent_with_context(parent_connection_id, context)
+            .await;
+    }
+
+    pub(crate) async fn cancel_by_parent_with_context(
+        &self,
+        parent_connection_id: &str,
+        context: ParentEndContext,
+    ) {
+        debug_assert_eq!(context.reason, ParentTurnEndReason::ParentDisconnected);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
             .drain_parent_tree(parent_connection_id, &context, false)
@@ -38533,6 +38543,60 @@ mod tests {
             assert_eq!(child_audit.termination.requested_at, Some(observed_at));
             assert_eq!(child_audit.termination.observed_at, observed_at);
             assert_eq!(child_audit, run_audit);
+        }
+    }
+
+    mod disconnect_origin {
+        use super::*;
+        use crate::acp::termination::{
+            AcpDisconnectOrigin, AcpTerminationClassification, AcpTerminationReason,
+            AcpTerminationSource,
+        };
+
+        #[tokio::test]
+        async fn typed_parent_connection_exit_preserves_producer_summary_and_timestamp() {
+            let spawner = Arc::new(MockSpawner::new());
+            let store = Arc::new(MockTaskStore::accept_any_running(42));
+            let broker = broker_with_store(spawner, store.clone());
+            broker
+                .seed_live_task_for_test("parent-conn", "disconnect-origin-task")
+                .await;
+
+            let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T04:05:06Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let requested_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T04:05:01Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let mut termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                true,
+                observed_at,
+            );
+            termination.frontend_origin = Some(AcpDisconnectOrigin::ProviderUnmount);
+            termination.requested_at = Some(requested_at);
+            let context = ParentEndContext {
+                reason: ParentTurnEndReason::ParentDisconnected,
+                termination: termination.clone(),
+            };
+
+            broker
+                .cancel_by_parent_with_context("parent-conn", context)
+                .await;
+
+            let calls = store.settle_calls().await;
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]
+                    .1
+                    .termination_evidence()
+                    .expect("typed termination evidence")
+                    .termination,
+                termination
+            );
+            assert_eq!(calls[0].1.finished_at, observed_at);
         }
     }
 }

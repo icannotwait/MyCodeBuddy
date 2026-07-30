@@ -49,6 +49,28 @@ beforeEach(() => {
 })
 
 describe("disposeDraftBindingForRemovedFolder", () => {
+  it("labels removed-folder draft disposal as draft retarget", async () => {
+    const acpDisconnect = vi.fn(async () => {})
+    useTabStore.getState().setSideEffects({
+      activateConversationPane: () => {},
+      acpDisconnect,
+    })
+    useAppWorkspaceStore.setState({
+      folders: [makeFolder({ id: 3 })],
+      allFolders: [makeFolder({ id: 3 }), makeFolder({ id: 12 })],
+    })
+    const draft = draftTab({ id: "draft-dispose", folderId: 12 })
+    useTabStore.setState({ rawTabs: [draft], tabs: [draft] })
+
+    useTabStore.getState().disposeDraftBindingForRemovedFolder(12)
+    await vi.waitFor(() => {
+      expect(acpDisconnect).toHaveBeenCalledWith(
+        "draft-dispose",
+        "draft_retarget"
+      )
+    })
+  })
+
   it("retargets draft and recomputes both rawTabs and tabs projections", () => {
     const keep = makeFolder({ id: 3 })
     const gone = makeFolder({ id: 12 })

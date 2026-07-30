@@ -6,6 +6,7 @@ import {
   getFolderConversation,
   listOpenedTabs,
   saveOpenedTabs,
+  type AcpDisconnectOrigin,
 } from "@/lib/api"
 import {
   hasLocalLiveConversations,
@@ -260,7 +261,10 @@ export interface TabStoreState {
   setLabels: (labels: TabLabels) => void
   setSideEffects: (deps: {
     activateConversationPane: () => void
-    acpDisconnect: (contextKey: string) => Promise<void>
+    acpDisconnect: (
+      contextKey: string,
+      origin?: AcpDisconnectOrigin
+    ) => Promise<void>
   }) => void
   setAgentAvailability: (sortedTypes: AgentType[], fresh: boolean) => void
 }
@@ -279,7 +283,10 @@ const TAB_ORIGIN = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 interface TabRuntime {
   labels: TabLabels
   activateConversationPane: () => void
-  acpDisconnect: (contextKey: string) => Promise<void>
+  acpDisconnect: (
+    contextKey: string,
+    origin?: AcpDisconnectOrigin
+  ) => Promise<void>
   sortedAvailableAgents: AgentType[]
   agentsFresh: boolean
 }
@@ -1353,9 +1360,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     if (needsDisconnect && existingDraft) {
-      void runtime.acpDisconnect(existingDraft.id).catch((err) => {
-        console.error("[TabStore] disconnect chat-mode draft:", err)
-      })
+      void runtime
+        .acpDisconnect(existingDraft.id, "draft_retarget")
+        .catch((err) => {
+          console.error("[TabStore] disconnect chat-mode draft:", err)
+        })
     }
     runtime.activateConversationPane()
   },
@@ -1454,6 +1463,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     if (next.every((t, i) => t === rawTabs[i])) return
     set({ rawTabs: next })
     recomputeTabs()
+    void runtime.acpDisconnect(draft.id, "draft_retarget").catch((err) => {
+      console.error("[TabStore] disconnect removed-folder draft:", err)
+    })
   },
 
   bindConversationTab: (
@@ -1920,7 +1932,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
 
         const expectedAgent = current.agentType
         try {
-          await runtime.acpDisconnect(tab.id)
+          await runtime.acpDisconnect(tab.id, "draft_retarget")
         } catch (err) {
           console.error("[TabStore] correct provisional disconnect:", err)
         }
@@ -2002,7 +2014,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     for (const request of consumedRequests) {
       void (async () => {
         try {
-          await runtime.acpDisconnect(request.tabId)
+          await runtime.acpDisconnect(request.tabId, "draft_retarget")
         } catch (err) {
           console.error("[TabStore] disconnect draft tab:", err)
         }

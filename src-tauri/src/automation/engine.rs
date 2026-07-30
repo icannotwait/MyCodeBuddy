@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
 use crate::acp::manager::ConnectionManager;
+use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
 use crate::commands::acp::verify_agent_installed;
@@ -676,7 +677,10 @@ impl AutomationEngine {
         let title = first_chars(&cfg.display_text, 80);
         #[cfg(test)]
         if matches!(inject, Some(LaunchInjectKind::InsertFail)) {
-            let _ = self.manager.disconnect(&conn_id).await;
+            let _ = self
+                .manager
+                .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+                .await;
             return Err("injected: conversation insert failed".to_string());
         }
         let conversation_id = match create_conversation_core(
@@ -690,7 +694,10 @@ impl AutomationEngine {
         {
             Ok(id) => id,
             Err(e) => {
-                let _ = self.manager.disconnect(&conn_id).await;
+                let _ = self
+                    .manager
+                    .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+                    .await;
                 return Err(e.to_string());
             }
         };
@@ -733,7 +740,10 @@ impl AutomationEngine {
         // not when it ran before this row existed); the run stays cancelled.
         if run_no_longer_running(&self.db.conn, run_id).await {
             self.index.lock().await.remove(&conn_id);
-            let _ = self.manager.disconnect(&conn_id).await;
+            let _ = self
+                .manager
+                .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+                .await;
             self.cancel_conversation(conversation_id).await;
             return Ok(());
         }
@@ -753,7 +763,10 @@ impl AutomationEngine {
             Ok(_) => Ok(()),
             Err(e) => {
                 self.index.lock().await.remove(&conn_id);
-                let _ = self.manager.disconnect(&conn_id).await;
+                let _ = self
+                    .manager
+                    .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+                    .await;
                 // The conversation row was created `InProgress`; with the prompt
                 // never sent and the connection gone, no TurnComplete will flip it
                 // and reconcile won't revisit a Failed run — so flip it terminal
@@ -942,7 +955,10 @@ impl AutomationEngine {
         // One prompt, one turn, then disconnect (last_assistant_text is cleared
         // at the next turn start, so an automation connection is never reused).
         self.index.lock().await.remove(&conn_id);
-        let _ = self.manager.disconnect(&conn_id).await;
+        let _ = self
+            .manager
+            .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+            .await;
 
         if let Ok(true) = settled {
             self.emit(AutomationChange::RunSettled {
@@ -1148,7 +1164,10 @@ impl AutomationEngine {
         if let Some(conn_id) = conn_id {
             let _ = self.manager.cancel(&self.db.conn, &conn_id).await;
             self.index.lock().await.remove(&conn_id);
-            let _ = self.manager.disconnect(&conn_id).await;
+            let _ = self
+                .manager
+                .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+                .await;
         }
 
         // Converge the produced conversation. A run with no live worker (lost
