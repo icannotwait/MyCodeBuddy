@@ -2018,6 +2018,7 @@ fn report_from_terminal_write(
 /// Map a parked/parent-end handoff disposition onto a durable terminal write.
 fn terminal_from_handoff_disposition(
     disposition: &ReservingHandoffDisposition,
+    prior_status: DelegationRunStatus,
 ) -> TerminalTaskWrite {
     match disposition {
         ReservingHandoffDisposition::ParentEnded(context) => {
@@ -2025,15 +2026,32 @@ fn terminal_from_handoff_disposition(
             TerminalTaskWrite::canceled(
                 context.reason.error_code(),
                 observed_at,
-                context.audit(
-                    DelegationRunStatus::Reserving,
-                    AdmissionClass::NormalRevision,
-                    None,
-                    None,
-                ),
+                context.audit(prior_status, AdmissionClass::NormalRevision, None, None),
             )
         }
         ReservingHandoffDisposition::ChildTerminal(observed) => observed.terminal.clone(),
+    }
+}
+
+fn observed_terminal_from_handoff_disposition(
+    disposition: &ReservingHandoffDisposition,
+    prior_status: DelegationRunStatus,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+) -> ObservedTerminal {
+    match disposition {
+        ReservingHandoffDisposition::ParentEnded(context) => ObservedTerminal {
+            outcome: DelegationOutcome::Err {
+                code: context.reason.error_code().to_string(),
+                message: context.reason.message().to_string(),
+                child_conversation_id: Some(child_conversation_id),
+            },
+            terminal: terminal_from_handoff_disposition(disposition, prior_status),
+            result_text: None,
+        },
+        ReservingHandoffDisposition::ChildTerminal(observed) => observed
+            .clone()
+            .with_child_identity(child_conversation_id, agent_type),
     }
 }
 
@@ -3286,6 +3304,11 @@ pub struct DelegationBroker {
     /// but before durable reserve starts, so parent-end cannot overtake it.
     #[cfg(any(test, feature = "test-utils"))]
     continue_post_note_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold continuation after its final closed-handoff check and
+    /// before the admission park lock, so a producer can park and unregister
+    /// the exact terminal disposition in that interleaving.
+    #[cfg(any(test, feature = "test-utils"))]
+    continue_pre_park_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: hold `continue_closed_handoff_report` after the first durable
     /// load (non-terminal) and before parked-disposition take, so settle can
     /// commit and clear the park between those steps.
@@ -3422,6 +3445,8 @@ impl DelegationBroker {
             continue_post_reserve_pre_handoff_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             continue_post_note_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            continue_pre_park_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -6118,7 +6143,7 @@ impl DelegationBroker {
                         &call_id,
                         TerminalTaskWrite::canceled(
                             reason.reason.error_code(),
-                            Utc::now(),
+                            reason.termination.observed_at,
                             reason.audit(
                                 DelegationRunStatus::Reserving,
                                 AdmissionClass::NormalRevision,
@@ -6214,7 +6239,7 @@ impl DelegationBroker {
                         &call_id,
                         TerminalTaskWrite::canceled(
                             reason.reason.error_code(),
-                            Utc::now(),
+                            reason.termination.observed_at,
                             reason.audit(
                                 DelegationRunStatus::Reserving,
                                 AdmissionClass::NormalRevision,
@@ -6504,7 +6529,7 @@ impl DelegationBroker {
                                 &call_id,
                                 TerminalTaskWrite::canceled(
                                     context.reason.error_code(),
-                                    Utc::now(),
+                                    context.termination.observed_at,
                                     context.audit(
                                         DelegationRunStatus::Reserving,
                                         AdmissionClass::NormalRevision,
@@ -6972,7 +6997,7 @@ impl DelegationBroker {
             Disposition::ParentEnded(parent_end) => {
                 let terminal = TerminalTaskWrite::canceled(
                     parent_end.reason.error_code(),
-                    Utc::now(),
+                    parent_end.termination.observed_at,
                     parent_end.audit(
                         DelegationRunStatus::Running,
                         AdmissionClass::NormalRevision,
@@ -7166,6 +7191,12 @@ impl DelegationBroker {
         // the terminal runtime snapshot uses the exact same timestamp.
         let finished_at = terminal.finished_at;
         let conversation_status = terminal.conversation_status.clone();
+        let producer_phase = terminal.termination_evidence().map(|audit| {
+            (
+                audit.prior_status.clone(),
+                audit.termination.prompt_may_have_executed,
+            )
+        });
         // Seal projector first so runtime stats writers no-op, then snapshot,
         // then settle with those stats. Do **not** set `runtime.terminal` yet —
         // mid-settle attention/reply races still need a nonterminal window
@@ -7397,9 +7428,15 @@ impl DelegationBroker {
                 self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 // Preserve captured final stats for the eventual successful settle.
+                // Failed/canceled producers always carry typed evidence. Reuse
+                // their actual phase and sticky prompt fact; only successful
+                // completion lacks termination evidence and therefore uses the
+                // post-prompt running completion invariant.
+                let (prior_status, prompt_may_have_executed) =
+                    producer_phase.unwrap_or((DelegationRunStatus::Running, true));
                 let mut retry_terminal = persistence_error_observation(
-                    DelegationRunStatus::Running,
-                    true,
+                    prior_status,
+                    prompt_may_have_executed,
                     Utc::now(),
                     Some(ctx.child_conversation_id),
                 )
@@ -8452,7 +8489,7 @@ impl DelegationBroker {
                         &run.task_id,
                         TerminalTaskWrite::canceled(
                             parent_end.reason.error_code(),
-                            Utc::now(),
+                            parent_end.termination.observed_at,
                             parent_end.audit(
                                 DelegationRunStatus::Reserving,
                                 run.admission_class.clone(),
@@ -8537,7 +8574,7 @@ impl DelegationBroker {
                         &reserved.task_id,
                         TerminalTaskWrite::canceled(
                             parent_end.reason.error_code(),
-                            Utc::now(),
+                            parent_end.termination.observed_at,
                             parent_end.audit(
                                 DelegationRunStatus::Reserving,
                                 reserved.admission_class.clone(),
@@ -9253,6 +9290,11 @@ impl DelegationBroker {
             }
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.continue_pre_park_gate).await;
+        }
+
         // Gen-1 first-terminal-wins park: early_complete / early_cancel /
         // admission_buffer, then re-drain after admitted_running. Parent-end
         // already unregisters the handoff — never insert Running after that.
@@ -9295,8 +9337,27 @@ impl DelegationBroker {
                     .coordination_by_child
                     .get(&child_connection_id)
                     .is_some_and(|c| !c.admitted_running && c.task_id == reserved.task_id);
+            let closed_disposition = inner
+                .resolve_terminal_intent(&reserved.task_id)
+                .map(|intent| intent.disposition);
 
-            if let Some((_, terminal)) = child_terminal {
+            if let Some(disposition) = closed_disposition {
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                (
+                    Arc::new(LiveRuntimeState::new(
+                        accepted.prompt_accepted_at,
+                        PathBuf::new(),
+                    )),
+                    ContinueAdmissionDisposition::ChildTerminal(
+                        observed_terminal_from_handoff_disposition(
+                            &disposition,
+                            DelegationRunStatus::Running,
+                            reserved.child_conversation_id,
+                            reserved.agent_type,
+                        ),
+                    ),
+                )
+            } else if let Some((_, terminal)) = child_terminal {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
                 (
                     inner
@@ -9334,7 +9395,7 @@ impl DelegationBroker {
                                 true,
                             )
                             .audit(
-                                DelegationRunStatus::Reserving,
+                                DelegationRunStatus::Running,
                                 AdmissionClass::NormalRevision,
                                 None,
                                 Some(child_connection_id.clone()),
@@ -11502,6 +11563,7 @@ impl DelegationBroker {
         &self,
         task_id: &str,
         fallback: ReservingHandoffDisposition,
+        prior_status: DelegationRunStatus,
     ) -> (ReservingHandoffDisposition, TerminalTaskWrite) {
         loop {
             let mut inner = self.pending.inner.lock().await;
@@ -11546,11 +11608,12 @@ impl DelegationBroker {
                         .resolve_terminal_intent(task_id)
                         .map(|intent| intent.disposition)
                         .unwrap_or_else(|| fallback.clone());
-                    let terminal = terminal_from_handoff_disposition(&disposition);
+                    let terminal =
+                        terminal_from_handoff_disposition(&disposition, prior_status.clone());
                     return (disposition, terminal);
                 }
             }
-            let terminal = terminal_from_handoff_disposition(&disposition);
+            let terminal = terminal_from_handoff_disposition(&disposition, prior_status.clone());
             return (disposition, terminal);
         }
     }
@@ -12637,7 +12700,7 @@ impl DelegationBroker {
         for (task_id, task, duration_ms) in drained {
             let terminal = TerminalTaskWrite::canceled(
                 parent_end.reason.error_code(),
-                Utc::now(),
+                parent_end.termination.observed_at,
                 parent_end.audit(
                     DelegationRunStatus::Running,
                     AdmissionClass::NormalRevision,
@@ -12671,7 +12734,11 @@ impl DelegationBroker {
             // Serialize claim selection with permanent PE finalize: re-read
             // disposition immediately before CAS under durable_cas_claim.
             let (disposition, terminal) = self
-                .take_parent_end_cas_selection(&handoff.task_id, handoff.disposition.clone())
+                .take_parent_end_cas_selection(
+                    &handoff.task_id,
+                    handoff.disposition.clone(),
+                    DelegationRunStatus::Reserving,
+                )
                 .await;
             match runs.settle_terminal(&handoff.task_id, terminal).await {
                 Ok(settlement) => {
@@ -12802,9 +12869,13 @@ impl DelegationBroker {
                 // Honor process-local bootstrap (or other) claim: never invent
                 // parent_canceled over an earlier ChildTerminal park. Claim
                 // selection is serialized with permanent PE finalize.
-                let fallback = ReservingHandoffDisposition::ParentEnded(parent_end.clone());
+                let prior_status = row.run_status.clone();
+                let prompt_may_have_executed = matches!(prior_status, DelegationRunStatus::Running);
+                let fallback = ReservingHandoffDisposition::ParentEnded(
+                    parent_end.with_prompt_may_have_executed(prompt_may_have_executed),
+                );
                 let (claimed, terminal) = self
-                    .take_parent_end_cas_selection(&row.task_id, fallback)
+                    .take_parent_end_cas_selection(&row.task_id, fallback, prior_status)
                     .await;
                 match runs.settle_terminal(&row.task_id, terminal).await {
                     Ok(settlement) => {
@@ -12966,6 +13037,19 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.continue_post_note_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold after the last closed-handoff check and before park.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_continue_pre_park_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.continue_pre_park_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -21779,7 +21863,6 @@ mod tests {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
-
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-ok").await;
         let parent = conversation_service::create(
@@ -29952,6 +30035,7 @@ mod tests {
                 terminal: retry.terminal.clone(),
                 result_text: None,
             }),
+            DelegationRunStatus::Running,
         );
         assert_eq!(
             drained.termination_evidence(),
@@ -29964,6 +30048,58 @@ mod tests {
             "child must be disconnected after persistence exhaustion"
         );
         assert!(broker.child_was_disconnected("task-1").await);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_reserving_transport_retry_preserves_phase_and_prompt() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+            .with_task_store(
+                store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+            )
+            .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)));
+        let terminal = failed_terminal(
+            "spawn_failed",
+            DelegationRunStatus::Reserving,
+            false,
+            AcpTerminationSource::Transport,
+            AcpTerminationReason::TransportDisconnected,
+            AcpTerminationClassification::Unexpected,
+        );
+        let context = SettleContext {
+            parent_connection_id: "parent-conn".into(),
+            parent_tool_use_id: "tu-wave3-retry".into(),
+            child_connection_id: "wave3-retry-child".into(),
+            child_conversation_id: 42,
+            agent_type: AgentType::ClaudeCode,
+            task_preview: "pre-prompt send failure".into(),
+            duration_ms: 0,
+            cancel_turn: false,
+            disconnect_on_loss: true,
+            message: Some("send failed before prompt dispatch".into()),
+            attention_resolution: AttentionResolutionCode::TaskTerminal,
+            runtime: None,
+            card_summary: None,
+        };
+
+        let report = broker
+            .settle_task("wave3-reserving-retry", terminal, None, context)
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        let retry = store
+            .get_retry("wave3-reserving-retry")
+            .await
+            .expect("retry payload");
+        let audit = retry
+            .terminal
+            .termination_evidence()
+            .expect("typed persistence retry evidence");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "retry must preserve the failed producer's sticky prompt fact"
+        );
     }
 
     #[tokio::test]
@@ -35433,7 +35569,8 @@ mod tests {
     /// after the durable commit returns, so only durable parent-tree settle
     /// can see the run.
     #[tokio::test]
-    async fn continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns() {
+    async fn termination_evidence_wave3_continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns(
+    ) {
         use crate::acp::delegation::types::ContinueDelegationRequest;
         use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
         use crate::db::service::conversation_service;
@@ -35533,6 +35670,24 @@ mod tests {
             "parent end must settle durable reserving without an in-memory handoff"
         );
         assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+        let canceled_entity =
+            crate::db::entities::delegation_task_run::Entity::find_by_id(&continued_task_id)
+                .one(&db.conn)
+                .await
+                .expect("load canceled entity")
+                .expect("canceled entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            canceled_entity
+                .termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "post-reserve/pre-handoff parent end is pre-prompt"
+        );
 
         let _ = release_tx.send(());
         let report = driver.await.expect("continue join");
@@ -36375,7 +36530,9 @@ mod tests {
         let (continued_task_id, child_connection_id) = loop {
             if let Ok(Some(run)) = runs.load_by_parent_tool_use(parent.id, "tu-adm-disc").await {
                 if let Some(cid) = run.child_connection_id {
-                    break (run.task_id, cid);
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -36450,7 +36607,8 @@ mod tests {
     /// Broker-level settle must still emit one terminal event, close attention,
     /// and drop the live registration.
     #[tokio::test]
-    async fn parent_cancel_running_with_run_store_emits_event_and_closes_attention() {
+    async fn termination_evidence_wave3_parent_cancel_running_with_run_store_emits_event_and_closes_attention(
+    ) {
         use crate::acp::delegation::attention::{
             mock::MemoryDelegationAttentionStore, AttentionResolutionCode, DelegationAttentionStore,
         };
@@ -36460,6 +36618,7 @@ mod tests {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-parent-cancel-running-sweep").await;
@@ -36540,6 +36699,25 @@ mod tests {
             .expect("row");
         assert_eq!(row.run_status, DelegationRunStatus::Canceled);
         assert_eq!(row.error_code.as_deref(), Some("parent_canceled"));
+        let row_entity = crate::db::entities::delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("load run entity")
+            .expect("run entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row_entity
+                .termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            row_entity.finished_at,
+            Some(audit.termination.observed_at),
+            "parent-end drain must use the producer observation as terminal time"
+        );
 
         let completed = events.snapshot().await;
         assert_eq!(
@@ -36563,6 +36741,69 @@ mod tests {
             "broker-level settle must unregister the live run"
         );
         assert!(!broker.is_running_for_test(&task_id).await);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_db_only_running_parent_end_uses_running_prompt_phase() {
+        use crate::db::entities::delegation_task_run;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-wave3-db-only-running").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("wave3 db-only running parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let child_connection_id = "wave3-db-only-running-child";
+        mock.queue_spawn(Ok(child_connection_id.into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "tu-wave3-db-only-running");
+        req.working_dir = Some(test_working_dir());
+        let ack = broker.start_delegation(req).await;
+        let task_id = ack.task_id.expect("running task id");
+        assert_eq!(ack.status, TaskStatus::Running);
+
+        // Simulate process-local recovery loss while the durable row remains
+        // Running. Parent-end must derive phase from that row, not root defaults.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.running.remove(&task_id);
+            inner.unregister_live_run(child_connection_id);
+        }
+        broker
+            .note_parent_conversation_for_test("parent-conn", parent.id)
+            .await;
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentTurnFailed)
+            .await;
+
+        let row = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row.termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentTurnFailed
+        );
     }
 
     /// Parent end while a child completion is mid-CAS (`settling`) must not let
@@ -36722,6 +36963,240 @@ mod tests {
         assert!(
             !broker.has_live_run_for_test("settling-child-conn").await,
             "completion producer must unregister the live run"
+        );
+    }
+
+    struct Wave3ContinuePreParkFixture {
+        db: Arc<crate::db::AppDatabase>,
+        broker: Arc<DelegationBroker>,
+        continued_task_id: String,
+        child_connection_id: String,
+        release: tokio::sync::oneshot::Sender<()>,
+        driver: tokio::task::JoinHandle<DelegationTaskReport>,
+    }
+
+    async fn wave3_continue_pre_park_fixture(label: &str) -> Wave3ContinuePreParkFixture {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-wave3-pre-park-{label}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("wave3 pre-park {label}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok(format!("root-{label}"))).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, &format!("tu-wave3-root-{label}"));
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some(format!("wave3-pre-park-session-{label}")));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok(format!("continued-{label}"))).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_pre_park_gate(entered_tx, release_rx)
+            .await;
+        let parent_tool_use_id = format!("tu-wave3-continue-{label}");
+        let continue_request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: parent_tool_use_id.clone(),
+            target_task_id: root_task_id,
+            task: "continue into pre-park race".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(continue_request).await })
+        };
+        entered_rx.await.expect("continue must reach pre-park gate");
+        let row = runs
+            .load_by_parent_tool_use(parent.id, &parent_tool_use_id)
+            .await
+            .expect("load continuation")
+            .expect("continuation row");
+        let child_connection_id = row
+            .child_connection_id
+            .clone()
+            .expect("continued child connection");
+
+        Wave3ContinuePreParkFixture {
+            db,
+            broker,
+            continued_task_id: row.task_id,
+            child_connection_id,
+            release,
+            driver,
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_parent_turn_failed_disposition_wins_exactly() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("parent-failed").await;
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T01:02:03Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                fixture.continued_task_id.clone(),
+                ReservingHandoffDisposition::ParentEnded(ParentEndContext::legacy(
+                    ParentTurnEndReason::ParentTurnFailed,
+                    observed_at,
+                    true,
+                )),
+            );
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let report = fixture.driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("parent_turn_failed"));
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(row.termination_audit_json.as_deref().expect("typed audit"))
+                .expect("valid audit");
+        assert_eq!(audit.termination.source, AcpTerminationSource::ParentTurn);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentTurnFailed
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert_eq!(audit.termination.observed_at, observed_at);
+        assert_eq!(row.finished_at, Some(observed_at));
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_child_terminal_disposition_wins_exactly() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("child-terminal").await;
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T02:03:04Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let observed = observe_child_outcome(
+            DelegationOutcome::Err {
+                code: "unresumable".into(),
+                message: "child terminal at producer".into(),
+                child_conversation_id: None,
+            },
+            DelegationRunStatus::Reserving,
+            true,
+            observed_at,
+        );
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                fixture.continued_task_id.clone(),
+                ReservingHandoffDisposition::ChildTerminal(observed),
+            );
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let report = fixture.driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(row.termination_audit_json.as_deref().expect("typed audit"))
+                .expect("valid audit");
+        assert_eq!(
+            audit.termination.source,
+            AcpTerminationSource::ChildConnection
+        );
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ChildTerminal
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert_eq!(audit.termination.observed_at, observed_at);
+        assert_eq!(row.finished_at, Some(observed_at));
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(audit.termination.prompt_may_have_executed);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_missing_disposition_uses_promoted_phase() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("fallback-phase").await;
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let _ = fixture.driver.await.expect("continue join");
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row.termination_audit_json
+                .as_deref()
+                .expect("typed fallback audit"),
+        )
+        .expect("valid audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentCanceled
         );
     }
 
