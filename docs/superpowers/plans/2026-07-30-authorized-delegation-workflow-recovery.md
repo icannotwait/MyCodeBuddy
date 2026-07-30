@@ -12,7 +12,7 @@
 
 - Approved delegation Design baseline: `docs/superpowers/specs/2026-07-30-delegation-recovery-authorization-design.md`, SHA-256 `b8b04fb31daafd275d24fd8f712ff488d9a7429e7a3b9cd6a7f38c7b4cf0401d`. Do not modify it during implementation.
 - Approved workflow Design baseline: `docs/superpowers/specs/2026-07-30-workflow-blocked-recovery-design.md`, SHA-256 `632d2c74a27fcff4c01b274b8b2bfb54fed35ea767cc2c39f5d0035352c87ce9`. Do not modify it during implementation.
-- Approved supplemental B2D recovery-contract Design baseline: `docs/superpowers/specs/2026-07-30-brainstorm-to-delivery-recovery-contract-hardening-design.md`, SHA-256 `b330c7b688fe7071caf17e53f0c8ab42cb063ced13e53834ae0580c42b6788a2`. Do not modify it during implementation.
+- Approved supplemental B2D recovery-contract Design baseline: `docs/superpowers/specs/2026-07-30-brainstorm-to-delivery-recovery-contract-hardening-design.md`, SHA-256 `f1616f50352b1ce2b20b98fb098e65847068b627d28fe29acfb65fcc58716c93`. Do not modify it during implementation.
 - Keep Task execution serial. Tasks 1-8 establish persistence, evidence, state authority, policies, and authorization interfaces consumed by Tasks 9-12.
 - **Workspace Gate before Task 1:** run `git status --short` and require a clean implementation worktree. At plan-review time the main worktree contains unrelated edits in `src/components/message/live-transcript-row.test.tsx`, `src/components/message/message-list-view.test.tsx`, `src/hooks/use-delegation-card-model.test.ts`, `src/hooks/use-delegation-card-model.ts`, `src/lib/delegation-transcript-projection.test.ts`, and `src/lib/delegation-transcript-projection.ts`. Do not start Task 1 or run the final matrix over those edits. Their owner must first commit/stash them, or the executor must use a clean isolated worktree; never stage, stash, revert, or overwrite them implicitly.
 - Follow RED-GREEN-REFACTOR for every Task. Observe each focused test fail for the intended missing behavior before production edits.
@@ -1440,6 +1440,8 @@ Implement the following frontend tests and assertions:
 | `localizes a recovery card from codes and submits raw approve or decline` | Render every action/cause/risk/target code in all ten locales; assert title/body/buttons come only from next-intl keys, unknown codes fail closed, model-provided prose is not rendered, no free-text/Other/skip control exists, dismiss resolves decline, pending submission locks both buttons, and callbacks receive only raw `approve` or `decline`. |
 | `keeps generic ask_user_question behavior unchanged` | Render the existing generic fixture and assert prompt/options/model copy remain visible, Other input and skip/dismiss behavior remain available under their existing flags, and recovery-specific copy or locking is absent. |
 
+Add both frontend tests inside the existing `describe("AskQuestionCard", ...)` suite so Vitest discovery emits the exact full names asserted by Step 3.
+
 - [ ] **Step 2: Write stable-ID Skill validator tests before changing validator or Skill prose**
 
 Change the test assertions first. Validator diagnostics use the exact form `[RULE-ID] human-readable detail`; positive fixtures assert no failure IDs, and every negative fixture asserts the exact expected ID rather than a message substring. Add:
@@ -1515,11 +1517,45 @@ Expected: FAIL because broker variants, catalog entries, parsers, role gating, a
 From repository root, run:
 
 ```powershell
-pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts
-if ($LASTEXITCODE -eq 0) { throw "Expected recovery card/i18n RED failure, but it passed" }
+$frontendDiscoveryRaw = @(& pnpm exec vitest list src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts --json 2>$null | ForEach-Object { "$_" })
+$frontendDiscoveryExit = $LASTEXITCODE
+if ($frontendDiscoveryExit -ne 0) { $frontendDiscoveryRaw | ForEach-Object { Write-Host $_ }; throw "Vitest frontend discovery command failed" }
+try {
+  $frontendDiscovery = @(($frontendDiscoveryRaw -join [Environment]::NewLine) | ConvertFrom-Json)
+} catch {
+  $frontendDiscoveryRaw | ForEach-Object { Write-Host $_ }
+  throw "Vitest frontend discovery did not emit valid JSON"
+}
+if ($frontendDiscovery.Count -le 0) { throw "Vitest frontend discovery collected zero tests" }
+$frontendDiscoveredFiles = @($frontendDiscovery | ForEach-Object { $_.file.Replace('\', '/') } | Sort-Object -Unique)
+$expectedFrontendFiles = @('/src/components/chat/ask-question-card.test.tsx', '/src/i18n/messages.test.ts')
+foreach ($expectedFile in $expectedFrontendFiles) {
+  if (-not @($frontendDiscoveredFiles | Where-Object { $_.EndsWith($expectedFile, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+    throw "Vitest frontend discovery missed expected file $expectedFile"
+  }
+}
+$expectedFrontendTests = @(
+  'AskQuestionCard > localizes a recovery card from codes and submits raw approve or decline',
+  'AskQuestionCard > keeps generic ask_user_question behavior unchanged'
+)
+foreach ($expectedTest in $expectedFrontendTests) {
+  if (-not @($frontendDiscovery | Where-Object { $_.name -ceq $expectedTest }).Count) {
+    throw "Vitest frontend discovery missed expected test: $expectedTest"
+  }
+}
+$frontendRed = @(& pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts --reporter=verbose --no-color 2>&1 | ForEach-Object { "$_" })
+$frontendRedExit = $LASTEXITCODE
+$frontendRedText = $frontendRed -join [Environment]::NewLine
+$collectionFailurePattern = 'No test files found|No test suite found|Failed to load url|Failed to resolve import|Cannot find module|Unhandled Error'
+if ($frontendRedText -match $collectionFailurePattern) { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED failed during collection/import/configuration" }
+$expectedFailingFrontendTest = 'AskQuestionCard > localizes a recovery card from codes and submits raw approve or decline'
+if ($frontendRedText -notmatch [regex]::Escape($expectedFailingFrontendTest)) { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED did not execute the recovery-card test" }
+if ($frontendRedText -notmatch 'AssertionError|TestingLibraryElementError|expected .+ to') { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED lacked an assertion-class feature failure" }
+$frontendRed | ForEach-Object { Write-Host $_ }
+if ($frontendRedExit -eq 0) { throw "Expected recovery card/i18n RED failure, but it passed" }
 ```
 
-Expected: FAIL because typed recovery presentation and locale keys do not exist.
+Expected: discovery exits 0 with `frontendDiscovery.Count > 0`, both exact files, and both exact planned tests. The run then exits nonzero with the recovery-card test name and an assertion-class failure because typed recovery presentation and locale keys do not exist. Missing files, zero tests, suite-load/import/configuration errors, and unrelated crashes are rejected before that nonzero exit can count as RED. Record the discovered test/file counts and assertion evidence in `.superpowers/sdd/task-11-report.md`.
 
 Then run this exact nonzero Node RED gate:
 
