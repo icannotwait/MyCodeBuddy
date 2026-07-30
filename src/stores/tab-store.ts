@@ -128,9 +128,22 @@ export type DetachTabResult =
   | { ok: true; nextActiveId: string; restoreToken: DetachRestoreToken }
   | { ok: false; reason: "not_found" | "last_tab" }
 
+/** Sidebar highlight when a conversation is focused without a main tab (pop-out). */
+export interface SidebarConversationSelection {
+  id: number
+  agentType: AgentType
+}
+
 export interface TabStoreState {
   rawTabs: TabItemInternal[]
   activeTabId: string | null
+  /**
+   * Sidebar-only selection for conversations focused via detached pop-out
+   * (no main-tab mirror). Prefer this over `activeTabId` when rendering the
+   * conversation list highlight / awaiting-reply chrome. Cleared whenever a
+   * main tab becomes the intentional selection (open/activate/switch).
+   */
+  sidebarSelection: SidebarConversationSelection | null
   previewReplacedTabIds: string[]
   draftRetargetRequests: DraftRetargetRequest[]
   tabsHydrated: boolean
@@ -156,6 +169,8 @@ export interface TabStoreState {
    * On local desktop, awaits focus of an existing detached window first.
    * @returns `false` when a detached window was focused (no main tab change);
    *          `true` when a main tab was opened or activated.
+   * On detached focus, sets {@link sidebarSelection} so the sidebar can show
+   * selected state / clear awaiting-reply without creating a main tab.
    */
   openTab: (
     folderId: number,
@@ -658,6 +673,7 @@ function initialTabState() {
   return {
     rawTabs: [] as TabItemInternal[],
     activeTabId: null as string | null,
+    sidebarSelection: null as SidebarConversationSelection | null,
     previewReplacedTabIds: [] as string[],
     draftRetargetRequests: [] as DraftRetargetRequest[],
     tabsHydrated: false,
@@ -708,21 +724,31 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           isTransferringOut(conversationId) ||
           isPopOutInFlight(conversationId) ||
           isConversationDetachedCache(conversationId)
+        const markDetachedSidebarSelection = () => {
+          // No main tab change — still highlight the card and drive
+          // awaiting-reply clear via ConversationAwaitingReplyClearer.
+          set({
+            sidebarSelection: { id: conversationId, agentType },
+          })
+        }
 
         if (shouldSkipMainTab()) {
           // Still await focus so a sidebar click brings the pop-out window
           // forward and lands the composer caret (OS focus alone is not enough).
           await focusDetachedConversation(conversationId).catch(() => false)
+          markDetachedSidebarSelection()
           return false
         }
 
         if (await focusDetachedConversation(conversationId)) {
+          markDetachedSidebarSelection()
           return false
         }
 
         // Post-await barrier: transfer started/ended or still fenced/detached.
         if (shouldSkipMainTab()) {
           await focusDetachedConversation(conversationId).catch(() => false)
+          markDetachedSidebarSelection()
           return false
         }
       } catch {
@@ -748,14 +774,19 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         set({
           rawTabs: stampActiveTab(updated, activateTabId),
           activeTabId: activateTabId,
+          sidebarSelection: null,
         })
         recomputeTabs()
       } else if (prevState.activeTabId !== activateTabId) {
         set({
           rawTabs: stampActiveTab(prevState.rawTabs, activateTabId),
           activeTabId: activateTabId,
+          sidebarSelection: null,
         })
         recomputeTabs()
+      } else if (prevState.sidebarSelection != null) {
+        // Already the active main tab: drop any stale detached highlight.
+        set({ sidebarSelection: null })
       }
       // Already active: leave activationSeq unchanged (matches switchTab).
       runtime.activateConversationPane()
@@ -797,6 +828,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       set({
         rawTabs: stampActiveTab(limited, tabId),
         activeTabId: tabId,
+        sidebarSelection: null,
       })
       recomputeTabs()
       runtime.activateConversationPane()
@@ -811,6 +843,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       set({
         rawTabs: stampActiveTab(updated, tabId),
         activeTabId: tabId,
+        sidebarSelection: null,
         previewReplacedTabIds: [
           ...prevState.previewReplacedTabIds,
           replacedPreviewTabId,
@@ -829,6 +862,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       set({
         rawTabs: stampActiveTab(limited, tabId),
         activeTabId: tabId,
+        sidebarSelection: null,
       })
       recomputeTabs()
       runtime.activateConversationPane()
@@ -1087,11 +1121,15 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     if (!prevState.rawTabs.some((t) => t.id === tabId)) return
     if (prevState.activeTabId !== tabId) {
       // Stamp activationSeq so detachTab MRU prefers the true last-active tab.
+      // Main-tab switch is the intentional selection — drop detached highlight.
       set({
         rawTabs: stampActiveTab(prevState.rawTabs, tabId),
         activeTabId: tabId,
+        sidebarSelection: null,
       })
       recomputeTabs()
+    } else if (prevState.sidebarSelection != null) {
+      set({ sidebarSelection: null })
     }
     runtime.activateConversationPane()
   },

@@ -280,6 +280,36 @@ describe("ConversationAwaitingReplyClearer", () => {
     expect(clearAwaitingReply).toHaveBeenCalledTimes(1)
   })
 
+  it("clears via sidebarSelection for a detached conversation without main focus", async () => {
+    // Pop-out re-click: no main tab for the conversation, main window loses
+    // focus after focusing the detached window, but sidebarSelection is set.
+    useTabStore.setState({
+      tabsHydrated: true,
+      isTileMode: false,
+      activeTabId: null,
+      rawTabs: [],
+      tabs: [],
+      sidebarSelection: { id: 77, agentType: "claude_code" },
+    })
+    useAppWorkspaceStore.getState().applyConversationUpsert(
+      makeSummary({
+        id: 77,
+        awaiting_reply_token: "generation-77",
+      })
+    )
+    documentHasFocus.mockReturnValue(false)
+    routeMock.isConversations = false
+    workspaceMock.filesMaximized = true
+    render(<ConversationAwaitingReplyClearer />)
+
+    await waitFor(() =>
+      expect(clearAwaitingReply).toHaveBeenCalledWith(77, "generation-77")
+    )
+    expect(
+      useAppWorkspaceStore.getState().conversations[0].awaiting_reply_token
+    ).toBeNull()
+  })
+
   it("retries a failed clear only after transport reconnect", async () => {
     seedActiveConversation({ id: 11, awaiting_reply_token: "generation-11" })
     let reconnectCb: (() => void) | null = null
