@@ -12,7 +12,7 @@
 
 - Approved delegation Design baseline: `docs/superpowers/specs/2026-07-30-delegation-recovery-authorization-design.md`, SHA-256 `b8b04fb31daafd275d24fd8f712ff488d9a7429e7a3b9cd6a7f38c7b4cf0401d`. Do not modify it during implementation.
 - Approved workflow Design baseline: `docs/superpowers/specs/2026-07-30-workflow-blocked-recovery-design.md`, SHA-256 `632d2c74a27fcff4c01b274b8b2bfb54fed35ea767cc2c39f5d0035352c87ce9`. Do not modify it during implementation.
-- Approved supplemental B2D recovery-contract Design baseline: `docs/superpowers/specs/2026-07-30-brainstorm-to-delivery-recovery-contract-hardening-design.md`, SHA-256 `f1616f50352b1ce2b20b98fb098e65847068b627d28fe29acfb65fcc58716c93`. Do not modify it during implementation.
+- Approved supplemental B2D recovery-contract Design baseline: `docs/superpowers/specs/2026-07-30-brainstorm-to-delivery-recovery-contract-hardening-design.md`, SHA-256 `ded3bd24a6f01c6e3af737bb5e7ec012a14871948aad7c48d39b5785243ae2f0`. Do not modify it during implementation.
 - Keep Task execution serial. Tasks 1-8 establish persistence, evidence, state authority, policies, and authorization interfaces consumed by Tasks 9-12.
 - **Workspace Gate before Task 1:** run `git status --short` and require a clean implementation worktree. At plan-review time the main worktree contains unrelated edits in `src/components/message/live-transcript-row.test.tsx`, `src/components/message/message-list-view.test.tsx`, `src/hooks/use-delegation-card-model.test.ts`, `src/hooks/use-delegation-card-model.ts`, `src/lib/delegation-transcript-projection.test.ts`, and `src/lib/delegation-transcript-projection.ts`. Do not start Task 1 or run the final matrix over those edits. Their owner must first commit/stash them, or the executor must use a clean isolated worktree; never stage, stash, revert, or overwrite them implicitly.
 - Follow RED-GREEN-REFACTOR for every Task. Observe each focused test fail for the intended missing behavior before production edits.
@@ -1555,12 +1555,14 @@ try {
   if ([int]$frontendRedReport.numTotalTests -le 0 -or $frontendRanCount -le 0) {
     throw "Vitest frontend RED ran zero tests"
   }
-  $expectedFailure = @($frontendAssertions | Where-Object {
+  $frontendFailures = @($frontendAssertions | Where-Object { $_.status -ceq 'failed' })
+  $expectedFailure = @($frontendFailures | Where-Object {
     $_.title -ceq $expectedFrontendTests[0] -and
-    $_.fullName.StartsWith('AskQuestionCard ', [StringComparison]::Ordinal) -and
-    $_.status -ceq 'failed'
+    $_.fullName.StartsWith('AskQuestionCard ', [StringComparison]::Ordinal)
   })
-  if ($expectedFailure.Count -ne 1) { throw "Vitest frontend RED did not fail the recovery-card test" }
+  if ([int]$frontendRedReport.numFailedTests -ne 1 -or $frontendFailures.Count -ne 1 -or $expectedFailure.Count -ne 1) {
+    throw "Vitest frontend RED did not fail exactly the recovery-card test"
+  }
   $expectedFailureText = @($expectedFailure[0].failureMessages) -join [Environment]::NewLine
   if ($expectedFailureText -notmatch 'AssertionError|TestingLibraryElementError|expected .+ to') {
     throw "Vitest frontend RED lacked an assertion-class recovery-card failure"
@@ -1573,7 +1575,7 @@ try {
 }
 ```
 
-Expected: the Vitest 2.1.9 JSON report contains one result for each exact requested file, a positive assertion count in both files, both exact planned `AskQuestionCard` tests, and `frontendRanCount > 0`. The command then exits nonzero with the recovery-card test in `failed` status and an assertion-class failure because typed recovery presentation and locale keys do not exist. Missing files, zero collected or executed tests, suite-load/import/configuration errors, and unrelated crashes are rejected before that nonzero exit can count as RED. Record the discovered file count, total/executed/passed/failed test counts, and intended assertion evidence in `.superpowers/sdd/task-11-report.md`.
+Expected: the Vitest 2.1.9 JSON report contains one result for each exact requested file, a positive assertion count in both files, both exact planned `AskQuestionCard` tests, and positive total and `frontendRanCount` values. The command then exits nonzero with exactly one failed assertion result, the recovery-card test, whose `failureMessages` contain an assertion-class failure because typed recovery presentation and locale keys do not exist. Missing or duplicate files, zero collected or executed tests, missing planned tests, suite-load/import/configuration errors, additional or unrelated failures, and a zero process exit are rejected before RED can count. Record the discovered file count, total/executed/passed/failed test counts, and intended assertion evidence in `.superpowers/sdd/task-11-report.md`.
 
 Then run this exact nonzero Node RED gate:
 

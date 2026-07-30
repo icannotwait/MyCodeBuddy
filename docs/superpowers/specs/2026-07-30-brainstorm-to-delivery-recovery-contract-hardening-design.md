@@ -424,13 +424,18 @@ contracts do not need redundant behavior tests.
 
 ### Nonzero Gates
 
-Before accepting the frontend RED exit, Task 11 runs Vitest's machine-readable
-`list --json` discovery for both exact frontend filters. The parsed array must
-contain a positive test count, both expected test files, and both newly written
-frontend test names. The subsequent verbose RED output must identify the
-recovery-card test and an assertion-class failure; missing files, no collected
-tests, suite-load/import/configuration errors, or an unrelated crash do not
-prove RED and must stop the Task.
+Task 11 uses one focused Vitest execution for both exact frontend filters with
+`--reporter=json` and a temporary output file. Before accepting its nonzero RED
+exit, the parsed report must contain exactly one file result for each requested
+file, a positive assertion count in each file, both exact newly written
+`AskQuestionCard` test names, positive total and passed-or-failed execution
+counts, and exactly one failed assertion result: the intended recovery-card
+test. That result must contain assertion-class `failureMessages`, and the
+Vitest process itself must exit nonzero. Missing or invalid JSON, missing or
+duplicate files, zero collection or execution, a missing planned test, an
+additional or unrelated failure, or a zero process exit does not prove RED and
+must stop the Task. Discovery and execution evidence therefore come from the
+same Vitest run.
 
 The Task 11 Node RED and GREEN wrappers must parse TAP output and require
 `# tests N` with `N > 0`. A zero-match run is a hard failure even if Node exits
