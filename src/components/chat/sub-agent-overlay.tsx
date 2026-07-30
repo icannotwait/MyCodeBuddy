@@ -46,7 +46,11 @@ import {
 import { AgentIcon } from "@/components/agent-icon"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import { WorkflowGraphPanel } from "@/components/chat/workflow-graph-panel"
-import { WorkflowPhaseRail } from "@/components/chat/workflow-phase-rail"
+import {
+  WorkflowPhaseRail,
+  phaseProgressFragments,
+} from "@/components/chat/workflow-phase-rail"
+import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
@@ -67,6 +71,7 @@ import {
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import {
   AGENT_LABELS,
+  type AgentType,
   type DelegationActivityView,
   type WorkflowGraphSnapshot,
 } from "@/lib/types"
@@ -81,11 +86,25 @@ import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { groupDelegationRuns } from "@/lib/delegation-work-unit"
 import {
   buildPhaseRail,
+  canOpenWorkflowNode,
   selectCurrentNodes,
   useWorkflowGraphStore,
+  type PhaseRailItem,
+  type PhaseRailKind,
   type WorkflowSegment,
 } from "@/lib/workflow-graph-store"
 import { cn } from "@/lib/utils"
+
+function resolveDefaultPhaseKind(
+  phases: readonly PhaseRailItem[]
+): PhaseRailKind | null {
+  const current = phases.find((phase) => phase.status === "current")
+  if (current) return current.kind
+  for (let index = phases.length - 1; index >= 0; index -= 1) {
+    if (phases[index].status !== "pending") return phases[index].kind
+  }
+  return phases[phases.length - 1]?.kind ?? null
+}
 
 interface SubAgentOverlayProps {
   /** All `delegate_to_agent` tool calls in this conversation (timeline order). */
@@ -504,6 +523,31 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     () => (graph ? selectCurrentNodes(graph) : []),
     [graph]
   )
+  const [selectedPhaseKind, setSelectedPhaseKind] =
+    useState<PhaseRailKind | null>(null)
+  const [phaseSelectionDirty, setPhaseSelectionDirty] = useState(false)
+
+  useEffect(() => {
+    if (activeSegment !== "workflow") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- phase selection resets with segment
+      setSelectedPhaseKind(null)
+      setPhaseSelectionDirty(false)
+      return
+    }
+    const fallback = resolveDefaultPhaseKind(phaseRail)
+    setSelectedPhaseKind((selected) => {
+      const selectionExists = phaseRail.some((phase) => phase.kind === selected)
+      if (!selectionExists) return fallback
+      return phaseSelectionDirty ? selected : fallback
+    })
+  }, [activeSegment, phaseRail, phaseSelectionDirty])
+
+  const selectedPhase =
+    phaseRail.find((phase) => phase.kind === selectedPhaseKind) ??
+    phaseRail.find(
+      (phase) => phase.kind === resolveDefaultPhaseKind(phaseRail)
+    ) ??
+    null
 
   // A13: mount when graph present even if session/activity count is zero.
   // Without a graph, keep today's null-when-empty behavior (no Workflow segment).
@@ -661,42 +705,104 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
         >
           {hasGraph && activeSegment === "workflow" && graph && (
             <div className="space-y-2" data-testid="workflow-compact-body">
-              <WorkflowPhaseRail phases={phaseRail} />
+              {selectedPhase && (
+                <>
+                  <WorkflowPhaseRail
+                    phases={phaseRail}
+                    selectedKind={selectedPhase.kind}
+                    onSelectKind={(kind) => {
+                      setSelectedPhaseKind(kind)
+                      setPhaseSelectionDirty(true)
+                    }}
+                  />
+                  <div
+                    className="px-1 text-xs text-muted-foreground"
+                    data-testid="workflow-phase-summary"
+                  >
+                    {[
+                      tw(`phaseStatus.${selectedPhase.status}`),
+                      ...phaseProgressFragments(selectedPhase, tw),
+                    ].join(" · ")}
+                  </div>
+                </>
+              )}
               {currentNodes.length > 0 && (
                 <div
-                  className="space-y-1 rounded-md border bg-muted/20 p-2 text-xs"
-                  data-testid="workflow-current-work"
+                  className="flex min-w-0 flex-col gap-1 px-1"
+                  data-testid="workflow-summary-current-nodes"
                 >
-                  {currentNodes.map((node) => (
-                    <div
-                      key={node.node_id}
-                      className="flex flex-wrap items-center gap-1.5"
-                    >
-                      <span className="font-medium">
-                        {tw("currentWork", {
-                          title: node.title?.trim() || node.node_id,
-                        })}
-                      </span>
-                      {node.role && (
-                        <Badge variant="outline" className="h-4 text-[10px]">
-                          {node.role}
-                        </Badge>
-                      )}
-                      {node.agent_type && (
-                        <Badge variant="outline" className="h-4 text-[10px]">
-                          {node.agent_type}
-                        </Badge>
-                      )}
-                      <Badge variant="secondary" className="h-4 text-[10px]">
-                        {tw(`nodeStatus.${node.status}`)}
-                      </Badge>
-                      {node.round_count != null && node.round_count > 0 && (
-                        <span className="tabular-nums text-muted-foreground">
-                          {tw("roundCount", { count: node.round_count })}
+                  {currentNodes.slice(0, 2).map((node) => {
+                    const openable = canOpenWorkflowNode(node)
+                    const title = node.title?.trim() || node.node_id
+                    const content = (
+                      <>
+                        <WorkflowStatusIcon visualStatus={node.status} />
+                        <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                          {title}
                         </span>
-                      )}
-                    </div>
-                  ))}
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {tw(`nodeStatus.${node.status}`)}
+                        </span>
+                        {node.role && (
+                          <Badge variant="outline" className="h-4 text-[10px]">
+                            {tw("roleLabel", { role: node.role })}
+                          </Badge>
+                        )}
+                        {node.agent_type && (
+                          <Badge variant="outline" className="h-4 text-[10px]">
+                            {tw("agentLabel", { agent: node.agent_type })}
+                          </Badge>
+                        )}
+                        {node.round_count != null && node.round_count > 0 && (
+                          <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
+                            {tw("roundCount", { count: node.round_count })}
+                          </span>
+                        )}
+                      </>
+                    )
+                    const rowClass =
+                      "flex min-w-0 w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-start"
+                    if (openable) {
+                      return (
+                        <button
+                          key={node.node_id}
+                          type="button"
+                          className={cn(
+                            rowClass,
+                            "hover:bg-muted/60 transition-colors"
+                          )}
+                          data-testid={`workflow-summary-current-node-${node.node_id}`}
+                          onClick={() => {
+                            void openDelegatedChildSession({
+                              childConversationId:
+                                node.latest_child_conversation_id,
+                              agentType:
+                                (node.agent_type as AgentType | null) ?? null,
+                              title: node.title,
+                            })
+                          }}
+                        >
+                          {content}
+                        </button>
+                      )
+                    }
+                    return (
+                      <div
+                        key={node.node_id}
+                        className={rowClass}
+                        data-testid={`workflow-summary-current-node-${node.node_id}`}
+                      >
+                        {content}
+                      </div>
+                    )
+                  })}
+                  {currentNodes.length > 2 && (
+                    <span className="shrink-0 text-[10px] text-muted-foreground">
+                      {tw("moreCurrentNodes", {
+                        count: currentNodes.length - 2,
+                      })}
+                    </span>
+                  )}
                 </div>
               )}
               {graphExpanded && <WorkflowGraphPanel snapshot={graph} compact />}

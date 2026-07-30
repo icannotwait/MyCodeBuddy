@@ -321,19 +321,179 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(screen.getByTestId("workflow-sessions-empty")).toBeInTheDocument()
   })
 
-  it("shows B11 required gate counts on plan phase", () => {
+  it("defaults to the current phase and moves the summary when selected", () => {
+    const planCurrent = { ...skeletonGraph(), current_phase_id: "plan" }
     renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
         activities={[]}
         conversationId={42}
-        workflowGraph={skeletonGraph()}
+        workflowGraph={planCurrent}
         defaultExpanded
       />
     )
-    const gate = screen.getByTestId("workflow-phase-gate-plan")
-    // required_count=2, returned=0 — optional reviewer must not inflate required
-    expect(gate).toHaveTextContent("0 / 2")
+
+    expect(screen.getByTestId("workflow-phase-plan")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-phase-summary")).toHaveTextContent(
+      "0 / 2 · 1 running"
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-phase-tasks"))
+    expect(screen.getByTestId("workflow-phase-tasks")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-phase-summary")).toHaveTextContent(
+      "Pending"
+    )
+  })
+
+  it("keeps sticky phase selection across live snapshot updates", () => {
+    const planCurrent = { ...skeletonGraph(), current_phase_id: "plan" }
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={planCurrent}
+        defaultExpanded
+      />
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-phase-plan"))
+    expect(screen.getByTestId("workflow-phase-plan")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={42}
+          workflowGraph={adaptiveTaskGraph(1)}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(screen.getByTestId("workflow-phase-plan")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+  })
+
+  it("resets phase selection to the latest current after leaving workflow segment", () => {
+    const planCurrent = { ...skeletonGraph(), current_phase_id: "plan" }
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={planCurrent}
+        defaultExpanded
+      />
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-phase-plan"))
+    expect(screen.getByTestId("workflow-phase-plan")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={42}
+          workflowGraph={adaptiveTaskGraph(1)}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-segment-sessions"))
+    fireEvent.click(screen.getByTestId("workflow-segment-workflow"))
+    expect(screen.getByTestId("workflow-phase-tasks")).toHaveAttribute(
+      "data-selected",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-phase-summary")).toHaveTextContent(
+      "Task 1 / 1"
+    )
+  })
+
+  it("caps summary current nodes at two and opens an actionable session", () => {
+    const threeCurrent: WorkflowGraphSnapshot = {
+      ...skeletonGraph(),
+      current_phase_id: "plan",
+      current_node_ids: ["current-1", "current-2", "current-3"],
+      nodes: [
+        node({
+          node_id: "current-1",
+          phase_id: "plan",
+          role: "implementer",
+          agent_type: "codex",
+          status: "running",
+          title: "First current node",
+          is_observed: true,
+          latest_child_conversation_id: 101,
+          round_count: 2,
+        }),
+        node({
+          node_id: "current-2",
+          phase_id: "plan",
+          role: "reviewer",
+          agent_type: "grok",
+          status: "running",
+          title: "Second current node",
+          is_observed: true,
+          latest_child_conversation_id: 102,
+        }),
+        node({
+          node_id: "current-3",
+          phase_id: "plan",
+          role: "reviewer",
+          agent_type: "claude",
+          status: "running",
+          title: "Third current node",
+          is_observed: true,
+          latest_child_conversation_id: 103,
+        }),
+      ],
+    }
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={threeCurrent}
+        defaultExpanded
+      />
+    )
+
+    expect(
+      screen.getAllByTestId(/^workflow-summary-current-node-/)
+    ).toHaveLength(2)
+    const firstCurrent = screen.getByTestId(
+      "workflow-summary-current-node-current-1"
+    )
+    expect(firstCurrent).toHaveTextContent("Running")
+    expect(firstCurrent).toHaveTextContent("Role: implementer")
+    expect(firstCurrent).toHaveTextContent("Agent: codex")
+    expect(firstCurrent).toHaveTextContent("Round 2")
+    const overflow = screen.getByText("+1")
+    expect(overflow.tagName).toBe("SPAN")
+    fireEvent.click(firstCurrent)
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({ childConversationId: 101 })
+    )
   })
 
   it("expands graph and marks estimated nodes non-openable", () => {
