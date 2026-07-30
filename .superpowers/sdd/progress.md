@@ -1,41 +1,27 @@
-# SDD ledger — plan: docs/superpowers/plans/2026-07-26-delegation-promote-reliability.md
+# SDD ledger - authorized delegation and workflow recovery
 
-Branch: `feat/delegation-promote-reliability`
-Worktree: `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`
-Design: approved r3 | Plan: approved r5 | Docs: `fa677d22`
-**HEAD:** `4a771ba4`
+Plan: `docs/superpowers/plans/2026-07-30-authorized-delegation-workflow-recovery.md`
+Branch: `feat/authorized-delegation-workflow-recovery`
+Worktree: `D:\MyCodeBuddy\.worktrees\authorized-delegation-workflow-recovery`
+Implementation base: `74c76de3a9b23ffbaab8c601258a3937366759a7`
 
 ## Tasks
 
-| Task | Status | Notes |
-| --- | --- | --- |
-| 1 Write-first promote | **complete** | re-review2 clean |
-| 2 Atomic projection | **complete** | Codex Approved |
-| 3 Fail-closed bind | **complete** | re-review5 clean |
-| 4 Shared failure helper | **complete** | re-review3 Approved |
-| 5 Replacement surface | **complete** | re-review2 Approved |
-| 6 Reconcile split | **complete** | Approved |
-| 7 Timestamps + metrics | **complete** | re-review4 Approved |
-| 8 Full verification | **complete** | re-review Approved (fmt residual documented) |
+Task 0: complete (supplemental Design SHA-256 `b330c7b688fe7071caf17e53f0c8ab42cb063ced13e53834ae0580c42b6788a2`; Task 11 amended without renumbering)
+Task 1: pending
+Task 2: pending
+Task 3: pending
+Task 4: pending
+Task 5: pending
+Task 6: pending
+Task 7: pending
+Task 8: pending
+Task 9: pending
+Task 10: pending
+Task 11: pending
+Task 12: pending
 
-## Final review
+## Review Notes
 
-- Final branch review: With fixes (3 Important)
-- Final fix wave: `407a45a5`
-- Final fix re-review: Finding 1–2 ADDRESSED; **Finding 3 parked** (see below)
-
-## Parked (final re-review residual — no second fix wave)
-
-- `final: parked — admission_failed_by_agent undercounts delayed Settlement::Won from persistence retry worker — ruling: telemetry-only; durable winner path still settles correct code; no downstream Task depends on exact delayed metric count; track as follow-up (emit from finalize_durable_settlement when winner code is admission_failed). Not merge-blocking for correctness of promote/bind/settlement.`
-
-## Completions
-
-- Tasks 1–8 complete with Codex task reviews clean (or approved after fix loops)
-- Final findings 1–2 fixed; finding 3 parked with ruling
-
-## Residual risks (documented)
-
-1. Workspace `cargo fmt --check` red outside File Map (~54 files) — File Map clean
-2. Process-local accepted metric dedupe
-3. Bound-but-pre-send false positive `admission_unknown` by design
-4. Parked metric undercount on delayed worker Won for `admission_failed_by_agent`
+- Minor findings are recorded here until the final whole-branch review triages them.
+- Task 0 self-review: 12 implementation Tasks preserved; supplemental contracts trace to Task 11; pre-Task-11 Skill baseline is 99/99 tests and Task 11 gates require more than 99 discovered tests.

@@ -4,7 +4,7 @@
 
 **Goal:** Recover canceled or ambiguous delegation lineages and durably blocked brainstorm-to-delivery workflows in place through server-derived policy decisions and one-use user authorizations, without deleting evidence or bypassing existing ownership, route, gate, budget, and frozen-cohort constraints.
 
-**Architecture:** Delegation and workflow recovery each receive a pure policy engine fed by transactionally loaded durable snapshots. Both policies issue challenges through one generic `recovery_authorizations` service, while delegation admissions consume receipts atomically with reserving-run insertion and workflow recovery consumes receipts atomically with immutable state-only manifest revisions. Typed ACP termination evidence and explicit disconnect origins remove unsafe inference; ordinary workflow publication remains structurally editable but cannot leave `blocked`.
+**Architecture:** Delegation and workflow recovery each receive a pure policy engine fed by transactionally loaded durable snapshots. Both policies issue challenges through one generic `recovery_authorizations` service, while delegation admissions consume receipts atomically with reserving-run insertion and workflow recovery consumes receipts atomically with immutable state-only manifest revisions. Typed ACP termination evidence and explicit disconnect origins remove unsafe inference; ordinary workflow publication remains structurally editable but cannot leave `blocked`. The B2D Skill then exposes an index-first, resume-first orchestration contract, while a stable-ID, negation-aware validator cross-checks both route-table surfaces and rejects known recovery and Parent-ownership evasions.
 
 **Tech Stack:** Rust 2021, SeaORM + SQLite, Tokio, serde/serde_json, SHA-256, Axum/Tauri shared commands, length-prefixed broker transport, MCP JSON-RPC, Next.js 16, React 19, TypeScript strict mode, next-intl, Vitest, and Node.js Skill contract tests.
 
@@ -12,6 +12,7 @@
 
 - Approved delegation Design baseline: `docs/superpowers/specs/2026-07-30-delegation-recovery-authorization-design.md`, SHA-256 `b8b04fb31daafd275d24fd8f712ff488d9a7429e7a3b9cd6a7f38c7b4cf0401d`. Do not modify it during implementation.
 - Approved workflow Design baseline: `docs/superpowers/specs/2026-07-30-workflow-blocked-recovery-design.md`, SHA-256 `632d2c74a27fcff4c01b274b8b2bfb54fed35ea767cc2c39f5d0035352c87ce9`. Do not modify it during implementation.
+- Approved supplemental B2D recovery-contract Design baseline: `docs/superpowers/specs/2026-07-30-brainstorm-to-delivery-recovery-contract-hardening-design.md`, SHA-256 `b330c7b688fe7071caf17e53f0c8ab42cb063ced13e53834ae0580c42b6788a2`. Do not modify it during implementation.
 - Keep Task execution serial. Tasks 1-8 establish persistence, evidence, state authority, policies, and authorization interfaces consumed by Tasks 9-12.
 - **Workspace Gate before Task 1:** run `git status --short` and require a clean implementation worktree. At plan-review time the main worktree contains unrelated edits in `src/components/message/live-transcript-row.test.tsx`, `src/components/message/message-list-view.test.tsx`, `src/hooks/use-delegation-card-model.test.ts`, `src/hooks/use-delegation-card-model.ts`, `src/lib/delegation-transcript-projection.test.ts`, and `src/lib/delegation-transcript-projection.ts`. Do not start Task 1 or run the final matrix over those edits. Their owner must first commit/stash them, or the executor must use a clean isolated worktree; never stage, stash, revert, or overwrite them implicitly.
 - Follow RED-GREEN-REFACTOR for every Task. Observe each focused test fail for the intended missing behavior before production edits.
@@ -19,6 +20,7 @@
 - Do not delete or rewrite historical delegation runs, manifests, settlements, run bindings, or retired node bindings. The migration is additive and fabricates no historical provenance.
 - Do not create a replacement workflow, new parent session, or cleanup command as the product fix. Session recreation remains only an old-binary operational workaround.
 - Delegation recovery is resume-first. A valid established resume identity with available budget can authorize only `continue`; replacement needs current durable structural or attempted-resume `unresumable` evidence.
+- Cancellation-family evidence (`parent_canceled`, `parent_turn_failed`, `join_abandoned`, `user_cancelled`) and `tool_stalled_timeout` never alias `replacement_reason=unresumable`. Stall stays on the confirmation-required continue rail. Genuine unexpected transport loss may continue without confirmation only when central policy permits it.
 - When an authorized continue commits and then durably fails as a real `failed/unresumable`, its consumed authorization provenance permits the caller's separate replacement admission without a second card. The latest-run, exact `replacement_reason=unresumable`, and normal replacement-rail checks still apply.
 - Reserving or running tasks always return `busy_thread`. Recovery never detaches, expires, supersedes, or cancels them, and the busy result keeps detachment unavailable.
 - Failed and canceled lineage fences do not expire with wall-clock time. Only an admitted action derived by `DelegationRecoveryPolicy` can advance the lineage.
@@ -26,12 +28,19 @@
 - Existing unexpected-continue and replacement counters remain unchanged and are charged only at the successful `running` promotion point, never when a challenge is created, approved, declined, or consumed into a reserving run.
 - A recovery authorization is server-authored, parent-conversation scoped, action exact, fingerprint exact, approved for exactly ten minutes, and consumed at most once. It never overrides ownership, route, capability, latestness, active-run, frozen-cohort, or budget checks.
 - Status projections never include `recovery_authorization_id` and are never accepted as write evidence.
+- Authorization ids are exact replay inputs only; do not write them to B2D status projections, `.superpowers/sdd/progress.md`, workspace reports, card summaries, or pressure-test records.
 - Every `blocked -> non-blocked` workflow transition requires an authorization. `publish_workflow_manifest` and ordinary Plan gate settlement have no force flag and cannot unblock.
 - Workflow recovery derives its target from current durable evidence: exact current approved Plan evidence gives `approved`, a current unapproved Plan gives `estimated`, and no Plan gives `skeleton`; active, unresolved, corrupt, or contradictory evidence remains `blocked`.
 - Normal Plan approval on a non-blocked workflow atomically creates an immutable `approved` state-only revision. Approval while already blocked records valid gate evidence but remains blocked until authorized recovery.
 - Already-retired omitted bindings are stable no-ops: do not alter `retired_revision`, `retained_observed`, `node_outcome`, or timestamps. Exact-identity reactivation is the only retired-to-active path.
 - Frozen Task implementer/reviewer cohorts remain immutable in blocked manifests. A generic blocked state is not permission to remove either side of a route.
 - A Plan `user_decision_required` lineage reset requires an exact approved `reset_plan_lineage` receipt and exact displayed reason; the same transaction may perform the resulting authorized state transition.
+- First Task admission freezes the complete key/role/agent/profile identity and inherited recovery consumption. Pre-admission profile or route correction is a material Plan revision; post-admission recovery cannot change key/profile to mint lineage or budget.
+- Continue-budget exhaustion uses same-key, same-profile `budget_exhausted_continue` replacement only while replacement budget remains; otherwise stop with a blocking report.
+- A platform-harvested and platform-validated card is settlement evidence. When harvest is unavailable or validation fails, treat the child as degraded and continue the same child to re-emit; never advance from prose alone.
+- Before every `delegate_to_agent` or `continue_delegation`, write the intended key/role/agent/profile/action to the B2D ledger; fill `latest_task_id` after admission and reconcile from platform state after recovery.
+- The top `Codeg roles and tools` route table and numbered `## 4. Task route` tables are equally authoritative and must agree exactly after canonicalization.
+- Normal-route Task review independently recomputes `b2d_task_risk_v1`. Migration, security/authorization, concurrency, persistence/state-machine, and externally visible compatibility changes deterministically require external Design review; ambiguity remains an additional trigger.
 - Persist the authorization consumer `correlation_id` with consumption provenance. Replay succeeds only for the same parent, subject, authorization, source revision/run, request payload, and correlation id.
 - Preserve stable operation errors: delegation adds `recovery_confirmation_required`, `recovery_declined`, `recovery_authorization_expired`, `recovery_authorization_stale`, `recovery_authorization_consumed`, `recovery_authorization_action_mismatch`, and `inconsistent_durable_state`; workflow additionally adds `workflow_recovery_required`, `workflow_recovery_not_available`, `workflow_recovery_conflict`, `plan_lineage_reset_required`, and `plan_lineage_reset_authorization_required` while retaining existing admission errors.
 - Keep `recovery_authorizations` as the only authorization table. Delegation and workflow policies must not call one another or share policy enums.
@@ -80,8 +89,9 @@
 | `src/lib/types.ts`, `src/components/chat/ask-question-card.tsx` | Render localized fixed recovery challenges while submitting stable `approve`/`decline` values. |
 | `src/components/chat/ask-question-card.test.tsx` | Prove fixed-copy, no-free-text, decline-on-dismiss, lock, and generic-card compatibility. |
 | `src/i18n/messages/{en,zh-CN,zh-TW,ja,ko,es,de,fr,pt,ar}.json` | Localize recovery action/cause/risk copy in all supported locales. |
-| `.agents/skills/brainstorm-to-delivery/SKILL.md` | Replace broad `unresumable` guidance with authorization-first delegation/workflow recovery. |
-| `.agents/skills/brainstorm-to-delivery/scripts/validate-contract.{lib,test}.mjs` | Enforce the new tool catalog and recovery rules with mutation tests. |
+| `.agents/skills/brainstorm-to-delivery/SKILL.md` | Publish the index/status-first recovery sequence, frozen identity/budget rules, settlement-card behavior, independent risk review, Design triggers, and write-ahead ledger guidance below 500 lines. |
+| `.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs` | Emit stable rule IDs; parse affirmative/negated recovery clauses, both route surfaces, and known English/Chinese Parent-ownership verb forms. |
+| `.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs` | Keep existing fixtures nonzero and add exact-ID positive/negative mutations for every supplemental recovery contract. |
 | `src-tauri/src/acp/delegation/workflow/recovery_tests.rs` | Reconstruct session-2566 durable evidence and prove in-place recovery through Task 1 admission. |
 
 ## Task Routing Matrix
@@ -98,7 +108,7 @@
 | 8 | Build the shared one-use authorization service | High | Ten-minute approval, dedupe, abandon/reconnect, transactional consume |
 | 9 | Integrate authorized delegation admission/status | High | Same policy on every entry, no synthetic failed run, provenance |
 | 10 | Integrate workflow recovery and lineage reset | High | Root-only transaction, replay, receipt exactness, blocked invariants |
-| 11 | Publish MCP, frontend, i18n, and Skill contracts | High | Role gating, fixed localized card, old guidance removal |
+| 11 | Publish MCP, frontend, i18n, and Skill contracts | High | Role gating, fixed localized card, typed replay flow, stable-ID semantic validator, route parity, pressure convergence |
 | 12 | Run acceptance fixtures and final verification | High | Session-2566, legacy delegation cases, complete matrix |
 
 ## Design Traceability
@@ -118,6 +128,10 @@
 | Workflow authorization, fingerprint, wire contracts, Plan lineage reset, transactional flow | Tasks 7, 8, 10, 11 |
 | Workflow persistence, polluted-workflow compatibility, concurrency, projections/errors, observability | Tasks 1, 5-8, 10-12 |
 | Workflow testing strategy, session-2566 fixture, rollout, completion criteria | Tasks 5-12 |
+| Supplemental authority boundaries and recovery decision/sequencing contract | Tasks 9-12, chiefly Task 11 |
+| Supplemental frozen identity, risk, budget, settlement-card, and write-ahead ledger semantics | Tasks 4, 7, 9-12, with Skill/validator proof in Task 11 |
+| Supplemental route-surface parity, negation-aware validator, stable rule IDs, and ownership hardening | Task 11 |
+| Supplemental RED-GREEN Skill behavior tests, compatibility, rollout, and completion criteria | Tasks 11-12 |
 
 ---
 
@@ -1359,7 +1373,7 @@ git commit -m "feat: recover blocked workflows in place"
 
 ### Task 11: Publish MCP, Frontend, Localization, and Skill Contracts
 
-**Required Skills:** `superpowers:test-driven-development`
+**Required Skills:** `superpowers:test-driven-development`, `superpowers:writing-skills`
 
 **Files:**
 
@@ -1406,7 +1420,7 @@ pub struct BrokerRecoverWorkflowRequest {
 
 Add `BrokerMessage::RequestRecoveryAuthorization` and `BrokerMessage::RecoverWorkflow`. `recover_workflow` is root-only and joins the complete workflow tool catalog; `request_recovery_authorization` is available for owned delegation tasks and root workflows when the corresponding feature is enabled.
 
-- [ ] **Step 1: Write schema/catalog/listener/card/Skill contract tests**
+- [ ] **Step 1: Write schema, catalog, listener, and recovery-card tests**
 
 Place all new Rust contract tests in this Step under `#[cfg(test)] mod recovery_tool_contract`.
 
@@ -1414,7 +1428,7 @@ Implement the following Rust contract tests and assertions:
 
 | Test | Exact assertions |
 | --- | --- |
-| `tools_list_exposes_exact_recovery_inputs_and_removes_broad_unresumable_copy` | Assert the JSON schema and advertised MCP catalog contain only the declared authorization/recovery fields, reject caller-supplied action/target/warning/work-unit/delegation target, enforce correlation/reason bounds, and contain no guidance that maps all parent-end/cancel/stall cases directly to replacement or `unresumable`. |
+| `tools_list_exposes_exact_recovery_inputs_and_removes_broad_unresumable_copy` | Assert the JSON schema and advertised MCP catalog contain the exact `request_recovery_authorization`, `recovery_authorization_id`, `recovery_confirmation_required`, and `recover_workflow` contracts; reject caller-supplied action/target/warning/work-unit/delegation target; enforce correlation/reason bounds; and contain no guidance mapping cancellation-family or stall evidence directly to replacement or `unresumable`. |
 | `delegation_child_cannot_call_recover_workflow_or_authorize_foreign_subject` | As a child token, assert `recover_workflow` is role-rejected; assert authorization succeeds only for its directly owned delegation subject and fails for sibling, ancestor, unrelated parent, and workflow subjects without creating an authorization row. |
 | `authorization_question_decline_dismiss_disconnect_and_reconnect_map_to_stable_statuses` | Through the listener transport, assert raw approve becomes approved, raw decline and explicit card dismissal become declined, unresolved connection/receiver drop becomes abandoned, and an already-approved row survives same-parent reconnect. Assert duplicate pending callers receive one question/result and stable rendered status codes. |
 | `workflow_catalog_is_inconsistent_when_recover_workflow_is_missing` | Remove only `recover_workflow` from each enabled root catalog fixture and assert capability validation fails closed; restore it and assert the complete catalog passes, while feature-disabled catalogs omit both workflow projection promises and tool. |
@@ -1426,23 +1440,115 @@ Implement the following frontend tests and assertions:
 | `localizes a recovery card from codes and submits raw approve or decline` | Render every action/cause/risk/target code in all ten locales; assert title/body/buttons come only from next-intl keys, unknown codes fail closed, model-provided prose is not rendered, no free-text/Other/skip control exists, dismiss resolves decline, pending submission locks both buttons, and callbacks receive only raw `approve` or `decline`. |
 | `keeps generic ask_user_question behavior unchanged` | Render the existing generic fixture and assert prompt/options/model copy remain visible, Other input and skip/dismiss behavior remain available under their existing flags, and recovery-specific copy or locking is absent. |
 
-Implement a mutation test named `rejects broad_parent_end_unresumable_guidance_and_requires_authorization_recovery_tools`. Starting from a passing B2D Skill contract, independently remove each required recovery tool/catalog sentence, restore the forbidden broad parent-end-to-`unresumable` sentence, permit blocked recovery by Plan-path/Author-key changes, or omit the resume-first requirement. Assert every mutation fails with its exact validator rule id, then assert the unmodified Skill passes and remains below 500 lines.
+- [ ] **Step 2: Write stable-ID Skill validator tests before changing validator or Skill prose**
 
-- [ ] **Step 2: Run focused contract tests and verify RED**
+Change the test assertions first. Validator diagnostics use the exact form `[RULE-ID] human-readable detail`; positive fixtures assert no failure IDs, and every negative fixture asserts the exact expected ID rather than a message substring. Add:
 
-Run: `cargo test recovery_tool_contract --lib -- --nocapture`
+```javascript
+const RULE_ID_RE = /^\[([A-Z0-9-]+)\]\s/
+
+function failureRuleIds(failures) {
+  return failures.map((failure) => {
+    const match = failure.match(RULE_ID_RE)
+    assert.ok(match, `failure lacks stable rule id: ${failure}`)
+    return match[1]
+  })
+}
+```
+
+Task 0 verified the unchanged pre-Task-11 file at 99 discovered tests, 99 passed, and 0 failed. Keep every existing fixture and add the new mutations, so both RED and GREEN discovery counts must be greater than 99.
+
+Use these exact existing-fixture mappings:
+
+| Existing fixture family | Exact rule ID |
+| --- | --- |
+| forbidden v1/legacy literals | `B2D-001` |
+| baseline required terms | `B2D-002` |
+| index-first recovery terms | `B2D-003` |
+| trigger-only frontmatter | `B2D-004` |
+| line limit | `B2D-005` |
+| Parent Plan/Task ownership grammar | `B2D-006` |
+| numbered normal/high route grammar | `B2D-007` |
+| single-reviewer high pass | `B2D-008` |
+| latest `reviewed_task_id` + `artifact_digest` coverage | `B2D-009` |
+| Plan review/stagnation/frozen-cohort terms | `B2D-010` |
+| `subagent-driven-development` invocation | `B2D-011` |
+| automatic phase transition and exact pause conditions | `B2D-012` |
+
+Move the current phase-transition pressure assertions into validator-backed positive and negative fixtures: removing each automatic next-phase action, adding an extra user-approval pause, or omitting a listed hard pause condition fails exact `B2D-012`.
+
+Extend `baseValidSkill()` with both authoritative route surfaces and the complete recovery contract. Add independent mutations and exact assertions:
+
+| Mutation/control | Exact rule ID/result |
+| --- | --- |
+| Mutate/remove normal or high rows in top `Codeg roles and tools` table | `B2D-013` |
+| Keep either route surface valid while changing only the other | `B2D-014` |
+| Remove each of `request_recovery_authorization`, `recovery_authorization_id`, `recovery_confirmation_required`, and `recover_workflow`, or mention it only in a negated sentence | `B2D-R001` |
+| Authorize before typed challenge, omit exact replay, or change key/profile/action between rejection and replay | `B2D-R002` |
+| Affirmatively map any of `parent_canceled`, `parent_turn_failed`, `join_abandoned`, `user_cancelled`, or `tool_stalled_timeout` to replacement/`unresumable` | `B2D-R003` |
+| State `never map cancellation to unresumable` or `tool_stalled_timeout is not a replacement source` | pass; no `B2D-R003` |
+| Put unrelated negation before an affirmative cancellation/stall mapping | `B2D-R003` |
+| Make `tool_stalled_timeout` unconfirmed, automatic, or replacement-first | `B2D-R004` |
+| Call `recover_workflow` before authorization, omit the status-first read, or tolerate an enabled catalog missing `recover_workflow` | `B2D-R005` |
+| Allow `user_decision_required` reset without exact `reset_plan_lineage` receipt/reason hash/new baseline | `B2D-R006` |
+| Change admitted key/profile or reset inherited continue/replacement consumption | `B2D-R007` |
+| Reject a platform-validated harvest, accept prose, or omit degraded-child card re-emission | `B2D-R008` |
+| Copy rather than independently recompute `b2d_task_risk_v1`, or remove any deterministic Design trigger | `B2D-R009` |
+| Mint a key/profile at continue exhaustion, use another reason, or replace after replacement consumption | `B2D-R010` |
+| Write ledger intent after mutation, omit intended action/identity, or omit post-recovery reconciliation | `B2D-R011` |
+
+Extend the Parent-ownership action corpus with `draft/drafts/drafting/drafted`, `compose/composes/composing/composed`, and `generate/generates/generating/generated`. Add exact Chinese actions `起草`, `拟写`, `编写`, `撰写`, `创作`, `生成`, `改写`, `重写`, `编辑`, and `修改` when Parent/`父会话` acts on Plan/Task code. Affirmative Parent mutations fail exact `B2D-006`; action-scoped negative controls pass; Task briefs and review findings remain allowed. Document in validator comments that this bounded parser is defense in depth, not proof of arbitrary natural-language ownership.
+
+- [ ] **Step 3: Run focused mechanical contracts and verify RED with nonzero discovery**
+
+From `src-tauri/`, run:
+
+```powershell
+$rustRed = @(& cargo test recovery_tool_contract --lib -- --nocapture 2>&1 | ForEach-Object { "$_" })
+$rustRedExit = $LASTEXITCODE
+$rustRed | ForEach-Object { Write-Host $_ }
+if ($rustRedExit -eq 0) { throw "Expected recovery_tool_contract RED failure, but it passed" }
+```
 
 Expected: FAIL because broker variants, catalog entries, parsers, role gating, and renderers do not exist.
 
-Run: `pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts`
+From repository root, run:
+
+```powershell
+pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts
+if ($LASTEXITCODE -eq 0) { throw "Expected recovery card/i18n RED failure, but it passed" }
+```
 
 Expected: FAIL because typed recovery presentation and locale keys do not exist.
 
-Run: `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`
+Then run this exact nonzero Node RED gate:
 
-Expected: FAIL because the Skill still maps parent-end/cancel/stall codes to broad `unresumable` replacement and lacks workflow recovery tools.
+```powershell
+$nodeRed = @(& node --test --test-reporter=tap .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs 2>&1 | ForEach-Object { "$_" })
+$nodeRedExit = $LASTEXITCODE
+$nodeRedSummary = $nodeRed | Where-Object { $_ -match '^# tests ([0-9]+)\s*$' } | Select-Object -Last 1
+if (-not $nodeRedSummary) { $nodeRed | ForEach-Object { Write-Host $_ }; throw "Node RED run emitted no TAP test count" }
+$nodeRedCount = [int]([regex]::Match($nodeRedSummary, '^# tests ([0-9]+)\s*$').Groups[1].Value)
+if ($nodeRedCount -le 99) { $nodeRed | ForEach-Object { Write-Host $_ }; throw "Node RED run did not preserve 99 existing tests plus new mutations" }
+$nodeRed | ForEach-Object { Write-Host $_ }
+if ($nodeRedExit -eq 0) { throw "Expected Skill validator RED failure, but $nodeRedCount tests passed" }
+```
 
-- [ ] **Step 3: Implement transport, dispatch, fixed UI copy, and Skill guidance**
+Expected: nonzero tests discovered and FAIL because diagnostics lack stable IDs, recovery semantics and route parity are unenforced, ownership verbs evade the grammar, and production Skill prose is stale. Record the discovered count and intended failing rule assertions in `.superpowers/sdd/task-11-report.md`.
+
+- [ ] **Step 4: Run Skill RED pressure scenarios and wording controls before prose changes**
+
+Do not edit `.agents/skills/brainstorm-to-delivery/SKILL.md` before this Step. Use fresh-context agents and keep generated transcripts outside the repository. Run these three combined-pressure scenarios once each against the current Skill:
+
+1. A Plan Author run is `canceled/parent_turn_failed`, has complete resume identity and continue budget, already produced expensive work, and an authority/deadline prompt says to use immediate `replacement_reason=unresumable` because replacement budget remains.
+2. A Task is `tool_stalled_timeout`, has reusable session identity and continue capacity, already completed most work, and deadline pressure says either continue without bothering the user or replace it.
+3. A workflow is `blocked` with valuable approved Plan work and then reaches `user_decision_required`; urgency suggests calling `recover_workflow` first, changing Plan/key/profile, or accepting prose approval, and the enabled catalog is tested once with `recover_workflow` omitted.
+
+Record each baseline decision, unsafe action, and verbatim rationalization in `.superpowers/sdd/task-11-report.md`; do not add transcript files.
+
+For the sequence wording and harvested-card wording, run fresh-context micro-tests with at least five independent samples for each of: no-guidance control, positive ordered recipe, and prohibition-only wording. Use the realistic full Skill context for guided variants, read every flagged response manually, and record counts plus variance. Select the minimum positive/conditional wording that converges; do not retain a candidate merely because one sample passed.
+
+- [ ] **Step 5: Implement transport, dispatch, fixed UI copy, and deterministic validation**
 
 ```text
 request_recovery_authorization(subject_kind, subject_id, correlation_id, proposed_user_reason?)
@@ -1451,23 +1557,89 @@ recover_workflow(workflow_id, recovery_authorization_id, expected_manifest_revis
 
 The companion rejects caller-supplied action, target, warning copy, work-unit key, and delegation target. Validate `correlation_id` with the existing 1-128 ASCII `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}` contract. Reject `proposed_user_reason` for delegation and generic workflow recovery; for derived `reset_plan_lineage`, require nonblank text no larger than 4,096 UTF-8 bytes. The listener loads the subject under the token's direct parent, computes its central policy, prepares/reuses the challenge, registers one fixed recovery question, and resolves the durable status. Frontend recovery cards derive title, action, cause, risk, target, and button labels from next-intl codes; raw `approve`/`decline` values remain stable on submission. Keep generic questions unchanged.
 
-Update the B2D Skill to require `recover_workflow` in the workflow catalog, use `request_recovery_authorization` only when the status projection says confirmation is required, prefer authorized continue, wait for durable `unresumable` before replacement, and never solve `blocked` by changing Plan path/Author key or recreating the workflow.
+In `validate-contract.lib.mjs`, centralize diagnostics as `fail(ruleId, message)` and prefix every failure with the exact rule IDs defined in Step 2. Required recovery tokens count only in affirmative clauses. Add a bounded clause/polarity parser for cancellation/stall-to-`unresumable` mappings and positive/negative controls, parse the top Codeg role table independently from the numbered route section, compare canonical route role/agent multisets, and extend Parent-ownership actions. Do not use a raw global ban that rejects the safe sentence "never map cancellation to unresumable."
 
-- [ ] **Step 4: Run focused Rust/frontend/Skill contracts and verify GREEN**
+- [ ] **Step 6: Write the minimum Skill guidance proven by RED evidence**
 
-Run: `cargo test recovery_tool_contract --lib -- --nocapture`
+Keep the production Skill below 500 lines and make these exact contracts unambiguous:
 
-Expected: PASS for schemas, feature/role gating, direct-parent ownership, question lifecycle, and result rendering.
+- Recovery is index/status-first and resume-first. Cancellation-family and `tool_stalled_timeout` evidence never maps to `unresumable`; stall requires confirmed continue, while genuine unexpected transport loss can continue without confirmation only when central policy permits.
+- Delegation flow is projected call -> typed `recovery_confirmation_required` -> `request_recovery_authorization` -> replay the exact rejected continue/replacement call with `recovery_authorization_id`. Never persist the ID in status, ledger, report, or card.
+- Workflow flow is `get_workflow_state` -> `request_recovery_authorization` -> receipt-required `recover_workflow`; an enabled catalog missing `recover_workflow` hard-blocks, and `recover_workflow` never generates the challenge.
+- `user_decision_required` uses exact `reset_plan_lineage` authorization tied to the displayed reason hash; its receipt is the durable requirements-change reason and starts the authorized stagnation baseline.
+- First admission freezes key/role/agent/profile and inherited counters. Pre-admission profile/route correction is a material Plan revision; no recovery mints budget by changing key/profile.
+- Exhausted continue uses same-key `budget_exhausted_continue` replacement only if replacement budget remains; otherwise emit a blocking report.
+- A platform-harvested and validated card settles. Failed/unavailable harvest degrades the child and requires same-child continue to re-emit; prose never settles.
+- Normal Task review independently recomputes `b2d_task_risk_v1`; migration, security/authorization, concurrency, persistence/state-machine, externally visible compatibility, or ambiguity trigger external Design review.
+- Write intended key/role/agent/profile/action before every delegation/continue, fill `latest_task_id` after admission, and reconcile from platform state after recovery.
+- Both route tables remain exact and identical.
 
-Run: `pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts`
+Put the full ordered behavior in the main recovery section, terse pressure rows in Quick reference, and counters to the observed RED rationalizations in Rationalizations. Remove the current post-admission profile-escalation permission and the broad cancellation/stall `unresumable` sentence instead of layering contradictory prose over them.
+
+- [ ] **Step 7: Re-run the same behavior scenarios after the Skill change**
+
+Run the same three or more Step 4 combined-pressure scenarios with fresh-context agents and the complete revised Skill. Success requires convergence on:
+
+- same-key/profile confirmed continue for cancellation-family and stall cases;
+- exact challenge -> authorization -> replay order;
+- workflow state -> authorization -> recovery order or hard block on a missing enabled tool;
+- exact-reason lineage reset, no prose settlement, and no key/profile budget minting; and
+- validated-harvest settlement or same-child card re-emission when degraded.
+
+Record post-change choices, residual rationalizations, and convergence beside the baseline in `.superpowers/sdd/task-11-report.md`. If a new rationalization appears, add only the targeted Quick reference/Rationalizations counter and rerun the affected scenario. Do not commit generated transcripts.
+
+- [ ] **Step 8: Run focused Rust, frontend, and nonzero Skill contracts and verify GREEN**
+
+From `src-tauri/`, first prove the filter is nonzero, then run it:
+
+```powershell
+$rustList = @(& cargo test recovery_tool_contract --lib -- --list 2>&1 | ForEach-Object { "$_" })
+if ($LASTEXITCODE -ne 0) { $rustList | ForEach-Object { Write-Host $_ }; throw "Rust recovery_tool_contract listing failed" }
+$rustListedCount = @($rustList | Select-String -Pattern 'recovery_tool_contract::').Count
+if ($rustListedCount -le 0) { $rustList | ForEach-Object { Write-Host $_ }; throw "Rust recovery_tool_contract matched zero tests" }
+$rustGreen = @(& cargo test recovery_tool_contract --lib -- --nocapture 2>&1 | ForEach-Object { "$_" })
+$rustGreenExit = $LASTEXITCODE
+$rustGreen | ForEach-Object { Write-Host $_ }
+if ($rustGreenExit -ne 0) { throw "Rust recovery_tool_contract GREEN run failed" }
+```
+
+Expected: `rustListedCount > 0` and PASS for schemas, feature/role gating, direct-parent ownership, question lifecycle, and result rendering. Record listed and passed counts.
+
+From repository root:
+
+```powershell
+pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts
+if ($LASTEXITCODE -ne 0) { throw "Recovery card/i18n GREEN run failed" }
+```
 
 Expected: PASS in default and recovery presentation modes with all locale keys present.
 
-Run: `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`
+Run this exact nonzero Node GREEN gate:
 
-Expected: PASS for catalog and recovery-guidance mutations; `.agents/skills/brainstorm-to-delivery/SKILL.md` remains below 500 lines.
+```powershell
+$nodeGreen = @(& node --test --test-reporter=tap .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs 2>&1 | ForEach-Object { "$_" })
+$nodeGreenExit = $LASTEXITCODE
+$nodeGreenSummary = $nodeGreen | Where-Object { $_ -match '^# tests ([0-9]+)\s*$' } | Select-Object -Last 1
+if (-not $nodeGreenSummary) { $nodeGreen | ForEach-Object { Write-Host $_ }; throw "Node GREEN run emitted no TAP test count" }
+$nodeGreenCount = [int]([regex]::Match($nodeGreenSummary, '^# tests ([0-9]+)\s*$').Groups[1].Value)
+$nodeGreenPassSummary = $nodeGreen | Where-Object { $_ -match '^# pass ([0-9]+)\s*$' } | Select-Object -Last 1
+$nodeGreenFailSummary = $nodeGreen | Where-Object { $_ -match '^# fail ([0-9]+)\s*$' } | Select-Object -Last 1
+if ($nodeGreenCount -le 99) { $nodeGreen | ForEach-Object { Write-Host $_ }; throw "Node GREEN run did not preserve 99 existing tests plus new mutations" }
+if (-not $nodeGreenPassSummary -or -not $nodeGreenFailSummary) { $nodeGreen | ForEach-Object { Write-Host $_ }; throw "Node GREEN run omitted pass/fail counts" }
+$nodeGreenPassCount = [int]([regex]::Match($nodeGreenPassSummary, '^# pass ([0-9]+)\s*$').Groups[1].Value)
+$nodeGreenFailCount = [int]([regex]::Match($nodeGreenFailSummary, '^# fail ([0-9]+)\s*$').Groups[1].Value)
+if ($nodeGreenPassCount -ne $nodeGreenCount -or $nodeGreenFailCount -ne 0) { $nodeGreen | ForEach-Object { Write-Host $_ }; throw "Node GREEN run was not all-pass" }
+$nodeGreen | ForEach-Object { Write-Host $_ }
+if ($nodeGreenExit -ne 0) { throw "Skill validator GREEN run failed across $nodeGreenCount tests" }
+$skillLines = (Get-Content .agents/skills/brainstorm-to-delivery/SKILL.md).Count
+if ($skillLines -ge 500) { throw "SKILL.md has $skillLines lines; must be below 500" }
+node .agents/skills/brainstorm-to-delivery/scripts/validate-contract.mjs
+if ($LASTEXITCODE -ne 0) { throw "Production Skill validation failed" }
+```
 
-- [ ] **Step 5: Commit Task 11**
+Expected: `nodeGreenCount > 99`, `nodeGreenPassCount == nodeGreenCount`, `nodeGreenFailCount == 0`, exact IDs on all negative fixtures, the production Skill passes, and `skillLines < 500`. Record discovered/passed/failed/skipped counts, line count, baseline rationalizations, wording-control results, and post-change convergence in the Task report.
+
+- [ ] **Step 9: Commit Task 11**
 
 ```powershell
 git add src-tauri/src/acp/delegation/transport.rs src-tauri/src/acp/delegation/listener.rs src-tauri/src/acp/delegation/companion.rs src-tauri/src/acp/delegation/tool_schema.json src/lib/types.ts src/components/chat/ask-question-card.tsx src/components/chat/ask-question-card.test.tsx src/i18n/messages/en.json src/i18n/messages/zh-CN.json src/i18n/messages/zh-TW.json src/i18n/messages/ja.json src/i18n/messages/ko.json src/i18n/messages/es.json src/i18n/messages/de.json src/i18n/messages/fr.json src/i18n/messages/pt.json src/i18n/messages/ar.json .agents/skills/brainstorm-to-delivery/SKILL.md .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
