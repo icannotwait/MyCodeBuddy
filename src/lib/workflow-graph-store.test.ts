@@ -132,6 +132,28 @@ function node(
   }
 }
 
+type Deferred<T> = {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 8; index += 1) {
+    await Promise.resolve()
+  }
+}
+
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   getWorkflowGraphSnapshot.mockReset()
@@ -171,21 +193,18 @@ describe("workflow-graph-store revision gate", () => {
         })
     )
 
-    const unmount = useWorkflowGraphStore.getState().mountConversation(11)
+    const release = useWorkflowGraphStore.getState().activateConversation(11)
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(11, baseSnapshot({ graph_revision: 1 }))
 
-    // First nudge starts gen=1 fetch.
-    useWorkflowGraphStore.getState().handleCompatibilityNudge({
-      parent_conversation_id: 11,
-    })
+    // The automatic initial refresh is generation 1.
+    await vi.waitFor(() => expect(resolvers.length).toBe(1))
     expect(
       useWorkflowGraphStore.getState().getEntry(11)?.requestGeneration
     ).toBe(1)
-    await vi.waitFor(() => expect(resolvers.length).toBe(1))
 
-    // Second nudge supersedes before first resolves (gen=2).
+    // The compatibility nudge supersedes it with generation 2.
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 11,
     })
@@ -218,17 +237,30 @@ describe("workflow-graph-store revision gate", () => {
       "fresh"
     )
 
-    unmount()
+    release()
   })
 
   it("graph_changed with lower-or-equal revision does not refetch", async () => {
-    getWorkflowGraphSnapshot.mockResolvedValue(
-      baseSnapshot({ graph_revision: 10 })
-    )
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 5 }))
+      .mockResolvedValue(baseSnapshot({ graph_revision: 10 }))
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(3, baseSnapshot({ graph_revision: 5 }))
-    useWorkflowGraphStore.getState().mountConversation(3)
+    const release = useWorkflowGraphStore.getState().activateConversation(3)
+
+    await vi.waitFor(() => {
+      expect(
+        useWorkflowGraphStore.getState().getSnapshot(3)?.graph_revision
+      ).toBe(5)
+    })
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(3, baseSnapshot({ graph_revision: 5 }))
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(3)?.graph_revision
+    ).toBe(5)
+    getWorkflowGraphSnapshot.mockClear()
 
     useWorkflowGraphStore.getState().handleGraphChanged({
       parent_conversation_id: 3,
@@ -250,11 +282,8 @@ describe("workflow-graph-store revision gate", () => {
     await vi.waitFor(() => {
       expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(3)
     })
-    await vi.waitFor(() => {
-      expect(
-        useWorkflowGraphStore.getState().getSnapshot(3)?.graph_revision
-      ).toBe(10)
-    })
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    release()
   })
 
   it("compatibility_nudge refetches with local request generation", async () => {
@@ -266,7 +295,16 @@ describe("workflow-graph-store revision gate", () => {
         workflow_id: null,
       })
     )
-    const unmount = useWorkflowGraphStore.getState().mountConversation(9)
+    const release = useWorkflowGraphStore.getState().activateConversation(9)
+    await vi.waitFor(() => {
+      expect(
+        useWorkflowGraphStore.getState().getSnapshot(9)?.compatibility
+      ).toBe("observed_only")
+    })
+    const generationAfterInitial =
+      useWorkflowGraphStore.getState().getEntry(9)?.requestGeneration ?? 0
+    getWorkflowGraphSnapshot.mockClear()
+
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 9,
     })
@@ -275,10 +313,729 @@ describe("workflow-graph-store revision gate", () => {
         useWorkflowGraphStore.getState().getSnapshot(9)?.compatibility
       ).toBe("observed_only")
     })
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
     expect(
       useWorkflowGraphStore.getState().getEntry(9)?.requestGeneration
-    ).toBeGreaterThan(0)
-    unmount()
+    ).toBe(generationAfterInitial + 1)
+    release()
+  })
+})
+
+describe("workflow activation lifecycle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("waits for both listener attempts before the first activation refresh", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 2 })
+    )
+
+    const release = useWorkflowGraphStore.getState().activateConversation(41)
+    changed.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(41)
+    release()
+  })
+
+  it("keeps the pending initial refresh when the zero-to-one lease releases first", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 2 })
+    )
+
+    const firstRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(42)
+    const secondRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(42)
+    firstRelease()
+
+    changed.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+
+    firstRelease()
+    secondRelease()
+  })
+
+  it("keeps one listener install until two different conversations both release", async () => {
+    const changedDispose = vi.fn()
+    const nudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged.mockResolvedValue(changedDispose)
+    subscribeWorkflowCompatibilityNudge.mockResolvedValue(nudgeDispose)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const firstRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(51)
+    const secondRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(52)
+    await flushMicrotasks()
+
+    expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
+    expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+
+    firstRelease()
+    expect(changedDispose).not.toHaveBeenCalled()
+    expect(nudgeDispose).not.toHaveBeenCalled()
+
+    secondRelease()
+    expect(changedDispose).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps a successful listener owned when its sibling rejects", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    const nudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const release = useWorkflowGraphStore.getState().activateConversation(53)
+    changed.reject(new Error("changed unavailable"))
+    await flushMicrotasks()
+    vi.advanceTimersByTime(4_999)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    nudge.resolve(nudgeDispose)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(53)
+    expect(nudgeDispose).not.toHaveBeenCalled()
+
+    release()
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+    release()
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("starts refresh-only mode at the five-second readiness deadline", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    const changedDispose = vi.fn()
+    const lateNudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const release = useWorkflowGraphStore.getState().activateConversation(54)
+    changed.resolve(changedDispose)
+    await flushMicrotasks()
+    vi.advanceTimersByTime(4_999)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(54)
+
+    release()
+    expect(changedDispose).toHaveBeenCalledTimes(1)
+    nudge.resolve(lateNudgeDispose)
+    await flushMicrotasks()
+    expect(lateNudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("deactivation before readiness prevents the initial refresh", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    const changedDispose = vi.fn()
+    const nudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(55)
+    release()
+    changed.resolve(changedDispose)
+    nudge.resolve(nudgeDispose)
+    await flushMicrotasks()
+    vi.advanceTimersByTime(5_001)
+    await flushMicrotasks()
+
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(changedDispose).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("old readiness callback and deadline cannot fetch into a reactivated epoch", async () => {
+    const changed1 = deferred<() => void>()
+    const nudge1 = deferred<() => void>()
+    const changed2 = deferred<() => void>()
+    const nudge2 = deferred<() => void>()
+    const changedDispose1 = vi.fn()
+    const nudgeDispose1 = vi.fn()
+    const changedDispose2 = vi.fn()
+    const nudgeDispose2 = vi.fn()
+    subscribeWorkflowGraphChanged
+      .mockReturnValueOnce(changed1.promise)
+      .mockReturnValueOnce(changed2.promise)
+    subscribeWorkflowCompatibilityNudge
+      .mockReturnValueOnce(nudge1.promise)
+      .mockReturnValueOnce(nudge2.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const release1 = useWorkflowGraphStore.getState().activateConversation(56)
+    vi.advanceTimersByTime(4_999)
+    await flushMicrotasks()
+    release1()
+    const release2 = useWorkflowGraphStore.getState().activateConversation(56)
+
+    vi.advanceTimersByTime(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    changed1.resolve(changedDispose1)
+    nudge1.resolve(nudgeDispose1)
+    await flushMicrotasks()
+    expect(changedDispose1).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose1).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    changed2.resolve(changedDispose2)
+    nudge2.resolve(nudgeDispose2)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(56)
+
+    release2()
+    expect(changedDispose2).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose2).toHaveBeenCalledTimes(1)
+  })
+
+  it("a stale lease cannot release a later activation epoch", async () => {
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const staleRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(57)
+    useWorkflowGraphStore.getState().reset()
+    const liveRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(57)
+    staleRelease()
+    staleRelease()
+    await flushMicrotasks()
+    getWorkflowGraphSnapshot.mockClear()
+
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 57,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(57)
+    liveRelease()
+  })
+
+  it("ignores non-positive conversation ids", async () => {
+    const releaseZero = useWorkflowGraphStore.getState().activateConversation(0)
+    const releaseNegative = useWorkflowGraphStore
+      .getState()
+      .activateConversation(-1)
+    await flushMicrotasks()
+
+    expect(subscribeWorkflowGraphChanged).not.toHaveBeenCalled()
+    expect(subscribeWorkflowCompatibilityNudge).not.toHaveBeenCalled()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    releaseZero()
+    releaseNegative()
+  })
+})
+
+describe("active workflow refresh scheduling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("refreshes every ten minutes and resets the clock after event convergence", async () => {
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 4 }))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 5 }))
+
+    const release = useWorkflowGraphStore.getState().activateConversation(71)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000)
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 71,
+      workflow_id: "wf-1",
+      graph_revision: 3,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+    release()
+  })
+
+  it("ignores graph events for inactive detail seeds", async () => {
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(72, baseSnapshot({ graph_revision: 2 }))
+
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 72,
+      workflow_id: "wf-1",
+      graph_revision: 3,
+    })
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 72,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+  })
+
+  it("equal and lower graph revisions neither fetch nor reset the timer", async () => {
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 5 })
+    )
+
+    const release = useWorkflowGraphStore.getState().activateConversation(73)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000)
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 73,
+      workflow_id: "wf-1",
+      graph_revision: 5,
+    })
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 73,
+      workflow_id: "wf-1",
+      graph_revision: 4,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
+  })
+
+  it("a compatibility nudge fetches only while active and resets fallback from completion", async () => {
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 3 }))
+
+    const release = useWorkflowGraphStore.getState().activateConversation(74)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000)
+
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 74,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
+    release()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 74,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+  })
+
+  it("one of two leases keeps event and fallback eligibility", async () => {
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const firstRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(75)
+    const finalRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(75)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    firstRelease()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 75,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
+    finalRelease()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 75,
+    })
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+  })
+
+  it("pending-readiness duplicate leases share one fallback after the creator releases", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const creatorRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(76)
+    const remainingRelease = useWorkflowGraphStore
+      .getState()
+      .activateConversation(76)
+    creatorRelease()
+
+    changed.resolve(vi.fn())
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    remainingRelease()
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+  })
+
+  it("a current response behind a newer cached revision still rearms fallback", async () => {
+    const initial = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot
+      .mockReturnValueOnce(initial.promise)
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 10 }))
+
+    const release = useWorkflowGraphStore.getState().activateConversation(77)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(77, baseSnapshot({ graph_revision: 9 }))
+    initial.resolve(baseSnapshot({ graph_revision: 8 }))
+    await flushMicrotasks()
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(77)?.graph_revision
+    ).toBe(9)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
+  })
+
+  it("stale generation completion never arms a timer", async () => {
+    const stale = deferred<WorkflowGraphSnapshot | null>()
+    const current = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockReturnValueOnce(stale.promise)
+      .mockReturnValueOnce(current.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(78)
+    await flushMicrotasks()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 78,
+    })
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 78,
+    })
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
+    stale.resolve(baseSnapshot({ graph_revision: 99 }))
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
+    current.resolve(baseSnapshot({ graph_revision: 2 }))
+    await flushMicrotasks()
+    release()
+  })
+
+  it("old activation epoch completion cannot arm a reactivated epoch timer", async () => {
+    const oldRequest = deferred<WorkflowGraphSnapshot | null>()
+    const newRequest = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(newRequest.promise)
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 3 }))
+
+    const oldRelease = useWorkflowGraphStore.getState().activateConversation(79)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    oldRelease()
+
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    const newRelease = useWorkflowGraphStore.getState().activateConversation(79)
+
+    oldRequest.resolve(baseSnapshot({ graph_revision: 1 }))
+    await flushMicrotasks()
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(79)?.graph_revision
+    ).toBe(1)
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    changed.resolve(vi.fn())
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1_000 + 55 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    newRequest.resolve(baseSnapshot({ graph_revision: 2 }))
+    await flushMicrotasks()
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+    newRelease()
+  })
+
+  it("final release clears fallback and late completion cannot rearm it", async () => {
+    const request = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot.mockReturnValue(request.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(80)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    release()
+    request.resolve(baseSnapshot({ graph_revision: 2 }))
+    await flushMicrotasks()
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(80)?.graph_revision
+    ).toBe(2)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it("null preserves an existing graph but remains empty without a cache", async () => {
+    useWorkflowGraphStore.getState().applyFromDetail(
+      81,
+      baseSnapshot({
+        graph_revision: null,
+        compatibility: "observed_only",
+        overall_state: "observed_only",
+      })
+    )
+    getWorkflowGraphSnapshot.mockResolvedValue(null)
+
+    const releaseExisting = useWorkflowGraphStore
+      .getState()
+      .activateConversation(81)
+    const releaseEmpty = useWorkflowGraphStore
+      .getState()
+      .activateConversation(82)
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    const existing = useWorkflowGraphStore.getState().getEntry(81)
+    expect(existing?.snapshot?.compatibility).toBe("observed_only")
+    expect(existing?.error).toBe("Workflow graph snapshot unavailable")
+    const empty = useWorkflowGraphStore.getState().getEntry(82)
+    expect(empty?.snapshot).toBeNull()
+    expect(empty?.error).toBeNull()
+
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(4)
+    releaseExisting()
+    releaseEmpty()
+  })
+
+  it("failed refresh retains the graph and retries only at the next interval", async () => {
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(83, baseSnapshot({ graph_revision: 3 }))
+    getWorkflowGraphSnapshot
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 4 }))
+
+    const release = useWorkflowGraphStore.getState().activateConversation(83)
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    const failed = useWorkflowGraphStore.getState().getEntry(83)
+    expect(failed?.snapshot?.graph_revision).toBe(3)
+    expect(failed?.loading).toBe(false)
+    expect(failed?.error).toBe("offline")
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(599_999)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
+  })
+
+  it("retains the exact cached snapshot while an accepted refresh is loading", async () => {
+    const seeded = baseSnapshot({
+      graph_revision: 3,
+      workflow_id: "wf-seed-loading",
+    })
+    useWorkflowGraphStore.getState().applyFromDetail(86, seeded)
+    const retainedBeforeRefresh = useWorkflowGraphStore
+      .getState()
+      .getSnapshot(86)
+
+    const pending = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot.mockReturnValueOnce(pending.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(86)
+    await flushMicrotasks()
+
+    const loading = useWorkflowGraphStore.getState().getEntry(86)
+    expect(loading?.loading).toBe(true)
+    expect(loading?.snapshot).toBe(retainedBeforeRefresh)
+    expect(loading?.snapshot).toBe(seeded)
+    expect(loading?.snapshot?.graph_revision).toBe(3)
+    expect(loading?.snapshot?.workflow_id).toBe("wf-seed-loading")
+    expect(loading?.error).toBeNull()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(86)
+
+    pending.resolve(
+      baseSnapshot({ graph_revision: 4, workflow_id: "wf-fresh-loading" })
+    )
+    await flushMicrotasks()
+
+    const done = useWorkflowGraphStore.getState().getEntry(86)
+    expect(done?.loading).toBe(false)
+    expect(done?.snapshot?.graph_revision).toBe(4)
+    expect(done?.snapshot?.workflow_id).toBe("wf-fresh-loading")
+    expect(done?.error).toBeNull()
+    release()
+  })
+
+  it("failed and stale compatibility completions follow the common scheduler", async () => {
+    const stale = deferred<WorkflowGraphSnapshot | null>()
+    const current = deferred<WorkflowGraphSnapshot | null>()
+    const postRelease = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockRejectedValueOnce(new Error("nudge offline"))
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
+      .mockReturnValueOnce(stale.promise)
+      .mockReturnValueOnce(current.promise)
+      .mockReturnValueOnce(postRelease.promise)
+
+    const release = useWorkflowGraphStore.getState().activateConversation(84)
+    await flushMicrotasks()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 84,
+    })
+    await flushMicrotasks()
+    expect(useWorkflowGraphStore.getState().getEntry(84)?.error).toBe(
+      "nudge offline"
+    )
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 84,
+    })
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 84,
+    })
+    stale.resolve(baseSnapshot({ graph_revision: 99 }))
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(5)
+
+    current.resolve(baseSnapshot({ graph_revision: 3 }))
+    await flushMicrotasks()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 84,
+    })
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(6)
+    release()
+    postRelease.resolve(baseSnapshot({ graph_revision: 4 }))
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(6)
+  })
+
+  it("subscription failures still allow initial and periodic refresh", async () => {
+    subscribeWorkflowGraphChanged.mockRejectedValue(
+      new Error("graph events unavailable")
+    )
+    subscribeWorkflowCompatibilityNudge.mockRejectedValue(
+      new Error("nudge events unavailable")
+    )
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const release = useWorkflowGraphStore.getState().activateConversation(85)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
   })
 })
 
@@ -755,7 +1512,7 @@ describe("event subscription Strict Mode / generation token", () => {
     )
 
     // Install 1 (first mount).
-    const unmount1 = useWorkflowGraphStore.getState().mountConversation(50)
+    const unmount1 = useWorkflowGraphStore.getState().activateConversation(50)
     await vi.waitFor(() => expect(changedResolvers.length).toBe(1))
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBeGreaterThan(
       0
@@ -766,7 +1523,7 @@ describe("event subscription Strict Mode / generation token", () => {
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
 
     // Remount → install 2.
-    const unmount2 = useWorkflowGraphStore.getState().mountConversation(50)
+    const unmount2 = useWorkflowGraphStore.getState().activateConversation(50)
     await vi.waitFor(() => expect(changedResolvers.length).toBe(2))
     const liveGen = __getWorkflowGraphEventInstallGenerationForTests()
     expect(liveGen).toBeGreaterThan(0)
@@ -807,7 +1564,7 @@ describe("event subscription Strict Mode / generation token", () => {
   it("eventInstallGeneration is monotonic — reset only clears active reference", () => {
     const counterBefore = __getWorkflowGraphEventInstallCounterForTests()
 
-    const un1 = useWorkflowGraphStore.getState().mountConversation(61)
+    const un1 = useWorkflowGraphStore.getState().activateConversation(61)
     const afterFirst = __getWorkflowGraphEventInstallCounterForTests()
     expect(afterFirst).toBe(counterBefore + 1)
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(afterFirst)
@@ -817,7 +1574,7 @@ describe("event subscription Strict Mode / generation token", () => {
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
     expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(afterFirst)
 
-    const un2 = useWorkflowGraphStore.getState().mountConversation(61)
+    const un2 = useWorkflowGraphStore.getState().activateConversation(61)
     const afterSecond = __getWorkflowGraphEventInstallCounterForTests()
     expect(afterSecond).toBe(afterFirst + 1)
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(afterSecond)
@@ -828,7 +1585,7 @@ describe("event subscription Strict Mode / generation token", () => {
     expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(afterSecond)
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
 
-    const un3 = useWorkflowGraphStore.getState().mountConversation(62)
+    const un3 = useWorkflowGraphStore.getState().activateConversation(62)
     expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(
       afterSecond + 1
     )
