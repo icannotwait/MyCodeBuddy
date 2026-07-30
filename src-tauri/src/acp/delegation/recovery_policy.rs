@@ -377,7 +377,7 @@ fn inconsistent_durable_state(source: &RecoverySourceSnapshot) -> bool {
     let protected_error = protected_cancellation_error(source.error_code.as_deref());
     let typed_protected = typed_termination
         .is_some_and(|termination| protected_cancellation_reason(termination.reason));
-    if source.run_status == DelegationRunStatus::Failed
+    if source.run_status != DelegationRunStatus::Canceled
         && (protected_error.is_some() || typed_protected)
     {
         return true;
@@ -1811,6 +1811,44 @@ mod delegation_recovery_policy {
                 RecoveryCauseCode::ContradictoryEvidence
             );
             assert_eq!(decision.proposed_action(), None);
+        }
+    }
+
+    #[test]
+    fn completed_protected_cancellation_errors_are_inconsistent() {
+        for error_code in [
+            "parent_disconnected",
+            "parent_canceled",
+            "parent_turn_failed",
+            "join_abandoned",
+            "user_cancelled",
+            "tool_stalled_timeout",
+        ] {
+            let mut completed = source();
+            completed.run_status = DelegationRunStatus::Completed;
+            completed.error_code = Some(error_code.into());
+            completed.parsed_termination = ParsedDelegationTermination::LegacyUnspecified;
+
+            let decision = decide_delegation_recovery(
+                &completed,
+                &rails(),
+                RequestedRecoveryOperation::Inspect,
+            );
+
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::InconsistentDurableState,
+                "completed + {error_code} must be inconsistent"
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+            assert_eq!(decision.proposed_action(), None);
+            assert!(!decision.requires_authorization());
+            assert!(!decision.operation_matches(RequestedRecoveryOperation::Continue));
+            assert!(
+                !decision.operation_matches(RequestedRecoveryOperation::Replace {
+                    replacement_reason: ReplacementReason::Unresumable,
+                })
+            );
         }
     }
 

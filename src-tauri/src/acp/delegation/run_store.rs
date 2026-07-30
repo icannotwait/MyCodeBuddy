@@ -8525,6 +8525,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_protected_errors_are_not_continuable_by_temporary_adapter() {
+        for error_code in [
+            "parent_disconnected",
+            "parent_canceled",
+            "parent_turn_failed",
+            "join_abandoned",
+            "user_cancelled",
+            "tool_stalled_timeout",
+        ] {
+            let mut completed = eligible_continue();
+            completed.run_status = DelegationRunStatus::Completed;
+            completed.error_code = Some(error_code.into());
+            completed.termination_audit_json = None;
+
+            assert_eq!(
+                decide_continue_eligibility(&completed),
+                ContinueDecision::NotContinuable,
+                "completed + {error_code} must not reach continue admission"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn continue_parent_tool_idempotency_precedes_busy_and_stale() {
         use crate::db::entities::conversation;
