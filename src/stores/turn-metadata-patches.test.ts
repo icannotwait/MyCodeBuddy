@@ -1,10 +1,19 @@
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   computeTurnMetadataPatches,
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { resolveActiveSessionDetails } from "@/components/conversations/active-session-details"
+import { resolveSessionModelDisplay } from "@/lib/status-bar-session-model"
 import type { DbConversationDetail, MessageTurn, TurnUsage } from "@/lib/types"
+
+vi.mock("@/lib/api", () => ({
+  getFolderConversation: vi.fn(),
+}))
+
+const { getFolderConversation } = await import("@/lib/api")
+const mockGetFolderConversation = vi.mocked(getFolderConversation)
 
 // The post-turn reparse (`syncTurnMetadata`) backfills usage/duration/model
 // onto this session's completed local turns by aligning them to a fresh parse.
@@ -368,6 +377,157 @@ function baseline(): number | null {
       ?.historyAssistantBaseline ?? null
   )
 }
+
+function seedMetadataSyncSession(
+  localAssistant: MessageTurn,
+  persistedTurns: MessageTurn[] = []
+) {
+  seedDetail(persistedTurns)
+  useConversationRuntimeStore.setState((state) => {
+    const byId = new Map(state.byConversationId)
+    const current = byId.get(CID)
+    if (!current) throw new Error("missing metadata sync session")
+    byId.set(CID, {
+      ...current,
+      localTurns: [localAssistant],
+      historyAssistantBaseline: persistedTurns.filter(
+        (turn) => turn.role === "assistant"
+      ).length,
+    })
+    return { byConversationId: byId }
+  })
+}
+
+function currentMetadataSyncSession() {
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(CID)
+  if (!session) throw new Error("missing metadata sync session")
+  return session
+}
+
+async function flushMetadataSync() {
+  await vi.advanceTimersByTimeAsync(1500)
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
+describe("syncTurnMetadata archived reasoning effort", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    mockGetFolderConversation.mockReset()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    resetConversationRuntimeStore()
+    vi.useRealTimers()
+  })
+
+  it("fills missing local effort and resolves model plus high for the status bar", async () => {
+    seedMetadataSyncSession(
+      asst({ id: "live", model: "gpt-5.6-sol", reasoning_effort: null })
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([
+        asst({
+          id: "archived",
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+          usage: usage(10, 2),
+        }),
+      ])
+    )
+
+    const cancel = useConversationRuntimeStore
+      .getState()
+      .actions.syncTurnMetadata(CID)
+    await flushMetadataSync()
+    cancel()
+
+    const runtime = currentMetadataSyncSession()
+    expect(runtime.localTurns[0]?.reasoning_effort).toBe("high")
+    const details = resolveActiveSessionDetails(
+      { conversationId: CID },
+      (id) => (id === CID ? runtime : null),
+      []
+    )
+    const display = resolveSessionModelDisplay({
+      configOptions: null,
+      conversationModel: details.model,
+      conversationEffort: details.reasoningEffort,
+    })
+    expect(
+      [display.model, display.thinkingLevel].filter(Boolean).join(" · ")
+    ).toBe("gpt-5.6-sol · high")
+  })
+
+  it("does not overwrite effort already present on the local turn", async () => {
+    seedMetadataSyncSession(
+      asst({
+        id: "live",
+        model: "live-model",
+        reasoning_effort: "medium",
+      })
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([
+        asst({
+          id: "archived",
+          model: "archive-model",
+          reasoning_effort: "high",
+          usage: usage(10, 2),
+        }),
+      ])
+    )
+
+    const cancel = useConversationRuntimeStore
+      .getState()
+      .actions.syncTurnMetadata(CID)
+    await flushMetadataSync()
+    cancel()
+
+    expect(currentMetadataSyncSession().localTurns[0]).toMatchObject({
+      model: "live-model",
+      reasoning_effort: "medium",
+    })
+  })
+
+  it("keeps the status output model-only when the archive has no effort", async () => {
+    seedMetadataSyncSession(asst({ id: "live", model: "gpt-5.6-sol" }))
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWith([
+        asst({
+          id: "archived",
+          model: "gpt-5.6-sol",
+          usage: usage(10, 2),
+        }),
+      ])
+    )
+
+    const cancel = useConversationRuntimeStore
+      .getState()
+      .actions.syncTurnMetadata(CID)
+    await flushMetadataSync()
+    cancel()
+
+    const runtime = currentMetadataSyncSession()
+    expect(runtime.localTurns[0]?.reasoning_effort).toBeUndefined()
+    const details = resolveActiveSessionDetails(
+      { conversationId: CID },
+      (id) => (id === CID ? runtime : null),
+      []
+    )
+    const display = resolveSessionModelDisplay({
+      configOptions: null,
+      conversationModel: details.model,
+      conversationEffort: details.reasoningEffort,
+    })
+    expect(
+      [display.model, display.thinkingLevel].filter(Boolean).join(" · ")
+    ).toBe("gpt-5.6-sol")
+  })
+})
 
 describe("historyAssistantBaseline capture", () => {
   afterEach(() => resetConversationRuntimeStore())

@@ -2425,6 +2425,10 @@ function reducer(
             : (turn.duration_ms ?? patch.duration_ms)
         const newModel =
           patch.model === undefined ? turn.model : (turn.model ?? patch.model)
+        const newReasoningEffort =
+          patch.reasoning_effort === undefined
+            ? turn.reasoning_effort
+            : (turn.reasoning_effort ?? patch.reasoning_effort)
         const newCompletedAt =
           patch.completed_at === undefined
             ? turn.completed_at
@@ -2458,6 +2462,7 @@ function reducer(
           newUsage !== turn.usage ||
           newDuration !== turn.duration_ms ||
           newModel !== turn.model ||
+          newReasoningEffort !== turn.reasoning_effort ||
           newCompletedAt !== turn.completed_at ||
           nextBlocks !== turn.blocks
         ) {
@@ -2467,6 +2472,7 @@ function reducer(
             usage: newUsage,
             duration_ms: newDuration,
             model: newModel,
+            reasoning_effort: newReasoningEffort,
             completed_at: newCompletedAt,
           }
           changed = true
