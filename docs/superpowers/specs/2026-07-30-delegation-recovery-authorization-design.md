@@ -10,6 +10,12 @@ This design amends the automatic-recovery rules in:
 - `2026-07-21-delegation-session-reuse-design.md`; and
 - `2026-07-21-acp-termination-causality-audit-design.md`.
 
+It is paired with
+`2026-07-30-workflow-blocked-recovery-design.md`. The two designs keep their
+policy engines separate and share one generic recovery-authorization service,
+question flow, and persistence model. The workflow companion owns lifecycle
+state recovery, binding lifecycle correction, and Plan lineage reset.
+
 Explicit user or parent cancellation remains ineligible for automatic
 recovery. This design adds a separate, server-verifiable, user-authorized
 recovery path. It does not redefine cancellation as `unresumable`.
@@ -81,6 +87,8 @@ termination evidence.
 - Add enough cold-status diagnostics to distinguish lookup, ownership, token,
   and storage failures internally.
 - Recover the observed historical NULL-audit task without guessing its cause.
+- Share one authorization infrastructure with workflow recovery without
+  allowing either policy to decide or consume the other's actions.
 
 ## Non-Goals
 
@@ -89,8 +97,9 @@ termination evidence.
 - Allowing confirmation to override route policy, authorization, ownership,
   agent/profile identity, active-run fencing, or hard budgets.
 - Guessing or backfilling historical termination provenance.
-- Reworking general delegation scheduling, workflow topology, or card summary
-  behavior.
+- Reworking general delegation scheduling or card summary behavior.
+- Making delegation recovery decide workflow lifecycle state or topology; that
+  boundary is defined by the workflow blocked-recovery companion design.
 - Adding an append-only termination journal; the bounded per-run and
   conversation projections remain sufficient.
 - Building a second question-card UI.
@@ -99,8 +108,9 @@ termination evidence.
 
 ## Chosen Approach
 
-Use a centralized recovery decision engine plus a server-issued, durable,
-one-time recovery authorization.
+Use a centralized delegation recovery decision engine plus a server-issued,
+durable, one-time authorization from the shared recovery-authorization
+service.
 
 The existing operation boundaries remain intact:
 
@@ -187,6 +197,12 @@ It does not include a cancel, parent-end, or stall code by itself.
 12. A terminal status/error-code contradiction fails closed as
     `inconsistent_durable_state`; it is not treated as a compatibility case.
 13. A confirmation-required decision does not mint a run or consume a budget.
+14. A reserving or running source always returns `busy_thread`; authorization
+    cannot detach or supersede it, and the busy tool result keeps
+    `Input.Detach=false`.
+15. Failed and canceled lineage fences do not expire with wall-clock time.
+    They leave the fence only through the typed continue/fresh/replacement
+    policy defined here.
 
 ## Architecture
 
@@ -439,14 +455,21 @@ No migration guesses historical provenance.
 
 ### Server-Owned Confirmation
 
-Add one MCP tool:
+Add one shared MCP tool:
 
 ```text
-request_delegation_recovery_authorization(
-  task_id,
-  correlation_id
+request_recovery_authorization(
+  subject_kind,
+  subject_id,
+  correlation_id,
+  proposed_user_reason?
 )
 ```
+
+For this design, `subject_kind` must be `delegation_task`, `subject_id` is the
+exact source task id, and `proposed_user_reason` is rejected. The optional
+reason exists only for the workflow companion's user-visible Plan lineage
+reset flow.
 
 The caller cannot supply action, reason, warning text, options, work-unit key,
 or target child. The server loads the task, computes policy, and either:
@@ -466,43 +489,48 @@ If no interactive user is attached, the request cannot auto-approve.
 
 ### Authorization Data Model
 
-Add `delegation_recovery_authorizations`:
+Add the shared `recovery_authorizations` table:
 
 | Column | Purpose |
 | --- | --- |
 | `authorization_id` | server-minted UUID primary key |
 | `parent_conversation_id` | parent ownership boundary |
-| `source_task_id` | exact source terminal run |
-| `child_conversation_id` | child identity binding |
-| `lineage_root_task_id` | lineage binding |
-| `work_unit_key` | orchestration binding, nullable for ad hoc calls |
+| `subject_kind` | `delegation_task` or `workflow` |
+| `subject_id` | exact task/workflow subject id |
+| `source_task_id` | exact source terminal run for delegation subjects, otherwise NULL |
+| `child_conversation_id` | delegation child identity binding, otherwise NULL |
+| `lineage_root_task_id` | delegation lineage binding, otherwise NULL |
+| `work_unit_key` | delegation orchestration binding, nullable for ad hoc/workflow subjects |
 | `source_state_fingerprint` | versioned hash of policy-relevant source state |
-| `allowed_action` | `continue`, `fresh_dispatch`, or `replace` |
-| `allowed_replacement_reason` | exact replacement reason, nullable otherwise |
+| `allowed_action` | exact delegation or workflow recovery action |
+| `action_payload_json` | canonical exact action parameters, including replacement reason or workflow target |
 | `cause_code` | stable displayed/audited cause |
 | `risk_class` | stable displayed/audited warning class |
+| `display_reason` | bounded user-visible reason when an action requires one |
 | `status` | `pending`, `approved`, `declined`, `consumed`, `expired`, or `abandoned` |
 | `question_id` | question registry correlation |
 | `requested_at` | challenge creation time |
 | `approved_at` | user approval time |
 | `expires_at` | approval expiration time |
-| `consumed_at` | successful admission reservation time |
-| `consumed_by_task_id` | newly inserted run, when consumed |
+| `consumed_at` | successful consumer transaction time |
+| `consumed_by_kind` | `delegation_task_run` or `workflow_manifest_revision` |
+| `consumed_by_id` | newly inserted run/revision identity, when consumed |
 
-Use a partial unique index over parent, source task, and source fingerprint for
-`pending`/`approved` rows. Repeated requests therefore reuse one active
-challenge instead of opening multiple cards.
+Use a partial unique index over parent, subject kind, subject id, and source
+fingerprint for `pending`/`approved` rows. One source state cannot carry two
+competing actions; repeated requests reuse its active challenge instead of
+opening multiple cards.
 
 Approvals expire ten minutes after approval. Pending questions are reclaimed
 when their parent turn/connection closes. Expired rows are marked lazily;
 consumed/declined audit rows follow the application's existing bounded
 retention policy.
 
-The authorization table and run column are logical references rather than a
-circular pair of SQLite foreign keys. Conversation deletion cleanup removes
-authorization rows for that parent conversation.
+The authorization table and consumer provenance columns are logical references
+rather than circular SQLite foreign keys. Conversation deletion cleanup
+removes authorization rows for that parent conversation.
 
-### Source State Fingerprint
+### Delegation Source State Fingerprint
 
 The fingerprint is a versioned SHA-256 over a canonical serialization of:
 
@@ -545,7 +573,7 @@ transaction:
 2. recompute the policy decision and source fingerprint;
 3. load the authorization under the same parent conversation;
 4. require `approved`, unexpired, unconsumed, exact fingerprint, exact action,
-   and exact replacement reason;
+   and exact action payload including replacement reason;
 5. run existing conditional budget/fence preflights;
 6. insert the new reserving run; and
 7. conditionally mark the authorization `consumed` with the new task id.
@@ -586,7 +614,8 @@ The new tool returns structured content resembling:
 {
   "status": "approved",
   "recovery_authorization_id": "uuid",
-  "source_task_id": "task-id",
+  "subject_kind": "delegation_task",
+  "subject_id": "task-id",
   "allowed_action": "continue",
   "replacement_reason": null,
   "cause_code": "legacy_parent_disconnect",
@@ -793,12 +822,15 @@ error text, answer prose, or external session ids.
 
 ## Database Migration and Compatibility
 
-The migration adds:
+The coordinated migration adds:
 
-1. `delegation_recovery_authorizations` and its active-challenge/expiry indexes;
+1. shared `recovery_authorizations` and its active-challenge/expiry indexes;
 2. nullable `delegation_task_runs.recovery_authorization_id`; and
 3. nullable `conversation.last_termination_audit_json` if the earlier
    termination-audit design has not already introduced it.
+
+The workflow companion adds its manifest/gate provenance columns in the same
+migration series. Neither policy owns a second authorization table.
 
 It does not rewrite existing run status, error code, audit JSON, counters, or
 lineage links. Legacy NULL audit remains NULL and is classified at read time.
@@ -819,18 +851,21 @@ and broker core. Only event delivery remains runtime-specific.
 
 The design expects focused ownership boundaries:
 
-- a new recovery-policy module for typed classification and pure decisions;
-- a recovery-authorization module for entity/store/service behavior;
+- a delegation recovery-policy module for typed classification and pure
+  decisions;
+- a shared recovery-authorization module for entity/store/service behavior;
 - database migration and entities for authorization/provenance fields;
 - termination-audit and broker settlement changes for typed evidence;
 - `run_store` integration for atomic policy/admission/authorization handling;
 - request/report types and companion schema/dispatcher changes;
 - existing question registry/card integration for the fixed recovery prompt;
 - i18n messages for all supported locales; and
-- updates to the brainstorm-to-delivery Skill and the two amended design docs.
+- updates to the brainstorm-to-delivery Skill and the amended/companion design
+  docs.
 
 Do not combine this work with unrelated broker decomposition or workflow/UI
-refactoring.
+refactoring. Workflow lifecycle decisions remain in the policy and store
+defined by `2026-07-30-workflow-blocked-recovery-design.md`.
 
 ## Testing Strategy
 
@@ -947,15 +982,18 @@ fixture or equivalent reconstructed database scenario.
 
 ## Rollout and Verification
 
-The implementation order is dependency-driven:
+The combined delegation/workflow implementation order is dependency-driven:
 
-1. additive migration, entities, and typed contracts;
-2. audit-complete terminal producers;
-3. pure policy and decision-table tests;
-4. authorization service, tool, and fixed question integration;
-5. continue/fresh/replacement integration through the central policy;
-6. removal of `cc55cf57` broad matchers and Skill/schema wording; and
-7. final end-to-end and full repository verification.
+1. additive shared authorization/provenance migration and typed contracts;
+2. workflow binding-lifecycle correction from the companion design;
+3. audit-complete delegation terminal producers;
+4. separate pure delegation/workflow policies and decision-table tests;
+5. shared authorization service, tool, and fixed question integration;
+6. workflow state-only revision and gate-settlement authority changes;
+7. continue/fresh/replacement integration through the delegation policy;
+8. workflow recovery and Plan lineage-reset integration;
+9. removal of `cc55cf57` broad matchers and Skill/schema wording; and
+10. final combined end-to-end and full repository verification.
 
 The behavioral cutover ships atomically. Do not remove the compatibility
 matcher before the authorization route exists, and do not ship both the broad
@@ -994,9 +1032,12 @@ The feature is complete only when:
 - newly canceled delegation runs have typed termination audit;
 - explicit and ambiguous recovery cannot proceed without a consumed
   server-issued authorization;
+- delegation and workflow subjects share one authorization service but cannot
+  cross-consume actions;
 - valid resume identity enforces continue before replacement;
 - pre-admission host-restart and pure-abort behavior remain distinct;
 - the observed stuck-task scenario passes end to end;
 - cold DB status has reason-coded internal diagnostics;
+- the workflow companion's session-2566 acceptance fixture recovers in place;
 - Skill and tool schema describe the same policy as the backend; and
 - the one final full validation matrix passes.
