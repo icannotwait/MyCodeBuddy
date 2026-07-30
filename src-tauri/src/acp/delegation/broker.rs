@@ -4115,6 +4115,7 @@ impl DelegationBroker {
         termination_audit: DelegationTerminationAuditV1,
         success_report: impl FnOnce(AgentType, Option<i32>) -> DelegationTaskReport,
     ) -> DelegationTaskReport {
+        let finished_at = termination_audit.termination.observed_at;
         match runs.abandon_reserving_claim(task_id).await {
             Ok(true) => {
                 if let Err(cleanup_err) = self
@@ -4156,7 +4157,7 @@ impl DelegationBroker {
                             task_id,
                             TerminalTaskWrite::canceled(
                                 settle_error_code,
-                                Utc::now(),
+                                finished_at,
                                 termination_audit,
                             ),
                         )
@@ -38346,5 +38347,192 @@ mod tests {
             not_ws.is_none(),
             "must not bind run under whitespace parent_tool_use_id"
         );
+    }
+
+    mod termination_evidence_wave4 {
+        use super::*;
+        use crate::db::entities::{conversation, delegation_task_run};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        struct BoundReservingFixture {
+            db: Arc<crate::db::AppDatabase>,
+            runs: RunStore,
+            broker: DelegationBroker,
+            task_id: String,
+            child_conversation_id: i32,
+        }
+
+        async fn bound_reserving_fixture(suffix: &str) -> BoundReservingFixture {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let folder = seed_folder(&db, &format!("/tmp/codeg-wave4-{suffix}")).await;
+            let parent = conversation_service::create(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("wave4 {suffix} parent")),
+                None,
+            )
+            .await
+            .expect("parent");
+            let task_id = format!("wave4-{suffix}-4111-8111-111111111111");
+            let child = conversation_service::create_with_delegation(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("wave4 {suffix} child")),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: format!("wave4-{suffix}-tool"),
+                    delegation_call_id: task_id.clone(),
+                }),
+            )
+            .await
+            .expect("child");
+            let runs = RunStore::new(db.clone());
+            let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                .expect("agent type json")
+                .as_str()
+                .expect("agent type string")
+                .to_string();
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some(format!("wave4-{suffix}-tool")),
+                child_conversation_id: child.id,
+                agent_type,
+                profile_id: None,
+                workspace_path: None,
+                route_fingerprint: None,
+                launch_snapshot_version: None,
+                mode_id: None,
+                config_values_json: None,
+                task_preview: Some("wave4 timestamp fallback".into()),
+                request_fingerprint: Some(format!("wave4-{suffix}-fingerprint")),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: None,
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve");
+            runs.bind_child_connection_while_reserving(
+                &task_id,
+                format!("wave4-{suffix}-child-connection"),
+            )
+            .await
+            .expect("bind child connection");
+
+            BoundReservingFixture {
+                db,
+                runs,
+                broker: DelegationBroker::new(
+                    Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                    shallow_lookup(),
+                ),
+                task_id,
+                child_conversation_id: child.id,
+            }
+        }
+
+        async fn load_terminal_projection(
+            fixture: &BoundReservingFixture,
+        ) -> (
+            delegation_task_run::Model,
+            DelegationTerminationAuditV1,
+            conversation::Model,
+            DelegationTerminationAuditV1,
+        ) {
+            let run = delegation_task_run::Entity::find_by_id(&fixture.task_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load run")
+                .expect("run");
+            let run_audit: DelegationTerminationAuditV1 = serde_json::from_str(
+                run.termination_audit_json
+                    .as_deref()
+                    .expect("typed run audit"),
+            )
+            .expect("valid run audit");
+            let child = conversation::Entity::find_by_id(fixture.child_conversation_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load child")
+                .expect("child");
+            let child_audit: DelegationTerminationAuditV1 = serde_json::from_str(
+                child
+                    .last_termination_audit_json
+                    .as_deref()
+                    .expect("typed child audit"),
+            )
+            .expect("valid child audit");
+            (run, run_audit, child, child_audit)
+        }
+
+        #[tokio::test]
+        async fn parent_end_bound_reserving_fallback_keeps_observed_timestamp() {
+            let fixture = bound_reserving_fixture("parent-end").await;
+            let observed_at = DateTime::parse_from_rfc3339("2025-02-03T04:05:06.123456Z")
+                .expect("fixed timestamp")
+                .with_timezone(&Utc);
+            let context =
+                ParentEndContext::legacy(ParentTurnEndReason::ParentTurnFailed, observed_at, false);
+
+            let report = fixture
+                .broker
+                .cancel_admitted_gen1_pre_spawn(
+                    &fixture.runs,
+                    &fixture.task_id,
+                    fixture.child_conversation_id,
+                    context,
+                    AgentType::ClaudeCode,
+                    u64::MAX,
+                    "wave4 parent-end fallback",
+                )
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("parent_turn_failed"));
+
+            let (run, run_audit, child, child_audit) = load_terminal_projection(&fixture).await;
+            assert_eq!(run_audit.termination.observed_at, observed_at);
+            assert_eq!(run.finished_at, Some(observed_at));
+            assert_eq!(child.delegation_finished_at, Some(observed_at));
+            assert_eq!(child_audit.termination.observed_at, observed_at);
+            assert_eq!(child_audit, run_audit);
+        }
+
+        #[tokio::test]
+        async fn external_cancel_bound_reserving_fallback_keeps_requested_observed_timestamp() {
+            let fixture = bound_reserving_fixture("external-cancel").await;
+
+            let report = fixture
+                .broker
+                .cancel_admitted_gen1_pre_spawn_external(
+                    &fixture.runs,
+                    &fixture.task_id,
+                    fixture.child_conversation_id,
+                    AgentType::ClaudeCode,
+                    u64::MAX,
+                    "wave4 external-cancel fallback",
+                )
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("canceled"));
+
+            let (run, run_audit, child, child_audit) = load_terminal_projection(&fixture).await;
+            let observed_at = run_audit.termination.observed_at;
+            assert_eq!(run_audit.termination.requested_at, Some(observed_at));
+            assert_eq!(run.finished_at, Some(observed_at));
+            assert_eq!(child.delegation_finished_at, Some(observed_at));
+            assert_eq!(child_audit.termination.requested_at, Some(observed_at));
+            assert_eq!(child_audit.termination.observed_at, observed_at);
+            assert_eq!(child_audit, run_audit);
+        }
     }
 }
