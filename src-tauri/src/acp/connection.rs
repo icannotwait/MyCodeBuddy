@@ -3292,8 +3292,12 @@ pub struct DelegationInjection {
 
 #[derive(Default)]
 pub(crate) struct ParentConnectionExitEvidence {
-    entries: std::sync::Mutex<HashMap<String, crate::acp::termination::AcpTerminationSummaryV1>>,
-    suspension_drain_timeouts: std::sync::Mutex<std::collections::HashSet<String>>,
+    entries: std::sync::Mutex<HashMap<String, ParentConnectionExitEvidenceEntry>>,
+}
+
+struct ParentConnectionExitEvidenceEntry {
+    termination: crate::acp::termination::AcpTerminationSummaryV1,
+    suspension_drain_timeout: bool,
 }
 
 impl ParentConnectionExitEvidence {
@@ -3337,11 +3341,18 @@ impl ParentConnectionExitEvidence {
             .unwrap_or_else(|error| error.into_inner());
         let preserve_existing_evidence = entries.get(connection_id).is_some_and(|existing| {
             origin == AcpDisconnectOrigin::LegacyUnspecified
-                || (existing.frontend_origin.is_some()
-                    && existing.frontend_origin != Some(AcpDisconnectOrigin::LegacyUnspecified))
+                || (existing.termination.frontend_origin.is_some()
+                    && existing.termination.frontend_origin
+                        != Some(AcpDisconnectOrigin::LegacyUnspecified))
         });
         if !preserve_existing_evidence {
-            entries.insert(connection_id.to_string(), summary);
+            entries.insert(
+                connection_id.to_string(),
+                ParentConnectionExitEvidenceEntry {
+                    termination: summary,
+                    suspension_drain_timeout: false,
+                },
+            );
         }
     }
 
@@ -3358,13 +3369,27 @@ impl ParentConnectionExitEvidence {
             .unwrap_or_else(|error| error.into_inner());
         match entries.get(connection_id) {
             None => {
-                entries.insert(connection_id.to_string(), summary);
+                entries.insert(
+                    connection_id.to_string(),
+                    ParentConnectionExitEvidenceEntry {
+                        termination: summary,
+                        suspension_drain_timeout: false,
+                    },
+                );
             }
             Some(existing)
-                if existing.classification == AcpTerminationClassification::LegacyUnknown
+                if !existing.suspension_drain_timeout
+                    && existing.termination.classification
+                        == AcpTerminationClassification::LegacyUnknown
                     && summary.classification == AcpTerminationClassification::Unexpected =>
             {
-                entries.insert(connection_id.to_string(), summary);
+                entries.insert(
+                    connection_id.to_string(),
+                    ParentConnectionExitEvidenceEntry {
+                        termination: summary,
+                        suspension_drain_timeout: false,
+                    },
+                );
             }
             Some(_) => {}
         }
@@ -3392,54 +3417,68 @@ impl ParentConnectionExitEvidence {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(connection_id)
-            .cloned()
+            .map(|entry| entry.termination.clone())
     }
 
     fn record_suspension_drain_timeout(&self, connection_id: &str) {
-        let observed_at = chrono::Utc::now();
-        self.record_observation(
-            connection_id,
-            crate::acp::termination::AcpTerminationSummaryV1::new(
-                crate::acp::termination::AcpTerminationSource::Session,
-                crate::acp::termination::AcpTerminationReason::SuspensionDrainTimeout,
-                crate::acp::termination::AcpTerminationClassification::AutomatedAmbiguous,
-                true,
-                observed_at,
-            ),
+        self.record_suspension_drain_timeout_at(connection_id, chrono::Utc::now());
+    }
+
+    fn record_suspension_drain_timeout_at(
+        &self,
+        connection_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let termination = crate::acp::termination::AcpTerminationSummaryV1::new(
+            crate::acp::termination::AcpTerminationSource::Session,
+            crate::acp::termination::AcpTerminationReason::SuspensionDrainTimeout,
+            crate::acp::termination::AcpTerminationClassification::AutomatedAmbiguous,
+            true,
+            observed_at,
         );
-        self.suspension_drain_timeouts
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(connection_id.to_string());
+            .unwrap_or_else(|error| error.into_inner());
+        let preserve_explicit_intent = entries.get(connection_id).is_some_and(|existing| {
+            existing.termination.frontend_origin.is_some()
+                && existing.termination.frontend_origin
+                    != Some(crate::acp::termination::AcpDisconnectOrigin::LegacyUnspecified)
+        });
+        if !preserve_explicit_intent {
+            entries.insert(
+                connection_id.to_string(),
+                ParentConnectionExitEvidenceEntry {
+                    termination,
+                    suspension_drain_timeout: true,
+                },
+            );
+        }
     }
 
     fn take(
         &self,
         connection_id: &str,
     ) -> crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause {
-        let termination = self
+        let entry = self
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(connection_id)
-            .unwrap_or_else(|| {
-                crate::acp::termination::AcpTerminationSummaryV1::legacy_unspecified(
-                    true,
-                    chrono::Utc::now(),
-                )
-            });
-        if self
-            .suspension_drain_timeouts
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(connection_id)
-        {
+            .remove(connection_id);
+        let Some(entry) = entry else {
+            return crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause::Disconnected {
+                termination: crate::acp::termination::AcpTerminationSummaryV1::legacy_unspecified(
+                    true, chrono::Utc::now(),
+                ),
+            };
+        };
+        if entry.suspension_drain_timeout {
             crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause::SuspensionDrainTimeout {
-                termination,
+                termination: entry.termination,
             }
         } else {
             crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause::Disconnected {
-                termination,
+                termination: entry.termination,
             }
         }
     }
@@ -3460,26 +3499,20 @@ fn unexpected_connection_termination(
     )
 }
 
-fn record_unexpected_connection_exit(
-    injection: Option<&DelegationInjection>,
-    connection_id: &str,
-    source: crate::acp::termination::AcpTerminationSource,
-    reason: crate::acp::termination::AcpTerminationReason,
-) {
-    if let Some(injection) = injection {
-        injection.parent_connection_exit_causes.record_observation(
-            connection_id,
-            unexpected_connection_termination(source, reason),
-        );
-    }
-}
-
 fn record_session_channel_loss(injection: Option<&DelegationInjection>, connection_id: &str) {
     if let Some(injection) = injection {
         injection
             .parent_connection_exit_causes
             .record_session_lost(connection_id, chrono::Utc::now());
     }
+}
+
+fn handle_idle_session_update_error(
+    _evidence: Option<&ParentConnectionExitEvidence>,
+    _connection_id: &str,
+    error: &sacp::Error,
+) {
+    tracing::warn!("[ACP] Ignoring unrecognized session update in idle loop: {error}");
 }
 
 /// Typed bootstrap outcome from the connection task to the manager.
@@ -8576,13 +8609,13 @@ async fn run_conversation_loop<'a>(
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            record_unexpected_connection_exit(
-                                delegation_injection,
+                            handle_idle_session_update_error(
+                                delegation_injection.map(|injection| {
+                                    injection.parent_connection_exit_causes.as_ref()
+                                }),
                                 conn_id,
-                                crate::acp::termination::AcpTerminationSource::Transport,
-                                crate::acp::termination::AcpTerminationReason::TransportDisconnected,
+                                &e,
                             );
-                            tracing::warn!("[ACP] Ignoring unrecognized session update in idle loop: {e}");
                         }
                     }
                 }
@@ -12051,6 +12084,46 @@ mod disconnect_origin {
     }
 
     #[test]
+    fn disconnect_origin_suspension_timeout_replaces_prior_unexpected_observation() {
+        let evidence = ParentConnectionExitEvidence::default();
+        evidence.record_observation("c1", unexpected_transport_summary());
+
+        evidence.record_suspension_drain_timeout_at("c1", at(8));
+
+        let ParentConnectionExitCause::SuspensionDrainTimeout { termination } = evidence.take("c1")
+        else {
+            panic!("suspension timeout must remain the classified exit cause")
+        };
+        assert_eq!(
+            termination.reason,
+            AcpTerminationReason::SuspensionDrainTimeout
+        );
+        assert_eq!(
+            termination.classification,
+            AcpTerminationClassification::AutomatedAmbiguous
+        );
+        assert_eq!(termination.observed_at, at(8));
+    }
+
+    #[test]
+    fn disconnect_origin_explicit_intent_outranks_later_suspension_timeout() {
+        let evidence = ParentConnectionExitEvidence::default();
+        evidence.record_intent("c1", AcpDisconnectOrigin::ExplicitUser, at(6));
+
+        evidence.record_suspension_drain_timeout_at("c1", at(9));
+
+        let ParentConnectionExitCause::Disconnected { termination } = evidence.take("c1") else {
+            panic!("explicit intent must not be relabeled as a suspension timeout")
+        };
+        assert_eq!(
+            termination.frontend_origin,
+            Some(AcpDisconnectOrigin::ExplicitUser)
+        );
+        assert_eq!(termination.requested_at, Some(at(6)));
+        assert_eq!(termination.observed_at, at(6));
+    }
+
+    #[test]
     fn cleanup_without_evidence_writes_legacy_unspecified_not_transport_loss() {
         let evidence = ParentConnectionExitEvidence::default();
         let ParentConnectionExitCause::Disconnected { termination } = evidence.take("parent")
@@ -12077,6 +12150,20 @@ mod disconnect_origin {
             AcpTerminationClassification::Unexpected
         );
         assert_eq!(observed.observed_at, at(7));
+    }
+
+    #[test]
+    fn disconnect_origin_recoverable_idle_update_error_records_no_terminal_evidence() {
+        let evidence = ParentConnectionExitEvidence::default();
+        let error = sacp::util::internal_error("unrecognized session update");
+
+        handle_idle_session_update_error(Some(&evidence), "c1", &error);
+
+        assert_eq!(
+            evidence.peek("c1"),
+            None,
+            "a recoverable idle update error must leave terminal evidence empty"
+        );
     }
 }
 

@@ -3316,8 +3316,8 @@ impl ConnectionManager {
         conn_id: &str,
         origin: AcpDisconnectOrigin,
     ) -> Result<(), AcpError> {
-        self.record_disconnect_intent(conn_id, origin);
-        // Admission fence → clear leases → map remove → Disconnect control.
+        // Admission fence → clear leases → final incarnation CAS + intent + map
+        // remove → Disconnect control.
         // Fencing first closes register_tool/start_turn for this incarnation so
         // a still-running connection loop cannot recreate leases in the gap
         // before it receives Disconnect.
@@ -3329,10 +3329,23 @@ impl ConnectionManager {
             }
         };
         self.clear_tool_leases(conn_id, &incarnation).await;
+        #[cfg(test)]
+        {
+            let hook = self
+                .disconnect_final_cas_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook.reached.notify_one();
+                hook.resume.notified().await;
+            }
+        }
         let removed = {
             let mut connections = self.connections.lock().await;
             match connections.get(conn_id) {
                 Some(conn) if conn.connection_incarnation == incarnation => {
+                    self.record_disconnect_intent(conn_id, origin);
                     connections.remove(conn_id)
                 }
                 _ => None,
@@ -6330,7 +6343,15 @@ mod disconnect_origin {
             .await;
         let evidence = install_exit_evidence(&manager);
 
-        let map_guard = manager.connections.lock().await;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *manager
+            .disconnect_final_cas_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(DisconnectFinalCasHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
         let disconnect = {
             let manager = manager.clone();
             tokio::spawn(async move {
@@ -6339,25 +6360,110 @@ mod disconnect_origin {
                     .await
             })
         };
-        for _ in 0..20 {
-            if evidence.peek("c1").is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+
+        reached.notified().await;
+        assert_eq!(
+            evidence.peek("c1"),
+            None,
+            "intent must wait for the final incarnation CAS"
+        );
+        assert!(manager.connections.lock().await.contains_key("c1"));
+        resume.notify_one();
+        disconnect.await.expect("disconnect join").unwrap();
+
         assert_eq!(
             evidence
                 .peek("c1")
-                .expect("intent must be recorded before waiting on map removal")
+                .expect("successful final CAS must record intent")
                 .frontend_origin,
             Some(AcpDisconnectOrigin::DisconnectAll)
         );
-        assert!(map_guard.contains_key("c1"));
-        assert!(!disconnect.is_finished());
-        drop(map_guard);
-
-        disconnect.await.expect("disconnect join").unwrap();
         assert!(manager.get_state("c1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_absent_unleased_id_records_no_intent() {
+        let manager = ConnectionManager::new();
+        let evidence = install_exit_evidence(&manager);
+
+        let result = manager
+            .disconnect_with_origin("missing", AcpDisconnectOrigin::DisconnectAll)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AcpError::ConnectionNotFound(connection_id)) if connection_id == "missing"
+        ));
+        assert_eq!(
+            evidence.peek("missing"),
+            None,
+            "an absent connection must not leave stale disconnect intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_origin_unleased_replacement_race_records_no_intent_for_survivor() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("c1", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let original_incarnation = manager
+            .connections
+            .lock()
+            .await
+            .get("c1")
+            .expect("original connection")
+            .connection_incarnation
+            .clone();
+        let evidence = install_exit_evidence(&manager);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *manager
+            .disconnect_final_cas_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(DisconnectFinalCasHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let disconnect = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .disconnect_with_origin("c1", AcpDisconnectOrigin::DisconnectAll)
+                    .await
+            })
+        };
+
+        reached.notified().await;
+        manager
+            .insert_test_connection("c1", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let replacement_incarnation = manager
+            .connections
+            .lock()
+            .await
+            .get("c1")
+            .expect("replacement connection")
+            .connection_incarnation
+            .clone();
+        assert_ne!(replacement_incarnation, original_incarnation);
+        resume.notify_one();
+        disconnect.await.expect("disconnect join").unwrap();
+
+        let surviving_incarnation = manager
+            .connections
+            .lock()
+            .await
+            .get("c1")
+            .expect("replacement must survive")
+            .connection_incarnation
+            .clone();
+        assert_eq!(surviving_incarnation, replacement_incarnation);
+        assert_eq!(
+            evidence.peek("c1"),
+            None,
+            "a disconnect that loses the incarnation CAS must not classify the replacement"
+        );
     }
 
     #[tokio::test]
