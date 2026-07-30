@@ -805,7 +805,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                   )}
                 </div>
               )}
-              {graphExpanded && <WorkflowGraphPanel snapshot={graph} compact />}
+              {graphExpanded && <WorkflowGraphPanel snapshot={graph} />}
             </div>
           )}
 

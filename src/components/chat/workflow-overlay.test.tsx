@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { fireEvent, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -513,11 +513,232 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(estimated).toHaveAttribute("data-estimated", "true")
     expect(estimated).toHaveAttribute("data-openable", "false")
     expect(estimated).toBeDisabled()
+    expect(estimated).toHaveAttribute("aria-disabled", "true")
+    expect(estimated).toHaveAttribute("title", "Estimated — no session yet")
 
     const observed = screen.getByTestId("workflow-graph-node-n-req")
     expect(observed).toHaveAttribute("data-estimated", "false")
     expect(observed).toHaveAttribute("data-openable", "true")
     expect(observed).not.toBeDisabled()
+  })
+
+  it("defaults empty lanes collapsed and non-empty plan expanded with toggle", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={skeletonGraph()}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-plan")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-tasks")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-final")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(
+      within(screen.getByTestId("workflow-graph-lane-design")).getByText(
+        "No work units"
+      )
+    ).toBeInTheDocument()
+    expect(screen.getByTestId("workflow-graph-node-n-req")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
+    expect(screen.getByTestId("workflow-lane-toggle-plan")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(screen.getByTestId("workflow-graph-lane-plan")).toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-graph-node-n-req")
+    ).not.toBeInTheDocument()
+  })
+
+  it("expands a non-dirty empty design lane when nodes appear, then collapses when empty again", () => {
+    const emptyDesign = {
+      ...skeletonGraph(),
+      graph_revision: 10,
+    }
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={401}
+        workflowGraph={emptyDesign}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+
+    const withDesign: WorkflowGraphSnapshot = {
+      ...skeletonGraph(),
+      graph_revision: 11,
+      nodes: [
+        ...skeletonGraph().nodes,
+        node({
+          node_id: "design-author",
+          phase_id: "design",
+          role: "author",
+          title: "Design author",
+          status: "running",
+          is_observed: true,
+          latest_child_conversation_id: 201,
+        }),
+      ],
+    }
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={401}
+          workflowGraph={withDesign}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(
+      screen.getByTestId("workflow-graph-node-design-author")
+    ).toBeInTheDocument()
+
+    const emptyAgain: WorkflowGraphSnapshot = {
+      ...skeletonGraph(),
+      graph_revision: 12,
+    }
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={401}
+          workflowGraph={emptyAgain}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+  })
+
+  it("keeps a dirty design lane expanded across empty and non-empty flips", () => {
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={402}
+        workflowGraph={{ ...skeletonGraph(), graph_revision: 20 }}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    fireEvent.click(screen.getByTestId("workflow-lane-toggle-design"))
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+
+    const withDesign: WorkflowGraphSnapshot = {
+      ...skeletonGraph(),
+      graph_revision: 21,
+      nodes: [
+        ...skeletonGraph().nodes,
+        node({
+          node_id: "design-author",
+          phase_id: "design",
+          role: "author",
+          title: "Design author",
+          status: "running",
+          is_observed: true,
+          latest_child_conversation_id: 202,
+        }),
+      ],
+    }
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={402}
+          workflowGraph={withDesign}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={402}
+          workflowGraph={{ ...skeletonGraph(), graph_revision: 22 }}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+  })
+
+  it("resets lane expansion defaults after graph panel unmount", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={403}
+        workflowGraph={skeletonGraph()}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
+    expect(screen.getByTestId("workflow-lane-toggle-plan")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    expect(screen.queryByTestId("workflow-graph-panel")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    expect(screen.getByTestId("workflow-lane-toggle-plan")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-lane-toggle-design")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
   })
 
   it("exposes B12 fields in node detail", () => {
@@ -552,14 +773,25 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
 
-    const row = screen.getByTestId("workflow-graph-row-tasks-1")
-    expect(row).toHaveAttribute("data-reviewer-count", "1")
-    expect(screen.getAllByTestId(/^workflow-task-reviewer-node-/)).toHaveLength(
-      1
+    const tasksLane = screen.getByTestId("workflow-graph-lane-tasks")
+    expect(
+      within(tasksLane).getAllByTestId(/^workflow-task-reviewer-node-/)
+    ).toHaveLength(1)
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("1 / 1")
+    expect(screen.getByTestId("workflow-graph-node-task-impl")).toHaveClass(
+      "h-auto"
     )
     expect(
-      screen.getByTestId("workflow-task-reviewer-count-1")
-    ).toHaveTextContent("1 / 1")
+      screen
+        .getByTestId("workflow-graph-node-task-impl")
+        .querySelector("[data-node-title]")
+    ).toHaveClass("line-clamp-2")
+    expect(screen.getByTestId("workflow-task-reviewers-1")).toHaveClass(
+      "ms-6",
+      "border-s"
+    )
     fireEvent.click(screen.getByTestId("workflow-graph-node-task-impl"))
     expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
       "Normal risk"
@@ -579,13 +811,27 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
 
-    const row = screen.getByTestId("workflow-graph-row-tasks-1")
-    expect(row).toHaveAttribute("data-reviewer-count", "2")
-    expect(screen.getAllByTestId(/^workflow-task-reviewer-node-/)).toHaveLength(
-      2
+    const tasksLane = screen.getByTestId("workflow-graph-lane-tasks")
+    expect(
+      within(tasksLane).getAllByTestId(/^workflow-task-reviewer-node-/)
+    ).toHaveLength(2)
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("1 / 2")
+    expect(screen.getByTestId("workflow-graph-node-task-impl")).toHaveClass(
+      "h-auto"
     )
     expect(
-      screen.getByTestId("workflow-task-reviewer-count-1")
+      screen
+        .getByTestId("workflow-graph-node-task-impl")
+        .querySelector("[data-node-title]")
+    ).toHaveClass("line-clamp-2")
+    expect(screen.getByTestId("workflow-task-reviewers-1")).toHaveClass(
+      "ms-6",
+      "border-s"
+    )
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
     ).toHaveTextContent("1 / 2")
 
     rerender(
@@ -645,22 +891,23 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
 
-    const planRow = screen.getByTestId("workflow-graph-row-plan")
-    const planNodes = planRow.querySelectorAll("button")
-    expect(planNodes[0]).toHaveAttribute(
-      "data-testid",
-      "workflow-graph-node-plan-author"
-    )
-    expect(planNodes[1]).toHaveAttribute(
-      "data-testid",
-      "workflow-graph-node-plan-review-grok"
-    )
+    const planLane = screen.getByTestId("workflow-graph-lane-plan")
+    const planNodes = within(planLane).getAllByTestId(/^workflow-graph-node-/)
+    expect(planNodes.map((nodeEl) => nodeEl.dataset.testid)).toEqual([
+      "workflow-graph-node-plan-author",
+      "workflow-graph-node-plan-review-grok",
+    ])
 
-    const taskRow = screen.getByTestId("workflow-graph-row-tasks-1")
-    expect(taskRow).toHaveClass("min-w-0", "overflow-hidden")
-    expect(screen.getByTestId("workflow-task-reviewers-1")).toHaveClass(
-      "min-w-0"
-    )
+    const tasksLane = screen.getByTestId("workflow-graph-lane-tasks")
+    expect(
+      within(tasksLane).getAllByTestId(/^workflow-task-reviewer-node-/)
+    ).toHaveLength(2)
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("1 / 2")
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewers-1")
+    ).toHaveClass("ms-6", "border-s")
 
     const reviewer = screen.getByTestId("workflow-graph-node-task-review-codex")
     reviewer.focus()
@@ -668,6 +915,85 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
       expect.objectContaining({ childConversationId: 93 })
     )
+  })
+
+  it("collapses dependencies by default and shows title chips when expanded", () => {
+    const withUnknownEdge: WorkflowGraphSnapshot = {
+      ...skeletonGraph(),
+      edges: [
+        { from: "n-est", to: "n-req" },
+        { from: "n-req", to: "unknown-endpoint" },
+      ],
+    }
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={47}
+        workflowGraph={withUnknownEdge}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    const edges = screen.getByTestId("workflow-graph-edges")
+    expect(screen.getByTestId("workflow-dependencies-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(
+      screen.getByTestId("workflow-dependencies-toggle")
+    ).toHaveTextContent("Dependencies (2)")
+    expect(within(edges).queryByText("Plan reviewer")).not.toBeInTheDocument()
+    expect(screen.queryByText(/n-est → n-req/)).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-dependency-arrow")
+    ).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("workflow-dependencies-toggle"))
+    expect(screen.getByTestId("workflow-dependencies-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(within(edges).getByText("Plan reviewer")).toBeInTheDocument()
+    expect(
+      within(edges).getAllByText("Required reviewer").length
+    ).toBeGreaterThanOrEqual(1)
+    expect(within(edges).getByText("unknown-endpoint")).toBeInTheDocument()
+    expect(screen.queryByText(/n-est → n-req/)).not.toBeInTheDocument()
+
+    for (const arrow of screen.getAllByTestId("workflow-dependency-arrow")) {
+      expect(arrow).toHaveClass("rtl:rotate-180")
+    }
+  })
+
+  it("renders node detail inline under the selected row and hides with lane collapse", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={48}
+        workflowGraph={skeletonGraph()}
+        defaultExpanded
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    fireEvent.click(screen.getByTestId("workflow-graph-node-n-req"))
+
+    const detail = screen.getByTestId("workflow-node-detail")
+    const panel = screen.getByTestId("workflow-graph-panel")
+    const nodeButton = screen.getByTestId("workflow-graph-node-n-req")
+    expect(detail).toBeInTheDocument()
+    expect(panel.contains(detail)).toBe(true)
+    expect(detail.parentElement?.contains(nodeButton)).toBe(true)
+    // Detail must not be a direct child of the panel (footer placement).
+    expect(detail.parentElement).not.toBe(panel)
+
+    fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
+    expect(screen.getByTestId("workflow-node-detail")).toBeInTheDocument()
   })
 
   it("activates once only after the full workflow graph expands", () => {
