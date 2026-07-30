@@ -4,6 +4,13 @@
 //! Validated summaries are frontend display data only — they are persisted on
 //! the run row (`card_summary_json`) and may ride completion events, but must
 //! **never** appear in parent-facing MCP tool results.
+//!
+//! **Report-file harvest (defense in depth):** agents sometimes put the card
+//! only inside a written report `.md` and link it from chat. Settlement may
+//! harvest a validated card from linked/touched report files when chat text
+//! has no well-formed block. Prefer chat emission; harvest is a fallback.
+
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,12 +104,159 @@ pub struct TestsSummary {
     pub summary: String,
 }
 
+/// Max report files to open when harvesting a missing chat card.
+pub const MAX_REPORT_HARVEST_CANDIDATES: usize = 8;
+/// Cap individual report reads (bytes) so settlement never slurps huge trees.
+pub const MAX_REPORT_HARVEST_FILE_BYTES: u64 = 512 * 1024;
+
 /// Extract the **last** well-formed `codeg-card-summary-v1` comment from raw
 /// assistant text. Earlier echoed examples are ignored. Returns `None` when
 /// missing or invalid (never fails the delegation).
 pub fn extract_card_summary(raw_final_text: &str) -> Option<CardSummary> {
     let json = last_well_formed_summary_json(raw_final_text)?;
     parse_and_validate_summary_json(&json)
+}
+
+/// Prefer a card in `raw_final_text`; if missing, harvest from report files.
+///
+/// Candidate order (later wins when scanning reverse):
+/// 1. Markdown link targets in chat (e.g. `](D:/…/final-review.md)`)
+/// 2. `extra_paths` (typically runtime touched `.md` paths)
+///
+/// Relative candidates are resolved against `workspace_path` when provided.
+/// Never fails the delegation: IO / oversized / invalid files are skipped.
+pub fn extract_card_summary_with_report_fallback(
+    raw_final_text: &str,
+    extra_paths: &[PathBuf],
+    workspace_path: Option<&Path>,
+) -> Option<CardSummary> {
+    if let Some(summary) = extract_card_summary(raw_final_text) {
+        return Some(summary);
+    }
+    let candidates =
+        collect_report_harvest_candidates(raw_final_text, extra_paths, workspace_path);
+    for path in candidates.iter().rev().take(MAX_REPORT_HARVEST_CANDIDATES) {
+        if let Some(summary) = extract_card_summary_from_report_file(path) {
+            return Some(summary);
+        }
+    }
+    None
+}
+
+/// Collect absolute-or-resolved paths that may contain a terminal card block.
+pub fn collect_report_harvest_candidates(
+    raw_final_text: &str,
+    extra_paths: &[PathBuf],
+    workspace_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for raw in extract_markdown_link_targets(raw_final_text) {
+        if let Some(path) = normalize_report_candidate(&raw, workspace_path) {
+            push_unique_path(&mut out, path);
+        }
+    }
+    for path in extra_paths {
+        if is_markdown_report_path(path) {
+            push_unique_path(&mut out, path.clone());
+        } else if let Some(s) = path.to_str() {
+            if let Some(norm) = normalize_report_candidate(s, workspace_path) {
+                push_unique_path(&mut out, norm);
+            }
+        }
+    }
+    out
+}
+
+/// Read a single report file and extract a validated card (size-bounded).
+pub fn extract_card_summary_from_report_file(path: &Path) -> Option<CardSummary> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_REPORT_HARVEST_FILE_BYTES {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    extract_card_summary(&content)
+}
+
+fn push_unique_path(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !out.iter().any(|existing| existing == &path) {
+        out.push(path);
+    }
+}
+
+fn extract_markdown_link_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find("](") {
+        let after = &rest[idx + 2..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        let target = after[..end].trim();
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+fn normalize_report_candidate(raw: &str, workspace_path: Option<&Path>) -> Option<PathBuf> {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Angle-bracket autolinks: <path>
+    if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+        s = s[1..s.len() - 1].trim();
+    }
+    // Strip surrounding quotes.
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s = s[1..s.len() - 1].trim();
+    }
+    // file:// / file:/// URLs (Windows file:///C:/... and file://localhost/...)
+    if let Some(rest) = s.strip_prefix("file://") {
+        s = rest.trim_start_matches('/');
+        // On Windows, file:///C:/... becomes /C:/... after one slash strip;
+        // trim leading slash before drive letter.
+        if s.len() >= 3 && s.as_bytes()[0] == b'/' && s.as_bytes()[2] == b':' {
+            s = &s[1..];
+        }
+    } else if s.contains("://") {
+        // http(s) and other schemes are not local reports.
+        return None;
+    }
+
+    if !looks_like_markdown_report(s) {
+        return None;
+    }
+
+    let path = PathBuf::from(s);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    // Workspace-relative only when a base is provided.
+    let base = workspace_path?;
+    // Reject parent traversal in relative report candidates.
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return None;
+        }
+    }
+    Some(base.join(path))
+}
+
+fn looks_like_markdown_report(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+fn is_markdown_report_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            let lower = ext.to_ascii_lowercase();
+            lower == "md" || lower == "markdown"
+        })
 }
 
 /// Strip all `codeg-card-summary-v1` comment blocks from text. Used when
@@ -641,5 +795,176 @@ mod tests {
             CardSummary::Review { minor, .. } => assert_eq!(minor, 2),
             other => panic!("expected review, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn report_fallback_reads_card_from_linked_markdown_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-card-harvest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("final-review.md");
+        // Session-2534 shape: card only in report file, not in chat.
+        std::fs::write(
+            &report,
+            r#"# Final Whole-Branch Review
+
+**Verdict:** request_changes
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":2,"summary":"HEAD fails TypeScript build; two deferred UI minors remain.","report_file":".superpowers/sdd/final-review.md"}
+-->
+"#,
+        )
+        .unwrap();
+
+        let chat = format!(
+            "Verdict: `request_changes`.\n\nReport: [final-review.md]({})",
+            report.display()
+        );
+        assert!(
+            extract_card_summary(&chat).is_none(),
+            "chat must not contain the card — simulates Codex final reviewer"
+        );
+
+        let summary = extract_card_summary_with_report_fallback(&chat, &[], None)
+            .expect("harvest from markdown link");
+        match summary {
+            CardSummary::Review {
+                verdict,
+                important,
+                report_file,
+                ..
+            } => {
+                assert_eq!(verdict, ReviewVerdict::RequestChanges);
+                assert_eq!(important, 1);
+                assert_eq!(
+                    report_file.as_deref(),
+                    Some(".superpowers/sdd/final-review.md")
+                );
+            }
+            other => panic!("expected review, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_fallback_uses_touched_paths_when_chat_has_no_link() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-card-touched-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("task-1-review.md");
+        std::fs::write(
+            &report,
+            r#"<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"Task 1 rebind approve.","report_file":".superpowers/sdd/task-1-review.md"}
+-->
+"#,
+        )
+        .unwrap();
+
+        let chat = "Review complete. See the report on disk.";
+        let summary =
+            extract_card_summary_with_report_fallback(chat, &[report.clone()], None)
+                .expect("harvest from touched path");
+        match summary {
+            CardSummary::Review { verdict, .. } => {
+                assert_eq!(verdict, ReviewVerdict::Approve);
+            }
+            other => panic!("expected review, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_fallback_prefers_chat_card_over_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-card-prefer-chat-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("stale.md");
+        std::fs::write(
+            &report,
+            r#"<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"block","critical":9,"important":0,"minor":0,"summary":"stale file card"}
+-->
+"#,
+        )
+        .unwrap();
+        let chat = format!(
+            "fresh chat card\n{}\nReport: [stale.md]({})",
+            review_block(""),
+            report.display()
+        );
+        let summary = extract_card_summary_with_report_fallback(&chat, &[report], None).unwrap();
+        match summary {
+            CardSummary::Review {
+                verdict: ReviewVerdict::ApproveWithMinors,
+                minor: 2,
+                ..
+            } => {}
+            other => panic!("chat card must win, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_fallback_resolves_workspace_relative_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-card-rel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sdd = dir.join(".superpowers").join("sdd");
+        std::fs::create_dir_all(&sdd).unwrap();
+        let report = sdd.join("final-review.md");
+        std::fs::write(
+            &report,
+            r#"<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"build fails","report_file":".superpowers/sdd/final-review.md"}
+-->
+"#,
+        )
+        .unwrap();
+        let chat =
+            "Report: [final-review.md](.superpowers/sdd/final-review.md)";
+        let summary =
+            extract_card_summary_with_report_fallback(chat, &[], Some(dir.as_path()))
+                .expect("relative link under workspace");
+        match summary {
+            CardSummary::Review {
+                verdict: ReviewVerdict::RequestChanges,
+                ..
+            } => {}
+            other => panic!("expected request_changes, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_fallback_skips_http_links_and_parent_relative() {
+        let chat = "see [doc](https://example.com/a.md) and [bad](../secret.md)";
+        assert!(extract_card_summary_with_report_fallback(
+            chat,
+            &[],
+            Some(Path::new("/tmp/ws"))
+        )
+        .is_none());
     }
 }
