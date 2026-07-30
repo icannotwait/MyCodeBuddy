@@ -275,6 +275,11 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
                     {progressParts.join(" · ")}
                   </span>
                 )}
+                {!expanded && lane.nodeRows.length === 0 && (
+                  <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+                    {t("emptyLane")}
+                  </span>
+                )}
                 <ChevronDownIcon
                   className={cn(
                     "size-3.5 shrink-0 text-muted-foreground transition-transform",
@@ -283,12 +288,6 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
                   aria-hidden
                 />
               </button>
-
-              {!expanded && lane.nodeRows.length === 0 && (
-                <p className="px-1 text-[10px] text-muted-foreground">
-                  {t("emptyLane")}
-                </p>
-              )}
 
               {expanded && lane.nodeRows.length === 0 && (
                 <p className="px-1 text-[10px] text-muted-foreground">
@@ -305,18 +304,19 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
                     const reviewers = row.nodes.filter(
                       (node) => node.role === "reviewer"
                     )
-                    const taskRow =
-                      lane.kind === "tasks" && row.taskIndex != null
+                    const taskIndex =
+                      lane.kind === "tasks" ? row.taskIndex : null
+                    const taskRow = taskIndex != null
 
                     return (
                       <li key={row.id} className="min-w-0 space-y-1">
-                        {taskRow && (
+                        {taskIndex != null && (
                           <div
                             className="flex items-center gap-2 px-1 text-[10px] font-medium text-muted-foreground"
-                            data-testid={`workflow-task-reviewer-count-${row.taskIndex}`}
+                            data-testid={`workflow-task-reviewer-count-${taskIndex}`}
                           >
                             <span>
-                              {t("taskIndex", { index: row.taskIndex })}
+                              {t("taskIndex", { index: taskIndex })}
                             </span>
                             {row.reviewerProgress && (
                               <span className="tabular-nums">

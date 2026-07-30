@@ -39,7 +39,11 @@ export const WorkflowPhaseRail = memo(function WorkflowPhaseRail({
           <li key={phase.kind} className="flex min-w-0 flex-1 items-center">
             <button
               type="button"
-              className="flex min-w-0 flex-col items-center gap-1 px-1 py-1 text-center text-xs"
+              className={cn(
+                "flex min-w-0 flex-col items-center gap-1 rounded px-1 py-1 text-center text-xs",
+                selectedKind === phase.kind &&
+                  "bg-muted/70 ring-1 ring-border ring-inset"
+              )}
               data-testid={`workflow-phase-${phase.kind}`}
               data-status={phase.status}
               data-selected={selectedKind === phase.kind ? "true" : "false"}
