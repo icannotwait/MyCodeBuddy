@@ -148,6 +148,81 @@ function skeletonGraph(): WorkflowGraphSnapshot {
   }
 }
 
+/** Single fixture covering AC3/AC5/AC6/AC7 vocabulary in one acceptance case. */
+function fullVocabularyGraph(): WorkflowGraphSnapshot {
+  return {
+    ...skeletonGraph(),
+    schema_version: 2,
+    graph_revision: 50,
+    current_phase_id: "tasks",
+    current_node_ids: ["task-review-req"],
+    nodes: [
+      node({
+        node_id: "task-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        agent_type: "codex",
+        task_index: 1,
+        status: "completed",
+        title: "Full vocab implementer",
+        is_observed: true,
+        latest_child_conversation_id: 201,
+        run_count: 2,
+        replacement_count: 1,
+        round_count: 3,
+        active_child_generation: 1,
+        gate_cycle: 2,
+        task_risk_level: "high",
+        task_risk_reason_codes: ["security_trust_boundary", "shared_interface"],
+        required_reviewer_count: 1,
+        returned_reviewer_count: 0,
+        ...({
+          task_risk_reason:
+            "Touches D:/private/project/src/security-boundary.ts",
+          task_risk_evidence: ["src/security-boundary.ts"],
+        } as Record<string, unknown>),
+      }),
+      node({
+        node_id: "task-review-req",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "grok",
+        task_index: 1,
+        status: "running",
+        title: "Required task reviewer",
+        required: true,
+        is_observed: true,
+        latest_child_conversation_id: 202,
+        run_count: 1,
+        replacement_count: 0,
+        round_count: 1,
+        task_risk_level: "high",
+        task_risk_reason_codes: ["security_trust_boundary", "shared_interface"],
+        required_reviewer_count: 1,
+        returned_reviewer_count: 0,
+      }),
+      node({
+        node_id: "task-review-opt",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "claude",
+        task_index: 1,
+        status: "estimated",
+        title: "Optional task reviewer",
+        required: false,
+        is_observed: false,
+        run_count: 0,
+        replacement_count: 0,
+      }),
+    ],
+    edges: [
+      { from: "task-impl", to: "task-review-req" },
+      { from: "task-impl", to: "task-review-opt" },
+    ],
+    gates: [],
+  }
+}
+
 function adaptiveTaskGraph(
   returnedReviewerCount: number,
   riskLevel: "normal" | "high" = "high"
@@ -319,6 +394,36 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       "sessions"
     )
     expect(screen.getByTestId("workflow-sessions-empty")).toBeInTheDocument()
+  })
+
+  it("keeps all four phase labels and status icons without one-line truncation classes", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={skeletonGraph()}
+        defaultExpanded
+      />
+    )
+
+    const rail = screen.getByTestId("workflow-phase-rail")
+    expect(within(rail).getAllByTestId("workflow-status-icon")).toHaveLength(4)
+    const phaseLabels: Record<string, string> = {
+      design: "Design",
+      plan: "Plan",
+      tasks: "Tasks",
+      final: "Final",
+    }
+    for (const kind of ["design", "plan", "tasks", "final"] as const) {
+      const label = screen
+        .getByTestId(`workflow-phase-${kind}`)
+        .querySelector("[data-phase-label]")
+      expect(label).not.toBeNull()
+      expect(label!).toHaveTextContent(phaseLabels[kind])
+      expect(label!).not.toHaveClass("truncate")
+      expect(label!).not.toHaveClass("line-clamp-1")
+    }
   })
 
   it("defaults to the current phase and moves the summary when selected", () => {
@@ -753,12 +858,125 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
     fireEvent.click(screen.getByTestId("workflow-graph-node-n-req"))
-    expect(screen.getByTestId("workflow-node-detail")).toBeInTheDocument()
+
+    const nodeEl = screen.getByTestId("workflow-graph-node-n-req")
+    const wrapper = nodeEl.parentElement
+    expect(wrapper).not.toBeNull()
+    expect(
+      within(wrapper!).getByTestId("workflow-node-detail")
+    ).toBeInTheDocument()
+    expect(screen.getByTestId("workflow-node-b12")).toBeInTheDocument()
     expect(screen.getByTestId("workflow-node-run-count")).toHaveTextContent("1")
     expect(
       screen.getByTestId("workflow-node-replacement-count")
     ).toHaveTextContent("0")
+  })
+
+  it("covers the full graph vocabulary in one acceptance fixture", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={55}
+        workflowGraph={fullVocabularyGraph()}
+        defaultExpanded
+      />
+    )
+
+    const currentRow = screen.getByTestId(
+      "workflow-summary-current-node-task-review-req"
+    )
+    expect(currentRow).toHaveTextContent("Running")
+    expect(currentRow).toHaveTextContent("Role: reviewer")
+    expect(currentRow).toHaveTextContent("Agent: grok")
+
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+
+    const tasksLane = screen.getByTestId("workflow-graph-lane-tasks")
+    expect(screen.getByTestId("workflow-lane-toggle-tasks")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+
+    const implementer = screen.getByTestId("workflow-graph-node-task-impl")
+    expect(implementer).toHaveTextContent("Completed")
+    expect(implementer).toHaveTextContent("Role: implementer")
+    expect(implementer).toHaveTextContent("Agent: codex")
+    expect(implementer).toHaveTextContent("Runs 2")
+    expect(implementer).toHaveTextContent("Replacements 1")
+    expect(implementer.querySelector("[data-node-title]")).toHaveClass(
+      "line-clamp-2"
+    )
+
+    expect(
+      within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
+    ).toHaveTextContent("0 / 1")
+    expect(screen.getByTestId("workflow-task-reviewers-1")).toHaveClass(
+      "ms-6",
+      "border-s"
+    )
+    expect(
+      within(tasksLane).getAllByTestId(/^workflow-task-reviewer-node-/)
+    ).toHaveLength(2)
+
+    const optionalReviewer = screen.getByTestId(
+      "workflow-graph-node-task-review-opt"
+    )
+    expect(optionalReviewer).toHaveTextContent("Optional")
+    expect(optionalReviewer).toHaveTextContent("Estimated")
+
+    fireEvent.click(implementer)
+    const detail = screen.getByTestId("workflow-node-detail")
+    expect(detail.parentElement?.contains(implementer)).toBe(true)
     expect(screen.getByTestId("workflow-node-b12")).toBeInTheDocument()
+    expect(screen.getByTestId("workflow-node-run-count")).toHaveTextContent("2")
+    expect(
+      screen.getByTestId("workflow-node-active-generation")
+    ).toHaveTextContent("1")
+    expect(
+      screen.getByTestId("workflow-node-replacement-count")
+    ).toHaveTextContent("1")
+    expect(screen.getByTestId("workflow-node-gate-cycle")).toHaveTextContent(
+      "2"
+    )
+    expect(screen.getByTestId("workflow-node-round-count")).toHaveTextContent(
+      "3"
+    )
+    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
+      "High risk"
+    )
+    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
+      "Security or trust boundary"
+    )
+    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
+      "Shared interface"
+    )
+    expect(screen.queryByText(/security-boundary\.ts/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/Touches D:\/private\/project/i)
+    ).not.toBeInTheDocument()
+
+    const edges = screen.getByTestId("workflow-graph-edges")
+    expect(screen.getByTestId("workflow-dependencies-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+    expect(
+      screen.getByTestId("workflow-dependencies-toggle")
+    ).toHaveTextContent("Dependencies (2)")
+    fireEvent.click(screen.getByTestId("workflow-dependencies-toggle"))
+    expect(screen.getByTestId("workflow-dependencies-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(within(edges).getAllByText("Full vocab implementer").length).toBe(2)
+    expect(
+      within(edges).getByText("Required task reviewer")
+    ).toBeInTheDocument()
+    expect(
+      within(edges).getByText("Optional task reviewer")
+    ).toBeInTheDocument()
+    expect(screen.getAllByTestId("workflow-dependency-arrow").length).toBe(2)
   })
 
   it("renders one normal-risk Task row with one reviewer branch", () => {
