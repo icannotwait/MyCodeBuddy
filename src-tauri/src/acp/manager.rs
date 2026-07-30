@@ -3420,7 +3420,11 @@ impl ConnectionManager {
         task_id: &str,
         cause: crate::acp::tool_watchdog::CancelCause,
     ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
-        use crate::acp::tool_watchdog::{error_code_for_cause, SpecificCancelOutcome};
+        use crate::acp::termination::{
+            AcpDisconnectOrigin, AcpTerminationClassification, AcpTerminationReason,
+            AcpTerminationSource, AcpTerminationSummaryV1,
+        };
+        use crate::acp::tool_watchdog::{error_code_for_cause, CancelCause, SpecificCancelOutcome};
 
         // Generation guard: incarnation + active turn generation must match.
         {
@@ -3452,9 +3456,36 @@ impl ConnectionManager {
             id
         };
         let reason = error_code_for_cause(cause);
+        let observed_at = chrono::Utc::now();
+        let mut termination = match cause {
+            CancelCause::AutoTimeout => AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Watchdog,
+                AcpTerminationReason::ToolStalledTimeout,
+                AcpTerminationClassification::AutomatedAmbiguous,
+                true,
+                observed_at,
+            ),
+            CancelCause::UserStop => AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::UserCancelled,
+                AcpTerminationClassification::Explicit,
+                true,
+                observed_at,
+            ),
+        };
+        if cause == CancelCause::UserStop {
+            termination.frontend_origin = Some(AcpDisconnectOrigin::LegacyUnspecified);
+            termination.requested_at = Some(observed_at);
+        }
         let _report = injection
             .broker
-            .cancel_task_by_id(&stamp.connection_id, conversation_id, task_id, reason)
+            .cancel_task_by_id_with_termination(
+                &stamp.connection_id,
+                conversation_id,
+                task_id,
+                reason,
+                termination,
+            )
             .await;
         Ok(())
     }

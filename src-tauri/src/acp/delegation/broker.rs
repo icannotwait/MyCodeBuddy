@@ -81,8 +81,7 @@ use crate::acp::delegation::meta_writer::{
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
 use crate::acp::delegation::run_identity::{
-    cold_resolve_allows, fence_allows_settlement, AdmissionWindowTerminal, LiveRunRegistration,
-    SettlementFenceDecision,
+    cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
@@ -473,15 +472,11 @@ struct PendingInner {
     /// (gated by `setups`), keyed by `call_id`. Each carries the `seq` arrival
     /// stamp taken when it buffered, so the park can order it against a racing
     /// parent cancel (first-terminal-wins). Drained at park.
-    early_completes: HashMap<String, (u64, DelegationOutcome)>,
-    /// Cancel reasons captured by a child failure that beat registration (gated
-    /// by `setups`), keyed by `child_connection_id`. The value pairs the `seq`
-    /// arrival stamp (for the park's first-terminal-wins ordering against a
-    /// racing parent cancel) with the pre-computed `Canceled { reason }` text
-    /// (same wording the parked `cancel_by_child_connection` path produces);
-    /// `handle_request` rebuilds the full outcome at park with the real
-    /// `child_conversation_id` (which the resolver, finding no entry, lacked).
-    early_cancels: HashMap<String, (u64, String)>,
+    early_completes: HashMap<String, (u64, ObservedTerminal)>,
+    /// Child failures captured before registration, keyed by child connection.
+    /// The value keeps the arrival stamp and producer-authored terminal
+    /// evidence together; park fills only the wire child identity.
+    early_cancels: HashMap<String, (u64, ObservedTerminal)>,
     /// In-flight `handle_request` setups, keyed by a unique per-call id and
     /// registered at entry (BEFORE the claim poll, so the whole claim→park
     /// window is covered). This is the parent-cancel counterpart to `setups`:
@@ -566,6 +561,20 @@ struct InflightSetup {
     /// Survives single-shot pre-cancel buffer consumption so every later
     /// durable-admission / launch checkpoint still fails closed.
     external_canceled: bool,
+    /// Whether this setup has crossed the prompt-send boundary.
+    prompt_may_have_executed: bool,
+}
+
+/// A terminal event captured at its producer boundary.
+///
+/// The wire outcome remains independent from the typed durable write. Buffer
+/// and drain paths carry this value unchanged, so error-code presentation can
+/// never be used to reconstruct termination evidence or timestamps.
+#[derive(Debug, Clone)]
+struct ObservedTerminal {
+    outcome: DelegationOutcome,
+    terminal: TerminalTaskWrite,
+    result_text: Option<String>,
 }
 
 /// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
@@ -579,7 +588,7 @@ enum ReservingHandoffDisposition {
     /// Parent end won first-terminal-wins (or no earlier child terminal).
     ParentEnded(ParentEndContext),
     /// A buffered child terminal stamped earlier than the parent end.
-    ChildTerminal(DelegationOutcome),
+    ChildTerminal(ObservedTerminal),
 }
 
 /// Process-local terminal intent while durable may still be non-terminal.
@@ -609,9 +618,12 @@ impl TerminalIntent {
                 ReservingHandoffDisposition::ParentEnded(context) => {
                     parent_end_setup_report(agent_type, context, Some(child_conversation_id))
                 }
-                ReservingHandoffDisposition::ChildTerminal(outcome) => {
-                    report_from_outcome(Some(task_id.to_string()), Some(agent_type), outcome, None)
-                }
+                ReservingHandoffDisposition::ChildTerminal(observed) => report_from_outcome(
+                    Some(task_id.to_string()),
+                    Some(agent_type),
+                    &observed.outcome,
+                    None,
+                ),
             }
         };
         if report.task_id.is_none() {
@@ -710,7 +722,7 @@ fn disposition_error_code(disposition: &ReservingHandoffDisposition) -> Option<S
         ReservingHandoffDisposition::ParentEnded(context) => {
             Some(context.reason.error_code().to_string())
         }
-        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
+        ReservingHandoffDisposition::ChildTerminal(observed) => match &observed.outcome {
             DelegationOutcome::Err { code, .. } => Some(code.clone()),
             DelegationOutcome::Ok(_) => None,
         },
@@ -804,7 +816,7 @@ pub(crate) struct CoordinationIdentity {
     /// connection registration, before `promote_running`). Each entry is
     /// stamped with the pending `seq` clock at buffer time so park can order
     /// first-terminal-wins against a racing parent cancel.
-    pub(crate) admission_buffer: Vec<(u64, AdmissionWindowTerminal)>,
+    admission_buffer: Vec<(u64, ObservedTerminal)>,
     /// True after `promote_running` succeeds — buffered terminals may then
     /// be applied.
     pub(crate) admitted_running: bool,
@@ -818,6 +830,10 @@ pub(crate) struct CoordinationIdentity {
     /// handoff while the lease is held; the send path re-checks after the
     /// await and cancels any accepted prompt if the fence lost.
     pub(crate) prompt_send_lease: bool,
+    /// Sticky fact set at the send boundary and never cleared by lease release.
+    prompt_may_have_executed: bool,
+    /// Setup record whose prompt flag advances with `prompt_send_lease`.
+    pub(crate) inflight_id: Option<u64>,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -950,7 +966,7 @@ impl PendingInner {
     fn buffer_admission_window_terminal(
         &mut self,
         child_connection_id: &str,
-        terminal: AdmissionWindowTerminal,
+        terminal: ObservedTerminal,
     ) -> bool {
         // Check before tick so we do not advance the clock for non-buffering
         // paths, and avoid holding a `get_mut` borrow across `tick()`.
@@ -977,7 +993,7 @@ impl PendingInner {
     fn take_first_admission_terminal(
         &mut self,
         child_connection_id: &str,
-    ) -> Option<(u64, AdmissionWindowTerminal)> {
+    ) -> Option<(u64, ObservedTerminal)> {
         let coord = self.coordination_by_child.get_mut(child_connection_id)?;
         if coord.admission_buffer.is_empty() {
             return None;
@@ -1001,38 +1017,35 @@ impl PendingInner {
     /// cancel. No-op when the `call_id` isn't reserved (already resolved by
     /// another terminal path), so the buffer only ever holds genuine
     /// pre-registration races.
-    fn buffer_early_complete(&mut self, call_id: &str, outcome: DelegationOutcome) {
+    fn buffer_early_complete(&mut self, call_id: &str, terminal: ObservedTerminal) {
         if self.setups.contains_key(call_id) {
             let stamp = self.tick();
             self.early_completes
-                .insert(call_id.to_string(), (stamp, outcome));
+                .insert(call_id.to_string(), (stamp, terminal));
         }
     }
 
     /// Buffer a child failure for a still-reserved delegation, stamped with the
     /// current arrival clock so the park can order it against a racing parent
     /// cancel. No-op when the child isn't reserved (normal post-resolution
-    /// teardown). Stores the pre-computed cancel reason so the park rebuilds the
-    /// same wording the parked `cancel_by_child_connection` path produces.
-    fn buffer_child_failure(&mut self, child_connection_id: &str, detail: Option<String>) {
+    /// teardown). Stores producer-authored evidence and its observation time.
+    fn buffer_child_failure(&mut self, child_connection_id: &str, terminal: ObservedTerminal) {
         if self.is_child_reserved(child_connection_id) {
             let stamp = self.tick();
-            self.early_cancels.insert(
-                child_connection_id.to_string(),
-                (stamp, child_canceled_reason(detail.as_deref())),
-            );
+            self.early_cancels
+                .insert(child_connection_id.to_string(), (stamp, terminal));
         }
     }
 
     /// Drain a buffered completion with its arrival stamp (by `call_id`) — used
     /// by `handle_request` at park.
-    fn take_early_complete(&mut self, call_id: &str) -> Option<(u64, DelegationOutcome)> {
+    fn take_early_complete(&mut self, call_id: &str) -> Option<(u64, ObservedTerminal)> {
         self.early_completes.remove(call_id)
     }
 
-    /// Drain a buffered cancel reason with its arrival stamp (by
+    /// Drain a buffered child terminal with its arrival stamp (by
     /// `child_connection_id`) — used by `handle_request` at park.
-    fn take_early_cancel(&mut self, child_connection_id: &str) -> Option<(u64, String)> {
+    fn take_early_cancel(&mut self, child_connection_id: &str) -> Option<(u64, ObservedTerminal)> {
         self.early_cancels.remove(child_connection_id)
     }
 
@@ -1071,6 +1084,7 @@ impl PendingInner {
                 parent_end: None,
                 external_handle,
                 external_canceled: false,
+                prompt_may_have_executed: false,
             },
         );
         id
@@ -1095,6 +1109,12 @@ impl PendingInner {
     fn mark_inflight_external_canceled_by_id(&mut self, id: u64) {
         if let Some(setup) = self.inflight.get_mut(&id) {
             setup.external_canceled = true;
+        }
+    }
+
+    fn mark_inflight_prompt_may_have_executed(&mut self, id: u64) {
+        if let Some(setup) = self.inflight.get_mut(&id) {
+            setup.prompt_may_have_executed = true;
         }
     }
 
@@ -1142,7 +1162,7 @@ impl PendingInner {
             if setup.parent_connection_id == parent_connection_id && setup.parent_end.is_none() {
                 setup.parent_end = Some(InflightParentEnd {
                     stamp,
-                    context: context.clone(),
+                    context: context.with_prompt_may_have_executed(setup.prompt_may_have_executed),
                 });
             }
         }
@@ -1205,37 +1225,20 @@ impl PendingInner {
             let Some(coord) = self.coordination_by_child.get(&child_id).cloned() else {
                 continue;
             };
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = self.take_early_complete(&coord.task_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = self.take_early_complete(&coord.task_id) {
+                consider(stamp, terminal);
+            }
+            if let Some((stamp, terminal)) = self.take_early_cancel(&child_id) {
+                consider(stamp, terminal);
             }
             let child_conversation_id = coord.run_registration.child_conversation_id;
-            if let Some((stamp, cancel_reason)) = self.take_early_cancel(&child_id) {
-                consider(
-                    stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled {
-                            reason: cancel_reason,
-                        },
-                        Some(child_conversation_id).filter(|id| *id != 0),
-                    ),
-                );
-            }
             if let Some((stamp, terminal)) = self.take_first_admission_terminal(&child_id) {
-                // Agent type is unknown on the handoff path; admission drain
-                // only needs the outcome wire code/message for durable settle.
-                consider(
-                    stamp,
-                    admission_terminal_to_outcome(
-                        terminal,
-                        child_conversation_id,
-                        AgentType::ClaudeCode,
-                    ),
-                );
+                consider(stamp, terminal);
             }
             // First-wins claim via shared non-destructive resolver: peek any
             // existing bootstrap ChildTerminal (or earlier park) before insert.
@@ -1245,10 +1248,12 @@ impl PendingInner {
                 intent.disposition
             } else {
                 let computed = match child_terminal {
-                    Some((child_stamp, outcome)) if child_stamp < parent_end_stamp => {
-                        ReservingHandoffDisposition::ChildTerminal(outcome)
+                    Some((child_stamp, terminal)) if child_stamp < parent_end_stamp => {
+                        ReservingHandoffDisposition::ChildTerminal(terminal)
                     }
-                    _ => ReservingHandoffDisposition::ParentEnded(context.clone()),
+                    _ => ReservingHandoffDisposition::ParentEnded(
+                        context.with_prompt_may_have_executed(coord.prompt_may_have_executed),
+                    ),
                 };
                 match self
                     .closed_handoff_dispositions
@@ -1329,7 +1334,10 @@ impl PendingInner {
     fn disposition_is_persistence_error(disposition: &ReservingHandoffDisposition) -> bool {
         matches!(
             disposition,
-            ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err { code, .. })
+            ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                outcome: DelegationOutcome::Err { code, .. },
+                ..
+            })
                 if code == "persistence_error"
         )
     }
@@ -1695,9 +1703,10 @@ trait ParentEndContextArg {
     fn into_parent_end_context(self) -> ParentEndContext;
 }
 
+#[cfg(test)]
 impl ParentEndContextArg for ParentTurnEndReason {
     fn into_parent_end_context(self) -> ParentEndContext {
-        ParentEndContext::legacy(self, Utc::now())
+        ParentEndContext::legacy(self, Utc::now(), true)
     }
 }
 
@@ -1820,6 +1829,99 @@ fn explicit_cancellation_audit(
     )
 }
 
+fn observed_terminal_from_outcome(
+    outcome: DelegationOutcome,
+    evidence: DelegationTerminationAuditV1,
+    observed_at: DateTime<Utc>,
+) -> ObservedTerminal {
+    let (terminal, result_text) = match &outcome {
+        DelegationOutcome::Ok(ok) => (
+            TerminalTaskWrite::completed(observed_at, ConversationStatus::PendingReview),
+            Some(ok.text.clone()),
+        ),
+        DelegationOutcome::Err { code, .. } => {
+            let terminal = if is_canceled_error_code(code) {
+                TerminalTaskWrite::canceled(code.clone(), observed_at, evidence)
+            } else {
+                TerminalTaskWrite::failed_with_evidence(code.clone(), observed_at, evidence)
+            };
+            (terminal, None)
+        }
+    };
+    ObservedTerminal {
+        outcome,
+        terminal,
+        result_text,
+    }
+}
+
+fn observe_child_outcome(
+    outcome: DelegationOutcome,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+) -> ObservedTerminal {
+    observed_terminal_from_outcome(
+        outcome,
+        termination_audit(
+            AcpTerminationSource::ChildConnection,
+            AcpTerminationReason::ChildTerminal,
+            AcpTerminationClassification::Unexpected,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+        observed_at,
+    )
+}
+
+fn persistence_error_observation(
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+    child_conversation_id: Option<i32>,
+) -> ObservedTerminal {
+    let outcome = DelegationOutcome::Err {
+        code: "persistence_error".into(),
+        message: bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError),
+        child_conversation_id,
+    };
+    observed_terminal_from_outcome(
+        outcome,
+        termination_audit(
+            AcpTerminationSource::Legacy,
+            AcpTerminationReason::LegacyUnspecified,
+            AcpTerminationClassification::LegacyUnknown,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+        observed_at,
+    )
+}
+
+impl ObservedTerminal {
+    fn with_child_identity(mut self, child_conversation_id: i32, agent_type: AgentType) -> Self {
+        match &mut self.outcome {
+            DelegationOutcome::Ok(ok) => {
+                ok.child_conversation_id = child_conversation_id;
+                ok.child_agent_type = agent_type;
+            }
+            DelegationOutcome::Err {
+                child_conversation_id: cid,
+                ..
+            } => {
+                if cid.is_none() {
+                    *cid = Some(child_conversation_id);
+                }
+            }
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 fn canceled_terminal(
     code: impl Into<String>,
@@ -1838,125 +1940,6 @@ fn canceled_terminal(
             observed_at,
         ),
     )
-}
-
-/// Map a resolved outcome onto a durable terminal write + optional result text.
-fn terminal_from_outcome(
-    outcome: &DelegationOutcome,
-    prior_status: DelegationRunStatus,
-    prompt_may_have_executed: bool,
-) -> (TerminalTaskWrite, Option<String>) {
-    let now = Utc::now();
-    match outcome {
-        DelegationOutcome::Ok(ok) => (
-            TerminalTaskWrite::completed(now, ConversationStatus::PendingReview),
-            Some(ok.text.clone()),
-        ),
-        DelegationOutcome::Err { code, .. } => {
-            let (source, reason, classification, requested) = match code.as_str() {
-                "parent_canceled" => (
-                    AcpTerminationSource::ParentTurn,
-                    AcpTerminationReason::ParentCanceled,
-                    AcpTerminationClassification::Explicit,
-                    true,
-                ),
-                "parent_turn_failed" => (
-                    AcpTerminationSource::ParentTurn,
-                    AcpTerminationReason::ParentTurnFailed,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-                "join_abandoned" => (
-                    AcpTerminationSource::ParentTurn,
-                    AcpTerminationReason::JoinAbandoned,
-                    AcpTerminationClassification::Intentional,
-                    true,
-                ),
-                "user_cancelled" | "canceled" => (
-                    AcpTerminationSource::Frontend,
-                    AcpTerminationReason::UserCancelled,
-                    AcpTerminationClassification::Explicit,
-                    true,
-                ),
-                "tool_stalled_timeout" => (
-                    AcpTerminationSource::Watchdog,
-                    AcpTerminationReason::ToolStalledTimeout,
-                    AcpTerminationClassification::AutomatedAmbiguous,
-                    true,
-                ),
-                "host_restarted" => (
-                    AcpTerminationSource::HostRestart,
-                    AcpTerminationReason::HostRestarted,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-                "process_exited" => (
-                    AcpTerminationSource::Process,
-                    AcpTerminationReason::ProcessExited,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-                "send_failed" | "transport_disconnected" => (
-                    AcpTerminationSource::Transport,
-                    AcpTerminationReason::TransportDisconnected,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-                "session_lost" | "unresumable" => (
-                    AcpTerminationSource::Session,
-                    AcpTerminationReason::SessionLost,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-                "admission_failed"
-                | "admission_unknown"
-                | "spawn_failed"
-                | "route_policy_rejected"
-                | "budget_exhausted"
-                | "not_supported" => (
-                    AcpTerminationSource::Admission,
-                    if code == "admission_unknown" {
-                        AcpTerminationReason::AdmissionUnknown
-                    } else {
-                        AcpTerminationReason::AdmissionFailed
-                    },
-                    if code == "admission_unknown" {
-                        AcpTerminationClassification::AutomatedAmbiguous
-                    } else {
-                        AcpTerminationClassification::Unexpected
-                    },
-                    false,
-                ),
-                "parent_disconnected" => (
-                    AcpTerminationSource::Legacy,
-                    AcpTerminationReason::LegacyUnspecified,
-                    AcpTerminationClassification::LegacyUnknown,
-                    false,
-                ),
-                _ => (
-                    AcpTerminationSource::ChildConnection,
-                    AcpTerminationReason::ChildTerminal,
-                    AcpTerminationClassification::Unexpected,
-                    false,
-                ),
-            };
-            let audit = termination_audit(
-                source,
-                reason,
-                classification,
-                prior_status,
-                prompt_may_have_executed,
-                requested.then_some(now),
-                now,
-            );
-            let terminal = if is_canceled_error_code(code) {
-                TerminalTaskWrite::canceled(code.clone(), now, audit)
-            } else {
-                TerminalTaskWrite::failed_with_evidence(code.clone(), now, audit)
-            };
-            (terminal, None)
-        }
-    }
 }
 
 /// Project a full [`TerminalTaskWrite`] payload onto a process-local outcome.
@@ -2038,10 +2021,10 @@ fn terminal_from_handoff_disposition(
 ) -> TerminalTaskWrite {
     match disposition {
         ReservingHandoffDisposition::ParentEnded(context) => {
-            let now = Utc::now();
+            let observed_at = context.termination.observed_at;
             TerminalTaskWrite::canceled(
                 context.reason.error_code(),
-                now,
+                observed_at,
                 context.audit(
                     DelegationRunStatus::Reserving,
                     AdmissionClass::NormalRevision,
@@ -2050,9 +2033,7 @@ fn terminal_from_handoff_disposition(
                 ),
             )
         }
-        ReservingHandoffDisposition::ChildTerminal(outcome) => {
-            terminal_from_outcome(outcome, DelegationRunStatus::Reserving, true).0
-        }
+        ReservingHandoffDisposition::ChildTerminal(observed) => observed.terminal.clone(),
     }
 }
 
@@ -2111,42 +2092,6 @@ fn report_harvest_context_from_runtime(
         .map(|f| std::path::PathBuf::from(f.path))
         .collect();
     (paths, workspace)
-}
-
-/// Convert an admission-window terminal into a settlement outcome.
-/// Preserves typed codes (refusal, max_tokens, unresumable, …) from
-/// [`AdmissionWindowTerminal::Outcome`]; bare disconnect maps to canceled.
-fn admission_terminal_to_outcome(
-    terminal: AdmissionWindowTerminal,
-    child_conversation_id: i32,
-    agent_type: AgentType,
-) -> DelegationOutcome {
-    match terminal {
-        AdmissionWindowTerminal::Outcome(outcome) => match outcome {
-            DelegationOutcome::Ok(mut ok) => {
-                ok.child_conversation_id = child_conversation_id;
-                if ok.child_agent_type != agent_type {
-                    ok.child_agent_type = agent_type;
-                }
-                DelegationOutcome::Ok(ok)
-            }
-            DelegationOutcome::Err {
-                code,
-                message,
-                child_conversation_id: cid,
-            } => DelegationOutcome::Err {
-                code,
-                message,
-                child_conversation_id: cid.or(Some(child_conversation_id)),
-            },
-        },
-        AdmissionWindowTerminal::Disconnect { detail } => DelegationOutcome::from_err(
-            DelegationError::Canceled {
-                reason: child_canceled_reason(detail.as_deref()),
-            },
-            Some(child_conversation_id),
-        ),
-    }
 }
 
 /// Rebuild a lightweight outcome for meta/event summary from a settled report.
@@ -6395,6 +6340,8 @@ impl DelegationBroker {
                     // Gen-1 setup still owns an inflight record; park does FWW.
                     settle_on_parent_end: false,
                     prompt_send_lease: false,
+                    prompt_may_have_executed: false,
+                    inflight_id: Some(inflight_id),
                 },
             );
         }
@@ -6511,8 +6458,17 @@ impl DelegationBroker {
             } else {
                 // Claim send lease under the same lock as the cancel observe so
                 // parent-end drain can see in-flight send ownership.
-                if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
+                let inflight_prompt_owner = if let Some(coord) =
+                    inner.coordination_by_child.get_mut(&child_connection_id)
+                {
                     coord.prompt_send_lease = true;
+                    coord.prompt_may_have_executed = true;
+                    coord.inflight_id
+                } else {
+                    None
+                };
+                if let Some(id) = inflight_prompt_owner {
+                    inner.mark_inflight_prompt_may_have_executed(id);
                 }
                 None
             }
@@ -6848,7 +6804,7 @@ impl DelegationBroker {
         // inline (never leaving an entry for a second resolver to grab) rules
         // out a double-finalize.
         enum Disposition {
-            ChildTerminal(DelegationOutcome),
+            ChildTerminal(ObservedTerminal),
             ParentEnded(ParentEndContext),
             /// Sticky external cancel observed under the park lock (setup-to-
             /// running handoff). Must not insert `running` or publish start.
@@ -6863,21 +6819,18 @@ impl DelegationBroker {
             // First-terminal-wins among: early complete (call_id), early cancel
             // (child connection), and admission-window buffer (connection-scoped
             // TurnComplete / disconnect / error / cancel while reserving).
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = inner.take_early_complete(&call_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = inner.take_early_complete(&call_id) {
+                consider(stamp, terminal);
             }
-            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+            if let Some((stamp, terminal)) = inner.take_early_cancel(&child_connection_id) {
                 consider(
                     stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled { reason },
-                        Some(child_conversation_id),
-                    ),
+                    terminal.with_child_identity(child_conversation_id, req.agent_type),
                 );
             }
             if let Some((stamp, terminal)) =
@@ -6885,7 +6838,7 @@ impl DelegationBroker {
             {
                 consider(
                     stamp,
-                    admission_terminal_to_outcome(terminal, child_conversation_id, req.agent_type),
+                    terminal.with_child_identity(child_conversation_id, req.agent_type),
                 );
             }
             let parent_end = inner.inflight_parent_end(inflight_id);
@@ -6950,11 +6903,9 @@ impl DelegationBroker {
                             inner.take_first_admission_terminal(&child_connection_id)
                         {
                             inner.deregister_inflight(inflight_id);
-                            Disposition::ChildTerminal(admission_terminal_to_outcome(
-                                terminal,
-                                child_conversation_id,
-                                req.agent_type,
-                            ))
+                            Disposition::ChildTerminal(
+                                terminal.with_child_identity(child_conversation_id, req.agent_type),
+                            )
                         } else {
                             inner.running.insert(
                                 call_id.clone(),
@@ -6985,9 +6936,10 @@ impl DelegationBroker {
 
         match disposition {
             // A child terminal beat registration — durable settle then return.
-            Disposition::ChildTerminal(outcome) => {
-                let (terminal, result_text) =
-                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+            Disposition::ChildTerminal(observed) => {
+                let outcome = observed.outcome;
+                let terminal = observed.terminal;
+                let result_text = observed.result_text;
                 let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
                 let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                     terminal,
@@ -7050,8 +7002,9 @@ impl DelegationBroker {
             // and never return a running acknowledgement.
             Disposition::ExternalCanceled => {
                 let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                let (terminal, result_text) =
-                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+                let terminal =
+                    explicit_cancellation_terminal("canceled", DelegationRunStatus::Running, true);
+                let result_text = None;
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -7146,8 +7099,12 @@ impl DelegationBroker {
                 if removed {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                    let (terminal, result_text) =
-                        terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+                    let terminal = explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Running,
+                        true,
+                    );
+                    let result_text = None;
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -7440,14 +7397,13 @@ impl DelegationBroker {
                 self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 // Preserve captured final stats for the eventual successful settle.
-                let mut retry_terminal = failed_terminal(
-                    "persistence_error",
+                let mut retry_terminal = persistence_error_observation(
                     DelegationRunStatus::Running,
                     true,
-                    AcpTerminationSource::Legacy,
-                    AcpTerminationReason::LegacyUnspecified,
-                    AcpTerminationClassification::LegacyUnknown,
-                );
+                    Utc::now(),
+                    Some(ctx.child_conversation_id),
+                )
+                .terminal;
                 if let Some(stats) = final_runtime_stats {
                     retry_terminal = retry_terminal.with_runtime_stats(stats);
                 }
@@ -8108,6 +8064,8 @@ impl DelegationBroker {
                     // durable-settle the handoff directly.
                     settle_on_parent_end: true,
                     prompt_send_lease: false,
+                    prompt_may_have_executed: false,
+                    inflight_id: None,
                 },
             );
             if let Some(inflight_id) = transfer_inflight_id {
@@ -9299,28 +9257,26 @@ impl DelegationBroker {
         // admission_buffer, then re-drain after admitted_running. Parent-end
         // already unregisters the handoff — never insert Running after that.
         enum ContinueAdmissionDisposition {
-            ChildTerminal(DelegationOutcome),
+            ChildTerminal(ObservedTerminal),
             Running,
         }
         let task_preview = reserved.task_preview.clone().unwrap_or_default();
         let started_at = Instant::now();
         let (runtime, disposition) = {
             let mut inner = self.pending.inner.lock().await;
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = inner.take_early_complete(&reserved.task_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = inner.take_early_complete(&reserved.task_id) {
+                consider(stamp, terminal);
             }
-            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+            if let Some((stamp, terminal)) = inner.take_early_cancel(&child_connection_id) {
                 consider(
                     stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled { reason },
-                        Some(reserved.child_conversation_id),
-                    ),
+                    terminal
+                        .with_child_identity(reserved.child_conversation_id, reserved.agent_type),
                 );
             }
             if let Some((stamp, terminal)) =
@@ -9328,11 +9284,8 @@ impl DelegationBroker {
             {
                 consider(
                     stamp,
-                    admission_terminal_to_outcome(
-                        terminal,
-                        reserved.child_conversation_id,
-                        reserved.agent_type,
-                    ),
+                    terminal
+                        .with_child_identity(reserved.child_conversation_id, reserved.agent_type),
                 );
             }
             let handoff_open = inner
@@ -9343,7 +9296,7 @@ impl DelegationBroker {
                     .get(&child_connection_id)
                     .is_some_and(|c| !c.admitted_running && c.task_id == reserved.task_id);
 
-            if let Some((_, outcome)) = child_terminal {
+            if let Some((_, terminal)) = child_terminal {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
                 (
                     inner
@@ -9356,7 +9309,7 @@ impl DelegationBroker {
                                 PathBuf::new(),
                             ))
                         }),
-                    ContinueAdmissionDisposition::ChildTerminal(outcome),
+                    ContinueAdmissionDisposition::ChildTerminal(terminal),
                 )
             } else if !handoff_open {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
@@ -9365,12 +9318,30 @@ impl DelegationBroker {
                         accepted.prompt_accepted_at,
                         PathBuf::new(),
                     )),
-                    ContinueAdmissionDisposition::ChildTerminal(DelegationOutcome::from_err(
-                        DelegationError::Canceled {
-                            reason: "parent_canceled".into(),
-                        },
-                        Some(reserved.child_conversation_id),
-                    )),
+                    {
+                        let observed_at = Utc::now();
+                        let outcome = DelegationOutcome::from_err(
+                            DelegationError::Canceled {
+                                reason: "parent_canceled".into(),
+                            },
+                            Some(reserved.child_conversation_id),
+                        );
+                        ContinueAdmissionDisposition::ChildTerminal(observed_terminal_from_outcome(
+                            outcome,
+                            ParentEndContext::legacy(
+                                ParentTurnEndReason::ParentCanceled,
+                                observed_at,
+                                true,
+                            )
+                            .audit(
+                                DelegationRunStatus::Reserving,
+                                AdmissionClass::NormalRevision,
+                                None,
+                                Some(child_connection_id.clone()),
+                            ),
+                            observed_at,
+                        ))
+                    },
                 )
             } else {
                 if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
@@ -9402,8 +9373,7 @@ impl DelegationBroker {
                     inner.unreserve(&reserved.task_id, &child_connection_id);
                     (
                         runtime,
-                        ContinueAdmissionDisposition::ChildTerminal(admission_terminal_to_outcome(
-                            terminal,
+                        ContinueAdmissionDisposition::ChildTerminal(terminal.with_child_identity(
                             reserved.child_conversation_id,
                             reserved.agent_type,
                         )),
@@ -9443,7 +9413,7 @@ impl DelegationBroker {
             }
         };
 
-        if let ContinueAdmissionDisposition::ChildTerminal(outcome) = disposition {
+        if let ContinueAdmissionDisposition::ChildTerminal(observed) = disposition {
             // Prefer durable parent-end settlement if it already won.
             if let Ok(Some(existing)) = runs.load_by_task_id(&reserved.task_id).await {
                 use crate::db::entities::delegation_task_run::DelegationRunStatus;
@@ -9461,8 +9431,9 @@ impl DelegationBroker {
                     return continue_idempotent_ack(&existing, req.target_task_id);
                 }
             }
-            let (terminal, result_text) =
-                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+            let outcome = observed.outcome;
+            let terminal = observed.terminal;
+            let result_text = observed.result_text;
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
@@ -9564,8 +9535,12 @@ impl DelegationBroker {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome =
                         canceled_outcome(reserved.child_conversation_id, "canceled before await");
-                    let (terminal, result_text) =
-                        terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+                    let terminal = explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Running,
+                        true,
+                    );
+                    let result_text = None;
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -9652,6 +9627,7 @@ impl DelegationBroker {
                             inner.coordination_by_child.get_mut(handoff_connection_id)
                         {
                             coord.prompt_send_lease = true;
+                            coord.prompt_may_have_executed = true;
                         }
                     }
                     open
@@ -9701,6 +9677,7 @@ impl DelegationBroker {
             if open && !terminal && claim_prompt_send {
                 if let Some(coord) = inner.coordination_by_child.get_mut(handoff_connection_id) {
                     coord.prompt_send_lease = true;
+                    coord.prompt_may_have_executed = true;
                 }
             }
             open
@@ -10148,7 +10125,21 @@ impl DelegationBroker {
             message: wire_message.clone(),
             child_conversation_id: Some(child_conversation_id),
         };
-        let (terminal, _) = terminal_from_outcome(&outcome, DelegationRunStatus::Reserving, true);
+        let observed_at = Utc::now();
+        let observed = observed_terminal_from_outcome(
+            outcome.clone(),
+            termination_audit(
+                AcpTerminationSource::Admission,
+                AcpTerminationReason::AdmissionFailed,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Reserving,
+                true,
+                None,
+                observed_at,
+            ),
+            observed_at,
+        );
+        let terminal = observed.terminal.clone();
 
         // 1) Claim local first-terminal disposition (insert-if-absent).
         // On Occupied: report from existing TerminalIntent / durable truth —
@@ -10218,7 +10209,7 @@ impl DelegationBroker {
                     return PostAcceptPromoteResult::Failed(report);
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(observed.clone()));
                     true
                 }
             }
@@ -10342,6 +10333,11 @@ impl DelegationBroker {
                         agent_type,
                         child_conversation_id,
                     );
+                    let adopted_observed = ObservedTerminal {
+                        outcome: adopted_outcome.clone(),
+                        terminal: existing.terminal.clone(),
+                        result_text: None,
+                    };
                     // Align disposition + overlay from the **full** TerminalTaskWrite
                     // only while retry ownership is still live and finalize has not
                     // already installed a terminal overlay. Do not invent
@@ -10359,7 +10355,7 @@ impl DelegationBroker {
                         } else {
                             inner.closed_handoff_dispositions.insert(
                                 task_id.to_string(),
-                                ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
+                                ReservingHandoffDisposition::ChildTerminal(adopted_observed),
                             );
                             let completed = build_completed(
                                 parent_connection_id,
@@ -10915,18 +10911,29 @@ impl DelegationBroker {
         let stable_message = sanitize_bootstrap_unresumable_message(&raw_message);
         let outcome =
             DelegationOutcome::from_err(DelegationError::Unresumable(stable_message), None);
-        let (terminal, _) = terminal_from_outcome(&outcome, DelegationRunStatus::Reserving, false);
+        let observed_at = Utc::now();
+        let observed = observed_terminal_from_outcome(
+            outcome.clone(),
+            termination_audit(
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Reserving,
+                false,
+                None,
+                observed_at,
+            ),
+            observed_at,
+        );
+        let terminal = observed.terminal.clone();
 
         // Test-only / no durable store: buffer admission-window outcome.
         if self.run_store.is_none() {
             let mut inner = self.pending.inner.lock().await;
             if let Some(conn) = child_connection_id {
-                let _ = inner.buffer_admission_window_terminal(
-                    conn,
-                    AdmissionWindowTerminal::Outcome(outcome.clone()),
-                );
+                let _ = inner.buffer_admission_window_terminal(conn, observed.clone());
             }
-            inner.buffer_early_complete(task_id, outcome);
+            inner.buffer_early_complete(task_id, observed);
             return BootstrapSettleResult::Won;
         }
 
@@ -10966,7 +10973,7 @@ impl DelegationBroker {
                         .await;
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(observed.clone()));
                     if let Some(ref id) = overlay_identity {
                         inner.insert_completed(
                             task_id,
@@ -11214,6 +11221,24 @@ impl DelegationBroker {
         }
 
         let persistence_message = bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
+        let retry_evidence = self
+            .task_store
+            .get_retry(task_id)
+            .await
+            .and_then(|retry| retry.terminal.termination_evidence().cloned());
+        let prior_status = retry_evidence
+            .as_ref()
+            .map(|audit| audit.prior_status.clone())
+            .unwrap_or(DelegationRunStatus::Running);
+        let prompt_may_have_executed = retry_evidence
+            .as_ref()
+            .is_some_and(|audit| audit.termination.prompt_may_have_executed);
+        let persistence_observed = persistence_error_observation(
+            prior_status,
+            prompt_may_have_executed,
+            Utc::now(),
+            accounting.map(|a| a.child_conversation_id),
+        );
 
         // Critical section: durable_cas free → take permanent_pe_claim, park,
         // re-read durable, (optionally test-gate), re-check durable + claim fence.
@@ -11256,19 +11281,15 @@ impl DelegationBroker {
             // payloads alongside unresumable / persistence_error.
             let is_same_owner = matches!(
                 inner.closed_handoff_dispositions.get(task_id),
-                Some(ReservingHandoffDisposition::ChildTerminal(
-                    DelegationOutcome::Err { code, .. }
-                )) if is_same_owner_intended_error_code(code)
+                Some(ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                    outcome: DelegationOutcome::Err { code, .. },
+                    ..
+                })) if is_same_owner_intended_error_code(code)
             );
             if is_same_owner {
-                let child_conversation_id = accounting.map(|a| a.child_conversation_id);
                 inner.closed_handoff_dispositions.insert(
                     task_id.to_string(),
-                    ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                        code: "persistence_error".into(),
-                        message: persistence_message.clone(),
-                        child_conversation_id,
-                    }),
+                    ReservingHandoffDisposition::ChildTerminal(persistence_observed.clone()),
                 );
             }
             // Upgrade process-local overlay when it is our business refuse or
@@ -11399,8 +11420,11 @@ impl DelegationBroker {
             should_record
         };
 
-        // Keep original retry payload ownership, freeze it (no worker spin).
-        self.task_store.freeze_retry(task_id).await;
+        // Preserve the same producer-authored persistence payload in the park
+        // and frozen retry record (no worker spin).
+        self.task_store
+            .replace_retry_and_freeze(task_id, persistence_observed.terminal.clone())
+            .await;
         if should_record {
             // Once-only: parent-end may later durable-win the parked
             // ChildTerminal(persistence_error) and must not re-count.
@@ -11849,17 +11873,20 @@ impl DelegationBroker {
         child_connection_id: &str,
         outcome: DelegationOutcome,
     ) {
+        let observed_at = Utc::now();
         // Admission-window buffer: connection registered, not yet promote_running.
         {
             let mut inner = self.pending.inner.lock().await;
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
-                    // Preserve the full outcome (refusal / max_tokens /
-                    // unresumable / Ok / canceled) so drain keeps wire codes.
-                    let _ = inner.buffer_admission_window_terminal(
-                        child_connection_id,
-                        AdmissionWindowTerminal::Outcome(outcome),
+                    let prompt_may_have_executed = coord.prompt_may_have_executed;
+                    let observed = observe_child_outcome(
+                        outcome,
+                        DelegationRunStatus::Reserving,
+                        prompt_may_have_executed,
+                        observed_at,
                     );
+                    let _ = inner.buffer_admission_window_terminal(child_connection_id, observed);
                     return;
                 }
                 // Fence: event connection must match registered incarnation.
@@ -11903,7 +11930,11 @@ impl DelegationBroker {
                 }
             }
         };
-        self.complete_call(&task_id, outcome).await;
+        self.complete_call_observed(
+            &task_id,
+            observe_child_outcome(outcome, DelegationRunStatus::Running, true, observed_at),
+        )
+        .await;
     }
 
     /// Called by the child-session lifecycle subscriber on `TurnComplete`
@@ -11925,6 +11956,15 @@ impl DelegationBroker {
     /// Prefer [`Self::complete_call_for_connection`] from lifecycle so continued
     /// runs settle by active task id rather than conversation root call id.
     pub async fn complete_call(&self, call_id: &str, outcome: DelegationOutcome) {
+        let observed_at = Utc::now();
+        self.complete_call_observed(
+            call_id,
+            observe_child_outcome(outcome, DelegationRunStatus::Running, true, observed_at),
+        )
+        .await;
+    }
+
+    async fn complete_call_observed(&self, call_id: &str, observed: ObservedTerminal) {
         let task = {
             let mut inner = self.pending.inner.lock().await;
             match inner.running.remove(call_id) {
@@ -11976,14 +12016,23 @@ impl DelegationBroker {
                         "[delegation] complete_call: not in running — buffer early complete \
                          if reserved, else no-op"
                     );
-                    inner.buffer_early_complete(call_id, outcome.clone());
+                    let observed_at = observed.terminal.finished_at;
+                    inner.buffer_early_complete(
+                        call_id,
+                        observe_child_outcome(
+                            observed.outcome.clone(),
+                            DelegationRunStatus::Reserving,
+                            true,
+                            observed_at,
+                        ),
+                    );
                     None
                 }
             }
         };
         if let Some((task, duration_ms)) = task {
-            let (terminal, result_text) =
-                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+            let terminal = observed.terminal;
+            let result_text = observed.result_text;
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
@@ -12174,6 +12223,10 @@ impl DelegationBroker {
     /// 2. if no setup was marked, buffer the handle in `pre_canceled_handles`
     ///    for entry-side observation (cancel before inflight registration).
     pub async fn cancel_by_external_handle(&self, external_handle: &str, reason: String) {
+        let observed_at = Utc::now();
+        let termination =
+            explicit_cancellation_audit(DelegationRunStatus::Running, true, observed_at)
+                .termination;
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             let keys: Vec<String> = inner
@@ -12198,7 +12251,7 @@ impl DelegationBroker {
             return;
         }
         // A turn is in flight, so cancel + disconnect after durable settle.
-        self.settle_drained_canceled(drained, &reason, true, false)
+        self.settle_drained_canceled(drained, &reason, true, termination)
             .await;
     }
 
@@ -12220,29 +12273,36 @@ impl DelegationBroker {
         child_connection_id: &str,
         terminal_error: Option<&str>,
     ) {
+        let observed_at = Utc::now();
         let reason = child_canceled_reason(terminal_error);
+        let outcome = DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: reason.clone(),
+            },
+            None,
+        );
+        let running_termination = AcpTerminationSummaryV1::new(
+            AcpTerminationSource::ChildConnection,
+            AcpTerminationReason::ChildTerminal,
+            AcpTerminationClassification::Unexpected,
+            true,
+            observed_at,
+        );
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             // Admission window: buffer disconnect/error while still reserving.
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
-                    let terminal = match terminal_error {
-                        Some(detail) => {
-                            AdmissionWindowTerminal::Outcome(DelegationOutcome::from_err(
-                                DelegationError::Canceled {
-                                    reason: child_canceled_reason(Some(detail)),
-                                },
-                                None,
-                            ))
-                        }
-                        None => AdmissionWindowTerminal::Disconnect { detail: None },
-                    };
-                    let _ = inner.buffer_admission_window_terminal(child_connection_id, terminal);
-                    // Also keep the classic early-cancel buffer for park drain.
-                    inner.buffer_child_failure(
-                        child_connection_id,
-                        terminal_error.map(|s| s.to_string()),
+                    let terminal = observe_child_outcome(
+                        outcome.clone(),
+                        DelegationRunStatus::Reserving,
+                        coord.prompt_may_have_executed,
+                        observed_at,
                     );
+                    let _ = inner
+                        .buffer_admission_window_terminal(child_connection_id, terminal.clone());
+                    // Also keep the classic early-cancel buffer for park drain.
+                    inner.buffer_child_failure(child_connection_id, terminal);
                     return;
                 }
                 // Fence: only settle if this connection is the registered incarnation.
@@ -12281,7 +12341,12 @@ impl DelegationBroker {
                     // registration instead of no-oping.
                     inner.buffer_child_failure(
                         child_connection_id,
-                        terminal_error.map(|s| s.to_string()),
+                        observe_child_outcome(
+                            outcome.clone(),
+                            DelegationRunStatus::Reserving,
+                            true,
+                            observed_at,
+                        ),
                     );
                 }
                 Vec::new()
@@ -12290,7 +12355,7 @@ impl DelegationBroker {
             }
         };
         // Child already disconnected/errored — disconnect-only after settle.
-        self.settle_drained_canceled(drained, &reason, false, true)
+        self.settle_drained_canceled(drained, &reason, false, running_termination)
             .await;
         {
             let mut inner = self.pending.inner.lock().await;
@@ -12305,7 +12370,8 @@ impl DelegationBroker {
     /// since those connections are going away. Runs fully inline — the
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
-        let context = ParentEndContext::legacy(ParentTurnEndReason::ParentDisconnected, Utc::now());
+        let context =
+            ParentEndContext::legacy(ParentTurnEndReason::ParentDisconnected, Utc::now(), true);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
             .drain_parent_tree(parent_connection_id, &context, false)
@@ -12357,7 +12423,7 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
-        let context = ParentEndContext::legacy(reason, Utc::now());
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
@@ -12405,7 +12471,7 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
-        let context = ParentEndContext::legacy(reason, Utc::now());
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
             .drain_parent_tree(parent_connection_id, &context, true)
@@ -12799,40 +12865,25 @@ impl DelegationBroker {
         drained: Vec<(String, RunningTask, u64)>,
         reason: &str,
         cancel_turn: bool,
-        child_connection_termination: bool,
+        termination: AcpTerminationSummaryV1,
     ) {
         for (task_id, task, duration_ms) in drained {
             let outcome = canceled_outcome(task.child_conversation_id, reason);
-            let (terminal, result_text) = if child_connection_termination {
-                let observed_at = Utc::now();
-                let termination = AcpTerminationSummaryV1::new(
-                    AcpTerminationSource::ChildConnection,
-                    AcpTerminationReason::ChildTerminal,
-                    AcpTerminationClassification::Unexpected,
-                    true,
-                    observed_at,
-                );
-                (
-                    TerminalTaskWrite::canceled(
-                        "canceled",
-                        observed_at,
-                        DelegationTerminationAuditV1::new(
-                            termination,
-                            DelegationRunStatus::Running,
-                            AdmissionClass::NormalRevision,
-                            Some(task.parent_tool_use_id.clone()),
-                            Some(task.child_connection_id.clone()),
-                        ),
-                    ),
-                    None,
-                )
-            } else {
-                terminal_from_outcome(&outcome, DelegationRunStatus::Running, true)
-            };
+            let terminal = TerminalTaskWrite::canceled(
+                "canceled",
+                termination.observed_at,
+                DelegationTerminationAuditV1::new(
+                    termination.clone(),
+                    DelegationRunStatus::Running,
+                    AdmissionClass::NormalRevision,
+                    Some(task.parent_tool_use_id.clone()),
+                    Some(task.child_connection_id.clone()),
+                ),
+            );
             let mut ctx = SettleContext::from_running(&task, duration_ms, cancel_turn);
             let (_, _, _, message) = terminal_fields(&outcome);
             ctx.message = message;
-            self.settle_task(&task_id, terminal, result_text, ctx).await;
+            self.settle_task(&task_id, terminal, None, ctx).await;
         }
     }
 
@@ -12860,7 +12911,7 @@ impl DelegationBroker {
             self.cancel_by_parent(parent_connection_id).await;
             return;
         }
-        let context = ParentEndContext::legacy(reason, Utc::now());
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
             .drain_parent_tree(parent_connection_id, &context, true)
@@ -13708,6 +13759,30 @@ impl DelegationBroker {
         task_id: &str,
         reason: &str,
     ) -> DelegationTaskReport {
+        let observed_at = Utc::now();
+        let termination =
+            explicit_cancellation_audit(DelegationRunStatus::Running, true, observed_at)
+                .termination;
+        self.cancel_task_by_id_with_termination(
+            parent_connection_id,
+            parent_conversation_id,
+            task_id,
+            reason,
+            termination,
+        )
+        .await
+    }
+
+    /// Internal producer-authored cancellation boundary. `reason` remains the
+    /// durable/wire error code; typed evidence is never derived from it.
+    pub async fn cancel_task_by_id_with_termination(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_id: &str,
+        reason: &str,
+        termination: AcpTerminationSummaryV1,
+    ) -> DelegationTaskReport {
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             if let Some(c) = inner.completed.get(task_id) {
@@ -13735,8 +13810,18 @@ impl DelegationBroker {
         match drained {
             Some((_id, task, duration_ms)) => {
                 let outcome = canceled_outcome(task.child_conversation_id, reason);
-                let (terminal, result_text) =
-                    terminal_from_outcome(&outcome, DelegationRunStatus::Running, true);
+                let terminal = TerminalTaskWrite::canceled(
+                    reason,
+                    termination.observed_at,
+                    DelegationTerminationAuditV1::new(
+                        termination,
+                        DelegationRunStatus::Running,
+                        AdmissionClass::NormalRevision,
+                        Some(task.parent_tool_use_id.clone()),
+                        Some(task.child_connection_id.clone()),
+                    ),
+                );
+                let result_text = None;
                 let mut ctx = SettleContext::from_running(&task, duration_ms, true);
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -14270,6 +14355,29 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
+    }
+
+    async fn assert_inflight_parent_end_is_reserving_preprompt(broker: &DelegationBroker) {
+        let inner = broker.pending.inner.lock().await;
+        let context = inner
+            .inflight
+            .values()
+            .filter_map(|setup| setup.parent_end.as_ref())
+            .next()
+            .expect("parent end must remain attached to the gated setup")
+            .context
+            .clone();
+        let audit = context.audit(
+            DelegationRunStatus::Reserving,
+            AdmissionClass::NormalRevision,
+            None,
+            None,
+        );
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "pre-prompt parent end must not claim that the prompt may have executed"
+        );
     }
 
     // -- Task 4.3 -----------------------------------------------------------
@@ -15461,6 +15569,10 @@ mod tests {
         }
         async fn freeze_retry(&self, task_id: &str) {
             self.inner.freeze_retry(task_id).await
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            self.inner.replace_retry_and_freeze(task_id, terminal).await
         }
     }
 
@@ -21304,9 +21416,8 @@ mod tests {
         }
         assert!(!broker.is_running_for_test(&call_id).await);
         assert!(!broker.has_live_run_for_test("c-unres").await);
-        // terminal_from_outcome maps non-canceled codes to
-        // TerminalTaskWrite::failed — so the returned outcome code is the
-        // durable settlement surface for this path.
+        // The producer-authored session terminal keeps the returned outcome
+        // code as the durable settlement surface for this path.
     }
 
     /// Order-sensitive: manager only returns connection id after bootstrap
@@ -22159,7 +22270,7 @@ mod tests {
     /// Parent cancel stamped during the post-bind pre-send window must not
     /// enqueue a prompt and must disconnect the unused child.
     #[tokio::test]
-    async fn gen1_bind_parent_cancel_before_send_no_prompt_disconnects() {
+    async fn termination_evidence_wave2_post_spawn_pre_dispatch_parent_end_is_preprompt() {
         use crate::db::entities::delegation_task_run::{
             Column as RunCol, DelegationRunStatus, Entity as DelegationTaskRun,
         };
@@ -22228,6 +22339,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
         let _ = release_tx.send(());
 
         let report = driver.await.expect("join");
@@ -22255,7 +22367,7 @@ mod tests {
     /// and external buffer drain, while the pre-send fence gate holds — the
     /// atomic fence must still observe it (zero sends + disconnect).
     #[tokio::test]
-    async fn gen1_pre_send_fence_parent_cancel_inter_check_no_prompt() {
+    async fn termination_evidence_wave2_pre_send_parent_end_is_preprompt() {
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
 
@@ -22306,6 +22418,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
         let _ = release_tx.send(());
 
         let report = driver.await.expect("join");
@@ -23477,8 +23590,21 @@ mod tests {
         assert!(retry.frozen, "must freeze ownership before release");
         assert_eq!(
             retry.terminal.error_code.as_deref(),
-            Some("admission_failed"),
-            "frozen payload keeps intended admission code"
+            Some("persistence_error"),
+            "frozen payload must match the permanent persistence producer"
+        );
+        let evidence = retry
+            .terminal
+            .termination_evidence()
+            .expect("typed frozen persistence evidence");
+        assert_eq!(evidence.termination.source, AcpTerminationSource::Legacy);
+        assert_eq!(
+            evidence.termination.reason,
+            AcpTerminationReason::LegacyUnspecified
+        );
+        assert_eq!(
+            evidence.termination.classification,
+            AcpTerminationClassification::LegacyUnknown
         );
     }
 
@@ -24164,6 +24290,7 @@ mod tests {
                 ReservingHandoffDisposition::ParentEnded(ParentEndContext::legacy(
                     ParentTurnEndReason::ParentCanceled,
                     Utc::now(),
+                    true,
                 )),
             );
         }
@@ -24383,11 +24510,16 @@ mod tests {
                 let mut inner = broker.pending.inner.lock().await;
                 inner.closed_handoff_dispositions.insert(
                     task_id.clone(),
-                    ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                        code: code.to_string(),
-                        message: format!("intended {code}"),
-                        child_conversation_id: Some(child.id),
-                    }),
+                    ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                        DelegationOutcome::Err {
+                            code: code.to_string(),
+                            message: format!("intended {code}"),
+                            child_conversation_id: Some(child.id),
+                        },
+                        DelegationRunStatus::Reserving,
+                        true,
+                        Utc::now(),
+                    )),
                 );
             }
             let _ = flaky
@@ -24421,8 +24553,8 @@ mod tests {
                 inner.closed_handoff_dispositions.get(&task_id).cloned()
             };
             match disp {
-                Some(ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                    code: pe,
+                Some(ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                    outcome: DelegationOutcome::Err { code: pe, .. },
                     ..
                 })) => {
                     assert_eq!(
@@ -24434,6 +24566,21 @@ mod tests {
             }
             let retry = flaky.get_retry(&task_id).await.expect("frozen");
             assert!(retry.frozen);
+            let parked_terminal = {
+                let inner = broker.pending.inner.lock().await;
+                match inner.closed_handoff_dispositions.get(&task_id) {
+                    Some(ReservingHandoffDisposition::ChildTerminal(observed)) => {
+                        observed.terminal.clone()
+                    }
+                    other => panic!("expected typed PE park for {code}, got {other:?}"),
+                }
+            };
+            assert_eq!(
+                retry.terminal.termination_evidence(),
+                parked_terminal.termination_evidence(),
+                "frozen persistence retry must retain the producer-authored park evidence"
+            );
+            assert_eq!(retry.terminal.finished_at, parked_terminal.finished_at);
         }
     }
 
@@ -25241,6 +25388,10 @@ mod tests {
         }
         async fn freeze_retry(&self, task_id: &str) {
             self.inner.freeze_retry(task_id).await
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            self.inner.replace_retry_and_freeze(task_id, terminal).await
         }
     }
 
@@ -26220,11 +26371,16 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 task_id.clone(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                    code: "unresumable".into(),
-                    message: "resume failed".into(),
-                    child_conversation_id: Some(child.id),
-                }),
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::Err {
+                        code: "unresumable".into(),
+                        message: "resume failed".into(),
+                        child_conversation_id: Some(child.id),
+                    },
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
+                )),
             );
         }
 
@@ -29771,7 +29927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_terminal_write_returns_persistence_error_and_keeps_retry() {
+    async fn termination_evidence_wave2_persistence_retry_matches_handoff_drain() {
         let store = Arc::new(MockTaskStore::fail_settle_times(4));
         let mock = Arc::new(MockSpawner::new());
         let broker =
@@ -29784,6 +29940,25 @@ mod tests {
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
         assert!(store.has_retry_record("task-1").await);
+        let retry = store.get_retry("task-1").await.expect("retry payload");
+        let retry_outcome = outcome_from_terminal_write(
+            &retry.terminal,
+            AgentType::ClaudeCode,
+            retry.child_conversation_id,
+        );
+        let drained = terminal_from_handoff_disposition(
+            &ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                outcome: retry_outcome,
+                terminal: retry.terminal.clone(),
+                result_text: None,
+            }),
+        );
+        assert_eq!(
+            drained.termination_evidence(),
+            retry.terminal.termination_evidence(),
+            "handoff drain must consume producer-authored persistence evidence unchanged"
+        );
+        assert_eq!(drained.finished_at, retry.terminal.finished_at);
         assert!(
             !mock.disconnects.lock().await.is_empty(),
             "child must be disconnected after persistence exhaustion"
@@ -30036,7 +30211,7 @@ mod tests {
     /// dropped; child cancel/disconnect still runs and the task does not stay
     /// permanently Running.
     #[tokio::test]
-    async fn cancel_task_by_id_outer_timeout_still_completes_settlement() {
+    async fn termination_evidence_wave2_watchdog_cancel_is_typed_at_producer() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn-timeout".into())).await;
         spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
@@ -30060,10 +30235,24 @@ mod tests {
         let cancel = {
             let broker = broker.clone();
             let t1 = t1.clone();
+            let observed_at = Utc::now();
+            let termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Watchdog,
+                AcpTerminationReason::ToolStalledTimeout,
+                AcpTerminationClassification::AutomatedAmbiguous,
+                true,
+                observed_at,
+            );
             tokio::spawn(async move {
                 tokio::time::timeout(
                     Duration::from_millis(30),
-                    broker.cancel_task_by_id("parent-conn", Some(1), &t1, "tool_stalled_timeout"),
+                    broker.cancel_task_by_id_with_termination(
+                        "parent-conn",
+                        Some(1),
+                        &t1,
+                        "tool_stalled_timeout",
+                        termination,
+                    ),
                 )
                 .await
             })
@@ -30118,6 +30307,23 @@ mod tests {
             store.persisted(&t1).await.error_code.as_deref(),
             Some("tool_stalled_timeout")
         );
+        let settle_calls = store.settle_calls().await;
+        let audit = settle_calls
+            .last()
+            .and_then(|(_, terminal)| terminal.termination_evidence())
+            .expect("typed watchdog termination evidence");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert_eq!(audit.termination.source, AcpTerminationSource::Watchdog);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ToolStalledTimeout
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::AutomatedAmbiguous
+        );
+        assert!(audit.termination.prompt_may_have_executed);
+        assert!(audit.termination.requested_at.is_none());
         assert_eq!(
             spawner.cancels.lock().await.as_slice(),
             &["child-conn-timeout".to_string()],
@@ -30826,9 +31032,14 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 "task-exist".into(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
-                    DelegationError::Unresumable("parked".into()),
-                    None,
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::from_err(
+                        DelegationError::Unresumable("parked".into()),
+                        None,
+                    ),
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
                 )),
             );
             inner.insert_completed(
@@ -30935,9 +31146,14 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 "task-mismatch".into(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
-                    DelegationError::Unresumable("missing external session id".into()),
-                    None,
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::from_err(
+                        DelegationError::Unresumable("missing external session id".into()),
+                        None,
+                    ),
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
                 )),
             );
         }
@@ -32659,7 +32875,7 @@ mod tests {
     /// canceled child. Uses the post-admit gate so durable parent-end sweep can
     /// race the committed reservation deterministically.
     #[tokio::test]
-    async fn gen1_parent_cancel_after_admit_before_spawn_compensates_despite_parent_sweep() {
+    async fn termination_evidence_wave2_pre_spawn_parent_end_is_preprompt() {
         use crate::db::entities::conversation::{self, DelegationTaskStatus};
         use crate::db::entities::delegation_task_run::{
             self, DelegationRunStatus, Entity as DelegationTaskRun,
@@ -32738,6 +32954,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
 
         let after_sweep = runs
             .load_by_task_id(&task_id)
@@ -36097,9 +36314,9 @@ mod tests {
 
     /// Admission-window disconnect on continue drains after promote.
     #[tokio::test]
-    async fn continue_admission_window_disconnect_drains_after_promote() {
+    async fn termination_evidence_wave2_buffered_admission_disconnect_keeps_observation() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
-        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::entities::{conversation, delegation_task_run};
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
@@ -36163,9 +36380,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
+        let observed_before = Utc::now();
         broker
             .cancel_by_child_connection(&child_connection_id, None)
             .await;
+        let observed_after = Utc::now();
         assert_eq!(
             broker
                 .admission_buffer_len_for_test(&child_connection_id)
@@ -36181,8 +36400,49 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(continued.run_status, DelegationRunStatus::Running);
-        assert_ne!(continued.run_status, DelegationRunStatus::Reserving);
+        assert_ne!(
+            continued.run_status,
+            delegation_task_run::DelegationRunStatus::Running
+        );
+        assert_ne!(
+            continued.run_status,
+            delegation_task_run::DelegationRunStatus::Reserving
+        );
+        let continued_row = delegation_task_run::Entity::find_by_id(&continued_task_id)
+            .one(&db.conn)
+            .await
+            .expect("load continued run entity")
+            .expect("continued run entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            continued_row
+                .termination_audit_json
+                .as_deref()
+                .expect("typed child-disconnect audit"),
+        )
+        .expect("valid V1 audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            audit.termination.source,
+            AcpTerminationSource::ChildConnection
+        );
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ChildTerminal
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert!(audit.termination.prompt_may_have_executed);
+        assert!(audit.termination.requested_at.is_none());
+        assert!(
+            audit.termination.observed_at >= observed_before
+                && audit.termination.observed_at <= observed_after,
+            "buffer drain replaced original observation time: {} not in [{}, {}]",
+            audit.termination.observed_at,
+            observed_before,
+            observed_after
+        );
     }
 
     /// Parent cancel of a live running task with a real RunStore must not let

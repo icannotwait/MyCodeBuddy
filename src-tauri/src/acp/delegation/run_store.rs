@@ -95,7 +95,6 @@ fn host_restarted_termination_audit(
 fn serialize_termination_evidence(
     evidence: Option<&DelegationTerminationAuditV1>,
     row: &delegation_task_run::Model,
-    prior_status: DelegationRunStatus,
 ) -> Result<Option<String>, TaskStoreError> {
     let Some(evidence) = evidence else {
         return Ok(None);
@@ -107,7 +106,6 @@ fn serialize_termination_evidence(
         )));
     }
     let mut canonical = evidence.clone();
-    canonical.prior_status = prior_status;
     canonical.admission_class = row.admission_class.clone();
     canonical.parent_tool_use_id = row.parent_tool_use_id.clone();
     canonical.child_connection_id = row.child_connection_id.clone();
@@ -2680,11 +2678,8 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?
                         .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-                    let termination_audit_json = serialize_termination_evidence(
-                        termination_evidence.as_ref(),
-                        &won,
-                        DelegationRunStatus::Reserving,
-                    )?;
+                    let termination_audit_json =
+                        serialize_termination_evidence(termination_evidence.as_ref(), &won)?;
                     if let Some(ref audit) = termination_audit_json {
                         DelegationTaskRun::update_many()
                             .col_expr(
@@ -3414,12 +3409,8 @@ impl RunStore {
                         DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
                     }
 
-                    let prior_status = row.status.clone();
-                    let termination_audit_json = serialize_termination_evidence(
-                        termination_evidence.as_ref(),
-                        &row,
-                        prior_status,
-                    )?;
+                    let termination_audit_json =
+                        serialize_termination_evidence(termination_evidence.as_ref(), &row)?;
                     let generation = row.generation;
                     let child_id = row.child_conversation_id;
                     let parent_id = row.parent_conversation_id;

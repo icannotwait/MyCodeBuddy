@@ -579,6 +579,9 @@ pub trait DelegationTaskStore: Send + Sync {
     /// Mark the retry record frozen so workers skip settle and `put_retry`
     /// refuses re-own. No-op when no record exists.
     async fn freeze_retry(&self, task_id: &str);
+    /// Replace the retry terminal with the producer-authored permanent failure
+    /// and freeze it in the same lock acquisition.
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite);
 }
 
 /// Default store for broker unit tests that do **not** exercise durability.
@@ -649,6 +652,13 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn freeze_retry(&self, task_id: &str) {
         if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
+    }
+
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.terminal = terminal;
             retry.frozen = true;
         }
     }
@@ -1155,6 +1165,13 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             retry.frozen = true;
         }
     }
+
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.terminal = terminal;
+            retry.frozen = true;
+        }
+    }
 }
 
 /// Scripted in-memory store for broker unit tests.
@@ -1632,6 +1649,13 @@ pub mod mock {
 
         async fn freeze_retry(&self, task_id: &str) {
             if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.frozen = true;
+            }
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.terminal = terminal;
                 retry.frozen = true;
             }
         }

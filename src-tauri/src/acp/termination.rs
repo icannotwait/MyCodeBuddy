@@ -330,7 +330,11 @@ pub struct ParentEndContext {
 }
 
 impl ParentEndContext {
-    pub fn legacy(reason: ParentTurnEndReason, observed_at: DateTime<Utc>) -> Self {
+    pub fn legacy(
+        reason: ParentTurnEndReason,
+        observed_at: DateTime<Utc>,
+        prompt_may_have_executed: bool,
+    ) -> Self {
         let (source, termination_reason, classification, requested_at) = match reason {
             ParentTurnEndReason::ParentCanceled => (
                 AcpTerminationSource::ParentTurn,
@@ -361,7 +365,7 @@ impl ParentEndContext {
             source,
             termination_reason,
             classification,
-            true,
+            prompt_may_have_executed,
             observed_at,
         );
         termination.requested_at = requested_at;
@@ -369,6 +373,12 @@ impl ParentEndContext {
             reason,
             termination,
         }
+    }
+
+    pub fn with_prompt_may_have_executed(&self, prompt_may_have_executed: bool) -> Self {
+        let mut context = self.clone();
+        context.termination.prompt_may_have_executed = prompt_may_have_executed;
+        context
     }
 
     pub fn audit(
