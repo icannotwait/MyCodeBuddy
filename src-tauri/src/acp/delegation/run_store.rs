@@ -22,6 +22,11 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
+use crate::acp::delegation::recovery_policy::{
+    decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
+    RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot, ReplacementReason,
+    RequestedRecoveryOperation,
+};
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
@@ -518,6 +523,18 @@ pub enum Gen1AdmitOutcome {
 /// Inputs for pure continuability decision (design decision table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinueEligibility {
+    pub source_task_id: String,
+    pub lineage_root_task_id: String,
+    pub generation: i64,
+    pub parent_conversation_id: i32,
+    pub child_conversation_id: i32,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub route_fingerprint: Option<String>,
+    pub work_unit_key: Option<String>,
+    pub parent_tool_use_id: Option<String>,
+    pub child_connection_id: Option<String>,
     pub history_only: bool,
     pub is_latest: bool,
     pub has_active_run: bool,
@@ -526,11 +543,18 @@ pub struct ContinueEligibility {
     pub agent_type_matches: bool,
     pub snapshot_complete: bool,
     pub external_id_present: bool,
+    pub external_session_identity_hash: Option<String>,
     pub run_status: DelegationRunStatus,
     pub error_code: Option<String>,
     pub admission_class: AdmissionClass,
     pub reached_running: bool,
     pub termination_audit_json: Option<String>,
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub recovery_authorization_id: Option<String>,
+    pub agent_supports_reuse: bool,
+    pub unexpected_continue_budget_available: bool,
+    pub replacement_budget_available: bool,
 }
 
 /// Continuability decision after ownership is already resolved.
@@ -564,122 +588,74 @@ pub enum ContinueAdmitOutcome {
 /// Decide continue eligibility with design precedence:
 /// busy → stale → not_continuable → admit (with admission_class).
 pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision {
-    // Lifecycle gates that run after parent-tool idempotency (caller-side).
-    if e.has_active_run {
-        return ContinueDecision::BusyThread;
-    }
-    if !e.is_latest {
-        return ContinueDecision::StaleTaskId;
-    }
-    if e.history_only
-        || e.child_superseded
-        || !e.child_ownership_valid
-        || !e.agent_type_matches
-        || !e.snapshot_complete
-        || !e.external_id_present
-    {
-        return ContinueDecision::NotContinuable;
-    }
-
-    match e.run_status {
-        DelegationRunStatus::Completed => ContinueDecision::Admit(AdmissionClass::NormalRevision),
-        DelegationRunStatus::Failed => {
-            if e.error_code.as_deref() == Some("host_restarted")
-                && !e.reached_running
-                && is_host_restarted_reserving_audit(e.termination_audit_json.as_deref())
-            {
-                // Pre-admission host_restarted: inherit class unless replacement.
-                if e.admission_class == AdmissionClass::Replacement {
-                    return ContinueDecision::NotContinuable;
-                }
-                return ContinueDecision::Admit(e.admission_class.clone());
-            }
-            if e.reached_running && is_revision_eligible_failure(e.error_code.as_deref()) {
-                ContinueDecision::Admit(AdmissionClass::NormalRevision)
-            } else {
-                ContinueDecision::NotContinuable
-            }
-        }
-        DelegationRunStatus::Canceled => {
-            if e.reached_running && is_unexpected_cancellation(e) {
-                ContinueDecision::Admit(AdmissionClass::UnexpectedContinue)
-            } else {
-                ContinueDecision::NotContinuable
-            }
-        }
-        DelegationRunStatus::Reserving | DelegationRunStatus::Running => {
-            // Should have been busy when has_active_run; fail closed.
-            ContinueDecision::BusyThread
-        }
-    }
-}
-
-fn is_revision_eligible_failure(code: Option<&str>) -> bool {
-    match code {
-        None => true,
-        Some("route_policy_rejected")
-        | Some("budget_exhausted")
-        | Some("not_supported")
-        | Some("unresumable")
-        | Some("parent_canceled")
-        | Some("parent_turn_failed")
-        | Some("join_abandoned")
-        | Some("parent_disconnected") => false,
-        Some("host_restarted") => false, // handled separately (inherit)
-        Some("admission_failed") | Some("admission_unknown") => false,
-        Some(_) => true,
-    }
-}
-
-/// Terminal codes that leave an established work-unit lineage non-continuable
-/// under continue policy, but must still allow same-role replacement so the
-/// unit is not permanently fenced after parent-end / explicit cancel / stall.
-///
-/// Skill recovery uses `replacement_reason = unresumable` for these codes
-/// (existing enum surface; the durable code is not rewritten to
-/// `unresumable` on settle). Includes `parent_disconnected` as a replace
-/// escape hatch when continue is not chosen or resume later fails.
-fn is_noncontinuable_lineage_stuck_code(code: Option<&str>) -> bool {
-    matches!(
-        code,
-        Some("parent_disconnected")
-            | Some("parent_canceled")
-            | Some("parent_turn_failed")
-            | Some("join_abandoned")
-            | Some("user_cancelled")
-            | Some("tool_stalled_timeout")
-    )
-}
-
-fn is_host_restarted_reserving_audit(audit: Option<&str>) -> bool {
-    matches!(
-        parse_delegation_termination(
-            DelegationRunStatus::Failed,
-            Some("host_restarted"),
-            false,
-            audit,
-        ),
-        ParsedDelegationTermination::Typed(DelegationTerminationAuditV1 {
-            termination: AcpTerminationSummaryV1 {
-                source: AcpTerminationSource::HostRestart,
-                reason: AcpTerminationReason::HostRestarted,
-                ..
-            },
-            prior_status: DelegationRunStatus::Reserving,
-            ..
-        })
-    )
-}
-
-/// Structured termination audit identifies unexpected cancel/recovery.
-fn is_unexpected_cancellation(e: &ContinueEligibility) -> bool {
-    let parsed = parse_delegation_termination(
-        e.run_status.clone(),
-        e.error_code.as_deref(),
-        e.reached_running,
-        e.termination_audit_json.as_deref(),
+    let source = recovery_source_from_continue_eligibility(e);
+    let decision = decide_delegation_recovery(
+        &source,
+        &RecoveryRailSnapshot {
+            agent_supports_reuse: e.agent_supports_reuse,
+            unexpected_continue_budget_available: e.unexpected_continue_budget_available,
+            replacement_budget_available: e.replacement_budget_available,
+        },
+        RequestedRecoveryOperation::Continue,
     );
-    parsed.is_automatic_unexpected_termination()
+    match decision.disposition {
+        RecoveryDisposition::Stop {
+            code: crate::acp::delegation::recovery_policy::RecoveryStopCode::BusyThread,
+        } => ContinueDecision::BusyThread,
+        RecoveryDisposition::Stop {
+            code: crate::acp::delegation::recovery_policy::RecoveryStopCode::StaleTaskId,
+        } => ContinueDecision::StaleTaskId,
+        RecoveryDisposition::Continue { admission_class }
+            if decision.confirmation == RecoveryConfirmation::NotRequired =>
+        {
+            ContinueDecision::Admit(admission_class)
+        }
+        _ => ContinueDecision::NotContinuable,
+    }
+}
+
+fn recovery_source_from_continue_eligibility(e: &ContinueEligibility) -> RecoverySourceSnapshot {
+    RecoverySourceSnapshot {
+        source_task_id: e.source_task_id.clone(),
+        lineage_root_task_id: e.lineage_root_task_id.clone(),
+        generation: e.generation,
+        parent_conversation_id: e.parent_conversation_id,
+        child_conversation_id: e.child_conversation_id,
+        agent_type: e.agent_type.clone(),
+        profile_id: e.profile_id.clone(),
+        workspace_path: e.workspace_path.clone(),
+        route_fingerprint: e.route_fingerprint.clone(),
+        work_unit_key: e.work_unit_key.clone(),
+        parent_tool_use_id: e.parent_tool_use_id.clone(),
+        child_connection_id: e.child_connection_id.clone(),
+        history_only: e.history_only,
+        is_latest: e.is_latest,
+        has_active_run: e.has_active_run,
+        child_superseded: e.child_superseded,
+        child_ownership_valid: e.child_ownership_valid,
+        agent_type_matches: e.agent_type_matches,
+        run_status: e.run_status.clone(),
+        error_code: e.error_code.clone(),
+        admission_class: e.admission_class.clone(),
+        parsed_termination: parse_delegation_termination(
+            e.run_status.clone(),
+            e.error_code.as_deref(),
+            e.reached_running,
+            e.termination_audit_json.as_deref(),
+        ),
+        reached_running: e.reached_running,
+        launch_snapshot_complete: e.snapshot_complete,
+        external_session_identity_hash: e
+            .external_id_present
+            .then(|| e.external_session_identity_hash.clone())
+            .flatten(),
+        replaced_task_id: e.replaced_task_id.clone(),
+        replacement_reason: e
+            .replacement_reason
+            .as_deref()
+            .and_then(ReplacementReason::parse),
+        recovery_authorization_id: e.recovery_authorization_id.clone(),
+    }
 }
 
 /// Allowed `replacement_reason` values for `delegate_to_agent` recovery.
@@ -701,46 +677,85 @@ fn replacement_reason_matches_source(
     unexpected_continue_exhausted: bool,
     missing_external_session: bool,
 ) -> bool {
-    match reason {
-        REPLACEMENT_REASON_UNRESUMABLE => {
-            // Admission-coded rows recover only via their dedicated reasons.
-            // Do not let missing workspace/route/session collapse them into
-            // unresumable (which would skip the admission_unknown ack warning).
-            if is_admission_recovery_error_code(source.error_code.as_deref()) {
-                return false;
-            }
-            source.error_code.as_deref() == Some("unresumable")
-                // Parent-end / explicit cancel / stall: continue is blocked
-                // (or optional) but lineage is established — allow same-role
-                // replace so work units are not permanently fenced.
-                || is_noncontinuable_lineage_stuck_code(source.error_code.as_deref())
-                || source
-                    .workspace_path
-                    .as_deref()
-                    .map(|value| value.trim().is_empty())
-                    .unwrap_or(true)
-                || source
-                    .route_fingerprint
-                    .as_deref()
-                    .map(|value| value.trim().is_empty())
-                    .unwrap_or(true)
-                || missing_external_session
-        }
-        REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE => unexpected_continue_exhausted,
-        REPLACEMENT_REASON_NOT_SUPPORTED => {
-            !agent_supports_reuse || source.error_code.as_deref() == Some("not_supported")
-        }
-        REPLACEMENT_REASON_ADMISSION_FAILED => {
-            source.run_status == DelegationRunStatus::Failed
-                && source.error_code.as_deref() == Some("admission_failed")
-                && source.reached_running_at.is_none()
-        }
-        REPLACEMENT_REASON_ADMISSION_UNKNOWN => {
-            source.run_status == DelegationRunStatus::Failed
-                && source.error_code.as_deref() == Some("admission_unknown")
-                && source.reached_running_at.is_none()
-        }
-        _ => false,
+    let Some(replacement_reason) = ReplacementReason::parse(reason) else {
+        return false;
+    };
+    let parsed = parse_delegation_termination(
+        source.run_status.clone(),
+        source.error_code.as_deref(),
+        source.reached_running_at.is_some(),
+        None,
+    );
+    let snapshot = recovery_source_from_persisted_run(
+        source,
+        parsed,
+        (!missing_external_session)
+            .then(|| hash_external_session_identity("legacy-adapter-session")),
+        true,
+        false,
+        None,
+    );
+    let requested = RequestedRecoveryOperation::Replace {
+        replacement_reason: replacement_reason.clone(),
+    };
+    let decision = decide_delegation_recovery(
+        &snapshot,
+        &RecoveryRailSnapshot {
+            agent_supports_reuse,
+            unexpected_continue_budget_available: !unexpected_continue_exhausted,
+            replacement_budget_available: true,
+        },
+        requested.clone(),
+    );
+    decision.confirmation == RecoveryConfirmation::NotRequired
+        && decision.operation_matches(requested)
+}
+
+fn recovery_source_from_persisted_run(
+    source: &PersistedRun,
+    parsed_termination: ParsedDelegationTermination,
+    external_session_identity_hash: Option<String>,
+    is_latest: bool,
+    child_superseded: bool,
+    recovery_authorization_id: Option<String>,
+) -> RecoverySourceSnapshot {
+    RecoverySourceSnapshot {
+        source_task_id: source.task_id.clone(),
+        lineage_root_task_id: source.lineage_root_task_id.clone(),
+        generation: source.generation,
+        parent_conversation_id: source.parent_conversation_id,
+        child_conversation_id: source.child_conversation_id,
+        agent_type: format!("{:?}", source.agent_type).to_ascii_lowercase(),
+        profile_id: source.profile_id.clone(),
+        workspace_path: source.workspace_path.clone(),
+        route_fingerprint: source.route_fingerprint.clone(),
+        work_unit_key: source.work_unit_key.clone(),
+        parent_tool_use_id: source.parent_tool_use_id.clone(),
+        child_connection_id: source.child_connection_id.clone(),
+        history_only: source.history_only,
+        is_latest,
+        has_active_run: matches!(
+            source.run_status,
+            DelegationRunStatus::Reserving | DelegationRunStatus::Running
+        ),
+        child_superseded,
+        child_ownership_valid: true,
+        agent_type_matches: true,
+        run_status: source.run_status.clone(),
+        error_code: source.error_code.clone(),
+        admission_class: source.admission_class.clone(),
+        parsed_termination,
+        reached_running: source.reached_running_at.is_some(),
+        launch_snapshot_complete: launch_snapshot_from_run(source)
+            .as_ref()
+            .is_some_and(snapshot_is_complete),
+        external_session_identity_hash,
+        replaced_task_id: source.replaced_task_id.clone(),
+        replacement_reason: source
+            .replacement_reason
+            .as_deref()
+            .and_then(ReplacementReason::parse),
+        recovery_authorization_id,
     }
 }
 
@@ -1349,38 +1364,57 @@ async fn build_continue_eligibility_txn(
         .one(txn)
         .await
         .map_err(map_db_err)?;
-    let (child_ownership_valid, agent_type_matches, external_id_present, termination_audit_json) =
-        match (child, parent, target_row) {
-            (Some(child), Some(parent), Some(target_row))
-                if child.deleted_at.is_none()
-                    && parent.deleted_at.is_none()
-                    && child.parent_id == Some(target.parent_conversation_id) =>
-            {
-                let run_agent = parse_known_agent_type(&target_row.agent_type);
-                let child_agent = parse_known_agent_type(&child.agent_type);
-                let agent_type_matches = run_agent
-                    .is_some_and(|run_agent| run_agent == target.agent_type)
-                    && child_agent.is_some_and(|child_agent| child_agent == target.agent_type)
-                    && target_row.agent_type == child.agent_type;
-                let external_id_present = child
-                    .external_id
-                    .as_deref()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false);
-                (
-                    true,
-                    agent_type_matches,
-                    external_id_present,
-                    target_row.termination_audit_json,
-                )
-            }
-            _ => (false, false, false, None),
-        };
+    let (
+        child_ownership_valid,
+        agent_type_matches,
+        external_session_identity_hash,
+        termination_audit_json,
+        recovery_authorization_id,
+    ) = match (child, parent, target_row) {
+        (Some(child), Some(parent), Some(target_row))
+            if child.deleted_at.is_none()
+                && parent.deleted_at.is_none()
+                && child.parent_id == Some(target.parent_conversation_id) =>
+        {
+            let run_agent = parse_known_agent_type(&target_row.agent_type);
+            let child_agent = parse_known_agent_type(&child.agent_type);
+            let agent_type_matches = run_agent
+                .is_some_and(|run_agent| run_agent == target.agent_type)
+                && child_agent.is_some_and(|child_agent| child_agent == target.agent_type)
+                && target_row.agent_type == child.agent_type;
+            let external_session_identity_hash = child
+                .external_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(hash_external_session_identity);
+            (
+                true,
+                agent_type_matches,
+                external_session_identity_hash,
+                target_row.termination_audit_json,
+                target_row.recovery_authorization_id,
+            )
+        }
+        _ => (false, false, None, None, None),
+    };
     let snapshot_complete = launch_snapshot_from_run(target)
         .map(|snapshot| snapshot_is_complete(&snapshot))
         .unwrap_or(false);
 
     Ok(ContinueEligibility {
+        source_task_id: target.task_id.clone(),
+        lineage_root_task_id: target.lineage_root_task_id.clone(),
+        generation: target.generation,
+        parent_conversation_id: target.parent_conversation_id,
+        child_conversation_id: target.child_conversation_id,
+        agent_type: format!("{:?}", target.agent_type).to_ascii_lowercase(),
+        profile_id: target.profile_id.clone(),
+        workspace_path: target.workspace_path.clone(),
+        route_fingerprint: target.route_fingerprint.clone(),
+        work_unit_key: target.work_unit_key.clone(),
+        parent_tool_use_id: target.parent_tool_use_id.clone(),
+        child_connection_id: target.child_connection_id.clone(),
         history_only: target.history_only,
         is_latest,
         has_active_run,
@@ -1388,12 +1422,41 @@ async fn build_continue_eligibility_txn(
         child_ownership_valid,
         agent_type_matches,
         snapshot_complete,
-        external_id_present,
+        external_id_present: external_session_identity_hash.is_some(),
+        external_session_identity_hash,
         run_status: target.run_status.clone(),
         error_code: target.error_code.clone(),
         admission_class: target.admission_class.clone(),
         reached_running: target.reached_running_at.is_some(),
         termination_audit_json,
+        replaced_task_id: target.replaced_task_id.clone(),
+        replacement_reason: target.replacement_reason.clone(),
+        recovery_authorization_id,
+        agent_supports_reuse: crate::acp::delegation::capability::agent_supports_session_reuse(
+            target.agent_type,
+        ),
+        unexpected_continue_budget_available: !(unexpected_continue_at_limit_txn(
+            txn,
+            &target.lineage_root_task_id,
+        )
+        .await?
+            || work_unit_unexpected_continue_at_limit_txn(
+                txn,
+                target.parent_conversation_id,
+                target.work_unit_key.as_deref(),
+            )
+            .await?),
+        replacement_budget_available: !(replacement_at_limit_txn(
+            txn,
+            &target.lineage_root_task_id,
+        )
+        .await?
+            || work_unit_replacement_at_limit_txn(
+                txn,
+                target.parent_conversation_id,
+                target.work_unit_key.as_deref(),
+            )
+            .await?),
     })
 }
 
@@ -1424,6 +1487,36 @@ async fn work_unit_unexpected_continue_at_limit_txn(
         .map_err(map_db_err)?;
     Ok(row
         .map(|budget| budget.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT)
+        .unwrap_or(false))
+}
+
+async fn replacement_at_limit_txn(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+) -> Result<bool, TaskStoreError> {
+    let row = LineageBudget::find_by_id(lineage_root_task_id)
+        .one(txn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(row
+        .map(|budget| budget.replacement_count >= REPLACEMENT_LIMIT)
+        .unwrap_or(false))
+}
+
+async fn work_unit_replacement_at_limit_txn(
+    txn: &DatabaseTransaction,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<bool, TaskStoreError> {
+    let Some(work_unit_key) = work_unit_key else {
+        return Ok(false);
+    };
+    let row = WorkUnitBudget::find_by_id((parent_conversation_id, work_unit_key.to_string()))
+        .one(txn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(row
+        .map(|budget| budget.replacement_count >= REPLACEMENT_LIMIT)
         .unwrap_or(false))
 }
 
@@ -1458,6 +1551,8 @@ async fn validate_replacement_insert_txn(
         .await
         .map_err(map_db_err)?
         .ok_or_else(|| TaskStoreError::NotFound(replaced_id.to_string()))?;
+    let source_termination_audit_json = source_row.termination_audit_json.clone();
+    let source_recovery_authorization_id = source_row.recovery_authorization_id.clone();
 
     // 1. Direct-parent ownership.
     if source_row.parent_conversation_id != insert.parent_conversation_id {
@@ -1508,12 +1603,14 @@ async fn validate_replacement_insert_txn(
         ));
     }
     // 4. Terminal and latest on the source child.
+    let source_is_latest =
+        is_latest_run_on_child_txn(txn, source.child_conversation_id, &source.task_id).await?;
     if !matches!(
         source.run_status,
         DelegationRunStatus::Completed
             | DelegationRunStatus::Failed
             | DelegationRunStatus::Canceled
-    ) || !is_latest_run_on_child_txn(txn, source.child_conversation_id, &source.task_id).await?
+    ) || !source_is_latest
     {
         return Err(TaskStoreError::InvalidReplacement(
             "replaced run is not the latest terminal run on its child".into(),
@@ -1521,11 +1618,7 @@ async fn validate_replacement_insert_txn(
     }
     // 4b. Lineage supersession across replacement edges (not merely
     // child-local latest). See `replacement_source_is_superseded_txn`.
-    if replacement_source_is_superseded_txn(txn, replaced_id).await? {
-        return Err(TaskStoreError::InvalidReplacement(
-            "replaced run has already been superseded by a replacement".into(),
-        ));
-    }
+    let source_superseded = replacement_source_is_superseded_txn(txn, replaced_id).await?;
     // 4c. Complete launch snapshot required only for admission_* recovery.
     // Established `unresumable` matching intentionally accepts missing
     // workspace/route (launch config unavailable); do not block those paths.
@@ -1551,23 +1644,73 @@ async fn validate_replacement_insert_txn(
                 source.work_unit_key.as_deref(),
             )
             .await?;
-    let missing_external_session =
+    let external_session_identity_hash =
         crate::db::entities::conversation::Entity::find_by_id(source.child_conversation_id)
             .one(txn)
             .await
             .map_err(map_db_err)?
             .and_then(|child| child.external_id)
-            .map(|external_id| external_id.trim().is_empty())
-            .unwrap_or(true);
+            .map(|external_id| external_id.trim().to_string())
+            .filter(|external_id| !external_id.is_empty())
+            .map(|external_id| hash_external_session_identity(&external_id));
     let agent_supports_reuse =
         crate::acp::delegation::capability::agent_supports_session_reuse(source.agent_type);
-    if !replacement_reason_matches_source(
-        reason,
+    let replacement_budget_available =
+        !(replacement_at_limit_txn(txn, &source.lineage_root_task_id).await?
+            || work_unit_replacement_at_limit_txn(
+                txn,
+                source.parent_conversation_id,
+                source.work_unit_key.as_deref(),
+            )
+            .await?);
+    let parsed_termination = parse_delegation_termination(
+        source.run_status.clone(),
+        source.error_code.as_deref(),
+        source.reached_running_at.is_some(),
+        source_termination_audit_json.as_deref(),
+    );
+    let source_snapshot = recovery_source_from_persisted_run(
         &source,
-        agent_supports_reuse,
-        unexpected_continue_exhausted,
-        missing_external_session,
+        parsed_termination,
+        external_session_identity_hash,
+        source_is_latest,
+        source_superseded,
+        source_recovery_authorization_id,
+    );
+    let requested_reason = ReplacementReason::parse(reason).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement(format!("replacement_reason {reason} is unsupported"))
+    })?;
+    let requested_operation = RequestedRecoveryOperation::Replace {
+        replacement_reason: requested_reason,
+    };
+    let central = decide_delegation_recovery(
+        &source_snapshot,
+        &RecoveryRailSnapshot {
+            agent_supports_reuse,
+            unexpected_continue_budget_available: !unexpected_continue_exhausted,
+            replacement_budget_available,
+        },
+        requested_operation.clone(),
+    );
+    if source_superseded {
+        return Err(TaskStoreError::InvalidReplacement(
+            "replaced run has already been superseded by a replacement".into(),
+        ));
+    }
+    if matches!(
+        central.disposition,
+        RecoveryDisposition::Stop {
+            code: crate::acp::delegation::recovery_policy::RecoveryStopCode::ReplacementBudgetExhausted
+        }
     ) {
+        return Err(TaskStoreError::BudgetExhausted(format!(
+            "replacement rail exhausted for {}",
+            source.lineage_root_task_id
+        )));
+    }
+    if central.confirmation == RecoveryConfirmation::Required
+        || !central.operation_matches(requested_operation)
+    {
         return Err(TaskStoreError::InvalidReplacement(format!(
             "replacement_reason {reason} does not match durable state"
         )));
@@ -2322,15 +2465,64 @@ impl RunStore {
             .unwrap_or(false);
 
         // Load termination audit from row (not on PersistedRun view).
-        let termination_audit_json = {
+        let (termination_audit_json, recovery_authorization_id) = {
             let row = DelegationTaskRun::find_by_id(&target.task_id)
                 .one(&self.db.conn)
                 .await
                 .map_err(map_db_err)?;
-            row.and_then(|r| r.termination_audit_json)
+            row.map(|r| (r.termination_audit_json, r.recovery_authorization_id))
+                .unwrap_or((None, None))
         };
 
+        let external_session_identity_hash = if external_id_present {
+            let external_id = conversation::Entity::find_by_id(target.child_conversation_id)
+                .one(&self.db.conn)
+                .await
+                .map_err(map_db_err)?
+                .and_then(|child| child.external_id)
+                .filter(|value| !value.trim().is_empty());
+            external_id.map(|value| hash_external_session_identity(value.trim()))
+        } else {
+            None
+        };
+        let lineage_budget = LineageBudget::find_by_id(&target.lineage_root_task_id)
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        let work_unit_budget = if let Some(key) = target.work_unit_key.as_deref() {
+            WorkUnitBudget::find_by_id((target.parent_conversation_id, key.to_string()))
+                .one(&self.db.conn)
+                .await
+                .map_err(map_db_err)?
+        } else {
+            None
+        };
+        let unexpected_continue_budget_available = lineage_budget
+            .as_ref()
+            .is_none_or(|budget| budget.unexpected_continue_count < UNEXPECTED_CONTINUE_LIMIT)
+            && work_unit_budget
+                .as_ref()
+                .is_none_or(|budget| budget.unexpected_continue_count < UNEXPECTED_CONTINUE_LIMIT);
+        let replacement_budget_available = lineage_budget
+            .as_ref()
+            .is_none_or(|budget| budget.replacement_count < REPLACEMENT_LIMIT)
+            && work_unit_budget
+                .as_ref()
+                .is_none_or(|budget| budget.replacement_count < REPLACEMENT_LIMIT);
+
         Ok(ContinueEligibility {
+            source_task_id: target.task_id.clone(),
+            lineage_root_task_id: target.lineage_root_task_id.clone(),
+            generation: target.generation,
+            parent_conversation_id: target.parent_conversation_id,
+            child_conversation_id: target.child_conversation_id,
+            agent_type: format!("{:?}", target.agent_type).to_ascii_lowercase(),
+            profile_id: target.profile_id.clone(),
+            workspace_path: target.workspace_path.clone(),
+            route_fingerprint: target.route_fingerprint.clone(),
+            work_unit_key: target.work_unit_key.clone(),
+            parent_tool_use_id: target.parent_tool_use_id.clone(),
+            child_connection_id: target.child_connection_id.clone(),
             history_only: target.history_only,
             is_latest,
             has_active_run: has_active,
@@ -2339,11 +2531,20 @@ impl RunStore {
             agent_type_matches,
             snapshot_complete,
             external_id_present,
+            external_session_identity_hash,
             run_status: target.run_status.clone(),
             error_code: target.error_code.clone(),
             admission_class: target.admission_class.clone(),
             reached_running: target.reached_running_at.is_some(),
             termination_audit_json,
+            replaced_task_id: target.replaced_task_id.clone(),
+            replacement_reason: target.replacement_reason.clone(),
+            recovery_authorization_id,
+            agent_supports_reuse: crate::acp::delegation::capability::agent_supports_session_reuse(
+                target.agent_type,
+            ),
+            unexpected_continue_budget_available,
+            replacement_budget_available,
         })
     }
 
@@ -4483,6 +4684,8 @@ async fn project_conversation_in_txn(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::acp::delegation::spawner::DelegationLink;
     use crate::db::service::conversation_service;
@@ -6421,8 +6624,6 @@ mod tests {
     /// prove budget contention. Two independent WAL pools race the last slot.
     #[tokio::test]
     async fn concurrent_promote_races_one_budget_winner() {
-        use std::time::Duration;
-
         use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
         use tokio::sync::Barrier;
 
@@ -7422,9 +7623,9 @@ mod tests {
         );
     }
 
-    /// Reconcile-produced admission_unknown is explicit-replacement eligible.
+    /// Reconcile-produced admission_unknown requires Task 9 authorization.
     #[tokio::test]
-    async fn admission_unknown_replacement_eligible() {
+    async fn admission_unknown_replacement_rejects_without_authorization() {
         let db = Arc::new(fresh_in_memory_db().await);
         let source = "adm-unk-elig-4111-8111-111111111111";
         let (parent_id, child_id) = seed_parent_child(&db, source).await;
@@ -7445,14 +7646,14 @@ mod tests {
 
         // Matcher path (reason + never-running + failed).
         assert!(
-            replacement_reason_matches_source(
+            !replacement_reason_matches_source(
                 REPLACEMENT_REASON_ADMISSION_UNKNOWN,
                 &source_run,
                 /*agent_supports_reuse*/ true,
                 /*unexpected_continue_exhausted*/ false,
                 /*missing_external_session*/ false,
             ),
-            "reconcile-produced admission_unknown must match dedicated replacement reason"
+            "temporary matcher must reject confirmation-required admission_unknown"
         );
         // Dedicated reason only — not unresumable collapse.
         assert!(
@@ -7466,7 +7667,7 @@ mod tests {
             "admission_unknown must not collapse into unresumable"
         );
 
-        // Full admit path: lineage-latest never-running source admits.
+        // Full adapter has no authorization input until Task 9.
         let repl_child =
             new_replacement_child(&db, parent_id, "tu-adm-unk-elig", "repl-adm-unk-elig").await;
         let mut repl = base_replacement_insert(
@@ -7477,10 +7678,19 @@ mod tests {
             REPLACEMENT_REASON_ADMISSION_UNKNOWN,
         );
         repl.work_unit_key = Some("unit-adm-unk-elig".into());
-        store
+        let err = store
             .admit_gen1_reserving(repl)
             .await
-            .expect("admission_unknown from reconcile must be explicit-replacement eligible");
+            .expect_err("admission_unknown replacement must fail closed");
+        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(
+            store
+                .load_by_task_id("repl-adm-unk-elig")
+                .await
+                .unwrap()
+                .is_none(),
+            "confirmation-required rejection must create no run"
+        );
     }
 
     #[tokio::test]
@@ -8028,6 +8238,18 @@ mod tests {
 
     fn eligible_continue() -> ContinueEligibility {
         ContinueEligibility {
+            source_task_id: "eligible-source".into(),
+            lineage_root_task_id: "eligible-lineage".into(),
+            generation: 1,
+            parent_conversation_id: 1,
+            child_conversation_id: 2,
+            agent_type: "codex".into(),
+            profile_id: None,
+            workspace_path: Some("C:/workspace".into()),
+            route_fingerprint: Some("route".into()),
+            work_unit_key: None,
+            parent_tool_use_id: None,
+            child_connection_id: None,
             history_only: false,
             is_latest: true,
             has_active_run: false,
@@ -8036,11 +8258,20 @@ mod tests {
             agent_type_matches: true,
             snapshot_complete: true,
             external_id_present: true,
+            external_session_identity_hash: Some(hash_external_session_identity(
+                "eligible-session",
+            )),
             run_status: DelegationRunStatus::Completed,
             error_code: None,
             admission_class: AdmissionClass::NormalRevision,
             reached_running: true,
             termination_audit_json: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+            recovery_authorization_id: None,
+            agent_supports_reuse: true,
+            unexpected_continue_budget_available: true,
+            replacement_budget_available: true,
         }
     }
 
@@ -8131,6 +8362,22 @@ mod tests {
         parent_disconnected.error_code = Some("parent_disconnected".into());
         parent_disconnected.termination_audit_json = None;
         parent_disconnected.reached_running = true;
+        let central = decide_delegation_recovery(
+            &recovery_source_from_continue_eligibility(&parent_disconnected),
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: true,
+                unexpected_continue_budget_available: true,
+                replacement_budget_available: true,
+            },
+            RequestedRecoveryOperation::Continue,
+        );
+        assert_eq!(
+            central.disposition,
+            RecoveryDisposition::Continue {
+                admission_class: AdmissionClass::UnexpectedContinue
+            }
+        );
+        assert_eq!(central.confirmation, RecoveryConfirmation::Required);
         assert_eq!(
             decide_continue_eligibility(&parent_disconnected),
             ContinueDecision::NotContinuable,
@@ -8546,14 +8793,11 @@ mod tests {
         );
     }
 
-    /// A continuation that has evaluated a source child must not admit after a
-    /// replacement has superseded that child. The gate makes the old
-    /// eligibility-to-insert gap deterministic.
+    /// A source cannot be eligible for both continue and replacement rails.
     #[tokio::test]
     async fn continue_and_replacement_admission_cannot_revive_a_superseded_child() {
         use crate::db::entities::conversation;
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
-        use std::time::Duration;
 
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, source_child_id) =
@@ -8607,75 +8851,32 @@ mod tests {
         );
         replacement.agent_type = "cursor".into();
 
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_continue_admission_gate(entered_tx, release_rx)
-            .await;
-        let continuation = {
-            let store = store.clone();
-            tokio::spawn(async move {
-                store
-                    .admit_continue_reserving(ContinueRunAdmission {
-                        task_id: "continue-replacement-race-continuation".into(),
-                        parent_conversation_id: parent_id,
-                        parent_tool_use_id: "tu-continue-replacement-race-continuation".into(),
-                        target_task_id: source_task_id.into(),
-                        task_preview: derive_task_preview("continue source child"),
-                        request_fingerprint: "continue-replacement-race-fingerprint".into(),
-                        work_unit_key: Some("unit-a".into()),
-                    })
-                    .await
+        let continuation = store
+            .admit_continue_reserving(ContinueRunAdmission {
+                task_id: "continue-replacement-race-continuation".into(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-continue-replacement-race-continuation".into(),
+                target_task_id: source_task_id.into(),
+                task_preview: derive_task_preview("continue source child"),
+                request_fingerprint: "continue-replacement-race-fingerprint".into(),
+                work_unit_key: Some("unit-a".into()),
             })
-        };
-        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
             .await
-            .expect("continuation eligibility did not enter gate within 5s")
-            .expect("continuation eligibility entered");
+            .expect_err("unsupported reuse must reject continue before creating a run");
+        assert!(matches!(continuation, TaskStoreError::NotContinuable(_)));
 
-        let mut replacement = {
-            let store = store.clone();
-            tokio::spawn(async move { store.admit_gen1_reserving(replacement).await })
-        };
-
-        // The fixed transaction owns the SQLite writer before this gate. A
-        // replacement therefore cannot commit while the continuation is held.
-        let replacement_before_release =
-            tokio::time::timeout(Duration::from_millis(100), &mut replacement).await;
-        let early_replacement = match replacement_before_release {
-            Ok(joined) => {
-                let outcome = joined.expect("replacement join");
-                assert!(
-                    !matches!(outcome, Ok(Gen1AdmitOutcome::Created(_))),
-                    "replacement committed during held continuation admission: {outcome:?}"
-                );
-                Some(outcome)
-            }
-            Err(_) => None,
-        };
-
-        let _ = release_tx.send(());
-        let continuation = continuation
+        let replacement = store
+            .admit_gen1_reserving(replacement)
             .await
-            .expect("continuation join")
-            .expect("continuation must own admission");
-        assert!(matches!(continuation, ContinueAdmitOutcome::Created(_)));
-
-        let replacement = match early_replacement {
-            Some(outcome) => outcome,
-            None => replacement.await.expect("replacement join"),
-        };
-        assert!(
-            !matches!(replacement, Ok(Gen1AdmitOutcome::Created(_))),
-            "replacement must lose once continuation reserved the source child: {replacement:?}"
-        );
+            .expect("central not_supported rail admits replacement");
+        assert!(matches!(replacement, Gen1AdmitOutcome::Created(_)));
         assert!(
             store
-                .load_by_task_id("continue-replacement-race-replacement")
+                .load_by_task_id("continue-replacement-race-continuation")
                 .await
-                .expect("load replacement")
+                .expect("load rejected continuation")
                 .is_none(),
-            "a replacement must not supersede the source after its continuation wins"
+            "fail-closed continue rejection must create no run"
         );
     }
 
@@ -9407,7 +9608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_admission_unknown_matches_only_lineage_latest_never_running() {
+    async fn replacement_admission_unknown_rejects_without_authorization() {
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) =
             seed_parent_child(&db, "adm-unk-src-4111-8111-111111111111").await;
@@ -9432,10 +9633,16 @@ mod tests {
             REPLACEMENT_REASON_ADMISSION_UNKNOWN,
         );
         insert.work_unit_key = Some("unit-adm-unk".into());
-        store
+        let err = store
             .admit_gen1_reserving(insert)
             .await
-            .expect("lineage-latest never-running admission_unknown must match");
+            .expect_err("admission_unknown must fail closed before Task 9");
+        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(store
+            .load_by_task_id("repl-adm-unk")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -9591,14 +9798,19 @@ mod tests {
         // Pure pre-admission abort on B (spawn_failed, never running) — alone
         // would allow retrying A; with C on B it must supersede A.
         store
-            .settle_terminal(
-                "repl-adm-trans-b",
-                TerminalTaskWrite::failed(
+            .settle_terminal("repl-adm-trans-b", {
+                let finished_at = Utc::now();
+                TerminalTaskWrite::failed_with_evidence(
                     "spawn_failed",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
-            )
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "spawn_failed",
+                        DelegationRunStatus::Reserving,
+                        false,
+                        finished_at,
+                    ),
+                )
+            })
             .await
             .expect("B pure abort");
 
@@ -9620,23 +9832,64 @@ mod tests {
         // Abandon mid so we can build A←B←C cleanly: settle mid as pure abort
         // and use B as the pure abort with C as successor instead.
         store
-            .settle_terminal(
-                "repl-adm-trans-mid",
-                TerminalTaskWrite::failed(
+            .settle_terminal("repl-adm-trans-mid", {
+                let finished_at = Utc::now();
+                TerminalTaskWrite::failed_with_evidence(
                     "spawn_failed",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
-            )
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "spawn_failed",
+                        DelegationRunStatus::Reserving,
+                        false,
+                        finished_at,
+                    ),
+                )
+            })
             .await
             .unwrap();
 
-        // C replaces B (unresumable-style pure terminal never-running B is not
-        // admission-eligible; use unresumable after marking B unresumable via
-        // missing external is flaky — re-seed chain: B pure abort, replace B
-        // is not the goal. Instead create C as replacement of B only if B
-        // matches a reason. B is spawn_failed — use unresumable if external
-        // session missing (default for new child without external_id).
+        let b_run = store
+            .load_by_task_id("repl-adm-trans-b")
+            .await
+            .unwrap()
+            .unwrap();
+        let b_row = DelegationTaskRun::find_by_id("repl-adm-trans-b")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let b_source = recovery_source_from_persisted_run(
+            &b_run,
+            parse_delegation_termination(
+                b_run.run_status.clone(),
+                b_run.error_code.as_deref(),
+                b_run.reached_running_at.is_some(),
+                b_row.termination_audit_json.as_deref(),
+            ),
+            None,
+            true,
+            false,
+            b_row.recovery_authorization_id,
+        );
+        let b_decision = decide_delegation_recovery(
+            &b_source,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: true,
+                unexpected_continue_budget_available: true,
+                replacement_budget_available: true,
+            },
+            RequestedRecoveryOperation::Inspect,
+        );
+        assert_eq!(
+            b_decision.disposition,
+            RecoveryDisposition::Replace {
+                replacement_reason: ReplacementReason::AdmissionFailed
+            },
+            "pre-admission replacement retry must preserve durable reason: {b_decision:?}"
+        );
+
+        // C retries the same pre-admission replacement rail as B. Missing
+        // external identity is not an alias for unresumable.
         let c_child =
             new_replacement_child(&db, parent_id, "tu-adm-trans-c", "repl-adm-trans-c").await;
         let mut c = base_replacement_insert(
@@ -9644,14 +9897,14 @@ mod tests {
             parent_id,
             c_child,
             "repl-adm-trans-b",
-            REPLACEMENT_REASON_UNRESUMABLE,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
         );
         c.work_unit_key = Some("unit-adm-trans".into());
         c.lineage_root_task_id = source.into();
         store
             .admit_gen1_reserving(c)
             .await
-            .expect("C replaces pure-abort B via unresumable");
+            .expect("C preserves B's pre-admission replacement reason");
 
         // A has pure-abort successor B which has successor C → A superseded.
         let a_retry_child =
@@ -9727,10 +9980,16 @@ mod tests {
             REPLACEMENT_REASON_ADMISSION_UNKNOWN,
         );
         ok.work_unit_key = Some("unit-adm-unres".into());
-        store
+        let err = store
             .admit_gen1_reserving(ok)
             .await
-            .expect("dedicated admission_unknown reason still matches");
+            .expect_err("dedicated admission_unknown still requires authorization");
+        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(store
+            .load_by_task_id("repl-adm-unres-ok")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -10214,8 +10473,6 @@ mod tests {
 
     #[test]
     fn admission_codes_are_not_revision_eligible_or_unresumable() {
-        assert!(!is_revision_eligible_failure(Some("admission_failed")));
-        assert!(!is_revision_eligible_failure(Some("admission_unknown")));
         // Matching is not represented as unresumable — dedicated reasons only.
         assert!(REPLACEMENT_REASON_ADMISSION_FAILED != REPLACEMENT_REASON_UNRESUMABLE);
         assert!(REPLACEMENT_REASON_ADMISSION_UNKNOWN != REPLACEMENT_REASON_UNRESUMABLE);
@@ -10276,7 +10533,7 @@ mod tests {
             false,
             true,
         ));
-        assert!(replacement_reason_matches_source(
+        assert!(!replacement_reason_matches_source(
             REPLACEMENT_REASON_ADMISSION_UNKNOWN,
             &source,
             true,
@@ -10296,11 +10553,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_end_and_explicit_cancel_codes_match_unresumable_replacement() {
-        // Full launch identity present — previously these were a recovery
-        // dead-end: not continuable (except parent_disconnected now) and not
-        // unresumable-replaceable, while established lineage blocked cold
-        // gen-1 re-dispatch on the same work_unit_key.
+    fn parent_end_explicit_cancel_and_stall_codes_do_not_match_unresumable_replacement() {
         let mut source = PersistedRun {
             task_id: "t".into(),
             root_task_id: "t".into(),
@@ -10343,14 +10596,14 @@ mod tests {
         ] {
             source.error_code = Some(code.into());
             assert!(
-                replacement_reason_matches_source(
+                !replacement_reason_matches_source(
                     REPLACEMENT_REASON_UNRESUMABLE,
                     &source,
                     true,
                     false,
-                    false, // external session present
+                    false,
                 ),
-                "{code} with intact launch identity must match unresumable replace"
+                "{code} must never alias directly to unresumable"
             );
             // Dedicated reasons must not spuriously match.
             assert!(!replacement_reason_matches_source(
@@ -10392,7 +10645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_disconnected_source_admits_unresumable_replacement() {
+    async fn parent_disconnected_source_rejects_unresumable_replacement_without_authorization() {
         use crate::db::service::conversation_service;
 
         let db = Arc::new(fresh_in_memory_db().await);
@@ -10443,10 +10696,19 @@ mod tests {
         replacement.admission_class = AdmissionClass::Replacement;
         replacement.replaced_task_id = Some(root.into());
         replacement.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
-        store
+        let err = store
             .admit_gen1_reserving(replacement)
             .await
-            .expect("parent_disconnected established lineage must admit unresumable replace");
+            .expect_err("temporary adapter has no authorization input and must reject");
+        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(
+            DelegationTaskRun::find_by_id("pd-replacement-1")
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "confirmation-required replacement rejection must create no run"
+        );
     }
 
     #[tokio::test]
@@ -12508,6 +12770,18 @@ mod termination_audit {
     #[test]
     fn malformed_parent_disconnect_evidence_is_not_continuable() {
         let eligibility = ContinueEligibility {
+            source_task_id: "malformed-source".into(),
+            lineage_root_task_id: "malformed-lineage".into(),
+            generation: 1,
+            parent_conversation_id: 1,
+            child_conversation_id: 2,
+            agent_type: "codex".into(),
+            profile_id: None,
+            workspace_path: Some("C:/workspace".into()),
+            route_fingerprint: Some("route".into()),
+            work_unit_key: None,
+            parent_tool_use_id: None,
+            child_connection_id: None,
             history_only: false,
             is_latest: true,
             has_active_run: false,
@@ -12516,11 +12790,20 @@ mod termination_audit {
             agent_type_matches: true,
             snapshot_complete: true,
             external_id_present: true,
+            external_session_identity_hash: Some(hash_external_session_identity(
+                "malformed-session",
+            )),
             run_status: DelegationRunStatus::Canceled,
             error_code: Some("parent_disconnected".into()),
             admission_class: AdmissionClass::NormalRevision,
             reached_running: true,
             termination_audit_json: Some("{not-json".into()),
+            replaced_task_id: None,
+            replacement_reason: None,
+            recovery_authorization_id: None,
+            agent_supports_reuse: true,
+            unexpected_continue_budget_available: true,
+            replacement_budget_available: true,
         };
 
         assert_eq!(
