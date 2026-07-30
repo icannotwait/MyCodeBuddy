@@ -1517,45 +1517,63 @@ Expected: FAIL because broker variants, catalog entries, parsers, role gating, a
 From repository root, run:
 
 ```powershell
-$frontendDiscoveryRaw = @(& pnpm exec vitest list src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts --json 2>$null | ForEach-Object { "$_" })
-$frontendDiscoveryExit = $LASTEXITCODE
-if ($frontendDiscoveryExit -ne 0) { $frontendDiscoveryRaw | ForEach-Object { Write-Host $_ }; throw "Vitest frontend discovery command failed" }
+$frontendReportPath = Join-Path ([System.IO.Path]::GetTempPath()) ("codeg-vitest-red-{0}.json" -f [guid]::NewGuid().ToString("N"))
 try {
-  $frontendDiscovery = @(($frontendDiscoveryRaw -join [Environment]::NewLine) | ConvertFrom-Json)
-} catch {
-  $frontendDiscoveryRaw | ForEach-Object { Write-Host $_ }
-  throw "Vitest frontend discovery did not emit valid JSON"
-}
-if ($frontendDiscovery.Count -le 0) { throw "Vitest frontend discovery collected zero tests" }
-$frontendDiscoveredFiles = @($frontendDiscovery | ForEach-Object { $_.file.Replace('\', '/') } | Sort-Object -Unique)
-$expectedFrontendFiles = @('/src/components/chat/ask-question-card.test.tsx', '/src/i18n/messages.test.ts')
-foreach ($expectedFile in $expectedFrontendFiles) {
-  if (-not @($frontendDiscoveredFiles | Where-Object { $_.EndsWith($expectedFile, [StringComparison]::OrdinalIgnoreCase) }).Count) {
-    throw "Vitest frontend discovery missed expected file $expectedFile"
+  $frontendRedLog = @(& pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts --reporter=json --outputFile=$frontendReportPath --no-color 2>&1 | ForEach-Object { "$_" })
+  $frontendRedExit = $LASTEXITCODE
+  if (-not (Test-Path -LiteralPath $frontendReportPath)) {
+    $frontendRedLog | ForEach-Object { Write-Host $_ }
+    throw "Vitest frontend RED emitted no JSON report"
   }
-}
-$expectedFrontendTests = @(
-  'AskQuestionCard > localizes a recovery card from codes and submits raw approve or decline',
-  'AskQuestionCard > keeps generic ask_user_question behavior unchanged'
-)
-foreach ($expectedTest in $expectedFrontendTests) {
-  if (-not @($frontendDiscovery | Where-Object { $_.name -ceq $expectedTest }).Count) {
-    throw "Vitest frontend discovery missed expected test: $expectedTest"
+  try {
+    $frontendRedReport = Get-Content -Raw -LiteralPath $frontendReportPath | ConvertFrom-Json
+  } catch {
+    $frontendRedLog | ForEach-Object { Write-Host $_ }
+    throw "Vitest frontend RED emitted invalid JSON"
   }
+
+  $frontendFileResults = @($frontendRedReport.testResults)
+  $expectedFrontendFiles = @('/src/components/chat/ask-question-card.test.tsx', '/src/i18n/messages.test.ts')
+  foreach ($expectedFile in $expectedFrontendFiles) {
+    $fileResult = @($frontendFileResults | Where-Object { $_.name.Replace('\', '/').EndsWith($expectedFile, [StringComparison]::OrdinalIgnoreCase) })
+    if ($fileResult.Count -ne 1) { throw "Vitest frontend RED did not discover exact file $expectedFile" }
+    if (@($fileResult[0].assertionResults).Count -le 0) { throw "Vitest frontend RED collected zero tests from $expectedFile" }
+  }
+
+  $frontendAssertions = @($frontendFileResults | ForEach-Object { $_.assertionResults })
+  $expectedFrontendTests = @(
+    'localizes a recovery card from codes and submits raw approve or decline',
+    'keeps generic ask_user_question behavior unchanged'
+  )
+  foreach ($expectedTest in $expectedFrontendTests) {
+    if (-not @($frontendAssertions | Where-Object { $_.title -ceq $expectedTest -and $_.fullName.StartsWith('AskQuestionCard ', [StringComparison]::Ordinal) }).Count) {
+      throw "Vitest frontend RED missed planned test: AskQuestionCard > $expectedTest"
+    }
+  }
+
+  $frontendRanCount = [int]$frontendRedReport.numPassedTests + [int]$frontendRedReport.numFailedTests
+  if ([int]$frontendRedReport.numTotalTests -le 0 -or $frontendRanCount -le 0) {
+    throw "Vitest frontend RED ran zero tests"
+  }
+  $expectedFailure = @($frontendAssertions | Where-Object {
+    $_.title -ceq $expectedFrontendTests[0] -and
+    $_.fullName.StartsWith('AskQuestionCard ', [StringComparison]::Ordinal) -and
+    $_.status -ceq 'failed'
+  })
+  if ($expectedFailure.Count -ne 1) { throw "Vitest frontend RED did not fail the recovery-card test" }
+  $expectedFailureText = @($expectedFailure[0].failureMessages) -join [Environment]::NewLine
+  if ($expectedFailureText -notmatch 'AssertionError|TestingLibraryElementError|expected .+ to') {
+    throw "Vitest frontend RED lacked an assertion-class recovery-card failure"
+  }
+
+  $frontendRedLog | ForEach-Object { Write-Host $_ }
+  if ($frontendRedExit -eq 0) { throw "Expected recovery card/i18n RED failure, but it passed" }
+} finally {
+  if (Test-Path -LiteralPath $frontendReportPath) { Remove-Item -LiteralPath $frontendReportPath -Force }
 }
-$frontendRed = @(& pnpm test -- src/components/chat/ask-question-card.test.tsx src/i18n/messages.test.ts --reporter=verbose --no-color 2>&1 | ForEach-Object { "$_" })
-$frontendRedExit = $LASTEXITCODE
-$frontendRedText = $frontendRed -join [Environment]::NewLine
-$collectionFailurePattern = 'No test files found|No test suite found|Failed to load url|Failed to resolve import|Cannot find module|Unhandled Error'
-if ($frontendRedText -match $collectionFailurePattern) { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED failed during collection/import/configuration" }
-$expectedFailingFrontendTest = 'AskQuestionCard > localizes a recovery card from codes and submits raw approve or decline'
-if ($frontendRedText -notmatch [regex]::Escape($expectedFailingFrontendTest)) { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED did not execute the recovery-card test" }
-if ($frontendRedText -notmatch 'AssertionError|TestingLibraryElementError|expected .+ to') { $frontendRed | ForEach-Object { Write-Host $_ }; throw "Frontend RED lacked an assertion-class feature failure" }
-$frontendRed | ForEach-Object { Write-Host $_ }
-if ($frontendRedExit -eq 0) { throw "Expected recovery card/i18n RED failure, but it passed" }
 ```
 
-Expected: discovery exits 0 with `frontendDiscovery.Count > 0`, both exact files, and both exact planned tests. The run then exits nonzero with the recovery-card test name and an assertion-class failure because typed recovery presentation and locale keys do not exist. Missing files, zero tests, suite-load/import/configuration errors, and unrelated crashes are rejected before that nonzero exit can count as RED. Record the discovered test/file counts and assertion evidence in `.superpowers/sdd/task-11-report.md`.
+Expected: the Vitest 2.1.9 JSON report contains one result for each exact requested file, a positive assertion count in both files, both exact planned `AskQuestionCard` tests, and `frontendRanCount > 0`. The command then exits nonzero with the recovery-card test in `failed` status and an assertion-class failure because typed recovery presentation and locale keys do not exist. Missing files, zero collected or executed tests, suite-load/import/configuration errors, and unrelated crashes are rejected before that nonzero exit can count as RED. Record the discovered file count, total/executed/passed/failed test counts, and intended assertion evidence in `.superpowers/sdd/task-11-report.md`.
 
 Then run this exact nonzero Node RED gate:
 
