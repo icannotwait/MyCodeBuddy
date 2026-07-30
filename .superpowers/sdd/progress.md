@@ -7,7 +7,7 @@ Implementation base: `74c76de3a9b23ffbaab8c601258a3937366759a7`
 
 ## Tasks
 
-Task 0: complete (supplemental Design SHA-256 `ded3bd24a6f01c6e3af737bb5e7ec012a14871948aad7c48d39b5785243ae2f0`; Task 11 amended without renumbering)
+Task 0: complete (commits `74c76de3..580e9526`, review clean; supplemental Design SHA-256 `ded3bd24a6f01c6e3af737bb5e7ec012a14871948aad7c48d39b5785243ae2f0`)
 Task 1: pending
 Task 2: pending
 Task 3: pending
