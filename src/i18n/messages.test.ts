@@ -47,6 +47,23 @@ describe("i18n locale key parity vs en.json", () => {
     const extra = [...localeKeys].filter((k) => !reference.has(k))
     expect({ missing, extra }).toEqual({ missing: [], extra: [] })
   })
+
+  it("defines workflow overlay controls with stable ICU placeholders", () => {
+    for (const messages of locales) {
+      const workflow = (
+        messages as unknown as {
+          Folder: { chat: { workflowGraph: Record<string, string> } }
+        }
+      ).Folder.chat.workflowGraph
+
+      expect(workflow.laneToggleAria).toContain("{phase}")
+      expect(workflow.dependenciesToggle).toContain("{count}")
+      expect(workflow.moreCurrentNodes).toContain("{count}")
+      expect(workflow.phaseProgressAria).toContain("{phase}")
+      expect(workflow.phaseProgressAria).toContain("{status}")
+      expect(workflow.phaseProgressAria).toContain("{progress}")
+    }
+  })
 })
 
 describe("DrawCode branding", () => {

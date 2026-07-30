@@ -2570,6 +2570,8 @@
         "segmentSessions": "Sessions",
         "segmentAria": "Workflow or sessions view",
         "phaseRailAria": "Workflow phases",
+        "laneToggleAria": "Toggle {phase} lane",
+        "phaseProgressAria": "{phase}, {status}, {progress}",
         "expandGraphAria": "Expand workflow graph",
         "collapseGraphAria": "Collapse workflow graph",
         "collapsedSummary": "Workflow {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "Workflow graph",
         "emptyLane": "No work units",
         "dependencies": "Dependencies",
+        "dependenciesToggle": "Dependencies ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "Design",
           "plan": "Plan",

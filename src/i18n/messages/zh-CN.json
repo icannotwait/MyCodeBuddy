@@ -2570,6 +2570,8 @@
         "segmentSessions": "会话",
         "segmentAria": "工作流或会话视图",
         "phaseRailAria": "工作流阶段",
+        "laneToggleAria": "切换{phase}分组",
+        "phaseProgressAria": "{phase}，{status}，{progress}",
         "expandGraphAria": "展开工作流图",
         "collapseGraphAria": "收起工作流图",
         "collapsedSummary": "工作流 {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "工作流图",
         "emptyLane": "无工作单元",
         "dependencies": "依赖",
+        "dependenciesToggle": "依赖（{count}）",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "设计",
           "plan": "计划",

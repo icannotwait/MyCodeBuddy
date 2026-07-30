@@ -2570,6 +2570,8 @@
         "segmentSessions": "工作階段",
         "segmentAria": "工作流程或工作階段檢視",
         "phaseRailAria": "工作流程階段",
+        "laneToggleAria": "切換{phase}分組",
+        "phaseProgressAria": "{phase}，{status}，{progress}",
         "expandGraphAria": "展開工作流程圖",
         "collapseGraphAria": "收合工作流程圖",
         "collapsedSummary": "工作流程 {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "工作流程圖",
         "emptyLane": "無工作單元",
         "dependencies": "相依性",
+        "dependenciesToggle": "相依項（{count}）",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "設計",
           "plan": "計畫",

@@ -2570,6 +2570,8 @@
         "segmentSessions": "Sessions",
         "segmentAria": "Vue flux ou sessions",
         "phaseRailAria": "Phases du flux",
+        "laneToggleAria": "Basculer le groupe {phase}",
+        "phaseProgressAria": "{phase}, {status}, {progress}",
         "expandGraphAria": "Développer le graphe",
         "collapseGraphAria": "Réduire le graphe",
         "collapsedSummary": "Flux {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "Graphe du flux",
         "emptyLane": "Aucune unité de travail",
         "dependencies": "Dépendances",
+        "dependenciesToggle": "Dépendances ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "Conception",
           "plan": "Plan",

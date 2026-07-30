@@ -2570,6 +2570,8 @@
         "segmentSessions": "Sitzungen",
         "segmentAria": "Workflow- oder Sitzungsansicht",
         "phaseRailAria": "Workflow-Phasen",
+        "laneToggleAria": "Gruppe {phase} umschalten",
+        "phaseProgressAria": "{phase}, {status}, {progress}",
         "expandGraphAria": "Workflow-Graph erweitern",
         "collapseGraphAria": "Workflow-Graph einklappen",
         "collapsedSummary": "Workflow {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "Workflow-Graph",
         "emptyLane": "Keine Arbeitseinheiten",
         "dependencies": "Abhängigkeiten",
+        "dependenciesToggle": "Abhängigkeiten ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "Design",
           "plan": "Plan",

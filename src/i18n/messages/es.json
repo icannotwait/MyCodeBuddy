@@ -2570,6 +2570,8 @@
         "segmentSessions": "Sesiones",
         "segmentAria": "Vista de flujo o sesiones",
         "phaseRailAria": "Fases del flujo",
+        "laneToggleAria": "Alternar grupo {phase}",
+        "phaseProgressAria": "{phase}, {status}, {progress}",
         "expandGraphAria": "Expandir grafo del flujo",
         "collapseGraphAria": "Contraer grafo del flujo",
         "collapsedSummary": "Flujo {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "Grafo del flujo",
         "emptyLane": "Sin unidades de trabajo",
         "dependencies": "Dependencias",
+        "dependenciesToggle": "Dependencias ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "Diseño",
           "plan": "Plan",

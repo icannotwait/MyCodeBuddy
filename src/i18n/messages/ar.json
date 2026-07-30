@@ -2570,6 +2570,8 @@
         "segmentSessions": "الجلسات",
         "segmentAria": "عرض سير العمل أو الجلسات",
         "phaseRailAria": "مراحل سير العمل",
+        "laneToggleAria": "تبديل مجموعة {phase}",
+        "phaseProgressAria": "{phase}، {status}، {progress}",
         "expandGraphAria": "توسيع مخطط سير العمل",
         "collapseGraphAria": "طي مخطط سير العمل",
         "collapsedSummary": "سير العمل {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "مخطط سير العمل",
         "emptyLane": "لا توجد وحدات عمل",
         "dependencies": "التبعيات",
+        "dependenciesToggle": "التبعيات ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "التصميم",
           "plan": "الخطة",

@@ -2570,6 +2570,8 @@
         "segmentSessions": "セッション",
         "segmentAria": "ワークフローまたはセッション表示",
         "phaseRailAria": "ワークフロー段階",
+        "laneToggleAria": "{phase}グループを切り替え",
+        "phaseProgressAria": "{phase}、{status}、{progress}",
         "expandGraphAria": "ワークフローグラフを展開",
         "collapseGraphAria": "ワークフローグラフを折りたたむ",
         "collapsedSummary": "ワークフロー {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "ワークフローグラフ",
         "emptyLane": "作業単位なし",
         "dependencies": "依存関係",
+        "dependenciesToggle": "依存関係（{count}）",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "設計",
           "plan": "計画",

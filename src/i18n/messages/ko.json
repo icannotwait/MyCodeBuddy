@@ -2570,6 +2570,8 @@
         "segmentSessions": "세션",
         "segmentAria": "워크플로 또는 세션 보기",
         "phaseRailAria": "워크플로 단계",
+        "laneToggleAria": "{phase} 그룹 전환",
+        "phaseProgressAria": "{phase}, {status}, {progress}",
         "expandGraphAria": "워크플로 그래프 펼치기",
         "collapseGraphAria": "워크플로 그래프 접기",
         "collapsedSummary": "워크플로 {state}",
@@ -2615,6 +2617,8 @@
         "graphTitle": "워크플로 그래프",
         "emptyLane": "작업 단위 없음",
         "dependencies": "의존성",
+        "dependenciesToggle": "종속성 ({count})",
+        "moreCurrentNodes": "+{count}",
         "phase": {
           "design": "설계",
           "plan": "계획",
