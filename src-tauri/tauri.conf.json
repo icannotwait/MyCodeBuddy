@@ -41,6 +41,7 @@
     "externalBin": ["binaries/codeg-mcp"],
     "windows": {
       "nsis": {
+        "template": "./windows/installer.nsi",
         "installerHooks": "./windows/installer-hooks.nsh"
       }
     }
