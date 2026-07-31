@@ -1228,6 +1228,8 @@ pub mod mock {
         /// When true, the next `write_runtime_stats` hangs until cancelled
         /// (for timeout tests with a paused Tokio clock).
         hang_next_runtime: std::sync::atomic::AtomicBool,
+        /// One queued load error for broker cold-lookup tests.
+        fail_next_load: Mutex<Option<TaskStoreError>>,
     }
 
     /// Deterministic settle delay for mid-settle observation tests.
@@ -1251,6 +1253,7 @@ pub mod mock {
                 runtime_writes: Mutex::new(Vec::new()),
                 fail_next_runtime: Mutex::new(None),
                 hang_next_runtime: std::sync::atomic::AtomicBool::new(false),
+                fail_next_load: Mutex::new(None),
             }
         }
 
@@ -1411,6 +1414,10 @@ pub mod mock {
             self.hang_next_runtime.store(true, Ordering::SeqCst);
         }
 
+        pub async fn fail_next_load(&self, error: TaskStoreError) {
+            *self.fail_next_load.lock().await = Some(error);
+        }
+
         pub async fn runtime_write_count(&self, task_id: &str) -> usize {
             self.runtime_writes
                 .lock()
@@ -1469,6 +1476,9 @@ pub mod mock {
     #[async_trait]
     impl DelegationTaskStore for MockTaskStore {
         async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError> {
+            if let Some(error) = self.fail_next_load.lock().await.take() {
+                return Err(error);
+            }
             let mut map = self.tasks.lock().await;
             if self.seed_on_load.load(Ordering::SeqCst) {
                 let child_id = self.default_child_id.load(Ordering::SeqCst);

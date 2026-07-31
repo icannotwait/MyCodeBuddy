@@ -3904,25 +3904,31 @@ impl DelegationBroker {
         risk: Option<&str>,
         code: Option<&str>,
     ) {
-        self.metrics
-            .record_recovery_event(DelegationRecoveryMetricEvent {
-                kind,
-                task_id: task_id.map(str::to_string),
-                authorization_id: authorization_id.map(str::to_string),
-                parent_id: parent_conversation_id.map(|id| id.to_string()),
-                child_id: child_conversation_id.map(|id| id.to_string()),
-                action: action.map(str::to_string),
-                cause: cause.map(str::to_string),
-                risk: risk.map(str::to_string),
-                code: code.map(str::to_string),
-            });
+        let Some(event) = DelegationRecoveryMetricEvent::validated(
+            kind,
+            task_id,
+            authorization_id,
+            parent_conversation_id.map(|id| id.to_string()),
+            child_conversation_id.map(|id| id.to_string()),
+            action,
+            cause,
+            risk,
+            code,
+        ) else {
+            tracing::warn!(
+                target: "codeg::delegation::recovery",
+                event = kind.as_str(),
+                "invalid stable recovery telemetry value rejected"
+            );
+            return;
+        };
+        self.metrics.record_recovery_event(event);
     }
 
     fn record_recovery_admission_error(
         &self,
         error: &TaskStoreError,
         task_id: &str,
-        authorization_id: Option<&str>,
         parent_conversation_id: i32,
         child_conversation_id: Option<i32>,
         action: &'static str,
@@ -3953,10 +3959,23 @@ impl DelegationBroker {
                 );
             }
             TaskStoreError::RecoveryAuthorizationRejected { code } => {
+                if *code == "recovery_authorization_declined" {
+                    self.record_recovery_event(
+                        RecoveryMetricEventKind::ConfirmationDeclined,
+                        Some(task_id),
+                        None,
+                        Some(parent_conversation_id),
+                        child_conversation_id,
+                        Some(action),
+                        None,
+                        None,
+                        Some(code),
+                    );
+                }
                 self.record_recovery_event(
                     RecoveryMetricEventKind::AuthorizationRejected,
                     Some(task_id),
-                    authorization_id,
+                    None,
                     Some(parent_conversation_id),
                     child_conversation_id,
                     Some(action),
@@ -6157,12 +6176,37 @@ impl DelegationBroker {
                     })
                     .unwrap_or_else(|| call_id.clone()),
             };
+            let authorized_projection = if req.recovery_authorization_id.is_some() {
+                match insert.replaced_task_id.as_deref() {
+                    Some(source_task_id) => runs
+                        .recovery_projection_for_task(source_task_id)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                }
+            } else {
+                None
+            };
             match runs
                 .admit_gen1_reserving_authorized(insert, authorization)
                 .await
             {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
                     if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                        if let Some(projection) = authorized_projection.as_ref() {
+                            self.record_recovery_event(
+                                RecoveryMetricEventKind::Decision,
+                                Some(&run.task_id),
+                                Some(authorization_id),
+                                Some(run.parent_conversation_id),
+                                Some(run.child_conversation_id),
+                                projection.proposed_action.as_deref(),
+                                Some(&projection.cause_code),
+                                Some(&projection.risk_class),
+                                None,
+                            );
+                        }
                         for kind in [
                             RecoveryMetricEventKind::ConfirmationApproved,
                             RecoveryMetricEventKind::AuthorizationConsumed,
@@ -6258,7 +6302,6 @@ impl DelegationBroker {
                     self.record_recovery_admission_error(
                         &e,
                         req.replaces_task_id.as_deref().unwrap_or(&call_id),
-                        req.recovery_authorization_id.as_deref(),
                         req.parent_conversation_id,
                         Some(child_row.id),
                         "replace",
@@ -8648,12 +8691,33 @@ impl DelegationBroker {
                 })
                 .unwrap_or_else(|| new_task_id.clone()),
         };
+        let authorized_projection = if req.recovery_authorization_id.is_some() {
+            runs.recovery_projection_for_task(&req.target_task_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let admitted = runs
             .admit_continue_reserving_authorized(admission, authorization)
             .await;
         match &admitted {
             Ok(ContinueAdmitOutcome::Created(run)) => {
                 if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                    if let Some(projection) = authorized_projection.as_ref() {
+                        self.record_recovery_event(
+                            RecoveryMetricEventKind::Decision,
+                            Some(&run.task_id),
+                            Some(authorization_id),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            projection.proposed_action.as_deref(),
+                            Some(&projection.cause_code),
+                            Some(&projection.risk_class),
+                            None,
+                        );
+                    }
                     for kind in [
                         RecoveryMetricEventKind::ConfirmationApproved,
                         RecoveryMetricEventKind::AuthorizationConsumed,
@@ -8675,7 +8739,6 @@ impl DelegationBroker {
             Err(error) => self.record_recovery_admission_error(
                 error,
                 &req.target_task_id,
-                req.recovery_authorization_id.as_deref(),
                 req.parent_conversation_id,
                 Some(target.child_conversation_id),
                 "continue",
@@ -13513,7 +13576,7 @@ impl DelegationBroker {
         parent_connection_id: &str,
         parent_conversation_id: Option<i32>,
         task_ids: &[String],
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<Option<&'static str>>) {
         let matches = {
             let inner = self.pending.inner.lock().await;
             task_ids
@@ -13528,20 +13591,18 @@ impl DelegationBroker {
         };
 
         let mut resolved = Vec::with_capacity(task_ids.len());
+        let mut unknown_causes = Vec::with_capacity(task_ids.len());
         for (requested, matched) in task_ids.iter().zip(matches) {
-            let canonical = match matched {
-                StatusTaskIdMatch::Unique(canonical) => Some(canonical),
-                StatusTaskIdMatch::Exact => None,
-                StatusTaskIdMatch::Ambiguous => {
-                    self.metrics
-                        .record_recovery_lookup_unknown("prefix_ambiguous");
-                    None
-                }
+            let (canonical, unknown_cause) = match matched {
+                StatusTaskIdMatch::Unique(canonical) => (Some(canonical), None),
+                StatusTaskIdMatch::Exact => (None, None),
+                StatusTaskIdMatch::Ambiguous => (None, Some("prefix_ambiguous")),
                 StatusTaskIdMatch::None => {
                     let (Some(parent_id), Some(prefix)) =
                         (parent_conversation_id, recovery_task_id_prefix(requested))
                     else {
                         resolved.push(requested.clone());
+                        unknown_causes.push(None);
                         continue;
                     };
                     let exact_exists = match self.task_store.load(requested).await {
@@ -13551,39 +13612,22 @@ impl DelegationBroker {
                             .find_by_call_id(requested)
                             .await
                             .is_some(),
-                        Err(error) => {
-                            self.metrics.record_recovery_lookup_unknown("store_error");
-                            tracing::warn!(
-                                parent_connection_id,
-                                parent_conversation_id = parent_id,
-                                requested_task_id = %requested,
-                                error = %error,
-                                "[delegation] exact task lookup failed; prefix recovery skipped"
-                            );
+                        Err(_) => {
                             resolved.push(requested.clone());
+                            unknown_causes.push(Some("store_error"));
                             continue;
                         }
                     };
                     if exact_exists {
-                        None
+                        (None, None)
                     } else {
                         match self
                             .task_store
                             .resolve_unique_owned_prefix(parent_id, &prefix)
                             .await
                         {
-                            Ok(canonical) => canonical,
-                            Err(error) => {
-                                self.metrics.record_recovery_lookup_unknown("store_error");
-                                tracing::warn!(
-                                    parent_connection_id,
-                                    parent_conversation_id = parent_id,
-                                    requested_task_id = %requested,
-                                    error = %error,
-                                    "[delegation] task prefix lookup failed"
-                                );
-                                None
-                            }
+                            Ok(canonical) => (canonical, None),
+                            Err(_) => (None, Some("store_error")),
                         }
                     }
                 }
@@ -13592,7 +13636,6 @@ impl DelegationBroker {
                 tracing::warn!(
                     parent_connection_id,
                     parent_conversation_id,
-                    requested_task_id = %requested,
                     canonical_task_id = %canonical,
                     "[delegation] recovered status task id from unique prefix"
                 );
@@ -13600,8 +13643,28 @@ impl DelegationBroker {
             } else {
                 resolved.push(requested.clone());
             }
+            unknown_causes.push(unknown_cause);
         }
-        resolved
+        (resolved, unknown_causes)
+    }
+
+    fn classify_status_task_ids(
+        inner: &PendingInner,
+        parent_connection_id: &str,
+        task_ids: &[String],
+        unknown_causes: &[Option<&'static str>],
+    ) -> Vec<StatusClass> {
+        task_ids
+            .iter()
+            .zip(unknown_causes)
+            .map(|(task_id, cause)| match cause {
+                Some(reason) => StatusClass::Unknown {
+                    report: unknown_report(task_id),
+                    reason,
+                },
+                None => classify_locked(inner, parent_connection_id, task_id),
+            })
+            .collect()
     }
 
     /// Backs the batch `get_delegation_status` tool. Resolves the status of one
@@ -13636,7 +13699,7 @@ impl DelegationBroker {
         if task_ids.is_empty() {
             return Vec::new();
         }
-        let resolved_task_ids = self
+        let (resolved_task_ids, unknown_causes) = self
             .resolve_status_task_ids(parent_connection_id, parent_conversation_id, task_ids)
             .await;
         let task_ids = resolved_task_ids.as_slice();
@@ -13670,10 +13733,12 @@ impl DelegationBroker {
 
             let classes: Vec<StatusClass> = {
                 let inner = self.pending.inner.lock().await;
-                task_ids
-                    .iter()
-                    .map(|id| classify_locked(&inner, parent_connection_id, id))
-                    .collect()
+                Self::classify_status_task_ids(
+                    &inner,
+                    parent_connection_id,
+                    task_ids,
+                    &unknown_causes,
+                )
             };
             // Park only on live in-memory Running (running ∪ settling). Any
             // NotInMemory/Settled id forces an immediate return of the assemble
@@ -13878,15 +13943,17 @@ impl DelegationBroker {
                 if task_ids.is_empty() {
                     return StatusWaitPreflight::Ready(DelegationStatusBatch::legacy(Vec::new()));
                 }
-                let resolved = self
+                let (resolved, unknown_causes) = self
                     .resolve_status_task_ids(parent_connection_id, parent_conversation_id, task_ids)
                     .await;
                 let classes = {
                     let inner = self.pending.inner.lock().await;
-                    resolved
-                        .iter()
-                        .map(|id| classify_locked(&inner, parent_connection_id, id))
-                        .collect::<Vec<_>>()
+                    Self::classify_status_task_ids(
+                        &inner,
+                        parent_connection_id,
+                        &resolved,
+                        &unknown_causes,
+                    )
                 };
                 let can_park = all_live_running(&classes);
                 let reports = self
@@ -13916,7 +13983,7 @@ impl DelegationBroker {
                         Vec::new(),
                     ));
                 }
-                let resolved = self
+                let (resolved, unknown_causes) = self
                     .resolve_status_task_ids(
                         parent_connection_id,
                         Some(parent_conversation_id),
@@ -13924,7 +13991,12 @@ impl DelegationBroker {
                     )
                     .await;
                 match self
-                    .evaluate_join_snapshot(parent_connection_id, parent_conversation_id, &resolved)
+                    .evaluate_join_snapshot_resolved(
+                        parent_connection_id,
+                        parent_conversation_id,
+                        &resolved,
+                        &unknown_causes,
+                    )
                     .await
                 {
                     JoinEvaluation::Ready(batch) => StatusWaitPreflight::Ready(batch),
@@ -13942,16 +14014,28 @@ impl DelegationBroker {
         parent_conversation_id: i32,
         task_ids: &[String],
     ) -> JoinEvaluation {
-        let resolved_task_ids = self
+        let (resolved_task_ids, unknown_causes) = self
             .resolve_status_task_ids(parent_connection_id, Some(parent_conversation_id), task_ids)
             .await;
-        let task_ids = resolved_task_ids.as_slice();
+        self.evaluate_join_snapshot_resolved(
+            parent_connection_id,
+            parent_conversation_id,
+            &resolved_task_ids,
+            &unknown_causes,
+        )
+        .await
+    }
+
+    async fn evaluate_join_snapshot_resolved(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+        task_ids: &[String],
+        unknown_causes: &[Option<&'static str>],
+    ) -> JoinEvaluation {
         let classes = {
             let inner = self.pending.inner.lock().await;
-            task_ids
-                .iter()
-                .map(|id| classify_locked(&inner, parent_connection_id, id))
-                .collect::<Vec<_>>()
+            Self::classify_status_task_ids(&inner, parent_connection_id, task_ids, unknown_causes)
         };
         let class_views = classes.clone();
         let tasks = self
@@ -14286,7 +14370,10 @@ impl DelegationBroker {
                 }
             }
             Ok(None) => {}
-            Err(_) => self.metrics.record_recovery_lookup_unknown("store_error"),
+            Err(_) => {
+                self.metrics.record_recovery_lookup_unknown("store_error");
+                return unknown_report(task_id);
+            }
         }
         match self.status_lookup.find_by_call_id(task_id).await {
             Some(rec)
@@ -14690,6 +14777,725 @@ mod tests {
     fn shallow_lookup() -> Arc<dyn ConversationDepthLookup> {
         // parent conversation is the root — depth = 0, no rejection.
         Arc::new(MockDepth(vec![(1, None)])) as Arc<dyn ConversationDepthLookup>
+    }
+
+    mod authorized_delegation_recovery {
+        use super::*;
+        use crate::acp::delegation::metrics::RecoveryMetricEventKind;
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, ReplacementReason,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::types::DelegationRecoveryProjection;
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        async fn assert_unknown_with_only_code(
+            broker: &DelegationBroker,
+            parent_connection_id: &str,
+            task_id: &str,
+            expected_code: &str,
+        ) {
+            let report = broker
+                .get_task_status(parent_connection_id, Some(1), task_id, StatusWait::Snapshot)
+                .await;
+            assert_eq!(report.status, TaskStatus::Unknown);
+            assert_eq!(
+                broker.metrics().recovery_lookup_unknown_codes(),
+                [(expected_code.to_string(), 1)].into_iter().collect()
+            );
+        }
+
+        #[tokio::test]
+        async fn cold_lookup_keeps_public_unknown_and_emits_stable_internal_reason() {
+            let missing = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            assert_unknown_with_only_code(
+                &missing,
+                "parent-conn",
+                "deadbeef-missing-task",
+                "db_not_found",
+            )
+            .await;
+
+            let foreign_store = Arc::new(MockTaskStore::new());
+            foreign_store
+                .seed_running("decafbad-foreign-task", 42, Some(2))
+                .await;
+            let foreign = broker_with_store(Arc::new(MockSpawner::new()), foreign_store);
+            assert_unknown_with_only_code(
+                &foreign,
+                "parent-conn",
+                "decafbad-foreign-task",
+                "ownership_mismatch",
+            )
+            .await;
+
+            let token_parent = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            token_parent
+                .seed_live_task_for_test("owner-connection", "c001d00d-live-task")
+                .await;
+            assert_unknown_with_only_code(
+                &token_parent,
+                "other-connection",
+                "c001d00d-live-task",
+                "token_parent_mismatch",
+            )
+            .await;
+
+            let failing_store = Arc::new(MockTaskStore::new());
+            failing_store
+                .fail_next_load(TaskStoreError::Permanent(
+                    "persistence detail must remain private".into(),
+                ))
+                .await;
+            let failing = broker_with_store(Arc::new(MockSpawner::new()), failing_store);
+            assert_unknown_with_only_code(
+                &failing,
+                "parent-conn",
+                "badc0ffe-store-error",
+                "store_error",
+            )
+            .await;
+
+            let ambiguous = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            ambiguous
+                .seed_live_task_for_test("parent-conn", "abcdef01-first-task")
+                .await;
+            ambiguous
+                .seed_live_task_for_test("parent-conn", "abcdef01-second-task")
+                .await;
+            assert_unknown_with_only_code(
+                &ambiguous,
+                "parent-conn",
+                "abcdef01-ambiguous-task",
+                "prefix_ambiguous",
+            )
+            .await;
+        }
+
+        struct RecoveryTelemetryFixture {
+            db: Arc<crate::db::AppDatabase>,
+            runs: Arc<RunStore>,
+            broker: Arc<DelegationBroker>,
+            parent_id: i32,
+            source_task_id: String,
+            workspace_path: String,
+        }
+
+        impl RecoveryTelemetryFixture {
+            fn replacement_request(&self, tool_use_id: &str) -> DelegationRequest {
+                let mut request = request(self.parent_id, tool_use_id);
+                request.working_dir = Some(self.workspace_path.clone());
+                request.work_unit_key = Some("telemetry-unit".into());
+                request.replaces_task_id = Some(self.source_task_id.clone());
+                request.replacement_reason = Some("admission_unknown".into());
+                request
+            }
+
+            async fn challenge(&self) -> RecoveryChallenge {
+                let source = self
+                    .runs
+                    .load_by_task_id(&self.source_task_id)
+                    .await
+                    .expect("load telemetry source")
+                    .expect("telemetry source");
+                let eligibility = self
+                    .runs
+                    .build_continue_eligibility(&source)
+                    .await
+                    .expect("telemetry eligibility");
+                let snapshot =
+                    crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+                        &eligibility,
+                    );
+                let operation = RequestedRecoveryOperation::Replace {
+                    replacement_reason: ReplacementReason::AdmissionUnknown,
+                };
+                let decision = decide_delegation_recovery(
+                    &snapshot,
+                    &RecoveryRailSnapshot {
+                        agent_supports_reuse: eligibility.agent_supports_reuse,
+                        unexpected_continue_budget_available: eligibility
+                            .unexpected_continue_budget_available,
+                        replacement_budget_available: eligibility.replacement_budget_available,
+                    },
+                    operation.clone(),
+                );
+                let projection = DelegationRecoveryProjection::from(&decision);
+                RecoveryChallenge {
+                    parent_conversation_id: source.parent_conversation_id,
+                    subject_kind: RecoverySubjectKind::DelegationTask,
+                    subject_id: source.task_id.clone(),
+                    delegation_identity: Some(DelegationAuthorizationIdentity {
+                        source_task_id: source.task_id,
+                        child_conversation_id: Some(source.child_conversation_id),
+                        lineage_root_task_id: source.lineage_root_task_id,
+                        work_unit_key: source.work_unit_key,
+                    }),
+                    source_state_fingerprint: decision.source_state_fingerprint,
+                    allowed_action: RecoveryAllowedAction::Replace,
+                    action_payload: crate::acp::delegation::run_store::recovery_action_payload(
+                        &operation,
+                    ),
+                    cause_code: projection.cause_code,
+                    risk_class: projection.risk_class,
+                    display_reason: Some("private display prose".into()),
+                }
+            }
+        }
+
+        async fn recovery_telemetry_fixture() -> RecoveryTelemetryFixture {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-telemetry-parent").await,
+                AgentType::ClaudeCode,
+                Some("telemetry parent".into()),
+                None,
+            )
+            .await
+            .expect("telemetry parent");
+            let runs = Arc::new(RunStore::new(db.clone()));
+            let spawner = Arc::new(MockSpawner::new());
+            spawner
+                .queue_spawn(Ok("telemetry-replacement-conn".into()))
+                .await;
+            spawner.queue_send(Ok(accepted(0, Utc::now()))).await;
+            let broker = broker_with_run_store(spawner, parent.id, runs.clone()).await;
+            let source_task_id = "telemetry-source-task".to_string();
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-telemetry-source").await,
+                AgentType::ClaudeCode,
+                Some("telemetry source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "telemetry-source-tool".into(),
+                    delegation_call_id: source_task_id.clone(),
+                }),
+            )
+            .await
+            .expect("telemetry source child");
+            let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                .expect("agent type json")
+                .as_str()
+                .expect("agent type string")
+                .to_string();
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.clone(),
+                root_task_id: source_task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("telemetry-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type,
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("telemetry source preview".into()),
+                request_fingerprint: Some("telemetry-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: Some("telemetry-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve telemetry source");
+            let finished_at = Utc::now();
+            runs.settle_terminal(
+                &source_task_id,
+                TerminalTaskWrite::failed_with_evidence(
+                    "admission_unknown",
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "admission_unknown",
+                        DelegationRunStatus::Reserving,
+                        true,
+                        finished_at,
+                    ),
+                ),
+            )
+            .await
+            .expect("terminal telemetry source");
+            RecoveryTelemetryFixture {
+                db,
+                runs,
+                broker,
+                parent_id: parent.id,
+                source_task_id,
+                workspace_path,
+            }
+        }
+
+        async fn authorized_continue_resume_failure_events(
+        ) -> Vec<crate::acp::delegation::metrics::DelegationRecoveryMetricEvent> {
+            use crate::acp::delegation::types::ContinueDelegationRequest;
+            use crate::db::entities::{conversation, delegation_task_run};
+            use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+            let db = Arc::new(fresh_in_memory_db().await);
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-resume-parent").await,
+                AgentType::ClaudeCode,
+                Some("resume parent".into()),
+                None,
+            )
+            .await
+            .expect("resume parent");
+            let source_task_id = "resume-recovery-source";
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-resume-source").await,
+                AgentType::ClaudeCode,
+                Some("resume source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "resume-source-tool".into(),
+                    delegation_call_id: source_task_id.into(),
+                }),
+            )
+            .await
+            .expect("resume source child");
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let runs = Arc::new(RunStore::new(db.clone()));
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.into(),
+                root_task_id: source_task_id.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("resume-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("resume source preview".into()),
+                request_fingerprint: Some("resume-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.into(),
+                work_unit_key: Some("resume-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve resume source");
+            runs.bind_child_connection_while_reserving(source_task_id, "resume-source-conn")
+                .await
+                .expect("bind resume source");
+            runs.promote_running(source_task_id, "resume-source-conn", Utc::now())
+                .await
+                .expect("promote resume source");
+            let run = delegation_task_run::Entity::find_by_id(source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut run = run.into_active_model();
+            run.status = Set(DelegationRunStatus::Canceled);
+            run.error_code = Set(Some("parent_disconnected".into()));
+            run.termination_audit_json = Set(None);
+            run.finished_at = Set(Some(Utc::now()));
+            run.update(&db.conn).await.expect("legacy resume source");
+            let child = conversation::Entity::find_by_id(source_child.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut child = child.into_active_model();
+            child.external_id = Set(Some("private-raw-resume-session".into()));
+            child
+                .update(&db.conn)
+                .await
+                .expect("resume session identity");
+
+            let source = runs.load_by_task_id(source_task_id).await.unwrap().unwrap();
+            let eligibility = runs.build_continue_eligibility(&source).await.unwrap();
+            let snapshot =
+                crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+                    &eligibility,
+                );
+            let operation = RequestedRecoveryOperation::Continue;
+            let decision = decide_delegation_recovery(
+                &snapshot,
+                &RecoveryRailSnapshot {
+                    agent_supports_reuse: eligibility.agent_supports_reuse,
+                    unexpected_continue_budget_available: eligibility
+                        .unexpected_continue_budget_available,
+                    replacement_budget_available: eligibility.replacement_budget_available,
+                },
+                operation.clone(),
+            );
+            let projection = DelegationRecoveryProjection::from(&decision);
+            let challenge = RecoveryChallenge {
+                parent_conversation_id: parent.id,
+                subject_kind: RecoverySubjectKind::DelegationTask,
+                subject_id: source_task_id.into(),
+                delegation_identity: Some(DelegationAuthorizationIdentity {
+                    source_task_id: source_task_id.into(),
+                    child_conversation_id: Some(source_child.id),
+                    lineage_root_task_id: source_task_id.into(),
+                    work_unit_key: Some("resume-unit".into()),
+                }),
+                source_state_fingerprint: decision.source_state_fingerprint,
+                allowed_action: RecoveryAllowedAction::Continue,
+                action_payload: crate::acp::delegation::run_store::recovery_action_payload(
+                    &operation,
+                ),
+                cause_code: projection.cause_code,
+                risk_class: projection.risk_class,
+                display_reason: Some("private resume display prose".into()),
+            };
+            let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+            let now = Utc::now();
+            let approved = authorizations
+                .insert_pending(&challenge, now)
+                .await
+                .expect("insert resume authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve resume authorization");
+
+            let spawner = Arc::new(MockSpawner::new());
+            spawner
+                .queue_spawn(Err(SpawnerError::Spawn(
+                    "private resume transport prose".into(),
+                )))
+                .await;
+            let broker = broker_with_run_store(spawner.clone(), parent.id, runs.clone()).await;
+            let report = broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "resume-authorized-tool".into(),
+                    target_task_id: source_task_id.into(),
+                    task: "private resume prompt prose".into(),
+                    work_unit_key: Some("resume-unit".into()),
+                    external_handle: None,
+                    correlation_id: Some("resume-correlation".into()),
+                    recovery_authorization_id: Some(approved.authorization_id.clone()),
+                })
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+            assert_eq!(spawner.resume_args.lock().await.len(), 1);
+            assert_eq!(
+                spawner.resume_args.lock().await[0].external_session_id,
+                "private-raw-resume-session"
+            );
+            let consumed = authorizations
+                .find_by_id(&approved.authorization_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                consumed.status,
+                crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus::Consumed
+            );
+            broker.metrics().recovery_events()
+        }
+
+        #[tokio::test]
+        async fn delegation_recovery_metrics_emit_only_stable_ids_actions_causes_and_codes() {
+            let fixture = recovery_telemetry_fixture().await;
+
+            let required = fixture
+                .broker
+                .start_delegation(fixture.replacement_request("telemetry-required"))
+                .await;
+            assert_eq!(
+                required.error_code.as_deref(),
+                Some("recovery_confirmation_required")
+            );
+
+            let authorizations = RecoveryAuthorizationStore::new(fixture.db.conn.clone());
+            let now = Utc::now();
+            let declined = authorizations
+                .insert_pending(&fixture.challenge().await, now)
+                .await
+                .expect("insert declined authorization");
+            authorizations
+                .decline_pending(&declined.authorization_id)
+                .await
+                .expect("decline authorization");
+            let mut declined_request = fixture.replacement_request("telemetry-declined");
+            declined_request.recovery_authorization_id = Some(declined.authorization_id);
+            let declined_report = fixture.broker.start_delegation(declined_request).await;
+            assert_eq!(
+                declined_report.error_code.as_deref(),
+                Some("recovery_authorization_declined")
+            );
+
+            let approved = authorizations
+                .insert_pending(&fixture.challenge().await, now)
+                .await
+                .expect("insert approved authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve authorization");
+            let mut approved_request = fixture.replacement_request("telemetry-approved");
+            approved_request.recovery_authorization_id = Some(approved.authorization_id);
+            let admitted = fixture.broker.start_delegation(approved_request).await;
+            assert_eq!(admitted.status, TaskStatus::Running, "{admitted:?}");
+
+            let mut events = fixture.broker.metrics().recovery_events();
+            events.extend(authorized_continue_resume_failure_events().await);
+            let counts = events.iter().fold(BTreeMap::new(), |mut counts, event| {
+                *counts.entry(event.kind.as_str()).or_insert(0usize) += 1;
+                counts
+            });
+            assert_eq!(counts.get("recovery.decision"), Some(&3));
+            assert_eq!(counts.get("recovery.confirmation_requested"), Some(&1));
+            assert_eq!(counts.get("recovery.confirmation_approved"), Some(&2));
+            assert_eq!(counts.get("recovery.confirmation_declined"), Some(&1));
+            assert_eq!(counts.get("recovery.authorization_consumed"), Some(&2));
+            assert_eq!(counts.get("recovery.authorization_rejected"), Some(&1));
+            assert_eq!(counts.get("recovery.replacement_admitted"), Some(&1));
+            assert_eq!(counts.get("recovery.resume_failed"), Some(&1));
+            assert!(events.iter().all(|event| {
+                matches!(
+                    event.action.as_ref().map(|value| value.as_str()),
+                    Some("replace" | "continue")
+                ) && event
+                    .cause
+                    .as_ref()
+                    .map(|value| value.as_str())
+                    .is_none_or(|cause| {
+                        matches!(cause, "admission_unknown" | "legacy_parent_disconnect")
+                    })
+                    && event
+                        .risk
+                        .as_ref()
+                        .map(|value| value.as_str())
+                        .is_none_or(|risk| {
+                            matches!(
+                                risk,
+                                "execution_may_have_occurred" | "legacy_unknown_origin"
+                            )
+                        })
+            }));
+            let serialized = serde_json::to_string(&events).expect("serialize recovery events");
+            for forbidden in [
+                "private display prose",
+                "telemetry source preview",
+                "prompt",
+                "answer",
+                "display_reason",
+                "external_session",
+                "private-raw-resume-session",
+                "private resume transport prose",
+                "private resume prompt prose",
+                "private resume display prose",
+            ] {
+                assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+            }
+            assert!(events.iter().any(|event| {
+                event.kind == RecoveryMetricEventKind::AuthorizationRejected
+                    && event.code.as_ref().map(|value| value.as_str())
+                        == Some("recovery_authorization_declined")
+            }));
+        }
+
+        #[tokio::test]
+        async fn cold_and_live_status_share_recovery_projection_without_receipt_id() {
+            use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+            let data_dir = tempfile::tempdir().expect("reopen database directory");
+            let db = Arc::new(
+                crate::db::init_database(data_dir.path(), "task9-reopen")
+                    .await
+                    .expect("open live database"),
+            );
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-status-parent").await,
+                AgentType::ClaudeCode,
+                Some("status parent".into()),
+                None,
+            )
+            .await
+            .expect("status parent");
+            let source_task_id = "status-recovery-source";
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-status-source").await,
+                AgentType::ClaudeCode,
+                Some("status source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "status-source-tool".into(),
+                    delegation_call_id: source_task_id.into(),
+                }),
+            )
+            .await
+            .expect("status source child");
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let runs = Arc::new(RunStore::new(db.clone()));
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.into(),
+                root_task_id: source_task_id.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("status-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("status source preview".into()),
+                request_fingerprint: Some("status-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.into(),
+                work_unit_key: Some("status-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve status source");
+            runs.bind_child_connection_while_reserving(source_task_id, "status-source-conn")
+                .await
+                .expect("bind status source");
+            runs.promote_running(source_task_id, "status-source-conn", Utc::now())
+                .await
+                .expect("promote status source");
+            let row = crate::db::entities::delegation_task_run::Entity::find_by_id(source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut row = row.into_active_model();
+            row.status = Set(DelegationRunStatus::Canceled);
+            row.error_code = Set(Some("parent_disconnected".into()));
+            row.termination_audit_json = Set(None);
+            row.finished_at = Set(Some(Utc::now()));
+            row.update(&db.conn).await.expect("legacy terminal source");
+
+            let live =
+                broker_with_run_store(Arc::new(MockSpawner::new()), parent.id, runs.clone()).await;
+            live.seed_live_task_for_test("parent-conn", source_task_id)
+                .await;
+            let live_report = live
+                .get_task_status(
+                    "parent-conn",
+                    Some(parent.id),
+                    source_task_id,
+                    StatusWait::Snapshot,
+                )
+                .await;
+            let live_projection = live_report.recovery.clone().expect("live projection");
+
+            drop(live);
+            drop(runs);
+            db.conn.clone().close().await.expect("close live database");
+            drop(db);
+
+            let reopened = Arc::new(
+                crate::db::init_database(data_dir.path(), "task9-reopen")
+                    .await
+                    .expect("reopen cold database"),
+            );
+            let cold_runs = Arc::new(RunStore::new(reopened.clone()));
+            let cold =
+                broker_with_run_store(Arc::new(MockSpawner::new()), parent.id, cold_runs).await;
+            let cold_report = cold
+                .get_task_status(
+                    "parent-conn",
+                    Some(parent.id),
+                    source_task_id,
+                    StatusWait::Snapshot,
+                )
+                .await;
+            assert_eq!(cold_report.recovery.as_ref(), Some(&live_projection));
+            for serialized in [
+                serde_json::to_string(&live_report).unwrap(),
+                serde_json::to_string(&cold_report).unwrap(),
+            ] {
+                for forbidden in [
+                    "authorization_id",
+                    "question_id",
+                    "receipt_id",
+                    "recovery_authorization_id",
+                ] {
+                    assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+                }
+            }
+        }
     }
 
     fn request(parent_conv: i32, tool_use: &str) -> DelegationRequest {
@@ -23743,14 +24549,14 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root)
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut budget = budget.into_active_model();
-        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        budget.update(&db.conn).await.unwrap();
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage_root),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
         let _ = release.send(());
         let report = driver.await.expect("join");
         assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
@@ -35422,17 +36228,14 @@ mod tests {
 
         // Simulate a concurrent promotion taking the final charge slot while
         // this prompt is admitted but still gated in the mock transport.
-        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root_task_id)
-            .one(&db.conn)
-            .await
-            .expect("lineage budget lookup")
-            .expect("lineage budget created by reserve");
-        let mut budget = budget.into_active_model();
-        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        budget
-            .update(&db.conn)
-            .await
-            .expect("exhaust lineage budget");
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage_root_task_id),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("exhaust lineage budget");
 
         let _ = release.send(());
         let report = driver.await.expect("continue join");

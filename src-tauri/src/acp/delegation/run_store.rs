@@ -976,103 +976,17 @@ fn task_status_to_delegation_task_status(
 // Platform recovery budget rails
 // ---------------------------------------------------------------------------
 
-/// SeaORM maps SQLite `ON CONFLICT DO NOTHING` with zero inserted rows to
-/// `DbErr::RecordNotInserted`. That is the desired lazy-create outcome.
-fn map_ensure_insert_err(err: sea_orm::DbErr) -> Result<(), TaskStoreError> {
-    match err {
-        sea_orm::DbErr::RecordNotInserted => Ok(()),
-        other => Err(map_db_err(other)),
-    }
-}
-
-async fn ensure_lineage_budget(
-    txn: &DatabaseTransaction,
-    lineage_root_task_id: &str,
-) -> Result<(), TaskStoreError> {
-    let model = delegation_lineage_budget::ActiveModel {
-        lineage_root_task_id: Set(lineage_root_task_id.to_string()),
-        unexpected_continue_count: Set(0),
-        replacement_count: Set(0),
-    };
-    match LineageBudget::insert(model)
-        .on_conflict(
-            OnConflict::column(delegation_lineage_budget::Column::LineageRootTaskId)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec(txn)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(err) => map_ensure_insert_err(err),
-    }
-}
-
-async fn ensure_work_unit_budget(
-    txn: &DatabaseTransaction,
-    parent_conversation_id: i32,
-    work_unit_key: &str,
-) -> Result<(), TaskStoreError> {
-    let model = delegation_work_unit_budget::ActiveModel {
-        parent_conversation_id: Set(parent_conversation_id),
-        work_unit_key: Set(work_unit_key.to_string()),
-        unexpected_continue_count: Set(0),
-        replacement_count: Set(0),
-    };
-    match WorkUnitBudget::insert(model)
-        .on_conflict(
-            OnConflict::columns([
-                delegation_work_unit_budget::Column::ParentConversationId,
-                delegation_work_unit_budget::Column::WorkUnitKey,
-            ])
-            .do_nothing()
-            .to_owned(),
-        )
-        .exec(txn)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(err) => map_ensure_insert_err(err),
-    }
-}
-
-async fn ensure_budget_rows(
-    txn: &DatabaseTransaction,
-    lineage_root_task_id: &str,
-    parent_conversation_id: i32,
-    work_unit_key: Option<&str>,
-) -> Result<(), TaskStoreError> {
-    ensure_lineage_budget(txn, lineage_root_task_id).await?;
-    if let Some(key) = work_unit_key {
-        ensure_work_unit_budget(txn, parent_conversation_id, key).await?;
-    }
-    Ok(())
-}
-
 async fn preflight_unexpected_continue(
     txn: &DatabaseTransaction,
     lineage_root_task_id: &str,
     parent_conversation_id: i32,
     work_unit_key: Option<&str>,
 ) -> Result<(), TaskStoreError> {
-    ensure_budget_rows(
-        txn,
-        lineage_root_task_id,
-        parent_conversation_id,
-        work_unit_key,
-    )
-    .await?;
-
     let lineage = LineageBudget::find_by_id(lineage_root_task_id)
         .one(txn)
         .await
-        .map_err(map_db_err)?
-        .ok_or_else(|| {
-            TaskStoreError::Permanent(format!(
-                "lineage budget missing after ensure for {lineage_root_task_id}"
-            ))
-        })?;
-    if lineage.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT {
+        .map_err(map_db_err)?;
+    if lineage.is_some_and(|row| row.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT) {
         return Err(TaskStoreError::BudgetExhausted(format!(
             "unexpected_continue lineage rail exhausted for {lineage_root_task_id}"
         )));
@@ -1082,13 +996,8 @@ async fn preflight_unexpected_continue(
         let wu = WorkUnitBudget::find_by_id((parent_conversation_id, key.to_string()))
             .one(txn)
             .await
-            .map_err(map_db_err)?
-            .ok_or_else(|| {
-                TaskStoreError::Permanent(format!(
-                    "work-unit budget missing after ensure for ({parent_conversation_id}, {key})"
-                ))
-            })?;
-        if wu.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT {
+            .map_err(map_db_err)?;
+        if wu.is_some_and(|row| row.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT) {
             return Err(TaskStoreError::BudgetExhausted(format!(
                 "unexpected_continue work-unit rail exhausted for ({parent_conversation_id}, {key})"
             )));
@@ -1103,24 +1012,11 @@ async fn preflight_replacement(
     parent_conversation_id: i32,
     work_unit_key: Option<&str>,
 ) -> Result<(), TaskStoreError> {
-    ensure_budget_rows(
-        txn,
-        lineage_root_task_id,
-        parent_conversation_id,
-        work_unit_key,
-    )
-    .await?;
-
     let lineage = LineageBudget::find_by_id(lineage_root_task_id)
         .one(txn)
         .await
-        .map_err(map_db_err)?
-        .ok_or_else(|| {
-            TaskStoreError::Permanent(format!(
-                "lineage budget missing after ensure for {lineage_root_task_id}"
-            ))
-        })?;
-    if lineage.replacement_count >= REPLACEMENT_LIMIT {
+        .map_err(map_db_err)?;
+    if lineage.is_some_and(|row| row.replacement_count >= REPLACEMENT_LIMIT) {
         return Err(TaskStoreError::BudgetExhausted(format!(
             "replacement lineage rail exhausted for {lineage_root_task_id}"
         )));
@@ -1130,13 +1026,8 @@ async fn preflight_replacement(
         let wu = WorkUnitBudget::find_by_id((parent_conversation_id, key.to_string()))
             .one(txn)
             .await
-            .map_err(map_db_err)?
-            .ok_or_else(|| {
-                TaskStoreError::Permanent(format!(
-                    "work-unit budget missing after ensure for ({parent_conversation_id}, {key})"
-                ))
-            })?;
-        if wu.replacement_count >= REPLACEMENT_LIMIT {
+            .map_err(map_db_err)?;
+        if wu.is_some_and(|row| row.replacement_count >= REPLACEMENT_LIMIT) {
             return Err(TaskStoreError::BudgetExhausted(format!(
                 "replacement work-unit rail exhausted for ({parent_conversation_id}, {key})"
             )));
@@ -8941,7 +8832,7 @@ mod tests {
     #[tokio::test]
     async fn continue_parent_tool_idempotency_precedes_busy_and_stale() {
         use crate::db::entities::conversation;
-        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) =
@@ -12294,7 +12185,7 @@ mod tests {
     #[tokio::test]
     async fn promote_budget_exhaust_rolls_back_no_charge() {
         use crate::db::entities::delegation_lineage_budget;
-        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use sea_orm::{ActiveModelTrait, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) =
@@ -12320,14 +12211,14 @@ mod tests {
             .await
             .expect("bind");
         // Fill lineage rail to the limit so promote charge refuses and rolls back.
-        let row = delegation_lineage_budget::Entity::find_by_id(lineage)
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .expect("budget row after insert preflight");
-        let mut active = row.into_active_model();
-        active.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        active.update(&db.conn).await.expect("max out lineage rail");
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage.to_string()),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed exhausted lineage rail");
 
         let outcome = store
             .promote_running_detailed("uc-br-3", "conn-br3", Utc::now())
@@ -13548,12 +13439,8 @@ mod termination_audit {
     #[cfg(test)]
     mod authorized_delegation_recovery {
         use super::*;
-        use crate::acp::delegation::metrics::{
-            DelegationMetrics, DelegationRecoveryMetricEvent, RecoveryMetricEventKind,
-        };
         use crate::acp::delegation::recovery_policy::{
-            decide_delegation_recovery, RecoveryCauseCode, RecoveryConfirmation, RecoveryDecision,
-            RecoveryDisposition, RecoveryRailSnapshot,
+            decide_delegation_recovery, RecoveryDecision, RecoveryRailSnapshot,
         };
         use crate::acp::delegation::run_store::tests::{
             base_replacement_insert, ensure_bound, lineage_counts, new_replacement_child,
@@ -13566,7 +13453,9 @@ mod termination_audit {
         };
         use crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus;
         use chrono::Duration;
-        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set};
+        use sea_orm::{
+            ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set,
+        };
 
         async fn seed_legacy_parent_disconnect(
             suffix: &str,
@@ -13672,6 +13561,31 @@ mod termination_audit {
             pending.authorization_id
         }
 
+        async fn approved_continue_fixture(
+            suffix: &str,
+        ) -> (Arc<AppDatabase>, RunStore, i32, i32, String, String) {
+            let (db, store, parent_id, child_id, source_task_id) =
+                seed_legacy_parent_disconnect(suffix).await;
+            let decision = recovery_decision(&store, &source_task_id).await;
+            let authorization_id = approved_continue_authorization(
+                &db,
+                &decision,
+                parent_id,
+                child_id,
+                &source_task_id,
+                Some(format!("unit-{suffix}")),
+            )
+            .await;
+            (
+                db,
+                store,
+                parent_id,
+                child_id,
+                source_task_id,
+                authorization_id,
+            )
+        }
+
         fn continue_admission(
             source_task_id: &str,
             parent_id: i32,
@@ -13698,11 +13612,58 @@ mod termination_audit {
             }
         }
 
+        async fn inherited_replacement(
+            db: &AppDatabase,
+            parent_id: i32,
+            continued_task_id: &str,
+            lineage_root_task_id: &str,
+            work_unit_key: &str,
+            suffix: &str,
+        ) -> ReservingRunInsert {
+            let task_id = format!("inherited-replacement-{suffix}");
+            let child =
+                new_replacement_child(db, parent_id, &format!("tu-{task_id}"), &task_id).await;
+            let mut replacement = base_replacement_insert(
+                &task_id,
+                parent_id,
+                child,
+                continued_task_id,
+                REPLACEMENT_REASON_UNRESUMABLE,
+            );
+            replacement.lineage_root_task_id = lineage_root_task_id.to_string();
+            replacement.work_unit_key = Some(work_unit_key.to_string());
+            replacement
+        }
+
         async fn run_count(db: &AppDatabase) -> u64 {
             DelegationTaskRun::find()
                 .count(&db.conn)
                 .await
                 .expect("count runs")
+        }
+
+        async fn assert_budget_rows_absent(
+            db: &AppDatabase,
+            lineage_root_task_id: &str,
+            parent_conversation_id: i32,
+            work_unit_key: &str,
+        ) {
+            assert!(
+                LineageBudget::find_by_id(lineage_root_task_id)
+                    .one(&db.conn)
+                    .await
+                    .expect("read lineage budget")
+                    .is_none(),
+                "reserving admission must not create the lineage budget row"
+            );
+            assert!(
+                WorkUnitBudget::find_by_id((parent_conversation_id, work_unit_key.to_string(),))
+                    .one(&db.conn)
+                    .await
+                    .expect("read work-unit budget")
+                    .is_none(),
+                "reserving admission must not create the work-unit budget row"
+            );
         }
 
         #[tokio::test]
@@ -13767,6 +13728,7 @@ mod termination_audit {
             );
             assert_eq!(run.run_status, DelegationRunStatus::Reserving);
             assert_eq!(lineage_counts(&db, &source_task_id).await, (0, 0));
+            assert_budget_rows_absent(&db, &source_task_id, parent_id, "unit-approved").await;
             assert_eq!(
                 conversation::Entity::find_by_id(child_id)
                     .one(&db.conn)
@@ -13797,6 +13759,79 @@ mod termination_audit {
                 .await
                 .expect("running promotion");
             assert_eq!(lineage_counts(&db, &source_task_id).await, (1, 0));
+
+            for (suffix, fail_consumption) in [("rollback-consume", true), ("rollback-run", false)]
+            {
+                let (db, store, parent_id, child_id, source_task_id) =
+                    seed_legacy_parent_disconnect(suffix).await;
+                let decision = recovery_decision(&store, &source_task_id).await;
+                let authorization_id = approved_continue_authorization(
+                    &db,
+                    &decision,
+                    parent_id,
+                    child_id,
+                    &source_task_id,
+                    Some(format!("unit-{suffix}")),
+                )
+                .await;
+                let admission = continue_admission(&source_task_id, parent_id, suffix);
+                let trigger = if fail_consumption {
+                    format!(
+                        "CREATE TRIGGER task9_fail_consume BEFORE UPDATE ON recovery_authorizations \
+                         WHEN NEW.authorization_id = '{}' AND NEW.status = 'consumed' \
+                         BEGIN SELECT RAISE(ABORT, 'task9 injected consume failure'); END;",
+                        authorization_id
+                    )
+                } else {
+                    format!(
+                        "CREATE TRIGGER task9_fail_run_insert BEFORE INSERT ON delegation_task_runs \
+                         WHEN NEW.task_id = '{}' \
+                         BEGIN SELECT RAISE(ABORT, 'task9 injected run failure'); END;",
+                        admission.task_id
+                    )
+                };
+                db.conn
+                    .execute_unprepared(&trigger)
+                    .await
+                    .expect("install transaction abort trigger");
+                let before = run_count(&db).await;
+                store
+                    .admit_continue_reserving_authorized(
+                        admission.clone(),
+                        recovery_authorization(Some(authorization_id.clone()), suffix),
+                    )
+                    .await
+                    .expect_err("injected conditional write must abort admission");
+                db.conn
+                    .execute_unprepared(if fail_consumption {
+                        "DROP TRIGGER task9_fail_consume"
+                    } else {
+                        "DROP TRIGGER task9_fail_run_insert"
+                    })
+                    .await
+                    .expect("drop transaction abort trigger");
+                assert_eq!(run_count(&db).await, before);
+                assert!(store
+                    .load_by_task_id(&admission.task_id)
+                    .await
+                    .expect("load rolled-back run")
+                    .is_none());
+                let receipt = RecoveryAuthorizationStore::new(db.conn.clone())
+                    .find_by_id(&authorization_id)
+                    .await
+                    .expect("read rolled-back receipt")
+                    .expect("rolled-back receipt");
+                assert_eq!(receipt.status, RecoveryAuthorizationStatus::Approved);
+                assert!(receipt.consumed_by_id.is_none());
+                assert!(receipt.consumer_correlation_id.is_none());
+                assert_budget_rows_absent(
+                    &db,
+                    &source_task_id,
+                    parent_id,
+                    &format!("unit-{suffix}"),
+                )
+                .await;
+            }
         }
 
         #[tokio::test]
@@ -13827,6 +13862,25 @@ mod termination_audit {
                 });
                 row.finished_at = Set(None);
                 row.update(&db.conn).await.unwrap();
+                let busy_projection = store
+                    .recovery_projection_for_task(&source_task_id)
+                    .await
+                    .expect("project busy source")
+                    .expect("busy recovery projection");
+                assert_eq!(busy_projection.disposition, "busy_thread");
+                assert_eq!(busy_projection.proposed_action, None);
+                assert_eq!(busy_projection.cause_code, "busy_source");
+                assert!(!busy_projection.authorization_required);
+                let source_before = DelegationTaskRun::find_by_id(&source_task_id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let child_before = conversation::Entity::find_by_id(child_id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let before = run_count(&db).await;
                 let error = store
                     .admit_continue_reserving_authorized(
@@ -13837,12 +13891,47 @@ mod termination_audit {
                     .expect_err("busy must win");
                 assert_eq!(error.wire_code(), Some("busy_thread"));
                 assert_eq!(run_count(&db).await, before);
+                let source_after = DelegationTaskRun::find_by_id(&source_task_id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(source_after.status, source_before.status);
+                assert_eq!(source_after.error_code, source_before.error_code);
+                assert_eq!(source_after.finished_at, source_before.finished_at);
+                assert_eq!(
+                    source_after.termination_audit_json,
+                    source_before.termination_audit_json
+                );
+                let child_after = conversation::Entity::find_by_id(child_id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(child_after.external_id, child_before.external_id);
+                assert_eq!(
+                    child_after.delegation_task_status,
+                    child_before.delegation_task_status
+                );
+                assert_eq!(
+                    child_after.delegation_run_generation,
+                    child_before.delegation_run_generation
+                );
+                assert_budget_rows_absent(
+                    &db,
+                    &source_task_id,
+                    parent_id,
+                    &format!("unit-{suffix}"),
+                )
+                .await;
                 let receipt = RecoveryAuthorizationStore::new(db.conn.clone())
                     .find_by_id(&authorization_id)
                     .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(receipt.status, RecoveryAuthorizationStatus::Approved);
+                assert!(receipt.consumed_by_id.is_none());
+                assert!(receipt.consumer_correlation_id.is_none());
             }
         }
 
@@ -13970,6 +14059,135 @@ mod termination_audit {
                 )
                 .await
                 .expect("persist unresumable failure");
+
+            let baseline_run_count = run_count(&db).await;
+            let original_source = DelegationTaskRun::find_by_id(&source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut stale_source = original_source.clone().into_active_model();
+            stale_source.generation = Set(continued.generation + 1);
+            stale_source.update(&db.conn).await.unwrap();
+            let replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &continued.task_id,
+                &source_task_id,
+                "unit-replace-bad-link",
+                "stale-latest",
+            )
+            .await;
+            store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("non-latest continued run must not inherit confirmation");
+            let mut stale_source = DelegationTaskRun::find_by_id(&source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            stale_source.generation = Set(original_source.generation);
+            stale_source.update(&db.conn).await.unwrap();
+
+            let continued_row = DelegationTaskRun::find_by_id(&continued.task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut wrong_failure = continued_row.clone().into_active_model();
+            wrong_failure.error_code = Set(Some("spawn_failed".into()));
+            wrong_failure.update(&db.conn).await.unwrap();
+            let replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &continued.task_id,
+                &source_task_id,
+                "unit-replace-bad-link",
+                "typed-failure",
+            )
+            .await;
+            store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("non-unresumable failure must not inherit confirmation");
+            let mut wrong_failure = DelegationTaskRun::find_by_id(&continued.task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            wrong_failure.error_code = Set(continued_row.error_code.clone());
+            wrong_failure.update(&db.conn).await.unwrap();
+
+            let mut replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &continued.task_id,
+                &source_task_id,
+                "unit-replace-bad-link",
+                "ownership",
+            )
+            .await;
+            replacement.parent_conversation_id = parent_id + 10_000;
+            store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("cross-parent replacement must not inherit confirmation");
+
+            delegation_lineage_budget::ActiveModel {
+                lineage_root_task_id: Set(source_task_id.clone()),
+                unexpected_continue_count: Set(0),
+                replacement_count: Set(REPLACEMENT_LIMIT),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("seed exhausted replacement rail");
+            let replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &continued.task_id,
+                &source_task_id,
+                "unit-replace-bad-link",
+                "budget",
+            )
+            .await;
+            let budget_error = store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("exhausted replacement budget must reject inherited confirmation");
+            assert!(matches!(budget_error, TaskStoreError::BudgetExhausted(_)));
+            delegation_lineage_budget::Entity::delete_by_id(&source_task_id)
+                .exec(&db.conn)
+                .await
+                .expect("clear exhausted replacement rail");
+
+            let mut replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &continued.task_id,
+                &source_task_id,
+                "unit-replace-bad-link",
+                "reason",
+            )
+            .await;
+            replacement.replacement_reason = Some(REPLACEMENT_REASON_ADMISSION_FAILED.into());
+            store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("changed replacement rail must not inherit confirmation");
+
+            assert_eq!(run_count(&db).await, baseline_run_count);
+            let receipt_before_corruption = RecoveryAuthorizationStore::new(db.conn.clone())
+                .find_by_id(&authorization_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt_before_corruption.consumed_by_id.as_deref(),
+                Some(continued.task_id.as_str())
+            );
             let receipt =
                 crate::db::entities::recovery_authorization::Entity::find_by_id(&authorization_id)
                     .one(&db.conn)
@@ -14003,179 +14221,379 @@ mod termination_audit {
 
         #[tokio::test]
         async fn explicit_cancel_and_admission_unknown_require_authorization() {
-            let (_, store, _, _, source_task_id) = seed_legacy_parent_disconnect("cancel").await;
-            let source = store
-                .load_by_task_id(&source_task_id)
+            let (db, store, parent_id, child_id, source_task_id) =
+                seed_legacy_parent_disconnect("cancel").await;
+            let canceled_at = Utc::now();
+            let row = DelegationTaskRun::find_by_id(&source_task_id)
+                .one(&db.conn)
                 .await
                 .unwrap()
                 .unwrap();
-            let mut eligibility = store.build_continue_eligibility(&source).await.unwrap();
-            for error_code in ["user_cancelled", "admission_unknown"] {
-                eligibility.error_code = Some(error_code.into());
-                eligibility.run_status = if error_code == "admission_unknown" {
-                    DelegationRunStatus::Failed
-                } else {
-                    DelegationRunStatus::Canceled
-                };
-                eligibility.reached_running = error_code != "admission_unknown";
-                eligibility.termination_audit_json = None;
-                let snapshot = recovery_source_from_continue_eligibility(&eligibility);
-                let decision = decide_delegation_recovery(
-                    &snapshot,
-                    &RecoveryRailSnapshot {
-                        agent_supports_reuse: true,
-                        unexpected_continue_budget_available: true,
-                        replacement_budget_available: true,
-                    },
-                    RequestedRecoveryOperation::Inspect,
-                );
-                assert_eq!(decision.confirmation, RecoveryConfirmation::Required);
-                assert_ne!(decision.cause_code, RecoveryCauseCode::PreAdmissionRetry);
-            }
+            let mut row = row.into_active_model();
+            row.status = Set(DelegationRunStatus::Canceled);
+            row.error_code = Set(Some("user_cancelled".into()));
+            row.termination_audit_json = Set(Some(
+                serde_json::to_string(&DelegationTerminationAuditV1::for_terminal_code(
+                    "user_cancelled",
+                    DelegationRunStatus::Running,
+                    true,
+                    canceled_at,
+                ))
+                .unwrap(),
+            ));
+            row.finished_at = Set(Some(canceled_at));
+            row.update(&db.conn).await.unwrap();
+
+            let before = run_count(&db).await;
+            let mut continue_request =
+                continue_admission(&source_task_id, parent_id, "explicit-cancel-continue");
+            continue_request.work_unit_key = Some("unit-cancel".into());
+            let error = store
+                .admit_continue_reserving_authorized(
+                    continue_request,
+                    recovery_authorization(None, "explicit-cancel-continue"),
+                )
+                .await
+                .expect_err("explicit cancel continue must require authorization");
+            let projection = error
+                .recovery_projection()
+                .unwrap_or_else(|| panic!("continue projection for {error:?}"));
+            assert_eq!(projection.proposed_action.as_deref(), Some("continue"));
+            assert_eq!(projection.cause_code, "user_cancelled");
+            assert!(projection.authorization_required);
+            assert_eq!(run_count(&db).await, before);
+
+            let child = conversation::Entity::find_by_id(child_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut child = child.into_active_model();
+            child.external_id = Set(None);
+            child.update(&db.conn).await.unwrap();
+            let mut replacement = inherited_replacement(
+                &db,
+                parent_id,
+                &source_task_id,
+                &source_task_id,
+                "unit-cancel",
+                "explicit-cancel-replace",
+            )
+            .await;
+            replacement.replacement_reason = Some(REPLACEMENT_REASON_NOT_SUPPORTED.into());
+            let error = store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("explicit cancel replacement must require authorization");
+            let projection = error.recovery_projection().expect("replacement projection");
+            assert_eq!(projection.proposed_action.as_deref(), Some("replace"));
+            assert_eq!(projection.cause_code, "user_cancelled");
+            assert!(projection.authorization_required);
+            assert_eq!(run_count(&db).await, before);
+
+            let db = Arc::new(fresh_in_memory_db().await);
+            let source_task_id = "admission-unknown-source";
+            let (parent_id, source_child) = seed_parent_child(&db, source_task_id).await;
+            let store = RunStore::new(db.clone());
+            let mut source = sample_insert(source_task_id, parent_id, source_child, 1, None);
+            source.work_unit_key = Some("admission-unknown-unit".into());
+            store.insert_reserving(source).await.unwrap();
+            let failed_at = Utc::now();
+            store
+                .settle_terminal(
+                    source_task_id,
+                    TerminalTaskWrite::failed_with_evidence(
+                        "admission_unknown",
+                        failed_at,
+                        DelegationTerminationAuditV1::for_terminal_code(
+                            "admission_unknown",
+                            DelegationRunStatus::Reserving,
+                            true,
+                            failed_at,
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+            let replacement_child = new_replacement_child(
+                &db,
+                parent_id,
+                "tu-admission-unknown-replace",
+                "admission-unknown-replace",
+            )
+            .await;
+            let mut replacement = base_replacement_insert(
+                "admission-unknown-replace",
+                parent_id,
+                replacement_child,
+                source_task_id,
+                REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+            );
+            replacement.lineage_root_task_id = source_task_id.into();
+            replacement.work_unit_key = Some("admission-unknown-unit".into());
+            let before = run_count(&db).await;
+            let error = store
+                .admit_gen1_reserving(replacement)
+                .await
+                .expect_err("admission unknown replacement must require authorization");
+            let projection = error
+                .recovery_projection()
+                .expect("admission unknown projection");
+            assert_eq!(projection.proposed_action.as_deref(), Some("replace"));
+            assert_eq!(projection.cause_code, "admission_unknown");
+            assert!(projection.authorization_required);
+            assert_eq!(run_count(&db).await, before);
         }
 
         #[tokio::test]
         async fn pure_infrastructure_pre_admission_abort_fresh_dispatches_without_budget_charge() {
-            let (_, store, _, _, source_task_id) = seed_legacy_parent_disconnect("fresh").await;
-            let source = store
-                .load_by_task_id(&source_task_id)
+            let db = Arc::new(fresh_in_memory_db().await);
+            let source_task_id = "pure-abort-source";
+            let (parent_id, source_child_id) = seed_parent_child(&db, source_task_id).await;
+            let store = RunStore::new(db.clone());
+            let mut source = sample_insert(source_task_id, parent_id, source_child_id, 1, None);
+            source.work_unit_key = Some("pure-abort-unit".into());
+            store
+                .insert_reserving(source)
                 .await
-                .unwrap()
-                .unwrap();
-            let mut eligibility = store.build_continue_eligibility(&source).await.unwrap();
-            eligibility.run_status = DelegationRunStatus::Failed;
-            eligibility.reached_running = false;
-            eligibility.child_connection_id = None;
-            eligibility.external_id_present = false;
-            eligibility.external_session_identity_hash = None;
-            eligibility.error_code = Some("spawn_failed".into());
-            eligibility.termination_audit_json = None;
-            let snapshot = recovery_source_from_continue_eligibility(&eligibility);
-            let decision = decide_delegation_recovery(
-                &snapshot,
-                &RecoveryRailSnapshot {
-                    agent_supports_reuse: true,
-                    unexpected_continue_budget_available: true,
-                    replacement_budget_available: true,
-                },
-                RequestedRecoveryOperation::FreshDispatch,
+                .expect("reserve source");
+            let failed_at = Utc::now();
+            store
+                .settle_terminal(
+                    source_task_id,
+                    TerminalTaskWrite::failed_with_evidence(
+                        "spawn_failed",
+                        failed_at,
+                        DelegationTerminationAuditV1::for_terminal_code(
+                            "spawn_failed",
+                            DelegationRunStatus::Reserving,
+                            false,
+                            failed_at,
+                        ),
+                    ),
+                )
+                .await
+                .expect("persist pure pre-admission abort");
+            let projection = store
+                .recovery_projection_for_task(source_task_id)
+                .await
+                .expect("project pure abort")
+                .expect("pure abort projection");
+            assert_eq!(projection.disposition, "fresh_dispatch");
+            assert_eq!(
+                projection.proposed_action.as_deref(),
+                Some("fresh_dispatch")
             );
-            assert_eq!(decision.disposition, RecoveryDisposition::FreshDispatch);
-            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+            assert_eq!(projection.cause_code, "pre_admission_abort");
+            assert!(!projection.authorization_required);
+
+            let fresh_task_id = "pure-abort-fresh-dispatch";
+            let fresh_child =
+                new_replacement_child(&db, parent_id, "tu-pure-abort-fresh", fresh_task_id).await;
+            let mut fresh = sample_insert(fresh_task_id, parent_id, fresh_child, 1, None);
+            fresh.work_unit_key = Some("pure-abort-unit".into());
+            let admitted = store
+                .admit_gen1_reserving(fresh)
+                .await
+                .expect("fresh dispatch reserve");
+            assert!(matches!(admitted, Gen1AdmitOutcome::Created(_)));
+            assert_budget_rows_absent(&db, source_task_id, parent_id, "pure-abort-unit").await;
+            assert_eq!(lineage_counts(&db, source_task_id).await, (0, 0));
         }
 
         #[tokio::test]
         async fn stale_changed_or_cross_parent_receipts_create_no_run_and_consume_nothing() {
-            let (db, store, parent_id, child_id, source_task_id) =
-                seed_legacy_parent_disconnect("stale").await;
-            let decision = recovery_decision(&store, &source_task_id).await;
-            let authorization_id = approved_continue_authorization(
-                &db,
-                &decision,
-                parent_id,
-                child_id,
-                &source_task_id,
-                Some("unit-stale".into()),
-            )
-            .await;
-            let mut admission = continue_admission(&source_task_id, parent_id, "stale");
-            admission.work_unit_key = Some("changed-unit".into());
+            async fn assert_approved_and_no_child(
+                db: &AppDatabase,
+                store: &RunStore,
+                authorization_id: &str,
+                child_task_id: &str,
+                run_count_before: u64,
+            ) {
+                assert_eq!(run_count(db).await, run_count_before);
+                assert!(store
+                    .load_by_task_id(child_task_id)
+                    .await
+                    .expect("load rejected child")
+                    .is_none());
+                let receipt = RecoveryAuthorizationStore::new(db.conn.clone())
+                    .find_by_id(authorization_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(receipt.status, RecoveryAuthorizationStatus::Approved);
+                assert!(receipt.consumed_by_id.is_none());
+                assert!(receipt.consumer_correlation_id.is_none());
+            }
+
+            let (db, store, parent_id, child_id, source_task_id, authorization_id) =
+                approved_continue_fixture("stale-latest").await;
+            let newer_task_id = "stale-latest-newer-run";
+            let mut newer =
+                sample_insert(newer_task_id, parent_id, child_id, 2, Some(&source_task_id));
+            newer.root_task_id = source_task_id.clone();
+            newer.lineage_root_task_id = source_task_id.clone();
+            newer.work_unit_key = Some("unit-stale-latest".into());
+            store
+                .insert_reserving(newer)
+                .await
+                .expect("insert newer run");
+            let newer_failed_at = Utc::now();
+            store
+                .settle_terminal(
+                    newer_task_id,
+                    TerminalTaskWrite::failed_with_evidence(
+                        "spawn_failed",
+                        newer_failed_at,
+                        DelegationTerminationAuditV1::for_terminal_code(
+                            "spawn_failed",
+                            DelegationRunStatus::Reserving,
+                            false,
+                            newer_failed_at,
+                        ),
+                    ),
+                )
+                .await
+                .expect("terminal newer run");
+            let admission = continue_admission(&source_task_id, parent_id, "stale-latest");
             let before = run_count(&db).await;
             let error = store
                 .admit_continue_reserving_authorized(
-                    admission,
-                    recovery_authorization(Some(authorization_id.clone()), "stale"),
+                    admission.clone(),
+                    recovery_authorization(Some(authorization_id.clone()), "stale-latest"),
                 )
                 .await
-                .expect_err("changed authorization context must reject");
-            assert!(matches!(
-                error.wire_code(),
-                Some("not_continuable") | Some("recovery_authorization_fingerprint_mismatch")
-            ));
-            assert_eq!(run_count(&db).await, before);
-            let receipt = RecoveryAuthorizationStore::new(db.conn.clone())
-                .find_by_id(&authorization_id)
+                .expect_err("newer latest run must stale the approved source");
+            assert_eq!(error.wire_code(), Some("stale_task_id"));
+            assert_approved_and_no_child(
+                &db,
+                &store,
+                &authorization_id,
+                &admission.task_id,
+                before,
+            )
+            .await;
+
+            for (suffix, field, expected_code) in [
+                (
+                    "fingerprint",
+                    "fingerprint",
+                    "recovery_authorization_fingerprint_mismatch",
+                ),
+                (
+                    "payload",
+                    "payload",
+                    "recovery_authorization_payload_mismatch",
+                ),
+            ] {
+                let (db, store, parent_id, _, source_task_id, authorization_id) =
+                    approved_continue_fixture(suffix).await;
+                let receipt = crate::db::entities::recovery_authorization::Entity::find_by_id(
+                    &authorization_id,
+                )
+                .one(&db.conn)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(receipt.status, RecoveryAuthorizationStatus::Approved);
-        }
+                let mut receipt = receipt.into_active_model();
+                if field == "fingerprint" {
+                    receipt.source_state_fingerprint = Set("changed-fingerprint".into());
+                } else {
+                    receipt.action_payload_json =
+                        Set(r#"{"action":"replace","replacement_reason":"unresumable"}"#.into());
+                }
+                receipt.update(&db.conn).await.unwrap();
+                let admission = continue_admission(&source_task_id, parent_id, suffix);
+                let before = run_count(&db).await;
+                let error = store
+                    .admit_continue_reserving_authorized(
+                        admission.clone(),
+                        recovery_authorization(Some(authorization_id.clone()), suffix),
+                    )
+                    .await
+                    .expect_err("changed receipt expectation must reject");
+                assert_eq!(error.wire_code(), Some(expected_code));
+                assert_approved_and_no_child(
+                    &db,
+                    &store,
+                    &authorization_id,
+                    &admission.task_id,
+                    before,
+                )
+                .await;
+            }
 
-        #[tokio::test]
-        async fn cold_and_live_status_share_recovery_projection_without_receipt_id() {
-            let (_, store, _, _, source_task_id) = seed_legacy_parent_disconnect("status").await;
-            let live = store
-                .recovery_projection_for_task(&source_task_id)
+            let (db, store, parent_id, _, source_task_id, authorization_id) =
+                approved_continue_fixture("cross-parent").await;
+            let admission = continue_admission(&source_task_id, parent_id + 10_000, "cross-parent");
+            let before = run_count(&db).await;
+            let error = store
+                .admit_continue_reserving_authorized(
+                    admission.clone(),
+                    recovery_authorization(Some(authorization_id.clone()), "cross-parent"),
+                )
                 .await
-                .expect("live projection")
-                .expect("projection");
-            let cold = store
-                .recovery_projection_for_task(&source_task_id)
+                .expect_err("cross-parent request must reject without revealing source");
+            assert_eq!(error.wire_code(), Some("not_found"));
+            assert_approved_and_no_child(
+                &db,
+                &store,
+                &authorization_id,
+                &admission.task_id,
+                before,
+            )
+            .await;
+
+            let (db, store, parent_id, _, source_task_id, authorization_id) =
+                approved_continue_fixture("work-unit").await;
+            let mut admission = continue_admission(&source_task_id, parent_id, "work-unit");
+            admission.work_unit_key = Some("changed-work-unit".into());
+            let before = run_count(&db).await;
+            let error = store
+                .admit_continue_reserving_authorized(
+                    admission.clone(),
+                    recovery_authorization(Some(authorization_id.clone()), "work-unit"),
+                )
                 .await
-                .expect("cold projection")
-                .expect("projection");
-            assert_eq!(live, cold);
-            let serialized = serde_json::to_string(&live).unwrap();
-            for forbidden in ["authorization_id", "question_id", "receipt_id"] {
-                assert!(!serialized.contains(forbidden), "leaked {forbidden}");
-            }
-        }
+                .expect_err("changed work-unit route must reject");
+            assert_eq!(error.wire_code(), Some("not_continuable"));
+            assert_approved_and_no_child(
+                &db,
+                &store,
+                &authorization_id,
+                &admission.task_id,
+                before,
+            )
+            .await;
 
-        #[test]
-        fn cold_lookup_keeps_public_unknown_and_emits_stable_internal_reason() {
-            let metrics = DelegationMetrics::default();
-            for code in [
-                "db_not_found",
-                "ownership_mismatch",
-                "token_parent_mismatch",
-                "store_error",
-                "prefix_ambiguous",
-            ] {
-                metrics.record_recovery_lookup_unknown(code);
+            let (db, store, parent_id, _, source_task_id, authorization_id) =
+                approved_continue_fixture("budget-change").await;
+            delegation_lineage_budget::ActiveModel {
+                lineage_root_task_id: Set(source_task_id.clone()),
+                unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+                replacement_count: Set(0),
             }
-            assert_eq!(
-                metrics.recovery_lookup_unknown_codes(),
-                [
-                    ("db_not_found".to_string(), 1),
-                    ("ownership_mismatch".to_string(), 1),
-                    ("prefix_ambiguous".to_string(), 1),
-                    ("store_error".to_string(), 1),
-                    ("token_parent_mismatch".to_string(), 1),
-                ]
-                .into_iter()
-                .collect()
-            );
-        }
-
-        #[test]
-        fn delegation_recovery_metrics_emit_only_stable_ids_actions_causes_and_codes() {
-            let metrics = DelegationMetrics::default();
-            for kind in RecoveryMetricEventKind::ALL {
-                metrics.record_recovery_event(DelegationRecoveryMetricEvent {
-                    kind,
-                    task_id: Some("stable-task".into()),
-                    authorization_id: Some("stable-authorization".into()),
-                    parent_id: Some("stable-parent".into()),
-                    child_id: Some("stable-child".into()),
-                    action: Some("continue".into()),
-                    cause: Some("legacy_parent_disconnect".into()),
-                    risk: Some("legacy_unknown_origin".into()),
-                    code: Some("recovery_confirmation_required".into()),
-                });
-            }
-            let events = metrics.recovery_events();
-            assert_eq!(events.len(), RecoveryMetricEventKind::ALL.len());
-            let serialized = serde_json::to_string(&events).unwrap();
-            for forbidden in [
-                "prompt",
-                "preview",
-                "arbitrary error prose",
-                "answer",
-                "display_reason",
-                "raw-external-session",
-            ] {
-                assert!(!serialized.contains(forbidden), "leaked {forbidden}");
-            }
+            .insert(&db.conn)
+            .await
+            .expect("exhaust budget after approval");
+            let admission = continue_admission(&source_task_id, parent_id, "budget-change");
+            let before = run_count(&db).await;
+            let error = store
+                .admit_continue_reserving_authorized(
+                    admission.clone(),
+                    recovery_authorization(Some(authorization_id.clone()), "budget-change"),
+                )
+                .await
+                .expect_err("post-approval budget exhaustion must reject");
+            assert_eq!(error.wire_code(), Some("not_continuable"));
+            assert_approved_and_no_child(
+                &db,
+                &store,
+                &authorization_id,
+                &admission.task_id,
+                before,
+            )
+            .await;
         }
     }
 }
