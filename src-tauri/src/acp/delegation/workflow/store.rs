@@ -25,7 +25,7 @@ use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
 use crate::acp::recovery_authorization::{
-    consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
+    canonical_json, consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
     RecoveryAllowedAction, RecoveryAuthorizationError, RecoveryConsumerKind, RecoverySubjectKind,
 };
 
@@ -420,6 +420,7 @@ pub async fn recover_workflow_core(
     parent_conversation_id: i32,
     req: RecoverWorkflowRequest,
 ) -> Result<RecoverWorkflowResult, WorkflowStoreError> {
+    let rejection_req = req.clone();
     let result = db
         .conn
         .transaction::<_, RecoverWorkflowResult, WorkflowStoreError>(|txn| {
@@ -522,7 +523,17 @@ pub async fn recover_workflow_core(
         Err(sea_orm::TransactionError::Connection(error)) => {
             return Err(WorkflowStoreError::Persistence(error.to_string()));
         }
-        Err(sea_orm::TransactionError::Transaction(error)) => return Err(error),
+        Err(sea_orm::TransactionError::Transaction(error)) => {
+            emit_recover_workflow_rejection_if_designated(
+                db,
+                emitter,
+                parent_conversation_id,
+                &rejection_req,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
     };
     if !result.idempotent_replay {
         emit_committed_recovery_events(emitter, &result, "recover_workflow", false);
@@ -577,8 +588,6 @@ async fn load_committed_recovery_replay_txn(
         .await
         .map_err(db_err)?
         .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-    let new_state = parse_manifest_state(&revision.manifest_state)
-        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
     let source = delegation_workflow_manifest_revision::Entity::find_by_id((
         req.workflow_id.clone(),
         source_manifest_revision,
@@ -587,23 +596,102 @@ async fn load_committed_recovery_replay_txn(
     .await
     .map_err(db_err)?
     .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+
+    let current_snapshot =
+        load_workflow_recovery_snapshot_detailed_conn(txn, header, None, None).await?;
+    if !current_snapshot.snapshot.active_manifest_valid
+        || !current_snapshot.snapshot.header_manifest_state_match
+        || !current_snapshot.snapshot.fingerprints_valid
+        || !current_snapshot.snapshot.binding_evidence_consistent
+        || !current_snapshot.snapshot.latest_run_supersession_valid
+        || current_snapshot.snapshot.contradictory_durable_state
+    {
+        return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+    }
+
     let old_state = parse_manifest_state(&source.manifest_state)
+        .filter(|state| *state == ManifestWorkflowState::Blocked)
         .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-    let expected_payload = serde_json::json!({ "target_state": new_state });
-    let stored_payload = serde_json::from_str::<serde_json::Value>(&receipt.action_payload_json)
-        .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?;
+    let new_state = parse_manifest_state(&revision.manifest_state)
+        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    let recovery_cause = revision
+        .transition_reason_code
+        .as_deref()
+        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    let source_block_cause = replay_source_block_cause(recovery_cause)
+        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    let mut source_header = header.clone();
+    source_header.active_manifest_revision = source_manifest_revision;
+    source_header.workflow_state = WorkflowState::Blocked;
+    source_header.updated_at = source.created_at;
+    source_header.block_cause_code = (source_block_cause != WorkflowBlockCause::LegacyUnknown)
+        .then(|| source_block_cause.as_str().to_string());
+    source_header.block_source_manifest_revision = source.source_manifest_revision;
+
+    let source_snapshot = load_workflow_recovery_snapshot_at_revision_txn(
+        txn,
+        &source_header,
+        None,
+        source_manifest_revision,
+    )
+    .await?;
+    let decision = decide_workflow_recovery(&source_snapshot);
+    let WorkflowRecoveryDisposition::Recover { target_state } = decision.disposition else {
+        return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+    };
+    let expected_payload = decision
+        .action_payload()
+        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    let expected_recovery_document = {
+        let mut document = serde_json::from_str::<ManifestDocument>(&source.document_json)
+            .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?;
+        document.workflow_state = target_state;
+        serde_json::to_string(&document)
+            .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?
+    };
+    let receipt_timestamps_valid = receipt
+        .approved_at
+        .zip(receipt.expires_at)
+        .zip(receipt.consumed_at)
+        .is_some_and(|((approved_at, expires_at), consumed_at)| {
+            receipt.requested_at <= approved_at
+                && approved_at <= consumed_at
+                && consumed_at < expires_at
+        });
     if receipt.status
         != crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus::Consumed
         || receipt.parent_conversation_id != parent_conversation_id
         || receipt.subject_kind != RecoverySubjectKind::Workflow.as_str()
         || receipt.subject_id != req.workflow_id
+        || receipt.source_task_id.is_some()
+        || receipt.child_conversation_id.is_some()
+        || receipt.lineage_root_task_id.is_some()
+        || receipt.work_unit_key.is_some()
+        || receipt.source_state_fingerprint != decision.source_state_fingerprint
         || receipt.allowed_action != RecoveryAllowedAction::RecoverWorkflow.as_str()
-        || stored_payload != expected_payload
+        || receipt.action_payload_json
+            != canonical_json(&expected_payload)
+                .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?
+        || receipt.cause_code != decision.cause_code.as_str()
+        || receipt.risk_class != decision.risk_class.as_str()
+        || receipt.display_reason.is_some()
+        || !receipt_timestamps_valid
+        || receipt.consumed_at != Some(revision.created_at)
         || receipt.consumed_by_kind.as_deref()
             != Some(RecoveryConsumerKind::WorkflowManifestRevision.as_str())
         || receipt.consumed_by_id.as_deref()
             != Some(revision.manifest_revision.to_string().as_str())
         || receipt.consumer_correlation_id.as_deref() != Some(req.correlation_id.as_str())
+        || target_state != new_state
+        || recovery_cause != decision.cause_code.as_str()
+        || revision.document_json != expected_recovery_document
+        || revision.document_digest != sha256_hex(revision.document_json.as_bytes())
+        || revision.recovery_authorization_id.as_deref()
+            != Some(req.recovery_authorization_id.as_str())
+        || header.workflow_state != manifest_state_to_db(new_state)
+        || header.block_cause_code.is_some()
+        || header.block_source_manifest_revision.is_some()
+        || header.graph_revision != source_header.graph_revision
     {
         return Err(WorkflowStoreError::WorkflowRecoveryConflict);
     }
@@ -614,12 +702,19 @@ async fn load_committed_recovery_replay_txn(
         source_manifest_revision: source_manifest_revision as u64,
         manifest_revision: revision.manifest_revision as u64,
         graph_revision: header.graph_revision as u64,
-        cause_code: revision
-            .transition_reason_code
-            .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?,
+        cause_code: recovery_cause.to_string(),
         recovery_authorization_id: req.recovery_authorization_id.clone(),
         idempotent_replay: true,
     }))
+}
+
+fn replay_source_block_cause(recovery_cause: &str) -> Option<WorkflowBlockCause> {
+    match recovery_cause {
+        "legacy_block_with_current_plan_approval"
+        | "legacy_block_with_current_plan"
+        | "legacy_block_without_plan" => Some(WorkflowBlockCause::LegacyUnknown),
+        other => WorkflowBlockCause::from_transition_reason(other).ok(),
+    }
 }
 
 fn map_workflow_authorization_error(error: RecoveryAuthorizationError) -> WorkflowStoreError {
@@ -722,6 +817,192 @@ fn emit_committed_recovery_events(
     }
 }
 
+fn designated_recovery_rejection_code(error: &WorkflowStoreError) -> Option<&str> {
+    match error {
+        WorkflowStoreError::WorkflowRecoveryConflict => Some("workflow_recovery_conflict"),
+        WorkflowStoreError::RecoveryAuthorizationStale => Some("recovery_authorization_stale"),
+        WorkflowStoreError::RecoveryAuthorizationRejected { code } => Some(code),
+        _ => None,
+    }
+}
+
+async fn emit_recover_workflow_rejection_if_designated(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: &RecoverWorkflowRequest,
+    error: &WorkflowStoreError,
+) {
+    let Some(rejection_code) = designated_recovery_rejection_code(error) else {
+        return;
+    };
+    let workflow_id = req.workflow_id.clone();
+    let recovery_authorization_id = req.recovery_authorization_id.clone();
+    let expected_manifest_revision = req.expected_manifest_revision;
+    let context = db
+        .conn
+        .transaction::<_, (u64, u64, String), WorkflowStoreError>(|txn| {
+            let workflow_id = workflow_id.clone();
+            let recovery_authorization_id = recovery_authorization_id.clone();
+            Box::pin(async move {
+                let header = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.clone()))?;
+                if header.parent_conversation_id != parent_conversation_id {
+                    return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+                }
+
+                if header.workflow_state == WorkflowState::Blocked
+                    && header.active_manifest_revision as u64 == expected_manifest_revision
+                {
+                    let decision = decide_workflow_recovery(
+                        &load_workflow_recovery_snapshot_txn(txn, &header, None).await?,
+                    );
+                    if !matches!(
+                        decision.disposition,
+                        WorkflowRecoveryDisposition::Recover { .. }
+                    ) {
+                        return Err(WorkflowStoreError::WorkflowRecoveryNotAvailable);
+                    }
+                    return Ok((
+                        header.active_manifest_revision as u64,
+                        header.graph_revision as u64,
+                        decision.cause_code.as_str().to_string(),
+                    ));
+                }
+
+                let revision = delegation_workflow_manifest_revision::Entity::find()
+                    .filter(
+                        delegation_workflow_manifest_revision::Column::WorkflowId.eq(workflow_id),
+                    )
+                    .filter(
+                        delegation_workflow_manifest_revision::Column::RecoveryAuthorizationId
+                            .eq(recovery_authorization_id),
+                    )
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+                Ok((
+                    revision
+                        .source_manifest_revision
+                        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?
+                        as u64,
+                    header.graph_revision as u64,
+                    revision
+                        .transition_reason_code
+                        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?,
+                ))
+            })
+        })
+        .await;
+    let Ok((source_manifest_revision, graph_revision, cause_code)) = context else {
+        return;
+    };
+    let event = WorkflowRecoveryEvent::RecoveryRejected {
+        workflow_id: req.workflow_id.clone(),
+        recovery_authorization_id: Some(req.recovery_authorization_id.clone()),
+        source_manifest_revision,
+        graph_revision,
+        action: RecoveryAllowedAction::RecoverWorkflow.as_str().to_string(),
+        cause_code,
+        rejection_code: rejection_code.to_string(),
+    };
+    if let Err(emit_error) = emit_workflow_recovery_event(emitter, event) {
+        tracing::warn!(
+            error = emit_error,
+            workflow_id = %req.workflow_id,
+            rejection_code,
+            "workflow recovery rejection event emission failed"
+        );
+    }
+}
+
+async fn emit_plan_lineage_reset_rejection_if_designated(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    workflow_id: &str,
+    recovery_authorization_id: &str,
+    displayed_reset_reason: &str,
+    error: &WorkflowStoreError,
+) {
+    let Some(rejection_code) = designated_recovery_rejection_code(error) else {
+        return;
+    };
+    let workflow_id_owned = workflow_id.to_string();
+    let recovery_authorization_id_owned = recovery_authorization_id.to_string();
+    let displayed_reset_reason = displayed_reset_reason.to_string();
+    let context = db
+        .conn
+        .transaction::<_, (u64, u64, String), WorkflowStoreError>(|txn| {
+            let workflow_id = workflow_id_owned.clone();
+            let recovery_authorization_id = recovery_authorization_id_owned.clone();
+            let displayed_reset_reason = displayed_reset_reason.clone();
+            Box::pin(async move {
+                let header = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id))?;
+                if header.parent_conversation_id != parent_conversation_id {
+                    return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+                }
+                let receipt = recovery_authorization::Entity::find_by_id(recovery_authorization_id)
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?;
+                let cause_code = if let Some(receipt) = receipt.filter(|receipt| {
+                    receipt.parent_conversation_id == parent_conversation_id
+                        && receipt.subject_kind == RecoverySubjectKind::Workflow.as_str()
+                        && receipt.subject_id == header.workflow_id
+                }) {
+                    receipt.cause_code
+                } else {
+                    decide_workflow_recovery(
+                        &load_workflow_recovery_snapshot_txn(
+                            txn,
+                            &header,
+                            Some(&displayed_reset_reason),
+                        )
+                        .await?,
+                    )
+                    .cause_code
+                    .as_str()
+                    .to_string()
+                };
+                Ok((
+                    header.active_manifest_revision as u64,
+                    header.graph_revision as u64,
+                    cause_code,
+                ))
+            })
+        })
+        .await;
+    let Ok((source_manifest_revision, graph_revision, cause_code)) = context else {
+        return;
+    };
+    let event = WorkflowRecoveryEvent::RecoveryRejected {
+        workflow_id: workflow_id.to_string(),
+        recovery_authorization_id: Some(recovery_authorization_id.to_string()),
+        source_manifest_revision,
+        graph_revision,
+        action: RecoveryAllowedAction::ResetPlanLineage.as_str().to_string(),
+        cause_code,
+        rejection_code: rejection_code.to_string(),
+    };
+    if let Err(emit_error) = emit_workflow_recovery_event(emitter, event) {
+        tracing::warn!(
+            error = emit_error,
+            workflow_id,
+            rejection_code,
+            "workflow Plan lineage reset rejection event emission failed"
+        );
+    }
+}
+
 /// Settle a **document** gate (Design/Plan) for one cycle. Never evaluates
 /// Task/Final execution gates.
 pub async fn settle_workflow_gate_core(
@@ -759,6 +1040,9 @@ pub async fn settle_workflow_gate_core(
         SettleGateEvidence::Plan(submission) => submission.lineage_reset_reason.clone(),
         SettleGateEvidence::Design { .. } => None,
     };
+    let rejection_workflow_id = req.workflow_id.clone();
+    let rejection_authorization_id = req.recovery_authorization_id.clone();
+    let rejection_reset_reason = lineage_reset_reason.clone();
     match (
         lineage_reset_reason.as_deref(),
         req.recovery_authorization_id.as_deref(),
@@ -1324,7 +1608,24 @@ pub async fn settle_workflow_gate_core(
         Err(sea_orm::TransactionError::Connection(e)) => {
             return Err(WorkflowStoreError::Persistence(e.to_string()));
         }
-        Err(sea_orm::TransactionError::Transaction(e)) => return Err(e),
+        Err(sea_orm::TransactionError::Transaction(e)) => {
+            if let (Some(authorization_id), Some(reset_reason)) = (
+                rejection_authorization_id.as_deref(),
+                rejection_reset_reason.as_deref(),
+            ) {
+                emit_plan_lineage_reset_rejection_if_designated(
+                    db,
+                    emitter,
+                    parent_conversation_id,
+                    &rejection_workflow_id,
+                    authorization_id,
+                    reset_reason,
+                    &e,
+                )
+                .await;
+            }
+            return Err(e);
+        }
     };
 
     if !result.idempotent_replay {
@@ -1391,7 +1692,10 @@ pub async fn get_workflow_state_core(
                 };
 
                 let recovery_snapshot = if header.workflow_state == WorkflowState::Blocked {
-                    Some(load_workflow_recovery_snapshot_detailed_conn(txn, &header, None).await?)
+                    Some(
+                        load_workflow_recovery_snapshot_detailed_conn(txn, &header, None, None)
+                            .await?,
+                    )
                 } else {
                     None
                 };
@@ -1681,13 +1985,29 @@ pub async fn load_workflow_recovery_snapshot_txn(
     load_workflow_recovery_snapshot_conn(txn, header, displayed_reset_reason).await
 }
 
+async fn load_workflow_recovery_snapshot_at_revision_txn(
+    txn: &DatabaseTransaction,
+    header: &delegation_workflow::Model,
+    displayed_reset_reason: Option<&str>,
+    revision_ceiling: i64,
+) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
+    Ok(load_workflow_recovery_snapshot_detailed_conn(
+        txn,
+        header,
+        displayed_reset_reason,
+        Some(revision_ceiling),
+    )
+    .await?
+    .snapshot)
+}
+
 pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
     displayed_reset_reason: Option<&str>,
 ) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
     Ok(
-        load_workflow_recovery_snapshot_detailed_conn(conn, header, displayed_reset_reason)
+        load_workflow_recovery_snapshot_detailed_conn(conn, header, displayed_reset_reason, None)
             .await?
             .snapshot,
     )
@@ -1702,6 +2022,7 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
     conn: &C,
     header: &delegation_workflow::Model,
     displayed_reset_reason: Option<&str>,
+    revision_ceiling: Option<i64>,
 ) -> Result<LoadedWorkflowRecoverySnapshot, WorkflowStoreError> {
     let mut contradictory_durable_state = false;
     let header_state = workflow_state_to_manifest(header.workflow_state.clone());
@@ -1711,11 +2032,15 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
         ));
     }
     note_recovery_revision_query();
-    let revisions = delegation_workflow_manifest_revision::Entity::find()
-        .filter(
-            delegation_workflow_manifest_revision::Column::WorkflowId
-                .eq(header.workflow_id.clone()),
-        )
+    let mut revision_query = delegation_workflow_manifest_revision::Entity::find().filter(
+        delegation_workflow_manifest_revision::Column::WorkflowId.eq(header.workflow_id.clone()),
+    );
+    if let Some(revision_ceiling) = revision_ceiling {
+        revision_query = revision_query.filter(
+            delegation_workflow_manifest_revision::Column::ManifestRevision.lte(revision_ceiling),
+        );
+    }
+    let revisions = revision_query
         .order_by_asc(delegation_workflow_manifest_revision::Column::ManifestRevision)
         .all(conn)
         .await
@@ -12538,9 +12863,7 @@ mod tests {
     #[cfg(test)]
     mod authorized_workflow_recovery {
         use super::*;
-        use crate::acp::delegation::workflow::events::{
-            set_inject_workflow_recovery_event_failure, WorkflowRecoveryEvent,
-        };
+        use crate::acp::delegation::workflow::events::set_inject_workflow_recovery_event_failure;
         use crate::acp::delegation::workflow::recovery_policy::{
             WorkflowRecoveryDecision, WorkflowRecoveryDisposition,
         };
@@ -13247,6 +13570,56 @@ mod tests {
             assert!(rx.try_recv().is_err());
 
             let (db, parent, workflow_id, emitter, mut rx) =
+                blocked_recovery_fixture(ManifestWorkflowState::Estimated, "race-orphan").await;
+            let header = load_header(&db, &workflow_id).await;
+            let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
+            let active = delegation_workflow_manifest_revision::Entity::find_by_id((
+                workflow_id.clone(),
+                header.active_manifest_revision,
+            ))
+            .one(&db.conn)
+            .await
+            .expect("load active revision before orphan")
+            .expect("active revision before orphan");
+            delegation_workflow_manifest_revision::ActiveModel {
+                workflow_id: Set(workflow_id.clone()),
+                manifest_revision: Set(header.active_manifest_revision + 1),
+                manifest_state: Set(active.manifest_state),
+                document_json: Set(active.document_json),
+                document_digest: Set(active.document_digest),
+                revision_kind: Set(Some(ManifestRevisionKind::StateOnly.as_str().into())),
+                source_manifest_revision: Set(Some(header.active_manifest_revision)),
+                recovery_authorization_id: Set(None),
+                transition_reason_code: Set(Some("plan_gate_blocked".into())),
+                consumer_correlation_id: Set(None),
+                created_at: Set(Utc::now()),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("insert orphan revision without advancing header");
+            let before = durable_state(&db, &workflow_id).await;
+            let error = recover_workflow_core(
+                &db,
+                &emitter,
+                parent,
+                RecoverWorkflowRequest {
+                    workflow_id: workflow_id.clone(),
+                    recovery_authorization_id: authorization_id.clone(),
+                    expected_manifest_revision: header.active_manifest_revision as u64,
+                    correlation_id: "race-orphan".into(),
+                },
+            )
+            .await
+            .expect_err("future orphan revision must fail closed before consumption");
+            assert_eq!(error, WorkflowStoreError::WorkflowRecoveryNotAvailable);
+            assert_eq!(durable_state(&db, &workflow_id).await, before);
+            assert_eq!(
+                load_authorization(&db, &authorization_id).await.status,
+                RecoveryAuthorizationStatus::Approved
+            );
+            assert!(rx.try_recv().is_err());
+
+            let (db, parent, workflow_id, emitter, mut rx) =
                 blocked_recovery_fixture(ManifestWorkflowState::Approved, "race-stale-gate").await;
             let header = load_header(&db, &workflow_id).await;
             let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
@@ -13398,6 +13771,24 @@ mod tests {
                     .unwrap_err(),
                 WorkflowStoreError::WorkflowRecoveryConflict
             );
+            let replay_rejections = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(replay_rejections.len(), 2);
+            for rejection in replay_rejections {
+                assert_eq!(rejection.channel, "workflow.recovery_rejected");
+                assert_eq!(rejection.payload["workflow_id"], workflow_id);
+                assert_eq!(
+                    rejection.payload["recovery_authorization_id"],
+                    authorization_id
+                );
+                assert_eq!(
+                    rejection.payload["source_manifest_revision"],
+                    first.source_manifest_revision
+                );
+                assert_eq!(
+                    rejection.payload["rejection_code"],
+                    "workflow_recovery_conflict"
+                );
+            }
             let receipt = load_authorization(&db, &authorization_id).await;
             let original_payload = receipt.action_payload_json.clone();
             let mut tampered: recovery_authorization::ActiveModel = receipt.into();
@@ -13430,6 +13821,12 @@ mod tests {
                 .await
                 .expect("restore replay payload");
             assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
+            let payload_rejection = rx.try_recv().expect("payload conflict rejection");
+            assert_eq!(payload_rejection.channel, "workflow.recovery_rejected");
+            assert_eq!(
+                payload_rejection.payload["rejection_code"],
+                "workflow_recovery_conflict"
+            );
             assert!(rx.try_recv().is_err());
 
             let later_header = load_header(&db, &workflow_id).await;
@@ -13459,7 +13856,217 @@ mod tests {
                 durable_state(&db, &workflow_id).await,
                 after_later_publication
             );
+            let lineage_rejection = rx.try_recv().expect("evolved lineage rejection");
+            assert_eq!(lineage_rejection.channel, "workflow.recovery_rejected");
+            assert_eq!(
+                lineage_rejection.payload["rejection_code"],
+                "workflow_recovery_conflict"
+            );
             assert!(rx.try_recv().is_err());
+
+            for mutation in [
+                "orphan_revision",
+                "receipt_fingerprint",
+                "receipt_cause",
+                "receipt_risk",
+                "noncanonical_payload",
+                "receipt_action",
+                "receipt_workflow_identity",
+                "receipt_consumed_at",
+                "receipt_consumed_at_value",
+                "header_state",
+                "header_block_projection",
+                "revision_digest",
+                "structural_revision",
+                "binding_evidence",
+            ] {
+                let token = format!("exact-replay-{mutation}");
+                let (db, parent, workflow_id, emitter, mut rx) =
+                    blocked_recovery_fixture(ManifestWorkflowState::Estimated, &token).await;
+                let header = load_header(&db, &workflow_id).await;
+                let (authorization_id, _) =
+                    authorize_decision(&db, parent, &workflow_id, None).await;
+                let request = RecoverWorkflowRequest {
+                    workflow_id: workflow_id.clone(),
+                    recovery_authorization_id: authorization_id.clone(),
+                    expected_manifest_revision: header.active_manifest_revision as u64,
+                    correlation_id: format!("exact-replay-{mutation}"),
+                };
+                recover_workflow_core(&db, &emitter, parent, request.clone())
+                    .await
+                    .expect("commit recovery before replay mutation");
+                while rx.try_recv().is_ok() {}
+
+                match mutation {
+                    "receipt_fingerprint"
+                    | "receipt_cause"
+                    | "receipt_risk"
+                    | "noncanonical_payload"
+                    | "receipt_action"
+                    | "receipt_workflow_identity"
+                    | "receipt_consumed_at"
+                    | "receipt_consumed_at_value" => {
+                        let receipt = load_authorization(&db, &authorization_id).await;
+                        let mut tampered: recovery_authorization::ActiveModel = receipt.into();
+                        match mutation {
+                            "receipt_fingerprint" => {
+                                tampered.source_state_fingerprint =
+                                    Set("workflow_recovery_v1:tampered".into());
+                            }
+                            "receipt_cause" => {
+                                tampered.cause_code = Set("tampered_cause".into());
+                            }
+                            "receipt_risk" => {
+                                tampered.risk_class = Set("tampered_risk".into());
+                            }
+                            "noncanonical_payload" => {
+                                tampered.action_payload_json =
+                                    Set("{ \"target_state\": \"estimated\" }".into());
+                            }
+                            "receipt_action" => {
+                                tampered.allowed_action =
+                                    Set(RecoveryAllowedAction::ResetPlanLineage.as_str().into());
+                            }
+                            "receipt_workflow_identity" => {
+                                tampered.source_task_id = Set(Some("unexpected-task".into()));
+                            }
+                            "receipt_consumed_at" => tampered.consumed_at = Set(None),
+                            "receipt_consumed_at_value" => {
+                                tampered.consumed_at = Set(tampered.approved_at.clone().unwrap());
+                            }
+                            _ => unreachable!(),
+                        }
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper consumed recovery receipt");
+                    }
+                    "header_state" => {
+                        let header = load_header(&db, &workflow_id).await;
+                        let mut tampered: delegation_workflow::ActiveModel = header.into();
+                        tampered.workflow_state = Set(WorkflowState::Approved);
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper recovered header state");
+                    }
+                    "header_block_projection" => {
+                        let header = load_header(&db, &workflow_id).await;
+                        let mut tampered: delegation_workflow::ActiveModel = header.into();
+                        tampered.block_cause_code =
+                            Set(Some(WorkflowBlockCause::PlanGateBlocked.as_str().into()));
+                        tampered.block_source_manifest_revision = Set(Some(1));
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper recovered block projection");
+                    }
+                    "revision_digest" => {
+                        let header = load_header(&db, &workflow_id).await;
+                        let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+                            workflow_id.clone(),
+                            header.active_manifest_revision,
+                        ))
+                        .one(&db.conn)
+                        .await
+                        .expect("load recovered revision")
+                        .expect("recovered revision");
+                        let mut tampered: delegation_workflow_manifest_revision::ActiveModel =
+                            revision.into();
+                        tampered.document_digest = Set("tampered-digest".into());
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper recovered revision digest");
+                    }
+                    "orphan_revision" => {
+                        let header = load_header(&db, &workflow_id).await;
+                        let active = delegation_workflow_manifest_revision::Entity::find_by_id((
+                            workflow_id.clone(),
+                            header.active_manifest_revision,
+                        ))
+                        .one(&db.conn)
+                        .await
+                        .expect("load active recovery revision before orphan")
+                        .expect("active recovery revision before orphan");
+                        delegation_workflow_manifest_revision::ActiveModel {
+                            workflow_id: Set(workflow_id.clone()),
+                            manifest_revision: Set(header.active_manifest_revision + 1),
+                            manifest_state: Set(active.manifest_state),
+                            document_json: Set(active.document_json),
+                            document_digest: Set(active.document_digest),
+                            revision_kind: Set(Some(
+                                ManifestRevisionKind::StateOnly.as_str().into(),
+                            )),
+                            source_manifest_revision: Set(Some(header.active_manifest_revision)),
+                            recovery_authorization_id: Set(None),
+                            transition_reason_code: Set(Some("plan_gate_approved".into())),
+                            consumer_correlation_id: Set(None),
+                            created_at: Set(Utc::now()),
+                        }
+                        .insert(&db.conn)
+                        .await
+                        .expect("insert orphan revision after committed recovery");
+                    }
+                    "structural_revision" => {
+                        let header = load_header(&db, &workflow_id).await;
+                        let mut tampered: delegation_workflow::ActiveModel = header.into();
+                        tampered.structural_revision = Set(0);
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper structural revision");
+                    }
+                    "binding_evidence" => {
+                        let binding = delegation_workflow_node_binding::Entity::find()
+                            .filter(
+                                delegation_workflow_node_binding::Column::WorkflowId
+                                    .eq(workflow_id.clone()),
+                            )
+                            .one(&db.conn)
+                            .await
+                            .expect("load workflow binding")
+                            .expect("workflow binding");
+                        let mut tampered: delegation_workflow_node_binding::ActiveModel =
+                            binding.into();
+                        tampered.work_unit_key = Set("tampered-work-unit".into());
+                        tampered
+                            .update(&db.conn)
+                            .await
+                            .expect("tamper binding evidence");
+                    }
+                    _ => unreachable!(),
+                }
+
+                let before_rejected_replay = durable_state(&db, &workflow_id).await;
+                let before_receipt = load_authorization(&db, &authorization_id).await;
+                assert_eq!(
+                    recover_workflow_core(&db, &emitter, parent, request)
+                        .await
+                        .unwrap_err(),
+                    WorkflowStoreError::WorkflowRecoveryConflict,
+                    "mutation {mutation} must fail closed"
+                );
+                assert_eq!(
+                    durable_state(&db, &workflow_id).await,
+                    before_rejected_replay,
+                    "mutation {mutation} must remain read-only"
+                );
+                assert_eq!(
+                    load_authorization(&db, &authorization_id).await,
+                    before_receipt,
+                    "mutation {mutation} must not rewrite the consumed receipt"
+                );
+                let rejection = rx
+                    .try_recv()
+                    .unwrap_or_else(|_| panic!("mutation {mutation} must emit rejection"));
+                assert_eq!(rejection.channel, "workflow.recovery_rejected");
+                assert_eq!(
+                    rejection.payload["rejection_code"],
+                    "workflow_recovery_conflict"
+                );
+                assert!(rx.try_recv().is_err());
+            }
         }
 
         #[tokio::test]
@@ -13495,6 +14102,14 @@ mod tests {
             assert_eq!(
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
+            );
+            let rejection = rx.try_recv().expect("action mismatch rejection");
+            assert_eq!(rejection.channel, "workflow.recovery_rejected");
+            assert_eq!(rejection.payload["workflow_id"], workflow_id);
+            assert_eq!(rejection.payload["action"], "reset_plan_lineage");
+            assert_eq!(
+                rejection.payload["rejection_code"],
+                "recovery_authorization_action_mismatch"
             );
             assert!(rx.try_recv().is_err());
         }
@@ -13731,7 +14346,17 @@ mod tests {
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
             );
-            assert!(rx.try_recv().is_err(), "stale reset attempts emit no event");
+            let stale_rejections = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(stale_rejections.len(), 5);
+            for rejection in stale_rejections {
+                assert_eq!(rejection.channel, "workflow.recovery_rejected");
+                assert_eq!(rejection.payload["workflow_id"], workflow_id);
+                assert_eq!(rejection.payload["action"], "reset_plan_lineage");
+                assert_eq!(
+                    rejection.payload["rejection_code"],
+                    "recovery_authorization_stale"
+                );
+            }
 
             let settled = settle_reset(
                 &db,
@@ -13918,7 +14543,7 @@ mod tests {
 
         #[tokio::test]
         async fn event_failure_after_commit_keeps_durable_recovered_state() {
-            let (db, parent, workflow_id, _, _) =
+            let (db, parent, workflow_id, emitter, mut rx) =
                 blocked_recovery_fixture(ManifestWorkflowState::Estimated, "event-failure").await;
             let header = load_header(&db, &workflow_id).await;
             let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
@@ -13929,12 +14554,27 @@ mod tests {
                 correlation_id: "event-failure-correlation".into(),
             };
             set_inject_workflow_recovery_event_failure(true);
-            let committed =
-                recover_workflow_core(&db, &EventEmitter::Noop, parent, request.clone())
-                    .await
-                    .expect("event delivery failure still returns committed result");
+            let committed = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("event delivery failure still returns committed result");
             set_inject_workflow_recovery_event_failure(false);
             assert!(!committed.idempotent_replay);
+            let graph_event = rx
+                .try_recv()
+                .expect("durable graph notification remains independently deliverable");
+            assert_eq!(
+                graph_event.channel,
+                super::super::super::events::WORKFLOW_GRAPH_CHANGED_EVENT
+            );
+            assert_eq!(
+                *graph_event.payload,
+                json!({
+                    "parent_conversation_id": parent,
+                    "workflow_id": workflow_id,
+                    "graph_revision": committed.graph_revision,
+                })
+            );
+            assert!(rx.try_recv().is_err());
             let durable = durable_state(&db, &workflow_id).await;
             assert_eq!(durable.header.workflow_state, WorkflowState::Estimated);
             assert_eq!(
@@ -13951,7 +14591,7 @@ mod tests {
                 .expect("later status converges from durable state");
             assert_eq!(status.workflow_state, ManifestWorkflowState::Estimated);
             assert!(status.recovery.is_none());
-            let replay = recover_workflow_core(&db, &EventEmitter::Noop, parent, request)
+            let replay = recover_workflow_core(&db, &emitter, parent, request)
                 .await
                 .expect("retry after event failure is exact replay");
             assert!(replay.idempotent_replay);
@@ -13960,205 +14600,136 @@ mod tests {
                 load_revisions(&db, &workflow_id).await.len(),
                 durable.revisions.len()
             );
+            assert!(
+                rx.try_recv().is_err(),
+                "exact replay must not duplicate recovery or graph events"
+            );
         }
 
-        #[test]
-        fn workflow_recovery_events_exclude_plan_contents_prompts_and_display_reason() {
-            let events = vec![
-                WorkflowRecoveryEvent::RecoveryDecision {
-                    workflow_id: "workflow-id".into(),
-                    source_manifest_revision: 4,
-                    graph_revision: 9,
-                    action: "recover_workflow".into(),
-                    target_state: Some(ManifestWorkflowState::Estimated),
-                    cause_code: "plan_gate_blocked".into(),
-                },
-                WorkflowRecoveryEvent::RecoveryConfirmationRequested {
-                    workflow_id: "workflow-id".into(),
-                    recovery_authorization_id: "authorization-id".into(),
-                    source_manifest_revision: 4,
-                    graph_revision: 9,
-                    action: "recover_workflow".into(),
-                    target_state: Some(ManifestWorkflowState::Estimated),
-                    cause_code: "plan_gate_blocked".into(),
-                },
-                WorkflowRecoveryEvent::RecoveryAuthorizationConsumed {
-                    workflow_id: "workflow-id".into(),
-                    recovery_authorization_id: "authorization-id".into(),
-                    manifest_revision: 5,
-                    graph_revision: 9,
-                    action: "recover_workflow".into(),
-                },
-                WorkflowRecoveryEvent::RecoveryRejected {
-                    workflow_id: "workflow-id".into(),
-                    recovery_authorization_id: Some("authorization-id".into()),
-                    source_manifest_revision: 4,
-                    graph_revision: 9,
-                    action: "recover_workflow".into(),
-                    cause_code: "plan_gate_blocked".into(),
-                    rejection_code: "workflow_recovery_conflict".into(),
-                },
-                WorkflowRecoveryEvent::StateOnlyRevisionCreated {
-                    workflow_id: "workflow-id".into(),
-                    source_manifest_revision: 4,
-                    manifest_revision: 5,
-                    graph_revision: 9,
-                    target_state: ManifestWorkflowState::Estimated,
-                    cause_code: "plan_gate_blocked".into(),
-                },
-                WorkflowRecoveryEvent::PlanLineageReset {
-                    workflow_id: "workflow-id".into(),
-                    recovery_authorization_id: "authorization-id".into(),
-                    source_manifest_revision: 4,
-                    manifest_revision: 5,
-                    graph_revision: 10,
-                    action: "reset_plan_lineage".into(),
-                    target_state: ManifestWorkflowState::Blocked,
-                    cause_code: "plan_user_decision_required".into(),
-                },
-                WorkflowRecoveryEvent::BindingReactivated {
-                    workflow_id: "workflow-id".into(),
-                    manifest_revision: 5,
-                    graph_revision: 9,
-                    target_state: ManifestWorkflowState::Estimated,
-                },
-            ];
-            let expected_keys = [
+        #[tokio::test]
+        async fn workflow_recovery_events_exclude_plan_contents_prompts_and_display_reason() {
+            let (db, parent, workflow_id, emitter, mut rx) = blocked_recovery_fixture(
+                ManifestWorkflowState::Estimated,
+                "production-event-privacy",
+            )
+            .await;
+            let source_header = load_header(&db, &workflow_id).await;
+            let (authorization_id, decision) =
+                authorize_decision(&db, parent, &workflow_id, None).await;
+            let request = RecoverWorkflowRequest {
+                workflow_id: workflow_id.clone(),
+                recovery_authorization_id: authorization_id.clone(),
+                expected_manifest_revision: source_header.active_manifest_revision as u64,
+                correlation_id: "production-event-privacy".into(),
+            };
+            let recovered = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("capture committed recovery events");
+            let mut events = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|event| event.channel.starts_with("workflow."))
+                .collect::<Vec<_>>();
+
+            let mut conflicting_replay = request;
+            conflicting_replay.correlation_id = "production-event-replay-conflict".into();
+            assert_eq!(
+                recover_workflow_core(&db, &emitter, parent, conflicting_replay)
+                    .await
+                    .unwrap_err(),
+                WorkflowStoreError::WorkflowRecoveryConflict
+            );
+            events.extend(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| event.channel.starts_with("workflow.")),
+            );
+
+            let reset_reason = "private reset reason must never be emitted";
+            let reset_token = "production-reset-event-privacy";
+            let (reset_db, reset_parent, reset_workflow_id, reset_emitter, mut reset_rx) =
+                plan_lineage_reset_fixture(reset_token).await;
+            insert_reset_reviewer_evidence(
+                &reset_db,
+                reset_parent,
+                &reset_workflow_id,
+                reset_token,
+            )
+            .await;
+            let (reset_authorization_id, reset_decision) = authorize_decision(
+                &reset_db,
+                reset_parent,
+                &reset_workflow_id,
+                Some(reset_reason),
+            )
+            .await;
+            let reset_before_rejection = durable_state(&reset_db, &reset_workflow_id).await;
+            assert_eq!(
+                settle_reset(
+                    &reset_db,
+                    &reset_emitter,
+                    reset_parent,
+                    &reset_workflow_id,
+                    reset_token,
+                    "changed private reset reason",
+                    Some(reset_authorization_id.clone()),
+                    GateSettlementOutcome::Approved,
+                    vec![],
+                )
+                .await
+                .unwrap_err(),
+                WorkflowStoreError::RecoveryAuthorizationStale
+            );
+            assert_eq!(
+                durable_state(&reset_db, &reset_workflow_id).await,
+                reset_before_rejection
+            );
+            events.push(
+                reset_rx
+                    .try_recv()
+                    .expect("capture production lineage-reset rejection event"),
+            );
+            let reset_result = settle_reset(
+                &reset_db,
+                &reset_emitter,
+                reset_parent,
+                &reset_workflow_id,
+                reset_token,
+                reset_reason,
+                Some(reset_authorization_id.clone()),
+                GateSettlementOutcome::Approved,
+                vec![],
+            )
+            .await
+            .expect("capture committed lineage-reset events");
+            events.extend(
+                std::iter::from_fn(|| reset_rx.try_recv().ok())
+                    .filter(|event| event.channel.starts_with("workflow.")),
+            );
+
+            let channels = events
+                .iter()
+                .map(|event| event.channel.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                channels,
                 vec![
-                    "action",
-                    "cause_code",
-                    "event",
-                    "graph_revision",
-                    "source_manifest_revision",
-                    "target_state",
-                    "workflow_id",
-                ],
-                vec![
-                    "action",
-                    "cause_code",
-                    "event",
-                    "graph_revision",
-                    "recovery_authorization_id",
-                    "source_manifest_revision",
-                    "target_state",
-                    "workflow_id",
-                ],
-                vec![
-                    "action",
-                    "event",
-                    "graph_revision",
-                    "manifest_revision",
-                    "recovery_authorization_id",
-                    "workflow_id",
-                ],
-                vec![
-                    "action",
-                    "cause_code",
-                    "event",
-                    "graph_revision",
-                    "recovery_authorization_id",
-                    "rejection_code",
-                    "source_manifest_revision",
-                    "workflow_id",
-                ],
-                vec![
-                    "cause_code",
-                    "event",
-                    "graph_revision",
-                    "manifest_revision",
-                    "source_manifest_revision",
-                    "target_state",
-                    "workflow_id",
-                ],
-                vec![
-                    "action",
-                    "cause_code",
-                    "event",
-                    "graph_revision",
-                    "manifest_revision",
-                    "recovery_authorization_id",
-                    "source_manifest_revision",
-                    "target_state",
-                    "workflow_id",
-                ],
-                vec![
-                    "event",
-                    "graph_revision",
-                    "manifest_revision",
-                    "target_state",
-                    "workflow_id",
-                ],
-            ];
-            let expected_values = [
-                json!({
-                    "event": "workflow.recovery_decision",
-                    "workflow_id": "workflow-id",
-                    "source_manifest_revision": 4,
-                    "graph_revision": 9,
-                    "action": "recover_workflow",
-                    "target_state": "estimated",
-                    "cause_code": "plan_gate_blocked",
-                }),
-                json!({
-                    "event": "workflow.recovery_confirmation_requested",
-                    "workflow_id": "workflow-id",
-                    "recovery_authorization_id": "authorization-id",
-                    "source_manifest_revision": 4,
-                    "graph_revision": 9,
-                    "action": "recover_workflow",
-                    "target_state": "estimated",
-                    "cause_code": "plan_gate_blocked",
-                }),
-                json!({
-                    "event": "workflow.recovery_authorization_consumed",
-                    "workflow_id": "workflow-id",
-                    "recovery_authorization_id": "authorization-id",
-                    "manifest_revision": 5,
-                    "graph_revision": 9,
-                    "action": "recover_workflow",
-                }),
-                json!({
-                    "event": "workflow.recovery_rejected",
-                    "workflow_id": "workflow-id",
-                    "recovery_authorization_id": "authorization-id",
-                    "source_manifest_revision": 4,
-                    "graph_revision": 9,
-                    "action": "recover_workflow",
-                    "cause_code": "plan_gate_blocked",
-                    "rejection_code": "workflow_recovery_conflict",
-                }),
-                json!({
-                    "event": "workflow.state_only_revision_created",
-                    "workflow_id": "workflow-id",
-                    "source_manifest_revision": 4,
-                    "manifest_revision": 5,
-                    "graph_revision": 9,
-                    "target_state": "estimated",
-                    "cause_code": "plan_gate_blocked",
-                }),
-                json!({
-                    "event": "workflow.plan_lineage_reset",
-                    "workflow_id": "workflow-id",
-                    "recovery_authorization_id": "authorization-id",
-                    "source_manifest_revision": 4,
-                    "manifest_revision": 5,
-                    "graph_revision": 10,
-                    "action": "reset_plan_lineage",
-                    "target_state": "blocked",
-                    "cause_code": "plan_user_decision_required",
-                }),
-                json!({
-                    "event": "workflow.binding_reactivated",
-                    "workflow_id": "workflow-id",
-                    "manifest_revision": 5,
-                    "graph_revision": 9,
-                    "target_state": "estimated",
-                }),
-            ];
-            for ((event, expected_keys), expected_value) in
-                events.iter().zip(expected_keys).zip(expected_values)
-            {
-                let value = serde_json::to_value(event).expect("serialize workflow event");
+                    "workflow.recovery_decision",
+                    "workflow.recovery_confirmation_requested",
+                    "workflow.recovery_authorization_consumed",
+                    "workflow.state_only_revision_created",
+                    "workflow.binding_reactivated",
+                    "workflow.recovery_rejected",
+                    "workflow.recovery_rejected",
+                    "workflow.recovery_decision",
+                    "workflow.recovery_confirmation_requested",
+                    "workflow.recovery_authorization_consumed",
+                    "workflow.state_only_revision_created",
+                    "workflow.plan_lineage_reset",
+                    "workflow.binding_reactivated",
+                ]
+            );
+
+            for event in events {
+                let value = event.payload;
+                assert_eq!(value["event"], event.channel);
                 let mut keys = value
                     .as_object()
                     .expect("event object")
@@ -14166,8 +14737,74 @@ mod tests {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 keys.sort_unstable();
+                let expected_keys = match event.channel.as_str() {
+                    "workflow.recovery_decision" => vec![
+                        "action",
+                        "cause_code",
+                        "event",
+                        "graph_revision",
+                        "source_manifest_revision",
+                        "target_state",
+                        "workflow_id",
+                    ],
+                    "workflow.recovery_confirmation_requested" => vec![
+                        "action",
+                        "cause_code",
+                        "event",
+                        "graph_revision",
+                        "recovery_authorization_id",
+                        "source_manifest_revision",
+                        "target_state",
+                        "workflow_id",
+                    ],
+                    "workflow.recovery_authorization_consumed" => vec![
+                        "action",
+                        "event",
+                        "graph_revision",
+                        "manifest_revision",
+                        "recovery_authorization_id",
+                        "workflow_id",
+                    ],
+                    "workflow.recovery_rejected" => vec![
+                        "action",
+                        "cause_code",
+                        "event",
+                        "graph_revision",
+                        "recovery_authorization_id",
+                        "rejection_code",
+                        "source_manifest_revision",
+                        "workflow_id",
+                    ],
+                    "workflow.state_only_revision_created" => vec![
+                        "cause_code",
+                        "event",
+                        "graph_revision",
+                        "manifest_revision",
+                        "source_manifest_revision",
+                        "target_state",
+                        "workflow_id",
+                    ],
+                    "workflow.plan_lineage_reset" => vec![
+                        "action",
+                        "cause_code",
+                        "event",
+                        "graph_revision",
+                        "manifest_revision",
+                        "recovery_authorization_id",
+                        "source_manifest_revision",
+                        "target_state",
+                        "workflow_id",
+                    ],
+                    "workflow.binding_reactivated" => vec![
+                        "event",
+                        "graph_revision",
+                        "manifest_revision",
+                        "target_state",
+                        "workflow_id",
+                    ],
+                    other => panic!("unexpected production recovery event {other}"),
+                };
                 assert_eq!(keys, expected_keys);
-                assert_eq!(value, expected_value);
                 let encoded = value.to_string();
                 for forbidden in [
                     "plan_contents",
@@ -14180,6 +14817,56 @@ mod tests {
                         !encoded.contains(forbidden),
                         "workflow event leaked {forbidden}"
                     );
+                }
+
+                if event.channel == "workflow.recovery_rejected"
+                    && value["workflow_id"] == workflow_id
+                {
+                    assert_eq!(value["workflow_id"], workflow_id);
+                    assert_eq!(value["recovery_authorization_id"], authorization_id);
+                    assert_eq!(
+                        value["source_manifest_revision"],
+                        recovered.source_manifest_revision
+                    );
+                    assert_eq!(value["graph_revision"], recovered.graph_revision);
+                    assert_eq!(value["action"], "recover_workflow");
+                    assert_eq!(value["cause_code"], decision.cause_code.as_str());
+                    assert_eq!(value["rejection_code"], "workflow_recovery_conflict");
+                } else if value["workflow_id"] == reset_workflow_id {
+                    let expected_graph_revision = if event.channel == "workflow.recovery_rejected" {
+                        reset_before_rejection.header.graph_revision as u64
+                    } else {
+                        reset_result.graph_revision
+                    };
+                    assert_eq!(value["graph_revision"], expected_graph_revision);
+                    if value.get("action").is_some() {
+                        assert_eq!(value["action"], "reset_plan_lineage");
+                    }
+                    if value.get("cause_code").is_some() {
+                        assert_eq!(value["cause_code"], reset_decision.cause_code.as_str());
+                    }
+                    if value.get("recovery_authorization_id").is_some() {
+                        assert_eq!(value["recovery_authorization_id"], reset_authorization_id);
+                    }
+                    if event.channel == "workflow.recovery_rejected" {
+                        assert_eq!(
+                            value["source_manifest_revision"],
+                            reset_before_rejection.header.active_manifest_revision
+                        );
+                        assert_eq!(value["rejection_code"], "recovery_authorization_stale");
+                    }
+                } else {
+                    assert_eq!(value["workflow_id"], workflow_id);
+                    assert_eq!(value["graph_revision"], recovered.graph_revision);
+                    if value.get("action").is_some() {
+                        assert_eq!(value["action"], "recover_workflow");
+                    }
+                    if value.get("cause_code").is_some() {
+                        assert_eq!(value["cause_code"], decision.cause_code.as_str());
+                    }
+                    if value.get("recovery_authorization_id").is_some() {
+                        assert_eq!(value["recovery_authorization_id"], authorization_id);
+                    }
                 }
             }
         }
