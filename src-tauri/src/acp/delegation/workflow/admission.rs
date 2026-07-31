@@ -817,8 +817,7 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
         }
     }
     if !reviewer_is_request_changes_or_block(&rev) {
-        let detail = if matches!(rev.status, TerminalRunStatus::Completed)
-            && !rev.summary_validated
+        let detail = if matches!(rev.status, TerminalRunStatus::Completed) && !rev.summary_validated
         {
             "Final fixer blocked: Final reviewer completed without a validated request_changes/block card summary (chat or report harvest)"
         } else {
@@ -843,7 +842,12 @@ async fn reharvest_final_reviewer_card_if_missing<C: ConnectionTrait>(
     let Some(run) = run else {
         return Ok(None);
     };
-    if run.card_summary_json.as_deref().and_then(parse_and_validate_summary_json).is_some() {
+    if run
+        .card_summary_json
+        .as_deref()
+        .and_then(parse_and_validate_summary_json)
+        .is_some()
+    {
         // Binding said unvalidated but JSON exists — re-apply settle validation.
         return finalize_reharvested_reviewer_summary(conn, header, &run, None).await;
     }
@@ -872,11 +876,7 @@ async fn reharvest_final_reviewer_card_if_missing<C: ConnectionTrait>(
                 p.to_path_buf()
             }
         });
-    let summary = extract_card_summary_with_report_fallback(
-        "",
-        &paths,
-        workspace.as_deref(),
-    );
+    let summary = extract_card_summary_with_report_fallback("", &paths, workspace.as_deref());
     let Some(summary) = summary else {
         return Ok(None);
     };

@@ -49,6 +49,7 @@ fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::Pi => "pi",
         AgentType::Grok => "grok",
         AgentType::Cursor => "cursor",
+        AgentType::Custom(_) => "custom",
     }
 }
 
@@ -282,5 +283,13 @@ mod tests {
         assert_eq!(label.agent_type, "unknown");
         assert_eq!(label.tool_category, "mcp");
         assert_eq!(label.key(), "unknown:mcp");
+    }
+
+    #[test]
+    fn custom_agent_label_does_not_expose_registry_id() {
+        let label =
+            WatchdogMetricLabel::new(Some(AgentType::Custom("private-id")), ToolCategory::Mcp);
+        assert_eq!(label.agent_type, "custom");
+        assert_eq!(label.key(), "custom:mcp");
     }
 }

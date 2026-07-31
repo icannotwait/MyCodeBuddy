@@ -223,9 +223,9 @@ fn agent_type_to_db(agent_type: AgentType) -> Result<String, DbError> {
 }
 
 fn agent_type_from_db(stored: &str) -> Result<AgentType, DbError> {
-    serde_json::from_value(Value::String(stored.to_owned())).map_err(|e| {
+    AgentType::from_wire(stored).ok_or_else(|| {
         DbError::Validation(format!(
-            "invalid agent_type in internal_agent_sessions: {stored}: {e}"
+            "invalid agent_type in internal_agent_sessions: {stored}"
         ))
     })
 }

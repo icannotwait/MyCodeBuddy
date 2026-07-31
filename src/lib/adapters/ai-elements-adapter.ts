@@ -5,6 +5,7 @@ import type {
   TurnUsage,
   TurnOutcome,
   AgentExecutionStats,
+  AgentTranscriptEntry,
   ToolCallStatus,
   PlanEntryInfo,
   ImageData,
@@ -26,6 +27,7 @@ import {
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
+  unwrapReferenceDestination,
 } from "@/lib/reference-link"
 
 /**
@@ -65,6 +67,12 @@ export type AdaptedToolCallPart = {
    * live DelegationContext entry is missing (page refresh, late mount).
    */
   meta?: Record<string, unknown> | null
+  /**
+   * Live subagent transcript (claude-agent-acp ≥0.63), forwarded from
+   * `ContentBlock.tool_result.agent_transcript`. Present only on a RUNNING
+   * Agent card during streaming — promotion and history never carry it.
+   */
+  agentTranscript?: AgentTranscriptEntry[] | null
 }
 
 /**
@@ -866,14 +874,11 @@ function handleMarkdownLink(
   resources: UserResourceDisplay[]
 ): string {
   const normalizedLabel = label.trim()
-  // Unwrap a CommonMark angle-bracket destination (`<uri>`) to the bare uri so
-  // scheme tests and the stored value are clean. `match` (returned for
-  // inline-kept refs) keeps the original bracketed form untouched.
-  const rawUri = uri.trim()
-  const normalizedUri =
-    rawUri.startsWith("<") && rawUri.endsWith(">")
-      ? rawUri.slice(1, -1).trim()
-      : rawUri
+  // Unwrap a CommonMark angle-bracket destination (`<uri>`) — and decode the
+  // `\`/`<`/`>` escapes it carries — so scheme tests and the stored chip uri see
+  // the real path, not `file:///C:\\dir`. `match` (returned for inline-kept
+  // refs) keeps the original bracketed form untouched.
+  const normalizedUri = unwrapReferenceDestination(uri)
   // A `codeg://` reference (session / commit / agent) renders as an inline badge
   // in the transcript (markdown-link → ReferenceBadge); never lift it to the
   // bottom resource-chip row. The guard mirrors markdown-link's interception
@@ -1849,6 +1854,7 @@ export function adaptMessageTurn(
             : undefined,
           agentStats: matchedResult.agent_stats ?? undefined,
           meta: block.meta ?? null,
+          agentTranscript: matchedResult.agent_transcript ?? undefined,
         })
       } else {
         // Position-based matching: if this tool_use has no ID, check next block
@@ -1883,6 +1889,7 @@ export function adaptMessageTurn(
               : undefined,
             agentStats: positionalResult.agent_stats ?? undefined,
             meta: block.meta ?? null,
+            agentTranscript: positionalResult.agent_transcript ?? undefined,
           })
         } else {
           // For live streaming, unmatched tools are still running.

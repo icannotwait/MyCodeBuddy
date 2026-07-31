@@ -1,3 +1,4 @@
+pub mod acp_native;
 pub mod claude;
 pub mod cline;
 pub mod codebuddy;

@@ -86,6 +86,8 @@ pub struct AcpAgent {
     server: sacp::schema::McpServer,
     debug_callback: Option<Arc<dyn Fn(&str, LineDirection) + Send + Sync + 'static>>,
     current_dir: Option<PathBuf>,
+    spawn_callback: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
+    exit_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for AcpAgent {
@@ -97,6 +99,11 @@ impl std::fmt::Debug for AcpAgent {
                 &self.debug_callback.as_ref().map(|_| "..."),
             )
             .field("current_dir", &self.current_dir)
+            .field(
+                "spawn_callback",
+                &self.spawn_callback.as_ref().map(|_| "..."),
+            )
+            .field("exit_callback", &self.exit_callback.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -108,6 +115,8 @@ impl AcpAgent {
             server,
             debug_callback: None,
             current_dir: None,
+            spawn_callback: None,
+            exit_callback: None,
         }
     }
 
@@ -173,6 +182,79 @@ impl AcpAgent {
     /// right place.
     pub fn with_current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(dir.into());
+        self
+    }
+
+    /// Register a callback invoked once with the OS process id (pid) of the
+    /// spawned agent process, right after it launches.
+    ///
+    /// The child is otherwise owned entirely by [`connect_to`]'s internal
+    /// `ChildGuard`, which kills the whole process tree on drop. But that drop
+    /// only runs when the driving future completes — during a host-process
+    /// shutdown the driver may be torn down before it can, leaking the agent
+    /// (and its own child processes) as orphans. Exposing the pid lets the host
+    /// record it and force a synchronous `kill_tree` on exit as a backstop.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use sacp_tokio::AcpAgent;
+    /// # use std::str::FromStr;
+    /// # use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+    /// let pid_cell = Arc::new(AtomicU32::new(0));
+    /// let cell = pid_cell.clone();
+    /// let agent = AcpAgent::from_str("python my_agent.py")
+    ///     .unwrap()
+    ///     .on_spawn(move |pid| cell.store(pid, Ordering::SeqCst));
+    /// ```
+    pub fn on_spawn<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32) + Send + Sync + 'static,
+    {
+        self.spawn_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Register a callback invoked once when the agent process has been
+    /// *reaped* — the counterpart to [`on_spawn`](Self::on_spawn), telling a
+    /// host that the pid it recorded no longer names this process.
+    ///
+    /// It deliberately does NOT fire merely because the connection ended. When
+    /// the protocol future finishes first, the internal `ChildGuard` kills the
+    /// tree on drop, but `kill_tree` only signals (SIGTERM on Unix) and does
+    /// not wait — the process can still be alive, so a host that cleared its
+    /// pid record there would disarm its own shutdown backstop.
+    ///
+    /// The callback fires only where the pid genuinely stops being ours: after
+    /// a successful `wait`, on drop of an already-reaped child, or from the
+    /// detached reaper that `drop` hands a still-running child to. That last
+    /// one is why the guard keeps owning the child instead of letting it fall
+    /// into Tokio's orphan queue — a pid reaped out of sight would go stale
+    /// while the host still believed it named this agent.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use sacp_tokio::AcpAgent;
+    /// # use std::str::FromStr;
+    /// # use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+    /// let pid_cell = Arc::new(AtomicU32::new(0));
+    /// let agent = AcpAgent::from_str("python my_agent.py")
+    ///     .unwrap()
+    ///     .on_spawn({
+    ///         let cell = pid_cell.clone();
+    ///         move |pid| cell.store(pid, Ordering::SeqCst)
+    ///     })
+    ///     .on_exit({
+    ///         let cell = pid_cell.clone();
+    ///         move || cell.store(0, Ordering::SeqCst)
+    ///     });
+    /// ```
+    pub fn on_exit<F>(mut self, callback: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.exit_callback = Some(Arc::new(callback));
         self
     }
 
@@ -250,20 +332,81 @@ impl AcpAgent {
 }
 
 /// A wrapper around Child that kills the process when dropped.
-struct ChildGuard(Child);
+struct ChildGuard {
+    /// `None` once the child has been handed to the detached reaper in `drop`.
+    child: Option<Child>,
+    /// Fired exactly once, at the moment the child is *reaped* — see
+    /// [`AcpAgent::on_exit`] for why that moment, and only that moment, is the
+    /// one worth reporting.
+    exit_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+}
 
 impl ChildGuard {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.wait().await
+        let Some(child) = self.child.as_mut() else {
+            return Err(std::io::Error::other("child already handed to the reaper"));
+        };
+        let status = child.wait().await;
+        if status.is_ok() {
+            // `wait` succeeded, so the child has been reaped and its pid is
+            // free for the OS to reassign.
+            self.notify_exit();
+        }
+        status
+    }
+
+    fn notify_exit(&mut self) {
+        if let Some(callback) = self.exit_callback.take() {
+            callback();
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.0.id() {
-            let _ = kill_tree::blocking::kill_tree(pid);
-        } else {
-            let _ = self.0.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let Some(pid) = child.id() else {
+            // Already reaped, so the pid is free — report the exit.
+            let _ = child.start_kill();
+            self.notify_exit();
+            return;
+        };
+
+        let _ = kill_tree::blocking::kill_tree(pid);
+
+        // `kill_tree` only signals (SIGTERM on Unix) and does not wait, so the
+        // process may well outlive this call. Keep OWNING the child until it is
+        // really reaped, and report the exit from there.
+        //
+        // Simply dropping it here would hand it to Tokio's orphan queue, which
+        // reaps it out of sight: the pid would silently become reusable while a
+        // host still held it as "this agent", and a later kill could land on an
+        // unrelated process tree. Holding the child keeps the pid pinned — a
+        // zombie on Unix, an open process handle on Windows — until we ourselves
+        // observe the exit and say so.
+        let exit_callback = self.exit_callback.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    // Same gate as `ChildGuard::wait`: only a successful `wait`
+                    // proves the child was reaped. Reporting an exit we failed
+                    // to observe would tell the host to stop tracking a pid
+                    // whose process may still be running.
+                    if child.wait().await.is_ok() {
+                        if let Some(callback) = exit_callback {
+                            callback();
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                // Dropped outside a runtime, so there is nothing to reap on.
+                // Fall back to the previous behaviour and deliberately stay
+                // silent about an exit we cannot observe.
+                drop(child);
+            }
         }
     }
 }
@@ -290,8 +433,12 @@ fn append_limited_utf8(output: &mut String, chunk: &str, limit: usize) -> bool {
 async fn monitor_child(
     child: Child,
     stderr_rx: tokio::sync::oneshot::Receiver<String>,
+    exit_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 ) -> Result<(), sacp::Error> {
-    let mut guard = ChildGuard(child);
+    let mut guard = ChildGuard {
+        child: Some(child),
+        exit_callback,
+    };
 
     // Wait for the child to exit
     let status = guard
@@ -327,12 +474,22 @@ impl<Counterpart: AcpAgentCounterpartRole> sacp::ConnectTo<Counterpart> for AcpA
         self,
         client: impl sacp::ConnectTo<Counterpart::Counterpart>,
     ) -> Result<(), sacp::Error> {
+        use futures::io::BufReader;
         use futures::AsyncBufReadExt;
         use futures::AsyncWriteExt;
         use futures::StreamExt;
-        use futures::io::BufReader;
 
         let (child_stdin, child_stdout, child_stderr, child) = self.spawn_process()?;
+
+        // Publish the OS pid to the spawn callback so the host can kill the
+        // process tree deterministically at shutdown rather than relying solely
+        // on `ChildGuard::drop` (which never runs if the driving thread is torn
+        // down by process exit before the connect future unwinds).
+        if let Some(callback) = self.spawn_callback.as_ref() {
+            if let Some(pid) = child.id() {
+                callback(pid);
+            }
+        }
 
         // Create a channel to collect stderr for error reporting
         let (stderr_tx, stderr_rx) = tokio::sync::oneshot::channel::<String>();
@@ -352,11 +509,8 @@ impl<Counterpart: AcpAgentCounterpartRole> sacp::ConnectTo<Counterpart> for AcpA
                     }
                     // Always collect for error reporting
                     if !collected.is_empty() {
-                        truncated |= append_limited_utf8(
-                            &mut collected,
-                            "\n",
-                            MAX_STDERR_CAPTURE_BYTES,
-                        );
+                        truncated |=
+                            append_limited_utf8(&mut collected, "\n", MAX_STDERR_CAPTURE_BYTES);
                     }
                     truncated |=
                         append_limited_utf8(&mut collected, &line, MAX_STDERR_CAPTURE_BYTES);
@@ -373,7 +527,7 @@ impl<Counterpart: AcpAgentCounterpartRole> sacp::ConnectTo<Counterpart> for AcpA
         });
 
         // Create a future that monitors the child process for early exit
-        let child_monitor = monitor_child(child, stderr_rx);
+        let child_monitor = monitor_child(child, stderr_rx, self.exit_callback.clone());
 
         // Convert stdio to line streams with optional debug inspection
         let incoming_lines = if let Some(callback) = self.debug_callback.clone() {
@@ -496,6 +650,8 @@ impl AcpAgent {
             ),
             debug_callback: None,
             current_dir: None,
+            spawn_callback: None,
+            exit_callback: None,
         })
     }
 }
@@ -540,6 +696,8 @@ impl FromStr for AcpAgent {
                 server,
                 debug_callback: None,
                 current_dir: None,
+                spawn_callback: None,
+                exit_callback: None,
             });
         }
 
@@ -662,6 +820,196 @@ mod tests {
         assert!(format!("{agent:?}").contains("/some/dir"));
     }
 
+    /// The exit callback is a promise about ONE thing: the pid has stopped
+    /// naming this child and the OS may reassign it. These tests pin the three
+    /// moments that promise is (and isn't) true. A host records the pid at spawn
+    /// and kills that tree at shutdown, so firing early aims its kill at a
+    /// stranger, and firing late leaves an orphan alive.
+    ///
+    /// Unix-only: they need a process that can refuse a kill signal, which has
+    /// no Windows analogue (`TerminateProcess` is unconditional). The ownership
+    /// property they cover is platform-neutral though — holding the `Child`
+    /// keeps a Windows process handle open, which is exactly what stops the OS
+    /// from reusing the pid there.
+    #[cfg(unix)]
+    fn counting_callback(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let calls = Arc::clone(calls);
+        Arc::new(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
+    /// A reaped child means its pid is free for the OS to reassign, so the exit
+    /// callback has to fire — a host still holding that pid would aim its
+    /// shutdown kill at whatever inherits the number next.
+    #[cfg(unix)]
+    #[test]
+    fn exit_callback_fires_once_the_child_is_reaped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn sh");
+            let mut guard = ChildGuard {
+                child: Some(child),
+                exit_callback: Some(counting_callback(&calls)),
+            };
+            guard.wait().await.expect("wait");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "a reaped child must report its exit"
+            );
+            drop(guard);
+        });
+        // Exactly once, even though `drop` also runs its own notify path.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Dropping the guard kills the tree but does not wait, so the exit is not
+    /// observed yet — and must not be reported yet. It has to be reported once
+    /// the child actually dies, which only works because `drop` keeps owning the
+    /// child instead of letting Tokio's orphan queue reap it out of sight.
+    ///
+    /// A current-thread runtime makes the ordering exact: the detached reaper
+    /// cannot run during the synchronous assertion right after `drop`.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_guard_reports_the_exit_only_once_the_child_is_reaped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .expect("spawn sh");
+            let guard = ChildGuard {
+                child: Some(child),
+                exit_callback: Some(counting_callback(&calls)),
+            };
+
+            drop(guard);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the kill was only signalled — the exit has not been observed yet"
+            );
+
+            let mut reported = false;
+            for _ in 0..200 {
+                if calls.load(Ordering::SeqCst) > 0 {
+                    reported = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                reported,
+                "the killed child was never reaped — its pid would stay published forever"
+            );
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The case that makes the whole design necessary: a child that ignores the
+    /// kill signal is STILL RUNNING after `drop`. Its pid must stay published so
+    /// a host's shutdown backstop still sweeps it — reporting an exit here would
+    /// disarm that backstop and leave a real orphan behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_survives_the_kill_keeps_its_pid_published() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        // The shell announces itself only AFTER installing the trap. Killing it
+        // before that point would hit the default disposition and the test would
+        // "fail" for a reason it isn't testing.
+        let ready = std::env::temp_dir().join(format!(
+            "sacp-tokio-trap-ready-{}-{:p}",
+            std::process::id(),
+            &calls
+        ));
+        let _ = std::fs::remove_file(&ready);
+
+        rt.block_on(async {
+            // Ignores SIGTERM and respawns the `sleep` that `kill_tree` reaches,
+            // so the whole tree outlives the guard's kill.
+            let child = tokio::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "trap '' TERM; echo ready > '{}'; while true; do sleep 1; done",
+                        ready.display()
+                    ),
+                ])
+                .spawn()
+                .expect("spawn sh");
+            let pid = child.id().expect("child has a pid").to_string();
+            let guard = ChildGuard {
+                child: Some(child),
+                exit_callback: Some(counting_callback(&calls)),
+            };
+
+            let mut trapped = false;
+            for _ in 0..200 {
+                if ready.exists() {
+                    trapped = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(trapped, "the shell never installed its SIGTERM trap");
+
+            drop(guard);
+
+            // Well past the signal it ignored. `kill -0` probes for existence
+            // without sending anything (no `libc` dependency in this crate).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .status()
+                .expect("run kill -0")
+                .success();
+            assert!(
+                alive,
+                "test setup is wrong — the child was supposed to survive SIGTERM"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a still-running child must keep its pid published"
+            );
+
+            // And once it really dies, the exit is reported — the reaper is
+            // armed the whole time, not abandoned.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+            let mut reported = false;
+            for _ in 0..200 {
+                if calls.load(Ordering::SeqCst) > 0 {
+                    reported = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(reported, "the reaper never observed the child's death");
+        });
+        let _ = std::fs::remove_file(&ready);
+    }
+
     #[cfg(unix)]
     #[test]
     fn spawn_process_honors_current_dir() {
@@ -675,8 +1023,7 @@ mod tests {
             .with_current_dir(&dir);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let out = rt.block_on(async {
-            let (_stdin, mut stdout, _stderr, mut child) =
-                agent.spawn_process().expect("spawn");
+            let (_stdin, mut stdout, _stderr, mut child) = agent.spawn_process().expect("spawn");
             let mut out = String::new();
             stdout.read_to_string(&mut out).await.expect("read stdout");
             let _ = child.wait().await;

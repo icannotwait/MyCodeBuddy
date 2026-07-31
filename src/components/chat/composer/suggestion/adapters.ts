@@ -1,9 +1,9 @@
 import {
-  AGENT_LABELS,
   type AcpAgentInfo,
   type DelegationProfile,
   type ReferenceCandidate,
 } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 
 import type { SuggestionItem } from "./types"
 
@@ -48,13 +48,13 @@ export function catalogSearchFields(entry: CatalogSearchEntry): {
   if (entry.kind === "agent") {
     const { agent } = entry
     return {
-      primary: [agent.name || AGENT_LABELS[agent.agent_type]],
+      primary: [agent.name || getAgentLabel(agent.agent_type)],
       secondary: [agent.agent_type, agent.description, ""],
     }
   }
   const { profile, backingAgent } = entry
   return {
-    primary: [`${AGENT_LABELS[profile.agent_type]}:${profile.name}`],
+    primary: [`${getAgentLabel(profile.agent_type)}:${profile.name}`],
     secondary: [
       profile.agent_type,
       backingAgent.description,
@@ -67,7 +67,7 @@ export function profileToSuggestion(
   profile: DelegationProfile,
   sourceOrdinal = 0
 ): SuggestionItem {
-  const agentLabel = AGENT_LABELS[profile.agent_type]
+  const agentLabel = getAgentLabel(profile.agent_type)
   return withControllerDefaults({
     reference: {
       refType: "delegation_profile",
@@ -95,7 +95,7 @@ export function agentToSuggestion(
     reference: {
       refType: "agent",
       id: agent.agent_type,
-      label: agent.name || AGENT_LABELS[agent.agent_type],
+      label: agent.name || getAgentLabel(agent.agent_type),
       uri: `codeg://agent/${agent.agent_type}`,
       meta: { agentType: agent.agent_type, available: agent.available },
     },

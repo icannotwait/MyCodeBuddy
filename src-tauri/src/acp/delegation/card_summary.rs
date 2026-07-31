@@ -133,8 +133,7 @@ pub fn extract_card_summary_with_report_fallback(
     if let Some(summary) = extract_card_summary(raw_final_text) {
         return Some(summary);
     }
-    let candidates =
-        collect_report_harvest_candidates(raw_final_text, extra_paths, workspace_path);
+    let candidates = collect_report_harvest_candidates(raw_final_text, extra_paths, workspace_path);
     for path in candidates.iter().rev().take(MAX_REPORT_HARVEST_CANDIDATES) {
         if let Some(summary) = extract_card_summary_from_report_file(path) {
             return Some(summary);
@@ -875,7 +874,7 @@ mod tests {
 
         let chat = "Review complete. See the report on disk.";
         let summary =
-            extract_card_summary_with_report_fallback(chat, &[report.clone()], None)
+            extract_card_summary_with_report_fallback(chat, std::slice::from_ref(&report), None)
                 .expect("harvest from touched path");
         match summary {
             CardSummary::Review { verdict, .. } => {
@@ -942,11 +941,9 @@ mod tests {
 "#,
         )
         .unwrap();
-        let chat =
-            "Report: [final-review.md](.superpowers/sdd/final-review.md)";
-        let summary =
-            extract_card_summary_with_report_fallback(chat, &[], Some(dir.as_path()))
-                .expect("relative link under workspace");
+        let chat = "Report: [final-review.md](.superpowers/sdd/final-review.md)";
+        let summary = extract_card_summary_with_report_fallback(chat, &[], Some(dir.as_path()))
+            .expect("relative link under workspace");
         match summary {
             CardSummary::Review {
                 verdict: ReviewVerdict::RequestChanges,
@@ -960,11 +957,9 @@ mod tests {
     #[test]
     fn report_fallback_skips_http_links_and_parent_relative() {
         let chat = "see [doc](https://example.com/a.md) and [bad](../secret.md)";
-        assert!(extract_card_summary_with_report_fallback(
-            chat,
-            &[],
-            Some(Path::new("/tmp/ws"))
-        )
-        .is_none());
+        assert!(
+            extract_card_summary_with_report_fallback(chat, &[], Some(Path::new("/tmp/ws")))
+                .is_none()
+        );
     }
 }

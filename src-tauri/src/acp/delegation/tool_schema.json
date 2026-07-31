@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start a cold local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. It cannot see this conversation; task must include all context. Fan out independent work, then Join required task_ids with get_delegation_status. For each distinct agent/profile mention, call once; pass profile_id for a profile. Replace admission_failed/admission_unknown explicitly, never continue_delegation.",
+    "description": "Start a cold local sub-agent. ASYNCHRONOUS: returns task_id. It cannot see this conversation; task must include all context. Fan out, then Join task_ids with get_delegation_status. For each distinct agent/profile, call once; pass profile_id. admission_failed/admission_unknown require explicit replacement, never continue_delegation.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -55,7 +55,7 @@
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "Required with replaces_task_id. admission_failed and admission_unknown: explicit replacement only (never continue). unresumable also matches parent_disconnected / parent_canceled / parent_turn_failed / join_abandoned / user_cancelled / tool_stalled_timeout so established work units are not permanently fenced. Prefer continue_delegation for parent_disconnected when the thread is still recoverable."
+          "description": "With replaces_task_id. admission_failed/admission_unknown require explicit replacement, never continue. unresumable covers parent_disconnected, parent_canceled, parent_turn_failed, join_abandoned, user_cancelled, tool_stalled_timeout; prefer continue_delegation when recoverable."
         }
       }
     }
@@ -270,7 +270,7 @@
   },
   {
     "name": "publish_workflow_manifest",
-    "description": "Publish/CAS v2 workflow manifest; Rust validates nested fields.",
+    "description": "Publish/CAS v2 workflow manifest.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -298,7 +298,7 @@
   },
   {
     "name": "settle_workflow_gate",
-    "description": "Root-only Design/Plan gate settle with structured evidence.",
+    "description": "Root-only Design/Plan gate settle.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -323,7 +323,7 @@
         },
         "evidence": {
           "type": "object",
-          "description": "kind=design: critical_count, important_count, minor_count. kind=plan: scope full/scoped; revision_kind initial/localized/material/holistic_rewrite; scope_reason; covered_author_task_id; covered_plan_digest; required_reviewer_node_ids; finding_updates of finding_id, severity, status, owner_reviewer_node_ids, summary, evidence_ref, report_file; optional lineage_reset_reason.",
+          "description": "kind=design: critical_count, important_count, minor_count. kind=plan: scope full/scoped; revision_kind; scope_reason; covered_author_task_id; covered_plan_digest; required_reviewer_node_ids; finding_updates fields finding_id, severity, status, owner_reviewer_node_ids, summary, evidence_ref, report_file; optional lineage_reset_reason.",
           "required": ["kind"],
           "properties": { "kind": { "enum": ["design", "plan"] } }
         },

@@ -128,7 +128,7 @@ import type {
   TurnOutcome,
   UserMessageBlock,
 } from "@/lib/types"
-import { AGENT_LABELS } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import {
   CONNECTION_IDLE_TIMEOUT_MS,
   CONNECTION_KEEPALIVE_INTERVAL_MS,
@@ -208,8 +208,8 @@ export interface ClaudeApiRetryState {
 }
 
 export type LiveContentBlock =
-  | { type: "text"; text: string }
-  | { type: "thinking"; text: string }
+  | { type: "text"; text: string; parentToolUseId?: string }
+  | { type: "thinking"; text: string; parentToolUseId?: string }
   | { type: "plan"; entries: PlanEntryInfo[] }
   | { type: "tool_call"; info: ToolCallInfo }
 
@@ -906,8 +906,18 @@ type Action =
     }
 
 type StreamingAction =
-  | { type: "CONTENT_DELTA"; contextKey: string; text: string }
-  | { type: "THINKING"; contextKey: string; text: string }
+  | {
+      type: "CONTENT_DELTA"
+      contextKey: string
+      text: string
+      parentToolUseId?: string
+    }
+  | {
+      type: "THINKING"
+      contextKey: string
+      text: string
+      parentToolUseId?: string
+    }
 
 type MapLevelAction = Extract<
   Action,
@@ -1463,31 +1473,72 @@ function applyStreamingAction(
   // redact thinking text entirely, keeping the empty block as the signal).
   if (action.type === "CONTENT_DELTA" && action.text.length === 0) return null
 
+  if (action.parentToolUseId) {
+    const parentPresent = conn.liveMessage?.content.some(
+      (block) =>
+        block.type === "tool_call" &&
+        block.info.tool_call_id === action.parentToolUseId
+    )
+    if (!parentPresent) return null
+  }
+
   const prev = ensureLiveMessage(conn.liveMessage)
   const lastBlock = prev.content[prev.content.length - 1]
   let newContent: LiveContentBlock[] | null = null
 
   if (action.type === "CONTENT_DELTA") {
-    if (lastBlock?.type === "text") {
+    if (
+      lastBlock?.type === "text" &&
+      lastBlock.parentToolUseId === action.parentToolUseId
+    ) {
       newContent = [
         ...prev.content.slice(0, -1),
-        { type: "text", text: lastBlock.text + action.text },
+        {
+          type: "text",
+          text: lastBlock.text + action.text,
+          parentToolUseId: action.parentToolUseId,
+        },
       ]
     } else {
-      newContent = [...prev.content, { type: "text", text: action.text }]
+      newContent = [
+        ...prev.content,
+        {
+          type: "text",
+          text: action.text,
+          parentToolUseId: action.parentToolUseId,
+        },
+      ]
     }
   } else {
-    if (action.text.length === 0 && lastBlock?.type === "thinking") {
+    if (
+      action.text.length === 0 &&
+      lastBlock?.type === "thinking" &&
+      lastBlock.parentToolUseId === action.parentToolUseId
+    ) {
       // Already have a thinking block; an empty follow-up event is a no-op.
       return null
     }
-    if (lastBlock?.type === "thinking") {
+    if (
+      lastBlock?.type === "thinking" &&
+      lastBlock.parentToolUseId === action.parentToolUseId
+    ) {
       newContent = [
         ...prev.content.slice(0, -1),
-        { type: "thinking", text: lastBlock.text + action.text },
+        {
+          type: "thinking",
+          text: lastBlock.text + action.text,
+          parentToolUseId: action.parentToolUseId,
+        },
       ]
     } else {
-      newContent = [...prev.content, { type: "thinking", text: action.text }]
+      newContent = [
+        ...prev.content,
+        {
+          type: "thinking",
+          text: action.text,
+          parentToolUseId: action.parentToolUseId,
+        },
+      ]
     }
   }
 
@@ -3143,10 +3194,20 @@ function prepareMappedEnvelope(
       actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
       break
     case "content_delta":
-      actions.push({ type: "CONTENT_DELTA", contextKey, text: e.text })
+      actions.push({
+        type: "CONTENT_DELTA",
+        contextKey,
+        text: e.text,
+        parentToolUseId: e.parent_tool_use_id ?? undefined,
+      })
       break
     case "thinking":
-      actions.push({ type: "THINKING", contextKey, text: e.text })
+      actions.push({
+        type: "THINKING",
+        contextKey,
+        text: e.text,
+        parentToolUseId: e.parent_tool_use_id ?? undefined,
+      })
       break
     case "turn_attempt_rollback":
       actions.push({ type: "TURN_ATTEMPT_ROLLBACK", contextKey })
@@ -3282,7 +3343,7 @@ function prepareMappedEnvelope(
           }
         }
         if (settled && settled.length > 0) {
-          const agentLabel = AGENT_LABELS[agentType]
+          const agentLabel = getAgentLabel(agentType)
           const fn = env.folderName
           const title = fn ? `${fn} - DrawCode` : "DrawCode"
           for (const item of settled) {
@@ -3325,7 +3386,7 @@ function prepareMappedEnvelope(
         fallback_kind: "tool",
         options: e.options,
       })
-      const agentLabel = AGENT_LABELS[snapshot.agentType]
+      const agentLabel = getAgentLabel(snapshot.agentType)
       const fn = env.folderName
       afterCommit.push(() => {
         const title = fn ? `${fn} - DrawCode` : "DrawCode"
@@ -3433,7 +3494,7 @@ function prepareMappedEnvelope(
         getTransport().isDesktop()
       ) {
         const conversationId = snapshot.conversationId ?? null
-        const agentLabel = AGENT_LABELS[snapshot.agentType]
+        const agentLabel = getAgentLabel(snapshot.agentType)
         const fn = env.folderName
         const leaseId = projection.lease_id
         const version = projection.version
@@ -3558,7 +3619,7 @@ function prepareMappedEnvelope(
           })
         })
       }
-      const agentLabel = AGENT_LABELS[snapshot.agentType]
+      const agentLabel = getAgentLabel(snapshot.agentType)
       const fn = env.folderName
       afterCommit.push(() => {
         const title = fn ? `${fn} - DrawCode` : "DrawCode"
@@ -3570,8 +3631,7 @@ function prepareMappedEnvelope(
       break
     }
     case "error": {
-      const agentLabel =
-        AGENT_LABELS[snapshot.agentType] || (e.agent_type as string)
+      const agentLabel = getAgentLabel(snapshot.agentType)
       const localizedMessage = (() => {
         // Shared mapping with cold detail projection — keep in sync via
         // continuationFailureI18nKey so live events cannot drift.
@@ -3641,7 +3701,7 @@ function prepareMappedEnvelope(
       break
     }
     case "session_load_failed": {
-      const agentLabel = AGENT_LABELS[snapshot.agentType] || ""
+      const agentLabel = getAgentLabel(snapshot.agentType)
       const localizedMessage = (() => {
         switch (e.code) {
           case "resource_not_found":
@@ -4562,7 +4622,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return { kind: "missing_config", reason: t("blocked.missingConfig") }
       }
 
-      const agentLabel = AGENT_LABELS[agent.agent_type]
+      const agentLabel = getAgentLabel(agent.agent_type)
       if (!agent.enabled) {
         return {
           kind: "disabled",
@@ -5496,6 +5556,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // The desktop subscription is process-global for this provider mount. Keep
+  // callbacks current without rebuilding the async listener when translations
+  // or lifecycle closures change during a render.
+  const desktopListenerCallbacksRef = useRef({
+    commitEventFrame,
+    handleSequenceGap,
+    handleDesktopDeliveryFailure,
+    t,
+  })
+  useEffect(() => {
+    desktopListenerCallbacksRef.current = {
+      commitEventFrame,
+      handleSequenceGap,
+      handleDesktopDeliveryFailure,
+      t,
+    }
+  })
+
   // One EventIngestor for desktop + attach. Desktop also subscribes via
   // subscribeDesktopAcpEvents (never hot-switches after failure).
   useEffect(() => {
@@ -5509,10 +5587,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         readCursor: (contextKey) =>
           storeRef.current.connections.get(contextKey)?.lastAppliedSeq ?? 0,
         commit: (frame) => {
-          commitEventFrame(frame)
+          desktopListenerCallbacksRef.current.commitEventFrame(frame)
         },
         onGap: (gap) => {
-          handleSequenceGap(gap)
+          desktopListenerCallbacksRef.current.handleSequenceGap(gap)
         },
         onDuplicate: (info) => {
           if (
@@ -5595,8 +5673,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
           pushAlertRef.current(
             "error",
-            t("eventErrorTitle"),
-            t("desktopDeliveryNegotiateFailed")
+            desktopListenerCallbacksRef.current.t("eventErrorTitle"),
+            desktopListenerCallbacksRef.current.t(
+              "desktopDeliveryNegotiateFailed"
+            )
           )
           if (!cancelled) settleListenerWaiters("failed", err)
           return
@@ -5639,7 +5719,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             eventIngestorRef.current?.pushBatch(batch)
           },
           onFailure: (failure) => {
-            handleDesktopDeliveryFailure(failure)
+            desktopListenerCallbacksRef.current.handleDesktopDeliveryFailure(
+              failure
+            )
           },
         })
       } catch (err) {
@@ -5648,8 +5730,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         eventIngestorRef.current = null
         pushAlertRef.current(
           "error",
-          t("eventErrorTitle"),
-          t("desktopDeliverySubscribeFailed")
+          desktopListenerCallbacksRef.current.t("eventErrorTitle"),
+          desktopListenerCallbacksRef.current.t(
+            "desktopDeliverySubscribeFailed"
+          )
         )
         if (!cancelled) {
           settleListenerWaiters(
@@ -5686,14 +5770,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       eventIngestorRef.current?.dispose()
       eventIngestorRef.current = null
     }
-  }, [
-    bufferUnmappedEvent,
-    commitEventFrame,
-    handleDesktopDeliveryFailure,
-    handleSequenceGap,
-    settleListenerWaiters,
-    t,
-  ])
+  }, [bufferUnmappedEvent, settleListenerWaiters])
 
   // ── Backend keepalive timer ──
   // Frontend is the only side that knows which conversation tabs the
@@ -6683,7 +6760,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             message: normalizeErrorMessage(error),
           })
           const failedTitle = t("connectFailedTitle", {
-            agent: AGENT_LABELS[agentType],
+            agent: getAgentLabel(agentType),
           })
           pushAlertRef.current(
             "error",
@@ -6697,7 +6774,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const blocked = resolveConnectBlockState(configuredAgent)
         if (blocked.kind !== "none") {
           const failedTitle = t("connectFailedTitle", {
-            agent: AGENT_LABELS[agentType],
+            agent: getAgentLabel(agentType),
           })
           const detail =
             blocked.kind === "sdk_missing"
@@ -7131,7 +7208,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               params?: Record<string, string | number>
             ) => string
           )
-          const agentLabel = AGENT_LABELS[agentType]
+          const agentLabel = getAgentLabel(agentType)
           // Backend safety net: if the agent turned out to be not
           // installed (e.g. the binary was removed between preflight
           // and spawn), surface the same install prompt with a direct

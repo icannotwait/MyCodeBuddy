@@ -206,7 +206,15 @@
       "downloadFailed": "Failed to download update package. Please try again later.",
       "installFailed": "Failed to install update. Please close the app and try again.",
       "unknown": "Update failed. Please try again later."
-    }
+    },
+    "newVersionBadge": "New v{version}",
+    "updateAvailableTitle": "Update available",
+    "releaseNotesTitle": "What's new",
+    "remindLater": "Later",
+    "retry": "Retry",
+    "stepDownload": "Download",
+    "stepInstall": "Install",
+    "stepRestart": "Restart"
   },
   "VersionControlSettings": {
     "loading": "Loading...",
@@ -752,7 +760,9 @@
       "loggedIn": "Account logged in",
       "loginRelogin": "Re-login / Switch account",
       "loginTimeout": "Login timed out, please try again",
-      "loginSaveFailed": "Login succeeded but failed to save config"
+      "loginSaveFailed": "Login succeeded but failed to save config",
+      "enableFast": "Enable Fast",
+      "enableFastAria": "Enable Fast service tier for Codex"
     },
     "gemini": {
       "authConfig": "Gemini Auth Config",
@@ -883,14 +893,20 @@
     },
     "kimiCode": {
       "configManagement": "Kimi Code Configuration",
-      "configDescription": "`kimi acp` only authenticates with a stored login token and rejects API keys on their own. To use an API key, codeg writes a managed ~/.kimi-code/config.toml provider AND seeds a local gate token so the session opens — inference still runs on your key.",
-      "gateReadyApiKey": "Authenticated via API key (codeg seeded the local gate token).",
-      "gateReadyLogin": "Authenticated via a Kimi account login.",
-      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
+      "configDescription": "`kimi acp` only accepts a stored login token, so codeg writes a managed provider into ~/.kimi-code/config.toml and seeds a local gate token — inference still runs on your own key.",
+      "statusUnconfigured": "Not configured yet",
+      "statusDirty": "Unsaved changes",
+      "summaryLabel": "In effect",
+      "gateReadyApiKey": "API key written to config.toml",
+      "gateReadyLogin": "Signed in with a Kimi account",
+      "revealConfig": "Show in folder",
+      "envOverrideWarning": "{keys} is set and takes priority over config.toml. Saving here clears it.",
       "authModeLabel": "Authentication method",
       "authModeApiKey": "API key",
       "authModeLogin": "Kimi account login (subscription)",
-      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
+      "authModeApiKeyHint": "Writes a codeg-managed provider into config.toml and seeds the gate token so sessions can open.",
+      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account. codeg stores nothing and reuses Kimi's own login. Saving here removes codeg's API-key gate token.",
+      "credentialTitle": "Credential",
       "interfaceTypeLabel": "Provider type",
       "interfaceTypeHint": "The provider protocol Kimi speaks (config.toml `type`). Use Kimi / Moonshot for a Moonshot / platform.kimi.com key.",
       "endpointLabel": "Endpoint",
@@ -902,26 +918,52 @@
       "baseUrlHint": "Leave blank to use the provider SDK default.",
       "apiKeyLabel": "API Key",
       "apiKeyHint": "Written to ~/.kimi-code/config.toml and used for inference. From platform.kimi.com or platform.kimi.ai.",
-      "authTypeLabel": "Advanced: credential placement",
-      "authTypeApiKey": "Inline api_key",
-      "authTypeEnv": "Provider env sub-table",
-      "authTypeHint": "Where the API key is written inside config.toml.",
       "vertexProjectLabel": "GCP project (GOOGLE_CLOUD_PROJECT)",
       "vertexLocationLabel": "GCP location (GOOGLE_CLOUD_LOCATION)",
       "vertexHint": "Vertex AI uses Google Application Default Credentials — run `gcloud auth application-default login` (no API key).",
+      "modelTitle": "Model",
       "modelLabel": "Model",
-      "modelHint": "The model id to use. Click Fetch to list the models your key can access (e.g. kimi-k2.7-code) — avoids “model not found” errors.",
-      "fetchModels": "Fetch",
-      "fetchModelsOk": "Found {count} models",
+      "modelHint": "The model id written to config.toml. Use “Test & list models” to see what your key can actually access.",
+      "maxContextLabel": "Max context size",
+      "maxContextHint": "Required by Kimi's schema: without it Kimi discards the whole model block and every prompt comes back empty. Defaults to 262144.",
+      "fetchModels": "Test & list models",
+      "fetchModelsOk": "Key works — {count} models available",
       "fetchModelsEmpty": "Key works, but no models were returned",
-      "fetchModelsFailed": "Couldn’t list models — check the key and endpoint",
+      "fetchModelsFailed": "Test failed",
       "fetchModelsNeedsKey": "Enter an API key and endpoint first",
-      "maxContextLabel": "Max context size (optional)",
-      "maxContextHint": "Tokens, e.g. 262144. Leave blank to use the model default.",
-      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account (device-code OAuth). codeg stores nothing and reuses Kimi’s own login. Saving here removes codeg’s API-key gate token.",
-      "rawEditorLabel": "Advanced: edit config.toml directly",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "modelNotInList": "This model is not in the list your key can access — Kimi will fail with “model not found”.",
+      "reasoningTitle": "Reasoning",
+      "reasoningEnableLabel": "Enable",
+      "reasoningDescription": "Kimi only shows a Thinking picker in the composer when the model declares a reasoning capability, so codeg writes one here. Takes effect on new sessions.",
+      "effortsLabel": "Levels offered",
+      "effortsHint": "These become the rows of the composer's Thinking picker. Kimi forwards the level to the provider verbatim, so pick ones your model accepts.",
+      "effortsEmptyHint": "With no levels chosen the composer falls back to a plain Off / On toggle.",
+      "effortsCustomPlaceholder": "Add another level",
+      "effortsAdd": "Add",
+      "defaultEffortLabel": "Default level",
+      "defaultEffortAuto": "Let Kimi choose",
+      "alwaysThinkingLabel": "The model always reasons — remove the Off row from the picker",
+      "fixErrorsFirst": "Fix the highlighted fields first",
+      "errorModelRequired": "Model is required",
+      "errorMaxContextRequired": "Max context size is required",
+      "errorMaxContextInvalid": "Must be a positive integer",
+      "errorApiKeyRequired": "API key is required",
+      "errorApiKeyInvalid": "The API key must not contain line breaks",
+      "errorBaseUrlRequired": "Base URL is required",
+      "errorBaseUrlInvalid": "Must start with http:// or https://",
+      "errorVertexProjectRequired": "GCP project is required",
+      "errorDefaultEffortUnlisted": "Pick one of the levels selected above",
+      "advancedTitle": "Advanced",
+      "authTypeLabel": "Credential placement",
+      "authTypeApiKey": "Inline api_key",
+      "authTypeEnv": "Provider env sub-table",
+      "authTypeHint": "Where the API key is written inside config.toml.",
+      "rawEditorLabel": "Edit config.toml directly",
+      "rawEditorWarning": "Saving here overwrites the entire file verbatim, replacing the structured settings above.",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
+      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
     },
     "authModeOfficialSubscription": "Official Subscription",
     "authModeCustomEndpoint": "Custom Endpoint",
@@ -1054,7 +1096,9 @@
       "remoteUnavailable": "{versionText}. Remote version is currently unavailable.",
       "latest": "{versionText}. Already latest.",
       "bundled": "Built in: {version}",
-      "bundledMissing": "Built-in adapter is missing. Reinstall or update DrawCode."
+      "bundledMissing": "Built-in adapter is missing. Reinstall or update DrawCode.",
+      "localOnly": "Local: {localVersion}",
+      "localInstalled": "{versionText}. Installed."
     },
     "cline": {
       "configDescription": "Configure Cline API provider and credentials. Settings are saved to ~/.cline/data/."
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "No matching model",
       "modelsNeedAuth": "Sign in to load the model list.",
       "modelDefaultBadge": "default"
-    }
+    },
+    "addCustomAgent": "Add custom agent",
+    "addCustomAgentHint": "Register any ACP-compatible agent. Pick one from the public ACP registry, or paste its registry information.",
+    "customAgentFromRegistry": "ACP registry",
+    "customAgentManual": "Manual",
+    "customAgentSearchPlaceholder": "Search agents…",
+    "customAgentLoadingCatalog": "Loading the ACP registry…",
+    "customAgentRetry": "Retry",
+    "customAgentNoResults": "No matching agents",
+    "customAgentAdd": "Add",
+    "customAgentAlreadyAdded": "Added",
+    "customAgentUnsupportedPlatform": "No build available for this platform",
+    "customAgentAdded": "Added {name}",
+    "customAgentIdLabel": "Registry ID",
+    "customAgentNameLabel": "Display name",
+    "customAgentVersionLabel": "Version",
+    "customAgentSpecLabel": "Distribution (JSON)",
+    "customAgentSpecHint": "Same shape as a registry entry's distribution object: npx, uvx and binary channels, or paste a whole registry entry. For npx/uvx, cmd is the executable the package installs — derived from the package name when omitted, so set it when the two differ. binary is keyed by platform (this machine: {platform}); its cmd is the launch path inside the archive, and sha256 optionally verifies the download.",
+    "customAgentTemplateLabel": "Templates",
+    "customAgentKindLabel": "Launch via",
+    "customAgentInvalidJson": "Not valid JSON",
+    "customAgentNoDistribution": "No npx, uvx, or binary distribution found",
+    "customAgentCancel": "Cancel",
+    "customAgentSave": "Add agent",
+    "customAgentSaveChanges": "Save changes",
+    "customAgentEdit": "Edit agent",
+    "customAgentEditHint": "Update the name, icon, distribution and skills declarations. The agent ID cannot be changed.",
+    "customAgentEditNotFound": "Custom agent {id} was not found",
+    "customAgentSaved": "Saved {name}",
+    "customAgentVersionProbeLabel": "Version probe command (optional)",
+    "customAgentVersionProbeHint": "Command that prints the locally installed version. Left empty, codeg runs the agent command with --version.",
+    "customAgentRemove": "Remove agent",
+    "customAgentRemoveHint": "Deletes the agent definition. Existing conversations keep their history; the agent just can no longer be launched.",
+    "customAgentIconLabel": "Icon (optional)",
+    "customAgentIconUpload": "Upload",
+    "customAgentIconReplace": "Replace",
+    "customAgentIconClear": "Remove icon",
+    "customAgentIconHint": "Stored with the agent, so it works offline. Without one, a colored initial is used.",
+    "customAgentSkillsLabel": "Skills (shared .agents/skills)",
+    "customAgentSkillsHint": "Declares that this agent reads the shared .agents/skills store — its global and project directories — and adds it to every skills matrix. Skills linked there are visible to every agent that reads the shared store.",
+    "customAgentSkillsDirLabel": "Dedicated skills directory",
+    "customAgentSkillsDirHint": "Absolute path of a directory this agent loads skills from — its own store, in addition to (or instead of) the shared one. ~ expands to your home directory; linked skills are placed here first.",
+    "customAgentIconNotAnImage": "Pick an image file.",
+    "customAgentIconTooLarge": "The icon must be smaller than {limit} KB.",
+    "customAgentIconReadFailed": "Could not read that image.",
+    "customAgentRemoveConfirm": "Remove {name}? Existing conversations stay, but the agent can no longer be launched.",
+    "customAgentRemoveWithData": "Also delete its recorded conversation history",
+    "customAgentRemoved": "Removed {name}",
+    "customAgentBadge": "Custom",
+    "customAgentNotLaunchable": "This agent cannot launch here: {reason}"
   },
   "SettingsPages": {
     "agentsLoading": "Loading agent settings...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "Close Others",
       "closeAll": "Close All",
       "tileDisplay": "Tile Display",
-      "untileDisplay": "Exit Tile"
+      "untileDisplay": "Exit Tile",
+      "splitRight": "Split Right",
+      "splitDown": "Split Down",
+      "splitAndMoveRight": "Split and Move Right",
+      "splitAndMoveDown": "Split and Move Down",
+      "moveToOppositeGroup": "Move to Opposite Group",
+      "moveToGroup": "Move to Group",
+      "groupLabel": "Group {index}",
+      "changeSplitterOrientation": "Change Splitter Orientation",
+      "unsplit": "Unsplit",
+      "unsplitAll": "Unsplit All"
     },
     "fileWorkspace": {
       "files": "Files",
@@ -1995,7 +2098,10 @@
         "current": "Current",
         "remoteBranches": "Remote branches",
         "refreshCommitHistory": "Refresh commit history",
-        "clearBranchFilterAria": "Clear branch filter"
+        "clearBranchFilterAria": "Clear branch filter",
+        "head": "HEAD",
+        "headHint": "Follows the current branch",
+        "headHintWithBranch": "Follows the current branch ({branch})"
       },
       "dialogs": {
         "newBranchTitle": "New branch",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "Creating session and loading configuration"
         },
         "errors": {
-          "connectionFailed": "Connection failed"
+          "connectionFailed": "Connection failed",
+          "sendPromptFailed": "Failed to send the message: {error}"
         }
       },
       "shared": {
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "Skills",
         "mentionInvalidPattern": "Invalid regular expression",
         "mentionSourceError": "This source could not be refreshed",
-        "mentionProfileError": "Delegation profiles could not be loaded"
+        "mentionProfileError": "Delegation profiles could not be loaded",
+        "attachUploadInProgress": "Images are still uploading — try again in a moment."
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -2959,7 +3067,8 @@
           "webSearchWithQuery": "WebSearch: {query}",
           "todosProgress": "Todos ({done}/{total})",
           "skillWithName": "Skill: {name}",
-          "genericWithContext": "{tool}: {context}"
+          "genericWithContext": "{tool}: {context}",
+          "listFilesWithPath": "List files {path}"
         },
         "toolGroup": {
           "search": "{count, plural, one {Explored # search} other {Explored # searches}}",
@@ -2992,6 +3101,13 @@
           "polledTimes": "Polled {count} times",
           "runningInBackground": "Background",
           "launchNote": "Running in background · {id}"
+        },
+        "agentLiveTranscript": "Live activity",
+        "search": {
+          "noMatches": "No matches",
+          "matchSummary": "{matches, plural, one {# match} other {# matches}} in {files, plural, one {# file} other {# files}}",
+          "fileSummary": "{files, plural, one {# file} other {# files}}",
+          "moreResults": "{count, plural, one {# more result not shown} other {# more results not shown}}"
         }
       },
       "messageNav": {
@@ -3128,6 +3244,16 @@
       "proposedPlan": {
         "title": "Proposed plan",
         "planning": "Planning…"
+      },
+      "fileActions": {
+        "openInFinder": "Open in Finder",
+        "openInExplorer": "Open in Explorer",
+        "openInFileManager": "Open in file manager",
+        "copyRelativePath": "Copy relative path",
+        "copyAbsolutePath": "Copy absolute path",
+        "pathCopied": "Path copied",
+        "copyPathFailed": "Failed to copy path",
+        "openFailed": "Failed to open local file"
       }
     },
     "diffPreview": {

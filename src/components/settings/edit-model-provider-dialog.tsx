@@ -25,7 +25,6 @@ import { updateModelProvider } from "@/lib/api"
 import { CodexModelListEditor } from "@/components/settings/codex-model-list-editor"
 import {
   MODEL_PROVIDER_AGENT_TYPES,
-  AGENT_LABELS,
   parseClaudeProviderModel,
   serializeClaudeProviderModel,
   parseCodexModelConfig,
@@ -35,6 +34,7 @@ import {
   type CodexModelConfig,
   type ModelProviderInfo,
 } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 
 interface EditModelProviderDialogProps {
   provider: ModelProviderInfo | null
@@ -230,7 +230,7 @@ export function EditModelProviderDialog({
               <SelectContent>
                 {MODEL_PROVIDER_AGENT_TYPES.map((at) => (
                   <SelectItem key={at} value={at}>
-                    {AGENT_LABELS[at]}
+                    {getAgentLabel(at)}
                   </SelectItem>
                 ))}
               </SelectContent>

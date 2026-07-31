@@ -918,21 +918,23 @@ const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
   const [latchedLive, setLatchedLive] = useState<LiveMessage | null>(null)
 
   useEffect(() => {
+    // Preserve the last live metrics when the runtime clears them before waiting.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (activeLive) setLatchedLive(activeLive)
   }, [activeLive])
 
   useEffect(() => {
     if (!isWaitingForSubagents && !isStreaming) {
+      // Reset only after both live display modes have ended.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLatchedLive(null)
     }
   }, [isWaitingForSubagents, isStreaming])
 
   if (isWaitingForSubagents) {
     const startedAt =
-      activeLive?.startedAt ??
-      latchedLive?.startedAt ??
-      waitingArmedAtMs ??
-      Date.now()
+      activeLive?.startedAt ?? latchedLive?.startedAt ?? waitingArmedAtMs
+    if (startedAt == null) return null
     const message =
       activeLive ?? latchedLive ?? waitingPlaceholderLiveMessage(startedAt)
     return (

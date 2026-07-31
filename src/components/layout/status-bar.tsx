@@ -21,6 +21,7 @@ export function StatusBar() {
           <StatusBarStats />
         </div>
         <div className="flex items-center gap-3">
+          <StatusBarUpdate />
           <CommandDropdown />
           <StatusBarAlerts />
         </div>

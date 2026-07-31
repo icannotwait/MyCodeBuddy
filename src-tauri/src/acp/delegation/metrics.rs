@@ -703,6 +703,7 @@ pub fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::Pi => "pi",
         AgentType::Grok => "grok",
         AgentType::Cursor => "cursor",
+        AgentType::Custom(_) => "custom",
     }
 }
 
@@ -1379,6 +1380,12 @@ mod tests {
     #[test]
     fn cursor_uses_stable_metrics_label() {
         assert_eq!(agent_type_label(AgentType::Cursor), "cursor");
+    }
+
+    #[test]
+    fn custom_agents_share_one_low_cardinality_metrics_label() {
+        assert_eq!(agent_type_label(AgentType::Custom("private-id")), "custom");
+        assert_eq!(agent_type_label(AgentType::Custom("another-id")), "custom");
     }
 
     fn codeg_plan(agent_type: AgentType) -> DelegationRoutePlan {

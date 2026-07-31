@@ -24,6 +24,14 @@ use crate::parsers::{
 const GROK_TOOL_OUTPUT_CAP: usize = 100_000;
 const GROK_TOOL_INPUT_CAP: usize = 8_000;
 
+/// Budget for a serialized `TaskOutput` envelope (see `grok_task_output_envelope`).
+/// Deliberately below the live path's `MAX_SINGLE_EMIT_BYTES` (64 KiB, see
+/// `acp::connection`): the envelope is JSON the frontend parses, and the live
+/// emitter truncates from the head with a marker — which would corrupt it. Both
+/// paths share this function, so a background command's output is capped here
+/// rather than shredded downstream.
+const GROK_TASK_OUTPUT_CAP: usize = 48 * 1024;
+
 /// Tool name the parser assigns to grok's native `ask_user_question` (from its
 /// `_meta["x.ai/tool"].name`). Used to find the ask ToolResults whose answer must
 /// be recovered from `chat_history.jsonl` (see `inject_grok_ask_answers`).
@@ -152,8 +160,10 @@ pub fn resolve_grok_context_window_max_tokens(
 ///   `status` ∈ {in_progress, completed, failed}, `content[]`, `rawOutput`).
 ///   The last update per `toolCallId` holds the full output.
 /// - `task_backgrounded` / `task_completed` — a command that was moved to the
-///   background; `task_completed.task_snapshot` carries the authoritative final
-///   `output` + `exit_code` (preferred over the streamed `tool_call_update`s).
+///   background. Both are ignored here (the launch call and the polls already
+///   carry everything rendered); note `task_backgrounded` is the ONLY event
+///   pairing `tool_call_id` with `task_id`, since `task_completed.task_snapshot`
+///   is keyed by `task_id` alone.
 /// - `turn_completed` — closes the current assistant turn (`stop_reason`).
 ///
 /// Turn model: one user turn per `user_message_chunk`, then a single assistant
@@ -434,11 +444,6 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
     let mut assistant: Option<MessageTurn> = None;
     let mut tool_result_idx: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    // toolCallIds whose result `task_completed` already finalized. A backgrounded
-    // command can emit a trailing (stale/cumulative) `tool_call_update` *after*
-    // its `task_completed` — those must not clobber the authoritative snapshot
-    // output. toolCallIds are unique within a session, so this is never cleared.
-    let mut finalized_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Stats for the in-flight turn (tokens/timing/model), applied to the
     // assistant turn when it is finalized. Reset at each turn boundary.
     let mut turn_meta = GrokTurnMeta::default();
@@ -476,6 +481,22 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("");
+
+        // Grok injects its own reminders (a background task finishing, …) as
+        // `user_message_chunk`s and marks them `_meta.hideFromScrollback` — its
+        // TUI never shows them. Honor the flag: rendered as a user bubble, such a
+        // chunk splits one reply into two turns with a raw `<system-reminder>`
+        // block wedged between them. Skipped BEFORE the turn-boundary logic below,
+        // so a reminder injected mid-turn doesn't cut the open assistant turn
+        // either.
+        if kind == "user_message_chunk"
+            && update
+                .pointer("/_meta/hideFromScrollback")
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            continue;
+        }
 
         // Grok's per-turn stats live in the OUTER `params._meta` (token total +
         // timing) plus `update._meta.modelId`. Accumulate them into `turn_meta`
@@ -611,32 +632,9 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             }
             "tool_call_update" => {
                 let id = str_field(update, "toolCallId");
-                // A trailing update after task_completed must not overwrite the
-                // authoritative snapshot output.
-                if !finalized_tools.contains(&id) {
-                    let output = update_tool_output(update);
-                    let failed = update.get("status").and_then(Value::as_str) == Some("failed");
-                    apply_tool_result(assistant.as_mut(), &tool_result_idx, &id, output, failed);
-                }
-            }
-            "task_completed" => {
-                let snap = update.get("task_snapshot");
-                let id = snap.map(|s| str_field(s, "task_id")).unwrap_or_default();
-                let output = snap
-                    .and_then(|s| s.get("output"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| truncate_str(s, GROK_TOOL_OUTPUT_CAP));
-                let failed = snap
-                    .and_then(|s| s.get("exit_code"))
-                    .and_then(Value::as_i64)
-                    .is_some_and(|code| code != 0);
-                // task_completed is authoritative for a backgrounded command;
-                // finalize the id so a trailing tool_call_update can't clobber it.
+                let output = update_tool_output(update);
+                let failed = update.get("status").and_then(Value::as_str) == Some("failed");
                 apply_tool_result(assistant.as_mut(), &tool_result_idx, &id, output, failed);
-                if !id.is_empty() {
-                    finalized_tools.insert(id);
-                }
             }
             "turn_completed" => {
                 if let Some(mut turn) = assistant.take() {
@@ -690,8 +688,21 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     images: Vec::new(),
                 });
             }
-            // task_backgrounded / plan / other extension updates carry no
-            // distinct rendered content beyond what the tool stream already has.
+            // `task_backgrounded` / `task_completed` / plan / other extension
+            // updates carry no distinct rendered content beyond what the tool
+            // stream already has.
+            //
+            // In particular `task_completed`'s snapshot is deliberately NOT
+            // applied to the launching tool call: Grok reports that CALL as
+            // `completed` on the wire (it did start the task), the live path
+            // never receives this ext notification at all, and the task's real
+            // outcome — command, exit code, output — renders from the
+            // `get_command_or_subagent_output` polls (see
+            // `grok_task_output_envelope`). Writing the snapshot here would make
+            // history contradict live for the same conversation.
+            //
+            // Known gap: a task the model never polls has its output ONLY in
+            // this snapshot, so neither path surfaces it.
             _ => {}
         }
     }
@@ -969,9 +980,10 @@ fn grok_mcp_output_text(raw_output: &Value) -> Option<String> {
 
 /// Extract the tool output text from a `tool_call_update`. Prefers the ACP
 /// `content[]` array (`{type:"content", content:{type:"text", text}}`), then
-/// `rawOutput.output_for_prompt` (Bash/terminal), then an MCP `rawOutput`'s
-/// `output` text (`use_tool`). All are cumulative, so the last update per call
-/// carries the full output.
+/// `rawOutput.output_for_prompt` (Bash/terminal), then a `TaskOutput` envelope
+/// (background-task polls — see `grok_task_output_envelope`), then an MCP
+/// `rawOutput`'s `output` text (`use_tool`). All are cumulative, so the last
+/// update per call carries the full output.
 fn update_tool_output(update: &Value) -> Option<String> {
     if let Some(items) = update.get("content").and_then(Value::as_array) {
         let mut buf = String::new();
@@ -998,6 +1010,9 @@ fn update_tool_output(update: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
     {
         return Some(truncate_str(text, GROK_TOOL_OUTPUT_CAP));
+    }
+    if let Some(envelope) = update.get("rawOutput").and_then(grok_task_output_envelope) {
+        return Some(envelope);
     }
     update
         .get("rawOutput")
@@ -1028,14 +1043,47 @@ fn grok_mcp_input_preview(input: &Value) -> Option<String> {
     if input.is_null() {
         return None;
     }
-    let mut per_string = GROK_TOOL_INPUT_CAP;
+    cap_json_to_budget(input, GROK_TOOL_INPUT_CAP)
+}
+
+/// Serialize `value` as JSON that stays VALID within `budget` bytes: cap every
+/// string value, halving the per-string cap until the WHOLE serialized form
+/// fits. Checking the actual serialized length each pass is what bounds every
+/// bloat vector (many strings, long arrays, JSON/UTF-8 escaping that expands
+/// bytes) — a single per-field cap could not. Converges in O(log budget) passes;
+/// an already-small value returns on the first pass unchanged.
+fn cap_json_to_budget(value: &Value, budget: usize) -> Option<String> {
+    let mut per_string = budget;
     loop {
-        let serialized = serde_json::to_string(&cap_json_string_values(input, per_string)).ok()?;
-        if serialized.len() <= GROK_TOOL_INPUT_CAP || per_string == 0 {
+        let serialized = serde_json::to_string(&cap_json_string_values(value, per_string)).ok()?;
+        if serialized.len() <= budget || per_string == 0 {
             return Some(serialized);
         }
         per_string /= 2;
     }
+}
+
+/// Serialize a Grok `TaskOutput` `rawOutput` — the result of a
+/// `get_command_or_subagent_output` poll — for the frontend, which parses it
+/// into a background-task card (`@/lib/background-task`). Returns `None` for
+/// every other `rawOutput`, so the caller falls through to its normal paths.
+///
+/// The WHOLE envelope is passed through verbatim (bounded by
+/// [`GROK_TASK_OUTPUT_CAP`]): its `type` discriminator is what lets the frontend
+/// claim it without hijacking other JSON tool output, and passing it whole means
+/// the variants Grok can put beside it (`Result`, `MultiResult`, `TaskNotFound`)
+/// need no per-variant handling here. Without this the readable output — the
+/// command, exit code and shell text all live under `Result` — is dropped
+/// entirely: `content[]` is absent on these updates, and the `output_for_prompt`
+/// / MCP paths don't match.
+///
+/// Shared with the live path (`acp::connection::grok_live_tool_output`) so both
+/// hand the frontend a byte-identical string.
+pub(crate) fn grok_task_output_envelope(raw_output: &Value) -> Option<String> {
+    if raw_output.get("type").and_then(Value::as_str) != Some("TaskOutput") {
+        return None;
+    }
+    cap_json_to_budget(raw_output, GROK_TASK_OUTPUT_CAP)
 }
 
 /// Truncate every string value in a JSON value to `cap` chars, preserving
@@ -1061,8 +1109,7 @@ fn cap_json_string_values(value: &Value, cap: usize) -> Value {
 /// Update the `ToolResult` block correlated to `id` in the current turn. Grok's
 /// `tool_call_update.content` is cumulative, and callers only pass `Some` output
 /// when non-empty, so the last non-empty output wins; `failed` only ever sets
-/// the error flag (never clears it). Ordering vs. `task_completed` is enforced
-/// by the caller's `finalized_tools` gate, not here.
+/// the error flag (never clears it).
 fn apply_tool_result(
     turn: Option<&mut MessageTurn>,
     tool_result_idx: &std::collections::HashMap<String, usize>,
@@ -1297,14 +1344,21 @@ mod tests {
         "\n",
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"正在执行"}}},"timestamp":1783584029}"#,
         "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#,
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build","background":true},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#,
         "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"partial output"}}]}},"timestamp":1783584033}"#,
+        // The only event pairing the task id with the launching tool call.
+        r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","tool_call_id":"call-1","task_id":"term_x","command":"pnpm build"}},"timestamp":1783584029}"#,
         "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"call-1","output":"build ok","exit_code":0}}},"timestamp":1783584122}"#,
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","title":"[bg] pnpm build (term_x)","content":[{"type":"content","content":{"type":"text","text":"Background task term_x started"}}]}},"timestamp":1783584033}"#,
         "\n",
-        // Trailing (stale) update AFTER task_completed — must NOT clobber "build ok".
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"STALE trailing output"}}]}},"timestamp":1783584123}"#,
+        // Snapshot keyed by `task_id` — deliberately ignored, so the launch call
+        // stays exactly as the wire (and the live path) reports it.
+        r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"term_x","command":"/bin/bash -lc 'pnpm build'","output":"boom","exit_code":1}}},"timestamp":1783584122}"#,
+        "\n",
+        // The model polls the task; its whole result lives in `rawOutput`.
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-2","title":"get_command_or_subagent_output","rawInput":{"task_ids":["term_x"],"timeout_ms":15000},"_meta":{"x.ai/tool":{"name":"get_command_or_subagent_output","kind":"background_task_action"}}}},"timestamp":1783584123}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-2","status":"completed","title":"/bin/bash -lc 'pnpm build' (term_x)","rawOutput":{"type":"TaskOutput","Result":{"task_id":"term_x","command":"/bin/bash -lc 'pnpm build'","status":"failed","exit_code":1,"output":"boom"}}}},"timestamp":1783584124}"#,
         "\n",
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584129}"#,
         "\n",
@@ -1357,8 +1411,11 @@ mod tests {
         assert!(
             matches!(tool_use, ContentBlock::ToolUse { tool_name, .. } if tool_name == "run_terminal_command")
         );
-        // task_completed output ("build ok") is authoritative over the streamed
-        // "partial output", and exit_code 0 → not an error.
+        // The launch keeps its own "started" text and its wire status: Grok
+        // reports the CALL as completed (it did start the task), and the failing
+        // `task_completed` snapshot is not applied — otherwise history would
+        // contradict the live path, which never sees that ext notification. The
+        // task's failure surfaces on the poll below.
         let tool_result = last
             .blocks
             .iter()
@@ -1367,8 +1424,93 @@ mod tests {
         assert!(matches!(
             tool_result,
             ContentBlock::ToolResult { output_preview, is_error, .. }
-                if output_preview.as_deref() == Some("build ok") && !*is_error
+                if output_preview.as_deref() == Some("Background task term_x started") && !*is_error
         ));
+    }
+
+    /// A `get_command_or_subagent_output` poll carries its whole result in
+    /// `rawOutput` (no `content[]`, no `output_for_prompt`), which used to be
+    /// dropped — leaving the card empty. It must reach the frontend verbatim so
+    /// the background-task card can render command/status/exit code/output.
+    #[test]
+    fn background_task_poll_surfaces_task_output_envelope() {
+        let (_tmp, sessions) = fixture(SUMMARY, UPDATES);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let blocks = &detail.turns[3].blocks;
+
+        let poll = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_name,
+                    tool_use_id,
+                    ..
+                } => Some((tool_name, tool_use_id)),
+                _ => None,
+            })
+            .find(|(name, _)| name.as_str() == "get_command_or_subagent_output")
+            .expect("poll tool use");
+        assert_eq!(poll.1.as_deref(), Some("call-2"));
+
+        let output = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    ..
+                } if tool_use_id.as_deref() == Some("call-2") => output_preview.clone(),
+                _ => None,
+            })
+            .expect("poll ToolResult output");
+        let env: Value = serde_json::from_str(&output).expect("envelope is valid JSON");
+        assert_eq!(env["type"], "TaskOutput");
+        assert_eq!(env["Result"]["exit_code"], 1);
+        assert_eq!(env["Result"]["status"], "failed");
+        assert_eq!(env["Result"]["output"], "boom");
+    }
+
+    /// Grok injects reminders as `user_message_chunk`s flagged
+    /// `_meta.hideFromScrollback`. Rendering them as user bubbles split one reply
+    /// into two turns with a raw `<system-reminder>` wedged between.
+    #[test]
+    fn hidden_user_chunk_does_not_split_the_reply() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"启动服务"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"已启动"}}},"timestamp":1783584020}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584021}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 1).\n</system-reminder>"},"_meta":{"modelId":"grok-4.5","promptIndex":1,"hideFromScrollback":true}}},"timestamp":1783584022}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"那次失败可以忽略"}}},"timestamp":1783584023}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+
+        // One real prompt + the two assistant replies; no reminder bubble.
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1
+        );
+        assert!(!detail.turns.iter().any(|t| t.blocks.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("system-reminder"))
+        )));
+        assert!(
+            matches!(&detail.turns[2].blocks[0], ContentBlock::Text { text } if text == "那次失败可以忽略")
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 /**
- * Shared parsing + detection helpers for Claude Code's built-in background-task
- * tools (`Bash(run_in_background)` launch → `TaskOutput` polls → `TaskStop`).
+ * Shared parsing + detection helpers for built-in background-task tools:
+ * Claude Code's (`Bash(run_in_background)` launch → `TaskOutput` polls →
+ * `TaskStop`) and Grok's (`run_terminal_command(background)` launch →
+ * `get_command_or_subagent_output` polls).
  *
  * Claude Code starts a background shell with `Bash(run_in_background: true)`,
  * whose result is a launch line carrying the task id ("Command running in
@@ -16,12 +18,21 @@
  *   stop  → {"message":"Successfully stopped task: … (<command>)",
  *           "task_id":…, "task_type":…, "command":…}
  *
+ * Grok reports the same lifecycle as a JSON envelope instead — its poll's whole
+ * result sits in the ACP `rawOutput`, which both paths hand over verbatim
+ * (`parsers/grok.rs::grok_task_output_envelope`, shared with the live path):
+ *
+ *   poll  → {"type":"TaskOutput","Result":{task_id, command, status,
+ *            exit_code, output, …}}   (also `MultiResult` / `TaskNotFound`)
+ *   launch→ "Background task <id> started"
+ *
  * The same task is polled repeatedly (first timeout/running, then
  * success/completed), so the renderer collapses consecutive polls of one task
  * id into a single lifecycle card — mirroring the delegation-status group
  * (`@/lib/delegation-status`). Codeg owns only the rendering: the backend
- * (`parsers/claude.rs`) passes the tool-result text through verbatim, so all
- * parsing lives here (same convention as `delegation-status.ts`).
+ * (`parsers/claude.rs`, `parsers/grok.rs`) passes the tool-result text through
+ * verbatim, so all parsing lives here (same convention as
+ * `delegation-status.ts`).
  */
 
 import { isUnsettledToolCall } from "@/lib/tool-call-lifecycle"
@@ -125,26 +136,130 @@ function parseStopEnvelope(text: string): BackgroundTaskEnvelope | null {
   }
 }
 
+/** Statuses Grok reports for a task that was ended rather than allowed to
+ *  finish — mapped to the `stop` kind so the row reads "stopped". */
+const GROK_STOPPED_STATUSES: ReadonlySet<string> = new Set([
+  "killed",
+  "stopped",
+  "cancelled",
+  "canceled",
+])
+
+/** Map one Grok `TaskOutputResult` onto the shared envelope. `status` is passed
+ *  through verbatim (lower-cased) — `deriveBackgroundBadge` reads it. */
+function grokResultToEnvelope(
+  result: Record<string, unknown>
+): BackgroundTaskEnvelope | null {
+  const taskId = typeof result.task_id === "string" ? result.task_id : null
+  const command = typeof result.command === "string" ? result.command : null
+  const status =
+    typeof result.status === "string"
+      ? result.status.trim().toLowerCase()
+      : null
+  // Require something identifying so a stray `{type:"TaskOutput"}` isn't read
+  // as a real (blank) task row.
+  if (taskId == null && command == null && status == null) return null
+  const output = typeof result.output === "string" ? result.output : null
+  const exitCode =
+    typeof result.exit_code === "number" && Number.isFinite(result.exit_code)
+      ? result.exit_code
+      : null
+  return {
+    kind: status != null && GROK_STOPPED_STATUSES.has(status) ? "stop" : "poll",
+    retrievalStatus: null,
+    taskId,
+    taskType: null,
+    status,
+    exitCode,
+    output,
+    command,
+    message: null,
+  }
+}
+
+/**
+ * Collect the result objects out of a Grok `TaskOutput` envelope. `Result` is
+ * the single-task variant (the only one captured from a real session);
+ * `MultiResult` wraps several, and `TaskNotFound` carries none. The MultiResult
+ * walk is deliberately shape-tolerant — it takes the first array of objects it
+ * finds — because its field names aren't pinned by any capture we have.
+ */
+function grokResultObjects(
+  envelope: Record<string, unknown>
+): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  const push = (value: unknown) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      out.push(value as Record<string, unknown>)
+    }
+  }
+  push(envelope.Result)
+  const multi = envelope.MultiResult
+  if (multi && typeof multi === "object" && !Array.isArray(multi)) {
+    for (const value of Object.values(multi as Record<string, unknown>)) {
+      if (Array.isArray(value)) {
+        value.forEach(push)
+        break
+      }
+    }
+  }
+  return out
+}
+
+/** Parse a Grok `get_command_or_subagent_output` result. Strict on the `type`
+ *  discriminator so other JSON tool output is never hijacked. */
+function parseGrokTaskOutputEnvelopes(text: string): BackgroundTaskEnvelope[] {
+  if (!text.startsWith("{")) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // A truncated envelope (an enormous log) degrades to the generic card
+    // rather than rendering a half-parsed task.
+    return []
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return []
+  const envelope = parsed as Record<string, unknown>
+  if (envelope.type !== "TaskOutput") return []
+  return grokResultObjects(envelope)
+    .map(grokResultToEnvelope)
+    .filter((e): e is BackgroundTaskEnvelope => e !== null)
+}
+
+/** Every task reported by one background-task tool result: a single envelope for
+ *  Claude Code's poll/stop shapes, and one per task for Grok's `TaskOutput`
+ *  (whose `MultiResult` variant can cover several). Empty when the text is
+ *  neither (callers fall back to generic rendering). */
+export function parseBackgroundTaskEnvelopes(
+  text: string | null | undefined
+): BackgroundTaskEnvelope[] {
+  const raw = text?.trim()
+  if (!raw) return []
+  const single = parsePollEnvelope(raw) ?? parseStopEnvelope(raw)
+  if (single) return [single]
+  return parseGrokTaskOutputEnvelopes(raw)
+}
+
 /** Parse a background-task tool result into its structured envelope, or `null`
- *  when the text is neither a `TaskOutput` poll nor a `TaskStop` ack (callers
- *  fall back to generic rendering). */
+ *  when the text is none of the recognized shapes (callers fall back to generic
+ *  rendering). The FIRST task when a result covers several. */
 export function parseBackgroundTaskEnvelope(
   text: string | null | undefined
 ): BackgroundTaskEnvelope | null {
-  const raw = text?.trim()
-  if (!raw) return null
-  return parsePollEnvelope(raw) ?? parseStopEnvelope(raw)
+  return parseBackgroundTaskEnvelopes(text)[0] ?? null
 }
 
 const LAUNCH_RE = /Command running in background with ID:\s*([A-Za-z0-9_-]+)/i
+/** Grok's `run_terminal_command(background: true)` acknowledgement. */
+const GROK_LAUNCH_RE = /Background task\s+([A-Za-z0-9_-]+)\s+started/i
 
-/** Recognize the `Bash(run_in_background: true)` launch result and pull the task
- *  id. Lets the command card flag itself as a background launch. */
+/** Recognize a background launch result and pull the task id. Lets the command
+ *  card flag itself as a background launch. */
 export function parseBackgroundLaunch(
   text: string | null | undefined
 ): { taskId: string } | null {
   if (!text) return null
-  const match = text.match(LAUNCH_RE)
+  const match = text.match(LAUNCH_RE) ?? text.match(GROK_LAUNCH_RE)
   return match ? { taskId: match[1] } : null
 }
 
@@ -169,27 +284,42 @@ function parseInputObject(
   }
 }
 
-/** A `TaskOutput` poll's input shape: `{task_id, block?, timeout?}`. The
- *  `block`/`timeout` requirement is what distinguishes it from `cancel_delegation`
- *  / `TaskStop` (which carry a bare `{task_id}`); `subagent_type` is excluded so
- *  real sub-agent `Agent`/`Task` calls never match. Catches the live in-flight
- *  poll before its output (and thus its envelope) has arrived. */
+/** A poll's input shape — Claude Code's `{task_id, block?, timeout?}` or Grok's
+ *  `{task_ids: [...], timeout_ms}`. The `block`/`timeout`/`timeout_ms`
+ *  requirement is what distinguishes them from `cancel_delegation` / `TaskStop`
+ *  (bare `{task_id}`) and `get_delegation_status` (`{task_ids, wait_ms}`);
+ *  `subagent_type` is excluded so real sub-agent `Agent`/`Task` calls never
+ *  match. Catches the live in-flight poll before its output (and thus its
+ *  envelope) has arrived. */
 function inputIsBackgroundPoll(input: string | null | undefined): boolean {
   const obj = parseInputObject(input)
   if (!obj) return false
-  if (typeof obj.task_id !== "string" || obj.task_id.length === 0) return false
   if ("subagent_type" in obj) return false
-  return "block" in obj || "timeout" in obj
+  if (typeof obj.task_id === "string" && obj.task_id.length > 0) {
+    return "block" in obj || "timeout" in obj
+  }
+  return (
+    Array.isArray(obj.task_ids) &&
+    obj.task_ids.length > 0 &&
+    obj.task_ids.every((id) => typeof id === "string") &&
+    "timeout_ms" in obj
+  )
 }
 
 /**
- * Whether a tool-call part is a Claude Code background-task poll/stop. True when
- * ANY holds: the raw tool name is `TaskOutput`/`TaskStop` (historical path); the
- * output parses as a background-task envelope (covers the live `task` alias and
- * any naming); or the input is a `TaskOutput` poll shape (covers the live
- * in-flight poll). Deliberately does NOT match real sub-agent `Agent` calls
- * (`subagent_type`), `get_delegation_status` (`task_ids` + JSON), or
- * `cancel_delegation` (bare `{task_id}`).
+ * Whether a tool-call part is a background-task poll/stop. True when ANY holds:
+ * the raw tool name is `TaskOutput`/`TaskStop` (Claude Code's historical path);
+ * the output parses as a background-task envelope (covers Claude's live `task`
+ * alias, Grok's `TaskOutput` JSON, and any naming); or the input is a poll shape
+ * (covers the live in-flight poll). Deliberately does NOT match real sub-agent
+ * `Agent` calls (`subagent_type`), `get_delegation_status` (`task_ids` +
+ * `wait_ms`), or `cancel_delegation` (bare `{task_id}`).
+ *
+ * Grok's `get_command_or_subagent_output` is intentionally absent from
+ * `BACKGROUND_TASK_NAMES`: the same tool also polls sub-agents, whose result is
+ * a completely different `SubagentCompleted` payload. Matching on the envelope
+ * (plus the in-flight input shape) means a sub-agent poll leaves this lane the
+ * moment its result lands, keeping its generic rendering.
  */
 export function isBackgroundTaskToolCall(part: AdaptedToolCallPart): boolean {
   if (BACKGROUND_TASK_NAMES.has(part.toolName.trim().toLowerCase())) return true
@@ -198,7 +328,17 @@ export function isBackgroundTaskToolCall(part: AdaptedToolCallPart): boolean {
   ) {
     return true
   }
-  return inputIsBackgroundPoll(part.input)
+  if (!inputIsBackgroundPoll(part.input)) return false
+  // The input shape alone cannot tell a background-command poll from a sub-agent
+  // poll — Grok's `get_command_or_subagent_output` does both with identical
+  // args. So the input shape only claims a call that is STILL IN FLIGHT (its
+  // documented purpose: render the live card in the lane it will settle into).
+  // Once settled, the envelope check above is the sole authority, so a sub-agent
+  // result — `SubagentCompleted`, which no backend path serializes into
+  // `part.output` at all — falls back to generic rendering instead of showing a
+  // permanently "running" background row. Claude Code's own polls are unaffected:
+  // they are claimed by name.
+  return isUnsettledToolCall(part)
 }
 
 export type BackgroundTaskBadge = "running" | "completed" | "failed" | "stopped"
@@ -221,9 +361,17 @@ export interface BackgroundTaskRow {
 
 function inputTaskId(input: string | null | undefined): string | null {
   const obj = parseInputObject(input)
-  return obj && typeof obj.task_id === "string" && obj.task_id.length > 0
-    ? obj.task_id
-    : null
+  if (!obj) return null
+  if (typeof obj.task_id === "string" && obj.task_id.length > 0) {
+    return obj.task_id
+  }
+  // Grok polls by list; a single-task poll still identifies its row, which is
+  // what lets an in-flight poll merge into the same row as its settled sibling.
+  if (Array.isArray(obj.task_ids) && obj.task_ids.length === 1) {
+    const [id] = obj.task_ids
+    if (typeof id === "string" && id.length > 0) return id
+  }
+  return null
 }
 
 function isInFlightState(part: AdaptedToolCallPart): boolean {
@@ -235,6 +383,10 @@ function deriveBackgroundBadge(
   part: AdaptedToolCallPart
 ): BackgroundTaskBadge {
   if (envelope?.kind === "stop") return "stopped"
+  // Grok reports the outcome in `status` itself; Claude Code only ever says
+  // running/completed, so this is inert for it. Checked before `completed` so a
+  // failure with no exit code (a spawn error) doesn't read as success.
+  if (envelope?.status === "failed") return "failed"
   if (envelope?.status === "completed") {
     return envelope.exitCode != null && envelope.exitCode !== 0
       ? "failed"
@@ -271,10 +423,10 @@ export function buildBackgroundTaskRows(
     string,
     { taskId: string | null; entries: ParsedBackgroundPoll[] }
   >()
-  for (const poll of polls) {
-    const envelope = parseBackgroundTaskEnvelope(
-      poll.output ?? poll.errorText ?? null
-    )
+  const record = (
+    poll: AdaptedToolCallPart,
+    envelope: BackgroundTaskEnvelope | null
+  ) => {
     const taskId = envelope?.taskId ?? inputTaskId(poll.input) ?? null
     // Drop an unsettled poll that carries no identity AND no output yet — a live
     // `TaskOutput` whose `task_id` hasn't streamed onto the wire. claude-agent-acp
@@ -289,7 +441,7 @@ export function buildBackgroundTaskRows(
     // settled — which would otherwise re-stack after the turn completes.
     // Mirrors `buildDelegationTaskRows`.
     if (taskId == null && envelope == null && isUnsettledToolCall(poll)) {
-      continue
+      return
     }
     const key = taskId ?? `__bg__:${poll.toolCallId}`
     let entry = byKey.get(key)
@@ -300,6 +452,20 @@ export function buildBackgroundTaskRows(
     }
     entry.entries.push({ poll, envelope })
   }
+
+  for (const poll of polls) {
+    // One poll can report several tasks (Grok's `MultiResult`), so each
+    // envelope is attributed to its own row.
+    const envelopes = parseBackgroundTaskEnvelopes(
+      poll.output ?? poll.errorText ?? null
+    )
+    if (envelopes.length === 0) {
+      record(poll, null)
+      continue
+    }
+    for (const envelope of envelopes) record(poll, envelope)
+  }
+
   return order.map((key) => {
     const entry = byKey.get(key)!
     const latest = entry.entries[entry.entries.length - 1]

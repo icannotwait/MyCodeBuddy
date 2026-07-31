@@ -65,8 +65,8 @@ import {
   type OverlaySize,
 } from "@/lib/overlay-size-storage"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
+import { getAgentLabel } from "@/lib/custom-agents"
 import {
-  AGENT_LABELS,
   type DelegationActivityView,
   type WorkflowGraphSnapshot,
 } from "@/lib/types"
@@ -909,7 +909,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           </span>
           <span className="min-w-0 break-words text-xs font-semibold text-foreground">
             {agentDisplayLabel ??
-              (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
+              (agentType ? getAgentLabel(agentType) : t("unknownAgent"))}
           </span>
           {taskId && (
             <span
@@ -991,7 +991,7 @@ const NativeActivityRow = memo(function NativeActivityRow({
             <AgentIcon agentType={activity.platform} className="h-3.5 w-3.5" />
           </span>
           <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-            {AGENT_LABELS[activity.platform] ?? tDel("unknownAgent")}
+            {getAgentLabel(activity.platform) ?? tDel("unknownAgent")}
           </span>
           {activity.task_id && (
             <span

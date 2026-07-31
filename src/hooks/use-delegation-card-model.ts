@@ -22,6 +22,7 @@ import {
   ALL_AGENT_TYPES,
   type AgentType,
   type AttentionRequestSummary,
+  type BuiltinAgentType,
   type CardSummary,
   type DelegationRunSnapshot,
   type DelegationRuntimeStats,
@@ -201,10 +202,18 @@ function cardStatusFromLifecycle(
   }
 }
 
+const BUILTIN_AGENT_TYPE_IDS = new Set<string>(ALL_AGENT_TYPES)
+
+function isBuiltinAgentType(
+  agentType: AgentType
+): agentType is BuiltinAgentType {
+  return BUILTIN_AGENT_TYPE_IDS.has(agentType)
+}
+
 function agentTypeFromRunSnapshot(
   snapshot: DelegationRunSnapshot | null
 ): AgentType | null {
-  if (!snapshot || !ALL_AGENT_TYPES.includes(snapshot.agent_type)) return null
+  if (!snapshot || !isBuiltinAgentType(snapshot.agent_type)) return null
   return snapshot.agent_type
 }
 

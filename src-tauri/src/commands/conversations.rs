@@ -12,6 +12,7 @@ use crate::db::service::{conversation_service, folder_service, import_service, t
 use crate::db::AppDatabase;
 use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
+use crate::parsers::acp_native::AcpNativeParser;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
@@ -235,7 +236,7 @@ fn list_conversations_sync(
     let mut all_rows: Vec<(AgentType, ConversationSummary)> = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
+    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
         (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
         (AgentType::Codex, Box::new(CodexParser::new())),
         (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
@@ -248,6 +249,11 @@ fn list_conversations_sync(
         (AgentType::Grok, Box::new(GrokParser::new())),
         (AgentType::Cursor, Box::new(CursorParser::new())),
     ];
+    // Registered custom agents read back from codeg's own ACP transcripts, so
+    // their sessions participate in folder grouping and stats like any other.
+    for custom in crate::acp::custom_registry::all() {
+        parsers.push((custom, Box::new(AcpNativeParser::new(custom))));
+    }
 
     for (at, parser) in &parsers {
         if let Some(ref agent_filter) = agent_type {
@@ -393,6 +399,9 @@ pub async fn get_conversation_core(
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
             AgentType::Cursor => Box::new(CursorParser::new()),
+            // Custom ACP agents have no native store to reverse-engineer;
+            // their history is codeg's own ACP transcript.
+            AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
         };
 
         let detail = parser
@@ -1479,6 +1488,7 @@ pub async fn get_folder_conversation_core(
                     AgentType::Pi => Box::new(PiParser::new()),
                     AgentType::Grok => Box::new(GrokParser::new()),
                     AgentType::Cursor => Box::new(CursorParser::new()),
+                    AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
                 };
                 match parser.get_conversation(&eid) {
                     Ok(d) => {
@@ -5692,10 +5702,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 continue;
             }
             let p = &*evt.payload;
-            if p["kind"] == "close"
-                && p["folder_id"] == folder_id
-                && p["cause"] == "auto_empty"
-            {
+            if p["kind"] == "close" && p["folder_id"] == folder_id && p["cause"] == "auto_empty" {
                 saw_auto_empty_close = true;
             }
         }
@@ -6422,14 +6429,14 @@ Call get_delegation_status with the returned task_id to collect the result.";
                     upsert_before_close = true;
                 }
             }
-            if p["kind"] == "close"
-                && p["folder_id"] == folder_id
-                && p["cause"] == "auto_empty"
-            {
+            if p["kind"] == "close" && p["folder_id"] == folder_id && p["cause"] == "auto_empty" {
                 saw_auto_empty_close = true;
             }
         }
-        assert!(saw_upsert, "empty-group import still Upserts the reopened folder");
+        assert!(
+            saw_upsert,
+            "empty-group import still Upserts the reopened folder"
+        );
         assert!(
             saw_auto_empty_close,
             "zero-live import group must emit Close{{AutoEmpty}}"

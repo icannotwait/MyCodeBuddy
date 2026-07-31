@@ -1190,9 +1190,8 @@ pub async fn focus_conversation_window(
 ) -> Result<bool, AppCommandError> {
     let label = conversation_window_label(conversation_id);
     if let Some(existing) = app.get_webview_window(&label) {
-        activate_conversation_window(&existing).map_err(|e| {
-            AppCommandError::window("Failed to focus conversation window", e)
-        })?;
+        activate_conversation_window(&existing)
+            .map_err(|e| AppCommandError::window("Failed to focus conversation window", e))?;
         return Ok(true);
     }
     Ok(false)

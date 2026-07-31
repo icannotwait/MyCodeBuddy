@@ -206,7 +206,15 @@
       "downloadFailed": "업데이트 패키지 다운로드에 실패했습니다. 잠시 후 다시 시도하세요.",
       "installFailed": "업데이트 설치에 실패했습니다. 앱을 종료한 뒤 다시 시도하세요.",
       "unknown": "업데이트에 실패했습니다. 잠시 후 다시 시도하세요."
-    }
+    },
+    "newVersionBadge": "새 버전 v{version}",
+    "updateAvailableTitle": "업데이트 있음",
+    "releaseNotesTitle": "새로운 기능",
+    "remindLater": "나중에",
+    "retry": "다시 시도",
+    "stepDownload": "다운로드",
+    "stepInstall": "설치",
+    "stepRestart": "다시 시작"
   },
   "VersionControlSettings": {
     "loading": "로딩 중...",
@@ -540,6 +548,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK 관리",
     "description": "Agent SDK 연결, 활성화 상태, 환경 변수, 구성 관리, 버전 사전 점검 정보를 한곳에서 관리합니다.",
+    "showThinking": "Show thinking",
     "loadingAgents": "에이전트 목록 불러오는 중...",
     "agentList": "에이전트 목록",
     "emptyNoAgent": "사용 가능한 에이전트가 없습니다.",
@@ -751,7 +760,9 @@
       "loggedIn": "계정 로그인됨",
       "loginRelogin": "재로그인 / 계정 전환",
       "loginTimeout": "로그인 시간 초과, 다시 시도해 주세요",
-      "loginSaveFailed": "로그인 성공했지만 설정 저장 실패"
+      "loginSaveFailed": "로그인 성공했지만 설정 저장 실패",
+      "enableFast": "Fast 활성화",
+      "enableFastAria": "Codex용 Fast 서비스 계층 활성화"
     },
     "gemini": {
       "authConfig": "Gemini 인증 설정",
@@ -881,46 +892,78 @@
       "loginHint": "API 키가 없나요? 터미널에서 ‘codebuddy’를 실행하여 Tencent 계정으로 로그인할 수도 있습니다."
     },
     "kimiCode": {
-      "configManagement": "Kimi Code Configuration",
-      "configDescription": "`kimi acp` only authenticates with a stored login token and rejects API keys on their own. To use an API key, codeg writes a managed ~/.kimi-code/config.toml provider AND seeds a local gate token so the session opens — inference still runs on your key.",
-      "gateReadyApiKey": "Authenticated via API key (codeg seeded the local gate token).",
-      "gateReadyLogin": "Authenticated via a Kimi account login.",
-      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
-      "authModeLabel": "Authentication method",
-      "authModeApiKey": "API key",
-      "authModeLogin": "Kimi account login (subscription)",
-      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "interfaceTypeLabel": "Provider type",
-      "interfaceTypeHint": "The provider protocol Kimi speaks (config.toml `type`). Use Kimi / Moonshot for a Moonshot / platform.kimi.com key.",
-      "endpointLabel": "Endpoint",
-      "endpointCustom": "Custom (OpenAI-compatible)",
-      "endpointHint": "International = api.moonshot.ai; China (platform.kimi.com keys) = api.moonshot.cn. Custom points at any OpenAI-compatible endpoint.",
-      "regionInternational": "International (api.moonshot.ai)",
-      "regionChina": "China (api.moonshot.cn)",
+      "configManagement": "Kimi Code 설정",
+      "configDescription": "`kimi acp`는 저장된 로그인 토큰만 인정하므로, codeg가 ~/.kimi-code/config.toml에 관리형 공급자를 기록하고 로컬에 게이트 토큰을 심습니다. 추론은 여전히 사용자의 키로 실행됩니다.",
+      "statusUnconfigured": "아직 설정되지 않음",
+      "statusDirty": "저장되지 않은 변경 사항",
+      "summaryLabel": "적용된 설정",
+      "gateReadyApiKey": "API 키가 config.toml에 기록됨",
+      "gateReadyLogin": "Kimi 계정으로 로그인됨",
+      "revealConfig": "폴더에서 보기",
+      "envOverrideWarning": "{keys}이(가) 설정되어 있으며 config.toml보다 우선합니다. 여기서 저장하면 자동으로 삭제됩니다.",
+      "authModeLabel": "인증 방식",
+      "authModeApiKey": "API 키",
+      "authModeLogin": "Kimi 계정 로그인(구독)",
+      "authModeApiKeyHint": "config.toml에 관리형 공급자를 기록하고, 세션이 열리도록 게이트 토큰을 심습니다.",
+      "loginHint": "터미널에서 `kimi login`을 실행해 Kimi 구독 계정으로 로그인하세요. codeg는 자격 증명을 저장하지 않고 Kimi 자체 로그인을 재사용합니다. 여기서 저장하면 codeg의 API 키 게이트 토큰이 제거됩니다.",
+      "credentialTitle": "자격 증명",
+      "interfaceTypeLabel": "공급자 유형",
+      "interfaceTypeHint": "Kimi가 사용하는 공급자 프로토콜(config.toml의 `type`). Moonshot / platform.kimi.com 키라면 「Kimi / Moonshot」을 선택하세요.",
+      "endpointLabel": "엔드포인트",
+      "endpointCustom": "사용자 지정(OpenAI 호환)",
+      "endpointHint": "국제 = api.moonshot.ai, 중국(platform.kimi.com 키) = api.moonshot.cn. 사용자 지정은 모든 OpenAI 호환 엔드포인트를 가리킬 수 있습니다.",
+      "regionInternational": "국제(api.moonshot.ai)",
+      "regionChina": "중국(api.moonshot.cn)",
       "baseUrlLabel": "Base URL",
-      "baseUrlHint": "Leave blank to use the provider SDK default.",
-      "apiKeyLabel": "API Key",
-      "apiKeyHint": "Written to ~/.kimi-code/config.toml and used for inference. From platform.kimi.com or platform.kimi.ai.",
-      "authTypeLabel": "Advanced: credential placement",
-      "authTypeApiKey": "Inline api_key",
-      "authTypeEnv": "Provider env sub-table",
-      "authTypeHint": "Where the API key is written inside config.toml.",
-      "vertexProjectLabel": "GCP project (GOOGLE_CLOUD_PROJECT)",
-      "vertexLocationLabel": "GCP location (GOOGLE_CLOUD_LOCATION)",
-      "vertexHint": "Vertex AI uses Google Application Default Credentials — run `gcloud auth application-default login` (no API key).",
-      "modelLabel": "Model",
-      "modelHint": "The model id to use. Click Fetch to list the models your key can access (e.g. kimi-k2.7-code) — avoids “model not found” errors.",
-      "fetchModels": "Fetch",
-      "fetchModelsOk": "Found {count} models",
-      "fetchModelsEmpty": "Key works, but no models were returned",
-      "fetchModelsFailed": "Couldn’t list models — check the key and endpoint",
-      "fetchModelsNeedsKey": "Enter an API key and endpoint first",
-      "maxContextLabel": "Max context size (optional)",
-      "maxContextHint": "Tokens, e.g. 262144. Leave blank to use the model default.",
-      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account (device-code OAuth). codeg stores nothing and reuses Kimi’s own login. Saving here removes codeg’s API-key gate token.",
-      "rawEditorLabel": "Advanced: edit config.toml directly",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "baseUrlHint": "비워 두면 공급자 SDK 기본값을 사용합니다.",
+      "apiKeyLabel": "API 키",
+      "apiKeyHint": "~/.kimi-code/config.toml에 기록되어 추론에 사용됩니다. platform.kimi.com 또는 platform.kimi.ai에서 발급받습니다.",
+      "vertexProjectLabel": "GCP 프로젝트(GOOGLE_CLOUD_PROJECT)",
+      "vertexLocationLabel": "GCP 리전(GOOGLE_CLOUD_LOCATION)",
+      "vertexHint": "Vertex AI는 Google 애플리케이션 기본 자격 증명을 사용합니다. `gcloud auth application-default login`을 실행하세요(API 키 불필요).",
+      "modelTitle": "모델",
+      "modelLabel": "모델",
+      "modelHint": "config.toml에 기록되는 모델 id입니다. 「테스트 후 모델 가져오기」로 키가 실제로 접근 가능한 모델을 확인하세요.",
+      "maxContextLabel": "최대 컨텍스트 길이",
+      "maxContextHint": "Kimi 스키마에서 필수입니다. 값이 없으면 Kimi가 모델 블록 전체를 버려 모든 프롬프트가 응답 없이 끝납니다. 기본값은 262144입니다.",
+      "fetchModels": "테스트 후 모델 가져오기",
+      "fetchModelsOk": "키 정상 — 모델 {count}개 사용 가능",
+      "fetchModelsEmpty": "키는 정상이지만 반환된 모델이 없습니다",
+      "fetchModelsFailed": "테스트 실패",
+      "fetchModelsNeedsKey": "먼저 API 키와 엔드포인트를 입력하세요",
+      "modelNotInList": "이 모델은 키가 접근할 수 있는 목록에 없습니다. Kimi가 「모델을 찾을 수 없음」으로 실패합니다.",
+      "reasoningTitle": "추론",
+      "reasoningEnableLabel": "사용",
+      "reasoningDescription": "모델이 추론 기능을 선언한 경우에만 Kimi가 입력창에 「Thinking」선택기를 표시하므로, codeg가 여기서 그 선언을 기록합니다. 새 세션부터 적용됩니다.",
+      "effortsLabel": "제공할 단계",
+      "effortsHint": "여기서 고른 값이 입력창 「Thinking」선택기의 항목이 됩니다. Kimi는 단계를 공급자에게 그대로 전달하므로 모델이 받아들이는 값을 고르세요.",
+      "effortsEmptyHint": "단계를 하나도 고르지 않으면 입력창은 Off / On 2단 토글로 축소됩니다.",
+      "effortsCustomPlaceholder": "다른 단계 추가",
+      "effortsAdd": "추가",
+      "defaultEffortLabel": "기본 단계",
+      "defaultEffortAuto": "Kimi에 맡기기",
+      "alwaysThinkingLabel": "모델이 항상 추론함 — 선택기에서 Off 항목 제거",
+      "fixErrorsFirst": "먼저 표시된 항목을 수정하세요",
+      "errorModelRequired": "모델은 필수 항목입니다",
+      "errorMaxContextRequired": "최대 컨텍스트 길이는 필수 항목입니다",
+      "errorMaxContextInvalid": "양의 정수여야 합니다",
+      "errorApiKeyRequired": "API 키는 필수 항목입니다",
+      "errorApiKeyInvalid": "API 키에는 줄바꿈을 포함할 수 없습니다",
+      "errorBaseUrlRequired": "Base URL은 필수 항목입니다",
+      "errorBaseUrlInvalid": "http:// 또는 https://로 시작해야 합니다",
+      "errorVertexProjectRequired": "GCP 프로젝트는 필수 항목입니다",
+      "errorDefaultEffortUnlisted": "위에서 선택한 단계 중 하나여야 합니다",
+      "advancedTitle": "고급",
+      "authTypeLabel": "자격 증명 기록 위치",
+      "authTypeApiKey": "인라인 api_key",
+      "authTypeEnv": "공급자 env 하위 테이블",
+      "authTypeHint": "config.toml 안에서 API 키를 기록할 위치입니다.",
+      "rawEditorLabel": "config.toml 직접 편집",
+      "rawEditorWarning": "여기서 저장하면 파일 전체가 그대로 덮어써져 위의 구조화된 설정이 대체됩니다.",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
+      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
     },
     "authModeOfficialSubscription": "공식 구독",
     "authModeCustomEndpoint": "사용자 정의 엔드포인트",
@@ -994,6 +1037,7 @@
       "localVersionRemoved": "로컬 버전이 제거되었습니다",
       "saveAgentOrderFailed": "Agent 순서 저장 실패",
       "saveAgentSwitchFailed": "Agent 스위치 저장 실패",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "환경 변수 저장 실패",
       "grokSaved": "Grok 설정이 저장됨",
       "saveGrokNativeFailed": "Grok 네이티브 설정 저장 실패",
@@ -1037,7 +1081,6 @@
       "piBinaryUninstalled": "pi 제거됨",
       "piBinaryUninstallFailed": "pi 제거 실패",
       "savePiTrustFailed": "작업 공간 신뢰 저장 실패",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "cursorSaved": "Cursor 설정이 저장되었습니다",
       "saveCursorConfigFailed": "Cursor 설정 저장 실패"
     },
@@ -1053,7 +1096,9 @@
       "remoteUnavailable": "{versionText}. 현재 원격 버전을 사용할 수 없습니다.",
       "latest": "{versionText}. 이미 최신입니다.",
       "bundled": "내장 버전: {version}",
-      "bundledMissing": "내장 어댑터가 없습니다. DrawCode를 다시 설치하거나 업데이트하세요."
+      "bundledMissing": "내장 어댑터가 없습니다. DrawCode를 다시 설치하거나 업데이트하세요.",
+      "localOnly": "로컬: {localVersion}",
+      "localInstalled": "{versionText}. 설치되어 있습니다."
     },
     "cline": {
       "configDescription": "Cline API 제공자와 자격 증명을 구성합니다. 설정은 ~/.cline/data/에 저장됩니다."
@@ -1129,7 +1174,6 @@
       "trustHint": "여기서 여는 폴더만 신뢰되며 전체 컴퓨터는 신뢰되지 않습니다. 또한 설정 로드에만 영향을 주며 pi가 실행할 수 있는 작업에는 영향을 주지 않습니다.",
       "configDirSkillsNote": "사용자 지정 구성 디렉터리를 설정하면 설정에서 관리하는 스킬, 전문가, 오피스 도구가 이 pi에 적용되지 않습니다. 해당 폴더에서 스킬을 직접 관리하세요."
     },
-    "showThinking": "Show thinking",
     "cursor": {
       "configDescription": "여기에서 Cursor를 설정합니다. 먼저 인증 방식을 선택하세요——공식 구독(브라우저 로그인) 또는 헤드리스/서버용 Cursor API 키——그런 다음 모델을 선택하고 CLI의 권한 규칙과 샌드박스를 편집합니다. codeg는 이를 ~/.cursor/cli-config.json에 기록하며 cursor-agent CLI와 공유합니다.",
       "authTitle": "인증",
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "일치하는 모델 없음",
       "modelsNeedAuth": "로그인하면 모델 목록을 불러옵니다.",
       "modelDefaultBadge": "기본값"
-    }
+    },
+    "addCustomAgent": "사용자 지정 에이전트 추가",
+    "addCustomAgentHint": "ACP를 지원하는 모든 에이전트를 등록할 수 있습니다. 공개 ACP 레지스트리에서 선택하거나 레지스트리 정보를 붙여넣으세요.",
+    "customAgentFromRegistry": "ACP 레지스트리",
+    "customAgentManual": "직접 입력",
+    "customAgentSearchPlaceholder": "에이전트 검색…",
+    "customAgentLoadingCatalog": "ACP 레지스트리를 불러오는 중…",
+    "customAgentRetry": "다시 시도",
+    "customAgentNoResults": "일치하는 에이전트가 없습니다",
+    "customAgentAdd": "추가",
+    "customAgentAlreadyAdded": "추가됨",
+    "customAgentUnsupportedPlatform": "이 플랫폼용 빌드가 없습니다",
+    "customAgentAdded": "{name} 추가됨",
+    "customAgentIdLabel": "레지스트리 ID",
+    "customAgentNameLabel": "표시 이름",
+    "customAgentVersionLabel": "버전",
+    "customAgentSpecLabel": "배포 정보(JSON)",
+    "customAgentSpecHint": "ACP 레지스트리의 distribution 객체와 동일한 형식입니다. npx·uvx·binary 채널을 지원하며 레지스트리 항목 전체를 붙여넣어도 됩니다. npx/uvx의 cmd는 패키지가 설치하는 실행 명령 이름으로, 생략하면 패키지 이름에서 유도되므로 서로 다를 때는 지정하세요. binary는 플랫폼 키로 구분하며(이 컴퓨터: {platform}) cmd는 아카이브 내 실행 경로, sha256은 선택 사항으로 다운로드를 검증합니다.",
+    "customAgentTemplateLabel": "템플릿",
+    "customAgentKindLabel": "실행 방식",
+    "customAgentInvalidJson": "올바른 JSON이 아닙니다",
+    "customAgentNoDistribution": "npx, uvx, binary 배포를 찾을 수 없습니다",
+    "customAgentCancel": "취소",
+    "customAgentSave": "에이전트 추가",
+    "customAgentSaveChanges": "변경 사항 저장",
+    "customAgentEdit": "에이전트 편집",
+    "customAgentEditHint": "이름, 아이콘, 배포 정보, 스킬 선언을 수정할 수 있습니다. 에이전트 ID는 변경할 수 없습니다.",
+    "customAgentEditNotFound": "커스텀 에이전트 {id}을(를) 찾을 수 없습니다",
+    "customAgentSaved": "{name} 저장됨",
+    "customAgentVersionProbeLabel": "버전 조회 명령(선택)",
+    "customAgentVersionProbeHint": "로컬에 설치된 버전을 출력하는 명령입니다. 비워 두면 에이전트 명령에 --version을 붙여 실행합니다.",
+    "customAgentRemove": "에이전트 제거",
+    "customAgentRemoveHint": "에이전트 정의를 삭제합니다. 기존 대화 기록은 유지되며 에이전트를 더 이상 실행할 수 없게 될 뿐입니다.",
+    "customAgentIconLabel": "아이콘(선택)",
+    "customAgentIconUpload": "업로드",
+    "customAgentIconReplace": "변경",
+    "customAgentIconClear": "아이콘 제거",
+    "customAgentIconHint": "에이전트와 함께 저장되어 오프라인에서도 표시됩니다. 지정하지 않으면 색상 이니셜을 사용합니다.",
+    "customAgentSkillsLabel": "Skills(공유 .agents/skills)",
+    "customAgentSkillsHint": "이 에이전트가 공유 .agents/skills 디렉터리(전역 및 프로젝트)를 읽는다고 선언하고 모든 스킬 매트릭스에 추가합니다. 공유 디렉터리에 연결된 스킬은 해당 디렉터리를 읽는 다른 에이전트에게도 보입니다.",
+    "customAgentSkillsDirLabel": "전용 스킬 디렉터리",
+    "customAgentSkillsDirHint": "이 에이전트가 스킬을 불러오는 디렉터리의 절대 경로입니다. 공유 저장소와 함께 또는 단독으로 사용할 수 있습니다. ~ 는 홈 디렉터리로 확장되며, 연결된 스킬은 이 디렉터리에 우선 배치됩니다.",
+    "customAgentIconNotAnImage": "이미지 파일을 선택하세요.",
+    "customAgentIconTooLarge": "아이콘은 {limit} KB 미만이어야 합니다.",
+    "customAgentIconReadFailed": "해당 이미지를 읽을 수 없습니다.",
+    "customAgentRemoveConfirm": "{name}을(를) 제거할까요? 기존 대화는 유지되지만 더 이상 실행할 수 없습니다.",
+    "customAgentRemoveWithData": "기록된 대화 기록도 삭제",
+    "customAgentRemoved": "{name} 제거됨",
+    "customAgentBadge": "사용자 지정",
+    "customAgentNotLaunchable": "이 환경에서는 실행할 수 없습니다: {reason}"
   },
   "SettingsPages": {
     "agentsLoading": "에이전트 설정을 불러오는 중...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "다른 항목 닫기",
       "closeAll": "모두 닫기",
       "tileDisplay": "타일 표시",
-      "untileDisplay": "타일 해제"
+      "untileDisplay": "타일 해제",
+      "splitRight": "오른쪽으로 분할",
+      "splitDown": "아래로 분할",
+      "splitAndMoveRight": "분할하고 오른쪽으로 이동",
+      "splitAndMoveDown": "분할하고 아래로 이동",
+      "moveToOppositeGroup": "반대쪽 그룹으로 이동",
+      "moveToGroup": "그룹으로 이동",
+      "groupLabel": "그룹 {index}",
+      "changeSplitterOrientation": "분할 방향 전환",
+      "unsplit": "분할 해제",
+      "unsplitAll": "모든 분할 해제"
     },
     "fileWorkspace": {
       "files": "파일",
@@ -1995,7 +2098,10 @@
         "current": "현재",
         "remoteBranches": "원격 브랜치",
         "refreshCommitHistory": "커밋 히스토리 새로고침",
-        "clearBranchFilterAria": "브랜치 필터 지우기"
+        "clearBranchFilterAria": "브랜치 필터 지우기",
+        "head": "HEAD",
+        "headHint": "현재 브랜치를 따라감",
+        "headHintWithBranch": "현재 브랜치를 따라감 ({branch})"
       },
       "dialogs": {
         "newBranchTitle": "새 브랜치",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "세션 생성 및 설정 불러오는 중"
         },
         "errors": {
-          "connectionFailed": "연결 실패"
+          "connectionFailed": "연결 실패",
+          "sendPromptFailed": "메시지 전송에 실패했습니다: {error}"
         }
       },
       "shared": {
@@ -2382,6 +2489,8 @@
         "askAnything": "무엇이든 물어보세요...",
         "removeAttachmentAria": "{name} 제거",
         "attachFiles": "파일 첨부",
+        "attachLocalUpload": "로컬 파일 첨부",
+        "attachServerFile": "서버 파일 첨부",
         "addActions": "추가",
         "quickMessages": "빠른 메시지",
         "quickMessagesEmpty": "빠른 메시지가 없습니다",
@@ -2413,8 +2522,6 @@
         "experts": "전문가",
         "office": "일상 업무",
         "research": "과학 연구",
-        "attachLocalUpload": "로컬 파일 첨부",
-        "attachServerFile": "서버 파일 첨부",
         "attachUploadTooLarge": "{names}이(가) {limit}MB 업로드 한도를 초과하여 건너뛰었습니다.",
         "attachUploadFailed": "{names} 업로드 실패.",
         "attachUploadNotAFile": "{names} 은(는) 일반 파일이 아니므로(디렉터리 또는 특수 파일) 건너뛰었습니다.",
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "스킬",
         "mentionInvalidPattern": "잘못된 정규식",
         "mentionSourceError": "이 소스를 새로 고치지 못했습니다",
-        "mentionProfileError": "위임 프로필을 불러오지 못했습니다"
+        "mentionProfileError": "위임 프로필을 불러오지 못했습니다",
+        "attachUploadInProgress": "이미지가 아직 업로드 중입니다. 잠시 후 다시 시도하세요."
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",
@@ -2959,7 +3067,8 @@
           "webSearchWithQuery": "WebSearch ({query})",
           "todosProgress": "할 일 ({done}/{total})",
           "skillWithName": "Skill: {name}",
-          "genericWithContext": "{tool} ({context})"
+          "genericWithContext": "{tool} ({context})",
+          "listFilesWithPath": "파일 목록 {path}"
         },
         "toolGroup": {
           "search": "{count}회 검색",
@@ -2992,6 +3101,13 @@
           "polledTimes": "{count}회 폴링",
           "runningInBackground": "백그라운드",
           "launchNote": "백그라운드에서 실행 중 · {id}"
+        },
+        "agentLiveTranscript": "실시간 활동",
+        "search": {
+          "noMatches": "일치하는 결과 없음",
+          "matchSummary": "{matches}개 일치 · {files}개 파일",
+          "fileSummary": "{files}개 파일",
+          "moreResults": "{count}개 결과가 더 있음(표시되지 않음)"
         }
       },
       "messageNav": {
@@ -3128,6 +3244,16 @@
       "proposedPlan": {
         "title": "제안된 계획",
         "planning": "계획 중…"
+      },
+      "fileActions": {
+        "openInFinder": "Finder에서 열기",
+        "openInExplorer": "Explorer에서 열기",
+        "openInFileManager": "파일 관리자에서 열기",
+        "copyRelativePath": "상대 경로 복사",
+        "copyAbsolutePath": "절대 경로 복사",
+        "pathCopied": "경로가 복사되었습니다",
+        "copyPathFailed": "경로 복사에 실패했습니다",
+        "openFailed": "로컬 파일 열기 실패"
       }
     },
     "diffPreview": {
@@ -3299,6 +3425,18 @@
     "emptyDirectory": "이 디렉토리는 비어 있습니다",
     "errorLoadingDir": "디렉토리 로딩 실패",
     "permissionDenied": "권한이 없습니다"
+  },
+  "ServerFileBrowser": {
+    "title": "서버 파일 선택",
+    "pathPlaceholder": "디렉토리 경로 입력...",
+    "goHome": "홈 디렉토리로",
+    "navigateUp": "상위 디렉토리로",
+    "select": "선택",
+    "cancel": "취소",
+    "loading": "로드 중...",
+    "emptyDirectory": "이 디렉토리는 비어 있습니다",
+    "errorLoadingDir": "디렉토리 로드 실패",
+    "selectedCount": "{count}개 선택됨"
   },
   "ChatChannelSettings": {
     "loading": "로딩 중...",
@@ -3880,18 +4018,6 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
-  },
-  "ServerFileBrowser": {
-    "title": "서버 파일 선택",
-    "pathPlaceholder": "디렉토리 경로 입력...",
-    "goHome": "홈 디렉토리로",
-    "navigateUp": "상위 디렉토리로",
-    "select": "선택",
-    "cancel": "취소",
-    "loading": "로드 중...",
-    "emptyDirectory": "이 디렉토리는 비어 있습니다",
-    "errorLoadingDir": "디렉토리 로드 실패",
-    "selectedCount": "{count}개 선택됨"
   },
   "BackupSettings": {
     "title": "백업 및 복원",

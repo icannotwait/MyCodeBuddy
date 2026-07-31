@@ -50,6 +50,10 @@ fn build_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
         AgentType::Pi => Box::new(PiParser::new()),
         AgentType::Grok => Box::new(GrokParser::new()),
         AgentType::Cursor => Box::new(CursorParser::new()),
+        // Custom agents' history lives in codeg's own ACP transcript.
+        AgentType::Custom(_) => {
+            Box::new(crate::parsers::acp_native::AcpNativeParser::new(agent_type))
+        }
     }
 }
 

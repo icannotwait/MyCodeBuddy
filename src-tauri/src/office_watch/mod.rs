@@ -647,14 +647,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// cannot pin a PowerShell/`sleep` process for 10 minutes; long enough that
 /// normal test body work finishes first. Callers must still use the Drop
 /// guard / `remove_*` so cleanup is prompt under success and panic.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 const TEST_SLEEPER_SECS: u64 = 30;
 
 /// Spawn a short-lived "live child" for registry/liveness tests.
 ///
 /// Uses `kill_on_drop(true)` so dropping the [`Child`] (via [`reap_join_test_child`]
 /// or process exit) always terminates the sleeper.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 fn spawn_test_sleeper_child() -> Child {
     #[cfg(windows)]
     let mut sleeper = {
@@ -678,7 +678,7 @@ fn spawn_test_sleeper_child() -> Child {
 }
 
 /// Kill and join a test sleeper so it cannot outlive the calling test.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 fn reap_join_test_child(mut child: Child) {
     let _ = child.start_kill();
     // Poll briefly for exit so we don't leave a detached sleeper racing Drop.
@@ -693,13 +693,8 @@ fn reap_join_test_child(mut child: Child) {
     let _ = child.start_kill();
 }
 
-#[cfg(feature = "test-utils")]
-fn insert_test_watch_entry(
-    key: String,
-    port: u16,
-    cap: &str,
-    file_canonical: PathBuf,
-) {
+#[cfg(any(test, feature = "test-utils"))]
+fn insert_test_watch_entry(key: String, port: u16, cap: &str, file_canonical: PathBuf) {
     let child = spawn_test_sleeper_child();
     lock_watches().insert(
         key,
@@ -716,7 +711,7 @@ fn insert_test_watch_entry(
     );
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 fn remove_and_reap_test_watch(key: &str) {
     if let Some(entry) = lock_watches().remove(key) {
         reap_join_test_child(entry.child);
@@ -728,7 +723,7 @@ fn remove_and_reap_test_watch(key: &str) {
 ///
 /// Prefer pairing with [`remove_known_port_for_test`] in a `defer`/finally path;
 /// the child is also capped at [`TEST_SLEEPER_SECS`] and uses `kill_on_drop`.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn insert_known_port_for_test(port: u16, cap: &str) {
     insert_test_watch_entry(
         format!("__test__:{port}"),
@@ -738,7 +733,7 @@ pub fn insert_known_port_for_test(port: u16, cap: &str) {
     );
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn remove_known_port_for_test(port: u16) {
     remove_and_reap_test_watch(&format!("__test__:{port}"));
 }
@@ -748,13 +743,13 @@ pub fn remove_known_port_for_test(port: u16) {
 ///
 /// **Always** reaps the sleeper on drop (success, early return, or panic), so a
 /// 10-minute PowerShell sleeper cannot leak from these tests.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct KnownWatchForFileGuard {
     port: u16,
     key: String,
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl KnownWatchForFileGuard {
     /// Install a live registry entry under `file_canonical` and return a guard
     /// that kills/joins the child when dropped.
@@ -769,7 +764,7 @@ impl KnownWatchForFileGuard {
     }
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl Drop for KnownWatchForFileGuard {
     fn drop(&mut self) {
         remove_and_reap_test_watch(&self.key);
@@ -779,17 +774,12 @@ impl Drop for KnownWatchForFileGuard {
 /// Seed a live watch under a path. Prefer [`KnownWatchForFileGuard::install`] so
 /// cleanup is panic-safe; this free form remains for call sites that already
 /// pair with [`remove_known_watch_for_file_for_test`].
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn insert_known_watch_for_file_for_test(port: u16, cap: &str, file_canonical: PathBuf) {
-    insert_test_watch_entry(
-        format!("__test_file__:{port}"),
-        port,
-        cap,
-        file_canonical,
-    );
+    insert_test_watch_entry(format!("__test_file__:{port}"), port, cap, file_canonical);
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn remove_known_watch_for_file_for_test(port: u16) {
     remove_and_reap_test_watch(&format!("__test_file__:{port}"));
 }

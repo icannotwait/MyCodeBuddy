@@ -139,6 +139,7 @@ mod tests {
             role: MessageRole::Assistant,
             content: vec![LiveContentBlock::Text {
                 text: text.to_string(),
+                parent_tool_use_id: None,
             }],
             started_at: Utc
                 .timestamp_opt(started_secs, 0)

@@ -217,3 +217,67 @@ describe("AgentToolCallPart cursor task outcome envelope", () => {
     ).toBeInTheDocument()
   })
 })
+
+describe("AgentToolCallPart live subagent transcript", () => {
+  const withTranscript = (
+    state: ToolCallPart["state"],
+    entries: NonNullable<ToolCallPart["agentTranscript"]>
+  ): ToolCallPart => ({
+    ...basePart(
+      JSON.stringify({ subagent_type: "Explore", description: "scan" }),
+      state
+    ),
+    agentTranscript: entries,
+  })
+
+  /** The capsule body is collapsed by default while running (matching the
+   *  existing child-tool-call UX) — expand it via the pill trigger. */
+  const expandRunningCapsule = () =>
+    fireEvent.click(screen.getByRole("button", { name: "Running" }))
+
+  it("renders text and thinking entries while running", () => {
+    renderCard(
+      withTranscript("input-available", [
+        { type: "thinking", text: "planning the sweep" },
+        { type: "text", text: "found three matches" },
+      ])
+    )
+    expandRunningCapsule()
+    expect(screen.getByText("Live activity")).toBeInTheDocument()
+    expect(screen.getByText("planning the sweep")).toBeInTheDocument()
+    expect(screen.getByText("found three matches")).toBeInTheDocument()
+  })
+
+  it("skips empty thinking entries and renders nothing when settled", () => {
+    renderCard(
+      withTranscript("input-available", [{ type: "thinking", text: "   " }])
+    )
+    expandRunningCapsule()
+    // Label shows (the list is non-empty) but the blank entry renders nothing.
+    expect(screen.getByText("Live activity")).toBeInTheDocument()
+
+    // A settled card never shows the transcript section — the store stops
+    // attaching it, and even a stale prop must not render.
+    const settled = withTranscript("output-available", [
+      { type: "text", text: "stale transcript" },
+    ])
+    renderCard({ ...settled, output: "final result" })
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.queryByText("stale transcript")).not.toBeInTheDocument()
+    expect(screen.getByText("final result")).toBeInTheDocument()
+  })
+
+  it("bounds the rendered tail to the newest entries", () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      type: "text" as const,
+      text: `entry-${i}`,
+    }))
+    renderCard(withTranscript("input-available", entries))
+    expandRunningCapsule()
+    // 25 entries, tail bound 20 → the first five never mount.
+    expect(screen.queryByText("entry-0")).not.toBeInTheDocument()
+    expect(screen.queryByText("entry-4")).not.toBeInTheDocument()
+    expect(screen.getByText("entry-5")).toBeInTheDocument()
+    expect(screen.getByText("entry-24")).toBeInTheDocument()
+  })
+})

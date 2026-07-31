@@ -6,6 +6,7 @@ pub mod codex_cli;
 pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod connection;
+pub mod custom_registry;
 pub mod delegation;
 #[cfg(feature = "tauri-runtime")]
 pub mod desktop_event_batcher;
@@ -26,8 +27,10 @@ pub mod owner_rebind;
 pub mod perf_fixture;
 pub mod plan_approval;
 pub mod preflight;
+pub mod prompt_hydration;
 pub mod question;
 pub mod registry;
+pub mod remote_registry;
 pub mod session_attach;
 pub mod session_info;
 pub mod session_state;

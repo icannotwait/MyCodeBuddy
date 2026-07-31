@@ -150,6 +150,14 @@ fn is_idle_for_residual(state: &SessionState, now: chrono::DateTime<chrono::Utc>
         && !state.has_active_background_work(now)
 }
 
+/// Grace window `disconnect_all` waits after firing every `Disconnect` before
+/// hard-killing surviving agent process trees. Long enough for a driver thread
+/// to unwind and run its own post-loop cleanup (delegation/question/plan-approval
+/// reclaim), short enough not to stall a quit noticeably. It is NOT there to
+/// make the agent's death gentler — the graceful path ends in the same
+/// `kill_tree`.
+const DISCONNECT_ALL_GRACE: Duration = Duration::from_millis(500);
+
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
 /// never land here: it would collide with a persisted transcript turn id and let
@@ -709,6 +717,7 @@ impl ConnectionManager {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -781,6 +790,7 @@ impl ConnectionManager {
                 route_preference: None,
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
         );
     }
@@ -845,6 +855,7 @@ impl ConnectionManager {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -2408,7 +2419,7 @@ impl ConnectionManager {
         &self,
         db: &AppDatabase,
         conn_id: &str,
-        blocks: Vec<PromptInputBlock>,
+        mut blocks: Vec<PromptInputBlock>,
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
@@ -2474,6 +2485,23 @@ impl ConnectionManager {
 
         self.admit_external_prompt(&state_arc, conversation_id, admission_source)
             .await?;
+
+        // Re-hydrate uploaded image attachments (web / remote-workspace mode
+        // sends empty-payload marker blocks with a `file://` uri into the
+        // uploads root; see `prompt_hydration`). Deliberately placed AFTER
+        // admission — the connection-exists check (`clone_prompt_lock` above)
+        // and the busy reject — so garbage or concurrent prompts never
+        // trigger file reads, and the prompt lock we hold serializes
+        // hydration per connection (a natural concurrency bound). Still
+        // BEFORE any side effect (linking / row creation / status flip) and
+        // before the `user_blocks_from_prompt` projection below, so a failure
+        // aborts cleanly and the viewer broadcast, the sender echo, and the
+        // agent all see the full bytes.
+        crate::acp::prompt_hydration::hydrate_prompt_blocks(
+            &mut blocks,
+            &crate::paths::codeg_uploads_root(),
+        )
+        .await?;
 
         if !already_linked {
             match (conversation_id, folder_id) {
@@ -4803,6 +4831,13 @@ impl ConnectionManager {
         })
     }
 
+    /// Disconnect every current connection, then hard-kill any agent process
+    /// tree whose live PID remains published after the grace window.
+    ///
+    /// `take_connections_for_disconnect` preserves the fork's watchdog and
+    /// incarnation fences before anything becomes unroutable. PID cells stay
+    /// shared with the process callbacks so a late spawn is still reached and
+    /// a process reaped during the grace window is skipped.
     pub async fn disconnect_all(&self) -> usize {
         let ids: Vec<String> = {
             let connections = self.connections.lock().await;
@@ -4810,10 +4845,49 @@ impl ConnectionManager {
         };
         let removed = self.take_connections_for_disconnect(ids).await;
         let disconnected = removed.len();
-        for (_id, conn) in removed {
-            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
+        let handles: Vec<(
+            LaneSender<ConnectionControl>,
+            Arc<std::sync::atomic::AtomicU32>,
+        )> = removed
+            .into_iter()
+            .map(|(_id, conn)| (conn.control_tx, conn.child_pid))
+            .collect();
+
+        // Shutdown cannot wait for a saturated command lane. A missed graceful
+        // signal is covered by the process-tree backstop below.
+        for (control_tx, _) in &handles {
+            let _ = control_tx.try_send(ConnectionControl::Disconnect);
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
+
+        if disconnected == 0 {
+            return 0;
+        }
+
+        tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+
+        let pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> =
+            handles.into_iter().map(|(_, pid)| pid).collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            for cell in pid_cells {
+                // Load only after the grace window. The process may have
+                // spawned late or its reaper may have cleared this cell.
+                let pid = cell.load(std::sync::atomic::Ordering::SeqCst);
+                if pid == 0 {
+                    continue;
+                }
+                match kill_tree::blocking::kill_tree(pid) {
+                    Ok(_) => tracing::info!(
+                        "[ACP] disconnect_all backstop killed process tree pid={pid}"
+                    ),
+                    Err(error) => tracing::debug!(
+                        "[ACP] disconnect_all backstop kill_tree pid={pid}: {error}"
+                    ),
+                }
+            }
+        })
+        .await;
+
         disconnected
     }
 
@@ -6178,6 +6252,15 @@ mod tests {
         Arc::new(TestNoPlanApprovals)
     }
 
+    struct AllAgentsAvailable;
+
+    #[async_trait::async_trait]
+    impl crate::acp::connection::AgentAvailabilityLookup for AllAgentsAvailable {
+        async fn disabled_agent_wire_slugs(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
     #[test]
     fn internal_probe_launch_context_tags_internal_probe_purpose() {
         // Policy used by `probe_agent_options`: InternalProbe, no inherited
@@ -6654,7 +6737,168 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Spawn a two-level process tree: `sh` (the stand-in for the agent CLI)
+    /// backgrounds a `sleep` grandchild (the stand-in for the agent's own
+    /// children — an MCP server, a forked `node`) and records its pid. The
+    /// grandchild is what the backstop assertions are about: it is the process
+    /// that gets reparented and lingers when only the direct child is killed.
+    ///
+    /// Returns the direct child — keep it alive, dropping a `Child` does NOT
+    /// kill it — and the grandchild pid.
+    #[cfg(unix)]
+    async fn spawn_process_tree(pidfile: &std::path::Path) -> (std::process::Child, i32) {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        for _ in 0..150 {
+            if let Ok(raw) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    return (child, pid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Bail-out path still reaps the tree, so a failing test can't leave a
+        // `sleep` behind for 30s.
+        let _ = kill_tree::blocking::kill_tree(child.id());
+        let _ = child.wait();
+        panic!("grandchild never recorded its pid");
+    }
+
+    /// True once `pid` is gone. `kill(pid, 0)` sends no signal, it only probes
+    /// existence; polling keeps the assertion from racing kernel teardown.
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32) -> bool {
+        for _ in 0..150 {
+            // SAFETY: signal 0 only probes for existence; it sends no signal.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence; it sends no signal.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Quit has to kill the agent's whole process TREE. Killing just the direct
+    /// child leaves its children reparented and lingering — that orphan window
+    /// is the entire reason the backstop exists.
+    ///
+    /// The test connection's command receiver is dropped, so the graceful path
+    /// is unavailable and the kill can only come from the backstop.
+    /// Unix-only (relies on `sh` / `kill(2)`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_kills_the_whole_agent_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-tree", None);
+        conn.child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-tree".to_string(), conn);
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        assert!(
+            wait_until_dead(gpid).await,
+            "grandchild {gpid} survived — the quit backstop did not kill the tree"
+        );
+        let _ = child.wait();
+    }
+
+    /// A connection still `Connecting` when quit begins publishes its pid AFTER
+    /// the map is drained. Reading the pids up front would see `0` there and
+    /// skip it, leaking exactly the orphan this exists to kill — so the load
+    /// has to happen after the grace window, from the live cell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_reaches_a_child_that_spawns_during_the_grace_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-late", None);
+        // Still 0 at drain time, exactly like a connection whose agent process
+        // hasn't launched yet.
+        let cell = Arc::clone(&conn.child_pid);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-late".to_string(), conn);
+
+        let pid = child.id();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cell.store(pid, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        assert!(
+            wait_until_dead(gpid).await,
+            "grandchild {gpid} survived — a pid published during the grace window was missed"
+        );
+        let _ = child.wait();
+    }
+
+    /// The mirror image: once the agent process has been reaped, the `on_exit`
+    /// callback zeroes the cell and the backstop must leave that pid alone.
+    /// Without the clear, a quit fires `kill_tree` at a pid whose process is
+    /// already dead and reaped — and if the OS recycled that number, the victim
+    /// is an unrelated process tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_leaves_a_cleared_pid_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-cleared", None);
+        conn.child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        let cell = Arc::clone(&conn.child_pid);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-cleared".to_string(), conn);
+
+        // Stands in for the driver unwinding mid-window: the process is gone
+        // and the guard has zeroed the cell.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cell.store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        // Settle: a wrongly-issued SIGTERM would have landed by now.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            is_alive(gpid),
+            "backstop killed a tree whose pid the driver had already cleared"
+        );
+
+        let _ = kill_tree::blocking::kill_tree(child.id());
+        let _ = child.wait();
     }
 
     /// Build a broadcaster + subscribed receiver. Subscribing here (not lazily
@@ -6747,6 +6991,7 @@ mod tests {
                 route_preference: None,
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             };
             mgr.connections
                 .lock()
@@ -7253,6 +7498,7 @@ mod tests {
                 route_preference: None,
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             };
             mgr.connections
                 .lock()
@@ -9240,6 +9486,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -10105,6 +10352,7 @@ mod tests {
             &EventEmitter::Noop,
             AcpEvent::ContentDelta {
                 text: "title delta".into(),
+                parent_tool_use_id: None,
             },
         )
         .await;
@@ -10322,6 +10570,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         mgr.connections
             .lock()
@@ -10870,6 +11119,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -13064,6 +13314,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -13555,6 +13806,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = ConnectionManager::new();
         {
@@ -14487,6 +14739,7 @@ mod tests {
             tokens: Arc::clone(&tokens),
             leases: Arc::clone(&leases),
             socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            agent_availability: Arc::new(AllAgentsAvailable),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
@@ -14574,6 +14827,7 @@ mod tests {
                 route_preference: None,
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
         );
 
@@ -14688,6 +14942,7 @@ mod tests {
             tokens: Arc::clone(&tokens),
             leases: Arc::clone(&leases),
             socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            agent_availability: Arc::new(AllAgentsAvailable),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
@@ -14748,6 +15003,7 @@ mod tests {
                 route_preference: None,
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
         );
 
@@ -15109,6 +15365,7 @@ mod tests {
             tokens,
             leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: std::path::PathBuf::from("cleanup.sock"),
+            agent_availability: Arc::new(AllAgentsAvailable),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
@@ -15403,6 +15660,7 @@ mod tests {
             tokens,
             leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: std::path::PathBuf::from("cleanup-queued.sock"),
+            agent_availability: Arc::new(AllAgentsAvailable),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
@@ -15849,6 +16107,7 @@ mod tests {
             tokens,
             leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: std::path::PathBuf::from("cleanup-admitted.sock"),
+            agent_availability: Arc::new(AllAgentsAvailable),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),

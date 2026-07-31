@@ -206,7 +206,15 @@
       "downloadFailed": "下载更新包失败，请稍后重试。",
       "installFailed": "安装更新失败，请关闭应用后重试。",
       "unknown": "更新失败，请稍后重试。"
-    }
+    },
+    "newVersionBadge": "新版本 v{version}",
+    "updateAvailableTitle": "发现新版本",
+    "releaseNotesTitle": "更新内容",
+    "remindLater": "稍后",
+    "retry": "重试",
+    "stepDownload": "下载",
+    "stepInstall": "安装",
+    "stepRestart": "重启"
   },
   "VersionControlSettings": {
     "loading": "加载中...",
@@ -752,7 +760,9 @@
       "loggedIn": "账号已登录",
       "loginRelogin": "重新登录 / 切换账号",
       "loginTimeout": "登录超时，请重试",
-      "loginSaveFailed": "登录成功但配置保存失败"
+      "loginSaveFailed": "登录成功但配置保存失败",
+      "enableFast": "启用 Fast",
+      "enableFastAria": "Codex 启用 Fast 服务等级"
     },
     "gemini": {
       "authConfig": "Gemini 认证配置",
@@ -883,14 +893,20 @@
     },
     "kimiCode": {
       "configManagement": "Kimi Code 配置",
-      "configDescription": "`kimi acp` 仅凭已存储的登录令牌鉴权，单独的 API Key 不被接受。为支持 API Key，codeg 会写入受管的 ~/.kimi-code/config.toml 供应商，并在本地播种一个门控令牌以打开会话——推理仍走你的 Key。",
-      "gateReadyApiKey": "已通过 API Key 鉴权（codeg 已播种本地门控令牌）。",
-      "gateReadyLogin": "已通过 Kimi 账号登录鉴权。",
-      "gateNotReady": "尚未鉴权——请在下方保存 API Key（或登录）以打开 Kimi 会话。",
+      "configDescription": "`kimi acp` 只认已存储的登录令牌，所以 codeg 会在 ~/.kimi-code/config.toml 写入受管供应商，并在本地播种一个门控令牌——推理仍然走你自己的 Key。",
+      "statusUnconfigured": "尚未配置",
+      "statusDirty": "有未保存的修改",
+      "summaryLabel": "生效配置",
+      "gateReadyApiKey": "API Key 已写入 config.toml",
+      "gateReadyLogin": "已通过 Kimi 账号登录",
+      "revealConfig": "在文件夹中显示",
+      "envOverrideWarning": "检测到 {keys}，其优先级高于 config.toml。在此保存会自动清除它。",
       "authModeLabel": "鉴权方式",
       "authModeApiKey": "API Key",
       "authModeLogin": "Kimi 账号登录（订阅）",
-      "authModeHint": "「API Key」写入受管 config.toml 供应商并播种门控令牌；「登录」会清除它并改用真实的 `kimi login` 会话（需要 Kimi 订阅）。",
+      "authModeApiKeyHint": "在 config.toml 写入受管供应商，并播种门控令牌以便会话能够打开。",
+      "loginHint": "在终端运行 `kimi login`，用 Kimi 订阅账号登录。codeg 不存储任何凭据，复用 Kimi 自己的登录。在此保存会移除 codeg 的 API Key 门控令牌。",
+      "credentialTitle": "凭据",
       "interfaceTypeLabel": "供应商类型",
       "interfaceTypeHint": "Kimi 使用的供应商协议（config.toml 的 `type`）。Moonshot / platform.kimi.com 的 Key 请选「Kimi / Moonshot」。",
       "endpointLabel": "接入点",
@@ -902,26 +918,52 @@
       "baseUrlHint": "留空则使用供应商 SDK 默认值。",
       "apiKeyLabel": "API Key",
       "apiKeyHint": "写入 ~/.kimi-code/config.toml 并用于推理。来自 platform.kimi.com 或 platform.kimi.ai。",
-      "authTypeLabel": "高级：凭据写入位置",
-      "authTypeApiKey": "内联 api_key",
-      "authTypeEnv": "供应商 env 子表",
-      "authTypeHint": "API Key 在 config.toml 中的写入位置。",
       "vertexProjectLabel": "GCP 项目（GOOGLE_CLOUD_PROJECT）",
       "vertexLocationLabel": "GCP 区域（GOOGLE_CLOUD_LOCATION）",
       "vertexHint": "Vertex AI 使用 Google 应用默认凭据——运行 `gcloud auth application-default login`（无需 API Key）。",
+      "modelTitle": "模型",
       "modelLabel": "模型",
-      "modelHint": "要使用的模型 id。点击「获取」可列出你的 Key 可访问的模型（如 kimi-k2.7-code），避免「模型不存在」错误。",
-      "fetchModels": "获取",
-      "fetchModelsOk": "找到 {count} 个模型",
-      "fetchModelsEmpty": "Key 有效，但未返回任何模型",
-      "fetchModelsFailed": "无法列出模型——请检查 Key 与接入点",
+      "modelHint": "写入 config.toml 的模型 id。点「测试并获取模型」可查看你的 Key 实际能访问哪些模型。",
+      "maxContextLabel": "最大上下文长度",
+      "maxContextHint": "Kimi 的配置 schema 要求必填：缺失会让 Kimi 丢弃整个模型块，导致每次对话都没有回复。默认 262144。",
+      "fetchModels": "测试并获取模型",
+      "fetchModelsOk": "Key 可用——共 {count} 个模型",
+      "fetchModelsEmpty": "Key 可用，但未返回任何模型",
+      "fetchModelsFailed": "测试失败",
       "fetchModelsNeedsKey": "请先填写 API Key 和接入点",
-      "maxContextLabel": "最大上下文长度（可选）",
-      "maxContextHint": "Token 数，例如 262144。留空则使用模型默认值。",
-      "loginHint": "在终端运行 `kimi login`，用 Kimi 订阅账号登录（设备码 OAuth）。codeg 不存储任何凭据，复用 Kimi 自己的登录。在此保存会移除 codeg 的 API Key 门控令牌。",
-      "rawEditorLabel": "高级：直接编辑 config.toml",
-      "rawEditorHint": "逐字写入（保留注释）并按 TOML 校验。codeg 同时会播种门控令牌以打开会话。",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "modelNotInList": "该模型不在你的 Key 可访问列表中，Kimi 会报「模型不存在」。",
+      "reasoningTitle": "推理",
+      "reasoningEnableLabel": "启用",
+      "reasoningDescription": "只有当模型声明了推理能力，Kimi 才会在输入框显示「Thinking」选择器，所以这里由 codeg 写入该声明。对新建会话生效。",
+      "effortsLabel": "可选档位",
+      "effortsHint": "这些会成为输入框「Thinking」选择器里的档位。Kimi 会把档位原样透传给供应商，请选你的模型能接受的值。",
+      "effortsEmptyHint": "一个档位都不选时，输入框只会退化成 Off / On 两档开关。",
+      "effortsCustomPlaceholder": "添加其它档位",
+      "effortsAdd": "添加",
+      "defaultEffortLabel": "默认档位",
+      "defaultEffortAuto": "由 Kimi 决定",
+      "alwaysThinkingLabel": "模型始终推理——从选择器中去掉 Off 档",
+      "fixErrorsFirst": "请先修正标红的字段",
+      "errorModelRequired": "模型为必填项",
+      "errorMaxContextRequired": "最大上下文长度为必填项",
+      "errorMaxContextInvalid": "必须是正整数",
+      "errorApiKeyRequired": "API Key 为必填项",
+      "errorApiKeyInvalid": "API Key 不能包含换行",
+      "errorBaseUrlRequired": "Base URL 为必填项",
+      "errorBaseUrlInvalid": "必须以 http:// 或 https:// 开头",
+      "errorVertexProjectRequired": "GCP 项目为必填项",
+      "errorDefaultEffortUnlisted": "必须是上面已选中的档位之一",
+      "advancedTitle": "高级",
+      "authTypeLabel": "凭据写入位置",
+      "authTypeApiKey": "内联 api_key",
+      "authTypeEnv": "供应商 env 子表",
+      "authTypeHint": "API Key 在 config.toml 中的写入位置。",
+      "rawEditorLabel": "直接编辑 config.toml",
+      "rawEditorWarning": "在此保存会按原文覆盖整个文件，替换掉上方的结构化配置。",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "尚未鉴权——请在下方保存 API Key（或登录）以打开 Kimi 会话。",
+      "authModeHint": "「API Key」写入受管 config.toml 供应商并播种门控令牌；「登录」会清除它并改用真实的 `kimi login` 会话（需要 Kimi 订阅）。",
+      "rawEditorHint": "逐字写入（保留注释）并按 TOML 校验。codeg 同时会播种门控令牌以打开会话。"
     },
     "authModeOfficialSubscription": "官网订阅",
     "authModeCustomEndpoint": "自定义接口",
@@ -1054,7 +1096,9 @@
       "remoteUnavailable": "{versionText}。远程版本暂不可用。",
       "latest": "{versionText}。已是最新版本。",
       "bundled": "内置版本：{version}",
-      "bundledMissing": "内置适配器缺失，请重新安装或更新 DrawCode。"
+      "bundledMissing": "内置适配器缺失，请重新安装或更新 DrawCode。",
+      "localOnly": "本地：{localVersion}",
+      "localInstalled": "{versionText}。已安装。"
     },
     "cline": {
       "configDescription": "配置 Cline API 提供商和凭证。设置将保存到 ~/.cline/data/。"
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "没有匹配的模型",
       "modelsNeedAuth": "登录后加载模型列表。",
       "modelDefaultBadge": "默认"
-    }
+    },
+    "addCustomAgent": "添加自定义智能体",
+    "addCustomAgentHint": "接入任意兼容 ACP 的智能体。可从公开 ACP 注册表中选择，或直接粘贴其注册表信息。",
+    "customAgentFromRegistry": "ACP 注册表",
+    "customAgentManual": "手动填写",
+    "customAgentSearchPlaceholder": "搜索智能体…",
+    "customAgentLoadingCatalog": "正在加载 ACP 注册表…",
+    "customAgentRetry": "重试",
+    "customAgentNoResults": "没有匹配的智能体",
+    "customAgentAdd": "添加",
+    "customAgentAlreadyAdded": "已添加",
+    "customAgentUnsupportedPlatform": "当前平台没有可用的构建",
+    "customAgentAdded": "已添加 {name}",
+    "customAgentIdLabel": "注册表 ID",
+    "customAgentNameLabel": "显示名称",
+    "customAgentVersionLabel": "版本",
+    "customAgentSpecLabel": "分发信息（JSON）",
+    "customAgentSpecHint": "与 ACP 注册表 distribution 对象同构：支持 npx、uvx、binary 三种通道，也可整条粘贴注册表条目。npx/uvx 的 cmd 为包安装的可执行命令名，缺省按包名推导，与包名不同时需填写。binary 按平台键区分（本机为 {platform}），cmd 为压缩包内启动路径，sha256 可选用于校验下载。",
+    "customAgentTemplateLabel": "模板",
+    "customAgentKindLabel": "启动方式",
+    "customAgentInvalidJson": "不是合法的 JSON",
+    "customAgentNoDistribution": "未找到 npx、uvx 或 binary 分发方式",
+    "customAgentCancel": "取消",
+    "customAgentSave": "添加智能体",
+    "customAgentSaveChanges": "保存修改",
+    "customAgentEdit": "编辑智能体",
+    "customAgentEditHint": "修改名称、图标、分发信息与技能声明；智能体 ID 不可修改。",
+    "customAgentEditNotFound": "未找到自定义智能体 {id}",
+    "customAgentSaved": "已保存 {name}",
+    "customAgentVersionProbeLabel": "版本查询命令（可选）",
+    "customAgentVersionProbeHint": "查询本地安装版本的命令；留空时默认执行智能体命令加 --version。",
+    "customAgentRemove": "移除智能体",
+    "customAgentRemoveHint": "删除该智能体定义。已有会话的历史会保留，只是该智能体无法再启动。",
+    "customAgentIconLabel": "图标（可选）",
+    "customAgentIconUpload": "上传",
+    "customAgentIconReplace": "更换",
+    "customAgentIconClear": "移除图标",
+    "customAgentIconHint": "随智能体一起保存，离线也能显示。不上传则使用彩色首字母。",
+    "customAgentSkillsLabel": "Skills（共享 .agents/skills）",
+    "customAgentSkillsHint": "声明该智能体会读取共享的 .agents/skills 目录（全局与项目级），并将其加入所有技能矩阵。链接到共享目录的技能对读取该目录的其他智能体同样可见。",
+    "customAgentSkillsDirLabel": "专属技能目录",
+    "customAgentSkillsDirHint": "该智能体自身加载技能的目录绝对路径 —— 可与共享目录并存，也可单独使用。~ 会展开为主目录；链接技能时优先放入此目录。",
+    "customAgentIconNotAnImage": "请选择图片文件。",
+    "customAgentIconTooLarge": "图标需小于 {limit} KB。",
+    "customAgentIconReadFailed": "无法读取该图片。",
+    "customAgentRemoveConfirm": "确定移除 {name}？已有会话会保留，但该智能体将无法再启动。",
+    "customAgentRemoveWithData": "同时删除已记录的会话历史",
+    "customAgentRemoved": "已移除 {name}",
+    "customAgentBadge": "自定义",
+    "customAgentNotLaunchable": "该智能体在此环境无法启动：{reason}"
   },
   "SettingsPages": {
     "agentsLoading": "加载 Agent 设置中...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "关闭其它",
       "closeAll": "关闭所有",
       "tileDisplay": "平铺显示",
-      "untileDisplay": "取消平铺"
+      "untileDisplay": "取消平铺",
+      "splitRight": "向右拆分",
+      "splitDown": "向下拆分",
+      "splitAndMoveRight": "拆分并右移",
+      "splitAndMoveDown": "拆分并下移",
+      "moveToOppositeGroup": "移动到对侧分组",
+      "moveToGroup": "移动到分组",
+      "groupLabel": "分组 {index}",
+      "changeSplitterOrientation": "切换分隔方向",
+      "unsplit": "取消拆分",
+      "unsplitAll": "全部取消拆分"
     },
     "fileWorkspace": {
       "files": "文件",
@@ -1995,7 +2098,10 @@
         "current": "当前",
         "remoteBranches": "远程分支",
         "refreshCommitHistory": "刷新提交记录",
-        "clearBranchFilterAria": "清除分支过滤"
+        "clearBranchFilterAria": "清除分支过滤",
+        "head": "HEAD",
+        "headHint": "跟随当前分支",
+        "headHintWithBranch": "跟随当前分支（{branch}）"
       },
       "dialogs": {
         "newBranchTitle": "新建分支",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "正在创建会话并加载配置"
         },
         "errors": {
-          "connectionFailed": "连接失败"
+          "connectionFailed": "连接失败",
+          "sendPromptFailed": "消息发送失败：{error}"
         }
       },
       "shared": {
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "技能",
         "mentionInvalidPattern": "正则表达式无效",
         "mentionSourceError": "无法刷新此来源",
-        "mentionProfileError": "无法加载委托配置"
+        "mentionProfileError": "无法加载委托配置",
+        "attachUploadInProgress": "图片仍在上传中，请稍候再发送。"
       },
       "messageQueue": {
         "addToQueue": "加入队列",
@@ -2959,7 +3067,8 @@
           "webSearchWithQuery": "网页搜索：{query}",
           "todosProgress": "待办（{done}/{total}）",
           "skillWithName": "Skill：{name}",
-          "genericWithContext": "{tool}：{context}"
+          "genericWithContext": "{tool}：{context}",
+          "listFilesWithPath": "列出文件 {path}"
         },
         "toolGroup": {
           "search": "搜索 {count} 次",
@@ -2992,6 +3101,13 @@
           "polledTimes": "轮询 {count} 次",
           "runningInBackground": "后台运行",
           "launchNote": "已在后台运行 · {id}"
+        },
+        "agentLiveTranscript": "实时活动",
+        "search": {
+          "noMatches": "无匹配结果",
+          "matchSummary": "{matches} 处匹配 · {files} 个文件",
+          "fileSummary": "{files} 个文件",
+          "moreResults": "另有 {count} 条结果未显示"
         }
       },
       "messageNav": {
@@ -3128,6 +3244,16 @@
       "proposedPlan": {
         "title": "计划提案",
         "planning": "规划中…"
+      },
+      "fileActions": {
+        "openInFinder": "在访达打开",
+        "openInExplorer": "在资源管理器打开",
+        "openInFileManager": "在文件管理器打开",
+        "copyRelativePath": "复制相对路径",
+        "copyAbsolutePath": "复制绝对路径",
+        "pathCopied": "已复制路径",
+        "copyPathFailed": "复制路径失败",
+        "openFailed": "打开本地文件失败"
       }
     },
     "diffPreview": {

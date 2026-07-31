@@ -101,6 +101,45 @@ describe("denormalizeSnapshot — session config filter", () => {
   })
 })
 
+describe("denormalizeSnapshot — subagent attribution on live blocks", () => {
+  it("forwards parent_tool_use_id onto text/thinking, absent field stays undefined", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        live_message: {
+          id: "lm-1",
+          role: "assistant",
+          started_at: "2026-07-28T00:00:00Z",
+          content: [
+            { kind: "text", text: "main" },
+            { kind: "text", text: "sub", parent_tool_use_id: "toolu_p" },
+            {
+              kind: "thinking",
+              text: "sub think",
+              parent_tool_use_id: "toolu_p",
+            },
+          ],
+        },
+      })
+    )
+    const content = patch.liveMessage?.content ?? []
+    expect(content).toHaveLength(3)
+    expect(content[0]).toMatchObject({ type: "text", text: "main" })
+    expect(
+      content[0]?.type === "text" ? content[0].parentToolUseId : "SET"
+    ).toBeUndefined()
+    expect(content[1]).toMatchObject({
+      type: "text",
+      text: "sub",
+      parentToolUseId: "toolu_p",
+    })
+    expect(content[2]).toMatchObject({
+      type: "thinking",
+      text: "sub think",
+      parentToolUseId: "toolu_p",
+    })
+  })
+})
+
 describe("denormalizeSnapshot — config staleness", () => {
   it("carries config_stale / config_stale_kind into the patch", () => {
     const patch = denormalizeSnapshot(

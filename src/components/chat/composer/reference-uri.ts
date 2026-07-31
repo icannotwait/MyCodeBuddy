@@ -86,7 +86,7 @@ export function parseCodegReferenceUri(
     const id = typedProfile[2]
     // Unknown agent segments are not coerced — fail closed so a typo cannot
     // silently become code_buddy and mis-route after reload.
-    if (!ALL_AGENT_TYPES.includes(agentType as AgentType)) {
+    if (!ALL_AGENT_TYPES.some((type) => type === agentType)) {
       return null
     }
     return {
@@ -154,6 +154,13 @@ export function parseCodegReferenceUri(
     } catch {
       // keep the raw segment if it isn't valid percent-encoding
     }
+    // The label's leading `/`·`$` is the trigger the token was sent with; keep
+    // it as `meta.invocationPrefix` so a badge restored from this parse
+    // re-serializes to the SAME token (`$deploy` must not come back as
+    // `/deploy` — Codex only executes the `$` form). No prefix on the label
+    // (e.g. a resource_link name) leaves meta null and the serializer's `/`
+    // default applies.
+    const prefix = /^[/$]/.test(label) ? (label[0] as "/" | "$") : null
     return {
       refType: "skill",
       // The link text carries the literal invocation token (`/build` / `$deploy`);
@@ -164,7 +171,7 @@ export function parseCodegReferenceUri(
       id,
       label: (label || id).replace(/^[/$]/, "") || id,
       uri,
-      meta: null,
+      meta: prefix ? { invocationPrefix: prefix } : null,
     }
   }
 

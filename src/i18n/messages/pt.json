@@ -206,7 +206,15 @@
       "downloadFailed": "Falha ao baixar o pacote de atualização. Tente novamente mais tarde.",
       "installFailed": "Falha ao instalar a atualização. Feche o app e tente novamente.",
       "unknown": "Falha na atualização. Tente novamente mais tarde."
-    }
+    },
+    "newVersionBadge": "Nova v{version}",
+    "updateAvailableTitle": "Atualização disponível",
+    "releaseNotesTitle": "Novidades",
+    "remindLater": "Mais tarde",
+    "retry": "Tentar novamente",
+    "stepDownload": "Download",
+    "stepInstall": "Instalação",
+    "stepRestart": "Reinício"
   },
   "VersionControlSettings": {
     "loading": "Carregando...",
@@ -540,6 +548,7 @@
   "AcpAgentSettings": {
     "title": "Gerenciamento do SDK de agentes",
     "description": "Gerencie em um só lugar a conexão do SDK de agentes, estado habilitado, variáveis de ambiente, gerenciamento de configuração e informações de preflight de versão.",
+    "showThinking": "Show thinking",
     "loadingAgents": "Carregando lista de agentes...",
     "agentList": "Lista de agentes",
     "emptyNoAgent": "Nenhum agente disponível.",
@@ -648,6 +657,9 @@
     "grok": {
       "configDescription": "Configure o Grok aqui. Os controles abaixo — modo de permissão, esforço de raciocínio, um modelo personalizado opcional (endpoint próprio) e a compactação — são mesclados em ~/.grok/config.toml, preservando suas outras chaves e comentários. O login usa seu XAI_API_KEY ou `grok login`. As demais chaves continuam editáveis em Avançado.",
       "permissionModeLabel": "Modo de permissão",
+      "permissionDefault": "Perguntar sempre",
+      "permissionAcceptEdits": "Aprovar edições automaticamente",
+      "permissionAuto": "Aprovação automática inteligente",
       "permissionAlwaysApprove": "Sempre aprovar",
       "reasoningEffortLabel": "Esforço de raciocínio",
       "effortLow": "Baixo (mais rápido)",
@@ -687,10 +699,7 @@
       "customContextWindowLabel": "Janela de contexto (tokens)",
       "customContextWindowHint": "Opcional. Define o momento da autocompactação; deixe vazio para o padrão do endpoint.",
       "autoCompactLabel": "Limite de autocompactação (%)",
-      "autoCompactHint": "Compacta a conversa quando o uso do contexto atinge esta porcentagem (padrão do Grok: 85). Gravado em `[session]`.",
-      "permissionDefault": "Perguntar sempre",
-      "permissionAcceptEdits": "Aprovar edições automaticamente",
-      "permissionAuto": "Aprovação automática inteligente"
+      "autoCompactHint": "Compacta a conversa quando o uso do contexto atinge esta porcentagem (padrão do Grok: 85). Gravado em `[session]`."
     },
     "codex": {
       "configDescription": "Suporta configuração rápida de URL da API, API Key, nome do modelo e reasoning effort, com sincronização para `auth.json` / `config.toml`.",
@@ -751,7 +760,9 @@
       "loggedIn": "Conta conectada",
       "loginRelogin": "Reconectar / Trocar conta",
       "loginTimeout": "Login expirou, tente novamente",
-      "loginSaveFailed": "Login realizado com sucesso, mas falha ao salvar configuração"
+      "loginSaveFailed": "Login realizado com sucesso, mas falha ao salvar configuração",
+      "enableFast": "Habilitar Fast",
+      "enableFastAria": "Habilitar nível de serviço Fast para Codex"
     },
     "gemini": {
       "authConfig": "Configuração de autenticação do Gemini",
@@ -881,46 +892,78 @@
       "loginHint": "Sem chave de API? Execute “codebuddy” em um terminal para fazer login com sua conta Tencent."
     },
     "kimiCode": {
-      "configManagement": "Kimi Code Configuration",
-      "configDescription": "`kimi acp` only authenticates with a stored login token and rejects API keys on their own. To use an API key, codeg writes a managed ~/.kimi-code/config.toml provider AND seeds a local gate token so the session opens — inference still runs on your key.",
-      "gateReadyApiKey": "Authenticated via API key (codeg seeded the local gate token).",
-      "gateReadyLogin": "Authenticated via a Kimi account login.",
-      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
-      "authModeLabel": "Authentication method",
-      "authModeApiKey": "API key",
-      "authModeLogin": "Kimi account login (subscription)",
-      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "interfaceTypeLabel": "Provider type",
-      "interfaceTypeHint": "The provider protocol Kimi speaks (config.toml `type`). Use Kimi / Moonshot for a Moonshot / platform.kimi.com key.",
+      "configManagement": "Configuração do Kimi Code",
+      "configDescription": "O `kimi acp` só aceita um token de login armazenado, por isso o codeg grava um provedor gerenciado em ~/.kimi-code/config.toml e cria um token de acesso local — a inferência continua usando a sua própria chave.",
+      "statusUnconfigured": "Ainda não configurado",
+      "statusDirty": "Alterações não salvas",
+      "summaryLabel": "Em vigor",
+      "gateReadyApiKey": "Chave de API gravada em config.toml",
+      "gateReadyLogin": "Conectado com uma conta Kimi",
+      "revealConfig": "Mostrar na pasta",
+      "envOverrideWarning": "{keys} está definido e tem prioridade sobre o config.toml. Salvar aqui remove essa variável.",
+      "authModeLabel": "Método de autenticação",
+      "authModeApiKey": "Chave de API",
+      "authModeLogin": "Login da conta Kimi (assinatura)",
+      "authModeApiKeyHint": "Grava um provedor gerenciado no config.toml e cria o token de acesso para que as sessões possam abrir.",
+      "loginHint": "Execute `kimi login` em um terminal para entrar com uma conta Kimi por assinatura. O codeg não armazena nada e reutiliza o login do próprio Kimi. Salvar aqui remove o token de acesso por chave de API do codeg.",
+      "credentialTitle": "Credencial",
+      "interfaceTypeLabel": "Tipo de provedor",
+      "interfaceTypeHint": "O protocolo de provedor que o Kimi fala (o `type` do config.toml). Use Kimi / Moonshot para uma chave da Moonshot / platform.kimi.com.",
       "endpointLabel": "Endpoint",
-      "endpointCustom": "Custom (OpenAI-compatible)",
-      "endpointHint": "International = api.moonshot.ai; China (platform.kimi.com keys) = api.moonshot.cn. Custom points at any OpenAI-compatible endpoint.",
-      "regionInternational": "International (api.moonshot.ai)",
+      "endpointCustom": "Personalizado (compatível com OpenAI)",
+      "endpointHint": "Internacional = api.moonshot.ai; China (chaves de platform.kimi.com) = api.moonshot.cn. Personalizado aponta para qualquer endpoint compatível com OpenAI.",
+      "regionInternational": "Internacional (api.moonshot.ai)",
       "regionChina": "China (api.moonshot.cn)",
-      "baseUrlLabel": "Base URL",
-      "baseUrlHint": "Leave blank to use the provider SDK default.",
-      "apiKeyLabel": "API Key",
-      "apiKeyHint": "Written to ~/.kimi-code/config.toml and used for inference. From platform.kimi.com or platform.kimi.ai.",
-      "authTypeLabel": "Advanced: credential placement",
-      "authTypeApiKey": "Inline api_key",
-      "authTypeEnv": "Provider env sub-table",
-      "authTypeHint": "Where the API key is written inside config.toml.",
-      "vertexProjectLabel": "GCP project (GOOGLE_CLOUD_PROJECT)",
-      "vertexLocationLabel": "GCP location (GOOGLE_CLOUD_LOCATION)",
-      "vertexHint": "Vertex AI uses Google Application Default Credentials — run `gcloud auth application-default login` (no API key).",
-      "modelLabel": "Model",
-      "modelHint": "The model id to use. Click Fetch to list the models your key can access (e.g. kimi-k2.7-code) — avoids “model not found” errors.",
-      "fetchModels": "Fetch",
-      "fetchModelsOk": "Found {count} models",
-      "fetchModelsEmpty": "Key works, but no models were returned",
-      "fetchModelsFailed": "Couldn’t list models — check the key and endpoint",
-      "fetchModelsNeedsKey": "Enter an API key and endpoint first",
-      "maxContextLabel": "Max context size (optional)",
-      "maxContextHint": "Tokens, e.g. 262144. Leave blank to use the model default.",
-      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account (device-code OAuth). codeg stores nothing and reuses Kimi’s own login. Saving here removes codeg’s API-key gate token.",
-      "rawEditorLabel": "Advanced: edit config.toml directly",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "baseUrlLabel": "URL base",
+      "baseUrlHint": "Deixe em branco para usar o padrão do SDK do provedor.",
+      "apiKeyLabel": "Chave de API",
+      "apiKeyHint": "Gravada em ~/.kimi-code/config.toml e usada para inferência. De platform.kimi.com ou platform.kimi.ai.",
+      "vertexProjectLabel": "Projeto do GCP (GOOGLE_CLOUD_PROJECT)",
+      "vertexLocationLabel": "Região do GCP (GOOGLE_CLOUD_LOCATION)",
+      "vertexHint": "O Vertex AI usa as credenciais padrão do aplicativo Google — execute `gcloud auth application-default login` (sem chave de API).",
+      "modelTitle": "Modelo",
+      "modelLabel": "Modelo",
+      "modelHint": "O id do modelo gravado no config.toml. Use «Testar e listar modelos» para ver o que a sua chave realmente acessa.",
+      "maxContextLabel": "Tamanho máximo de contexto",
+      "maxContextHint": "Obrigatório pelo esquema do Kimi: sem ele o Kimi descarta todo o bloco do modelo e nenhuma solicitação retorna resposta. Padrão 262144.",
+      "fetchModels": "Testar e listar modelos",
+      "fetchModelsOk": "A chave funciona — {count} modelos disponíveis",
+      "fetchModelsEmpty": "A chave funciona, mas nenhum modelo foi retornado",
+      "fetchModelsFailed": "Falha no teste",
+      "fetchModelsNeedsKey": "Informe primeiro uma chave de API e um endpoint",
+      "modelNotInList": "Este modelo não está na lista acessível pela sua chave — o Kimi falhará com «modelo não encontrado».",
+      "reasoningTitle": "Raciocínio",
+      "reasoningEnableLabel": "Ativar",
+      "reasoningDescription": "O Kimi só mostra o seletor «Thinking» na caixa de mensagem quando o modelo declara uma capacidade de raciocínio, por isso o codeg a grava aqui. Vale para sessões novas.",
+      "effortsLabel": "Níveis oferecidos",
+      "effortsHint": "Estes níveis viram as opções do seletor «Thinking». O Kimi repassa o nível ao provedor tal como está, então escolha os que o seu modelo aceita.",
+      "effortsEmptyHint": "Sem nenhum nível escolhido, a caixa de mensagem fica apenas com um interruptor Off / On.",
+      "effortsCustomPlaceholder": "Adicionar outro nível",
+      "effortsAdd": "Adicionar",
+      "defaultEffortLabel": "Nível padrão",
+      "defaultEffortAuto": "Deixar o Kimi escolher",
+      "alwaysThinkingLabel": "O modelo sempre raciocina — remover a opção Off do seletor",
+      "fixErrorsFirst": "Corrija primeiro os campos destacados",
+      "errorModelRequired": "O modelo é obrigatório",
+      "errorMaxContextRequired": "O tamanho máximo de contexto é obrigatório",
+      "errorMaxContextInvalid": "Deve ser um número inteiro positivo",
+      "errorApiKeyRequired": "A chave de API é obrigatória",
+      "errorApiKeyInvalid": "A chave de API não pode conter quebras de linha",
+      "errorBaseUrlRequired": "A URL base é obrigatória",
+      "errorBaseUrlInvalid": "Deve começar com http:// ou https://",
+      "errorVertexProjectRequired": "O projeto do GCP é obrigatório",
+      "errorDefaultEffortUnlisted": "Escolha um dos níveis selecionados acima",
+      "advancedTitle": "Avançado",
+      "authTypeLabel": "Local da credencial",
+      "authTypeApiKey": "api_key em linha",
+      "authTypeEnv": "Subtabela env do provedor",
+      "authTypeHint": "Onde a chave de API é gravada dentro do config.toml.",
+      "rawEditorLabel": "Editar config.toml diretamente",
+      "rawEditorWarning": "Salvar aqui sobrescreve o arquivo inteiro literalmente, substituindo as configurações estruturadas acima.",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
+      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
     },
     "authModeOfficialSubscription": "Assinatura oficial",
     "authModeCustomEndpoint": "Endpoint personalizado",
@@ -994,6 +1037,7 @@
       "localVersionRemoved": "Versão local removida",
       "saveAgentOrderFailed": "Falha ao salvar a ordem dos Agents",
       "saveAgentSwitchFailed": "Falha ao salvar o switch dos Agents",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "Falha ao salvar variáveis de ambiente",
       "grokSaved": "Configuração do Grok salva",
       "saveGrokNativeFailed": "Falha ao salvar a configuração nativa do Grok",
@@ -1037,7 +1081,6 @@
       "piBinaryUninstalled": "pi desinstalado",
       "piBinaryUninstallFailed": "Falha ao desinstalar o pi",
       "savePiTrustFailed": "Falha ao salvar a confiança do espaço de trabalho",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "cursorSaved": "Configuração do Cursor salva",
       "saveCursorConfigFailed": "Falha ao salvar a configuração do Cursor"
     },
@@ -1053,7 +1096,9 @@
       "remoteUnavailable": "{versionText}. A versão remota está indisponível no momento.",
       "latest": "{versionText}. Já está na versão mais recente.",
       "bundled": "Integrado: {version}",
-      "bundledMissing": "O adaptador integrado está ausente. Reinstale ou atualize o DrawCode."
+      "bundledMissing": "O adaptador integrado está ausente. Reinstale ou atualize o DrawCode.",
+      "localOnly": "Local: {localVersion}",
+      "localInstalled": "{versionText}. Instalado."
     },
     "cline": {
       "configDescription": "Configure o provedor de API e as credenciais do Cline. As configurações são salvas em ~/.cline/data/."
@@ -1129,7 +1174,6 @@
       "trustHint": "Apenas as pastas que você abre aqui são confiáveis, nunca a máquina inteira — e isso afeta somente o carregamento da configuração, não o que o pi pode executar.",
       "configDirSkillsNote": "Com um diretório de configuração personalizado, as habilidades, os especialistas e as ferramentas de escritório gerenciados nas Configurações não se aplicam a este pi — gerencie as habilidades dele diretamente nessa pasta."
     },
-    "showThinking": "Show thinking",
     "cursor": {
       "configDescription": "Configure o Cursor aqui. Escolha um método de autenticação — assinatura oficial (login pelo navegador) ou uma chave de API do Cursor para máquinas headless ou servidores — depois escolha um modelo e edite as regras de permissão e o sandbox do CLI. O codeg as grava em ~/.cursor/cli-config.json, compartilhado com o CLI cursor-agent.",
       "authTitle": "Autenticação",
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "Nenhum modelo correspondente",
       "modelsNeedAuth": "Faça login para carregar a lista de modelos.",
       "modelDefaultBadge": "padrão"
-    }
+    },
+    "addCustomAgent": "Adicionar agente personalizado",
+    "addCustomAgentHint": "Registre qualquer agente compatível com ACP. Escolha um no registro público do ACP ou cole as informações de registro dele.",
+    "customAgentFromRegistry": "Registro ACP",
+    "customAgentManual": "Manual",
+    "customAgentSearchPlaceholder": "Buscar agentes…",
+    "customAgentLoadingCatalog": "Carregando o registro ACP…",
+    "customAgentRetry": "Tentar novamente",
+    "customAgentNoResults": "Nenhum agente correspondente",
+    "customAgentAdd": "Adicionar",
+    "customAgentAlreadyAdded": "Adicionado",
+    "customAgentUnsupportedPlatform": "Nenhuma compilação disponível para esta plataforma",
+    "customAgentAdded": "{name} adicionado",
+    "customAgentIdLabel": "ID do registro",
+    "customAgentNameLabel": "Nome exibido",
+    "customAgentVersionLabel": "Versão",
+    "customAgentSpecLabel": "Distribuição (JSON)",
+    "customAgentSpecHint": "Mesma forma do objeto distribution do registro ACP: canais npx, uvx e binary, ou cole uma entrada completa do registro. Em npx/uvx, cmd é o executável que o pacote instala — derivado do nome do pacote quando omitido, então defina-o quando forem diferentes. binary é organizado por chave de plataforma (esta máquina: {platform}); cmd é o caminho de execução dentro do arquivo e sha256 verifica opcionalmente o download.",
+    "customAgentTemplateLabel": "Modelos",
+    "customAgentKindLabel": "Iniciar via",
+    "customAgentInvalidJson": "JSON inválido",
+    "customAgentNoDistribution": "Nenhuma distribuição npx, uvx ou binary encontrada",
+    "customAgentCancel": "Cancelar",
+    "customAgentSave": "Adicionar agente",
+    "customAgentSaveChanges": "Salvar alterações",
+    "customAgentEdit": "Editar agente",
+    "customAgentEditHint": "Atualize o nome, o ícone, a distribuição e as declarações de skills. O ID do agente não pode ser alterado.",
+    "customAgentEditNotFound": "Agente personalizado {id} não encontrado",
+    "customAgentSaved": "{name} salvo",
+    "customAgentVersionProbeLabel": "Comando de consulta de versão (opcional)",
+    "customAgentVersionProbeHint": "Comando que imprime a versão instalada localmente. Se ficar vazio, o codeg executa o comando do agente com --version.",
+    "customAgentRemove": "Remover agente",
+    "customAgentRemoveHint": "Exclui a definição do agente. As conversas existentes mantêm o histórico; o agente apenas não pode mais ser iniciado.",
+    "customAgentIconLabel": "Ícone (opcional)",
+    "customAgentIconUpload": "Enviar",
+    "customAgentIconReplace": "Substituir",
+    "customAgentIconClear": "Remover ícone",
+    "customAgentIconHint": "Salvo junto com o agente, portanto funciona offline. Sem um ícone, usa-se uma inicial colorida.",
+    "customAgentSkillsLabel": "Skills (.agents/skills compartilhado)",
+    "customAgentSkillsHint": "Declara que este agente lê o repositório compartilhado .agents/skills (diretórios global e de projeto) e o adiciona a todas as matrizes de habilidades. Habilidades vinculadas lá ficam visíveis para todos os agentes que leem esse repositório compartilhado.",
+    "customAgentSkillsDirLabel": "Diretório de skills dedicado",
+    "customAgentSkillsDirHint": "Caminho absoluto do diretório de onde este agente carrega skills — o seu próprio repositório, além do compartilhado ou no lugar dele. ~ expande para o diretório pessoal; skills vinculadas são colocadas aqui primeiro.",
+    "customAgentIconNotAnImage": "Selecione um arquivo de imagem.",
+    "customAgentIconTooLarge": "O ícone deve ter menos de {limit} KB.",
+    "customAgentIconReadFailed": "Não foi possível ler essa imagem.",
+    "customAgentRemoveConfirm": "Remover {name}? As conversas existentes permanecem, mas o agente não poderá mais ser iniciado.",
+    "customAgentRemoveWithData": "Excluir também o histórico de conversas registrado",
+    "customAgentRemoved": "{name} removido",
+    "customAgentBadge": "Personalizado",
+    "customAgentNotLaunchable": "Este agente não pode ser iniciado aqui: {reason}"
   },
   "SettingsPages": {
     "agentsLoading": "Carregando configurações de agentes...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "Fechar outros",
       "closeAll": "Fechar tudo",
       "tileDisplay": "Exibição em mosaico",
-      "untileDisplay": "Sair do mosaico"
+      "untileDisplay": "Sair do mosaico",
+      "splitRight": "Dividir à direita",
+      "splitDown": "Dividir abaixo",
+      "splitAndMoveRight": "Dividir e mover para a direita",
+      "splitAndMoveDown": "Dividir e mover para baixo",
+      "moveToOppositeGroup": "Mover para o grupo oposto",
+      "moveToGroup": "Mover para o grupo",
+      "groupLabel": "Grupo {index}",
+      "changeSplitterOrientation": "Alternar orientação do divisor",
+      "unsplit": "Desfazer divisão",
+      "unsplitAll": "Desfazer todas as divisões"
     },
     "fileWorkspace": {
       "files": "Arquivos",
@@ -1995,7 +2098,10 @@
         "current": "Atual",
         "remoteBranches": "Branches remotas",
         "refreshCommitHistory": "Atualizar histórico de commits",
-        "clearBranchFilterAria": "Limpar filtro de branch"
+        "clearBranchFilterAria": "Limpar filtro de branch",
+        "head": "HEAD",
+        "headHint": "Acompanha a branch atual",
+        "headHintWithBranch": "Acompanha a branch atual ({branch})"
       },
       "dialogs": {
         "newBranchTitle": "Nova branch",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "Creating session and loading configuration"
         },
         "errors": {
-          "connectionFailed": "Falha na conexão"
+          "connectionFailed": "Falha na conexão",
+          "sendPromptFailed": "Falha ao enviar a mensagem: {error}"
         }
       },
       "shared": {
@@ -2382,6 +2489,8 @@
         "askAnything": "Pergunte qualquer coisa...",
         "removeAttachmentAria": "Remover {name}",
         "attachFiles": "Anexar arquivos",
+        "attachLocalUpload": "Carregar arquivo local",
+        "attachServerFile": "Selecionar arquivo do servidor",
         "addActions": "Adicionar",
         "quickMessages": "Mensagens rápidas",
         "quickMessagesEmpty": "Ainda não há mensagens rápidas",
@@ -2413,8 +2522,6 @@
         "experts": "Especialistas",
         "office": "Escritório",
         "research": "Pesquisa",
-        "attachLocalUpload": "Carregar arquivo local",
-        "attachServerFile": "Selecionar arquivo do servidor",
         "attachUploadTooLarge": "{names} excede o limite de upload de {limit}MB e foi ignorado.",
         "attachUploadFailed": "Falha ao enviar {names}.",
         "attachUploadNotAFile": "{names} não é um arquivo regular (diretório ou arquivo especial) e foi ignorado.",
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "Habilidades",
         "mentionInvalidPattern": "Expressão regular inválida",
         "mentionSourceError": "Não foi possível atualizar esta fonte",
-        "mentionProfileError": "Não foi possível carregar os perfis de delegação"
+        "mentionProfileError": "Não foi possível carregar os perfis de delegação",
+        "attachUploadInProgress": "As imagens ainda estão sendo enviadas — tente novamente em instantes."
       },
       "messageQueue": {
         "addToQueue": "Adicionar à fila",
@@ -2959,7 +3067,8 @@
           "webSearchWithQuery": "Pesquisa web: {query}",
           "todosProgress": "Tarefas ({done}/{total})",
           "skillWithName": "Skill: {name}",
-          "genericWithContext": "{tool} ({context})"
+          "genericWithContext": "{tool} ({context})",
+          "listFilesWithPath": "Listar arquivos {path}"
         },
         "toolGroup": {
           "search": "{count, plural, one {Explorou # busca} other {Explorou # buscas}}",
@@ -2992,6 +3101,13 @@
           "polledTimes": "Consultada {count} vezes",
           "runningInBackground": "Segundo plano",
           "launchNote": "Em execução em segundo plano · {id}"
+        },
+        "agentLiveTranscript": "Atividade ao vivo",
+        "search": {
+          "noMatches": "Nenhuma correspondência",
+          "matchSummary": "{matches, plural, one {# correspondência} other {# correspondências}} em {files, plural, one {# arquivo} other {# arquivos}}",
+          "fileSummary": "{files, plural, one {# arquivo} other {# arquivos}}",
+          "moreResults": "{count, plural, one {# resultado adicional não exibido} other {# resultados adicionais não exibidos}}"
         }
       },
       "messageNav": {
@@ -3128,6 +3244,16 @@
       "proposedPlan": {
         "title": "Plano proposto",
         "planning": "A planear…"
+      },
+      "fileActions": {
+        "openInFinder": "Abrir no Finder",
+        "openInExplorer": "Abrir no Explorer",
+        "openInFileManager": "Abrir no gerenciador de arquivos",
+        "copyRelativePath": "Copiar caminho relativo",
+        "copyAbsolutePath": "Copiar caminho absoluto",
+        "pathCopied": "Caminho copiado",
+        "copyPathFailed": "Falha ao copiar o caminho",
+        "openFailed": "Falha ao abrir o arquivo local"
       }
     },
     "diffPreview": {
@@ -3299,6 +3425,18 @@
     "emptyDirectory": "Este diretório está vazio",
     "errorLoadingDir": "Falha ao carregar o diretório",
     "permissionDenied": "Permissão negada"
+  },
+  "ServerFileBrowser": {
+    "title": "Selecionar arquivo do servidor",
+    "pathPlaceholder": "Inserir caminho do diretório...",
+    "goHome": "Ir para o diretório inicial",
+    "navigateUp": "Ir para o diretório acima",
+    "select": "Selecionar",
+    "cancel": "Cancelar",
+    "loading": "Carregando...",
+    "emptyDirectory": "Este diretório está vazio",
+    "errorLoadingDir": "Falha ao carregar o diretório",
+    "selectedCount": "{count} selecionado(s)"
   },
   "ChatChannelSettings": {
     "loading": "Carregando...",
@@ -3880,18 +4018,6 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
-  },
-  "ServerFileBrowser": {
-    "title": "Selecionar arquivo do servidor",
-    "pathPlaceholder": "Inserir caminho do diretório...",
-    "goHome": "Ir para o diretório inicial",
-    "navigateUp": "Ir para o diretório acima",
-    "select": "Selecionar",
-    "cancel": "Cancelar",
-    "loading": "Carregando...",
-    "emptyDirectory": "Este diretório está vazio",
-    "errorLoadingDir": "Falha ao carregar o diretório",
-    "selectedCount": "{count} selecionado(s)"
   },
   "BackupSettings": {
     "title": "Backup e restauração",

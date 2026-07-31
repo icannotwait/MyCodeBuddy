@@ -17,6 +17,9 @@
 //!     --token <ephemeral secret>
 //!
 //! All three are required and the binary exits early if any is missing.
+//! `--disabled-agents` may narrow the closed built-in delegate target enum.
+//! `--custom-agents` is accepted for launcher compatibility but never expands
+//! that public schema.
 //! Everything heavyweight — JSON-RPC dispatch, UDS round-trip, MCP tool
 //! schema, cancellation tracking — lives in
 //! `codeg_lib::acp::delegation::{companion, transport}` so it's
@@ -59,6 +62,8 @@ struct Args {
     features: Option<String>,
     /// Launch role. Omitted by older launchers → Root.
     role: CompanionRole,
+    /// Built-in slugs removed from the closed delegate target enum.
+    disabled_agents: Option<String>,
 }
 
 fn parse_role(raw: &str) -> Result<CompanionRole, String> {
@@ -78,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
     let mut parent_pid = None;
     let mut features = None;
     let mut role = None;
+    let mut disabled_agents = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -121,9 +127,20 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--role requires a value".to_string())?;
                 role = Some(parse_role(&raw)?);
             }
+            "--disabled-agents" => {
+                disabled_agents = Some(
+                    iter.next()
+                        .ok_or_else(|| "--disabled-agents requires a value".to_string())?,
+                );
+            }
+            "--custom-agents" => {
+                let _ = iter
+                    .next()
+                    .ok_or_else(|| "--custom-agents requires a value".to_string())?;
+            }
             "--help" | "-h" => {
                 println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child]"
+                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--disabled-agents <agent>,...] [--custom-agents <ignored>]"
                 );
                 std::process::exit(0);
             }
@@ -139,7 +156,19 @@ fn parse_args() -> Result<Args, String> {
         features,
         // Older launchers omit --role; default Root for backward compatibility.
         role: role.unwrap_or(CompanionRole::Root),
+        disabled_agents,
     })
+}
+
+fn parse_csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|csv| {
+        csv.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
@@ -177,6 +206,7 @@ async fn main() -> ExitCode {
         token: args.token.clone(),
         features,
         role: args.role,
+        disabled_agents: parse_csv(args.disabled_agents.as_deref()),
     };
 
     // When delegation is enabled, establish the authenticated ready lease
@@ -411,6 +441,7 @@ mod tests {
             token: "token".into(),
             features: CompanionFeatures::parse(Some("workflow_v2")),
             role: CompanionRole::Root,
+            disabled_agents: Vec::new(),
         };
         let line = json!({
             "jsonrpc": "2.0",

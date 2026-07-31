@@ -160,7 +160,9 @@ describe("openTab focus-before-open", () => {
 
   it("clears detached sidebarSelection when a main tab is later activated", async () => {
     focusDetachedConversation.mockResolvedValueOnce(true)
-    await useTabStore.getState().openTab(1, 42, "claude_code", false, "Detached")
+    await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", false, "Detached")
     expect(useTabStore.getState().sidebarSelection).toEqual({
       id: 42,
       agentType: "claude_code",

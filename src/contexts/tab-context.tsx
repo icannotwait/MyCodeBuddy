@@ -9,6 +9,7 @@ import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { useSortedAvailableAgents } from "@/hooks/use-sorted-available-agents"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import {
+  pruneOrphanDraftsOnce,
   runCorrectionOnce,
   runRecoveryOnce,
   useTabStore,
@@ -176,11 +177,15 @@ export function TabProvider({ children }: TabProviderProps) {
     runCorrectionOnce()
   }, [agentsFresh, tabsHydrated, foldersHydrated])
 
-  // Post-hydration recovery: a draft-only session hydrates to zero tabs; never
-  // leave the workspace blank.
+  // Once tabs AND folders are in: drop restored drafts whose folder is gone
+  // (hydration is deliberately folder-blind), then — only if that leaves nothing
+  // at all — recover a draft so the workspace is never blank. Order matters: an
+  // orphaned draft must not suppress recovery. State is re-read after the prune
+  // because the closure's `rawTabs` predates it.
   useEffect(() => {
     if (!tabsHydrated || !foldersHydrated) return
-    if (rawTabs.length > 0) return
+    pruneOrphanDraftsOnce()
+    if (useTabStore.getState().rawTabs.length > 0) return
     runRecoveryOnce()
   }, [tabsHydrated, foldersHydrated, rawTabs])
 
@@ -196,7 +201,7 @@ export interface TabContextValue {
   tabs: TabItem[]
   activeTabId: string | null
   tabsHydrated: boolean
-  isTileMode: boolean
+  tileByGroup: Record<string, boolean>
   openTab: (
     folderId: number,
     conversationId: number,
@@ -215,7 +220,7 @@ export interface TabContextValue {
   closeTabsByFolder: (folderId: number) => void
   switchTab: (tabId: string) => void
   pinTab: (tabId: string) => void
-  toggleTileMode: () => void
+  toggleGroupTile: (groupId: string) => void
   consumeRemoteActivation: () => boolean
   openNewConversationTab: (
     folderId: number,
@@ -224,9 +229,10 @@ export interface TabContextValue {
       inheritFromActive?: boolean
       folderDefaultAgent?: TabItem["agentType"] | null
       folderRecentAgent?: TabItem["agentType"] | null
+      targetGroup?: string
     }
   ) => void
-  openChatModeTab: () => void
+  openChatModeTab: (options?: { targetGroup?: string }) => void
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: TabItem["agentType"]) => void
   setDraftAgentFromFallback: (
@@ -256,7 +262,7 @@ export interface TabContextValue {
  * consumers should read `useTabStore(selector)` / `useTabActions()` directly to
  * subscribe to the narrowest slice they render. `useShallow` keeps the returned
  * object stable, so this re-renders only when a read field (tabs/activeTabId/
- * tabsHydrated/isTileMode) changes — matching the former context's behavior.
+ * tabsHydrated/tileByGroup) changes — matching the former context's behavior.
  */
 export function useTabContext(): TabContextValue {
   return useTabStore(
@@ -264,7 +270,7 @@ export function useTabContext(): TabContextValue {
       tabs: s.tabs,
       activeTabId: s.activeTabId,
       tabsHydrated: s.tabsHydrated,
-      isTileMode: s.isTileMode,
+      tileByGroup: s.tileByGroup,
       openTab: s.openTab,
       closeTab: s.closeTab,
       closeConversationTab: s.closeConversationTab,
@@ -273,7 +279,7 @@ export function useTabContext(): TabContextValue {
       closeTabsByFolder: s.closeTabsByFolder,
       switchTab: s.switchTab,
       pinTab: s.pinTab,
-      toggleTileMode: s.toggleTileMode,
+      toggleGroupTile: s.toggleGroupTile,
       consumeRemoteActivation: s.consumeRemoteActivation,
       openNewConversationTab: s.openNewConversationTab,
       openChatModeTab: s.openChatModeTab,

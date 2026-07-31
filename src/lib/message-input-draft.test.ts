@@ -2,10 +2,15 @@ import type { JSONContent } from "@tiptap/core"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
+  adoptLegacyNewConversationDraft,
+  buildNewConversationDraftStorageKey,
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  moveMessageInputDraft,
+  resetLegacyDraftAdoptionForTests,
   saveMessageInputDraft,
   saveMessageInputDraftV2,
+  sweepOrphanDraftKeys,
 } from "./message-input-draft"
 
 const DOC: JSONContent = {
@@ -104,5 +109,133 @@ describe("message-input-draft v2", () => {
   it("ignores a non-object/array v2 payload and returns null without a v1 draft", () => {
     localStorage.setItem(V2("k-corrupt2"), JSON.stringify({ doc: [1, 2] }))
     expect(loadMessageInputDraftV2("k-corrupt2")).toBeNull()
+  })
+})
+
+// Every split group owns its own unsent draft, so composer text is keyed per
+// draft TAB. Before this the key was the single literal "new" and two groups'
+// drafts overwrote each other.
+describe("per-draft-tab composer drafts", () => {
+  beforeEach(() => {
+    resetLegacyDraftAdoptionForTests()
+  })
+
+  it("keys each draft tab separately", () => {
+    const a = buildNewConversationDraftStorageKey("new-1-a")
+    const b = buildNewConversationDraftStorageKey("new-2-b")
+    expect(a).not.toBe(b)
+
+    saveMessageInputDraftV2(a, DOC)
+    expect(loadMessageInputDraftV2(a)).toEqual({ kind: "doc", doc: DOC })
+    expect(loadMessageInputDraftV2(b)).toBeNull()
+  })
+
+  it("moves a draft to another key (closing tab hands off to its replacement)", () => {
+    const from = buildNewConversationDraftStorageKey("new-old")
+    const to = buildNewConversationDraftStorageKey("new-fresh")
+    saveMessageInputDraftV2(from, DOC)
+
+    moveMessageInputDraft(from, to)
+
+    expect(loadMessageInputDraftV2(to)).toEqual({ kind: "doc", doc: DOC })
+    expect(loadMessageInputDraftV2(from)).toBeNull()
+    expect(localStorage.getItem(V2(from))).toBeNull()
+  })
+
+  it("carries a legacy v1 text draft through a move", () => {
+    const from = buildNewConversationDraftStorageKey("new-v1")
+    const to = buildNewConversationDraftStorageKey("new-v1-next")
+    saveMessageInputDraft(from, "unsent words")
+
+    moveMessageInputDraft(from, to)
+
+    expect(loadMessageInputDraftV2(to)).toEqual({
+      kind: "legacyMarkdown",
+      markdown: "unsent words",
+    })
+    expect(localStorage.getItem(V1(from))).toBeNull()
+  })
+
+  it("hands the pre-per-tab shared draft to the FIRST draft tab only", () => {
+    saveMessageInputDraftV2("new", DOC)
+    const first = buildNewConversationDraftStorageKey("new-first")
+    const second = buildNewConversationDraftStorageKey("new-second")
+
+    adoptLegacyNewConversationDraft(first)
+    adoptLegacyNewConversationDraft(second)
+
+    expect(loadMessageInputDraftV2(first)).toEqual({ kind: "doc", doc: DOC })
+    expect(loadMessageInputDraftV2(second)).toBeNull()
+    expect(localStorage.getItem(V2("new"))).toBeNull()
+  })
+
+  it("never overwrites a draft tab's own text — the next empty tab takes the legacy one", () => {
+    const own: JSONContent = {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "own" }] },
+      ],
+    }
+    saveMessageInputDraftV2("new", DOC)
+    const owner = buildNewConversationDraftStorageKey("new-owner")
+    const empty = buildNewConversationDraftStorageKey("new-empty")
+    saveMessageInputDraftV2(owner, own)
+
+    adoptLegacyNewConversationDraft(owner)
+    expect(loadMessageInputDraftV2(owner)).toEqual({ kind: "doc", doc: own })
+
+    // The handover was not consumed by the tab that declined it.
+    adoptLegacyNewConversationDraft(empty)
+    expect(loadMessageInputDraftV2(empty)).toEqual({ kind: "doc", doc: DOC })
+  })
+
+  it("sweeps drafts whose tab is gone and keeps the live ones", () => {
+    const live = buildNewConversationDraftStorageKey("new-live")
+    const dead = buildNewConversationDraftStorageKey("new-dead")
+    saveMessageInputDraftV2(live, DOC)
+    saveMessageInputDraftV2(dead, DOC)
+    saveMessageInputDraft(dead, "legacy too")
+    // A bound conversation's draft is not a per-tab draft key — untouched.
+    saveMessageInputDraftV2("conv:42", DOC)
+
+    sweepOrphanDraftKeys(() => new Set(["new-live"]))
+
+    expect(loadMessageInputDraftV2(live)).toEqual({ kind: "doc", doc: DOC })
+    expect(loadMessageInputDraftV2("conv:42")).toEqual({
+      kind: "doc",
+      doc: DOC,
+    })
+    expect(localStorage.getItem(V2(dead))).toBeNull()
+    expect(localStorage.getItem(V1(dead))).toBeNull()
+    expect(loadMessageInputDraftV2(dead)).toBeNull()
+  })
+
+  it("reads the live set when it RUNS, so a draft opened after scheduling survives", () => {
+    const late = buildNewConversationDraftStorageKey("new-late")
+    const dead = buildNewConversationDraftStorageKey("new-dead")
+    saveMessageInputDraftV2(late, DOC)
+    saveMessageInputDraftV2(dead, DOC)
+    const live = new Set<string>()
+
+    // Defer like a real idle callback: scheduled while nothing is open (the
+    // hydration-races-recovery window), fired after a draft has appeared.
+    let idleCallback: (() => void) | null = null
+    const win = window as unknown as { requestIdleCallback?: unknown }
+    const hadIdle = "requestIdleCallback" in win
+    win.requestIdleCallback = (cb: () => void) => {
+      idleCallback = cb
+      return 1
+    }
+    try {
+      sweepOrphanDraftKeys(() => live)
+      live.add("new-late")
+      expect(idleCallback).not.toBeNull()
+      idleCallback!()
+    } finally {
+      if (!hadIdle) delete win.requestIdleCallback
+    }
+
+    expect(loadMessageInputDraftV2(late)).toEqual({ kind: "doc", doc: DOC })
+    expect(loadMessageInputDraftV2(dead)).toBeNull()
   })
 })

@@ -239,7 +239,7 @@ async fn delete_workflow_cascades_to_child_tables() {
 
 #[tokio::test]
 async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
-    const MIGRATIONS_THROUGH_GATE_FINGERPRINTS: u32 = 41;
+    const MIGRATIONS_THROUGH_GATE_FINGERPRINTS: u32 = 43;
 
     let db = open_db().await;
     Migrator::up(&db, Some(MIGRATIONS_THROUGH_GATE_FINGERPRINTS))

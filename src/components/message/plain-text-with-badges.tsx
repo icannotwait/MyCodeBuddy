@@ -5,6 +5,7 @@ import { memo, useMemo } from "react"
 import { ReferenceBadge } from "@/components/chat/composer/badges/reference-badge"
 import { cn } from "@/lib/utils"
 
+import { FileReferenceActions } from "./file-reference-actions"
 import { parseUserMessageSegments } from "./user-message-segments"
 
 /**
@@ -33,7 +34,16 @@ export const PlainTextWithBadges = memo(function PlainTextWithBadges({
     <div className={cn("whitespace-pre-wrap break-words", className)}>
       {segments.map((segment, index) =>
         segment.kind === "reference" ? (
-          <ReferenceBadge key={index} data={segment.attrs} />
+          segment.attrs.refType === "file" && segment.attrs.uri ? (
+            // Right-clicking a file badge opens its reveal / copy-path menu. A
+            // non-file reference (session, agent, commit, skill) has no path, so
+            // it stays a bare badge.
+            <FileReferenceActions key={index} target={segment.attrs.uri}>
+              <ReferenceBadge data={segment.attrs} />
+            </FileReferenceActions>
+          ) : (
+            <ReferenceBadge key={index} data={segment.attrs} />
+          )
         ) : (
           // A fragment (not a wrapping span) so adjacent text and badges share
           // one inline flow and `whitespace-pre-wrap` collapses nothing.

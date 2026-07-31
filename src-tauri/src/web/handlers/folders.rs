@@ -71,12 +71,9 @@ pub async fn open_worktree_folder(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<OpenWorktreeFolderParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
-    let detail = folder_commands::open_worktree_folder_core(
-        &state.db,
-        params.path,
-        params.source_folder_id,
-    )
-    .await?;
+    let detail =
+        folder_commands::open_worktree_folder_core(&state.db, params.path, params.source_folder_id)
+            .await?;
     folder_commands::emit_folder_upsert(&state.emitter, detail.clone());
     Ok(Json(detail))
 }
@@ -135,8 +132,7 @@ pub async fn open_folder_by_id(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<FolderIdParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
-    let detail =
-        folder_commands::open_folder_by_id_core(&state.db, params.folder_id).await?;
+    let detail = folder_commands::open_folder_by_id_core(&state.db, params.folder_id).await?;
     folder_commands::emit_folder_upsert(&state.emitter, detail.clone());
     Ok(Json(detail))
 }
@@ -156,12 +152,9 @@ pub async fn close_folder_if_empty(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<FolderIdParams>,
 ) -> Result<Json<folder_commands::CloseFolderIfEmptyResult>, AppCommandError> {
-    let closed = folder_commands::close_folder_if_empty_core(
-        &state.db,
-        &state.emitter,
-        params.folder_id,
-    )
-    .await?;
+    let closed =
+        folder_commands::close_folder_if_empty_core(&state.db, &state.emitter, params.folder_id)
+            .await?;
     Ok(Json(folder_commands::CloseFolderIfEmptyResult { closed }))
 }
 

@@ -195,9 +195,7 @@ export function assertWindowsReleaseWorkflow(workflowText) {
     /--bin\s+codeg-server\b/i.test(policyText) ||
     /cargo\s+build[^\n]*codeg-server/i.test(policyText)
   ) {
-    throw new Error(
-      "release workflow must not build the codeg-server binary"
-    )
+    throw new Error("release workflow must not build the codeg-server binary")
   }
   // Codex ACP ships via npm (`@agentclientprotocol/codex-acp`); desktop
   // release must not re-introduce a Windows sidecar or its Bun compile pin.

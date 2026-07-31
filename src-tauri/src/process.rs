@@ -1,12 +1,20 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::path::Path;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How long to keep retrying a spawn the kernel refuses with `ETXTBSY`.
+/// Generous on purpose: the window it covers is another thread's fork→exec gap,
+/// which is microseconds wide when idle but can stretch on a loaded machine.
+const EXEC_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(1);
+/// Upper bound on the wait between `ETXTBSY` retries.
+const EXEC_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(25);
 
 pub fn configure_std_command(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -120,6 +128,74 @@ where
     let mut command = tokio::process::Command::new(normalized_program(program));
     configure_tokio_command(&mut command);
     command
+}
+
+/// True when the OS refused to exec a file because something holds it open for
+/// writing (`ETXTBSY`). Checked by `ErrorKind` *and* raw errno: the kind is the
+/// portable form, the errno covers a target whose std leaves it unmapped.
+fn is_exec_busy(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::ExecutableFileBusy {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if err.raw_os_error() == Some(libc::ETXTBSY) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run a process spawn, riding out a transient `ETXTBSY` ("Text file busy").
+///
+/// exec fails with `ETXTBSY` while *any* process holds the target file open for
+/// writing, so a multi-threaded process that writes an executable and then runs
+/// it races itself. Rust opens files `O_CLOEXEC`, but `CLOEXEC` only takes
+/// effect at exec: a `fork()` on another thread — codeg forks constantly, for
+/// git, agents, and other terminals — copies the fd table while the write
+/// descriptor is still open, and that inherited copy keeps the file busy until
+/// the forked child reaches its own exec. An agent that writes `build.sh` and
+/// immediately asks for `terminal/create ./build.sh` can therefore be refused
+/// for a reason that has nothing to do with its command.
+///
+/// That window is self-closing (bounded by the forked child's exec), so
+/// retrying with backoff turns the race into a delay nobody notices. A file
+/// held open by a genuine long-lived writer still fails once the budget is
+/// spent, carrying the original `ETXTBSY` — callers that classify spawn errors
+/// (e.g. the terminal runtime's shell fallback) never see a substitute.
+pub async fn spawn_retrying_exec_busy<T, F>(attempt: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    spawn_retrying_exec_busy_within(EXEC_BUSY_RETRY_BUDGET, attempt).await
+}
+
+/// [`spawn_retrying_exec_busy`] with an explicit budget so tests can exercise
+/// give-up behavior without waiting out the production one.
+async fn spawn_retrying_exec_busy_within<T, F>(
+    budget: Duration,
+    mut attempt: F,
+) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    // `tokio::time::Instant`, not `std::time::Instant`, so paused-time tests
+    // advance the deadline along with the sleeps instead of waiting for real.
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match attempt() {
+            Err(err) if is_exec_busy(&err) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                tokio::time::sleep(backoff.min(deadline - now)).await;
+                backoff = (backoff * 2).min(EXEC_BUSY_MAX_BACKOFF);
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// If `node` is not already in PATH, detect common Node.js version manager
@@ -577,8 +653,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::collect_lines_lossy;
+    use super::{collect_lines_lossy, spawn_retrying_exec_busy, spawn_retrying_exec_busy_within};
     use std::io::Cursor;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn collect_lines_lossy_preserves_lines_around_invalid_utf8() {
@@ -621,5 +698,81 @@ mod tests {
 
         assert!(seen.is_empty());
         assert!(collected.is_empty());
+    }
+
+    /// A spawn refused with `ETXTBSY` is retried until the writer lets go — the
+    /// racing fork→exec window is self-closing, so the caller must see the
+    /// eventual success, not the transient failure.
+    #[tokio::test(start_paused = true)]
+    async fn exec_busy_spawn_is_retried_until_the_file_is_free() {
+        let mut attempts = 0u32;
+        let outcome = spawn_retrying_exec_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("spawned")
+            }
+        })
+        .await;
+
+        assert_eq!(outcome.expect("spawn eventually succeeds"), "spawned");
+        assert_eq!(attempts, 3, "retried until the file was no longer busy");
+    }
+
+    /// Any other spawn failure returns on the first attempt: retrying a missing
+    /// program would only delay the caller's own fallback (the terminal
+    /// runtime's `NotFound` → shell-wrap path).
+    #[tokio::test(start_paused = true)]
+    async fn non_busy_spawn_failure_is_not_retried() {
+        let mut attempts = 0u32;
+        let outcome: std::io::Result<()> = spawn_retrying_exec_busy(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .await;
+
+        assert_eq!(attempts, 1, "no retry for a non-busy error");
+        assert_eq!(
+            outcome.expect_err("error surfaces").kind(),
+            std::io::ErrorKind::NotFound,
+            "original kind reaches the caller's fallback classifier"
+        );
+    }
+
+    /// A file held open by a long-lived writer gives up once the budget is
+    /// spent and reports the original `ETXTBSY` — never swallowed, never
+    /// reclassified.
+    #[tokio::test(start_paused = true)]
+    async fn persistently_busy_spawn_gives_up_with_the_original_error() {
+        let mut attempts = 0u32;
+        let outcome: std::io::Result<()> =
+            spawn_retrying_exec_busy_within(Duration::from_millis(20), || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            })
+            .await;
+
+        assert!(
+            attempts > 1,
+            "budget allowed at least one retry: {attempts}"
+        );
+        assert_eq!(
+            outcome.expect_err("error surfaces").kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+    }
+
+    /// `ETXTBSY` arriving as a bare errno, with no `ErrorKind` mapping, is still
+    /// recognized — and a neighboring errno is not.
+    #[cfg(unix)]
+    #[test]
+    fn raw_etxtbsy_errno_is_recognized_as_exec_busy() {
+        assert!(super::is_exec_busy(&std::io::Error::from_raw_os_error(
+            libc::ETXTBSY
+        )));
+        assert!(!super::is_exec_busy(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
     }
 }

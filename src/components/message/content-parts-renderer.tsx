@@ -11,7 +11,10 @@ import {
   type ToolKindLabel,
 } from "@/lib/adapters/tool-kind-classifier"
 import type { MessageRole, PlanEntryInfo } from "@/lib/types"
-import { normalizeToolName } from "@/lib/tool-call-normalization"
+import {
+  extractClaudeCodeMetaTitle,
+  normalizeToolName,
+} from "@/lib/tool-call-normalization"
 import { parseBackgroundLaunch } from "@/lib/background-task"
 import { normalizePriority, normalizeStatus } from "@/lib/plan-parse"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
@@ -53,6 +56,8 @@ import {
   isContextCompactionMeta,
 } from "./context-compaction-card"
 import { FeedbackCheckResultCard } from "./feedback-check-result-card"
+import { SearchResultsOutput } from "./search-results-output"
+import { parseCodexCommandEnvelope } from "@/lib/codex-command-action"
 import { COLLAB_AGENT_TOOL_NAME } from "@/lib/collab-tool"
 import { DelegatedSubThread } from "./delegated-sub-thread"
 import { DelegationStatusCard } from "./delegation-status-card"
@@ -1000,14 +1005,20 @@ function deriveToolTitle(
     return ellipsis(simplifyShellCommand(commandLike).split("\n")[0], 80)
   }
 
-  // Search tools
+  // Search tools. The path fallbacks cover pattern-less listings — Cline's
+  // `list_files` and codex's `listFiles` / path-only `search` command actions all
+  // classify as glob/grep but carry a scope path instead of a pattern.
   if (name === "glob") {
     const p = getField("pattern")
     if (p) return `Glob ${p}`
+    const path = getField("path")
+    if (path) return `List files ${ellipsis(path, 50)}`
   }
   if (name === "grep") {
     const p = getField("pattern")
     if (p) return `Grep ${ellipsis(p, 50)}`
+    const path = getField("path")
+    if (path) return `Grep ${ellipsis(path, 50)}`
   }
 
   // Task / agent tools
@@ -1171,6 +1182,11 @@ function localizeDerivedToolTitle(
     return t("title.globWithPattern", { pattern: globWithPattern[1] })
   }
 
+  const listFilesWithPath = title.match(/^List files (.+)$/)
+  if (listFilesWithPath) {
+    return t("title.listFilesWithPath", { path: listFilesWithPath[1] })
+  }
+
   const grepWithPattern = title.match(/^Grep (.+)$/)
   if (grepWithPattern) {
     return t("title.grepWithPattern", { pattern: grepWithPattern[1] })
@@ -1331,24 +1347,15 @@ function BashToolInput({ input }: { input: Record<string, unknown> }) {
  * file content renders. Requiring BOTH keys keeps a genuine JSON-file read
  * (`{ output: … }`, `{ stdout: … }`, a lone `{ exit_code: 0 }`, …) from being
  * mistaken for a command envelope. Returns null when it isn't that exact shape.
+ *
+ * Read-only on purpose: the sibling `search` body unwraps the envelope WITHOUT
+ * the CLI-framing strip below, because a search's matched line can legitimately
+ * begin with one of those metadata words (see the `searchOutput` memo).
  */
 export function codexCommandReadOutput(raw: string): string | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-    return null
-  const obj = parsed as Record<string, unknown>
-  if (
-    typeof obj.exit_code !== "number" ||
-    typeof obj.formatted_output !== "string"
-  ) {
-    return null
-  }
-  const out = obj.formatted_output
+  const envelope = parseCodexCommandEnvelope(raw)
+  if (!envelope) return null
+  const out = envelope.output
   // Strip codex's CLI framing ("Chunk ID:/Wall time:/…/Output:\n<content>") only
   // when the output actually STARTS with that metadata — so a clean file whose
   // first line happens to be "Output:" is never truncated by the envelope parser.
@@ -2158,6 +2165,8 @@ const ToolCallBody = memo(function ToolCallBody({
   liveOutputTruncated,
   shouldRenderCommandTerminal,
   terminalOutput,
+  searchOutput,
+  searchQuery,
   shouldHideDuplicateResult,
 }: {
   part: Extract<AdaptedContentPart, { type: "tool-call" }>
@@ -2168,6 +2177,8 @@ const ToolCallBody = memo(function ToolCallBody({
   liveOutputTruncated: boolean
   shouldRenderCommandTerminal: boolean
   terminalOutput: string
+  searchOutput: string | null
+  searchQuery: string | null
   shouldHideDuplicateResult: boolean
 }) {
   const t = useTranslations("Folder.chat.contentParts")
@@ -2198,6 +2209,13 @@ const ToolCallBody = memo(function ToolCallBody({
                   {t("showingTailOutput")}
                 </div>
               )}
+            </div>
+          ) : searchOutput !== null ? (
+            <div className="space-y-2">
+              <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                {t("result")}
+              </h4>
+              <SearchResultsOutput text={searchOutput} query={searchQuery} />
             </div>
           ) : (
             !shouldHideDuplicateResult &&
@@ -2232,6 +2250,7 @@ export const ToolCallPart = memo(function ToolCallPart({
   const isCommandTool =
     toolNameLower === "bash" || toolNameLower === "exec_command"
   const isCommandLikeTool = isCommandTool || toolNameLower === "apply_patch"
+  const isSearchTool = toolNameLower === "grep" || toolNameLower === "glob"
   const isRunning =
     part.state === "input-available" || part.state === "input-streaming"
   // A `Bash(run_in_background: true)` launch — its result is just the task id +
@@ -2246,7 +2265,16 @@ export const ToolCallPart = memo(function ToolCallPart({
     [isCommandTool, part.output, part.errorText]
   )
   const title = useMemo(() => {
+    // claude-agent-acp ≥0.63 supplies the human-readable description as
+    // `_meta.claudeCode.title` (ACP `title` stays the raw command). It wins
+    // over input-derived titles because it is available from frame 1 —
+    // before `rawInput` streams — and is the same string `deriveToolTitle`
+    // would later extract from `input.description`, so the title never
+    // jitters when the input lands. Same 80-char ellipsis as the derived
+    // path for identical truncation behavior.
+    const metaTitle = extractClaudeCodeMetaTitle(part.meta)
     const rawTitle =
+      (metaTitle ? ellipsis(metaTitle, 80) : null) ??
       deriveToolTitle(
         normalizedToolName,
         part.input,
@@ -2261,6 +2289,7 @@ export const ToolCallPart = memo(function ToolCallPart({
     ) => string)
   }, [
     normalizedToolName,
+    part.meta,
     part.input,
     part.output,
     part.errorText,
@@ -2412,7 +2441,6 @@ export const ToolCallPart = memo(function ToolCallPart({
     typeof commandOutput === "string" &&
     typeof liveOutput === "string" &&
     liveOutput.length < commandOutput.length
-
   const open = (isRunning && (isCommandTool || hasLiveOutput)) || manualOpen
 
   // Completed command output is parsed only while the body is open.
@@ -2433,6 +2461,49 @@ export const ToolCallPart = memo(function ToolCallPart({
   const resolvedCommandOutput = isRunning
     ? commandOutput
     : completedCommandOutput
+  // Search results get a grouped, clickable body instead of the generic result
+  // block. `null` means "not a search tool / nothing to show yet" and falls
+  // through to <ToolOutput>; `""` is a real result — an empty search, rendered
+  // as "no matches".
+  //
+  // Only codex's exact `{formatted_output, exit_code}` envelope is unwrapped
+  // (that is what the generic block was dumping as raw JSON) — every other
+  // agent's search output passes through byte-for-byte, and NOTHING is stripped
+  // from the unwrapped text. codex-acp assigns `formatted_output` straight from
+  // the process's raw `aggregatedOutput`, so it never carries codex's own
+  // "Chunk ID:/Wall time:/Output:" text framing or a Markdown fence — whereas
+  // every cleanup step the command/read paths apply is lossy on a legitimate
+  // search hit. A single-file grep prints matches with no `<path>:` prefix, so
+  // `grep 'Wall time:' server.log`, `grep '^Output:' log`, `grep -h '```' *.md`
+  // and a lone `{"exit_code":0}` all used to come out truncated or empty
+  // ("no matches").
+  const searchOutput = useMemo(() => {
+    if (!isSearchTool) return null
+
+    // codex appears to derive the tool status from the exit code, so an rg/grep
+    // "no matches" (exit 1, no output) can arrive as a FAILED call and land on
+    // the error channel. Recognise exactly that shape as an empty result instead
+    // of a red envelope dump. Scoped to `grep`: exit 1 means "nothing selected"
+    // only for grep-likes — for the list-files commands that classify as `glob`
+    // (ls/find/…) it is a genuine failure, and a successful empty listing
+    // already arrives with exit 0. A real grep failure (exit ≥ 2, or any stderr
+    // text) keeps the error rendering, as does any non-codex error string.
+    if (typeof part.errorText === "string") {
+      if (toolNameLower !== "grep") return null
+      const envelope = parseCodexCommandEnvelope(part.errorText)
+      const noMatches =
+        envelope?.exitCode === 1 && envelope.output.trim().length === 0
+      return noMatches ? "" : null
+    }
+
+    if (typeof part.output !== "string") return null
+    return parseCodexCommandEnvelope(part.output)?.output ?? part.output
+  }, [isSearchTool, toolNameLower, part.output, part.errorText])
+  const searchQuery = useMemo(() => {
+    if (!isSearchTool || !part.input) return null
+    const pattern = tryParseJson(part.input)?.pattern
+    return typeof pattern === "string" && pattern.length > 0 ? pattern : null
+  }, [isSearchTool, part.input])
   const shouldRenderCommandTerminal =
     isCommandTool &&
     open &&
@@ -2493,8 +2564,11 @@ export const ToolCallPart = memo(function ToolCallPart({
       <AgentToolCallPart
         part={part}
         renderToolCall={(p, key) => (
-          // Strip agentStats to prevent recursive Agent nesting
-          <ToolCallPart key={key} part={{ ...p, agentStats: undefined }} />
+          // Strip agentStats/agentTranscript to prevent recursive Agent nesting
+          <ToolCallPart
+            key={key}
+            part={{ ...p, agentStats: undefined, agentTranscript: undefined }}
+          />
         )}
       />
     )
@@ -2674,6 +2748,8 @@ export const ToolCallPart = memo(function ToolCallPart({
             liveOutputTruncated={liveOutputTruncated}
             shouldRenderCommandTerminal={shouldRenderCommandTerminal}
             terminalOutput={terminalOutput}
+            searchOutput={searchOutput}
+            searchQuery={searchQuery}
             shouldHideDuplicateResult={shouldHideDuplicateResult}
           />
         </ToolContent>

@@ -67,7 +67,12 @@ export function PermissionDialog({
         <div className="min-w-0 space-y-1">
           <div className="flex items-center gap-1.5 text-sm font-medium">
             <ShieldAlert className="h-4 w-4 shrink-0 text-amber-500" />
-            <span className="truncate">{parsed.title}</span>
+            {/* Prefer the human-readable description (claude-agent-acp ≥0.63
+                `_meta.claudeCode.title`) over the raw title (the shell
+                command, which the command block below already shows). */}
+            <span className="truncate">
+              {parsed.description ?? parsed.title}
+            </span>
           </div>
           <p className="text-xs text-muted-foreground">{t("subtitle")}</p>
         </div>

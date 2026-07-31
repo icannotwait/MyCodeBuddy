@@ -355,6 +355,57 @@ describe("parseAskQuestionOutcome", () => {
     ])
   })
 
+  it("parses kimi's string-valued answers keyed by question text", () => {
+    // Verbatim tool.result output from a Kimi Code wire.jsonl: the native
+    // AskUserQuestion keys `answers` by the QUESTION TEXT with the chosen
+    // option label as a plain string — NOT codex's `{answers:[…]}` records.
+    // Without this the card showed "no selection" (the reported bug).
+    const output = JSON.stringify({
+      answers: { "你最近在用哪种编程语言最多？": "Rust" },
+    })
+    expect(parseAskQuestionOutcome(output)).toEqual({
+      declined: false,
+      answers: [
+        {
+          header: "",
+          question: "你最近在用哪种编程语言最多？",
+          selected: ["Rust"],
+        },
+      ],
+    })
+  })
+
+  it("splits kimi's ', '-joined multi-select value into one pick per label", () => {
+    // kimi-code joins multi-select picks (and a free-text other) with ", " —
+    // the same documented lossiness as the human-readable text fallback.
+    const output = JSON.stringify({
+      answers: { "Pick any": "Alpha, Beta" },
+    })
+    expect(parseAskQuestionOutcome(output)?.answers[0].selected).toEqual([
+      "Alpha",
+      "Beta",
+    ])
+  })
+
+  it("treats kimi's empty string value as an answered-but-empty selection", () => {
+    const output = JSON.stringify({ answers: { "Pick any": "" } })
+    expect(parseAskQuestionOutcome(output)).toEqual({
+      declined: false,
+      answers: [{ header: "", question: "Pick any", selected: [] }],
+    })
+  })
+
+  it("reads kimi's dismissal (empty answers map + note) as declined", () => {
+    const output = JSON.stringify({
+      answers: {},
+      note: "User dismissed the question without answering.",
+    })
+    expect(parseAskQuestionOutcome(output)).toEqual({
+      declined: true,
+      answers: [],
+    })
+  })
+
   it("keeps an option label containing a comma intact as one entry", () => {
     const output = JSON.stringify({
       answers: [

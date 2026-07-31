@@ -1,6 +1,7 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { DbConversationSummary } from "@/lib/types"
+import { firstLeafId } from "@/lib/tab-group-layout"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -95,12 +96,15 @@ function seedActiveConversation(opts: {
   awaiting_reply_token: string
 }) {
   const tab = makeTab(opts.id)
+  const groupId = firstLeafId(useTabStore.getState().groupLayout)
   useTabStore.setState({
     tabsHydrated: true,
-    isTileMode: false,
     activeTabId: tab.id,
     rawTabs: [tab],
     tabs: [tab],
+    groupOf: { [tab.id]: groupId },
+    groupSelection: { [groupId]: tab.id },
+    tileByGroup: { [groupId]: false },
   })
   useAppWorkspaceStore.getState().applyConversationUpsert(
     makeSummary({
@@ -117,12 +121,18 @@ function seedTiledConversations(opts: {
 }) {
   const activeTab = makeTab(opts.activeId)
   const inactiveTab = makeTab(opts.inactiveId)
+  const groupId = firstLeafId(useTabStore.getState().groupLayout)
   useTabStore.setState({
     tabsHydrated: true,
-    isTileMode: true,
     activeTabId: activeTab.id,
     rawTabs: [activeTab, inactiveTab],
     tabs: [activeTab, inactiveTab],
+    groupOf: {
+      [activeTab.id]: groupId,
+      [inactiveTab.id]: groupId,
+    },
+    groupSelection: { [groupId]: activeTab.id },
+    tileByGroup: { [groupId]: true },
   })
   useAppWorkspaceStore.getState().applyConversationUpsert(
     makeSummary({
@@ -285,10 +295,10 @@ describe("ConversationAwaitingReplyClearer", () => {
     // focus after focusing the detached window, but sidebarSelection is set.
     useTabStore.setState({
       tabsHydrated: true,
-      isTileMode: false,
       activeTabId: null,
       rawTabs: [],
       tabs: [],
+      tileByGroup: {},
       sidebarSelection: { id: 77, agentType: "claude_code" },
     })
     useAppWorkspaceStore.getState().applyConversationUpsert(

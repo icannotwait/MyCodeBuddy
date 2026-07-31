@@ -192,7 +192,13 @@ function parseCodexAnswers(
   if (!map || typeof map !== "object" || Array.isArray(map)) return null
   const out: AskQuestionAnswer[] = []
   for (const [id, entry] of Object.entries(map as Record<string, unknown>)) {
-    const raw = asRecord(entry)?.answers
+    // Only a record-shaped entry is codex's. Kimi Code keys the same `answers`
+    // map with plain STRING values (label per question text — see
+    // `parseKimiOutcome`); swallowing those here turned every kimi answer into
+    // a ghost empty selection ("no selection" despite a real pick).
+    const rec = asRecord(entry)
+    if (!rec) continue
+    const raw = rec.answers
     const selected = Array.isArray(raw)
       ? raw.filter((x): x is string => typeof x === "string")
       : []
@@ -202,11 +208,55 @@ function parseCodexAnswers(
 }
 
 /**
+ * Kimi Code's native `AskUserQuestion` persists its result as
+ *   {"answers": {"<question text>": "<value>"}}
+ * — an object map keyed by the QUESTION TEXT whose values are strings: the
+ * chosen option label, a free-text "other" answer, or a ", "-joined list for
+ * multi-select (kimi-code ask-user.ts: single→label, multi→join(", ")). A
+ * dismissal persists as {"answers": {}, "note": "User dismissed…"}. Splitting
+ * on ", " mirrors the human-readable fallback's documented lossiness (a label
+ * containing ", " degrades to a free-text answer, display-equivalent).
+ * Returns `null` when no entry is string-valued and there is no dismissal
+ * note, so codex's record-valued map (`parseCodexAnswers`) and the codeg-mcp
+ * array envelope never land here.
+ */
+function parseKimiOutcome(
+  source: Record<string, unknown> | null | undefined
+): AskQuestionOutcome | null {
+  if (!source) return null
+  const map = source.answers
+  if (!map || typeof map !== "object" || Array.isArray(map)) return null
+  const entries = Object.entries(map as Record<string, unknown>)
+  const answers: AskQuestionAnswer[] = []
+  for (const [question, value] of entries) {
+    if (typeof value !== "string") continue
+    answers.push({
+      header: "",
+      question,
+      selected: value ? value.split(", ") : [],
+    })
+  }
+  if (answers.length > 0) return { declined: false, answers }
+  // Kimi's dismissal: an EMPTY answers map plus an explanatory `note`. (The
+  // text fallback would also catch today's exact wording, but the shape is the
+  // stable contract — the wording isn't.)
+  if (
+    entries.length === 0 &&
+    typeof source.note === "string" &&
+    source.note.trim()
+  ) {
+    return { declined: true, answers: [] }
+  }
+  return null
+}
+
+/**
  * Parse the structured `{ answers, declined }` envelope the agent CLI persists
  * for the tool result (the companion's `structuredContent`). It may sit at the
  * top level or nested under `structuredContent`. Also recognizes codex's
- * object-keyed `request_user_input` envelope (see `parseCodexAnswers`). Returns
- * `null` when `output` is neither, so the text fallback can take over.
+ * object-keyed `request_user_input` envelope (see `parseCodexAnswers`) and
+ * Kimi Code's string-valued native envelope (see `parseKimiOutcome`). Returns
+ * `null` when `output` is none of these, so the text fallback can take over.
  */
 function parseOutcomeJson(output: string): AskQuestionOutcome | null {
   let parsed: unknown
@@ -252,7 +302,10 @@ function parseOutcomeJson(output: string): AskQuestionOutcome | null {
     parseCodexAnswers(resultOk)
   if (codex) return { declined: false, answers: codex }
 
-  return null
+  // Kimi Code's native AskUserQuestion: string-valued answers keyed by
+  // question text, always at the top level (both the live ACP wire and the
+  // wire.jsonl history carry the bare `{"answers": {...}}` output verbatim).
+  return parseKimiOutcome(top)
 }
 
 /**

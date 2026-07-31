@@ -744,7 +744,13 @@ vi.mock("@/stores/app-workspace-store", () => {
       }, [])
       return sel(getWorkspaceSlice())
     },
-    { getState: () => getWorkspaceSlice() }
+    {
+      getState: () => getWorkspaceSlice(),
+      subscribe: (listener: () => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+    }
   )
   return { useAppWorkspaceStore }
 })
@@ -2323,4 +2329,3 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
     expect(delegateStatus()).toBe("waiting")
   })
 })
-

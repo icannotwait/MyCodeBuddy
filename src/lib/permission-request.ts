@@ -27,6 +27,14 @@ export interface PermissionAllowedPrompt {
 
 export interface ParsedPermissionToolCall {
   title: string
+  /**
+   * Human-readable description from `_meta.claudeCode.title`
+   * (claude-agent-acp ≥0.63; for Bash it is the model-authored `description`
+   * input). The permission path carries the RAW serde spelling `_meta` —
+   * unlike tool parts, whose `AcpEvent` field is named `meta`. Null when the
+   * agent supplied none; the dialog then falls back to `title`.
+   */
+  description: string | null
   normalizedKind: string
   command: string | null
   cwd: string | null
@@ -765,8 +773,20 @@ export function parsePermissionToolCall(
     pickString(toolCallObj, ["title", "tool_name", "toolName", "name"]) ??
     formatFallbackTitle(normalizedKind)
 
+  // `_meta.claudeCode.title` — NOTE the underscore key: the permission
+  // request forwards the raw ACP ToolCallUpdate serialization (serde renames
+  // `meta` → `_meta`), unlike tool parts whose event field is plain `meta`.
+  const description =
+    pickString(
+      asObject(
+        pickValue(asObject(pickValue(toolCallObj, ["_meta"])), ["claudeCode"])
+      ),
+      ["title"]
+    ) ?? null
+
   return {
     title,
+    description,
     normalizedKind,
     command,
     cwd,

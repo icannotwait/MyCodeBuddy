@@ -21,7 +21,8 @@
 
 Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智慧體（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor 等）統一到一個工作區中，支援會話彙整和多智慧體協作，支援桌面安裝、伺服器/Docker 部署。
 
-![gallery](../images/gallery.svg)
+![gallery](../images/workspace-light.png#gh-light-mode-only)
+![gallery](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## 贊助
 
@@ -60,13 +61,13 @@ Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智
 
 ## 主介面
 
-![Codeg Light](../images/main-light.png#gh-light-mode-only)
-![Codeg Dark](../images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## 多智慧體協作
 
-![Codeg Light](../images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## 日常辦公
 
@@ -110,13 +111,23 @@ Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智
 
 > 注意：環境變數的優先順序高於預設路徑。
 
+
+名單之外的呢？自己加就行。從公開的 ACP 註冊表裡挑一個，或者貼上它的 distribution JSON，Codeg 會安裝它、預檢它能否啟動，然後像對待內建智慧體一樣對待它——出現在選擇器裡，接受 `@` 委派與技能設定；即便這個智慧體本身不留下任何歷史，它的工作階段也會被記錄下來並可搜尋。→ [自訂智慧體](https://docs.codeg.app/zh/guide/custom-agents)
+
+## 🪟 分割檢視
+
+一條標籤列不總是夠用。右鍵點擊對話標籤，即可把檢視**向右**或**向下**拆分，想拆幾次就拆幾次：左右兩欄、上下三格，或者一整片網格。每個分組都是獨立的工作區——自己的標籤、自己的標題列、自己的新建對話按鈕——所以左邊這格可以讓 Claude Code 重構，右邊那格讓 Codex 審閱 diff。
+
+把標籤從一個分組拖到另一個分組，它的工作階段在搬家途中也不會中斷；拖動兩個分組之間的分隔條，就能改變它們分配空間的方式。版面配置會按工作區記住，草稿也包含在內：重新打開 Codeg，拆分原樣回來，沒送出去的文字還在輸入框裡。
+
+![把對話區拆分成標籤分組構成的網格](../images/split-light.gif#gh-light-mode-only)
+![把對話區拆分成標籤分組構成的網格](../images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>專案啟動器</h2></summary>
 
 視覺化建立新專案：左側設定面板，右側即時預覽。
 
-![Project Boot Light](../images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](../images/project-boot-dark.png#gh-dark-mode-only)
 
 ### 功能特色
 
@@ -290,7 +301,7 @@ GitHub Releases for this fork ship **desktop only**. They do **not** attach
 (`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### 方式三：Docker

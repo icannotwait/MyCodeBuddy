@@ -98,11 +98,20 @@ export function AskQuestionResultCard({
         a.selected,
       ])
     )
+    // Kimi Code's native ask keys its answers by the bare question TEXT (its
+    // envelope carries no header), so the header+question signature misses any
+    // question that has one — fall back to the question text alone.
+    const byQuestion = new Map(
+      (outcome?.answers ?? [])
+        .filter((a) => a.question)
+        .map((a) => [a.question, a.selected])
+    )
     pending.questions.forEach((q, i) => {
       const qid = questions[i]?.id
       const values =
         (qid ? byId.get(qid) : undefined) ??
         bySig.get(`${q.header}${KEY_SEP}${q.question}`) ??
+        byQuestion.get(q.question) ??
         []
       const { selected, other } = matchSelections(
         values,

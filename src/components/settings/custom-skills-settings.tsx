@@ -186,7 +186,15 @@ export function CustomSkillsBody({
         acpListAgents(),
       ])
       setSkills(list)
-      setAgents(agentList.filter((agent) => !piUsesCustomAgentDir(agent)))
+      // `skills_capable` is derived backend-side from `skill_storage_spec`:
+      // every built-in today, custom agents only once they declare the shared
+      // `.agents/skills` store. Without the filter an undeclared custom agent
+      // would render a matrix column whose links can only fail.
+      setAgents(
+        agentList.filter(
+          (agent) => agent.skills_capable && !piUsesCustomAgentDir(agent)
+        )
+      )
       setReloadKey((k) => k + 1)
     } catch (err) {
       setLoadError(toErrorMessage(err))

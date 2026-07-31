@@ -3072,6 +3072,7 @@ mod tests {
             route_preference: None,
             route_capability:
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -4092,7 +4093,10 @@ mod tests {
         let env = EventEnvelope {
             seq: 1,
             connection_id: "c1".to_string(),
-            payload: AcpEvent::ContentDelta { text: "hi".into() },
+            payload: AcpEvent::ContentDelta {
+                text: "hi".into(),
+                parent_tool_use_id: None,
+            },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
 
@@ -4151,6 +4155,7 @@ mod tests {
         // Rejected (worker no-ops on these — must not enter the queue):
         assert!(!is_lifecycle_relevant(&AcpEvent::ContentDelta {
             text: "x".into(),
+            parent_tool_use_id: None,
         }));
         assert!(!is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Connected,
@@ -4320,6 +4325,7 @@ mod tests {
                 connection_id: "c1".to_string(),
                 payload: AcpEvent::ContentDelta {
                     text: format!("delta {i}"),
+                    parent_tool_use_id: None,
                 },
             }));
         }

@@ -149,6 +149,33 @@ describe("parseUserMessageSegments", () => {
         }),
       ],
       [
+        // A uri holding `\`, `<` or `>` is angle-wrapped AND backslash-escaped
+        // by escapeLinkDestination; parsing has to decode those escapes or the
+        // recovered uri carries doubled backslashes (wrong path, and one more
+        // doubling per round-trip).
+        "windows file with backslashes",
+        ref({
+          refType: "file",
+          // The basename split is `/`-only, so a backslash-only path yields the
+          // whole path as id (unchanged by the escape decode; `buildFileUri`
+          // never emits this form, but an agent-supplied ResourceLink can).
+          id: "C:\\repo\\app.ts",
+          label: "app.ts",
+          uri: "file:///C:\\repo\\app.ts",
+          meta: { fileKind: "file" },
+        }),
+      ],
+      [
+        "file with angle brackets",
+        ref({
+          refType: "file",
+          id: "a<b>c.ts",
+          label: "a<b>c.ts",
+          uri: "file:///repo/a<b>c.ts",
+          meta: { fileKind: "file" },
+        }),
+      ],
+      [
         "agent",
         ref({
           refType: "agent",

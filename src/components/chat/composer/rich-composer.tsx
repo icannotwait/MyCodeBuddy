@@ -19,9 +19,9 @@ import { cn } from "@/lib/utils"
 
 import { buildComposerExtensions } from "./editor-config"
 import {
-  decidePastedPlainText,
-  textToDoc,
-  textToInlineContent,
+  decidePastedContent,
+  textToSeededDoc,
+  textToSeededInlineContent,
 } from "./plain-text-content"
 import { serializeDocToText } from "./to-prompt-blocks"
 import { decideComposerKey } from "./submit-key"
@@ -46,7 +46,12 @@ export interface RichComposerHandle {
   /** Serialize the current document to plain text (references → their inline
    *  token, hard breaks → newlines). */
   getText: () => string
-  /** Replace the whole document from a plain-text string. */
+  /**
+   * Replace the whole document from a plain-text string. Serialized references
+   * in the text hydrate into inline badges (see {@link textToSeededDoc}), so a
+   * restored draft / queued message / template previews the way the sent
+   * message renders.
+   */
   setText: (text: string) => void
   /**
    * Replace the whole document from a Tiptap JSON doc — used to hydrate a v2
@@ -70,7 +75,11 @@ export interface RichComposerHandle {
   isEmpty: () => boolean
   /** Serialize the current document to Tiptap JSON (for draft persistence). */
   getJSON: () => JSONContent
-  /** Insert plain text at the current selection (quick messages, appended text). */
+  /**
+   * Insert plain text at the current selection (quick messages, appended text).
+   * Serialized references in the text hydrate into inline badges, so seeded
+   * content previews the way the sent message renders.
+   */
   insertTextAtCursor: (text: string) => void
   /** Insert an inline reference badge at the current selection. */
   insertReference: (attrs: ReferenceAttrs) => void
@@ -79,7 +88,10 @@ export interface RichComposerHandle {
 }
 
 export interface RichComposerProps {
-  /** Initial content, inserted as plain text. Applied once on creation. */
+  /**
+   * Initial content, inserted as plain text (serialized references hydrate into
+   * badges — see {@link textToSeededDoc}). Applied once on creation.
+   */
   defaultText?: string
   placeholder?: string
   autoFocus?: boolean
@@ -375,16 +387,16 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           // out-of-band, in which case the editor must not also insert text.
           if (onPasteFilesRef.current?.(event) === true) return true
           // Plain-text composer: prefer the clipboard's text/plain over an
-          // external text/html fragment. Copying a URL from a browser address
-          // bar puts `<a href="URL">Page Title</a>` on the clipboard; the
-          // default HTML parse drops the href (no Link mark) and keeps the
-          // title, so the URL would paste as the page title. See
-          // decidePastedPlainText for what still defers to ProseMirror (pure
-          // plain text, and our own reference badges).
+          // external text/html fragment (a URL copied from an address bar
+          // would otherwise paste as the page title), and hydrate serialized
+          // references in the pasted text back into inline badges so the
+          // composer previews them the way the sent message renders. See
+          // decidePastedContent for what still defers to ProseMirror
+          // (reference-free plain text, and our own copied badges/structure).
           const editor = editorInstanceRef.current
           const clipboard = event.clipboardData
           if (!editor || !clipboard) return false
-          const inline = decidePastedPlainText({
+          const inline = decidePastedContent({
             html: clipboard.getData("text/html"),
             text: clipboard.getData("text/plain"),
           })
@@ -397,7 +409,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onCreate: ({ editor }) => {
         editorInstanceRef.current = editor
         if (defaultText) {
-          editor.commands.setContent(textToDoc(defaultText), {
+          editor.commands.setContent(textToSeededDoc(defaultText), {
             emitUpdate: false,
           })
         }
@@ -425,7 +437,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       ref,
       (): RichComposerHandle => ({
         getText: () => (editor ? serializeDocToText(editor.state.doc) : ""),
-        setText: (text) => editor?.commands.setContent(textToDoc(text)),
+        setText: (text) => editor?.commands.setContent(textToSeededDoc(text)),
         setDoc: (doc) => editor?.commands.setContent(doc),
         clear: () => editor?.commands.clearContent(true),
         focus: () => editor?.commands.focus("end"),
@@ -463,10 +475,16 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         isEmpty: () => editor?.isEmpty ?? true,
         getJSON: () => editor?.getJSON() ?? { type: "doc", content: [] },
         insertTextAtCursor: (text) => {
-          // Insert literal text with `\n` → hardBreak so line breaks survive in
-          // the plain-text schema. No Markdown parsing (and thus no schema-
-          // rejection throw) is possible, so no recovery path is needed.
-          editor?.chain().focus().insertContent(textToInlineContent(text)).run()
+          // `\n` → hardBreak so line breaks survive in the plain-text schema,
+          // and serialized references hydrate back into badges (same treatment
+          // as a paste — see textToSeededInlineContent). No Markdown parsing
+          // (and thus no schema-rejection throw) is possible, so no recovery
+          // path is needed.
+          editor
+            ?.chain()
+            .focus()
+            .insertContent(textToSeededInlineContent(text))
+            .run()
         },
         insertReference: (attrs) => {
           editor?.chain().focus().insertReference(attrs).run()

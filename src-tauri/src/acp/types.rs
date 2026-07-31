@@ -65,9 +65,22 @@ pub struct EventEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
     /// Agent returned text content (streaming delta)
-    ContentDelta { text: String },
+    ContentDelta {
+        text: String,
+        /// `_meta.claudeCode.parentToolUseId` of a subagent chunk
+        /// (claude-agent-acp ≥0.63 with the `subagent-transcript`
+        /// capability advertised). `None` = main-thread content. Skip-none
+        /// keeps the wire shape byte-identical for every other agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Agent thinking/reasoning
-    Thinking { text: String },
+    Thinking {
+        text: String,
+        /// Same contract as `ContentDelta::parent_tool_use_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// The provider abandoned a streamed attempt and started a retry.
     /// Consumers discard speculative content after their latest accepted
     /// tool-call boundary before processing the replacement attempt.
@@ -719,12 +732,21 @@ pub struct ConversationConnectionInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub agent_type: crate::models::agent::AgentType,
+    /// Whether this agent has a codeg-known skill store — every built-in, and
+    /// custom agents that declared the shared `.agents/skills` store. Gates
+    /// the skills matrices frontend-side.
+    pub skills_capable: bool,
     pub registry_id: String,
     pub registry_version: Option<String>,
     pub name: String,
     pub description: String,
     pub available: bool,
     pub distribution_type: String,
+    /// For custom agents, where the definition came from (`registry` |
+    /// `manual`); `None` for built-ins. A manual definition's
+    /// `registry_version` is user-typed, so the version-status display shows
+    /// only the local version for those.
+    pub custom_source: Option<String>,
     pub enabled: bool,
     pub show_thinking: bool,
     pub sort_order: i32,
@@ -764,6 +786,11 @@ pub struct AcpAgentInfo {
     /// for `AgentType::Cursor`. Derived from `cursor_cli_config_json`.
     pub cursor_settings: Option<CursorSettings>,
     pub model_provider_id: Option<i32>,
+    /// Display icon for a custom ACP agent — normally an inlined
+    /// `data:image/…;base64,…` URL (see
+    /// `crate::acp::custom_registry::CustomAgentDef::icon_url`). Always `None`
+    /// for built-ins, which ship hand-drawn marks in the frontend.
+    pub icon_url: Option<String>,
 }
 
 /// The `~/.codex/config.toml` sandbox / approval keys surfaced as structured
@@ -1204,6 +1231,7 @@ mod envelope_tests {
             connection_id: "conn-1".to_string(),
             payload: AcpEvent::ContentDelta {
                 text: "hello".to_string(),
+                parent_tool_use_id: None,
             },
         };
         let json = serde_json::to_value(&env).unwrap();

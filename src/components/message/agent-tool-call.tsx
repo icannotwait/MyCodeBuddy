@@ -110,6 +110,11 @@ function parseTaskOutcomeEnvelope(
   return null
 }
 
+/** Render bound for the live subagent transcript — the DATA is uncapped;
+ *  only the visible tail is limited (entries only split at kind boundaries,
+ *  so the count stays small in practice; this is a backstop). */
+const AGENT_TRANSCRIPT_RENDER_TAIL = 20
+
 // ── main component ────────────────────────────────────────────────────
 
 export const AgentToolCallPart = memo(function AgentToolCallPart({
@@ -165,6 +170,11 @@ export const AgentToolCallPart = memo(function AgentToolCallPart({
     backgroundSettled && backgroundLifecycle?.status !== "completed"
 
   const [promptOpen, setPromptOpen] = useState(false)
+
+  const transcriptTail = useMemo(
+    () => (part.agentTranscript ?? []).slice(-AGENT_TRANSCRIPT_RENDER_TAIL),
+    [part.agentTranscript]
+  )
 
   const subagentType = useMemo(
     () =>
@@ -314,6 +324,38 @@ export const AgentToolCallPart = memo(function AgentToolCallPart({
             renderToolCall(
               tc as Extract<AdaptedContentPart, { type: "tool-call" }>,
               `subagent-tc-${i}`
+            )
+          )}
+        </div>
+      )}
+
+      {/* Live subagent transcript (claude-agent-acp ≥0.63) — streaming
+          text/thinking attributed to this Agent call. LIVE-only by
+          construction: the store stops attaching it at settle and promotion
+          never carries it, so this section disappears when the real result
+          takes over below. Render is tail-bounded; the data is not. */}
+      {isRunning && transcriptTail.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+            {t("agentLiveTranscript")}
+          </div>
+          {transcriptTail.map((entry, i) =>
+            entry.type === "thinking" ? (
+              entry.text.trim() ? (
+                <div
+                  key={i}
+                  className="whitespace-pre-wrap text-xs italic text-muted-foreground/80"
+                >
+                  {entry.text}
+                </div>
+              ) : null
+            ) : (
+              <div
+                key={i}
+                className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside"
+              >
+                <MessageResponse>{entry.text}</MessageResponse>
+              </div>
             )
           )}
         </div>

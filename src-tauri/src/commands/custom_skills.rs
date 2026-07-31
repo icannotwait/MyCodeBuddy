@@ -827,6 +827,86 @@ mod tests {
         assert!(agents.iter().all(|a| skill_storage_spec(*a).is_some()));
     }
 
+    #[test]
+    fn a_custom_agent_joins_the_matrix_by_declaring_a_store() {
+        use crate::acp::custom_registry::{
+            hydrate, hydrate_test_guard, CustomAgentDef, CustomAgentSpec, CustomDistributionKind,
+            NpxSpec,
+        };
+        let _guard = hydrate_test_guard();
+        let mut def = CustomAgentDef {
+            registry_id: "skills-matrix-agent".into(),
+            name: "Skills Matrix Agent".into(),
+            description: String::new(),
+            version: "1.0.0".into(),
+            distribution_kind: CustomDistributionKind::Npx,
+            spec: CustomAgentSpec {
+                npx: Some(NpxSpec {
+                    package: "skills-matrix-agent@1.0.0".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+        };
+        let agent = crate::models::agent::AgentType::custom("skills-matrix-agent").unwrap();
+        // Absolute on every platform — a unix literal would not be on Windows.
+        let dedicated = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("codeg-dedicated-skills");
+
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        assert!(
+            skill_storage_spec(agent).is_none(),
+            "undeclared custom agents expose no skill store"
+        );
+        assert!(!supported_agents().contains(&agent));
+
+        // Shared store alone: exactly the `.agents/skills` convention, global
+        // and project-local, nothing agent-specific to list first.
+        def.skills_shared_store = true;
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        let spec = skill_storage_spec(agent).expect("declared agent joins the matrix");
+        assert!(supported_agents().contains(&agent));
+        assert_eq!(spec.project_rel_dirs, vec![".agents/skills"]);
+        assert_eq!(spec.global_dirs.len(), 1);
+        assert!(spec.global_dirs[0].ends_with(".agents/skills"));
+
+        // A dedicated directory alone is an equally valid way in; it has no
+        // project-local convention to offer.
+        def.skills_shared_store = false;
+        def.skills_dir = Some(dedicated.to_string_lossy().into_owned());
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        let spec = skill_storage_spec(agent).expect("a dedicated dir joins the matrix too");
+        assert!(supported_agents().contains(&agent));
+        assert_eq!(spec.global_dirs, vec![dedicated.clone()]);
+        assert!(spec.project_rel_dirs.is_empty());
+
+        // Both: the dedicated directory is listed first so linking targets it
+        // without side effects on the shared store (the pi/Cursor ordering).
+        def.skills_shared_store = true;
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        let spec = skill_storage_spec(agent).expect("both declarations compose");
+        assert_eq!(spec.global_dirs.len(), 2);
+        assert_eq!(spec.global_dirs[0], dedicated);
+        assert!(spec.global_dirs[1].ends_with(".agents/skills"));
+        assert_eq!(spec.project_rel_dirs, vec![".agents/skills"]);
+
+        // A non-absolute stored value (hand-edited database) is ignored
+        // rather than resolved against the working directory.
+        def.skills_shared_store = false;
+        def.skills_dir = Some("relative/skills".into());
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        assert!(skill_storage_spec(agent).is_none());
+
+        assert!(hydrate(&[]).is_empty());
+        assert!(skill_storage_spec(agent).is_none());
+    }
+
     #[tokio::test]
     async fn apply_links_does_not_deadlock() {
         let ops = vec![

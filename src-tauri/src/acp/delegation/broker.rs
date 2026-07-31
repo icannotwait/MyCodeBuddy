@@ -6710,8 +6710,7 @@ impl DelegationBroker {
             // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
                 let (terminal, result_text) = terminal_from_outcome(&outcome);
-                let (extra_paths, workspace) =
-                    report_harvest_context_from_runtime(Some(&runtime));
+                let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
                 let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                     terminal,
                     result_text,
@@ -9150,8 +9149,7 @@ impl DelegationBroker {
                 }
             }
             let (terminal, result_text) = terminal_from_outcome(&outcome);
-            let (extra_paths, workspace) =
-                report_harvest_context_from_runtime(Some(&runtime));
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
                 result_text,
@@ -11672,8 +11670,7 @@ impl DelegationBroker {
             let (terminal, result_text) = terminal_from_outcome(&outcome);
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
-            let (extra_paths, workspace) =
-                report_harvest_context_from_runtime(Some(&task.runtime));
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
                 result_text,

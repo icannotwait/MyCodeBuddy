@@ -7,6 +7,7 @@ import type { Components, LinkSafetyModalProps } from "streamdown"
 
 import { ReferenceBadge } from "@/components/chat/composer/badges/reference-badge"
 import { parseCodegReferenceUri } from "@/components/chat/composer/reference-uri"
+import { FileReferenceActions } from "@/components/message/file-reference-actions"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import { classifyResourceKind, type ResourceKind } from "@/lib/resource-kind"
 import { cn } from "@/lib/utils"
@@ -148,15 +149,19 @@ export function MarkdownLink({
     }
     return (
       <>
-        <button
-          type="button"
-          data-resource-kind="file"
-          title={href}
-          onClick={handleClick}
-          className="inline-flex max-w-full -translate-y-[1.5px] cursor-pointer appearance-none items-center align-middle leading-none hover:opacity-80"
-        >
-          <ReferenceBadge data={fileData} />
-        </button>
+        {/* Right-clicking the badge opens its actions (reveal in file manager /
+            copy paths); a left click still opens the file. */}
+        <FileReferenceActions target={href}>
+          <button
+            type="button"
+            data-resource-kind="file"
+            title={href}
+            onClick={handleClick}
+            className="inline-flex max-w-full -translate-y-[1.5px] cursor-pointer appearance-none items-center align-middle leading-none hover:opacity-80"
+          >
+            <ReferenceBadge data={fileData} />
+          </button>
+        </FileReferenceActions>
         {linkSafety.renderModal ? linkSafety.renderModal(modalProps) : null}
       </>
     )

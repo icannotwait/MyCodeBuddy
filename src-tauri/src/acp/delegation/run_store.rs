@@ -10166,8 +10166,7 @@ mod tests {
         use crate::db::service::conversation_service;
 
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) =
-            seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
+        let (parent_id, child_id) = seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let root = "pd-root-4111-8111-111111111111";
         store

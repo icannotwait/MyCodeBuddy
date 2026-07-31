@@ -21,7 +21,8 @@
 
 Codeg（Code Generation）は、マルチエージェント・コーディングワークスペースです。Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor などの複数のエージェントを 1 つのワークスペースに統合し、会話の集約とマルチエージェント協働に対応します。デスクトップへのインストールに加え、サーバー/Docker デプロイにも対応しています。
 
-![gallery](../images/gallery.svg)
+![gallery](../images/workspace-light.png#gh-light-mode-only)
+![gallery](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## スポンサー
 
@@ -60,13 +61,13 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 
 ## メインインターフェース
 
-![Codeg Light](../images/main-light.png#gh-light-mode-only)
-![Codeg Dark](../images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## マルチエージェント協調
 
-![Codeg Light](../images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## オフィスワークフロー
 
@@ -110,13 +111,23 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 
 > 注: 環境変数はフォールバックパスより優先されます。
 
+
+リストにない？自分で追加できます。公開されている ACP レジストリから選ぶか、distribution JSON を貼り付けるだけで、Codeg がインストールし、起動できるかを事前に確認し、あとは内蔵エージェントと同じように扱います — ピッカーに並び、`@` 委譲やスキルにも対応し、そのエージェント自身が履歴を残さない場合でも会話は記録され検索できます。→ [カスタムエージェント](https://docs.codeg.app/guide/custom-agents)
+
+## 🪟 画面分割
+
+タブ列がひとつでは足りないときもあります。会話タブを右クリックすれば、ビューを**右**または**下**へ、何度でも分割できます — 左右に 2 つ、縦に 3 つ、あるいは格子状に。どのグループもそれ自体がひとつのワークスペースで、独自のタブ、独自のヘッダー、独自の新規会話ボタンを持ちます。片方のペインで Claude Code にリファクタリングさせ、隣のペインで Codex に diff をレビューさせる、という具合です。
+
+タブをグループ間でドラッグしても、そのセッションは移動中もストリーミングを続けます。グループの境界をドラッグすれば、スペースの分け方が変わります。レイアウトはワークスペースごとに、下書きも含めて記憶されます — Codeg を開き直せば分割はそのまま戻り、送らなかった文字も入力欄に残っています。
+
+![会話エリアをタブグループの格子に分割する](../images/split-light.gif#gh-light-mode-only)
+![会話エリアをタブグループの格子に分割する](../images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>プロジェクトブート</h2></summary>
 
 分割ペインインターフェースで新規プロジェクトをビジュアルに作成：左側で設定、右側でリアルタイムプレビュー。
 
-![Project Boot Light](../images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](../images/project-boot-dark.png#gh-dark-mode-only)
 
 ### 主な機能
 
@@ -290,7 +301,7 @@ GitHub Releases for this fork ship **desktop only**. They do **not** attach
 (`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### オプション 3: Docker

@@ -214,10 +214,21 @@ function denormalizeBlock(
   toolMap: Map<string, ToolCallState>
 ): LocalLiveContentBlock | null {
   switch (wire.kind) {
+    // Subagent attribution must be forwarded explicitly — a mid-run attach
+    // (cold attach / refresh while a Claude subagent streams) rebuilds the
+    // capsule-vs-main routing from these fields alone.
     case "text":
-      return { type: "text", text: wire.text }
+      return {
+        type: "text",
+        text: wire.text,
+        parentToolUseId: wire.parent_tool_use_id ?? undefined,
+      }
     case "thinking":
-      return { type: "thinking", text: wire.text }
+      return {
+        type: "thinking",
+        text: wire.text,
+        parentToolUseId: wire.parent_tool_use_id ?? undefined,
+      }
     case "plan":
       // Wire `plan.entries` is `unknown` (passed through opaque from agent);
       // local shape expects PlanEntryInfo[]. We cast — backend's typed plan

@@ -26,7 +26,8 @@ function hasComponentReturnBeforeCall(
     ts.forEachChild(node, findComponent)
   }
   findComponent(file)
-  if (!component) throw new Error(`Missing component: ${componentName}`)
+  if (!component?.body) throw new Error(`Missing component: ${componentName}`)
+  const componentBody = component.body
 
   let callStart: number | undefined
   const findCall = (node: ts.Node) => {
@@ -41,7 +42,7 @@ function hasComponentReturnBeforeCall(
     }
     ts.forEachChild(node, findCall)
   }
-  findCall(component.body)
+  findCall(componentBody)
   if (callStart == null) throw new Error(`Missing call: ${callName}`)
 
   let found = false
@@ -54,7 +55,7 @@ function hasComponentReturnBeforeCall(
     }
     ts.forEachChild(node, scan)
   }
-  scan(component.body)
+  scan(componentBody)
   return found
 }
 
@@ -94,10 +95,18 @@ const globalsCssSource = readFileSync(
   resolve(process.cwd(), "src/app/globals.css"),
   "utf8"
 )
+const workspaceLayoutSource = readFileSync(
+  resolve(process.cwd(), "src/app/workspace/layout.tsx"),
+  "utf8"
+)
+const tabBarSource = readFileSync(
+  resolve(process.cwd(), "src/components/tabs/tab-bar.tsx"),
+  "utf8"
+)
 
 describe("ConversationDetailPanel inactive panel paint isolation", () => {
   it("uses native hidden outside tile mode instead of visibility-only hiding", () => {
-    expect(panelSource).toContain("hidden={!canTile && !active}")
+    expect(panelSource).toContain("hidden={!visible}")
     expect(panelSource).not.toContain(
       '"absolute inset-0 invisible pointer-events-none"'
     )
@@ -143,7 +152,13 @@ describe("ConversationDetailPanel new conversation layout", () => {
 
     const welcomeBranch = source.slice(welcomeBranchStart, nextBranchStart)
     expect(welcomeBranch).toContain("<ChatInput")
-    expect(welcomeBranch).toContain("overflow-x-hidden overflow-y-auto")
+    // The welcome page scrolls with the app's shared overlay scrollbar (the
+    // sidebar's os-theme-codeg bar), not the platform's native one. `min-h-full`
+    // on the inner column preserves the spacer layout the old
+    // `overflow-y-auto` flex column had.
+    expect(welcomeBranch).toContain("<ScrollArea")
+    expect(welcomeBranch).toContain('className="flex min-h-full flex-col"')
+    expect(welcomeBranch).not.toContain("overflow-y-auto")
     expect(welcomeBranch).not.toContain("WelcomeBackdrop")
     // The welcome input is flushed: the welcome column already supplies px-4, so
     // the input must not double-pad (would make it narrower than the cards).
@@ -259,6 +274,82 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(source).not.toContain("containerClassName")
     expect(conversationShellSource).not.toContain("containerClassName")
     expect(source).toContain("mx-auto flex w-full max-w-3xl")
+  })
+})
+
+describe("ConversationDetailPanel split-group render model", () => {
+  // The split feature's one structural invariant: group shells are FLAT
+  // SIBLINGS keyed by their stable group id, positioned purely by computed
+  // percentage rects. Nesting shells per layout-tree depth would reparent (and
+  // remount) every live conversation view on split/unsplit/orientation
+  // changes.
+  it("renders group shells as flat keyed siblings from computed rects", () => {
+    expect(panelSource).toContain(
+      "{orderedGroupIds.map((groupId) => renderGroupShell(groupId))}"
+    )
+    expect(panelSource).toContain("const renderGroupShell = (groupId: string)")
+    // A component defined inside render would change type identity every
+    // render and remount its subtree — keep these plain function calls.
+    expect(panelSource).not.toContain("<RenderGroupShell")
+    expect(panelSource).not.toContain("<RenderTabWrapper")
+    expect(panelSource).toContain("key={groupId}")
+    expect(panelSource).toContain("computeRects(groupLayout)")
+  })
+
+  it("marks the active session whenever several are visible (split or tiled)", () => {
+    expect(panelSource).toContain(
+      "showActiveFlow={(isSplit || canTileGroup) && active}"
+    )
+  })
+
+  it("gives each split group its own strip and divider overlays only while split", () => {
+    expect(panelSource).toContain("<TabBar groupId={groupId} />")
+    const handlesIdx = panelSource.indexOf("groupHandles.map((handle) => (")
+    expect(handlesIdx).toBeGreaterThan(-1)
+    expect(panelSource.slice(handlesIdx - 80, handlesIdx)).toContain(
+      "{isSplit &&"
+    )
+  })
+
+  // Each split group keeps the unsplit layout's "tabs + conversation title
+  // bar" pairing: its own header (driven by the GROUP's selected tab) sits
+  // under its strip, and the global single header steps aside while split.
+  it("pairs every split group with its own title bar and gates the global one", () => {
+    const shellStart = panelSource.indexOf("const renderGroupShell = (groupId")
+    const shellBody = panelSource.slice(shellStart, shellStart + 6000)
+    expect(shellBody).toContain("{isSplit && selectedTab && (")
+    expect(shellBody).toContain("<ConversationDetailHeader")
+    expect(shellBody).toContain("tabId={selectedTab.id}")
+    expect(panelSource).toContain("{!isSplit && activeTab && (")
+  })
+
+  // While split the workspace layout drops its title-bar strip row ENTIRELY —
+  // no blank drag row above the shells. The window-drag surface moves into the
+  // group strips instead: every strip's tail spacer is a drag region, and the
+  // TOP-edge strips re-create the corner reserves (traffic lights / caption
+  // buttons / chrome clusters) the unsplit row normally provides.
+  it("replaces the unsplit title-bar row with in-strip drag surfaces while split", () => {
+    // Layout: the whole h-10 conversation top bar is gated on !isConvSplit;
+    // the old always-rendered row with a split drag-region branch is gone.
+    expect(workspaceLayoutSource).toContain("{!isConvSplit && (")
+    expect(workspaceLayoutSource).not.toContain("hasConvTabs && !isConvSplit")
+
+    // Panel: TOP-edge group strips carry the corner reserves themselves.
+    const shellStart = panelSource.indexOf("const renderGroupShell = (groupId")
+    const shellBody = panelSource.slice(shellStart, shellStart + 6000)
+    expect(shellBody).toContain(
+      '{touchesLeft && <SplitStripCornerReserve side="left" />}'
+    )
+    expect(shellBody).toContain(
+      '{touchesRight && <SplitStripCornerReserve side="right" />}'
+    )
+
+    // Tab bar: the tail spacer is a window-drag region on EVERY strip (group
+    // strips are the window's top edge while split), not just the unsplit one.
+    expect(tabBarSource).toContain(
+      '<div data-tauri-drag-region className="h-full min-w-10 flex-1" />'
+    )
+    expect(tabBarSource).not.toContain("data-tauri-drag-region={groupId")
   })
 })
 

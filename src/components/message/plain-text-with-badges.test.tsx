@@ -65,6 +65,28 @@ describe("PlainTextWithBadges", () => {
     expect(path.textContent).toContain("/usr/bin")
   })
 
+  it("gives a file badge — and only a file badge — the hover-actions anchor", () => {
+    const { container: file } = render(
+      <PlainTextWithBadges text="edit [app.ts](file:///repo/app.ts) here" />
+    )
+    const hoverAnchor = file.querySelector("[data-file-actions]")
+    expect(hoverAnchor).not.toBeNull()
+    expect(hoverAnchor?.contains(badge(file, "file"))).toBe(true)
+
+    // A path-less embedded attachment renders as a file badge too, but there is
+    // nothing to reveal or copy — no anchor.
+    const { container: embedded } = render(
+      <PlainTextWithBadges text="[report.pdf](codeg://embedded/abc-123)" />
+    )
+    expect(badge(embedded, "file")).not.toBeNull()
+    expect(embedded.querySelector("[data-file-actions]")).toBeNull()
+
+    const { container: session } = render(
+      <PlainTextWithBadges text="[#42](codeg://session/42)" />
+    )
+    expect(session.querySelector("[data-file-actions]")).toBeNull()
+  })
+
   it("does NOT badge a non-reference http link", () => {
     const { container } = render(
       <PlainTextWithBadges text="[docs](https://example.com)" />

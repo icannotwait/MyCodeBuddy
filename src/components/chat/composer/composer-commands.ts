@@ -4,7 +4,7 @@ import type { PromptInputBlock } from "@/lib/types"
 
 import type { InputAttachment } from "../message-input-attachments"
 import { blocksToRestoredDraft } from "./from-prompt-blocks"
-import { textToInlineContent } from "./plain-text-content"
+import { textToSeededInlineContent } from "./plain-text-content"
 import type { ReferenceAttrs } from "./types"
 
 /**
@@ -144,6 +144,13 @@ export function restampSkillPrefixes(
  * attachments (images / embedded resources / non-composer links) for the host to
  * set. Inverse of `docToPromptBlocks` for the queue-edit round-trip. The editor
  * is cleared first so this fully replaces the current content.
+ *
+ * A text segment goes through {@link textToSeededInlineContent}, so the
+ * references `docToPromptBlocks` serialized INTO that text (it emits one text
+ * block with every badge inline) come back as badges instead of raw
+ * `[label](uri)` / `/cmd` source — the same treatment paste and the other
+ * seeding paths get. Lossless: re-serializing the restored badges reproduces the
+ * block text verbatim.
  */
 export function restoreBlocksIntoEditor(
   editor: Editor,
@@ -154,7 +161,7 @@ export function restoreBlocksIntoEditor(
   for (const segment of segments) {
     chain =
       segment.kind === "text"
-        ? chain.insertContent(textToInlineContent(segment.text))
+        ? chain.insertContent(textToSeededInlineContent(segment.text))
         : chain.insertReference(segment.attrs)
   }
   chain.focus("end").run()
