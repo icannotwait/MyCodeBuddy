@@ -52,9 +52,10 @@ pub use state_dto::{
     INDEX_MAX_NODES,
 };
 pub use store::{
-    append_state_only_revision_txn, get_workflow_state_core, publish_workflow_manifest_core,
-    settle_workflow_gate_core, PublishResult, PublishWorkflowRequest, SettleGateEvidence,
-    SettleResult, SettleWorkflowRequest, StateOnlyRevisionRequest, StateOnlyRevisionResult,
+    append_state_only_revision_txn, append_workflow_block_revision_txn, get_workflow_state_core,
+    publish_workflow_manifest_core, settle_workflow_gate_core, PublishResult,
+    PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
+    StateOnlyRevisionRequest, StateOnlyRevisionResult, WorkflowBlockEntryRequest,
     WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
     WORKFLOW_CAPABILITY_VERSION,
 };

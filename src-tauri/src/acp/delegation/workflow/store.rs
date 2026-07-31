@@ -169,6 +169,12 @@ pub struct StateOnlyRevisionResult {
     pub block_cause: Option<WorkflowBlockCause>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowBlockEntryRequest<'a> {
+    pub cause: WorkflowBlockCause,
+    pub consumer_correlation_id: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_result(
     workflow_id: String,
@@ -179,18 +185,22 @@ fn publish_result(
     publication_committed: bool,
     block_cause_code: Option<&str>,
     block_source_manifest_revision: Option<i64>,
-) -> PublishResult {
+) -> Result<PublishResult, WorkflowStoreError> {
     let blocked = workflow_state == ManifestWorkflowState::Blocked;
-    let recovery = blocked.then(|| WorkflowRecoveryRequiredProjection {
-        workflow_id: workflow_id.clone(),
-        workflow_state,
-        block_cause: Some(
-            WorkflowBlockCause::from_db(block_cause_code)
-                .unwrap_or(WorkflowBlockCause::DurableStateInconsistent),
-        ),
-        block_source_manifest_revision: block_source_manifest_revision.map(|value| value as u64),
-    });
-    PublishResult {
+    let recovery = if blocked {
+        let block_cause = WorkflowBlockCause::from_db(block_cause_code)
+            .map_err(WorkflowStoreError::Persistence)?;
+        Some(WorkflowRecoveryRequiredProjection {
+            workflow_id: workflow_id.clone(),
+            workflow_state,
+            block_cause: Some(block_cause),
+            block_source_manifest_revision: block_source_manifest_revision
+                .map(|value| value as u64),
+        })
+    } else {
+        None
+    };
+    Ok(PublishResult {
         workflow_id,
         manifest_revision,
         graph_revision,
@@ -203,7 +213,7 @@ fn publish_result(
             WorkflowPublicationDisposition::Published
         },
         recovery,
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -683,21 +693,21 @@ pub async fn settle_workflow_gate_core(
                 };
                 row.insert(txn).await.map_err(db_err)?;
 
-                let state_revision = if req.outcome == GateSettlementOutcome::Blocked {
-                    let reason =
+                let state_revision = if req.outcome == GateSettlementOutcome::Blocked
+                    && gate.gate_kind == DocumentGateKind::Plan
+                {
+                    let cause =
                         if plan_next_action == Some(PlanReviewNextAction::UserDecisionRequired) {
-                            WorkflowBlockCause::PlanUserDecisionRequired.as_str()
+                            WorkflowBlockCause::PlanUserDecisionRequired
                         } else {
-                            WorkflowBlockCause::PlanGateBlocked.as_str()
+                            WorkflowBlockCause::PlanGateBlocked
                         };
                     Some(
-                        append_state_only_revision_txn(
+                        append_workflow_block_revision_txn(
                             txn,
                             &header,
-                            StateOnlyRevisionRequest {
-                                target_state: ManifestWorkflowState::Blocked,
-                                transition_reason_code: reason,
-                                recovery_authorization_id: None,
+                            WorkflowBlockEntryRequest {
+                                cause,
                                 consumer_correlation_id: None,
                             },
                             now,
@@ -1262,6 +1272,32 @@ pub async fn append_state_only_revision_txn(
     })
 }
 
+/// Authoritative typed entry boundary for placing a workflow in blocked state.
+pub async fn append_workflow_block_revision_txn(
+    txn: &DatabaseTransaction,
+    header: &delegation_workflow::Model,
+    request: WorkflowBlockEntryRequest<'_>,
+    now: DateTime<Utc>,
+) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+    if request.cause == WorkflowBlockCause::LegacyUnknown {
+        return Err(WorkflowStoreError::Persistence(
+            "new blocked revisions cannot use legacy_unknown".into(),
+        ));
+    }
+    append_state_only_revision_txn(
+        txn,
+        header,
+        StateOnlyRevisionRequest {
+            target_state: ManifestWorkflowState::Blocked,
+            transition_reason_code: request.cause.as_str(),
+            recovery_authorization_id: None,
+            consumer_correlation_id: request.consumer_correlation_id,
+        },
+        now,
+    )
+    .await
+}
+
 /// Internal marker: winner not visible in this txn snapshot; outer must re-read.
 const TOKEN_RACE_RECLASSIFY_MARKER: &str = "__workflow_publication_token_race_reclassify__";
 
@@ -1319,17 +1355,21 @@ async fn publish_in_txn(
             by_token.active_manifest_revision,
         )
         .await?;
-        let replay_digest = if by_token.workflow_state == WorkflowState::Blocked
-            && normalized.workflow_state != ManifestWorkflowState::Blocked
-        {
+        let ordinary_unblock_attempt = by_token.workflow_state == WorkflowState::Blocked
+            && normalized.workflow_state != ManifestWorkflowState::Blocked;
+        let replay_digest = if ordinary_unblock_attempt {
             manifest_document_digest_with_state(normalized, ManifestWorkflowState::Blocked)?
         } else {
             document_digest.to_string()
         };
         if active_digest.as_deref() == Some(replay_digest.as_str()) {
-            let by_token = stamp_workflow_capability_version(txn, by_token).await?;
+            let by_token = if ordinary_unblock_attempt {
+                by_token
+            } else {
+                stamp_workflow_capability_version(txn, by_token).await?
+            };
             let state = workflow_state_to_manifest(by_token.workflow_state.clone());
-            return Ok(publish_result(
+            return publish_result(
                 by_token.workflow_id,
                 by_token.active_manifest_revision as u64,
                 by_token.graph_revision as u64,
@@ -1338,7 +1378,7 @@ async fn publish_in_txn(
                 false,
                 by_token.block_cause_code.as_deref(),
                 by_token.block_source_manifest_revision,
-            ));
+            );
         }
         let is_explicit_update = normalized
             .workflow_id
@@ -1423,7 +1463,7 @@ async fn publish_in_txn(
                 if active_digest.as_deref() == Some(document_digest) {
                     let existing = stamp_workflow_capability_version(txn, existing).await?;
                     let state = workflow_state_to_manifest(existing.workflow_state.clone());
-                    return Ok(publish_result(
+                    return publish_result(
                         existing.workflow_id.clone(),
                         existing.active_manifest_revision as u64,
                         existing.graph_revision as u64,
@@ -1432,7 +1472,7 @@ async fn publish_in_txn(
                         false,
                         existing.block_cause_code.as_deref(),
                         existing.block_source_manifest_revision,
-                    ));
+                    );
                 }
                 let next_m = existing.active_manifest_revision + 1;
                 let next_g = existing.graph_revision + 1;
@@ -1464,7 +1504,7 @@ async fn publish_in_txn(
         let prior = prior_header
             .as_ref()
             .expect("sticky state has prior header");
-        return Ok(publish_result(
+        return publish_result(
             prior.workflow_id.clone(),
             prior.active_manifest_revision as u64,
             prior.graph_revision as u64,
@@ -1473,7 +1513,7 @@ async fn publish_in_txn(
             false,
             prior.block_cause_code.as_deref(),
             prior.block_source_manifest_revision,
-        ));
+        );
     }
 
     // A8: material Plan structure change forces demotion when previously
@@ -1631,7 +1671,7 @@ async fn publish_in_txn(
         ));
     }
 
-    Ok(publish_result(
+    publish_result(
         workflow_id.clone(),
         next_manifest_rev as u64,
         next_graph_rev as u64,
@@ -1640,7 +1680,7 @@ async fn publish_in_txn(
         true,
         active_block_cause.as_deref(),
         active_block_source,
-    ))
+    )
 }
 
 /// Insert create header under SAVEPOINT.
@@ -1826,7 +1866,7 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
         workflow_state_to_manifest(header.workflow_state),
     )?;
     if result.workflow_state == ManifestWorkflowState::Blocked {
-        return Ok(publish_result(
+        return publish_result(
             result.workflow_id,
             result.manifest_revision,
             result.graph_revision,
@@ -1835,7 +1875,7 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
             result.publication_committed,
             block_cause_code.as_deref(),
             block_source_manifest_revision,
-        ));
+        );
     }
     Ok(result)
 }
@@ -1876,7 +1916,7 @@ pub(crate) fn classify_header_against_digest(
         });
     }
     if active_digest == Some(document_digest) {
-        return Ok(publish_result(
+        return publish_result(
             workflow_id,
             manifest_revision,
             graph_revision,
@@ -1885,7 +1925,7 @@ pub(crate) fn classify_header_against_digest(
             false,
             None,
             None,
-        ));
+        );
     }
     // Different digest for the same token → B8 Mismatch (requires durable row).
     Err(WorkflowStoreError::PublicationTokenMismatch {
@@ -9223,6 +9263,7 @@ mod tests {
     mod workflow_state_authority {
         use super::*;
         use crate::db::test_helpers::fresh_disk_db;
+        use sea_orm::ConnectionTrait;
 
         async fn load_header(db: &AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
             delegation_workflow::Entity::find_by_id(workflow_id.to_string())
@@ -9355,6 +9396,110 @@ mod tests {
             assert_eq!(
                 load_bindings(&db, &initial.workflow_id).await,
                 before_bindings
+            );
+        }
+
+        #[tokio::test]
+        async fn unauthorized_blocked_replay_is_read_only_for_legacy_header() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut blocked = design_plan_doc("legacy-sticky-state-only-publication");
+            blocked.workflow_state = ManifestWorkflowState::Blocked;
+            let initial = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("publish blocked workflow");
+
+            blocked.workflow_id = Some(initial.workflow_id.clone());
+            blocked.expected_manifest_revision = Some(initial.manifest_revision);
+            blocked.workflow_state = ManifestWorkflowState::Estimated;
+            blocked.plan.as_mut().expect("Plan document").digest =
+                "sha256:legacy-sticky-structural-update".into();
+            let published = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("commit structural publication with effective blocked state");
+            assert!(published.publication_committed);
+            assert_eq!(published.workflow_state, ManifestWorkflowState::Blocked);
+
+            let header = load_header(&db, &initial.workflow_id).await;
+            let mut legacy: delegation_workflow::ActiveModel = header.into();
+            legacy.capability_version = Set("workflow-manifest-v1".into());
+            legacy
+                .update(&db.conn)
+                .await
+                .expect("downgrade capability fixture");
+            let before_header = load_header(&db, &initial.workflow_id).await;
+            let before_revisions = load_revisions(&db, &initial.workflow_id).await;
+            let before_bindings = load_bindings(&db, &initial.workflow_id).await;
+
+            db.conn
+                .execute_unprepared(
+                    "CREATE TRIGGER reject_legacy_unblock_header_update \
+                     BEFORE UPDATE ON delegation_workflows \
+                     BEGIN SELECT RAISE(ABORT, 'legacy unblock header update reached'); END",
+                )
+                .await
+                .expect("install no-header-write trigger");
+
+            reset_binding_diff_invocation_count();
+            let rejected = publish_document(&db, &emitter, parent, blocked)
+                .await
+                .expect("ordinary unblock replay returns read-only recovery projection");
+
+            assert_eq!(
+                rejected.disposition,
+                WorkflowPublicationDisposition::WorkflowRecoveryRequired
+            );
+            assert!(!rejected.publication_committed);
+            assert_eq!(rejected.manifest_revision, published.manifest_revision);
+            assert_eq!(binding_diff_invocation_count(), 0);
+            assert_eq!(load_header(&db, &initial.workflow_id).await, before_header);
+            assert_eq!(
+                load_revisions(&db, &initial.workflow_id).await,
+                before_revisions
+            );
+            assert_eq!(
+                load_bindings(&db, &initial.workflow_id).await,
+                before_bindings
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_persisted_block_cause_fails_closed_without_fabricating_provenance() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut blocked = design_plan_doc("invalid-persisted-block-cause");
+            blocked.workflow_state = ManifestWorkflowState::Blocked;
+            let initial = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("publish blocked workflow");
+
+            let header = load_header(&db, &initial.workflow_id).await;
+            let mut corrupt: delegation_workflow::ActiveModel = header.into();
+            corrupt.block_cause_code = Set(Some("unknown_future_cause".into()));
+            corrupt
+                .update(&db.conn)
+                .await
+                .expect("persist invalid non-NULL block cause fixture");
+
+            let error = publish_document(&db, &emitter, parent, blocked)
+                .await
+                .expect_err("invalid persisted cause must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    WorkflowStoreError::Persistence(ref reason)
+                        if reason.contains("unknown workflow block cause: unknown_future_cause")
+                ),
+                "unexpected corrupt durable-state error: {error:?}"
+            );
+            let persisted = load_header(&db, &initial.workflow_id).await;
+            assert_eq!(
+                persisted.block_cause_code.as_deref(),
+                Some("unknown_future_cause")
+            );
+            assert_ne!(
+                WorkflowBlockCause::from_db(persisted.block_cause_code.as_deref()),
+                Ok(WorkflowBlockCause::DurableStateInconsistent)
             );
         }
 
@@ -9705,130 +9850,303 @@ mod tests {
 
         #[tokio::test]
         async fn blocked_settlement_records_typed_cause_in_a_state_only_revision() {
-            let cases = [
-                (
-                    WorkflowBlockCause::PlanUserDecisionRequired,
-                    "plan_user_decision_required",
-                ),
-                (WorkflowBlockCause::PlanGateBlocked, "plan_gate_blocked"),
-                (
-                    WorkflowBlockCause::ExplicitManifestBlock,
-                    "explicit_manifest_block",
-                ),
+            let (explicit_db, explicit_parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut explicit_document = design_plan_doc("typed-explicit-manifest-block");
+            explicit_document.workflow_state = ManifestWorkflowState::Blocked;
+            let explicit = publish_document(
+                &explicit_db,
+                &emitter,
+                explicit_parent,
+                explicit_document.clone(),
+            )
+            .await
+            .expect("publish explicit blocked manifest");
+            let explicit_header = load_header(&explicit_db, &explicit.workflow_id).await;
+            let explicit_revisions = load_revisions(&explicit_db, &explicit.workflow_id).await;
+            assert_eq!(explicit_header.block_source_manifest_revision, Some(1));
+            assert_eq!(
+                WorkflowBlockCause::from_db(explicit_header.block_cause_code.as_deref())
+                    .expect("explicit block cause"),
+                WorkflowBlockCause::ExplicitManifestBlock
+            );
+            assert_eq!(explicit_revisions[0].source_manifest_revision, Some(1));
+            assert_eq!(
+                explicit_revisions[0].transition_reason_code.as_deref(),
+                Some(WorkflowBlockCause::ExplicitManifestBlock.as_str())
+            );
+            assert_eq!(
+                ManifestRevisionKind::from_db(explicit_revisions[0].revision_kind.as_deref())
+                    .expect("explicit publication kind"),
+                ManifestRevisionKind::Publication
+            );
+
+            let (plan_db, plan_parent) = seed_parent().await;
+            let plan = publish_document(
+                &plan_db,
+                &emitter,
+                plan_parent,
+                design_plan_doc("typed-plan-gate-block"),
+            )
+            .await
+            .expect("publish Plan gate fixture");
+            seed_ready_plan_round(&plan_db, plan_parent, &plan.workflow_id, "plan-block").await;
+            let plan_blocked = settle_workflow_gate_core(
+                &plan_db,
+                &emitter,
+                plan_parent,
+                SettleWorkflowRequest {
+                    workflow_id: plan.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: plan.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Blocked,
+                    evidence: SettleGateEvidence::Plan(plan_submission(
+                        PlanReviewScope::Full,
+                        PlanRevisionKind::Initial,
+                        &["plan-reviewer-1"],
+                        vec![finding(
+                            "F-plan-gate-blocked",
+                            FindingSeverity::Important,
+                            FindingStatus::Open,
+                            &["plan-reviewer-1"],
+                        )],
+                        "author-state-authority-plan-block",
+                        "sha256:plan",
+                    )),
+                    summary: "Plan gate blocks on current findings".into(),
+                },
+            )
+            .await
+            .expect("settle blocked Plan gate");
+            assert_eq!(plan_blocked.manifest_revision, 2);
+            let plan_header = load_header(&plan_db, &plan.workflow_id).await;
+            let plan_revisions = load_revisions(&plan_db, &plan.workflow_id).await;
+            assert_eq!(plan_header.block_source_manifest_revision, Some(1));
+            assert_eq!(
+                WorkflowBlockCause::from_db(plan_header.block_cause_code.as_deref())
+                    .expect("Plan gate block cause"),
+                WorkflowBlockCause::PlanGateBlocked
+            );
+            assert_eq!(plan_revisions[1].source_manifest_revision, Some(1));
+            assert_eq!(
+                plan_revisions[1].transition_reason_code.as_deref(),
+                Some(WorkflowBlockCause::PlanGateBlocked.as_str())
+            );
+
+            let (design_db, design_parent) = seed_parent().await;
+            let design = publish_document(
+                &design_db,
+                &emitter,
+                design_parent,
+                zero_reviewer_design_doc("typed-design-gate-block"),
+            )
+            .await
+            .expect("publish Design gate fixture");
+            let design_blocked = settle_workflow_gate_core(
+                &design_db,
+                &emitter,
+                design_parent,
+                SettleWorkflowRequest {
+                    workflow_id: design.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "design".into(),
+                    expected_graph_revision: design.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Blocked,
+                    evidence: design_evidence(0, 1, 0),
+                    summary: "Design gate evidence is blocked".into(),
+                },
+            )
+            .await
+            .expect("persist blocked Design gate evidence");
+            assert_eq!(design_blocked.manifest_revision, 1);
+            let design_header = load_header(&design_db, &design.workflow_id).await;
+            assert_eq!(design_header.workflow_state, WorkflowState::Estimated);
+            assert_eq!(design_header.block_cause_code, None);
+            assert_eq!(design_header.block_source_manifest_revision, None);
+            assert_eq!(
+                load_revisions(&design_db, &design.workflow_id).await.len(),
+                1
+            );
+
+            let (decision_db, decision_parent) = seed_parent().await;
+            let decision = publish_document(
+                &decision_db,
+                &emitter,
+                decision_parent,
+                design_plan_doc("typed-plan-user-decision"),
+            )
+            .await
+            .expect("publish user-decision fixture");
+            insert_plan_author_evidence(
+                &decision_db,
+                decision_parent,
+                &decision.workflow_id,
+                "author-typed-user-decision",
+                1,
+                "sha256:plan",
+                "reports/author-typed-user-decision.md",
+                0,
+            )
+            .await;
+            let rounds = [
+                (PlanReviewScope::Full, PlanRevisionKind::Initial),
+                (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
+                (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
+                (PlanReviewScope::Full, PlanRevisionKind::HolisticRewrite),
+                (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
+            ];
+            let mut graph_revision = decision.graph_revision;
+            for (index, (scope, revision_kind)) in rounds.into_iter().enumerate() {
+                let cycle = index as u64 + 1;
+                insert_plan_reviewer_evidence(
+                    &decision_db,
+                    decision_parent,
+                    &decision.workflow_id,
+                    "plan-reviewer-1",
+                    &format!("review-typed-user-decision-{cycle}"),
+                    cycle as i64,
+                    1,
+                    "sha256:plan",
+                    "author-typed-user-decision",
+                    "request_changes",
+                    &format!("reports/review-typed-user-decision-{cycle}.md"),
+                    cycle as i64,
+                )
+                .await;
+                let findings = if cycle == 1 {
+                    vec![finding(
+                        "F-typed-user-decision",
+                        FindingSeverity::Important,
+                        FindingStatus::Open,
+                        &["plan-reviewer-1"],
+                    )]
+                } else {
+                    vec![]
+                };
+                let outcome = if cycle == 5 {
+                    GateSettlementOutcome::Blocked
+                } else {
+                    GateSettlementOutcome::ChangesRequested
+                };
+                let settled = settle_workflow_gate_core(
+                    &decision_db,
+                    &emitter,
+                    decision_parent,
+                    SettleWorkflowRequest {
+                        workflow_id: decision.workflow_id.clone(),
+                        manifest_revision: 1,
+                        gate_id: "plan".into(),
+                        expected_graph_revision: graph_revision,
+                        gate_cycle: cycle,
+                        outcome,
+                        evidence: SettleGateEvidence::Plan(plan_submission(
+                            scope,
+                            revision_kind,
+                            &["plan-reviewer-1"],
+                            findings,
+                            "author-typed-user-decision",
+                            "sha256:plan",
+                        )),
+                        summary: format!("typed user-decision round {cycle}"),
+                    },
+                )
+                .await
+                .expect("settle user-decision Plan round");
+                graph_revision = settled.graph_revision;
+            }
+            let decision_header = load_header(&decision_db, &decision.workflow_id).await;
+            let decision_revisions = load_revisions(&decision_db, &decision.workflow_id).await;
+            assert_eq!(decision_header.block_source_manifest_revision, Some(1));
+            assert_eq!(
+                WorkflowBlockCause::from_db(decision_header.block_cause_code.as_deref())
+                    .expect("user-decision block cause"),
+                WorkflowBlockCause::PlanUserDecisionRequired
+            );
+            assert_eq!(decision_revisions[1].source_manifest_revision, Some(1));
+            assert_eq!(
+                decision_revisions[1].transition_reason_code.as_deref(),
+                Some(WorkflowBlockCause::PlanUserDecisionRequired.as_str())
+            );
+
+            let legacy_header = load_header(&explicit_db, &explicit.workflow_id).await;
+            let mut legacy: delegation_workflow::ActiveModel = legacy_header.into();
+            legacy.block_cause_code = Set(None);
+            legacy
+                .update(&explicit_db.conn)
+                .await
+                .expect("persist historical NULL cause");
+            let legacy_projection =
+                publish_document(&explicit_db, &emitter, explicit_parent, explicit_document)
+                    .await
+                    .expect("load historical NULL through normal projection");
+            assert_eq!(
+                legacy_projection
+                    .recovery
+                    .and_then(|projection| projection.block_cause),
+                Some(WorkflowBlockCause::LegacyUnknown)
+            );
+
+            for (cause, suffix) in [
                 (
                     WorkflowBlockCause::UnresolvedTaskCohort,
-                    "unresolved_task_cohort",
+                    "unresolved-task-cohort",
                 ),
                 (
                     WorkflowBlockCause::DurableStateInconsistent,
-                    "durable_state_inconsistent",
+                    "durable-state-inconsistent",
                 ),
-            ];
-
-            for (index, (expected_cause, reason)) in cases.into_iter().enumerate() {
-                let (db, parent) = seed_parent().await;
-                let (emitter, _) = emitter_with_rx();
-                let published = publish_document(
-                    &db,
+            ] {
+                let (boundary_db, boundary_parent) = seed_parent().await;
+                let boundary = publish_document(
+                    &boundary_db,
                     &emitter,
-                    parent,
-                    design_plan_doc(&format!("typed-block-cause-{index}")),
+                    boundary_parent,
+                    design_plan_doc(&format!("typed-boundary-{suffix}")),
                 )
                 .await
-                .expect("publish block-cause fixture");
-                let source = load_header(&db, &published.workflow_id).await;
-                let txn = db.conn.begin().await.expect("begin block transition");
-                let result = append_state_only_revision_txn(
+                .expect("publish typed block-entry boundary fixture");
+                let source = load_header(&boundary_db, &boundary.workflow_id).await;
+                let txn = boundary_db
+                    .conn
+                    .begin()
+                    .await
+                    .expect("begin typed block-entry transaction");
+                let result = append_workflow_block_revision_txn(
                     &txn,
                     &source,
-                    StateOnlyRevisionRequest {
-                        target_state: ManifestWorkflowState::Blocked,
-                        transition_reason_code: reason,
-                        recovery_authorization_id: None,
-                        consumer_correlation_id: None,
+                    WorkflowBlockEntryRequest {
+                        cause,
+                        consumer_correlation_id: Some("task-6-policy-boundary"),
                     },
                     Utc::now(),
                 )
                 .await
-                .expect("append typed blocked state-only revision");
-                txn.commit().await.expect("commit block transition");
+                .expect("append through typed block-entry boundary");
+                txn.commit()
+                    .await
+                    .expect("commit typed block-entry transaction");
 
-                assert_eq!(result.block_cause, Some(expected_cause));
+                assert_eq!(result.block_cause, Some(cause));
                 assert_eq!(result.source_manifest_revision, 1);
-                let header = load_header(&db, &published.workflow_id).await;
+                let header = load_header(&boundary_db, &boundary.workflow_id).await;
                 assert_eq!(
                     WorkflowBlockCause::from_db(header.block_cause_code.as_deref())
-                        .expect("typed active block cause"),
-                    expected_cause
+                        .expect("typed boundary cause"),
+                    cause
                 );
                 assert_eq!(header.block_source_manifest_revision, Some(1));
-                let revisions = load_revisions(&db, &published.workflow_id).await;
-                assert_eq!(revisions.len(), 2);
+                let revisions = load_revisions(&boundary_db, &boundary.workflow_id).await;
                 assert_eq!(revisions[1].source_manifest_revision, Some(1));
-                assert_eq!(revisions[1].transition_reason_code.as_deref(), Some(reason));
                 assert_eq!(
-                    ManifestRevisionKind::from_db(revisions[1].revision_kind.as_deref())
-                        .expect("state-only revision kind"),
-                    ManifestRevisionKind::StateOnly
-                );
-
-                let unauthorized = db.conn.begin().await.expect("begin unauthorized recovery");
-                let error = append_state_only_revision_txn(
-                    &unauthorized,
-                    &header,
-                    StateOnlyRevisionRequest {
-                        target_state: ManifestWorkflowState::Estimated,
-                        transition_reason_code: "recover_workflow",
-                        recovery_authorization_id: None,
-                        consumer_correlation_id: None,
-                    },
-                    Utc::now(),
-                )
-                .await
-                .expect_err("blocked transition requires recovery authorization");
-                assert!(error.is_workflow_recovery_required());
-                unauthorized
-                    .rollback()
-                    .await
-                    .expect("rollback unauthorized recovery");
-                assert_eq!(load_revisions(&db, &published.workflow_id).await.len(), 2);
-
-                let authorized = db.conn.begin().await.expect("begin authorized recovery");
-                let recovered = append_state_only_revision_txn(
-                    &authorized,
-                    &header,
-                    StateOnlyRevisionRequest {
-                        target_state: ManifestWorkflowState::Estimated,
-                        transition_reason_code: "recover_workflow",
-                        recovery_authorization_id: Some("recovery-authorization"),
-                        consumer_correlation_id: Some("recovery-correlation"),
-                    },
-                    Utc::now(),
-                )
-                .await
-                .expect("authorized recovery state revision");
-                authorized
-                    .commit()
-                    .await
-                    .expect("commit authorized recovery");
-                assert_eq!(recovered.source_manifest_revision, 2);
-                let recovered_header = load_header(&db, &published.workflow_id).await;
-                assert_eq!(recovered_header.workflow_state, WorkflowState::Estimated);
-                assert_eq!(recovered_header.block_cause_code, None);
-                assert_eq!(recovered_header.block_source_manifest_revision, None);
-                let recovered_revisions = load_revisions(&db, &published.workflow_id).await;
-                assert_eq!(
-                    recovered_revisions[1].transition_reason_code.as_deref(),
-                    Some(reason),
-                    "immutable blocked provenance must remain"
+                    revisions[1].transition_reason_code.as_deref(),
+                    Some(cause.as_str())
                 );
                 assert_eq!(
-                    recovered_revisions[2].recovery_authorization_id.as_deref(),
-                    Some("recovery-authorization")
-                );
-                assert_eq!(
-                    recovered_revisions[2].consumer_correlation_id.as_deref(),
-                    Some("recovery-correlation")
+                    revisions[1].consumer_correlation_id.as_deref(),
+                    Some("task-6-policy-boundary")
                 );
             }
 
@@ -9836,12 +10154,7 @@ mod tests {
                 ManifestRevisionKind::from_db(None).expect("historical revision kind"),
                 ManifestRevisionKind::Publication
             );
-            assert_eq!(
-                WorkflowBlockCause::from_db(None).expect("legacy NULL block cause"),
-                WorkflowBlockCause::LegacyUnknown
-            );
             assert!(WorkflowBlockCause::from_db(Some("legacy_unknown")).is_err());
-            assert!(WorkflowBlockCause::from_db(Some("unknown_future_cause")).is_err());
         }
     }
 }
