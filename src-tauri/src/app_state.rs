@@ -172,6 +172,11 @@ pub fn build_delegation_stack(
     use crate::acp::manager::ConnectionManagerSpawner;
 
     let cm_arc = Arc::new(connection_manager.clone_ref());
+    let recovery_authorizations = Arc::new(
+        crate::acp::recovery_authorization::RecoveryAuthorizationService::new(db_conn.clone()),
+    );
+    connection_manager.install_recovery_authorization_service(recovery_authorizations.clone());
+    recovery_authorizations.start_maintenance();
     let db_arc = Arc::new(AppDatabase {
         conn: db_conn.clone(),
     });

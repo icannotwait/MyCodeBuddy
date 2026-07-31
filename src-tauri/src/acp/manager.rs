@@ -39,8 +39,8 @@ use crate::acp::plan_approval::{
     PlanApprovalAnswer, RegisteredPlanApproval, SessionPlanApprovalAccess,
 };
 use crate::acp::question::{
-    build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
-    SessionQuestionAccess,
+    build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec,
+    RecoveryQuestionRegistrationError, RegisteredQuestion, SessionQuestionAccess,
 };
 use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
@@ -493,6 +493,9 @@ pub struct ConnectionManager {
     /// touch the same map. At most one per connection (the agent is blocked in
     /// its `exit_plan_mode` call) — no cap, no cumulative growth.
     pending_plan_approvals: Arc<Mutex<HashMap<String, PendingPlanApprovalEntry>>>,
+    recovery_authorization_service: Arc<
+        std::sync::OnceLock<Arc<crate::acp::recovery_authorization::RecoveryAuthorizationService>>,
+    >,
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
 }
@@ -504,6 +507,7 @@ struct PendingQuestionEntry {
     parent_connection_id: String,
     questions: Vec<QuestionSpec>,
     sender: tokio::sync::oneshot::Sender<QuestionOutcome>,
+    recovery_authorization_id: Option<String>,
 }
 
 /// A parked Grok `exit_plan_mode` approval awaiting the user's decision. The
@@ -558,6 +562,7 @@ impl ConnectionManager {
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            recovery_authorization_service: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -580,6 +585,7 @@ impl ConnectionManager {
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
+            recovery_authorization_service: self.recovery_authorization_service.clone(),
             #[cfg(test)]
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
         }
@@ -617,6 +623,19 @@ impl ConnectionManager {
     /// the unlikely event a second `build_delegation_stack` runs.
     pub fn install_delegation(&self, injection: crate::acp::connection::DelegationInjection) {
         let _ = self.delegation_injection.set(injection);
+    }
+
+    pub fn install_recovery_authorization_service(
+        &self,
+        service: Arc<crate::acp::recovery_authorization::RecoveryAuthorizationService>,
+    ) {
+        let _ = self.recovery_authorization_service.set(service);
+    }
+
+    pub fn recovery_authorization_service(
+        &self,
+    ) -> Option<Arc<crate::acp::recovery_authorization::RecoveryAuthorizationService>> {
+        self.recovery_authorization_service.get().cloned()
     }
 
     fn delegation_snapshot(&self) -> Option<crate::acp::connection::DelegationInjection> {
@@ -658,6 +677,7 @@ impl ConnectionManager {
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            recovery_authorization_service: Arc::new(std::sync::OnceLock::new()),
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -5228,19 +5248,77 @@ impl ConnectionManager {
         conn_id: &str,
         questions: Vec<QuestionSpec>,
     ) -> Option<RegisteredQuestion> {
+        self.register_question_inner(conn_id, questions, None)
+            .await
+            .ok()
+    }
+
+    pub async fn register_recovery_question(
+        &self,
+        parent_conversation_id: i32,
+        authorization_id: String,
+        questions: Vec<QuestionSpec>,
+    ) -> Result<RegisteredQuestion, RecoveryQuestionRegistrationError> {
+        if questions.len() != 1 || questions[0].recovery().is_none() {
+            for question in &questions {
+                question.clear_recovery();
+            }
+            return Err(RecoveryQuestionRegistrationError::Invalid);
+        }
+        let states: Vec<_> = self
+            .connections
+            .lock()
+            .await
+            .iter()
+            .map(|(id, connection)| (id.clone(), connection.state.clone()))
+            .collect();
+        let mut parent_connection_id = None;
+        for (connection_id, state) in states {
+            if state.read().await.conversation_id == Some(parent_conversation_id) {
+                parent_connection_id = Some(connection_id);
+                break;
+            }
+        }
+        let Some(parent_connection_id) = parent_connection_id else {
+            for question in &questions {
+                question.clear_recovery();
+            }
+            return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
+        };
+        self.register_question_inner(&parent_connection_id, questions, Some(authorization_id))
+            .await
+    }
+
+    async fn register_question_inner(
+        &self,
+        conn_id: &str,
+        questions: Vec<QuestionSpec>,
+        recovery_authorization_id: Option<String>,
+    ) -> Result<RegisteredQuestion, RecoveryQuestionRegistrationError> {
         // Defense-in-depth: the companion validates, but the broker socket is
         // only token-gated, so refuse to broadcast malformed/oversized specs
         // (None → the listener declines the ask, as for any other None path).
         if crate::acp::question::validate_specs(&questions).is_err() {
-            return None;
+            for question in &questions {
+                question.clear_recovery();
+            }
+            return Err(RecoveryQuestionRegistrationError::Invalid);
         }
-        let (state, emitter) = self.get_state_and_emitter(conn_id).await?;
+        let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await else {
+            for question in &questions {
+                question.clear_recovery();
+            }
+            return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
+        };
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut reg = self.pending_questions.lock().await;
             if reg.values().any(|e| e.parent_connection_id == conn_id) {
-                return None;
+                for question in &questions {
+                    question.clear_recovery();
+                }
+                return Err(RecoveryQuestionRegistrationError::Occupied);
             }
             reg.insert(
                 question_id.clone(),
@@ -5248,6 +5326,7 @@ impl ConnectionManager {
                     parent_connection_id: conn_id.to_string(),
                     questions: questions.clone(),
                     sender: tx,
+                    recovery_authorization_id,
                 },
             );
         }
@@ -5258,7 +5337,7 @@ impl ConnectionManager {
             &emitter,
             AcpEvent::QuestionRequest {
                 question_id: question_id.clone(),
-                questions,
+                questions: questions.clone(),
             },
         )
         .await;
@@ -5292,9 +5371,12 @@ impl ConnectionManager {
             .compensate_if_question_drained(&question_id, &state, &emitter)
             .await
         {
-            return None;
+            for question in &questions {
+                question.clear_recovery();
+            }
+            return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
         }
-        Some(RegisteredQuestion {
+        Ok(RegisteredQuestion {
             question_id,
             answer_rx: rx,
         })
@@ -5342,6 +5424,16 @@ impl ConnectionManager {
             .map(|entry| entry.parent_connection_id.clone())
     }
 
+    #[cfg(test)]
+    pub async fn pending_question_count_for_parent(&self, conn_id: &str) -> usize {
+        self.pending_questions
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.parent_connection_id == conn_id)
+            .count()
+    }
+
     /// Resolve a pending `ask_user_question` with the user's submission (from any
     /// client). Removes the one-shot atomically (first answer wins; a duplicate /
     /// already-resolved id is an idempotent no-op), sends the self-describing
@@ -5367,6 +5459,23 @@ impl ConnectionManager {
             return Ok(());
         };
         let outcome = build_outcome(&entry.questions, &answer);
+        if let (Some(authorization_id), Some(service)) = (
+            entry.recovery_authorization_id.as_deref(),
+            self.recovery_authorization_service(),
+        ) {
+            if let Err(error) = service
+                .resolve_question(authorization_id, outcome.clone())
+                .await
+            {
+                tracing::warn!(
+                    code = error.code(),
+                    "[recovery_authorization] question resolution persistence failed"
+                );
+            }
+        }
+        for question in &entry.questions {
+            question.clear_recovery();
+        }
         // Ignore a dropped receiver: the listener may have abandoned the wait
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
@@ -5399,6 +5508,23 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
+        if let (Some(authorization_id), Some(service)) = (
+            entry.recovery_authorization_id.as_deref(),
+            self.recovery_authorization_service(),
+        ) {
+            let _ = service
+                .resolve_question(
+                    authorization_id,
+                    QuestionOutcome {
+                        answers: Vec::new(),
+                        declined: true,
+                    },
+                )
+                .await;
+        }
+        for question in &entry.questions {
+            question.clear_recovery();
+        }
         if let Some((state, emitter)) = self
             .get_state_and_emitter(&entry.parent_connection_id)
             .await
@@ -5427,27 +5553,42 @@ impl ConnectionManager {
         // Remove every entry for this parent under the lock (dropping their
         // senders unblocks the parked listeners), then emit outside the lock —
         // the registry mutex is never held across an await.
-        let drained: Vec<String> = {
+        let drained: Vec<(String, Option<String>, Vec<QuestionSpec>)> = {
             let mut reg = self.pending_questions.lock().await;
             let ids: Vec<String> = reg
                 .iter()
                 .filter(|(_, e)| e.parent_connection_id == conn_id)
                 .map(|(id, _)| id.clone())
                 .collect();
-            for id in &ids {
-                reg.remove(id);
-            }
-            ids
+            ids.into_iter()
+                .filter_map(|id| {
+                    reg.remove(&id)
+                        .map(|entry| (id, entry.recovery_authorization_id, entry.questions))
+                })
+                .collect()
         };
         if drained.is_empty() {
             return;
+        }
+        for (question_id, authorization_id, questions) in &drained {
+            if let (Some(authorization_id), Some(service)) = (
+                authorization_id.as_deref(),
+                self.recovery_authorization_service(),
+            ) {
+                let _ = service
+                    .abandon_question(authorization_id, question_id)
+                    .await;
+            }
+            for question in questions {
+                question.clear_recovery();
+            }
         }
         // Best-effort card clear: depending on the teardown path the connection
         // may already be out of the map (`disconnect` removes it before the
         // run_connection cleanup guard fires this sweep), so tolerate `None` — the
         // core removal above already ran and the frontend clears on disconnect.
         if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
-            for question_id in drained {
+            for (question_id, _, _) in drained {
                 emit_with_state(&state, &emitter, AcpEvent::QuestionResolved { question_id }).await;
             }
         }

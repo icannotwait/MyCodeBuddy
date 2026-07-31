@@ -25,7 +25,7 @@
 //!   * [`QuestionRuntimeConfig`] — the hot-swappable "is the feature on?" flag,
 //!     read at MCP injection time (mirrors [`crate::acp::feedback`]).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -67,8 +67,18 @@ pub struct QuestionOption {
     pub description: String,
 }
 
-/// A single multiple-choice question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryQuestionPresentation {
+    pub subject: String,
+    pub action: String,
+    pub target: String,
+    pub cause: String,
+    pub risk: String,
+    pub display_reason: Option<String>,
+}
+
+/// A single multiple-choice question.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestionSpec {
     /// Backend-minted stable id. Used as the answer correlation key instead of
     /// the question text (which Claude Code keys on) so duplicate question
@@ -89,8 +99,90 @@ pub struct QuestionSpec {
     /// True when the answer is a secret (codex `request_user_input` marks API
     /// keys etc. with `_meta.codex.isSecret`): the card masks the free-text
     /// input. Default false — absent on the wire for every non-secret source.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_secret: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuestionSpecWire {
+    id: String,
+    question: String,
+    header: String,
+    multi_select: bool,
+    options: Vec<QuestionOption>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryQuestionPresentation>,
+}
+
+fn recovery_presentations() -> &'static Mutex<BTreeMap<String, RecoveryQuestionPresentation>> {
+    static PRESENTATIONS: OnceLock<Mutex<BTreeMap<String, RecoveryQuestionPresentation>>> =
+        OnceLock::new();
+    PRESENTATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+impl QuestionSpec {
+    pub fn with_recovery(self, recovery: RecoveryQuestionPresentation) -> Self {
+        recovery_presentations()
+            .lock()
+            .expect("recovery presentation lock poisoned")
+            .insert(self.id.clone(), recovery);
+        self
+    }
+
+    pub fn recovery(&self) -> Option<RecoveryQuestionPresentation> {
+        recovery_presentations()
+            .lock()
+            .expect("recovery presentation lock poisoned")
+            .get(&self.id)
+            .cloned()
+    }
+
+    pub(crate) fn clear_recovery(&self) {
+        recovery_presentations()
+            .lock()
+            .expect("recovery presentation lock poisoned")
+            .remove(&self.id);
+    }
+}
+
+impl Serialize for QuestionSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        QuestionSpecWire {
+            id: self.id.clone(),
+            question: self.question.clone(),
+            header: self.header.clone(),
+            multi_select: self.multi_select,
+            options: self.options.clone(),
+            is_secret: self.is_secret,
+            recovery: self.recovery(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for QuestionSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = QuestionSpecWire::deserialize(deserializer)?;
+        let spec = Self {
+            id: wire.id,
+            question: wire.question,
+            header: wire.header,
+            multi_select: wire.multi_select,
+            options: wire.options,
+            is_secret: wire.is_secret,
+        };
+        Ok(match wire.recovery {
+            Some(recovery) => spec.with_recovery(recovery),
+            None => spec,
+        })
+    }
 }
 
 /// The pending (awaiting-answer) question set stored on
@@ -151,6 +243,34 @@ pub struct QuestionOutcome {
 pub struct RegisteredQuestion {
     pub question_id: String,
     pub answer_rx: oneshot::Receiver<QuestionOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryQuestionRegistrationError {
+    ParentUnavailable,
+    Occupied,
+    Invalid,
+}
+
+#[cfg(test)]
+pub(crate) fn generic_test_question() -> QuestionSpec {
+    QuestionSpec {
+        id: "generic-test-question".into(),
+        question: "Generic question?".into(),
+        header: "Generic".into(),
+        multi_select: false,
+        options: vec![
+            QuestionOption {
+                label: "A".into(),
+                description: String::new(),
+            },
+            QuestionOption {
+                label: "B".into(),
+                description: String::new(),
+            },
+        ],
+        is_secret: false,
+    }
 }
 
 /// Listener-facing access to register / cancel a pending question on a parent
@@ -375,6 +495,17 @@ pub fn validate_specs(specs: &[QuestionSpec]) -> Result<(), String> {
                     "questions[{qi}].options[{oi}] `description` exceeds {MAX_QUESTION_TEXT_CHARS} characters"
                 ));
             }
+        }
+        if q.recovery().is_some()
+            && (q.multi_select
+                || q.is_secret
+                || q.options.len() != 2
+                || q.options[0].label != crate::acp::recovery_authorization::RECOVERY_APPROVE_LABEL
+                || q.options[1].label != crate::acp::recovery_authorization::RECOVERY_DECLINE_LABEL)
+        {
+            return Err(format!(
+                "questions[{qi}] has an invalid recovery authorization presentation"
+            ));
         }
     }
     Ok(())
@@ -2233,5 +2364,60 @@ mod tests {
             output["answers"][0]["question"]
         );
         assert_eq!(output["answers"][0]["header"], "");
+    }
+
+    #[test]
+    fn question_recovery_presentation_round_trips_without_receipt_metadata() {
+        let presentation = RecoveryQuestionPresentation {
+            subject: "workflow".into(),
+            action: "recover_workflow".into(),
+            target: "workflow-a".into(),
+            cause: "stalled".into(),
+            risk: "state_change".into(),
+            display_reason: Some("workflow_stalled".into()),
+        };
+        let spec = QuestionSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            question: "recovery_authorization".into(),
+            header: "Recovery".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: crate::acp::recovery_authorization::RECOVERY_APPROVE_LABEL.into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: crate::acp::recovery_authorization::RECOVERY_DECLINE_LABEL.into(),
+                    description: String::new(),
+                },
+            ],
+            is_secret: false,
+        }
+        .with_recovery(presentation.clone());
+
+        let wire = serde_json::to_value(&spec).unwrap();
+        let recovery = wire["recovery"].as_object().unwrap();
+        let keys: std::collections::BTreeSet<_> = recovery.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "cause",
+                "display_reason",
+                "risk",
+                "subject",
+                "target"
+            ]
+            .into_iter()
+            .collect()
+        );
+        let encoded = wire.to_string();
+        assert!(!encoded.contains("authorization_id"));
+        assert!(!encoded.contains("receipt"));
+
+        let round_trip: QuestionSpec = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.recovery(), Some(presentation));
+        assert!(validate_specs(&[round_trip.clone()]).is_ok());
+        round_trip.clear_recovery();
     }
 }

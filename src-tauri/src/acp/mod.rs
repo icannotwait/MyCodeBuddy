@@ -27,6 +27,7 @@ pub mod perf_fixture;
 pub mod plan_approval;
 pub mod preflight;
 pub mod question;
+pub mod recovery_authorization;
 pub mod registry;
 pub mod session_attach;
 pub mod session_info;
