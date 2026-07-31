@@ -5,7 +5,6 @@ import {
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { resolveActiveSessionDetails } from "@/components/conversations/active-session-details"
-import { resolveSessionModelDisplay } from "@/lib/status-bar-session-model"
 import type { DbConversationDetail, MessageTurn, TurnUsage } from "@/lib/types"
 
 vi.mock("@/lib/api", () => ({
@@ -424,7 +423,7 @@ describe("syncTurnMetadata archived reasoning effort", () => {
     vi.useRealTimers()
   })
 
-  it("fills missing local effort and resolves model plus high for the status bar", async () => {
+  it("fills missing local effort and resolves archived model plus high", async () => {
     seedMetadataSyncSession(
       asst({ id: "live", model: "gpt-5.6-sol", reasoning_effort: null })
     )
@@ -452,14 +451,8 @@ describe("syncTurnMetadata archived reasoning effort", () => {
       (id) => (id === CID ? runtime : null),
       []
     )
-    const display = resolveSessionModelDisplay({
-      configOptions: null,
-      conversationModel: details.model,
-      conversationEffort: details.reasoningEffort,
-    })
-    expect(
-      [display.model, display.thinkingLevel].filter(Boolean).join(" · ")
-    ).toBe("gpt-5.6-sol · high")
+    expect(details.model).toBe("gpt-5.6-sol")
+    expect(details.reasoningEffort).toBe("high")
   })
 
   it("does not overwrite effort already present on the local turn", async () => {
@@ -493,7 +486,7 @@ describe("syncTurnMetadata archived reasoning effort", () => {
     })
   })
 
-  it("keeps the status output model-only when the archive has no effort", async () => {
+  it("keeps resolved metadata model-only when the archive has no effort", async () => {
     seedMetadataSyncSession(asst({ id: "live", model: "gpt-5.6-sol" }))
     mockGetFolderConversation.mockResolvedValueOnce(
       detailWith([
@@ -518,14 +511,8 @@ describe("syncTurnMetadata archived reasoning effort", () => {
       (id) => (id === CID ? runtime : null),
       []
     )
-    const display = resolveSessionModelDisplay({
-      configOptions: null,
-      conversationModel: details.model,
-      conversationEffort: details.reasoningEffort,
-    })
-    expect(
-      [display.model, display.thinkingLevel].filter(Boolean).join(" · ")
-    ).toBe("gpt-5.6-sol")
+    expect(details.model).toBe("gpt-5.6-sol")
+    expect(details.reasoningEffort).toBeNull()
   })
 })
 
