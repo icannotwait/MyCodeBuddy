@@ -12518,6 +12518,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);

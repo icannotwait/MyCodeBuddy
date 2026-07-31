@@ -79,14 +79,16 @@ use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaSnapshot,
     DelegationMetaWriter, NoopMetaWriter,
 };
-use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
+use crate::acp::delegation::metrics::{
+    DelegationRecoveryMetricEvent, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
+};
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
     PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
-    PromoteRunningOutcome, ReservingRunInsert, RunStore,
+    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -1743,6 +1745,7 @@ fn parent_end_setup_report(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2219,6 +2222,7 @@ fn report_from_outcome(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2229,8 +2233,14 @@ fn report_err(
     err: DelegationError,
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
+    let recovery = match &err {
+        DelegationError::RecoveryConfirmationRequired(projection) => Some(projection.clone()),
+        _ => None,
+    };
     let outcome = DelegationOutcome::from_err(err, child_conversation_id);
-    report_from_outcome(None, Some(agent_type), &outcome, None)
+    let mut report = report_from_outcome(None, Some(agent_type), &outcome, None);
+    report.recovery = recovery;
+    report
 }
 
 /// Build an error report after a continuation has durably reserved a run.
@@ -2267,6 +2277,14 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
         TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
+        TaskStoreError::RecoveryConfirmationRequired(projection) => {
+            DelegationError::RecoveryConfirmationRequired(projection)
+        }
+        TaskStoreError::RecoveryAuthorizationRejected { code } => {
+            DelegationError::RecoveryAuthorizationRejected {
+                code: code.to_string(),
+            }
+        }
         TaskStoreError::StaleTaskId(m) => DelegationError::StaleTaskId(m),
         TaskStoreError::NotContinuable(m) => DelegationError::NotContinuable(m),
         TaskStoreError::NotFound(m) => DelegationError::NotFound(m),
@@ -2466,6 +2484,7 @@ fn running_ack(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2700,6 +2719,7 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2719,6 +2739,7 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2743,6 +2764,7 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2771,6 +2793,7 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2785,6 +2808,10 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
 enum StatusClass {
     /// Terminal/owned-cached, or a cross-parent `unknown` — the report is final.
     Settled(DelegationTaskReport),
+    Unknown {
+        report: DelegationTaskReport,
+        reason: &'static str,
+    },
     /// Running or mid-settle (settling map) and owned — the bare running
     /// snapshot plus its child connection id, so `assemble_reports` can attach
     /// the latest live reply out of lock. Waiters treat this as not-yet-
@@ -2881,7 +2908,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
         // do not treat as cross-parent denial; fall through for DB ownership
         // and/or disposition-backed intent.
         if !c.parent_connection_id.is_empty() {
-            return StatusClass::Settled(unknown_report(task_id));
+            return StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            };
         }
     }
     // Owned terminal intent without a parent-matching completed row (e.g.
@@ -2923,7 +2953,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
                 child_connection_id: r.child_connection_id.clone(),
             }
         } else {
-            StatusClass::Settled(unknown_report(task_id))
+            StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            }
         };
     }
     // Durable CAS in flight: keep waiters parked and snapshot status Running.
@@ -2934,7 +2967,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
                 child_connection_id: r.child_connection_id.clone(),
             }
         } else {
-            StatusClass::Settled(unknown_report(task_id))
+            StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            }
         };
     }
     StatusClass::NotInMemory
@@ -3854,6 +3890,83 @@ impl DelegationBroker {
     /// Shared metrics handle for supervisor / listener / tests.
     pub fn metrics(&self) -> Arc<crate::acp::delegation::metrics::DelegationMetrics> {
         self.metrics.clone()
+    }
+
+    fn record_recovery_event(
+        &self,
+        kind: RecoveryMetricEventKind,
+        task_id: Option<&str>,
+        authorization_id: Option<&str>,
+        parent_conversation_id: Option<i32>,
+        child_conversation_id: Option<i32>,
+        action: Option<&str>,
+        cause: Option<&str>,
+        risk: Option<&str>,
+        code: Option<&str>,
+    ) {
+        self.metrics
+            .record_recovery_event(DelegationRecoveryMetricEvent {
+                kind,
+                task_id: task_id.map(str::to_string),
+                authorization_id: authorization_id.map(str::to_string),
+                parent_id: parent_conversation_id.map(|id| id.to_string()),
+                child_id: child_conversation_id.map(|id| id.to_string()),
+                action: action.map(str::to_string),
+                cause: cause.map(str::to_string),
+                risk: risk.map(str::to_string),
+                code: code.map(str::to_string),
+            });
+    }
+
+    fn record_recovery_admission_error(
+        &self,
+        error: &TaskStoreError,
+        task_id: &str,
+        authorization_id: Option<&str>,
+        parent_conversation_id: i32,
+        child_conversation_id: Option<i32>,
+        action: &'static str,
+    ) {
+        match error {
+            TaskStoreError::RecoveryConfirmationRequired(projection) => {
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::Decision,
+                    Some(task_id),
+                    None,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    projection.proposed_action.as_deref(),
+                    Some(&projection.cause_code),
+                    Some(&projection.risk_class),
+                    Some("recovery_confirmation_required"),
+                );
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::ConfirmationRequested,
+                    Some(task_id),
+                    None,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    projection.proposed_action.as_deref(),
+                    Some(&projection.cause_code),
+                    Some(&projection.risk_class),
+                    Some("recovery_confirmation_required"),
+                );
+            }
+            TaskStoreError::RecoveryAuthorizationRejected { code } => {
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::AuthorizationRejected,
+                    Some(task_id),
+                    authorization_id,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    Some(action),
+                    None,
+                    None,
+                    Some(code),
+                );
+            }
+            _ => {}
+        }
     }
 
     /// Record one status-wait outcome (exact-once per request return path).
@@ -6034,8 +6147,52 @@ impl DelegationBroker {
                     Some(child_row.id),
                 );
             }
-            match runs.admit_gen1_reserving(insert).await {
+            let authorization = RecoveryAdmissionAuthorization {
+                authorization_id: req.recovery_authorization_id.clone(),
+                correlation_id: req
+                    .correlation_id
+                    .clone()
+                    .or_else(|| {
+                        (!req.parent_tool_use_id.is_empty()).then(|| req.parent_tool_use_id.clone())
+                    })
+                    .unwrap_or_else(|| call_id.clone()),
+            };
+            match runs
+                .admit_gen1_reserving_authorized(insert, authorization)
+                .await
+            {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
+                    if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                        for kind in [
+                            RecoveryMetricEventKind::ConfirmationApproved,
+                            RecoveryMetricEventKind::AuthorizationConsumed,
+                        ] {
+                            self.record_recovery_event(
+                                kind,
+                                Some(&run.task_id),
+                                Some(authorization_id),
+                                Some(run.parent_conversation_id),
+                                Some(run.child_conversation_id),
+                                Some("replace"),
+                                None,
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    if run.replaced_task_id.is_some() {
+                        self.record_recovery_event(
+                            RecoveryMetricEventKind::ReplacementAdmitted,
+                            Some(&run.task_id),
+                            run.recovery_authorization_id.as_deref(),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            Some("replace"),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                     // Post-commit / pre-spawn window: parent-end durable sweep
                     // may race the pure reserving claim here. Hold for tests.
                     #[cfg(any(test, feature = "test-utils"))]
@@ -6098,6 +6255,14 @@ impl DelegationBroker {
                     return gen1_idempotent_ack(&existing);
                 }
                 Err(e) => {
+                    self.record_recovery_admission_error(
+                        &e,
+                        req.replaces_task_id.as_deref().unwrap_or(&call_id),
+                        req.recovery_authorization_id.as_deref(),
+                        req.parent_conversation_id,
+                        Some(child_row.id),
+                        "replace",
+                    );
                     // Loser of work-unit / unique fence — never dispatch, and
                     // terminalize + hide the provisional InProgress/Running
                     // child so the sidebar and list_children do not show an
@@ -7406,6 +7571,7 @@ impl DelegationBroker {
                     observation: None,
                     last_agent_activity_at: None,
                     stalled_since: None,
+                    recovery: None,
                 };
                 {
                     let mut inner = self.pending.inner.lock().await;
@@ -8472,7 +8638,50 @@ impl DelegationBroker {
             );
         }
 
-        let admitted = runs.admit_continue_reserving(admission).await;
+        let authorization = RecoveryAdmissionAuthorization {
+            authorization_id: req.recovery_authorization_id.clone(),
+            correlation_id: req
+                .correlation_id
+                .clone()
+                .or_else(|| {
+                    (!req.parent_tool_use_id.is_empty()).then(|| req.parent_tool_use_id.clone())
+                })
+                .unwrap_or_else(|| new_task_id.clone()),
+        };
+        let admitted = runs
+            .admit_continue_reserving_authorized(admission, authorization)
+            .await;
+        match &admitted {
+            Ok(ContinueAdmitOutcome::Created(run)) => {
+                if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                    for kind in [
+                        RecoveryMetricEventKind::ConfirmationApproved,
+                        RecoveryMetricEventKind::AuthorizationConsumed,
+                    ] {
+                        self.record_recovery_event(
+                            kind,
+                            Some(&run.task_id),
+                            Some(authorization_id),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            Some("continue"),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+            Err(error) => self.record_recovery_admission_error(
+                error,
+                &req.target_task_id,
+                req.recovery_authorization_id.as_deref(),
+                req.parent_conversation_id,
+                Some(target.child_conversation_id),
+                "continue",
+            ),
+            Ok(ContinueAdmitOutcome::Idempotent(_)) => {}
+        }
 
         // Test-only hold: cancel between durable reserve commit and handoff
         // registration. Production is a no-op when no gate is installed.
@@ -8798,6 +9007,17 @@ impl DelegationBroker {
             return report;
         }
         let Some(external_id) = external_id else {
+            self.record_recovery_event(
+                RecoveryMetricEventKind::ResumeFailed,
+                Some(&reserved.task_id),
+                reserved.recovery_authorization_id.as_deref(),
+                Some(reserved.parent_conversation_id),
+                Some(reserved.child_conversation_id),
+                Some("continue"),
+                None,
+                None,
+                Some("unresumable"),
+            );
             let settle = self
                 .settle_bootstrap_unresumable(
                     &reserved.task_id,
@@ -8899,6 +9119,17 @@ impl DelegationBroker {
         {
             Ok(id) => id,
             Err(_e) => {
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::ResumeFailed,
+                    Some(&reserved.task_id),
+                    reserved.recovery_authorization_id.as_deref(),
+                    Some(reserved.parent_conversation_id),
+                    Some(reserved.child_conversation_id),
+                    Some("continue"),
+                    None,
+                    None,
+                    Some("unresumable"),
+                );
                 if let Some(report) = self
                     .continue_abort_if_handoff_closed(ContinueHandoffGate {
                         task_id: &reserved.task_id,
@@ -9002,6 +9233,17 @@ impl DelegationBroker {
         // The admission handoff is keyed by this exact incarnation. A spawner
         // returning another id cannot safely receive the continued prompt.
         if child_connection_id != handoff.child_connection_id {
+            self.record_recovery_event(
+                RecoveryMetricEventKind::ResumeFailed,
+                Some(&reserved.task_id),
+                reserved.recovery_authorization_id.as_deref(),
+                Some(reserved.parent_conversation_id),
+                Some(reserved.child_conversation_id),
+                Some("continue"),
+                None,
+                None,
+                Some("unresumable"),
+            );
             let _ = self.spawner.disconnect(&child_connection_id).await;
             let _ = runs
                 .settle_terminal(
@@ -11887,6 +12129,7 @@ impl DelegationBroker {
                             observation: None,
                             last_agent_activity_at: None,
                             stalled_since: None,
+                            recovery: None,
                         };
                         if report.agent_type.is_none() {
                             report.agent_type = Some(agent_type);
@@ -13288,7 +13531,12 @@ impl DelegationBroker {
         for (requested, matched) in task_ids.iter().zip(matches) {
             let canonical = match matched {
                 StatusTaskIdMatch::Unique(canonical) => Some(canonical),
-                StatusTaskIdMatch::Exact | StatusTaskIdMatch::Ambiguous => None,
+                StatusTaskIdMatch::Exact => None,
+                StatusTaskIdMatch::Ambiguous => {
+                    self.metrics
+                        .record_recovery_lookup_unknown("prefix_ambiguous");
+                    None
+                }
                 StatusTaskIdMatch::None => {
                     let (Some(parent_id), Some(prefix)) =
                         (parent_conversation_id, recovery_task_id_prefix(requested))
@@ -13304,6 +13552,7 @@ impl DelegationBroker {
                             .await
                             .is_some(),
                         Err(error) => {
+                            self.metrics.record_recovery_lookup_unknown("store_error");
                             tracing::warn!(
                                 parent_connection_id,
                                 parent_conversation_id = parent_id,
@@ -13325,6 +13574,7 @@ impl DelegationBroker {
                         {
                             Ok(canonical) => canonical,
                             Err(error) => {
+                                self.metrics.record_recovery_lookup_unknown("store_error");
                                 tracing::warn!(
                                     parent_connection_id,
                                     parent_conversation_id = parent_id,
@@ -13776,6 +14026,10 @@ impl DelegationBroker {
         for (id, class) in task_ids.iter().zip(classes) {
             let report = match class {
                 StatusClass::Settled(report) => report,
+                StatusClass::Unknown { report, reason } => {
+                    self.metrics.record_recovery_lookup_unknown(reason);
+                    report
+                }
                 StatusClass::Running {
                     mut report,
                     child_connection_id,
@@ -13794,6 +14048,15 @@ impl DelegationBroker {
                     report
                 }
             };
+            let mut report = report;
+            if report.status != TaskStatus::Unknown {
+                if let Some(run_store) = &self.run_store {
+                    match run_store.recovery_projection_for_task(id).await {
+                        Ok(projection) => report.recovery = projection,
+                        Err(_) => self.metrics.record_recovery_lookup_unknown("store_error"),
+                    }
+                }
+            }
             out.push(report);
         }
         out
@@ -13905,8 +14168,12 @@ impl DelegationBroker {
         match drained {
             Some((_id, task, duration_ms)) => {
                 let outcome = canceled_outcome(task.child_conversation_id, reason);
+                let terminal_code = match &outcome {
+                    DelegationOutcome::Err { code, .. } => code.clone(),
+                    DelegationOutcome::Ok(_) => unreachable!("canceled outcome must be an error"),
+                };
                 let terminal = TerminalTaskWrite::canceled(
-                    reason,
+                    terminal_code,
                     termination.observed_at,
                     DelegationTerminationAuditV1::new(
                         termination,
@@ -13966,6 +14233,7 @@ impl DelegationBroker {
                             observation: None,
                             last_agent_activity_at: None,
                             stalled_since: None,
+                            recovery: None,
                         }
                     }
                 }
@@ -13985,34 +14253,40 @@ impl DelegationBroker {
         parent_conversation_id: Option<i32>,
         task_id: &str,
     ) -> DelegationTaskReport {
-        if let Ok(Some(row)) = self.task_store.load(task_id).await {
-            if parent_conversation_id.is_some() && row.parent_id == parent_conversation_id {
-                // Ownership established via durable parent_id — may project
-                // claimed terminal intent while durable is still running.
-                if row.status == TaskStatus::Running {
-                    let intent = {
-                        let inner = self.pending.inner.lock().await;
-                        inner.resolve_terminal_intent(task_id)
-                    };
-                    if let Some(intent) = intent {
-                        let agent_type = intent
-                            .completed
-                            .as_ref()
-                            .map(|c| c.agent_type)
-                            .unwrap_or(row.agent_type);
-                        let child_id = intent
-                            .completed
-                            .as_ref()
-                            .map(|c| c.child_conversation_id)
-                            .unwrap_or(row.child_conversation_id);
-                        return intent.to_report(task_id, agent_type, child_id, None);
+        match self.task_store.load(task_id).await {
+            Ok(Some(row)) => {
+                if parent_conversation_id.is_some() && row.parent_id == parent_conversation_id {
+                    // Ownership established via durable parent_id — may project
+                    // claimed terminal intent while durable is still running.
+                    if row.status == TaskStatus::Running {
+                        let intent = {
+                            let inner = self.pending.inner.lock().await;
+                            inner.resolve_terminal_intent(task_id)
+                        };
+                        if let Some(intent) = intent {
+                            let agent_type = intent
+                                .completed
+                                .as_ref()
+                                .map(|c| c.agent_type)
+                                .unwrap_or(row.agent_type);
+                            let child_id = intent
+                                .completed
+                                .as_ref()
+                                .map(|c| c.child_conversation_id)
+                                .unwrap_or(row.child_conversation_id);
+                            return intent.to_report(task_id, agent_type, child_id, None);
+                        }
                     }
+                    return row.to_report(None);
                 }
-                return row.to_report(None);
+                if parent_conversation_id.is_some() {
+                    self.metrics
+                        .record_recovery_lookup_unknown("ownership_mismatch");
+                    return unknown_report(task_id);
+                }
             }
-            if parent_conversation_id.is_some() {
-                return unknown_report(task_id);
-            }
+            Ok(None) => {}
+            Err(_) => self.metrics.record_recovery_lookup_unknown("store_error"),
         }
         match self.status_lookup.find_by_call_id(task_id).await {
             Some(rec)
@@ -14020,7 +14294,15 @@ impl DelegationBroker {
             {
                 db_report(task_id, &rec)
             }
-            _ => unknown_report(task_id),
+            Some(_) => {
+                self.metrics
+                    .record_recovery_lookup_unknown("ownership_mismatch");
+                unknown_report(task_id)
+            }
+            None => {
+                self.metrics.record_recovery_lookup_unknown("db_not_found");
+                unknown_report(task_id)
+            }
         }
     }
 
@@ -14425,6 +14707,7 @@ mod tests {
             replaces_task_id: None,
             replacement_reason: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         }
     }
 
@@ -22602,6 +22885,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -22754,6 +23038,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -23038,6 +23323,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
@@ -23440,6 +23726,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -23977,6 +24264,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -24481,6 +24769,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -24881,6 +25170,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -25053,6 +25343,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -26766,6 +27057,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -26857,6 +27149,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -27496,6 +27789,7 @@ mod tests {
             observation: None,
             last_agent_activity_at: None,
             stalled_since: None,
+            recovery: None,
         };
         let accounting = PersistenceRetryAccounting {
             parent_connection_id: parent_conn.clone(),
@@ -29646,6 +29940,7 @@ mod tests {
             runtime_stats: None,
             replaced_task_id: None,
             replacement_reason: None,
+            recovery_authorization_id: None,
         };
         let reserving_report = continue_idempotent_ack(&reserving, "run-2".into());
         assert!(
@@ -29933,6 +30228,7 @@ mod tests {
                     observation: None,
                     last_agent_activity_at: None,
                     stalled_since: None,
+                    recovery: None,
                 }
             }
         }
@@ -30931,6 +31227,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
         let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
@@ -31163,6 +31460,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
 
@@ -31277,6 +31575,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
 
@@ -31485,6 +31784,7 @@ mod tests {
             observation: Some(snap.observation),
             last_agent_activity_at: Some(snap.last_agent_activity_at),
             stalled_since: snap.stalled_since,
+            recovery: None,
         }
     }
 
@@ -33451,6 +33751,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33494,6 +33795,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33527,6 +33829,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33563,6 +33866,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -33601,6 +33905,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33679,6 +33984,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(
@@ -33776,6 +34082,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
+            recovery_authorization_id: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -33952,6 +34259,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(
@@ -34189,6 +34497,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -34209,6 +34518,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -34230,6 +34540,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -34267,6 +34578,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -34543,6 +34855,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(cont.error_code.is_none(), "continue: {cont:?}");
@@ -34655,6 +34968,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(corr.into()),
+                recovery_authorization_id: None,
             })
             .await;
         drop(_guard);
@@ -34758,6 +35072,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
 
@@ -34843,6 +35158,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -34925,6 +35241,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35080,6 +35397,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -35205,6 +35523,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -35274,6 +35593,80 @@ mod tests {
 
     /// Idempotent parent-tool replay of a successful admission_unknown
     /// replacement must carry the same warning as the fresh running ack.
+    async fn approve_replacement_recovery(
+        db: &crate::db::AppDatabase,
+        runs: &RunStore,
+        source_task_id: &str,
+        replacement_reason: crate::acp::delegation::recovery_policy::ReplacementReason,
+    ) -> String {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, RequestedRecoveryOperation,
+        };
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+
+        let source = runs
+            .load_by_task_id(source_task_id)
+            .await
+            .expect("load recovery source")
+            .expect("recovery source");
+        let eligibility = runs
+            .build_continue_eligibility(&source)
+            .await
+            .expect("build recovery eligibility");
+        let snapshot = crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+            &eligibility,
+        );
+        let operation = RequestedRecoveryOperation::Replace { replacement_reason };
+        let decision = decide_delegation_recovery(
+            &snapshot,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: eligibility.agent_supports_reuse,
+                unexpected_continue_budget_available: eligibility
+                    .unexpected_continue_budget_available,
+                replacement_budget_available: eligibility.replacement_budget_available,
+            },
+            operation.clone(),
+        );
+        assert!(decision.requires_authorization());
+        let projection =
+            crate::acp::delegation::types::DelegationRecoveryProjection::from(&decision);
+        let challenge = RecoveryChallenge {
+            parent_conversation_id: source.parent_conversation_id,
+            subject_kind: RecoverySubjectKind::DelegationTask,
+            subject_id: source.task_id.clone(),
+            delegation_identity: Some(DelegationAuthorizationIdentity {
+                source_task_id: source.task_id.clone(),
+                child_conversation_id: Some(source.child_conversation_id),
+                lineage_root_task_id: source.lineage_root_task_id.clone(),
+                work_unit_key: source.work_unit_key.clone(),
+            }),
+            source_state_fingerprint: decision.source_state_fingerprint,
+            allowed_action: RecoveryAllowedAction::Replace,
+            action_payload: crate::acp::delegation::run_store::recovery_action_payload(&operation),
+            cause_code: projection.cause_code,
+            risk_class: projection.risk_class,
+            display_reason: None,
+        };
+        let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+        let now = Utc::now();
+        let pending = authorizations
+            .insert_pending(&challenge, now)
+            .await
+            .expect("insert replacement authorization");
+        authorizations
+            .approve_pending(
+                &pending.authorization_id,
+                now,
+                now + chrono::Duration::minutes(10),
+            )
+            .await
+            .expect("approve replacement authorization");
+        pending.authorization_id
+    }
+
     #[tokio::test]
     async fn replacement_admission_unknown_idempotent_ack_includes_duplicate_execution_warning() {
         use crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
@@ -35353,12 +35746,18 @@ mod tests {
         })
         .await
         .expect("source reserve");
+        let finished_at = Utc::now();
         runs.settle_terminal(
             source_task_id,
-            TerminalTaskWrite::failed(
+            TerminalTaskWrite::failed_with_evidence(
                 "admission_unknown",
-                Utc::now(),
-                ConversationStatus::Cancelled,
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
+                    "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
+                    finished_at,
+                ),
             ),
         )
         .await
@@ -35369,6 +35768,15 @@ mod tests {
         replacement_request.work_unit_key = Some("adm-unk-idem-unit".into());
         replacement_request.replaces_task_id = Some(source_task_id.into());
         replacement_request.replacement_reason = Some("admission_unknown".into());
+        replacement_request.recovery_authorization_id = Some(
+            approve_replacement_recovery(
+                &db,
+                &runs,
+                source_task_id,
+                crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+            )
+            .await,
+        );
         let first = broker.start_delegation(replacement_request.clone()).await;
         assert_eq!(first.status, TaskStatus::Running, "{first:?}");
         assert!(
@@ -35499,12 +35907,18 @@ mod tests {
         })
         .await
         .expect("source reserve");
+        let finished_at = Utc::now();
         runs.settle_terminal(
             source_task_id,
-            TerminalTaskWrite::failed(
+            TerminalTaskWrite::failed_with_evidence(
                 "admission_unknown",
-                Utc::now(),
-                ConversationStatus::Cancelled,
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
+                    "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
+                    finished_at,
+                ),
             ),
         )
         .await
@@ -35522,6 +35936,15 @@ mod tests {
         replacement_request.work_unit_key = Some("adm-unk-unit".into());
         replacement_request.replaces_task_id = Some(source_task_id.into());
         replacement_request.replacement_reason = Some("admission_unknown".into());
+        replacement_request.recovery_authorization_id = Some(
+            approve_replacement_recovery(
+                &db,
+                &runs,
+                source_task_id,
+                crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+            )
+            .await,
+        );
         let replacement = broker.start_delegation(replacement_request).await;
         assert_eq!(
             replacement.status,
@@ -35641,6 +36064,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35786,6 +36210,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35926,6 +36351,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36033,6 +36459,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36134,6 +36561,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36260,6 +36688,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36374,6 +36803,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -36468,6 +36898,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -36533,6 +36964,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37045,6 +37477,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37270,6 +37703,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37379,6 +37813,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37525,6 +37960,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37687,6 +38123,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -37871,6 +38308,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
+                recovery_authorization_id: None,
             })
             .await;
 
@@ -37993,6 +38431,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
+            recovery_authorization_id: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -38095,6 +38534,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -38185,6 +38625,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(

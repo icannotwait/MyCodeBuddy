@@ -21,7 +21,9 @@ use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::types::{cold_task_report_message, DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    cold_task_report_message, DelegationRecoveryProjection, DelegationTaskReport, TaskStatus,
+};
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
     AcpTerminationSummaryV1, DelegationTerminationAuditV1,
@@ -251,6 +253,7 @@ impl PersistedTask {
             observation: None,
             last_agent_activity_at: None,
             stalled_since: None,
+            recovery: None,
         }
     }
 }
@@ -328,6 +331,10 @@ pub enum TaskStoreError {
     /// Continue target fails eligibility. Wire: `not_continuable`.
     #[error("not continuable: {0}")]
     NotContinuable(String),
+    #[error("recovery confirmation required")]
+    RecoveryConfirmationRequired(DelegationRecoveryProjection),
+    #[error("recovery authorization rejected: {code}")]
+    RecoveryAuthorizationRejected { code: &'static str },
     /// Workflow graph admission rejected (B2/B6/A8.3/A14/B14).
     /// Wire code is the structured `code` field (e.g. `final_early`).
     #[error("workflow admission rejected ({code}): {message}")]
@@ -361,6 +368,8 @@ impl TaskStoreError {
             Self::InvalidReplacement(_) => Some("invalid_replacement"),
             Self::StaleTaskId(_) => Some("stale_task_id"),
             Self::NotContinuable(_) => Some("not_continuable"),
+            Self::RecoveryConfirmationRequired(_) => Some("recovery_confirmation_required"),
+            Self::RecoveryAuthorizationRejected { code } => Some(code),
             Self::NotFound(_) => Some("not_found"),
             // Structured admission codes are returned via
             // [`TaskStoreError::workflow_admission_code`] / DelegationError;
@@ -370,6 +379,13 @@ impl TaskStoreError {
             // Pre-admission ownership fence — broker maps to spawn_failed.
             Self::BindOwnershipConflict(_) => Some("spawn_failed"),
             Self::Transient(_) | Self::Permanent(_) => None,
+        }
+    }
+
+    pub fn recovery_projection(&self) -> Option<&DelegationRecoveryProjection> {
+        match self {
+            Self::RecoveryConfirmationRequired(projection) => Some(projection),
+            _ => None,
         }
     }
 
@@ -820,6 +836,7 @@ fn report_from_terminal(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 

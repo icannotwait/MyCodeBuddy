@@ -1639,6 +1639,7 @@ impl DelegationListener {
                 work_unit_key,
                 external_handle: req.external_handle,
                 correlation_id,
+                recovery_authorization_id: None,
             };
             return self.broker.continue_delegation(continue_req).await;
         }
@@ -1701,6 +1702,7 @@ impl DelegationListener {
             replaces_task_id,
             replacement_reason,
             correlation_id,
+            recovery_authorization_id: None,
         };
         self.broker.start_delegation(delegation_req).await
     }
@@ -2049,6 +2051,7 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2068,6 +2071,7 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2088,6 +2092,7 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2113,6 +2118,7 @@ fn wait_cancel_report(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2131,6 +2137,7 @@ fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -3431,6 +3438,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -5020,6 +5028,7 @@ mod tests {
                         replaces_task_id: None,
                         replacement_reason: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
                     .task_id
@@ -5128,6 +5137,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -5177,6 +5187,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -5365,6 +5376,7 @@ mod tests {
                     replaces_task_id: None,
                     replacement_reason: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 };
                 broker.handle_request(req).await
             })
@@ -6725,6 +6737,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -7138,6 +7151,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await
             .task_id
@@ -7157,6 +7171,7 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await
             .task_id
