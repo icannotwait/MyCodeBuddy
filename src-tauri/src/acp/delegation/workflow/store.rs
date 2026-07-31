@@ -1079,6 +1079,13 @@ async fn publish_in_txn(
             .as_deref()
             .is_some_and(|id| id == by_token.workflow_id);
         if !is_explicit_update {
+            if normalized.workflow_id.is_some() {
+                if let Some(binding) =
+                    retired_reactivation_candidate(txn, &by_token.workflow_id, normalized).await?
+                {
+                    return Err(binding_identity_conflict(&binding));
+                }
+            }
             // Create / bare replay with different digest → B8 mismatch.
             return Err(WorkflowStoreError::PublicationTokenMismatch {
                 publication_token: normalized.publication_token.clone(),
@@ -1213,6 +1220,30 @@ async fn publish_in_txn(
     }
     let workflow_state = manifest_state_to_db(effective_state);
 
+    let existing_bindings = if prior_header.is_some() {
+        delegation_workflow_node_binding::Entity::find()
+            .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id.clone()))
+            .all(txn)
+            .await
+            .map_err(db_err)?
+    } else {
+        Vec::new()
+    };
+
+    let has_run_bindings = if prior_header.is_some() {
+        load_observed_node_ids(txn, &workflow_id).await?
+    } else {
+        HashSet::new()
+    };
+
+    let binding_diff = plan_binding_diff(
+        &workflow_id,
+        normalized,
+        prior_normalized.as_ref(),
+        &existing_bindings,
+        &has_run_bindings,
+    )?;
+
     // Header first so child FK rows can land in the same transaction.
     if let Some(prior) = prior_header.clone() {
         let mut am: delegation_workflow::ActiveModel = prior.into();
@@ -1245,33 +1276,7 @@ async fn publish_in_txn(
         }
     }
 
-    let existing_bindings = if prior_header.is_some() {
-        delegation_workflow_node_binding::Entity::find()
-            .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id.clone()))
-            .all(txn)
-            .await
-            .map_err(db_err)?
-    } else {
-        Vec::new()
-    };
-
-    let has_run_bindings = if prior_header.is_some() {
-        load_observed_node_ids(txn, &workflow_id).await?
-    } else {
-        HashSet::new()
-    };
-
-    apply_binding_diff(
-        txn,
-        &workflow_id,
-        next_manifest_rev,
-        normalized,
-        prior_normalized.as_ref(),
-        &existing_bindings,
-        &has_run_bindings,
-        now,
-    )
-    .await?;
+    apply_binding_diff(txn, next_manifest_rev, binding_diff, now).await?;
 
     let rev_row = delegation_workflow_manifest_revision::ActiveModel {
         workflow_id: Set(workflow_id.clone()),
@@ -1626,20 +1631,65 @@ fn frozen_cohort_error(task_index: i64) -> WorkflowStoreError {
     }
 }
 
-/// Apply node-binding create / retain / freeze rules for a publish.
-#[allow(clippy::too_many_arguments)]
-async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
+async fn retired_reactivation_candidate<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
-    next_revision: i64,
+    normalized: &NormalizedManifest,
+) -> Result<Option<delegation_workflow_node_binding::Model>, WorkflowStoreError> {
+    let bindings = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id.to_string()))
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    Ok(bindings.into_iter().find(|binding| {
+        binding.retired_revision.is_some()
+            && normalized.nodes.iter().any(|node| {
+                node.kind == ManifestNodeKind::WorkUnit
+                    && (node.id == binding.node_id
+                        || node.work_unit_key.as_ref() == Some(&binding.work_unit_key))
+            })
+    }))
+}
+
+enum BindingDiffAction {
+    Reactivate {
+        binding: delegation_workflow_node_binding::Model,
+    },
+    Retire {
+        binding: delegation_workflow_node_binding::Model,
+        retained_observed: bool,
+    },
+    Retain {
+        binding: delegation_workflow_node_binding::Model,
+        node: NormalizedNode,
+        is_admitted: bool,
+        freeze_cohort: bool,
+    },
+    Insert {
+        node: NormalizedNode,
+        freeze_cohort: bool,
+    },
+}
+
+struct BindingDiffPlan {
+    workflow_id: String,
+    actions: Vec<BindingDiffAction>,
+}
+
+/// Validate every binding lifecycle decision without performing a write.
+fn plan_binding_diff(
+    workflow_id: &str,
     normalized: &NormalizedManifest,
     prior_normalized: Option<&NormalizedManifest>,
     existing: &[delegation_workflow_node_binding::Model],
     nodes_with_runs: &HashSet<String>,
-    now: chrono::DateTime<Utc>,
-) -> Result<(), WorkflowStoreError> {
+) -> Result<BindingDiffPlan, WorkflowStoreError> {
     let existing_by_id: HashMap<&str, &delegation_workflow_node_binding::Model> =
         existing.iter().map(|b| (b.node_id.as_str(), b)).collect();
+    let existing_by_key: HashMap<&str, &delegation_workflow_node_binding::Model> = existing
+        .iter()
+        .map(|binding| (binding.work_unit_key.as_str(), binding))
+        .collect();
 
     let new_work_units: Vec<&NormalizedNode> = normalized
         .nodes
@@ -1700,6 +1750,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         frozen_routes.insert(task_index, route);
     }
 
+    let mut actions = Vec::with_capacity(existing.len() + new_work_units.len());
     for binding in existing {
         if binding.workflow_id != workflow_id {
             return Err(binding_identity_conflict(binding));
@@ -1707,29 +1758,52 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         let next_node = new_by_id.get(binding.node_id.as_str()).copied();
         match (binding.retired_revision.is_some(), next_node) {
             (true, None) => continue,
-            (true, Some(node)) => reactivate_exact_identity(conn, binding, node, now).await?,
+            (true, Some(node)) => {
+                require_exact_binding_identity(workflow_id, binding, node)?;
+                actions.push(BindingDiffAction::Reactivate {
+                    binding: binding.clone(),
+                });
+            }
             (false, None) => {
-                retire_active_binding_if_legal(
-                    conn,
-                    binding,
-                    next_revision,
-                    normalized,
-                    nodes_with_runs,
-                    now,
-                )
-                .await?
+                let is_admitted = binding.is_observed || nodes_with_runs.contains(&binding.node_id);
+                let binding_protected = binding.cohort_frozen
+                    || binding.is_observed
+                    || binding.retained_observed
+                    || nodes_with_runs.contains(&binding.node_id);
+                if binding_protected && !is_canceled_drop(normalized, binding) {
+                    return Err(WorkflowStoreError::CohortFrozen {
+                        node_id: binding.node_id.clone(),
+                    });
+                }
+                actions.push(BindingDiffAction::Retire {
+                    binding: binding.clone(),
+                    retained_observed: binding.retained_observed
+                        || is_admitted
+                        || binding.cohort_frozen,
+                });
             }
             (false, Some(node)) => {
-                retain_active_binding(
-                    conn,
-                    workflow_id,
-                    binding,
-                    node,
-                    nodes_with_runs,
-                    &frozen_routes,
-                    now,
-                )
-                .await?
+                let is_admitted = binding.is_observed || nodes_with_runs.contains(&node.id);
+                let identity_changed = !binding_identity_matches(workflow_id, binding, node);
+                let freeze_cohort = node.task_index.is_some_and(|task_index| {
+                    frozen_routes
+                        .get(&i64::from(task_index))
+                        .is_some_and(|route| route.contains(&node.id))
+                });
+                if freeze_cohort && identity_changed {
+                    return Err(frozen_cohort_error(i64::from(
+                        node.task_index.expect("frozen cohort Task index"),
+                    )));
+                }
+                if is_admitted && identity_changed {
+                    return Err(binding_identity_conflict(binding));
+                }
+                actions.push(BindingDiffAction::Retain {
+                    binding: binding.clone(),
+                    node: node.clone(),
+                    is_admitted,
+                    freeze_cohort,
+                });
             }
         }
     }
@@ -1738,41 +1812,25 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         if existing_by_id.contains_key(node.id.as_str()) {
             continue;
         }
-        let key = node.work_unit_key.as_ref().expect("work unit key");
-        let role = role_str(node.role.expect("work unit role"));
-        let agent = node.agent_type.as_ref().expect("agent").clone();
-        let phase = node.phase_id.as_ref().expect("phase").clone();
-        let outcome = node.node_outcome.map(|o| match o {
-            ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
-        });
+        let key = node.work_unit_key.as_deref().expect("work unit key");
+        if let Some(binding) = existing_by_key.get(key) {
+            return Err(binding_identity_conflict(binding));
+        }
         let freeze_cohort = node.task_index.is_some_and(|task_index| {
             frozen_routes
                 .get(&(task_index as i64))
                 .is_some_and(|route| route.contains(&node.id))
         });
-
-        let row = delegation_workflow_node_binding::ActiveModel {
-            workflow_id: Set(workflow_id.to_string()),
-            node_id: Set(node.id.clone()),
-            work_unit_key: Set(key.clone()),
-            role: Set(role.into()),
-            agent_type: Set(agent),
-            profile_id: Set(node.profile_id.clone()),
-            phase_id: Set(phase),
-            task_index: Set(node.task_index.map(|i| i as i64)),
-            introduced_revision: Set(next_revision),
-            retired_revision: Set(None),
-            is_observed: Set(false),
-            retained_observed: Set(false),
-            cohort_frozen: Set(freeze_cohort),
-            node_outcome: Set(outcome),
-            created_at: Set(now),
-            updated_at: Set(now),
-        };
-        row.insert(conn).await.map_err(db_err)?;
+        actions.push(BindingDiffAction::Insert {
+            node: node.clone(),
+            freeze_cohort,
+        });
     }
 
-    Ok(())
+    Ok(BindingDiffPlan {
+        workflow_id: workflow_id.to_string(),
+        actions,
+    })
 }
 
 fn binding_identity_matches(
@@ -1808,95 +1866,88 @@ fn require_exact_binding_identity(
         .ok_or_else(|| binding_identity_conflict(binding))
 }
 
-async fn reactivate_exact_identity<C: sea_orm::ConnectionTrait>(
+/// Apply a preflighted binding plan. No lifecycle validation belongs here.
+async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
     conn: &C,
-    binding: &delegation_workflow_node_binding::Model,
-    node: &NormalizedNode,
-    now: chrono::DateTime<Utc>,
-) -> Result<(), WorkflowStoreError> {
-    require_exact_binding_identity(&binding.workflow_id, binding, node)?;
-    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
-    active.retired_revision = Set(None);
-    active.updated_at = Set(now);
-    active.update(conn).await.map_err(db_err)?;
-    Ok(())
-}
-
-async fn retire_active_binding_if_legal<C: sea_orm::ConnectionTrait>(
-    conn: &C,
-    binding: &delegation_workflow_node_binding::Model,
     next_revision: i64,
-    normalized: &NormalizedManifest,
-    nodes_with_runs: &HashSet<String>,
+    plan: BindingDiffPlan,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), WorkflowStoreError> {
-    let is_admitted = binding.is_observed || nodes_with_runs.contains(&binding.node_id);
-    let binding_protected = binding.cohort_frozen
-        || binding.is_observed
-        || binding.retained_observed
-        || nodes_with_runs.contains(&binding.node_id);
-    if binding_protected && !is_canceled_drop(normalized, binding) {
-        return Err(WorkflowStoreError::CohortFrozen {
-            node_id: binding.node_id.clone(),
-        });
+    for action in plan.actions {
+        match action {
+            BindingDiffAction::Reactivate { binding } => {
+                let mut active: delegation_workflow_node_binding::ActiveModel = binding.into();
+                active.retired_revision = Set(None);
+                active.updated_at = Set(now);
+                active.update(conn).await.map_err(db_err)?;
+            }
+            BindingDiffAction::Retire {
+                binding,
+                retained_observed,
+            } => {
+                let mut active: delegation_workflow_node_binding::ActiveModel = binding.into();
+                active.retired_revision = Set(Some(next_revision));
+                active.retained_observed = Set(retained_observed);
+                active.updated_at = Set(now);
+                active.update(conn).await.map_err(db_err)?;
+            }
+            BindingDiffAction::Retain {
+                binding,
+                node,
+                is_admitted,
+                freeze_cohort,
+            } => {
+                let mut active: delegation_workflow_node_binding::ActiveModel = binding.into();
+                if !is_admitted {
+                    active.work_unit_key = Set(node.work_unit_key.expect("work unit key"));
+                    active.role = Set(role_str(node.role.expect("work unit role")).into());
+                    active.agent_type = Set(node.agent_type.expect("agent"));
+                    active.profile_id = Set(node.profile_id);
+                    active.phase_id = Set(node.phase_id.expect("phase"));
+                    active.task_index = Set(node.task_index.map(i64::from));
+                }
+                if freeze_cohort {
+                    active.cohort_frozen = Set(true);
+                }
+                if let Some(outcome) = node.node_outcome {
+                    active.node_outcome = Set(Some(match outcome {
+                        ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
+                    }));
+                }
+                active.updated_at = Set(now);
+                active.update(conn).await.map_err(db_err)?;
+            }
+            BindingDiffAction::Insert {
+                node,
+                freeze_cohort,
+            } => {
+                let outcome = node.node_outcome.map(|outcome| match outcome {
+                    ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
+                });
+                delegation_workflow_node_binding::ActiveModel {
+                    workflow_id: Set(plan.workflow_id.clone()),
+                    node_id: Set(node.id),
+                    work_unit_key: Set(node.work_unit_key.expect("work unit key")),
+                    role: Set(role_str(node.role.expect("work unit role")).into()),
+                    agent_type: Set(node.agent_type.expect("agent")),
+                    profile_id: Set(node.profile_id),
+                    phase_id: Set(node.phase_id.expect("phase")),
+                    task_index: Set(node.task_index.map(i64::from)),
+                    introduced_revision: Set(next_revision),
+                    retired_revision: Set(None),
+                    is_observed: Set(false),
+                    retained_observed: Set(false),
+                    cohort_frozen: Set(freeze_cohort),
+                    node_outcome: Set(outcome),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(conn)
+                .await
+                .map_err(db_err)?;
+            }
+        }
     }
-
-    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
-    active.retired_revision = Set(Some(next_revision));
-    active.retained_observed =
-        Set(binding.retained_observed || is_admitted || binding.cohort_frozen);
-    active.updated_at = Set(now);
-    active.update(conn).await.map_err(db_err)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn retain_active_binding<C: sea_orm::ConnectionTrait>(
-    conn: &C,
-    workflow_id: &str,
-    binding: &delegation_workflow_node_binding::Model,
-    node: &NormalizedNode,
-    nodes_with_runs: &HashSet<String>,
-    frozen_routes: &HashMap<i64, HashSet<String>>,
-    now: chrono::DateTime<Utc>,
-) -> Result<(), WorkflowStoreError> {
-    let is_admitted = binding.is_observed || nodes_with_runs.contains(&node.id);
-    let identity_changed = !binding_identity_matches(workflow_id, binding, node);
-    let freeze_cohort = node.task_index.is_some_and(|task_index| {
-        frozen_routes
-            .get(&i64::from(task_index))
-            .is_some_and(|route| route.contains(&node.id))
-    });
-    if freeze_cohort && identity_changed {
-        return Err(frozen_cohort_error(i64::from(
-            node.task_index.expect("frozen cohort Task index"),
-        )));
-    }
-    if is_admitted && identity_changed {
-        return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
-            node_id: node.id.clone(),
-        });
-    }
-
-    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
-    if !is_admitted {
-        active.work_unit_key = Set(node.work_unit_key.clone().expect("work unit key"));
-        active.role = Set(role_str(node.role.expect("work unit role")).into());
-        active.agent_type = Set(node.agent_type.clone().expect("agent"));
-        active.profile_id = Set(node.profile_id.clone());
-        active.phase_id = Set(node.phase_id.clone().expect("phase"));
-        active.task_index = Set(node.task_index.map(i64::from));
-    }
-    if freeze_cohort {
-        active.cohort_frozen = Set(true);
-    }
-    if let Some(outcome) = node.node_outcome {
-        active.node_outcome = Set(Some(match outcome {
-            ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
-        }));
-    }
-    active.updated_at = Set(now);
-    active.update(conn).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -8392,6 +8443,59 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn frozen_cohort_rejection_preflights_before_header_update() {
+            use sea_orm::ConnectionTrait;
+
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("frozen-preflight-order");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            freeze_task_cohort(&db, &initial.workflow_id).await;
+
+            db.conn
+                .execute_unprepared(
+                    "CREATE TRIGGER reject_workflow_header_update \
+                     BEFORE UPDATE ON delegation_workflows \
+                     BEGIN SELECT RAISE(ABORT, 'header update reached'); END",
+                )
+                .await
+                .unwrap();
+
+            let mut invalid = source;
+            update_doc(
+                &mut invalid,
+                &initial.workflow_id,
+                1,
+                "sha256:frozen-preflight-order-invalid",
+            );
+            let node = invalid
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "task-1-impl")
+                .unwrap();
+            let profile = "preflight-order-profile";
+            node.profile_id = Some(profile.into());
+            node.work_unit_key = Some(
+                build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                    task_index: 1,
+                    agent_type: node.agent_type.as_deref().unwrap(),
+                    profile_id: Some(profile),
+                })
+                .unwrap(),
+            );
+
+            assert_eq!(
+                publish(&db, &emitter, parent, invalid).await.unwrap_err(),
+                WorkflowStoreError::CohortFrozen {
+                    node_id: "Task 1".into()
+                },
+                "frozen validation must reject before the header UPDATE trigger fires"
+            );
+        }
+
+        #[tokio::test]
         async fn retired_omitted_binding_is_a_byte_stable_noop_across_republish() {
             let (db, parent) = seed_parent().await;
             let (emitter, _) = emitter_with_rx();
@@ -8433,16 +8537,31 @@ mod tests {
 
         #[tokio::test]
         async fn retired_present_binding_reactivates_only_exact_identity() {
-            let (db, parent) = seed_parent().await;
-            let (emitter, _) = emitter_with_rx();
-            let source = design_plan_doc("retired-exact-reactivation");
-            let initial = publish(&db, &emitter, parent, source.clone())
-                .await
-                .unwrap();
-            let mut retired_doc =
-                retire_final_fixer(&db, &emitter, parent, &initial.workflow_id, &source).await;
+            async fn retired_fixture(
+                token: &str,
+            ) -> (
+                AppDatabase,
+                i32,
+                EventEmitter,
+                PublishResult,
+                ManifestDocument,
+                ManifestDocument,
+            ) {
+                let (db, parent) = seed_parent().await;
+                let (emitter, _) = emitter_with_rx();
+                let source = design_plan_doc(token);
+                let initial = publish(&db, &emitter, parent, source.clone())
+                    .await
+                    .unwrap();
+                let retired_doc =
+                    retire_final_fixer(&db, &emitter, parent, &initial.workflow_id, &source).await;
+                (db, parent, emitter, initial, source, retired_doc)
+            }
+
+            let (db, parent, emitter, initial, source, mut exact_doc) =
+                retired_fixture("retired-exact-reactivation").await;
             let retired = binding(&db, &initial.workflow_id, "final-fixer").await;
-            retired_doc.nodes.push(
+            exact_doc.nodes.push(
                 source
                     .nodes
                     .iter()
@@ -8451,47 +8570,20 @@ mod tests {
                     .clone(),
             );
             update_doc(
-                &mut retired_doc,
+                &mut exact_doc,
                 &initial.workflow_id,
                 2,
                 "sha256:exact-reactivation",
             );
-            publish(&db, &emitter, parent, retired_doc.clone())
-                .await
-                .unwrap();
+            publish(&db, &emitter, parent, exact_doc).await.unwrap();
             let reactivated = binding(&db, &initial.workflow_id, "final-fixer").await;
-            let mut expected = retired.clone();
+            let mut expected = retired;
             expected.retired_revision = None;
             expected.updated_at = reactivated.updated_at;
             assert_eq!(reactivated, expected, "only retirement state may clear");
 
-            let mut active: delegation_workflow_node_binding::ActiveModel = reactivated.into();
-            active.retired_revision = Set(Some(4));
-            active.update(&db.conn).await.unwrap();
-            let retired = binding(&db, &initial.workflow_id, "final-fixer").await;
-            let normalized = validate_manifest_document(&retired_doc).unwrap();
-            let exact = normalized
-                .nodes
-                .iter()
-                .find(|node| node.id == "final-fixer")
-                .unwrap()
-                .clone();
-            let mut wrong_workflow = retired.clone();
-            wrong_workflow.workflow_id = "different-workflow".into();
-            assert_eq!(
-                require_exact_binding_identity(&initial.workflow_id, &wrong_workflow, &exact)
-                    .unwrap_err(),
-                WorkflowStoreError::AdmittedNodeIdentityMutation {
-                    node_id: retired.node_id.clone()
-                },
-                "exact identity-conflict error for workflow_id"
-            );
-            assert_eq!(
-                binding(&db, &initial.workflow_id, "final-fixer").await,
-                retired
-            );
-            let mut mutations = Vec::new();
             for field in [
+                "workflow_id",
                 "node_id",
                 "work_unit_key",
                 "role",
@@ -8500,33 +8592,60 @@ mod tests {
                 "phase_id",
                 "task_index",
             ] {
-                let mut node = exact.clone();
-                match field {
-                    "node_id" => node.id = "different-node".into(),
-                    "work_unit_key" => node.work_unit_key = Some("different-key".into()),
-                    "role" => node.role = Some(ManifestNodeRole::Reviewer),
-                    "agent_type" => node.agent_type = Some("codex".into()),
-                    "profile_id" => node.profile_id = Some("different-profile".into()),
-                    "phase_id" => node.phase_id = Some(PHASE_PLAN.into()),
-                    "task_index" => node.task_index = Some(1),
-                    _ => unreachable!(),
+                let token = format!("retired-identity-conflict-{field}");
+                let (db, parent, emitter, initial, source, mut candidate) =
+                    retired_fixture(&token).await;
+                candidate.nodes.push(
+                    source
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == "final-fixer")
+                        .unwrap()
+                        .clone(),
+                );
+                update_doc(
+                    &mut candidate,
+                    &initial.workflow_id,
+                    2,
+                    &format!("sha256:identity-conflict-{field}"),
+                );
+
+                if field == "workflow_id" {
+                    candidate.workflow_id = Some("different-workflow".into());
+                } else if field == "node_id" {
+                    candidate
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.id == "final-fixer")
+                        .unwrap()
+                        .id = "different-final-fixer".into();
+                } else {
+                    let row = binding(&db, &initial.workflow_id, "final-fixer").await;
+                    let mut active: delegation_workflow_node_binding::ActiveModel = row.into();
+                    match field {
+                        "work_unit_key" => active.work_unit_key = Set("different-key".into()),
+                        "role" => active.role = Set("reviewer".into()),
+                        "agent_type" => active.agent_type = Set("codex".into()),
+                        "profile_id" => active.profile_id = Set(Some("different-profile".into())),
+                        "phase_id" => active.phase_id = Set(PHASE_PLAN.into()),
+                        "task_index" => active.task_index = Set(Some(1)),
+                        _ => unreachable!(),
+                    }
+                    active.update(&db.conn).await.unwrap();
                 }
-                mutations.push((field, node));
-            }
-            for (field, node) in mutations {
-                let error = reactivate_exact_identity(&db.conn, &retired, &node, Utc::now())
-                    .await
-                    .unwrap_err();
+
+                let snapshot = binding(&db, &initial.workflow_id, "final-fixer").await;
                 assert_eq!(
-                    error,
+                    publish(&db, &emitter, parent, candidate).await.unwrap_err(),
                     WorkflowStoreError::AdmittedNodeIdentityMutation {
-                        node_id: retired.node_id.clone()
+                        node_id: snapshot.node_id.clone()
                     },
-                    "exact identity-conflict error for {field}"
+                    "real publication must return the exact identity conflict for {field}"
                 );
                 assert_eq!(
                     binding(&db, &initial.workflow_id, "final-fixer").await,
-                    retired
+                    snapshot,
+                    "failed {field} publication must not change the retired row"
                 );
             }
         }
