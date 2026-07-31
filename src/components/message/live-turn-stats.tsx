@@ -16,10 +16,17 @@ import { FilePenLine, Timer, Wrench } from "lucide-react"
 import type { AgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
 
+export type LiveTurnStatusMode = "auto" | "waiting_for_subagents"
+
 interface LiveTurnStatsProps {
   message: LiveMessage
   agentType: AgentType
   isStreaming?: boolean
+  /**
+   * `waiting_for_subagents` replaces the thinking/streaming label while keeping
+   * the same elapsed / edit / tool-call layout for the bottom banner.
+   */
+  statusMode?: LiveTurnStatusMode
 }
 
 interface LineChangeStats {
@@ -310,6 +317,7 @@ export function LiveTurnStats({
   message,
   agentType,
   isStreaming = true,
+  statusMode = "auto",
 }: LiveTurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.liveTurnStats")
@@ -346,25 +354,33 @@ export function LiveTurnStats({
   // Only active streams should show thinking/streaming state.
   const lastBlock = message.content[message.content.length - 1]
   const isThinking =
+    statusMode === "auto" &&
     isStreaming &&
     hasThinkingBlock &&
     message.content.length <= 1 &&
     lastBlock?.type === "thinking"
 
+  const statusLabel =
+    statusMode === "waiting_for_subagents"
+      ? t("waitingForSubagents")
+      : isThinking
+        ? t("thinking")
+        : t("streaming")
+
   const elapsedLabel = formatElapsedLabel(elapsed, t)
 
   return (
-    <div className="@container/turnstats shrink-0">
+    <div
+      className="@container/turnstats shrink-0"
+      data-testid="live-turn-stats"
+      data-status-mode={statusMode}
+    >
       <div className="flex min-h-8 flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1 text-xs leading-none text-muted-foreground">
         <AgentIcon
           agentType={agentType}
           className="h-3.5 w-3.5 animate-pulse"
         />
-        {isThinking ? (
-          <span>{t("thinking")}</span>
-        ) : (
-          <span>{t("streaming")}</span>
-        )}
+        <span data-testid="live-turn-stats-status">{statusLabel}</span>
         <span className="text-border leading-none">|</span>
         <span className="inline-flex items-center gap-1 leading-none">
           <Timer className="h-3 w-3 shrink-0" />

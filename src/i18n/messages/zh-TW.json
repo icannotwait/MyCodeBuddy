@@ -2732,11 +2732,13 @@
         "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息",
         "showMore": "展開",
         "showLess": "收合",
-        "responseInterrupted": "回應已中斷"
+        "responseInterrupted": "回應已中斷",
+        "waitingForSubagents": "等待子任務中…"
       },
       "liveTurnStats": {
         "thinking": "思考中...",
         "streaming": "生成中",
+        "waitingForSubagents": "等待子任務中…",
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",

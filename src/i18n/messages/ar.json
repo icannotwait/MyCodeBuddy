@@ -2732,11 +2732,13 @@
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
         "showLess": "طي",
-        "responseInterrupted": "تمت مقاطعة الاستجابة"
+        "responseInterrupted": "تمت مقاطعة الاستجابة",
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…"
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",
         "streaming": "جارٍ البث",
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…",
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",

@@ -2732,11 +2732,13 @@
         "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
         "showMore": "もっと見る",
         "showLess": "折りたたむ",
-        "responseInterrupted": "応答が中断されました"
+        "responseInterrupted": "応答が中断されました",
+        "waitingForSubagents": "サブエージェントを待機中…"
       },
       "liveTurnStats": {
         "thinking": "考え中...",
         "streaming": "ストリーミング中",
+        "waitingForSubagents": "サブエージェントを待機中…",
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",

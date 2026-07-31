@@ -121,7 +121,7 @@ function visibleStatusTaskIds(messages: readonly AdaptedMessage[]): string[] {
 }
 
 describe("projectDelegationTranscript", () => {
-  it("projects a 2075-like history to one work-unit card and one residual row", () => {
+  it("projects a multi-turn history to one card per run and one residual row", () => {
     const messages = [
       assistant("1", delegate("tool-1", "run-1", "unit-a")),
       assistant(
@@ -153,16 +153,25 @@ describe("projectDelegationTranscript", () => {
 
     const projected = projectDelegationTranscript(messages, 2075)
 
-    expect(workUnits(projected.messages)).toHaveLength(1)
-    expect(workUnits(projected.messages)[0]).toMatchObject({
-      key: "wu:unit-a",
-      explicitUserCancel: false,
-    })
+    expect(workUnits(projected.messages)).toHaveLength(2)
+    expect(workUnits(projected.messages).map((unit) => unit.key)).toEqual([
+      "wu:unit-a:run-1",
+      "wu:unit-a:run-2",
+    ])
     expect(
-      workUnits(projected.messages)[0].sources.map(
-        (source) => source.toolCallId
+      workUnits(projected.messages).map((unit) =>
+        unit.sources.map((source) => source.toolCallId)
       )
-    ).toEqual(["tool-1", "tool-2"])
+    ).toEqual([["tool-1"], ["tool-2"]])
+    // Each card sits at its original turn position (not collapsed to the first).
+    expect(projected.messages[0].content[0]).toMatchObject({
+      type: "delegation-work-unit",
+      key: "wu:unit-a:run-1",
+    })
+    expect(projected.messages[3].content[0]).toMatchObject({
+      type: "delegation-work-unit",
+      key: "wu:unit-a:run-2",
+    })
     expect(
       allParts(projected.messages)
         .filter((part) => part.type === "text")
@@ -200,13 +209,13 @@ describe("projectDelegationTranscript", () => {
     )
 
     expect(workUnits(projected.messages).map((unit) => unit.key)).toEqual([
-      "wu:unit-a",
-      "wu:unit-b",
+      "wu:unit-a:run-a",
+      "wu:unit-b:run-b",
     ])
     expect(visibleStatusTaskIds(projected.messages)).toEqual([])
   })
 
-  it("resolves out-of-order task linkage while preserving source order", () => {
+  it("resolves out-of-order task linkage while keeping one card per run", () => {
     const projected = projectDelegationTranscript(
       [
         assistant(
@@ -221,12 +230,15 @@ describe("projectDelegationTranscript", () => {
       2075
     )
 
-    expect(workUnits(projected.messages)).toHaveLength(1)
+    expect(workUnits(projected.messages)).toHaveLength(2)
     expect(
-      workUnits(projected.messages)[0].sources.map(
-        (source) => source.toolCallId
+      workUnits(projected.messages).map((unit) =>
+        unit.sources.map((source) => source.toolCallId)
       )
-    ).toEqual(["continue", "initial"])
+    ).toEqual([["continue"], ["initial"]])
+    // Status folding still knows both task ids belong to the linked unit.
+    expect(projected.identityIndex.knownTaskIds.has("run-1")).toBe(true)
+    expect(projected.identityIndex.knownTaskIds.has("run-2")).toBe(true)
   })
 
   it("retains wholly unmapped status groups by reference", () => {
@@ -346,7 +358,7 @@ describe("shouldFoldLiveDelegationTool", () => {
     ).toBe(false)
   })
 
-  it("folds a linked continuation but not an identity-free initial dispatch", () => {
+  it("never folds live delegate/continue tool calls into historical cards", () => {
     const continuation = delegate("continue", "run-2", null, {
       toolName: "continue_delegation",
       targetTaskId: "run-1",
@@ -356,7 +368,7 @@ describe("shouldFoldLiveDelegationTool", () => {
 
     expect(
       shouldFoldLiveDelegationTool(continuation, projected.identityIndex, 2075)
-    ).toBe(true)
+    ).toBe(false)
     expect(
       shouldFoldLiveDelegationTool(initial, projected.identityIndex, 2075)
     ).toBe(false)

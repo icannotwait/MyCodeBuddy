@@ -196,7 +196,20 @@ vi.mock("./content-parts-renderer", () => ({
 }))
 
 vi.mock("./live-turn-stats", () => ({
-  LiveTurnStats: () => <div data-testid="live-turn-stats" />,
+  LiveTurnStats: (props: {
+    statusMode?: string
+    message?: { content?: unknown[] }
+  }) => (
+    <div
+      data-testid="live-turn-stats"
+      data-status-mode={props.statusMode ?? "auto"}
+      data-tool-count={
+        props.message?.content?.filter(
+          (b: { type?: string }) => b.type === "tool_call"
+        ).length ?? 0
+      }
+    />
+  ),
 }))
 
 vi.mock("./turn-stats", () => ({
@@ -666,23 +679,31 @@ function enableIncremental() {
   })
 }
 
-function messageListUi(isDelegatedChild = false) {
+function messageListUi(options?: {
+  waitingForSubagentsArmedAtMs?: number | null
+  connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
+}) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
         conversationId={CID}
         agentType="codex"
-        connStatus="prompting"
+        connStatus={options?.connStatus ?? "prompting"}
         isActive
         showMessageNav={false}
-        isDelegatedChild={isDelegatedChild}
+        waitingForSubagentsArmedAtMs={
+          options?.waitingForSubagentsArmedAtMs ?? null
+        }
       />
     </NextIntlClientProvider>
   )
 }
 
-function renderMessageList(isDelegatedChild = false) {
-  return render(messageListUi(isDelegatedChild))
+function renderMessageList(options?: {
+  waitingForSubagentsArmedAtMs?: number | null
+  connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
+}) {
+  return render(messageListUi(options))
 }
 
 function assistantTexts(): string[] {
@@ -1115,7 +1136,7 @@ describe("MessageListView delegation work-unit projection", () => {
     __resetStreamingPerformanceConfigForTests()
   })
 
-  it("renders one historical card and one residual status row across continuations", () => {
+  it("renders one historical card per turn and one residual status row", () => {
     seedHistory([
       userTurn("u1", "start"),
       workUnitRunTurn("a1", "tool-1", "run-1"),
@@ -1131,15 +1152,12 @@ describe("MessageListView delegation work-unit projection", () => {
 
     renderMessageList()
 
-    expect(screen.getAllByTestId("delegation-work-unit")).toHaveLength(1)
-    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
-      "data-work-unit-key",
-      "wu:unit-a"
-    )
-    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
-      "data-source-count",
-      "2"
-    )
+    const cards = screen.getAllByTestId("delegation-work-unit")
+    expect(cards).toHaveLength(2)
+    expect(cards[0]).toHaveAttribute("data-work-unit-key", "wu:unit-a:run-1")
+    expect(cards[0]).toHaveAttribute("data-source-count", "1")
+    expect(cards[1]).toHaveAttribute("data-work-unit-key", "wu:unit-a:run-2")
+    expect(cards[1]).toHaveAttribute("data-source-count", "1")
     expect(screen.getByText("checkpoint explanation")).toBeInTheDocument()
     expect(screen.getByText("still working")).toBeInTheDocument()
     expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
@@ -1153,7 +1171,7 @@ describe("MessageListView delegation work-unit projection", () => {
     ).toEqual(["tool-1", "tool-2"])
   })
 
-  it("projects a 2075-like persisted session to one card per work unit", () => {
+  it("projects a multi-turn persisted session to one card per run", () => {
     const checkpoints = [
       "checkpoint 01",
       "checkpoint 02",
@@ -1226,16 +1244,28 @@ describe("MessageListView delegation work-unit projection", () => {
     renderMessageList()
 
     const cards = screen.getAllByTestId("delegation-work-unit")
-    expect(cards).toHaveLength(2)
-    const unitA = cards.find(
-      (card) => card.getAttribute("data-work-unit-key") === "wu:unit-a"
+    // unit-a: gen1 + gen2 + gen3 + terminal gen4; unit-b: gen1
+    expect(cards).toHaveLength(5)
+    const unitAKeys = cards
+      .map((card) => card.getAttribute("data-work-unit-key") ?? "")
+      .filter((key) => key.startsWith("wu:unit-a:"))
+    const unitBKeys = cards
+      .map((card) => card.getAttribute("data-work-unit-key") ?? "")
+      .filter((key) => key.startsWith("wu:unit-b:"))
+    expect(unitAKeys).toEqual([
+      "wu:unit-a:run-a-1",
+      "wu:unit-a:run-a-2",
+      "wu:unit-a:run-a-3",
+      "wu:unit-a:run-a-4",
+    ])
+    expect(unitBKeys).toEqual(["wu:unit-b:run-b-1"])
+    for (const card of cards) {
+      expect(card).toHaveAttribute("data-source-count", "1")
+    }
+    const terminalA = cards.find(
+      (card) => card.getAttribute("data-work-unit-key") === "wu:unit-a:run-a-4"
     )
-    const unitB = cards.find(
-      (card) => card.getAttribute("data-work-unit-key") === "wu:unit-b"
-    )
-    expect(unitA).toHaveAttribute("data-source-count", "4")
-    expect(unitA).toHaveAttribute("data-latest-status", "completed")
-    expect(unitB).toHaveAttribute("data-source-count", "1")
+    expect(terminalA).toHaveAttribute("data-latest-status", "completed")
     expect(screen.getAllByTestId("delegation-status-residual")).toHaveLength(1)
     expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
       "data-visible-task-ids",
@@ -1248,7 +1278,7 @@ describe("MessageListView delegation work-unit projection", () => {
   })
 })
 
-describe("MessageListView delegated interruption marker", () => {
+describe("MessageListView interruption marker", () => {
   beforeEach(() => {
     resetConversationRuntimeStore()
     __resetLiveTranscriptStoreForTests()
@@ -1263,14 +1293,106 @@ describe("MessageListView delegated interruption marker", () => {
     __resetStreamingPerformanceConfigForTests()
   })
 
-  it("hides the exact historical marker only for delegated children", () => {
-    const { rerender } = renderMessageList(true)
+  it("hides the exact historical marker on parent and child sessions", () => {
+    renderMessageList()
     expect(
       screen.queryByText(/Conversation interrupted/)
     ).not.toBeInTheDocument()
+  })
+})
 
-    rerender(messageListUi(false))
-    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
+describe("MessageListView waiting-for-subagents bottom banner", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    enableIncremental()
+    seedHistory([
+      {
+        id: "u1",
+        role: "user",
+        blocks: [{ type: "text", text: "delegate work" }],
+        timestamp: "2026-05-28T00:00:00.000Z",
+      },
+      assistantTurn("a1", "delegated; waiting"),
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("shows LiveTurnStats with waiting status when continuation owns admission", () => {
+    renderMessageList({
+      waitingForSubagentsArmedAtMs: Date.parse("2026-05-28T00:00:00.000Z"),
+      connStatus: "connected",
+    })
+    const banner = screen.getByTestId("live-turn-stats")
+    expect(banner).toBeInTheDocument()
+    expect(banner).toHaveAttribute("data-status-mode", "waiting_for_subagents")
+  })
+
+  it("hides the banner when not waiting and not streaming", () => {
+    renderMessageList({
+      waitingForSubagentsArmedAtMs: null,
+      connStatus: "connected",
+    })
+    expect(screen.queryByTestId("live-turn-stats")).not.toBeInTheDocument()
+  })
+
+  it("latches pre-suspend live tools into the waiting banner", () => {
+    const live: LiveMessage = {
+      id: "lm-1",
+      role: "assistant",
+      content: [
+        { type: "text", text: "delegating" },
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "tc-1",
+            title: "delegate_to_agent",
+            kind: "other",
+            status: "completed",
+            content: null,
+            raw_input: "{}",
+            raw_output_chunks: [],
+            raw_output_total_bytes: 0,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt: 1_700_000_000_000,
+    }
+    liveTranscriptStore.rebuild(CID, "c1", live, 1)
+    useConversationRuntimeStore.getState().actions.setLiveMessage(CID, live, true)
+
+    const { rerender } = renderMessageList({
+      waitingForSubagentsArmedAtMs: null,
+      connStatus: "prompting",
+    })
+    expect(screen.getByTestId("live-turn-stats")).toHaveAttribute(
+      "data-status-mode",
+      "auto"
+    )
+
+    // Clear live stream (suspend) but keep waiting banner.
+    liveTranscriptStore.remove(CID)
+    useConversationRuntimeStore.getState().actions.setLiveMessage(CID, null, true)
+    rerender(
+      messageListUi({
+        waitingForSubagentsArmedAtMs: Date.parse("2026-05-28T00:01:00.000Z"),
+        connStatus: "connected",
+      })
+    )
+
+    const banner = screen.getByTestId("live-turn-stats")
+    expect(banner).toHaveAttribute("data-status-mode", "waiting_for_subagents")
+    expect(banner).toHaveAttribute("data-tool-count", "1")
   })
 })
 

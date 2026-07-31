@@ -2732,11 +2732,13 @@
         "jumpToPreviousUserMessage": "Jump to user message",
         "showMore": "Show more",
         "showLess": "Show less",
-        "responseInterrupted": "Response interrupted"
+        "responseInterrupted": "Response interrupted",
+        "waitingForSubagents": "Waiting for subagents..."
       },
       "liveTurnStats": {
         "thinking": "Thinking...",
         "streaming": "Streaming",
+        "waitingForSubagents": "Waiting for subagents...",
         "elapsedHours": "{value}h",
         "elapsedMinutes": "{value}m",
         "elapsedSeconds": "{value}s",

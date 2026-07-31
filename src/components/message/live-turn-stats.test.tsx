@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest"
+import { render, screen, cleanup } from "@testing-library/react"
+import { NextIntlClientProvider } from "next-intl"
+import { afterEach, describe, expect, it } from "vitest"
 
-import { extractLiveEditStats } from "./live-turn-stats"
+import { extractLiveEditStats, LiveTurnStats } from "./live-turn-stats"
 import type {
   LiveContentBlock,
   LiveMessage,
 } from "@/contexts/acp-connections-context"
+import enMessages from "@/i18n/messages/en.json"
 
 // --- fixtures --------------------------------------------------------------
 
@@ -101,5 +104,45 @@ describe("extractLiveEditStats", () => {
     const added = toolBlock(writeInput("p\nq", "z.ts"))
     const after = extractLiveEditStats(msg([shared, added]))
     expect(after).toEqual({ files: 2, additions: 5, deletions: 0 })
+  })
+})
+
+describe("LiveTurnStats status label", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("replaces streaming with waiting-for-subagents while keeping tool metrics", () => {
+    const message = msg([
+      textBlock("hi"),
+      toolBlock(writeInput("a\nb", "x.ts")),
+      toolBlock('{"command":"ls"}'),
+    ])
+    // startedAt far enough in the past that elapsed is non-zero once mounted
+    message.startedAt = Date.now() - 5_000
+
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTurnStats
+          message={message}
+          agentType="codex"
+          isStreaming
+          statusMode="waiting_for_subagents"
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(screen.getByTestId("live-turn-stats")).toHaveAttribute(
+      "data-status-mode",
+      "waiting_for_subagents"
+    )
+    expect(screen.getByTestId("live-turn-stats-status")).toHaveTextContent(
+      enMessages.Folder.chat.liveTurnStats.waitingForSubagents
+    )
+    expect(
+      screen.queryByText(enMessages.Folder.chat.liveTurnStats.streaming)
+    ).not.toBeInTheDocument()
+    // tool uses still render (2 tool_call blocks)
+    expect(screen.getByText(/2 tool/)).toBeInTheDocument()
   })
 })

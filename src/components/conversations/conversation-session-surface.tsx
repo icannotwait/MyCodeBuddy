@@ -2165,6 +2165,13 @@ export const ConversationSessionSurface = memo(
       tabId,
     ])
 
+    const waitingForSubagentsArmedAtMs = (() => {
+      const waiting = conn.waitingForSubagents
+      if (!waiting) return null
+      const armedAtMs = Date.parse(waiting.armed_at)
+      return Number.isFinite(armedAtMs) ? armedAtMs : Date.now()
+    })()
+
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
@@ -2185,9 +2192,7 @@ export const ConversationSessionSurface = memo(
           initialHistoryScrollEligible={initialHistoryScrollEligible}
           historyLoadComplete={detail != null}
           focusTurnAnchor={focusTurnAnchor}
-          isDelegatedChild={
-            detail?.summary.parent_id != null || conn.isDelegationChild === true
-          }
+          waitingForSubagentsArmedAtMs={waitingForSubagentsArmedAtMs}
         />
       </GoalControlProvider>
     )

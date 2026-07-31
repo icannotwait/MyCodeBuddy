@@ -2732,11 +2732,13 @@
         "jumpToPreviousUserMessage": "이전 사용자 메시지로 이동",
         "showMore": "더보기",
         "showLess": "접기",
-        "responseInterrupted": "응답이 중단됨"
+        "responseInterrupted": "응답이 중단됨",
+        "waitingForSubagents": "하위 작업 대기 중…"
       },
       "liveTurnStats": {
         "thinking": "생각 중...",
         "streaming": "스트리밍 중",
+        "waitingForSubagents": "하위 작업 대기 중…",
         "elapsedHours": "{value}시간",
         "elapsedMinutes": "{value}분",
         "elapsedSeconds": "{value}초",
