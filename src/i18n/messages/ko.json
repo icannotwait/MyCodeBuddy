@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "이미지 생성 중…",
         "imageGenerationFailed": "이미지 생성 실패",
         "model": "모델",
+        "reasoningEffort": "추론 강도",
         "tokenStats": "토큰 사용량",
         "tokenInput": "입력",
         "tokenOutput": "출력",

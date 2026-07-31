@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "Génération de l'image…",
         "imageGenerationFailed": "Échec de la génération d'image",
         "model": "Modèle",
+        "reasoningEffort": "Effort de raisonnement",
         "tokenStats": "Utilisation des tokens",
         "tokenInput": "Entrée",
         "tokenOutput": "Sortie",

@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "جارٍ إنشاء الصورة…",
         "imageGenerationFailed": "فشل إنشاء الصورة",
         "model": "النموذج",
+        "reasoningEffort": "جهد الاستدلال",
         "tokenStats": "استخدام الرموز",
         "tokenInput": "الإدخال",
         "tokenOutput": "الإخراج",

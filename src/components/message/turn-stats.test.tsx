@@ -46,3 +46,38 @@ describe("TurnStats jump-to-previous-user gating", () => {
     expect(screen.queryByLabelText(jumpLabel)).not.toBeInTheDocument()
   })
 })
+
+describe("TurnStats model and reasoning effort metadata", () => {
+  it("shows model and archived reasoning effort in the footer", () => {
+    const view = renderStats(
+      <TurnStats
+        copyText="reply"
+        model="gpt-5.6-sol"
+        reasoningEffort="high"
+      />
+    )
+
+    expect(screen.getByLabelText("Model")).toBeInTheDocument()
+    expect(screen.getByLabelText("Reasoning effort")).toBeInTheDocument()
+
+    view.rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageScrollProvider value={{ scrollToIndex: vi.fn() }}>
+          <TurnStats copyText="reply" model="gpt-5.6-sol" />
+        </MessageScrollProvider>
+      </NextIntlClientProvider>
+    )
+    expect(
+      screen.queryByLabelText("Reasoning effort")
+    ).not.toBeInTheDocument()
+  })
+
+  it("renders metadata even when a turn has no copyable body", () => {
+    renderStats(
+      <TurnStats model="gpt-5.6-sol" reasoningEffort="medium" copyText="" />
+    )
+
+    expect(screen.getByLabelText("Model")).toBeInTheDocument()
+    expect(screen.getByLabelText("Reasoning effort")).toBeInTheDocument()
+  })
+})

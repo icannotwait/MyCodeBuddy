@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "画像を生成中…",
         "imageGenerationFailed": "画像生成に失敗しました",
         "model": "モデル",
+        "reasoningEffort": "推論レベル",
         "tokenStats": "トークン使用量",
         "tokenInput": "入力",
         "tokenOutput": "出力",

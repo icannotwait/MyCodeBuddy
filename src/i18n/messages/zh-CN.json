@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "正在生成图片…",
         "imageGenerationFailed": "图片生成失败",
         "model": "模型",
+        "reasoningEffort": "推理级别",
         "tokenStats": "Token 使用情况",
         "tokenInput": "输入",
         "tokenOutput": "输出",

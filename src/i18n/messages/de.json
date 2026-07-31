@@ -2722,6 +2722,7 @@
         "imageGenerationPending": "Bild wird generiert…",
         "imageGenerationFailed": "Bildgenerierung fehlgeschlagen",
         "model": "Modell",
+        "reasoningEffort": "Denkaufwand",
         "tokenStats": "Token-Nutzung",
         "tokenInput": "Eingabe",
         "tokenOutput": "Ausgabe",
