@@ -10034,7 +10034,9 @@ mod tests {
     #[cfg(test)]
     mod workflow_state_authority {
         use super::*;
-        use crate::acp::delegation::workflow::recovery_policy::WorkflowRecoveryDisposition;
+        use crate::acp::delegation::workflow::recovery_policy::{
+            WorkflowRecoveryDecision, WorkflowRecoveryDisposition,
+        };
         use crate::db::test_helpers::fresh_disk_db;
         use sea_orm::ConnectionTrait;
 
@@ -10120,11 +10122,58 @@ mod tests {
         }
 
         async fn load_recovery_fingerprint(db: &AppDatabase, workflow_id: &str) -> String {
+            load_recovery_decision(db, workflow_id)
+                .await
+                .source_state_fingerprint
+        }
+
+        async fn load_recovery_decision(
+            db: &AppDatabase,
+            workflow_id: &str,
+        ) -> WorkflowRecoveryDecision {
             let header = load_header(db, workflow_id).await;
             let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
                 .await
                 .expect("load workflow recovery snapshot");
-            decide_workflow_recovery(&snapshot).source_state_fingerprint
+            decide_workflow_recovery(&snapshot)
+        }
+
+        struct LinkedPlanChildConversations {
+            author: conversation::Model,
+            reviewer: conversation::Model,
+        }
+
+        async fn load_linked_plan_child_conversations(
+            db: &AppDatabase,
+            author_task_id: &str,
+            reviewer_task_id: &str,
+        ) -> LinkedPlanChildConversations {
+            let author_run = delegation_task_run::Entity::find_by_id(author_task_id.to_string())
+                .one(&db.conn)
+                .await
+                .expect("load Author run")
+                .expect("persisted Author run");
+            let reviewer_run =
+                delegation_task_run::Entity::find_by_id(reviewer_task_id.to_string())
+                    .one(&db.conn)
+                    .await
+                    .expect("load reviewer run")
+                    .expect("persisted reviewer run");
+            assert_ne!(
+                author_run.child_conversation_id,
+                reviewer_run.child_conversation_id
+            );
+            let author = conversation::Entity::find_by_id(author_run.child_conversation_id)
+                .one(&db.conn)
+                .await
+                .expect("load Author child conversation")
+                .expect("linked Author child conversation");
+            let reviewer = conversation::Entity::find_by_id(reviewer_run.child_conversation_id)
+                .one(&db.conn)
+                .await
+                .expect("load reviewer child conversation")
+                .expect("linked reviewer child conversation");
+            LinkedPlanChildConversations { author, reviewer }
         }
 
         async fn load_bindings(
@@ -11369,18 +11418,20 @@ mod tests {
         async fn task7_recovery_fingerprint_excludes_real_nondurable_loader_inputs() {
             let (db, parent) = seed_parent().await;
             let (emitter, _) = emitter_with_rx();
+            let author_task_id = "author-state-authority-loader-exclusions";
+            let reviewer_task_id = "review-state-authority-loader-exclusions";
             let mut document = design_plan_doc("task7-real-loader-exclusions");
             document.workflow_state = ManifestWorkflowState::Blocked;
             let published = publish_document(&db, &emitter, parent, document)
                 .await
                 .expect("publish blocked workflow");
             seed_ready_plan_round(&db, parent, &published.workflow_id, "loader-exclusions").await;
+            let linked_children =
+                load_linked_plan_child_conversations(&db, author_task_id, reviewer_task_id).await;
+            assert_ne!(linked_children.author.id, linked_children.reviewer.id);
             for (node_id, task_id) in [
-                ("plan-author", "author-state-authority-loader-exclusions"),
-                (
-                    "plan-reviewer-1",
-                    "review-state-authority-loader-exclusions",
-                ),
+                ("plan-author", author_task_id),
+                ("plan-reviewer-1", reviewer_task_id),
             ] {
                 let binding = delegation_workflow_node_binding::Entity::find_by_id((
                     published.workflow_id.clone(),
@@ -11426,15 +11477,50 @@ mod tests {
                 .await
                 .expect("load baseline recovery snapshot");
             assert!(!baseline_snapshot.contradictory_durable_state);
+            let baseline_decision = decide_workflow_recovery(&baseline_snapshot);
             assert_eq!(
-                decide_workflow_recovery(&baseline_snapshot).disposition,
+                baseline_decision.disposition,
                 WorkflowRecoveryDisposition::Recover {
                     target_state: ManifestWorkflowState::Approved,
                 }
             );
-            let baseline = decide_workflow_recovery(&baseline_snapshot).source_state_fingerprint;
+            let baseline = baseline_decision.source_state_fingerprint.clone();
             assert!(baseline.starts_with("workflow_recovery_v1:"));
             assert_eq!(baseline.len(), 85);
+
+            let mut changed: conversation::ActiveModel = linked_children.author.clone().into();
+            changed.external_id = Set(Some("raw-author-acp-session-id".into()));
+            changed.update(&db.conn).await.unwrap();
+            assert_eq!(
+                baseline_decision,
+                load_recovery_decision(&db, &published.workflow_id).await
+            );
+            let mut restore: conversation::ActiveModel =
+                conversation::Entity::find_by_id(linked_children.author.id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into();
+            restore.external_id = Set(linked_children.author.external_id.clone());
+            restore.update(&db.conn).await.unwrap();
+
+            let mut changed: conversation::ActiveModel = linked_children.reviewer.clone().into();
+            changed.external_id = Set(Some("raw-reviewer-acp-session-id".into()));
+            changed.update(&db.conn).await.unwrap();
+            assert_eq!(
+                baseline_decision,
+                load_recovery_decision(&db, &published.workflow_id).await
+            );
+            let mut restore: conversation::ActiveModel =
+                conversation::Entity::find_by_id(linked_children.reviewer.id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into();
+            restore.external_id = Set(linked_children.reviewer.external_id.clone());
+            restore.update(&db.conn).await.unwrap();
 
             let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
                 published.workflow_id.clone(),
@@ -11466,7 +11552,6 @@ mod tests {
             restore.summary = Set(original_summary);
             restore.update(&db.conn).await.unwrap();
 
-            let author_task_id = "author-state-authority-loader-exclusions";
             let author_run = delegation_task_run::Entity::find_by_id(author_task_id.to_string())
                 .one(&db.conn)
                 .await
@@ -11496,11 +11581,11 @@ mod tests {
                 .unwrap();
             let original_connection_id = author_run.child_connection_id.clone();
             let mut changed: delegation_task_run::ActiveModel = author_run.into();
-            changed.child_connection_id = Set(Some("raw-external-session-identity".into()));
+            changed.child_connection_id = Set(Some("internal-codeg-connection-uuid".into()));
             changed.update(&db.conn).await.unwrap();
             assert_eq!(
-                baseline,
-                load_recovery_fingerprint(&db, &published.workflow_id).await
+                baseline_decision,
+                load_recovery_decision(&db, &published.workflow_id).await
             );
             let mut restore: delegation_task_run::ActiveModel =
                 delegation_task_run::Entity::find_by_id(author_task_id.to_string())
@@ -11556,8 +11641,38 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+            let original_observed = binding.is_observed;
             let mut changed: delegation_workflow_node_binding::ActiveModel = binding.into();
             changed.is_observed = Set(false);
+            changed.update(&db.conn).await.unwrap();
+            assert_ne!(
+                baseline,
+                load_recovery_fingerprint(&db, &published.workflow_id).await
+            );
+            let mut restore: delegation_workflow_node_binding::ActiveModel =
+                delegation_workflow_node_binding::Entity::find_by_id((
+                    published.workflow_id.clone(),
+                    "plan-author".to_string(),
+                ))
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+            restore.is_observed = Set(original_observed);
+            restore.update(&db.conn).await.unwrap();
+
+            let reviewer_binding = delegation_workflow_node_binding::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "plan-reviewer-1".to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut changed: delegation_workflow_node_binding::ActiveModel =
+                reviewer_binding.into();
+            changed.profile_id = Set(Some("included-reviewer-profile-id".into()));
             changed.update(&db.conn).await.unwrap();
             assert_ne!(
                 baseline,
