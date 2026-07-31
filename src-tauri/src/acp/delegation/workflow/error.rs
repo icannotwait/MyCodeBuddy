@@ -3,9 +3,28 @@
 use thiserror::Error;
 
 use super::plan_review::PlanReviewError;
+use super::recovery_policy::WorkflowRecoveryProjection;
 pub use super::types::WorkflowError;
 
 pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
+pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
+pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowAdmissionRecoveryError {
+    pub message: String,
+    pub recovery: WorkflowRecoveryProjection,
+}
+
+impl WorkflowAdmissionRecoveryError {
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn decode(value: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(value)
+    }
+}
 
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

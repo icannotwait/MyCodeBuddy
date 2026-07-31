@@ -36,6 +36,12 @@ use super::plan_review::{
     PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
 };
 use super::project::evidence_from_run_and_binding;
+use super::recovery_policy::{
+    decide_workflow_recovery, hash_displayed_reset_reason, WorkflowRecoveryActiveRun,
+    WorkflowRecoveryBindingLifecycle, WorkflowRecoveryDocumentIdentity,
+    WorkflowRecoveryFrozenTaskCohort, WorkflowRecoveryPlanGateEvidence,
+    WorkflowRecoveryPlanIdentity, WorkflowRecoverySnapshot,
+};
 use super::state_dto::{
     project_workflow_state_index, PlanRecoverySourceDto, WorkflowGateStateDto,
     WorkflowNodeStateDto, WorkflowStateDto, WorkflowStateIndexDto,
@@ -832,12 +838,36 @@ pub async fn get_workflow_state_core(
                         })?,
                 };
 
-                let doc = load_active_manifest_document_txn(
+                let recovery_snapshot = if header.workflow_state == WorkflowState::Blocked {
+                    Some(load_workflow_recovery_snapshot_conn(txn, &header, None).await?)
+                } else {
+                    None
+                };
+                let recovery = recovery_snapshot
+                    .as_ref()
+                    .map(|snapshot| decide_workflow_recovery(snapshot).projection());
+
+                let doc = match load_active_manifest_document_txn(
                     txn,
                     &header.workflow_id,
                     header.active_manifest_revision,
                 )
-                .await?;
+                .await
+                {
+                    Ok(document) => document,
+                    Err(_error)
+                        if recovery_snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| !snapshot.active_manifest_valid) =>
+                    {
+                        return Ok(project_invalid_manifest_recovery_index(
+                            &header,
+                            recovery_snapshot.as_ref().expect("guarded snapshot"),
+                            recovery.expect("blocked snapshot has projection"),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let normalized = validate_manifest_document(&doc)?;
 
                 let bindings = delegation_workflow_node_binding::Entity::find()
@@ -1001,11 +1031,24 @@ pub async fn get_workflow_state_core(
                     .iter()
                     .rev()
                     .find(|settlement| settlement.review_scope.is_some());
-                let latest_plan_review = current_plan_settlement
+                let persisted_plan_review = current_plan_settlement
                     .or(latest_plan_settlement)
                     .map(load_persisted_plan_evidence)
-                    .transpose()?
-                    .map(|evidence| evidence.state);
+                    .transpose();
+                let latest_plan_review = match persisted_plan_review {
+                    Ok(evidence) => evidence.map(|evidence| evidence.state),
+                    Err(_error)
+                        if recovery.as_ref().is_some_and(|projection| {
+                            projection
+                                .blockers
+                                .iter()
+                                .any(|blocker| blocker == "stale_plan_gate_evidence")
+                        }) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 let mut task_gate_passed = BTreeMap::new();
                 for policy in &normalized.task_policies {
@@ -1063,6 +1106,7 @@ pub async fn get_workflow_state_core(
                     &active_manifest_node_ids,
                     &task_gate_passed,
                 );
+                index.recovery = recovery;
                 constrain_plan_recovery_sources(&mut index);
                 Ok(index)
             })
@@ -1076,6 +1120,560 @@ pub async fn get_workflow_state_core(
         }
         Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
     }
+}
+
+pub async fn load_workflow_recovery_snapshot_txn(
+    txn: &DatabaseTransaction,
+    header: &delegation_workflow::Model,
+    displayed_reset_reason: Option<&str>,
+) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
+    load_workflow_recovery_snapshot_conn(txn, header, displayed_reset_reason).await
+}
+
+pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    displayed_reset_reason: Option<&str>,
+) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
+    let mut contradictory_durable_state = false;
+    let header_state = workflow_state_to_manifest(header.workflow_state.clone());
+    let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+        header.workflow_id.clone(),
+        header.active_manifest_revision,
+    ))
+    .one(conn)
+    .await
+    .map_err(db_err)?;
+
+    let active_manifest_revision_kind = revision
+        .as_ref()
+        .and_then(|row| ManifestRevisionKind::from_db(row.revision_kind.as_deref()).ok())
+        .unwrap_or_else(|| {
+            if revision.is_some() {
+                contradictory_durable_state = true;
+            }
+            ManifestRevisionKind::Publication
+        });
+    let active_manifest_source_revision = revision
+        .as_ref()
+        .and_then(|row| row.source_manifest_revision)
+        .and_then(|value| u64::try_from(value).ok());
+    if active_manifest_revision_kind == ManifestRevisionKind::StateOnly
+        && active_manifest_source_revision.is_none()
+    {
+        contradictory_durable_state = true;
+    }
+    if active_manifest_revision_kind == ManifestRevisionKind::StateOnly
+        && active_manifest_source_revision.is_some_and(|source_revision| {
+            source_revision >= header.active_manifest_revision as u64
+        })
+    {
+        contradictory_durable_state = true;
+    }
+
+    let parsed_document = revision
+        .as_ref()
+        .and_then(|row| serde_json::from_str::<ManifestDocument>(&row.document_json).ok());
+    let normalized = parsed_document
+        .as_ref()
+        .and_then(|document| validate_manifest_document(document).ok());
+    let manifest_state = revision
+        .as_ref()
+        .and_then(|row| parse_manifest_state(&row.manifest_state));
+    let normalized_manifest_state = normalized.as_ref().map(|document| document.workflow_state);
+    let document_digest_valid = revision
+        .as_ref()
+        .is_some_and(|row| sha256_hex(row.document_json.as_bytes()) == row.document_digest);
+    let active_manifest_valid = revision.is_some()
+        && parsed_document.is_some()
+        && normalized.is_some()
+        && manifest_state.is_some()
+        && document_digest_valid;
+    let header_manifest_state_match =
+        manifest_state == Some(header_state) && normalized_manifest_state == Some(header_state);
+    let fingerprints_valid = normalized.as_ref().is_some_and(|document| {
+        design_fingerprint_hash(document) == header.design_fingerprint
+            && plan_fingerprint_hash(document) == header.plan_fingerprint
+    });
+
+    let bindings = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    let run_bindings = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
+        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    let task_ids = run_bindings
+        .iter()
+        .map(|binding| binding.task_id.clone())
+        .collect::<Vec<_>>();
+    let runs = if task_ids.is_empty() {
+        Vec::new()
+    } else {
+        delegation_task_run::Entity::find()
+            .filter(delegation_task_run::Column::TaskId.is_in(task_ids))
+            .all(conn)
+            .await
+            .map_err(db_err)?
+    };
+    let run_by_id = runs
+        .iter()
+        .map(|run| (run.task_id.clone(), run))
+        .collect::<HashMap<_, _>>();
+    let active_binding_by_node = bindings
+        .iter()
+        .filter(|binding| binding.retired_revision.is_none())
+        .map(|binding| (binding.node_id.clone(), binding))
+        .collect::<HashMap<_, _>>();
+    let mut latest_run_binding_by_node = HashMap::new();
+    for run_binding in &run_bindings {
+        latest_run_binding_by_node
+            .entry(run_binding.node_id.clone())
+            .or_insert(run_binding);
+    }
+
+    let binding_lifecycle = bindings
+        .iter()
+        .map(|binding| WorkflowRecoveryBindingLifecycle {
+            node_id: binding.node_id.clone(),
+            work_unit_key: binding.work_unit_key.clone(),
+            role: binding.role.clone(),
+            agent_type: binding.agent_type.clone(),
+            profile_id: binding.profile_id.clone(),
+            phase_id: binding.phase_id.clone(),
+            task_index: binding
+                .task_index
+                .and_then(|value| u32::try_from(value).ok()),
+            introduced_revision: u64::try_from(binding.introduced_revision).unwrap_or_default(),
+            retired_revision: binding
+                .retired_revision
+                .and_then(|value| u64::try_from(value).ok()),
+            observed: binding.is_observed,
+            retained_observed: binding.retained_observed,
+            frozen: binding.cohort_frozen,
+            node_outcome: binding.node_outcome.as_ref().map(|outcome| match outcome {
+                NodeOutcome::Canceled => "canceled".to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    let active_runs = run_bindings
+        .iter()
+        .filter_map(|binding| {
+            let run = run_by_id.get(&binding.task_id)?;
+            matches!(
+                run.status,
+                DelegationRunStatus::Running | DelegationRunStatus::Reserving
+            )
+            .then(|| WorkflowRecoveryActiveRun {
+                task_id: run.task_id.clone(),
+                node_id: binding.node_id.clone(),
+                status: run.status.clone(),
+                generation: run.generation,
+                lineage_ordinal: binding.lineage_ordinal,
+                replaced_task_id: run.replaced_task_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut latest_run_supersession_valid = true;
+    let bound_task_ids = run_bindings
+        .iter()
+        .map(|binding| binding.task_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut lineage_ordinals = HashSet::new();
+    for binding in &run_bindings {
+        let Some(run) = run_by_id.get(&binding.task_id) else {
+            latest_run_supersession_valid = false;
+            continue;
+        };
+        let replacement_valid = run.replaced_task_id.as_deref().map_or(true, |replaced| {
+            bound_task_ids.contains(replaced)
+                && run_bindings.iter().any(|candidate| {
+                    candidate.task_id == replaced
+                        && candidate.node_id == binding.node_id
+                        && candidate.lineage_ordinal < binding.lineage_ordinal
+                })
+        });
+        if !lineage_ordinals.insert((binding.node_id.as_str(), binding.lineage_ordinal))
+            || !replacement_valid
+        {
+            latest_run_supersession_valid = false;
+        }
+    }
+
+    let binding_evidence_consistent = normalized.as_ref().is_some_and(|document| {
+        let active_manifest_nodes = document
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ManifestNodeKind::WorkUnit)
+            .map(|node| (node.id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        let active_bindings_match = active_binding_by_node.iter().all(|(node_id, binding)| {
+            active_manifest_nodes
+                .get(node_id.as_str())
+                .is_some_and(|node| {
+                    node.work_unit_key.as_deref() == Some(binding.work_unit_key.as_str())
+                        && node.role.map(role_str) == Some(binding.role.as_str())
+                        && node.agent_type.as_deref() == Some(binding.agent_type.as_str())
+                        && node.profile_id == binding.profile_id
+                        && node.phase_id.as_deref() == Some(binding.phase_id.as_str())
+                        && node.task_index.map(i64::from) == binding.task_index
+                })
+        });
+        let manifest_nodes_bound = active_manifest_nodes
+            .keys()
+            .all(|node_id| active_binding_by_node.contains_key(*node_id));
+        let run_bindings_match = run_bindings.iter().all(|run_binding| {
+            bindings
+                .iter()
+                .any(|binding| binding.node_id == run_binding.node_id)
+                && run_by_id.get(&run_binding.task_id).is_some_and(|run| {
+                    run.parent_conversation_id == header.parent_conversation_id
+                        && run.work_unit_key.as_deref()
+                            == bindings
+                                .iter()
+                                .find(|binding| binding.node_id == run_binding.node_id)
+                                .map(|binding| binding.work_unit_key.as_str())
+                })
+        });
+        active_bindings_match && manifest_nodes_bound && run_bindings_match
+    });
+
+    let mut frozen_task_cohorts = Vec::new();
+    if let Some(document) = normalized.as_ref() {
+        let mut covered_task_indices = HashSet::new();
+        for policy in &document.task_policies {
+            covered_task_indices.insert(policy.task_index);
+            let mut route_node_ids = vec![policy.route.implementer_node_id.clone()];
+            route_node_ids.extend(policy.route.reviewer_node_ids.iter().cloned());
+            let frozen = route_node_ids.iter().any(|node_id| {
+                active_binding_by_node
+                    .get(node_id)
+                    .is_some_and(|binding| binding.cohort_frozen)
+                    || run_bindings
+                        .iter()
+                        .any(|binding| binding.node_id == *node_id)
+            });
+            if !frozen {
+                continue;
+            }
+            let route_complete = route_node_ids
+                .iter()
+                .all(|node_id| active_binding_by_node.contains_key(node_id));
+            let complete_cohort_frozen = route_node_ids.iter().all(|node_id| {
+                active_binding_by_node
+                    .get(node_id)
+                    .is_some_and(|binding| binding.cohort_frozen)
+            });
+            let canceled_evidence_consistent = route_node_ids.iter().all(|node_id| {
+                let Some(binding) = active_binding_by_node.get(node_id) else {
+                    return false;
+                };
+                if binding.node_outcome != Some(NodeOutcome::Canceled) {
+                    return true;
+                }
+                latest_run_binding_by_node
+                    .get(node_id)
+                    .and_then(|run_binding| run_by_id.get(&run_binding.task_id))
+                    .map_or(true, |run| run.status == DelegationRunStatus::Canceled)
+            });
+            let unresolved = !route_complete
+                || !complete_cohort_frozen
+                || !canceled_evidence_consistent
+                || active_runs
+                    .iter()
+                    .any(|run| route_node_ids.contains(&run.node_id));
+            frozen_task_cohorts.push(WorkflowRecoveryFrozenTaskCohort {
+                task_index: policy.task_index,
+                implementer_node_id: policy.route.implementer_node_id.clone(),
+                reviewer_node_ids: policy.route.reviewer_node_ids.clone(),
+                route_complete,
+                unresolved,
+                evidence_consistent: route_complete
+                    && complete_cohort_frozen
+                    && canceled_evidence_consistent,
+            });
+        }
+        let orphaned_frozen_indices = bindings
+            .iter()
+            .filter(|binding| binding.cohort_frozen)
+            .filter_map(|binding| binding.task_index)
+            .filter_map(|index| u32::try_from(index).ok())
+            .filter(|index| !covered_task_indices.contains(index))
+            .collect::<BTreeSet<_>>();
+        for task_index in orphaned_frozen_indices {
+            frozen_task_cohorts.push(WorkflowRecoveryFrozenTaskCohort {
+                task_index,
+                implementer_node_id: String::new(),
+                reviewer_node_ids: Vec::new(),
+                route_complete: false,
+                unresolved: true,
+                evidence_consistent: false,
+            });
+        }
+    }
+
+    let plan_identity = |node_id: &str| -> Option<WorkflowRecoveryPlanIdentity> {
+        let binding = active_binding_by_node.get(node_id)?;
+        let latest = latest_run_binding_by_node.get(node_id).copied();
+        let run = latest.and_then(|latest| run_by_id.get(&latest.task_id).copied());
+        let evidence_consistent = latest.is_none() || run.is_some();
+        Some(WorkflowRecoveryPlanIdentity {
+            node_id: binding.node_id.clone(),
+            work_unit_key: binding.work_unit_key.clone(),
+            agent_type: binding.agent_type.clone(),
+            profile_id: binding.profile_id.clone(),
+            active: binding.retired_revision.is_none(),
+            observed: binding.is_observed,
+            latest_task_id: latest.map(|latest| latest.task_id.clone()),
+            latest_status: run.map(|run| run.status.clone()),
+            summary_validated: latest.is_some_and(|latest| latest.summary_validated),
+            artifact_digest: latest.and_then(|latest| latest.artifact_digest.clone()),
+            gate_id: latest.and_then(|latest| latest.gate_id.clone()),
+            gate_cycle: latest.and_then(|latest| latest.gate_cycle),
+            reviewed_task_id: latest.and_then(|latest| latest.reviewed_task_id.clone()),
+            evidence_consistent,
+        })
+    };
+
+    let plan_gate = normalized.as_ref().and_then(|document| {
+        document
+            .gates
+            .iter()
+            .find(|gate| gate.gate_kind == DocumentGateKind::Plan)
+    });
+    let active_plan_author = normalized.as_ref().and_then(|document| {
+        document
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == ManifestNodeKind::WorkUnit
+                    && node.phase_id.as_deref() == Some("plan")
+                    && node.role == Some(ManifestNodeRole::Author)
+            })
+            .and_then(|node| plan_identity(&node.id))
+    });
+    let required_plan_reviewers = plan_gate
+        .map(|gate| {
+            gate.required_reviewer_node_ids
+                .iter()
+                .filter_map(|node_id| plan_identity(node_id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let settlements = delegation_workflow_gate_settlement::Entity::find()
+        .filter(
+            delegation_workflow_gate_settlement::Column::WorkflowId.eq(header.workflow_id.clone()),
+        )
+        .order_by_desc(delegation_workflow_gate_settlement::Column::GateCycle)
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    let latest_plan_settlement = settlements
+        .iter()
+        .find(|settlement| settlement.review_scope.is_some());
+    let current_plan_settlement = settlements.iter().find(|settlement| {
+        settlement.review_scope.is_some()
+            && settlement.content_fingerprint == header.plan_fingerprint
+    });
+    let project_plan_gate = |settlement: &delegation_workflow_gate_settlement::Model| {
+        let persisted_evidence = load_persisted_plan_evidence(settlement);
+        let parsed_reviewers = settlement
+            .required_reviewer_node_ids_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok());
+        let ledger_valid = settlement
+            .finding_ledger_json
+            .as_deref()
+            .is_some_and(|json| serde_json::from_str::<serde_json::Value>(json).is_ok());
+        let required_reviewer_node_ids = parsed_reviewers.clone().unwrap_or_default();
+        let reviewer_evidence_count = required_plan_reviewers
+            .iter()
+            .filter(|reviewer| {
+                reviewer.latest_status == Some(DelegationRunStatus::Completed)
+                    && reviewer.summary_validated
+            })
+            .count();
+        WorkflowRecoveryPlanGateEvidence {
+            gate_id: settlement.gate_id.clone(),
+            gate_cycle: settlement.gate_cycle,
+            outcome: settlement.outcome.clone(),
+            content_fingerprint: settlement.content_fingerprint.clone(),
+            critical_count: settlement.critical_count,
+            important_count: settlement.important_count,
+            minor_count: settlement.minor_count,
+            next_action: settlement
+                .next_action
+                .as_ref()
+                .map(plan_next_action_from_db),
+            covered_author_task_id: settlement.covered_author_task_id.clone(),
+            covered_plan_digest: settlement.covered_plan_digest.clone(),
+            required_reviewer_node_ids,
+            reviewer_evidence_count,
+            evidence_consistent: persisted_evidence.as_ref().is_ok_and(|evidence| {
+                validate_plan_outcome(&settlement.outcome, &evidence.state).is_ok()
+            }) && parsed_reviewers.is_some()
+                && ledger_valid
+                && settlement.critical_count >= 0
+                && settlement.important_count >= 0
+                && settlement.minor_count >= 0
+                && settlement.next_action.is_some()
+                && settlement.covered_author_task_id.is_some()
+                && settlement.covered_plan_digest.is_some(),
+            lineage_reset_consumed: settlement.lineage_reset_authorization_id.is_some(),
+        }
+    };
+    let latest_plan_gate = latest_plan_settlement.map(&project_plan_gate);
+    let current_plan_gate = current_plan_settlement.map(project_plan_gate);
+
+    if header.structural_revision <= 0
+        || header.structural_revision > header.active_manifest_revision
+        || header
+            .supersedes_approved_revision
+            .is_some_and(|revision| revision > header.active_manifest_revision)
+        || header
+            .block_source_manifest_revision
+            .is_some_and(|revision| revision > header.active_manifest_revision)
+    {
+        contradictory_durable_state = true;
+    }
+    let block_cause = match WorkflowBlockCause::from_db(header.block_cause_code.as_deref()) {
+        Ok(cause) => cause,
+        Err(_) => {
+            contradictory_durable_state = true;
+            WorkflowBlockCause::DurableStateInconsistent
+        }
+    };
+    let plan_lineage_reset_pending = latest_plan_gate.as_ref().is_some_and(|gate| {
+        gate.next_action == Some(PlanReviewNextAction::UserDecisionRequired)
+            && !gate.lineage_reset_consumed
+    });
+
+    Ok(WorkflowRecoverySnapshot {
+        workflow_id: header.workflow_id.clone(),
+        parent_conversation_id: header.parent_conversation_id,
+        workflow_kind: header.workflow_kind.clone(),
+        schema_version: u64::try_from(header.schema_version).unwrap_or_default(),
+        capability_version: header.capability_version.clone(),
+        header_state,
+        active_manifest_revision: u64::try_from(header.active_manifest_revision)
+            .unwrap_or_default(),
+        structural_revision: u64::try_from(header.structural_revision).unwrap_or_default(),
+        active_manifest_revision_kind,
+        active_manifest_source_revision,
+        supersedes_approved_revision: header
+            .supersedes_approved_revision
+            .and_then(|value| u64::try_from(value).ok()),
+        active_manifest_digest: revision.as_ref().map(|row| row.document_digest.clone()),
+        manifest_state,
+        normalized_manifest_state,
+        header_manifest_state_match,
+        active_manifest_valid,
+        fingerprints_valid,
+        design_fingerprint: header.design_fingerprint.clone(),
+        plan_fingerprint: header.plan_fingerprint.clone(),
+        plan_target_rel_path: normalized
+            .as_ref()
+            .map(|document| document.plan_target_rel_path.clone())
+            .unwrap_or_default(),
+        design: normalized.as_ref().and_then(|document| {
+            document
+                .design
+                .as_ref()
+                .map(|design| WorkflowRecoveryDocumentIdentity {
+                    rel_path: design.rel_path.clone(),
+                    digest: design.digest.clone(),
+                })
+        }),
+        plan: normalized.as_ref().and_then(|document| {
+            document
+                .plan
+                .as_ref()
+                .map(|plan| WorkflowRecoveryDocumentIdentity {
+                    rel_path: plan.rel_path.clone(),
+                    digest: plan.digest.clone(),
+                })
+        }),
+        current_plan_gate_id: plan_gate.map(|gate| gate.id.clone()),
+        active_plan_author,
+        required_plan_reviewers,
+        latest_plan_gate,
+        current_plan_gate,
+        binding_lifecycle,
+        active_runs,
+        frozen_task_cohorts,
+        binding_evidence_consistent,
+        latest_run_supersession_valid,
+        contradictory_durable_state,
+        block_cause,
+        block_source_manifest_revision: header
+            .block_source_manifest_revision
+            .and_then(|value| u64::try_from(value).ok()),
+        plan_lineage_reset_pending,
+        displayed_reset_reason_hash: displayed_reset_reason.map(hash_displayed_reset_reason),
+    })
+}
+
+fn project_invalid_manifest_recovery_index(
+    header: &delegation_workflow::Model,
+    snapshot: &WorkflowRecoverySnapshot,
+    recovery: super::recovery_policy::WorkflowRecoveryProjection,
+) -> WorkflowStateIndexDto {
+    WorkflowStateIndexDto {
+        workflow_id: header.workflow_id.clone(),
+        parent_conversation_id: header.parent_conversation_id,
+        workflow_kind: header.workflow_kind.clone(),
+        capability_version: header.capability_version.clone(),
+        publication_token: header.publication_token.clone(),
+        workflow_state: workflow_state_to_manifest(header.workflow_state.clone()),
+        manifest_revision: u64::try_from(header.active_manifest_revision).unwrap_or_default(),
+        graph_revision: u64::try_from(header.graph_revision).unwrap_or_default(),
+        schema_version: u64::try_from(header.schema_version).unwrap_or_default(),
+        plan_target_rel_path: snapshot.plan_target_rel_path.clone(),
+        risk_policy_version: String::new(),
+        recovery: Some(recovery),
+        detail: super::state_dto::WorkflowStateDetail::Index,
+        inline_findings: false,
+        payload_truncated: true,
+        omitted: vec!["invalid_active_manifest".into()],
+        evidence_truncated: true,
+        design: snapshot
+            .design
+            .as_ref()
+            .map(|document| super::types::DocumentRef {
+                rel_path: document.rel_path.clone(),
+                digest: document.digest.clone(),
+            }),
+        plan: snapshot
+            .plan
+            .as_ref()
+            .map(|document| super::types::DocumentRef {
+                rel_path: document.rel_path.clone(),
+                digest: document.digest.clone(),
+            }),
+        gates: Vec::new(),
+        latest_plan_review: None,
+        nodes: Vec::new(),
+        task_policies: Vec::new(),
+        actionable_task_routes: Vec::new(),
+        omission_state: super::state_dto::WorkflowIndexOmissionState { nodes: Vec::new() },
+    }
+}
+
+fn parse_manifest_state(value: &str) -> Option<ManifestWorkflowState> {
+    Some(match value {
+        "skeleton" => ManifestWorkflowState::Skeleton,
+        "estimated" => ManifestWorkflowState::Estimated,
+        "approved" => ManifestWorkflowState::Approved,
+        "blocked" => ManifestWorkflowState::Blocked,
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -10155,6 +10753,229 @@ mod tests {
                 ManifestRevisionKind::Publication
             );
             assert!(WorkflowBlockCause::from_db(Some("legacy_unknown")).is_err());
+        }
+
+        #[tokio::test]
+        async fn task7_corrupt_plan_evidence_blocks_approved_recovery() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-corrupt-plan-evidence");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            seed_ready_plan_round(&db, parent, &published.workflow_id, "task7-corrupt").await;
+            settle_workflow_gate_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowRequest {
+                    workflow_id: published.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: published.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Approved,
+                    evidence: approved_plan_submission("task7-corrupt"),
+                    summary: "approved before evidence corruption".into(),
+                },
+            )
+            .await
+            .expect("settle approval");
+
+            let row = delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "plan".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut corrupt: delegation_workflow_gate_settlement::ActiveModel = row.into();
+            corrupt.finding_ledger_json = Set(Some("{}".into()));
+            corrupt.update(&db.conn).await.unwrap();
+
+            let header = load_header(&db, &published.workflow_id).await;
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            let decision = decide_workflow_recovery(&snapshot);
+            assert!(matches!(
+                decision.disposition,
+                super::super::super::recovery_policy::WorkflowRecoveryDisposition::Stop {
+                    blockers,
+                    ..
+                } if blockers.contains(
+                    &super::super::super::recovery_policy::WorkflowRecoveryBlocker::StalePlanGateEvidence
+                )
+            ));
+            let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+                .await
+                .expect("corrupt Plan evidence still returns recovery projection");
+            let recovery = state.recovery.expect("typed recovery projection");
+            assert_eq!(recovery.disposition, "blocked");
+            assert!(!recovery.authorization_required);
+            assert!(recovery
+                .blockers
+                .contains(&"stale_plan_gate_evidence".to_string()));
+        }
+
+        #[tokio::test]
+        async fn task7_exact_current_historical_approval_survives_later_other_plan_round() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-historical-current-approval");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            seed_ready_plan_round(&db, parent, &published.workflow_id, "task7-history").await;
+            for (node_id, task_id) in [
+                ("plan-author", "author-state-authority-task7-history"),
+                ("plan-reviewer-1", "review-state-authority-task7-history"),
+            ] {
+                let binding = delegation_workflow_node_binding::Entity::find_by_id((
+                    published.workflow_id.clone(),
+                    node_id.to_string(),
+                ))
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+                let mut observed: delegation_workflow_node_binding::ActiveModel =
+                    binding.clone().into();
+                observed.is_observed = Set(true);
+                observed.update(&db.conn).await.unwrap();
+                let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut bound_run: delegation_task_run::ActiveModel = run.into();
+                bound_run.work_unit_key = Set(Some(binding.work_unit_key));
+                bound_run.update(&db.conn).await.unwrap();
+            }
+            settle_workflow_gate_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowRequest {
+                    workflow_id: published.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: published.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Approved,
+                    evidence: approved_plan_submission("task7-history"),
+                    summary: "exact current Plan approval".into(),
+                },
+            )
+            .await
+            .expect("settle current approval");
+
+            let approved = delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "plan".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut evidence = load_persisted_plan_evidence(&approved).unwrap();
+            evidence.state.next_action = PlanReviewNextAction::ContinueReview;
+            let evidence_json = serialize_bounded_plan_evidence(&evidence).unwrap();
+            let mut later: delegation_workflow_gate_settlement::ActiveModel = approved.into();
+            later.gate_cycle = Set(2);
+            later.content_fingerprint = Set("different-plan-fingerprint".into());
+            later.outcome = Set(GateSettlementOutcome::ChangesRequested);
+            later.next_action = Set(Some(DbPlanReviewNextAction::ContinueReview));
+            later.finding_ledger_json = Set(Some(evidence_json));
+            later.insert(&db.conn).await.unwrap();
+
+            let header = load_header(&db, &published.workflow_id).await;
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert!(
+                snapshot.binding_evidence_consistent,
+                "historical approval fixture: {snapshot:#?}"
+            );
+            assert_eq!(snapshot.latest_plan_gate.as_ref().unwrap().gate_cycle, 2);
+            assert_eq!(snapshot.current_plan_gate.as_ref().unwrap().gate_cycle, 1);
+            assert_eq!(
+                decide_workflow_recovery(&snapshot).disposition,
+                super::super::super::recovery_policy::WorkflowRecoveryDisposition::Recover {
+                    target_state: ManifestWorkflowState::Approved,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn task7_partially_frozen_task_cohort_blocks_recovery() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-partial-frozen-cohort");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            let binding = delegation_workflow_node_binding::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "task-1-impl".to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut partially_frozen: delegation_workflow_node_binding::ActiveModel =
+                binding.into();
+            partially_frozen.cohort_frozen = Set(true);
+            partially_frozen.update(&db.conn).await.unwrap();
+
+            let header = load_header(&db, &published.workflow_id).await;
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert!(snapshot
+                .frozen_task_cohorts
+                .iter()
+                .any(|cohort| cohort.task_index == 1
+                    && cohort.unresolved
+                    && !cohort.evidence_consistent));
+        }
+
+        #[tokio::test]
+        async fn task7_corrupt_manifest_returns_fail_closed_recovery_projection() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-corrupt-manifest-projection");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+                published.workflow_id.clone(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut corrupt: delegation_workflow_manifest_revision::ActiveModel = revision.into();
+            corrupt.document_json = Set("{".into());
+            corrupt.update(&db.conn).await.unwrap();
+
+            let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+                .await
+                .expect("corrupt blocked manifest still returns recovery projection");
+            let recovery = state.recovery.expect("typed recovery projection");
+            assert_eq!(recovery.disposition, "blocked");
+            assert!(!recovery.authorization_required);
+            assert!(recovery
+                .blockers
+                .contains(&"invalid_active_manifest".to_string()));
         }
     }
 }
