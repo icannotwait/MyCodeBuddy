@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
+use sea_orm::EntityTrait;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -24,13 +25,19 @@ use crate::acp::delegation::continuation::coordinator::{
     ContinuationError, DelegationContinuationCoordinator, JoinArmOutcome, JoinArmRequest,
 };
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
+use crate::acp::delegation::recovery_policy::{
+    decide_delegation_recovery, RecoveryAction, RecoveryRailSnapshot, RequestedRecoveryOperation,
+};
+use crate::acp::delegation::run_store::{
+    recovery_action_payload, recovery_source_from_continue_eligibility,
+};
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
     BrokerMessage, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
-    CompanionRole,
+    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
+    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -39,14 +46,24 @@ use crate::acp::delegation::types::{
     TaskStatus,
 };
 use crate::acp::delegation::workflow::{
-    get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    ManifestDocument, PlanReviewError, PublishWorkflowRequest, SettleWorkflowRequest,
-    WorkflowError, WorkflowStoreError,
+    decide_workflow_recovery, get_workflow_state_core, publish_workflow_manifest_core,
+    recover_workflow_core, settle_workflow_gate_core, ManifestDocument, PlanReviewError,
+    PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowRequest, WorkflowError,
+    WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
-use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
+use crate::acp::question::{
+    QuestionOption, QuestionOutcome, QuestionSpec, RecoveryQuestionPresentation,
+    SessionQuestionAccess,
+};
+use crate::acp::recovery_authorization::{
+    DelegationAuthorizationIdentity, PreparedAuthorization, RecoveryAllowedAction,
+    RecoveryAuthorizationError, RecoveryAuthorizationResult, RecoveryAuthorizationService,
+    RecoveryChallenge, RecoverySubjectKind, RECOVERY_APPROVE_LABEL, RECOVERY_DECLINE_LABEL,
+};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
+use crate::db::entities::{delegation_workflow, recovery_authorization};
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
@@ -247,6 +264,7 @@ pub struct DelegationListener {
     pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     /// Shared `EventEmitter` for workflow graph live events (publish/settle).
     pub workflow_emitter: EventEmitter,
+    recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
 }
 
 impl DelegationListener {
@@ -311,6 +329,9 @@ impl DelegationListener {
         workflow_emitter: EventEmitter,
     ) -> Arc<Self> {
         let metrics = broker.metrics();
+        let recovery_authorizations = broker
+            .run_store()
+            .map(|runs| Arc::new(RecoveryAuthorizationService::new(runs.db().conn.clone())));
         Arc::new(Self {
             broker,
             tokens,
@@ -322,6 +343,7 @@ impl DelegationListener {
             wait_cancel,
             metrics,
             workflow_emitter,
+            recovery_authorizations,
         })
     }
 
@@ -580,6 +602,25 @@ impl DelegationListener {
             }
             BrokerMessage::GetWorkflowState(req) => {
                 value_response(&self.process_get_workflow_state(req).await)?
+            }
+            BrokerMessage::RequestRecoveryAuthorization(req) => {
+                let cancelled = CancellationToken::new();
+                let request_fut = self.process_recovery_authorization(req, cancelled.clone());
+                tokio::pin!(request_fut);
+                let mut probe = [0_u8; 1];
+                let outcome = tokio::select! {
+                    biased;
+                    outcome = &mut request_fut => outcome,
+                    _ = conn.read(&mut probe) => {
+                        cancelled.cancel();
+                        let _ = request_fut.await;
+                        return Ok(());
+                    }
+                };
+                value_response(&outcome)?
+            }
+            BrokerMessage::RecoverWorkflow(req) => {
+                value_response(&self.process_recover_workflow(req).await)?
             }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
@@ -1552,6 +1593,422 @@ impl DelegationListener {
         }
     }
 
+    async fn process_recovery_authorization(
+        &self,
+        req: BrokerRecoveryAuthorizationRequest,
+        cancelled: CancellationToken,
+    ) -> Value {
+        if let Err(message) = validate_correlation_id(&req.correlation_id) {
+            return recovery_wire_error("invalid_correlation_id", &message);
+        }
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return recovery_wire_error("invalid_token", "invalid token");
+        };
+        let Some(parent_conversation_id) = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await
+        else {
+            return recovery_wire_error(
+                "no_active_conversation",
+                "parent has no active conversation",
+            );
+        };
+        let Some(service) = self.recovery_authorizations.as_ref() else {
+            return recovery_wire_error(
+                "store_unavailable",
+                "recovery authorization store is unavailable",
+            );
+        };
+
+        let challenge = match req.subject_kind {
+            RecoverySubjectKind::DelegationTask => {
+                if !entry.coordination_v1 {
+                    return recovery_wire_error(
+                        "feature_disabled",
+                        "delegation recovery is not enabled",
+                    );
+                }
+                if req.proposed_user_reason.is_some() {
+                    return recovery_wire_error(
+                        "invalid_arguments",
+                        "proposed_user_reason is not accepted for delegation recovery",
+                    );
+                }
+                match self
+                    .delegation_recovery_challenge(parent_conversation_id, &req.subject_id)
+                    .await
+                {
+                    Ok(challenge) => challenge,
+                    Err(error) => return error,
+                }
+            }
+            RecoverySubjectKind::Workflow => {
+                if !entry.workflow_v2 {
+                    return recovery_wire_error(
+                        "feature_disabled",
+                        "workflow_v2 is not enabled for this companion",
+                    );
+                }
+                if entry.role != CompanionRole::Root {
+                    return recovery_wire_error(
+                        "root_only",
+                        "workflow recovery authorization is Root-only",
+                    );
+                }
+                match self
+                    .workflow_recovery_challenge(
+                        parent_conversation_id,
+                        &req.subject_id,
+                        req.proposed_user_reason.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(challenge) => challenge,
+                    Err(error) => return error,
+                }
+            }
+        };
+
+        let prepared = match service.prepare(challenge.clone()).await {
+            Ok(prepared) => prepared,
+            Err(error) => return recovery_authorization_error_value(error),
+        };
+        match prepared {
+            PreparedAuthorization::ExistingApproved(result) => {
+                recovery_authorization_result_value(&result, true)
+            }
+            PreparedAuthorization::Pending {
+                row,
+                newly_created: false,
+            } => match service
+                .wait_for_resolution(&row.authorization_id, cancelled)
+                .await
+            {
+                Ok(result) => recovery_authorization_result_value(&result, true),
+                Err(error) => recovery_authorization_error_value(error),
+            },
+            PreparedAuthorization::Pending {
+                row,
+                newly_created: true,
+            } => {
+                self.drive_new_recovery_question(
+                    service,
+                    &entry.parent_connection_id,
+                    &challenge,
+                    row.authorization_id,
+                    cancelled,
+                )
+                .await
+            }
+            PreparedAuthorization::NotRequired { .. } => recovery_wire_error(
+                "recovery_authorization_not_required",
+                "central recovery policy does not require authorization",
+            ),
+            PreparedAuthorization::HardStop { code } => recovery_wire_error(
+                "recovery_authorization_blocked",
+                &format!("central recovery policy blocked authorization: {code}"),
+            ),
+        }
+    }
+
+    async fn delegation_recovery_challenge(
+        &self,
+        parent_conversation_id: i32,
+        task_id: &str,
+    ) -> Result<RecoveryChallenge, Value> {
+        let Some(runs) = self.broker.run_store() else {
+            return Err(recovery_wire_error(
+                "store_unavailable",
+                "delegation run store is unavailable",
+            ));
+        };
+        let target = runs
+            .load_by_task_id(task_id)
+            .await
+            .map_err(|_| {
+                recovery_wire_error("recovery_subject_load_failed", "failed to load task")
+            })?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "task was not found")
+            })?;
+        if target.parent_conversation_id != parent_conversation_id {
+            return Err(recovery_wire_error(
+                "recovery_subject_not_owned",
+                "task is not directly owned by this caller",
+            ));
+        }
+        let eligibility = runs
+            .build_continue_eligibility(&target)
+            .await
+            .map_err(|_| {
+                recovery_wire_error(
+                    "recovery_subject_load_failed",
+                    "failed to derive task recovery state",
+                )
+            })?;
+        let decision = decide_delegation_recovery(
+            &recovery_source_from_continue_eligibility(&eligibility),
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: eligibility.agent_supports_reuse,
+                unexpected_continue_budget_available: eligibility
+                    .unexpected_continue_budget_available,
+                replacement_budget_available: eligibility.replacement_budget_available,
+            },
+            RequestedRecoveryOperation::Inspect,
+        );
+        if !decision.requires_authorization() {
+            return Err(recovery_wire_error(
+                "recovery_authorization_not_required",
+                "central recovery policy does not project a confirmable action",
+            ));
+        }
+        let (allowed_action, operation) = match decision.proposed_action() {
+            Some(RecoveryAction::Continue { .. }) => (
+                RecoveryAllowedAction::Continue,
+                RequestedRecoveryOperation::Continue,
+            ),
+            Some(RecoveryAction::FreshDispatch) => (
+                RecoveryAllowedAction::FreshDispatch,
+                RequestedRecoveryOperation::FreshDispatch,
+            ),
+            Some(RecoveryAction::Replace { replacement_reason }) => (
+                RecoveryAllowedAction::Replace,
+                RequestedRecoveryOperation::Replace { replacement_reason },
+            ),
+            None => {
+                return Err(recovery_wire_error(
+                    "recovery_authorization_not_required",
+                    "central recovery policy does not project an action",
+                ))
+            }
+        };
+        Ok(RecoveryChallenge {
+            parent_conversation_id,
+            subject_kind: RecoverySubjectKind::DelegationTask,
+            subject_id: target.task_id.clone(),
+            delegation_identity: Some(DelegationAuthorizationIdentity {
+                source_task_id: target.task_id,
+                child_conversation_id: Some(target.child_conversation_id),
+                lineage_root_task_id: target.lineage_root_task_id,
+                work_unit_key: target.work_unit_key,
+            }),
+            source_state_fingerprint: decision.source_state_fingerprint.clone(),
+            allowed_action,
+            action_payload: recovery_action_payload(&operation),
+            cause_code: serialized_recovery_code(&decision.cause_code),
+            risk_class: serialized_recovery_code(&decision.risk_class),
+            display_reason: None,
+        })
+    }
+
+    async fn workflow_recovery_challenge(
+        &self,
+        parent_conversation_id: i32,
+        workflow_id: &str,
+        proposed_user_reason: Option<&str>,
+    ) -> Result<RecoveryChallenge, Value> {
+        let Some(runs) = self.broker.run_store() else {
+            return Err(recovery_wire_error(
+                "store_unavailable",
+                "workflow store is unavailable",
+            ));
+        };
+        if let Some(reason) = proposed_user_reason {
+            if reason.trim().is_empty() || reason.len() > 4096 {
+                return Err(recovery_wire_error(
+                    "invalid_arguments",
+                    "proposed_user_reason must be nonblank and at most 4096 UTF-8 bytes",
+                ));
+            }
+        }
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&runs.db().conn)
+            .await
+            .map_err(|_| {
+                recovery_wire_error("recovery_subject_load_failed", "failed to load workflow")
+            })?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "workflow was not found")
+            })?;
+        if header.parent_conversation_id != parent_conversation_id {
+            return Err(recovery_wire_error(
+                "recovery_subject_not_owned",
+                "workflow is not owned by this caller",
+            ));
+        }
+        let snapshot =
+            crate::acp::delegation::workflow::store::load_workflow_recovery_snapshot_conn(
+                &runs.db().conn,
+                &header,
+                proposed_user_reason,
+            )
+            .await
+            .map_err(workflow_store_error_value)?;
+        let decision = decide_workflow_recovery(&snapshot);
+        if !decision.requires_authorization() {
+            return Err(recovery_wire_error(
+                "recovery_authorization_not_required",
+                "central workflow policy does not project a confirmable action",
+            ));
+        }
+        let (allowed_action, display_reason) = match &decision.disposition {
+            WorkflowRecoveryDisposition::Recover { .. } => {
+                if proposed_user_reason.is_some() {
+                    return Err(recovery_wire_error(
+                        "invalid_arguments",
+                        "proposed_user_reason is not accepted for generic workflow recovery",
+                    ));
+                }
+                (RecoveryAllowedAction::RecoverWorkflow, None)
+            }
+            WorkflowRecoveryDisposition::ResetPlanLineage => (
+                RecoveryAllowedAction::ResetPlanLineage,
+                proposed_user_reason.map(str::to_string),
+            ),
+            _ => {
+                return Err(recovery_wire_error(
+                    "recovery_authorization_not_required",
+                    "central workflow policy does not project an action",
+                ))
+            }
+        };
+        Ok(RecoveryChallenge {
+            parent_conversation_id,
+            subject_kind: RecoverySubjectKind::Workflow,
+            subject_id: workflow_id.to_string(),
+            delegation_identity: None,
+            source_state_fingerprint: decision.source_state_fingerprint.clone(),
+            allowed_action,
+            action_payload: decision
+                .action_payload()
+                .expect("authorized workflow decision has action payload"),
+            cause_code: decision.cause_code.as_str().to_string(),
+            risk_class: decision.risk_class.as_str().to_string(),
+            display_reason,
+        })
+    }
+
+    async fn drive_new_recovery_question(
+        &self,
+        service: &RecoveryAuthorizationService,
+        parent_connection_id: &str,
+        challenge: &RecoveryChallenge,
+        authorization_id: String,
+        cancelled: CancellationToken,
+    ) -> Value {
+        let questions = vec![QuestionSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            question: "recovery_authorization".to_string(),
+            header: "Recovery".to_string(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: RECOVERY_APPROVE_LABEL.to_string(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: RECOVERY_DECLINE_LABEL.to_string(),
+                    description: String::new(),
+                },
+            ],
+            is_secret: false,
+            recovery: Some(RecoveryQuestionPresentation {
+                subject: challenge.subject_kind.as_str().to_string(),
+                action: challenge.allowed_action.as_str().to_string(),
+                target: challenge.subject_id.clone(),
+                cause: challenge.cause_code.clone(),
+                risk: challenge.risk_class.clone(),
+                display_reason: challenge.display_reason.clone(),
+            }),
+        }];
+        let Some(registration) = self
+            .questions
+            .register_question(parent_connection_id, questions)
+            .await
+        else {
+            let _ = service
+                .abandon_until_terminal(&authorization_id, None)
+                .await;
+            return recovery_wire_error(
+                "recovery_authorization_blocked",
+                "recovery question could not be registered",
+            );
+        };
+        if let Err(error) = service
+            .bind_question(&authorization_id, &registration.question_id)
+            .await
+        {
+            self.questions
+                .cancel_question(parent_connection_id, &registration.question_id)
+                .await;
+            let _ = service
+                .abandon_until_terminal(&authorization_id, None)
+                .await;
+            return recovery_authorization_error_value(error);
+        }
+
+        let question_id = registration.question_id;
+        let outcome = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => None,
+            outcome = registration.answer_rx => outcome.ok(),
+        };
+        match outcome {
+            Some(outcome) => match service.resolve_question(&authorization_id, outcome).await {
+                Ok(result) => recovery_authorization_result_value(&result, false),
+                Err(error) => recovery_authorization_error_value(error),
+            },
+            None => {
+                self.questions
+                    .cancel_question(parent_connection_id, &question_id)
+                    .await;
+                match service
+                    .abandon_question(&authorization_id, &question_id)
+                    .await
+                {
+                    Ok(()) => match service.get(&authorization_id).await {
+                        Ok(row) => recovery_authorization_row_value(&row, false),
+                        Err(error) => recovery_authorization_error_value(error),
+                    },
+                    Err(error) => recovery_authorization_error_value(error),
+                }
+            }
+        }
+    }
+
+    async fn process_recover_workflow(&self, req: BrokerRecoverWorkflowRequest) -> Value {
+        if let Err(message) = validate_correlation_id(&req.correlation_id) {
+            return recovery_wire_error("invalid_correlation_id", &message);
+        }
+        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
+            Ok((_, id)) => id,
+            Err(error) => return error.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        match recover_workflow_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            RecoverWorkflowRequest {
+                workflow_id: req.workflow_id,
+                recovery_authorization_id: req.recovery_authorization_id,
+                expected_manifest_revision: req.expected_manifest_revision,
+                correlation_id: req.correlation_id,
+            },
+        )
+        .await
+        {
+            Ok(result) => serde_json::to_value(result).unwrap_or_else(|error| {
+                WorkflowWireError::Internal(format!("serialize recover workflow result: {error}"))
+                    .to_value()
+            }),
+            Err(error) => workflow_store_error_value(error),
+        }
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -1618,6 +2075,11 @@ impl DelegationListener {
             }
         };
 
+        let recovery_authorization_id = match parse_recovery_authorization_id(&req.input) {
+            Ok(id) => id,
+            Err(message) => return report_failed("invalid_recovery_authorization_id", &message),
+        };
+
         if is_continue {
             let target_task_id = match req.input.get("task_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => s.trim().to_string(),
@@ -1640,7 +2102,7 @@ impl DelegationListener {
                 work_unit_key,
                 external_handle: req.external_handle,
                 correlation_id,
-                recovery_authorization_id: None,
+                recovery_authorization_id,
             };
             return self.broker.continue_delegation(continue_req).await;
         }
@@ -1703,7 +2165,7 @@ impl DelegationListener {
             replaces_task_id,
             replacement_reason,
             correlation_id,
-            recovery_authorization_id: None,
+            recovery_authorization_id,
         };
         self.broker.start_delegation(delegation_req).await
     }
@@ -1724,6 +2186,19 @@ pub(crate) fn parse_correlation_id(input: &Value) -> Result<Option<String>, Stri
             Err(message) => Err(message),
         },
         Some(_) => Err("correlation_id must be a string".into()),
+    }
+}
+
+/// Parse the optional recovery receipt used by an exact continue or
+/// replacement replay. The receipt is opaque and must remain nonblank; the
+/// admission layer validates its subject, action, and one-time consumption.
+pub(crate) fn parse_recovery_authorization_id(input: &Value) -> Result<Option<String>, String> {
+    match input.get("recovery_authorization_id") {
+        None => Ok(None),
+        Some(Value::String(raw)) if !raw.trim().is_empty() => Ok(Some(raw.clone())),
+        Some(Value::String(_)) => Err("recovery_authorization_id must not be blank".into()),
+        Some(Value::Null) => Err("recovery_authorization_id must not be null".into()),
+        Some(_) => Err("recovery_authorization_id must be a string".into()),
     }
 }
 
@@ -1847,6 +2322,45 @@ impl WorkflowWireError {
     }
 }
 
+fn serialized_recovery_code<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn recovery_wire_error(code: &str, message: &str) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
+}
+
+fn recovery_authorization_error_value(error: RecoveryAuthorizationError) -> Value {
+    recovery_wire_error(error.code(), &error.to_string())
+}
+
+fn recovery_authorization_result_value(
+    result: &RecoveryAuthorizationResult,
+    reused: bool,
+) -> Value {
+    serde_json::json!({
+        "status": serialized_recovery_code(&result.status),
+        "recovery_authorization_id": result.authorization_id,
+        "reused": reused,
+    })
+}
+
+fn recovery_authorization_row_value(row: &recovery_authorization::Model, reused: bool) -> Value {
+    serde_json::json!({
+        "status": serialized_recovery_code(&row.status),
+        "recovery_authorization_id": row.authorization_id,
+        "reused": reused,
+    })
+}
+
 fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, String> {
     match raw {
         "approved" => Ok(GateSettlementOutcome::Approved),
@@ -1894,9 +2408,7 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
         WorkflowStoreError::Busy(_) => "busy",
-        WorkflowStoreError::WorkflowRecoveryNotAvailable => {
-            "workflow_recovery_not_available"
-        }
+        WorkflowStoreError::WorkflowRecoveryNotAvailable => "workflow_recovery_not_available",
         WorkflowStoreError::WorkflowRecoveryConflict => "workflow_recovery_conflict",
         WorkflowStoreError::RecoveryAuthorizationRequired { .. } => {
             "recovery_authorization_required"
@@ -3313,6 +3825,25 @@ mod tests {
         let long: String = "x".repeat(201);
         let err = parse_work_unit_key(&json!({"work_unit_key": long})).unwrap_err();
         assert!(err.contains("200"), "{err}");
+    }
+
+    #[test]
+    fn parse_recovery_authorization_id_accepts_opaque_receipt_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_recovery_authorization_id(&json!({
+                "recovery_authorization_id": "receipt-opaque"
+            }))
+            .unwrap(),
+            Some("receipt-opaque".into())
+        );
+        assert_eq!(parse_recovery_authorization_id(&json!({})).unwrap(), None);
+        for value in [
+            json!({"recovery_authorization_id": "  "}),
+            json!({"recovery_authorization_id": null}),
+            json!({"recovery_authorization_id": 7}),
+        ] {
+            assert!(parse_recovery_authorization_id(&value).is_err());
+        }
     }
 
     #[tokio::test]
@@ -7340,5 +7871,650 @@ mod tests {
                 ..
             } if code == "coordination_unavailable"
         ));
+    }
+
+    mod recovery_tool_contract {
+        use super::*;
+        use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::spawner::DelegationLink;
+        use crate::acp::delegation::store::TerminalTaskWrite;
+        use crate::acp::question::QuestionAnsweredItem;
+        use crate::acp::termination::DelegationTerminationAuditV1;
+        use crate::db::entities::delegation_task_run::{
+            self as delegation_task_run, AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus;
+        use crate::db::entities::{conversation, recovery_authorization};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, IntoActiveModel, PaginatorTrait, QueryFilter, Set,
+        };
+        use tokio::io::DuplexStream;
+
+        struct RecoveryFixture {
+            db: Arc<crate::db::AppDatabase>,
+            folder_id: i32,
+            parent_id: i32,
+            runs: Arc<RunStore>,
+            spawner: Arc<MockSpawner>,
+            tokens: Arc<TokenRegistry>,
+            listener: Arc<DelegationListener>,
+            questions: Arc<StubQuestion>,
+        }
+
+        async fn recovery_fixture() -> RecoveryFixture {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let folder_id = seed_folder(&db, "/tmp/recovery-listener-contract").await;
+            let parent_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+            let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+            let spawner = Arc::new(MockSpawner::new());
+            let broker = Arc::new(
+                DelegationBroker::new(
+                    Arc::clone(&spawner) as Arc<dyn ConnectionSpawner>,
+                    Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+                )
+                .with_run_store(Arc::clone(&runs)),
+            );
+            broker
+                .set_config(DelegationConfig {
+                    enabled: true,
+                    ..DelegationConfig::default()
+                })
+                .await;
+            let tokens = Arc::new(TokenRegistry::default());
+            tokens
+                .register(
+                    "recovery-child-token".into(),
+                    TokenEntry {
+                        parent_connection_id: "recovery-parent-conn".into(),
+                        working_dir: PathBuf::from("/tmp"),
+                        coordination_v1: true,
+                        delegation_continuation_v1: false,
+                        role: CompanionRole::DelegationChild,
+                        workflow_v2: true,
+                    },
+                )
+                .await;
+            let questions = Arc::new(StubQuestion::default());
+            let listener = DelegationListener::new(
+                broker,
+                Arc::clone(&tokens),
+                Arc::new(CompanionLeaseRegistry::default()),
+                Arc::new(StaticParentLookup(Some(parent_id))),
+                Arc::new(StubFeedback::default()),
+                Arc::clone(&questions) as Arc<dyn SessionQuestionAccess>,
+                Arc::new(StubSessionInfo::default()),
+            );
+            RecoveryFixture {
+                db,
+                folder_id,
+                parent_id,
+                runs,
+                spawner,
+                tokens,
+                listener,
+                questions,
+            }
+        }
+
+        async fn seed_confirmable_task(
+            fixture: &RecoveryFixture,
+            parent_id: i32,
+            label: &str,
+        ) -> String {
+            let task_id = format!("{label}-{}", uuid::Uuid::new_v4());
+            let child = conversation_service::create_with_delegation(
+                &fixture.db.conn,
+                fixture.folder_id,
+                AgentType::Codex,
+                Some(format!("child {label}")),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent_id,
+                    parent_tool_use_id: format!("tool-{label}"),
+                    delegation_call_id: format!("call-{label}"),
+                }),
+            )
+            .await
+            .expect("seed delegated child");
+            let mut active: conversation::ActiveModel = child.clone().into();
+            active.external_id = Set(Some(format!("session-{label}")));
+            active
+                .update(&fixture.db.conn)
+                .await
+                .expect("seed reusable session identity");
+
+            fixture
+                .runs
+                .insert_reserving(ReservingRunInsert {
+                    task_id: task_id.clone(),
+                    root_task_id: task_id.clone(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: parent_id,
+                    parent_tool_use_id: Some(format!("tool-{label}")),
+                    child_conversation_id: child.id,
+                    agent_type: "codex".into(),
+                    profile_id: None,
+                    workspace_path: Some("/tmp/recovery-listener-contract".into()),
+                    route_fingerprint: Some("aabbccdd".into()),
+                    launch_snapshot_version: Some("v1".into()),
+                    mode_id: Some("default".into()),
+                    config_values_json: Some("{}".into()),
+                    task_preview: Some("recovery contract task".into()),
+                    request_fingerprint: Some("a".repeat(64)),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: task_id.clone(),
+                    work_unit_key: Some(format!("task|{label}|implementer|codex|none")),
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                })
+                .await
+                .expect("insert recovery source");
+            let child_connection_id = format!("child-connection-{label}");
+            fixture
+                .runs
+                .bind_child_connection_while_reserving(&task_id, &child_connection_id)
+                .await
+                .expect("bind recovery child");
+            fixture
+                .runs
+                .promote_running(&task_id, &child_connection_id, Utc::now())
+                .await
+                .expect("promote recovery child");
+            let finished_at = Utc::now();
+            fixture
+                .runs
+                .settle_terminal(
+                    &task_id,
+                    TerminalTaskWrite::canceled(
+                        "parent_turn_failed",
+                        finished_at,
+                        DelegationTerminationAuditV1::for_terminal_code(
+                            "parent_turn_failed",
+                            DelegationRunStatus::Running,
+                            true,
+                            finished_at,
+                        ),
+                    ),
+                )
+                .await
+                .expect("settle recovery source");
+            task_id
+        }
+
+        fn authorization_request(token: &str, task_id: &str, suffix: &str) -> BrokerMessage {
+            BrokerMessage::RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest {
+                token: token.into(),
+                subject_kind: RecoverySubjectKind::DelegationTask,
+                subject_id: task_id.into(),
+                correlation_id: format!("recovery-{suffix}"),
+                proposed_user_reason: None,
+            })
+        }
+
+        async fn start_call(
+            listener: Arc<DelegationListener>,
+            message: BrokerMessage,
+        ) -> (DuplexStream, tokio::task::JoinHandle<std::io::Result<()>>) {
+            let (mut client, mut server) = duplex(64 * 1024);
+            let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+            write_frame(&mut client, &message)
+                .await
+                .expect("write recovery request");
+            (client, server_task)
+        }
+
+        async fn finish_call(
+            mut client: DuplexStream,
+            server_task: tokio::task::JoinHandle<std::io::Result<()>>,
+        ) -> Value {
+            let response: BrokerResponse = read_frame(&mut client)
+                .await
+                .expect("read recovery response");
+            server_task
+                .await
+                .expect("listener task")
+                .expect("listener response");
+            response.outcome
+        }
+
+        async fn immediate_call(
+            listener: Arc<DelegationListener>,
+            message: BrokerMessage,
+        ) -> Value {
+            let (client, task) = start_call(listener, message).await;
+            finish_call(client, task).await
+        }
+
+        async fn wait_for_questions(questions: &StubQuestion, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if questions.registered.lock().await.len() >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("recovery question registration");
+        }
+
+        fn question_outcome(label: Option<&str>, declined: bool) -> QuestionOutcome {
+            QuestionOutcome {
+                answers: label
+                    .map(|label| {
+                        vec![QuestionAnsweredItem {
+                            question: "recovery_authorization".into(),
+                            header: "Recovery".into(),
+                            multi_select: false,
+                            selected: vec![label.into()],
+                        }]
+                    })
+                    .unwrap_or_default(),
+                declined,
+            }
+        }
+
+        async fn authorization_count(fixture: &RecoveryFixture) -> u64 {
+            recovery_authorization::Entity::find()
+                .count(&fixture.db.conn)
+                .await
+                .expect("count recovery authorization rows")
+        }
+
+        #[tokio::test]
+        async fn listener_forwards_recovery_receipt_into_continue_admission() {
+            let fixture = recovery_fixture().await;
+            let source_task_id =
+                seed_confirmable_task(&fixture, fixture.parent_id, "listener-continue").await;
+            let source = fixture
+                .runs
+                .load_by_task_id(&source_task_id)
+                .await
+                .expect("load continue source")
+                .expect("continue source row");
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request(
+                    "recovery-child-token",
+                    &source_task_id,
+                    "listener-continue-authorize",
+                ),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 1).await;
+            fixture
+                .questions
+                .answer("q-1", question_outcome(Some(RECOVERY_APPROVE_LABEL), false))
+                .await;
+            let authorization = finish_call(client, server).await;
+            assert_eq!(authorization["status"], "approved");
+            let authorization_id = authorization["recovery_authorization_id"]
+                .as_str()
+                .expect("approved recovery receipt")
+                .to_string();
+
+            fixture
+                .spawner
+                .queue_spawn(Ok("child-connection-listener-continue".into()))
+                .await;
+            fixture
+                .spawner
+                .queue_send(Ok(accepted(source.child_conversation_id, Utc::now())))
+                .await;
+            let replay = immediate_call(
+                Arc::clone(&fixture.listener),
+                BrokerMessage::Call(BrokerRequest {
+                    token: "recovery-child-token".into(),
+                    parent_connection_id: "recovery-parent-conn".into(),
+                    parent_tool_use_id: "listener-continue-replay".into(),
+                    external_handle: None,
+                    input: json!({
+                        "_codeg_tool": "continue_delegation",
+                        "task_id": source_task_id,
+                        "task": "recovery contract task",
+                        "work_unit_key": "task|listener-continue|implementer|codex|none",
+                        "correlation_id": "listener-continue-replay",
+                        "recovery_authorization_id": authorization_id,
+                    }),
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                replay["status"], "running",
+                "authorized continue must admit"
+            );
+            assert_eq!(replay["continued_from_task_id"], source_task_id);
+            assert_eq!(replay["reused_session"], true);
+            assert_eq!(
+                replay["child_conversation_id"],
+                source.child_conversation_id
+            );
+
+            let row = recovery_authorization::Entity::find_by_id(&authorization_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load consumed recovery authorization")
+                .expect("consumed recovery authorization row");
+            assert_eq!(row.status, RecoveryAuthorizationStatus::Consumed);
+            assert_eq!(row.authorization_id, authorization_id);
+        }
+
+        #[tokio::test]
+        async fn listener_forwards_recovery_receipt_into_replacement_admission() {
+            let fixture = recovery_fixture().await;
+            let source_task_id =
+                seed_confirmable_task(&fixture, fixture.parent_id, "listener-replace").await;
+            let source = fixture
+                .runs
+                .load_by_task_id(&source_task_id)
+                .await
+                .expect("load replacement source")
+                .expect("replacement source row");
+            let workspace = std::env::current_dir()
+                .expect("test workspace")
+                .to_string_lossy()
+                .into_owned();
+            let mut source_row = delegation_task_run::Entity::find_by_id(&source_task_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load replacement source for workspace")
+                .expect("replacement source model")
+                .into_active_model();
+            source_row.status = Set(DelegationRunStatus::Failed);
+            source_row.error_code = Set(Some("admission_unknown".into()));
+            source_row.reached_running_at = Set(None);
+            source_row.termination_audit_json = Set(None);
+            source_row.workspace_path = Set(Some(workspace.clone()));
+            source_row
+                .update(&fixture.db.conn)
+                .await
+                .expect("set replacement source workspace");
+            let child = conversation::Entity::find_by_id(source.child_conversation_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load replacement child")
+                .expect("replacement child row");
+            let mut child = child.into_active_model();
+            child.external_id = Set(None);
+            child
+                .update(&fixture.db.conn)
+                .await
+                .expect("remove resume identity");
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request(
+                    "recovery-child-token",
+                    &source_task_id,
+                    "listener-replace-authorize",
+                ),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 1).await;
+            fixture
+                .questions
+                .answer("q-1", question_outcome(Some(RECOVERY_APPROVE_LABEL), false))
+                .await;
+            let authorization = finish_call(client, server).await;
+            assert_eq!(authorization["status"], "approved");
+            let authorization_id = authorization["recovery_authorization_id"]
+                .as_str()
+                .expect("approved replacement receipt")
+                .to_string();
+
+            fixture
+                .spawner
+                .queue_spawn(Ok("child-connection-listener-replace".into()))
+                .await;
+            fixture
+                .spawner
+                .queue_send(Ok(accepted(0, Utc::now())))
+                .await;
+            let replay = immediate_call(
+                Arc::clone(&fixture.listener),
+                BrokerMessage::Call(BrokerRequest {
+                    token: "recovery-child-token".into(),
+                    parent_connection_id: "recovery-parent-conn".into(),
+                    parent_tool_use_id: "listener-replace-replay".into(),
+                    external_handle: None,
+                    input: json!({
+                        "agent_type": "codex",
+                        "task": "replacement contract task",
+                        "working_dir": workspace,
+                        "work_unit_key": "task|listener-replace|implementer|codex|none",
+                        "replaces_task_id": source_task_id,
+                        "replacement_reason": "admission_unknown",
+                        "correlation_id": "listener-replace-replay",
+                        "recovery_authorization_id": authorization_id,
+                    }),
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                replay["status"], "running",
+                "authorized replacement must admit: {replay:?}"
+            );
+            let row = recovery_authorization::Entity::find_by_id(&authorization_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load consumed replacement authorization")
+                .expect("consumed replacement authorization row");
+            assert_eq!(row.status, RecoveryAuthorizationStatus::Consumed);
+        }
+
+        #[tokio::test]
+        async fn delegation_child_cannot_call_recover_workflow_or_authorize_foreign_subject() {
+            let fixture = recovery_fixture().await;
+            let owned = seed_confirmable_task(&fixture, fixture.parent_id, "owned").await;
+            let other_parent =
+                seed_conversation(&fixture.db, fixture.folder_id, AgentType::ClaudeCode).await;
+            let sibling = seed_confirmable_task(&fixture, other_parent, "sibling").await;
+            let ancestor = seed_confirmable_task(&fixture, other_parent, "ancestor").await;
+            let unrelated = seed_confirmable_task(&fixture, other_parent, "unrelated").await;
+
+            for (index, foreign) in [&sibling, &ancestor, &unrelated].into_iter().enumerate() {
+                let outcome = immediate_call(
+                    Arc::clone(&fixture.listener),
+                    authorization_request(
+                        "recovery-child-token",
+                        foreign,
+                        &format!("foreign-{index}"),
+                    ),
+                )
+                .await;
+                assert_eq!(outcome["error"]["code"], "recovery_subject_not_owned");
+                assert_eq!(authorization_count(&fixture).await, 0);
+            }
+
+            let workflow = immediate_call(
+                Arc::clone(&fixture.listener),
+                BrokerMessage::RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest {
+                    token: "recovery-child-token".into(),
+                    subject_kind: RecoverySubjectKind::Workflow,
+                    subject_id: "foreign-workflow".into(),
+                    correlation_id: "recovery-foreign-workflow".into(),
+                    proposed_user_reason: None,
+                }),
+            )
+            .await;
+            assert_eq!(workflow["error"]["code"], "root_only");
+            assert_eq!(authorization_count(&fixture).await, 0);
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &owned, "owned"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 1).await;
+            let registered = fixture.questions.registered.lock().await;
+            assert_eq!(registered[0].0, "recovery-parent-conn");
+            assert_eq!(registered[0].1.len(), 1);
+            assert_eq!(registered[0].1[0].question, "recovery_authorization");
+            assert_eq!(
+                registered[0].1[0]
+                    .recovery
+                    .as_ref()
+                    .expect("fixed recovery presentation")
+                    .subject,
+                "delegation_task"
+            );
+            drop(registered);
+            fixture
+                .questions
+                .answer("q-1", question_outcome(Some(RECOVERY_DECLINE_LABEL), false))
+                .await;
+            let outcome = finish_call(client, server).await;
+            assert_eq!(outcome["status"], "declined");
+            assert_eq!(authorization_count(&fixture).await, 1);
+
+            let recover = immediate_call(
+                Arc::clone(&fixture.listener),
+                BrokerMessage::RecoverWorkflow(BrokerRecoverWorkflowRequest {
+                    token: "recovery-child-token".into(),
+                    workflow_id: "foreign-workflow".into(),
+                    recovery_authorization_id: "authorization-token".into(),
+                    expected_manifest_revision: 1,
+                    correlation_id: "recovery-child-workflow".into(),
+                }),
+            )
+            .await;
+            assert_eq!(recover["error"]["code"], "root_only");
+            assert_eq!(authorization_count(&fixture).await, 1);
+        }
+
+        #[tokio::test]
+        async fn authorization_question_decline_dismiss_disconnect_and_reconnect_map_to_stable_statuses(
+        ) {
+            let fixture = recovery_fixture().await;
+            let approved = seed_confirmable_task(&fixture, fixture.parent_id, "approve").await;
+            let declined = seed_confirmable_task(&fixture, fixture.parent_id, "decline").await;
+            let dismissed = seed_confirmable_task(&fixture, fixture.parent_id, "dismiss").await;
+            let abandoned = seed_confirmable_task(&fixture, fixture.parent_id, "abandon").await;
+            let duplicate = seed_confirmable_task(&fixture, fixture.parent_id, "duplicate").await;
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &approved, "approve"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 1).await;
+            fixture
+                .questions
+                .answer("q-1", question_outcome(Some(RECOVERY_APPROVE_LABEL), false))
+                .await;
+            let approved_outcome = finish_call(client, server).await;
+            assert_eq!(approved_outcome["status"], "approved");
+            let approved_id = approved_outcome["recovery_authorization_id"]
+                .as_str()
+                .expect("approved authorization id")
+                .to_string();
+
+            fixture
+                .tokens
+                .register(
+                    "recovery-reconnect-token".into(),
+                    TokenEntry {
+                        parent_connection_id: "recovery-reconnected-parent".into(),
+                        working_dir: PathBuf::from("/tmp"),
+                        coordination_v1: true,
+                        delegation_continuation_v1: true,
+                        role: CompanionRole::DelegationChild,
+                        workflow_v2: false,
+                    },
+                )
+                .await;
+            let reconnected = immediate_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-reconnect-token", &approved, "reconnect"),
+            )
+            .await;
+            assert_eq!(reconnected["status"], "approved");
+            assert_eq!(reconnected["reused"], true);
+            assert_eq!(reconnected["recovery_authorization_id"], approved_id);
+            assert_eq!(fixture.questions.registered.lock().await.len(), 1);
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &declined, "decline"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 2).await;
+            fixture
+                .questions
+                .answer("q-2", question_outcome(Some(RECOVERY_DECLINE_LABEL), false))
+                .await;
+            assert_eq!(finish_call(client, server).await["status"], "declined");
+
+            let (client, server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &dismissed, "dismiss"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 3).await;
+            fixture
+                .questions
+                .answer("q-3", question_outcome(None, true))
+                .await;
+            assert_eq!(finish_call(client, server).await["status"], "declined");
+
+            let (abandoned_client, abandoned_server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &abandoned, "abandon"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 4).await;
+            drop(abandoned_client);
+            tokio::time::timeout(Duration::from_secs(5), abandoned_server)
+                .await
+                .expect("disconnect cleanup")
+                .expect("disconnect listener task")
+                .expect("disconnect listener result");
+            let abandoned_row = recovery_authorization::Entity::find()
+                .filter(recovery_authorization::Column::SubjectId.eq(&abandoned))
+                .one(&fixture.db.conn)
+                .await
+                .expect("load abandoned authorization")
+                .expect("abandoned authorization row");
+            assert_eq!(abandoned_row.status, RecoveryAuthorizationStatus::Abandoned);
+
+            let (first_client, first_server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &duplicate, "duplicate-a"),
+            )
+            .await;
+            wait_for_questions(&fixture.questions, 5).await;
+            let (second_client, second_server) = start_call(
+                Arc::clone(&fixture.listener),
+                authorization_request("recovery-child-token", &duplicate, "duplicate-b"),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                fixture.questions.registered.lock().await.len(),
+                5,
+                "duplicate pending callers must share one question"
+            );
+            fixture
+                .questions
+                .answer("q-5", question_outcome(Some(RECOVERY_APPROVE_LABEL), false))
+                .await;
+            let first = finish_call(first_client, first_server).await;
+            let second = finish_call(second_client, second_server).await;
+            assert_eq!(first["status"], "approved");
+            assert_eq!(second["status"], "approved");
+            assert_eq!(
+                first["recovery_authorization_id"],
+                second["recovery_authorization_id"]
+            );
+            assert!(first["reused"] == true || second["reused"] == true);
+        }
     }
 }

@@ -1,9 +1,18 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi } from "vitest"
 
 import { AskQuestionCard } from "./ask-question-card"
+import arMessages from "@/i18n/messages/ar.json"
+import deMessages from "@/i18n/messages/de.json"
 import enMessages from "@/i18n/messages/en.json"
+import esMessages from "@/i18n/messages/es.json"
+import frMessages from "@/i18n/messages/fr.json"
+import jaMessages from "@/i18n/messages/ja.json"
+import koMessages from "@/i18n/messages/ko.json"
+import ptMessages from "@/i18n/messages/pt.json"
+import zhCNMessages from "@/i18n/messages/zh-CN.json"
+import zhTWMessages from "@/i18n/messages/zh-TW.json"
 import type { PendingQuestionState, QuestionAnswer } from "@/lib/types"
 
 function renderCard(
@@ -141,6 +150,294 @@ const twoMultiFirst: PendingQuestionState = {
 }
 
 describe("AskQuestionCard", () => {
+  it("localizes a recovery card from codes and submits raw approve or decline", async () => {
+    const actions = [
+      "continue",
+      "fresh_dispatch",
+      "replace",
+      "recover_workflow",
+      "reset_plan_lineage",
+    ] as const
+    const causes = [
+      "completed",
+      "revision_eligible_failure",
+      "unexpected_transport_loss",
+      "unexpected_process_loss",
+      "unexpected_session_loss",
+      "unexpected_host_restart",
+      "unexpected_child_connection_loss",
+      "parent_canceled",
+      "parent_turn_failed",
+      "join_abandoned",
+      "user_cancelled",
+      "tool_stalled_timeout",
+      "legacy_parent_disconnect",
+      "intentional_parent_disconnect",
+      "malformed_termination_audit",
+      "pre_admission_retry",
+      "pre_admission_abort",
+      "admission_failed",
+      "admission_unknown",
+      "missing_resume_identity",
+      "unsupported_reuse",
+      "persisted_unresumable",
+      "continue_budget_exhausted",
+      "replacement_budget_exhausted",
+      "route_rejected",
+      "stale_source",
+      "busy_source",
+      "structural_fence",
+      "contradictory_evidence",
+      "legacy_block_with_current_plan_approval",
+      "legacy_block_with_current_plan",
+      "legacy_block_without_plan",
+      "plan_user_decision_required",
+      "plan_gate_blocked",
+      "explicit_manifest_block",
+      "unresolved_task_cohort",
+      "durable_state_inconsistent",
+    ] as const
+    const risks = [
+      "normal",
+      "execution_may_have_occurred",
+      "explicit_user_stop",
+      "legacy_unknown_origin",
+      "plan_lineage_reset",
+      "durable_state_risk",
+    ] as const
+    const subjects = ["delegation_task", "workflow"] as const
+    const locales = [
+      ["en", enMessages],
+      ["ar", arMessages],
+      ["de", deMessages],
+      ["es", esMessages],
+      ["fr", frMessages],
+      ["ja", jaMessages],
+      ["ko", koMessages],
+      ["pt", ptMessages],
+      ["zh-CN", zhCNMessages],
+      ["zh-TW", zhTWMessages],
+    ] as const
+
+    const recoveryQuestion = (
+      action: (typeof actions)[number],
+      cause: (typeof causes)[number],
+      risk: (typeof risks)[number],
+      subject: (typeof subjects)[number]
+    ): PendingQuestionState => ({
+      question_id: `recovery-${action}-${cause}-${risk}-${subject}`,
+      created_at: "2026-01-01T00:00:00Z",
+      questions: [
+        {
+          id: "recovery-choice",
+          question: "MODEL-PROVIDED QUESTION MUST NOT RENDER",
+          header: "MODEL HEADER",
+          multi_select: false,
+          options: [
+            {
+              label: "approve",
+              description: "MODEL APPROVE COPY MUST NOT RENDER",
+            },
+            {
+              label: "decline",
+              description: "MODEL DECLINE COPY MUST NOT RENDER",
+            },
+          ],
+          recovery: {
+            subject,
+            action,
+            target: "MODEL TARGET MUST NOT RENDER",
+            cause,
+            risk,
+            display_reason: "MODEL REASON MUST NOT RENDER",
+          },
+        },
+      ],
+    })
+
+    for (const [locale, messages] of locales) {
+      for (let index = 0; index < causes.length; index += 1) {
+        const action = actions[index % actions.length]
+        const risk = risks[index % risks.length]
+        const subject = subjects[index % subjects.length]
+        const onAnswer = vi.fn().mockResolvedValue(undefined)
+        render(
+          <NextIntlClientProvider locale={locale} messages={messages}>
+            <AskQuestionCard
+              question={recoveryQuestion(action, causes[index], risk, subject)}
+              onAnswer={onAnswer}
+            />
+          </NextIntlClientProvider>
+        )
+
+        if (locale === "en") {
+          expect(
+            screen.getByRole("group", {
+              name: "Recovery confirmation required",
+            })
+          ).toBeInTheDocument()
+        }
+
+        expect(
+          screen.getByRole("group", {
+            name: messages.Folder.chat.askQuestion.recovery.title,
+          })
+        ).toBeInTheDocument()
+        expect(
+          screen.getByText(
+            messages.Folder.chat.askQuestion.recovery.actions[action]
+          )
+        ).toBeInTheDocument()
+        expect(
+          screen.getByText(
+            messages.Folder.chat.askQuestion.recovery.causes[causes[index]]
+          )
+        ).toBeInTheDocument()
+        expect(
+          screen.getByText(
+            messages.Folder.chat.askQuestion.recovery.risks[risk]
+          )
+        ).toBeInTheDocument()
+        expect(
+          screen.getByText(
+            messages.Folder.chat.askQuestion.recovery.subjects[subject]
+          )
+        ).toBeInTheDocument()
+        for (const modelCopy of [
+          "MODEL-PROVIDED QUESTION MUST NOT RENDER",
+          "MODEL HEADER",
+          "MODEL APPROVE COPY MUST NOT RENDER",
+          "MODEL DECLINE COPY MUST NOT RENDER",
+          "MODEL TARGET MUST NOT RENDER",
+          "MODEL REASON MUST NOT RENDER",
+        ]) {
+          expect(screen.queryByText(modelCopy)).not.toBeInTheDocument()
+        }
+        expect(screen.queryByRole("radio")).not.toBeInTheDocument()
+        expect(screen.queryByRole("textbox")).not.toBeInTheDocument()
+        expect(
+          screen.queryByRole("button", {
+            name: messages.Folder.chat.askQuestion.skip,
+          })
+        ).not.toBeInTheDocument()
+        cleanup()
+      }
+    }
+
+    const approve = deferred()
+    const onApprove = vi.fn().mockReturnValue(approve.promise)
+    const approveQuestion = recoveryQuestion(
+      "continue",
+      "parent_canceled",
+      "explicit_user_stop",
+      "delegation_task"
+    )
+    const { rerender } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <AskQuestionCard question={approveQuestion} onAnswer={onApprove} />
+      </NextIntlClientProvider>
+    )
+    const approveButton = screen.getByRole("button", {
+      name: enMessages.Folder.chat.askQuestion.recovery.approve,
+    })
+    const declineButton = screen.getByRole("button", {
+      name: enMessages.Folder.chat.askQuestion.recovery.decline,
+    })
+    fireEvent.click(approveButton)
+    expect(onApprove).toHaveBeenCalledWith(approveQuestion.question_id, {
+      answers: [{ questionId: "recovery-choice", labels: ["approve"] }],
+      declined: false,
+    })
+    expect(approveButton).toBeDisabled()
+    expect(declineButton).toBeDisabled()
+    approve.resolve()
+    await act(async () => {
+      await approve.promise
+    })
+    const replacementQuestion = recoveryQuestion(
+      "replace",
+      "tool_stalled_timeout",
+      "execution_may_have_occurred",
+      "delegation_task"
+    )
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <AskQuestionCard question={replacementQuestion} onAnswer={vi.fn()} />
+      </NextIntlClientProvider>
+    )
+    expect(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.askQuestion.recovery.approve,
+      })
+    ).toBeEnabled()
+    expect(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.askQuestion.recovery.decline,
+      })
+    ).toBeEnabled()
+    cleanup()
+
+    const onDecline = vi.fn().mockResolvedValue(undefined)
+    const declineQuestion = recoveryQuestion(
+      "recover_workflow",
+      "plan_gate_blocked",
+      "normal",
+      "workflow"
+    )
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <AskQuestionCard question={declineQuestion} onAnswer={onDecline} />
+      </NextIntlClientProvider>
+    )
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.askQuestion.recovery.decline,
+      })
+    )
+    expect(onDecline).toHaveBeenCalledWith(declineQuestion.question_id, {
+      answers: [{ questionId: "recovery-choice", labels: ["decline"] }],
+      declined: true,
+    })
+    cleanup()
+
+    for (const mutation of [
+      { action: "unknown_action" },
+      { cause: "unknown_cause" },
+      { risk: "unknown_risk" },
+      { subject: "unknown_subject" },
+    ]) {
+      const unknown = recoveryQuestion(
+        "continue",
+        "parent_canceled",
+        "normal",
+        "delegation_task"
+      )
+      Object.assign(unknown.questions[0].recovery!, mutation)
+      const { container } = render(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <AskQuestionCard question={unknown} onAnswer={vi.fn()} />
+        </NextIntlClientProvider>
+      )
+      expect(container).toBeEmptyDOMElement()
+      cleanup()
+    }
+  })
+
+  it("keeps generic ask_user_question behavior unchanged", () => {
+    const onAnswer = renderCard(single)
+    expect(screen.getByText("Which approach?")).toBeInTheDocument()
+    expect(screen.getByText("smaller diffs")).toBeInTheDocument()
+    expect(screen.getByText("Other")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Skip" })).toBeInTheDocument()
+    expect(screen.queryByText(/recovery/i)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("radio", { name: /Incremental/ }))
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }))
+    expect(onAnswer).toHaveBeenCalledWith("q-1", {
+      answers: [{ questionId: "qa", labels: ["Incremental"] }],
+      declined: false,
+    })
+  })
+
   it("submits a single-select choice keyed by question id", () => {
     const onAnswer = renderCard(single)
     fireEvent.click(screen.getByRole("radio", { name: /Incremental/ }))

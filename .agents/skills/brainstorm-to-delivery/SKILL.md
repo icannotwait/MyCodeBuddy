@@ -23,16 +23,13 @@ full procedures here.
 
 ## Codeg roles and tools
 
-| Work unit | Agent | First dispatch | Continue |
-| --- | --- | --- | --- |
-| Plan Author | Codex (`agent_type: "codex"`) | Fresh Author work unit | Same Author for revisions / one holistic rewrite |
-| Plan reviewer (each) | Configured doc group (always includes Codex) | Independent child | Same reviewer for re-review |
-| Task implementer/fixer (normal) | Grok | New per Task | Same implementer for fix rounds |
-| Task implementer/fixer (high) | Codex | New per Task | Same implementer for fix rounds |
-| Task reviewer (normal) | Independent Codex | New per Task | Same reviewer |
-| Task reviewers (high) | Independent Codex **and** independent Grok | New per Task; neither reuses Author or implementer | Both re-review after every fix |
-| Final whole-branch reviewer | Codex | Always new | That Final thread only |
-| Final fixer | Grok | Only after non-pass Final | Never reuse a Task implementer |
+| Route | Role | Agent |
+| --- | --- | --- |
+| Normal | Implementer / fixer | Grok |
+| Normal | Independent reviewer | Codex |
+| High | Implementer / fixer | Codex |
+| High | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| High | Independent reviewer 2 | Grok (independent child) |
 
 Cross-agent routing uses Codeg `delegate_to_agent` / `continue_delegation`
 (`agent_type: "grok"` | `"codex"`). Discover delayed MCP tools before reporting
@@ -59,26 +56,18 @@ Keys are workspace-relative, NFC/B1-normalized, `|`-separated, ≤200 scalars:
 | Final reviewer   | `final_review\|reviewer\|{agent}\|{profile\|none}`  |
 | Final fixer      | `final_review\|fixer\|{agent}\|{profile\|none}`     |
 
-Prefer `continue_delegation` when the ledger shows a recoverable thread
-(including `canceled` + `parent_disconnected` after the child reached running).
-Same key cold `delegate_to_agent` without `replaces_task_id` is invalid once
-lineage exists. Replacement only for `unresumable` | `budget_exhausted_continue`
-| `not_supported` (and admission_* reasons), same key/role/profile, at most one
-replacement and two unexpected continues per work unit. Use
-`replacement_reason=unresumable` also for parent-end / explicit-cancel /
-stall codes that block continue (`parent_canceled`, `parent_turn_failed`,
-`join_abandoned`, `user_cancelled`, `tool_stalled_timeout`, and
-`parent_disconnected` when continue is not viable). Recovery is a **new turn**:
-re-inspect disk, treat prior reasoning as provisional, rebuild missing reports,
-re-run covering tests before claiming done.
+Prefer `continue_delegation` when the ledger shows a recoverable thread.
+Same-key cold `delegate_to_agent` without `replaces_task_id` is invalid once
+lineage exists. Recovery is a **new turn**: re-inspect disk, treat prior
+reasoning as provisional, rebuild missing reports, and re-run covering tests.
 
 ## Workflow capability (v2 only)
 
 Before first Design dispatch, call `get_workflow_capabilities`. Require the
 full v2 tool set (`get_workflow_capabilities`, `get_workflow_state`,
-`publish_workflow_manifest`, `settle_workflow_gate`). Missing or inconsistent
-tools → hard block. **Do not use legacy capability mode or any pre-v2 manifest
-schema.**
+`publish_workflow_manifest`, `settle_workflow_gate`, `recover_workflow`).
+Missing or inconsistent tools → hard block. **Do not use legacy capability
+mode or any pre-v2 manifest schema.**
 
 Publish with schema v2 only (`workflow_kind=brainstorm_to_delivery`), required
 `plan_target_rel_path`, `risk_policy_version: "b2d_task_risk_v1"`, Task
@@ -92,16 +81,40 @@ estimated (digest, matrix, policies, routes, full initial required set) →
 parent `settle_workflow_gate` → approved. Material Plan change demotes to
 estimated and reopens Plan review.
 
-Recovery is index-first. Call `get_workflow_state` with omitted `detail` or
-`detail=index`; one index read supplies authoritative gate cycles/outcomes,
-counts + `next_action`, full Plan reviewer cohort, `recovery_sources`, and
-current/next `actionable_task_routes`. Before settlement, the root reads each
-referenced workspace `report_file`; use `get_session_info` with bounded
-`max_messages` for a selected child transcript and `get_delegation_status` for
-selected `latest_task_id` outcomes. Never depend on inline finding summaries,
-full policy evidence/reasons, replacement chains, or
-complete historical node lists. Use the ledger for durable thread bookkeeping,
-and never invent a second active workflow from memory.
+Recovery is index-first. Treat recovery_sources and actionable_task_routes as
+authoritative. Read each workspace report_file before settlement, use
+get_session_info for bounded child transcripts, and use get_delegation_status
+for selected run outcomes. Never depend on inline finding summaries.
+
+Recovery is status-first and resume-first. Cancellation-family evidence never
+maps to unresumable, and tool_stalled_timeout is not a replacement source.
+For tool_stalled_timeout, use a confirmed same-key continue; only genuine
+unexpected transport loss may continue without confirmation when central
+policy permits.
+
+Delegation recovery follows this exact ordered recipe: make the projected call;
+receive typed recovery_confirmation_required; call
+request_recovery_authorization; then replay the exact rejected continue or
+replacement call with recovery_authorization_id and the same key, profile, and
+action. Never persist recovery_authorization_id in status, ledger, report, or
+card.
+
+Workflow recovery follows this exact ordered recipe: get_workflow_state; call
+request_recovery_authorization; then call receipt-required recover_workflow.
+An enabled catalog missing recover_workflow hard-blocks. recover_workflow never
+generates a challenge. user_decision_required requires exact reset_plan_lineage
+authorization tied to the displayed reason hash; its receipt is the durable
+requirements-change reason and begins a new authorized stagnation baseline.
+
+First admission freezes the key, role, agent, profile, and inherited continue
+and replacement counters. Pre-admission profile or route correction is a
+material Plan revision. Recovery never changes key/profile or resets inherited
+consumption. Exhausted continue uses same-key budget_exhausted_continue replacement
+only while replacement budget remains; after replacement consumption, block.
+
+Before every delegation or continue, write ledger intent with intended key,
+role, agent, profile, and action. Fill latest_task_id after admission and
+reconcile from platform state after recovery.
 
 Every Design/Plan/Task/Final child must emit one validated terminal
 `<!-- codeg-card-summary-v1 ... -->` block **in the final assistant message
@@ -111,12 +124,15 @@ markdown-linked or touched report `.md` as a fallback; still require chat
 emission in child prompts. Review pass set: `approve` | `approve_with_minors`.
 Implementation pass set: `done` | `done_with_concerns`.
 
-If Final (or any review work unit) completes and the platform summary is
-missing/unvalidated, **do not** treat prose verdicts as authoritative. Prefer
-`continue_delegation` on that reviewer to re-emit the card in chat (and keep
-the report). For Final `request_changes`/`block` only: after a validated
-non-pass card is present, dispatch Final fixer. Never start Final fixer on
-chat prose alone.
+A platform-harvested and validated card settles. Failed or unavailable harvest
+degrades the child and requires same-child continue to re-emit the card; prose
+never settles. For Final `request_changes`/`block` only: after a validated
+non-pass card is present, dispatch Final fixer.
+
+Normal Task review independently recomputes b2d_task_risk_v1. Migration,
+security/authorization, concurrency, persistence/state-machine,
+externally visible compatibility, and ambiguity each trigger external Design
+review.
 
 Respect platform bounds (Tasks≤100, nodes≤400, edges≤800, gates≤50, adj≤4KiB,
 JSON≤512KiB). Details of wire fields live in tools/validation—do not restate
@@ -243,8 +259,7 @@ Run full `subagent-driven-development`. B2D only overrides agent routing:
 - Risk route replaces generic model discretion for Task agent types.
 - Normal: one Grok implementer + one Codex reviewer.
 - High: Codex implementer + Codex and Grok reviewers; join at one gate.
-- Fix-round profile escalation may only pick a profile still legal under the
-  frozen route; it may not change agent type or drop a reviewer.
+- Admitted key, role, agent, and profile remain frozen through every fix round.
 - Final whole-branch review remains a new Codex child after all active Task
   gates pass; Final fixer is Grok on non-pass Final only.
 
@@ -268,13 +283,17 @@ worktree, blockers.
 | Post-admission risk looks wrong | Block + escalate; do not mutate `cohort_frozen` |
 | Urgency / small Task | Still Author + Plan review + risk route + SDD |
 | Agent unavailable | Hard block; no agent substitution |
-| Design Gate approved | In the same parent turn, dispatch the fresh Codex Plan Author. Do not request extra user approval. |
-| Plan Gate approved | Immediately run the Workspace gate, then dispatch the first eligible Task. Do not request extra user approval. |
-| Task Gate passed | Immediately dispatch the next eligible Task; after all active Task gates pass, dispatch a new Final reviewer. Do not request extra user approval. |
-| Final review approved | Immediately verify, commit, and report. Do not request extra user approval. |
+| Design Gate approved | Design Gate approved -> dispatch Plan Author automatically. |
+| Plan Gate approved | Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically. |
+| Task Gate passed | Task Gate passed -> dispatch the next eligible Task or Final review automatically. |
+| Final review approved | Final review approved -> verify, commit, and report automatically. |
 | Final request_changes / block with validated card | Immediately dispatch Final fixer (Grok). Do not request extra user approval. |
-| Final completed but card missing / unvalidated | `continue_delegation` Final reviewer to re-emit `codeg-card-summary-v1` in chat (report alone is not enough for the parent to advance). Platform may auto-harvest from the report file; still rebind if admission fails. |
-| Any phase could continue | Only pause for a platform hard block, `user_decision_required`, or a change to requirements, scope, architecture, or user data handling; otherwise continue. |
+| Missing chat card | A platform-harvested validated card settles without re-emission. If harvest fails or is unavailable, degrade the child and `continue_delegation` on the same child to re-emit; prose never settles. |
+| Cancellation-family / `tool_stalled_timeout` | Never map cancellation to `unresumable`; stall uses confirmed same-key continue before replacement. |
+| Typed delegation recovery challenge | Projected call -> `recovery_confirmation_required` -> `request_recovery_authorization` -> exact rejected call replay with the ID. |
+| Workflow recovery | `get_workflow_state` -> `request_recovery_authorization` -> receipt-required `recover_workflow`; a missing enabled tool hard-blocks. |
+| Continue budget exhausted | Same-key `budget_exhausted_continue` replacement if its budget remains; otherwise block. |
+| Any phase could continue | Only pause for a hard block, `user_decision_required`, or an unresolved choice that changes requirements, scope, architecture, or user data handling. |
 | Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
 | Context compacted / recovery resumed | One index read for gates, counts, reviewer sets, and current/next routes; read referenced reports and bounded secondary detail before settle |
 
@@ -294,7 +313,11 @@ worktree, blockers.
 | “`spawn_agent` can’t pick Grok.” | Use Codeg `delegate_to_agent`. |
 | “The Gate is approved, but I should ask the user to confirm the next phase.” | An approved Gate is not a user gate. Dispatch the next admissible work unit in the same parent turn. |
 | “A ledger or document still says pending, so I should stop.” | Reconcile with `get_workflow_state`; only its hard block or an explicit pause condition may stop advancement. |
-| “Final said request_changes in prose / report; start fixer.” | Need platform-validated card (`summary_validated` + verdict). Rebind Final reviewer if missing; then Final fixer. |
+| “Cancellation means the child is unresumable, so replacement is faster.” | Cancellation-family evidence never proves `unresumable`; preserve the admitted key/profile and follow the confirmed authorization sequence. |
+| “A stalled tool can be replaced immediately because the deadline is tight.” | `tool_stalled_timeout` is resume-first and requires a confirmed same-key continue. |
+| “The old four-tool catalog is close enough.” | Workflow recovery requires `recover_workflow`; its absence from an enabled catalog hard-blocks. |
+| “The user approved in prose, so the workflow can reset.” | Prose never settles. `user_decision_required` needs the exact reason-hash-bound `reset_plan_lineage` receipt. |
+| “Final said request_changes in prose / report; start fixer.” | Need a platform-validated card. Harvest it or continue the same child to re-emit before Final fixer. |
 
 ## Red flags — stop
 
@@ -305,6 +328,9 @@ worktree, blockers.
 - Grok implementer on hard-trigger Tasks
 - Gate pass without matching `reviewed_task_id` + non-empty `artifact_digest`
 - Silent cohort drop or conversation-stop as cancel
+- Cancellation or stall treated as proof of `unresumable`
+- Recovery changes key/profile, resets consumption, or skips the typed challenge
+- Prose approval, missing recovery receipt, or an incomplete enabled tool catalog
 
 ## End-to-end example
 

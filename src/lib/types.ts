@@ -1250,6 +1250,71 @@ export interface QuestionOption {
   description: string
 }
 
+export type RecoverySubjectCode = "delegation_task" | "workflow"
+
+export type RecoveryActionCode =
+  | "continue"
+  | "fresh_dispatch"
+  | "replace"
+  | "recover_workflow"
+  | "reset_plan_lineage"
+
+export type RecoveryRiskCode =
+  | "normal"
+  | "execution_may_have_occurred"
+  | "explicit_user_stop"
+  | "legacy_unknown_origin"
+  | "plan_lineage_reset"
+  | "durable_state_risk"
+
+export type RecoveryCauseCode =
+  | "completed"
+  | "revision_eligible_failure"
+  | "unexpected_transport_loss"
+  | "unexpected_process_loss"
+  | "unexpected_session_loss"
+  | "unexpected_host_restart"
+  | "unexpected_child_connection_loss"
+  | "parent_canceled"
+  | "parent_turn_failed"
+  | "join_abandoned"
+  | "user_cancelled"
+  | "tool_stalled_timeout"
+  | "legacy_parent_disconnect"
+  | "intentional_parent_disconnect"
+  | "malformed_termination_audit"
+  | "pre_admission_retry"
+  | "pre_admission_abort"
+  | "admission_failed"
+  | "admission_unknown"
+  | "missing_resume_identity"
+  | "unsupported_reuse"
+  | "persisted_unresumable"
+  | "continue_budget_exhausted"
+  | "replacement_budget_exhausted"
+  | "route_rejected"
+  | "stale_source"
+  | "busy_source"
+  | "structural_fence"
+  | "contradictory_evidence"
+  | "legacy_block_with_current_plan_approval"
+  | "legacy_block_with_current_plan"
+  | "legacy_block_without_plan"
+  | "plan_user_decision_required"
+  | "plan_gate_blocked"
+  | "explicit_manifest_block"
+  | "unresolved_task_cohort"
+  | "durable_state_inconsistent"
+
+export interface RecoveryQuestionPresentation {
+  subject: string
+  action: string
+  target: string
+  cause: string
+  risk: string
+  display_reason?: string | null
+}
+
 /** A single multiple-choice question (mirror of Rust `QuestionSpec`). `id` is
  *  the backend-minted correlation key the answer is submitted against. Empty
  *  `options` means free-text: the card renders only its "Other" input (codex
@@ -1262,6 +1327,7 @@ export interface QuestionSpec {
   multi_select: boolean
   options: QuestionOption[]
   is_secret?: boolean
+  recovery?: RecoveryQuestionPresentation
 }
 
 /** Awaiting-answer question set on the session (mirror of `PendingQuestionState`). */
