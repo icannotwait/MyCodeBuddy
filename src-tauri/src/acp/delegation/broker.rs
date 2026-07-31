@@ -100,9 +100,10 @@ use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
     AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
-    DelegationOutcome, DelegationProfile, DelegationReplyResult, DelegationRequest,
-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ObservationSnapshot,
-    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
+    DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
+    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
+    ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
@@ -6176,37 +6177,35 @@ impl DelegationBroker {
                     })
                     .unwrap_or_else(|| call_id.clone()),
             };
-            let authorized_projection = if req.recovery_authorization_id.is_some() {
-                match insert.replaced_task_id.as_deref() {
-                    Some(source_task_id) => runs
-                        .recovery_projection_for_task(source_task_id)
-                        .await
-                        .ok()
-                        .flatten(),
-                    None => None,
-                }
-            } else {
-                None
-            };
-            match runs
+            let admitted = match runs
                 .admit_gen1_reserving_authorized(insert, authorization)
                 .await
             {
+                Ok(Gen1AdmitOutcome::AuthorizedCreated {
+                    run,
+                    recovery_decision,
+                }) => {
+                    let projection = DelegationRecoveryProjection::from(&recovery_decision);
+                    if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                        self.record_recovery_event(
+                            RecoveryMetricEventKind::Decision,
+                            Some(&run.task_id),
+                            Some(authorization_id),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            projection.proposed_action.as_deref(),
+                            Some(&projection.cause_code),
+                            Some(&projection.risk_class),
+                            None,
+                        );
+                    }
+                    Ok(Gen1AdmitOutcome::Created(run))
+                }
+                other => other,
+            };
+            match admitted {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
                     if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
-                        if let Some(projection) = authorized_projection.as_ref() {
-                            self.record_recovery_event(
-                                RecoveryMetricEventKind::Decision,
-                                Some(&run.task_id),
-                                Some(authorization_id),
-                                Some(run.parent_conversation_id),
-                                Some(run.child_conversation_id),
-                                projection.proposed_action.as_deref(),
-                                Some(&projection.cause_code),
-                                Some(&projection.risk_class),
-                                None,
-                            );
-                        }
                         for kind in [
                             RecoveryMetricEventKind::ConfirmationApproved,
                             RecoveryMetricEventKind::AuthorizationConsumed,
@@ -6276,6 +6275,9 @@ impl DelegationBroker {
                             .await;
                     }
                     prebound_child = Some((child_row.id, folder.id));
+                }
+                Ok(Gen1AdmitOutcome::AuthorizedCreated { .. }) => {
+                    unreachable!("authorized created outcome normalized above")
                 }
                 Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
                     // Race after pre-check: matching fingerprint already reserved.
@@ -8691,33 +8693,35 @@ impl DelegationBroker {
                 })
                 .unwrap_or_else(|| new_task_id.clone()),
         };
-        let authorized_projection = if req.recovery_authorization_id.is_some() {
-            runs.recovery_projection_for_task(&req.target_task_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let admitted = runs
+        let admitted = match runs
             .admit_continue_reserving_authorized(admission, authorization)
-            .await;
+            .await
+        {
+            Ok(ContinueAdmitOutcome::AuthorizedCreated {
+                run,
+                recovery_decision,
+            }) => {
+                let projection = DelegationRecoveryProjection::from(&recovery_decision);
+                if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                    self.record_recovery_event(
+                        RecoveryMetricEventKind::Decision,
+                        Some(&run.task_id),
+                        Some(authorization_id),
+                        Some(run.parent_conversation_id),
+                        Some(run.child_conversation_id),
+                        projection.proposed_action.as_deref(),
+                        Some(&projection.cause_code),
+                        Some(&projection.risk_class),
+                        None,
+                    );
+                }
+                Ok(ContinueAdmitOutcome::Created(run))
+            }
+            other => other,
+        };
         match &admitted {
             Ok(ContinueAdmitOutcome::Created(run)) => {
                 if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
-                    if let Some(projection) = authorized_projection.as_ref() {
-                        self.record_recovery_event(
-                            RecoveryMetricEventKind::Decision,
-                            Some(&run.task_id),
-                            Some(authorization_id),
-                            Some(run.parent_conversation_id),
-                            Some(run.child_conversation_id),
-                            projection.proposed_action.as_deref(),
-                            Some(&projection.cause_code),
-                            Some(&projection.risk_class),
-                            None,
-                        );
-                    }
                     for kind in [
                         RecoveryMetricEventKind::ConfirmationApproved,
                         RecoveryMetricEventKind::AuthorizationConsumed,
@@ -8735,6 +8739,9 @@ impl DelegationBroker {
                         );
                     }
                 }
+            }
+            Ok(ContinueAdmitOutcome::AuthorizedCreated { .. }) => {
+                unreachable!("authorized created outcome normalized above")
             }
             Err(error) => self.record_recovery_admission_error(
                 error,
@@ -8756,6 +8763,9 @@ impl DelegationBroker {
         // Post-reserve cancel check (does not drop the fence on None — the
         // Created path transfers it atomically into the handoff below).
         let reserved = match (admitted, self.take_inflight_cancel(inflight_id).await) {
+            (Ok(ContinueAdmitOutcome::AuthorizedCreated { .. }), _) => {
+                unreachable!("authorized created outcome normalized above")
+            }
             (Ok(ContinueAdmitOutcome::Created(run)), Some(parent_end)) => {
                 if let Err(error) = runs
                     .settle_terminal(
@@ -15352,6 +15362,65 @@ mod tests {
                     && event.code.as_ref().map(|value| value.as_str())
                         == Some("recovery_authorization_declined")
             }));
+        }
+
+        #[tokio::test]
+        async fn successful_recovery_decision_uses_transaction_authority_after_projection_failure()
+        {
+            let fixture = recovery_telemetry_fixture().await;
+            let challenge = fixture.challenge().await;
+            let authorizations = RecoveryAuthorizationStore::new(fixture.db.conn.clone());
+            let now = Utc::now();
+            let approved = authorizations
+                .insert_pending(&challenge, now)
+                .await
+                .expect("insert approved authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve authorization");
+
+            fixture.runs.fail_next_recovery_projection();
+            let mut request = fixture.replacement_request("transaction-authority");
+            request.recovery_authorization_id = Some(approved.authorization_id.clone());
+            let admitted = fixture.broker.start_delegation(request).await;
+            assert_eq!(admitted.status, TaskStatus::Running, "{admitted:?}");
+
+            let decisions: Vec<_> = fixture
+                .broker
+                .metrics()
+                .recovery_events()
+                .into_iter()
+                .filter(|event| event.kind == RecoveryMetricEventKind::Decision)
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "committed admission must emit one decision"
+            );
+            let event = &decisions[0];
+            assert_eq!(event.task_id.as_deref(), admitted.task_id.as_deref());
+            assert_eq!(
+                event.action.as_ref().map(|value| value.as_str()),
+                Some(challenge.allowed_action.as_str())
+            );
+            assert_eq!(
+                event.cause.as_ref().map(|value| value.as_str()),
+                Some(challenge.cause_code.as_str())
+            );
+            assert_eq!(
+                event.risk.as_ref().map(|value| value.as_str()),
+                Some(challenge.risk_class.as_str())
+            );
+            fixture
+                .runs
+                .recovery_projection_for_task(&fixture.source_task_id)
+                .await
+                .expect_err("standalone projection fault must remain unused by admission");
         }
 
         #[tokio::test]
