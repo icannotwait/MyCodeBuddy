@@ -511,14 +511,6 @@ struct PendingQuestionEntry {
     settling: bool,
 }
 
-fn question_settlement_retry_delay() -> std::time::Duration {
-    if cfg!(test) {
-        std::time::Duration::from_millis(1)
-    } else {
-        std::time::Duration::from_secs(1)
-    }
-}
-
 enum QuestionSettlementClaim {
     Missing,
     InFlight,
@@ -5570,42 +5562,85 @@ impl ConnectionManager {
     }
 
     async fn abandon_question_for_parent_teardown(&self, question_id: String) {
+        if let Err(error) = self
+            .settle_recovery_question_abandonment(&question_id, None)
+            .await
+        {
+            tracing::error!(
+                code = error.code(),
+                "[recovery_authorization] parent teardown abandonment stopped"
+            );
+        }
+    }
+
+    pub(crate) async fn abandon_recovery_question_until_terminal(
+        &self,
+        authorization_id: &str,
+        question_id: &str,
+    ) -> Result<(), crate::acp::recovery_authorization::RecoveryAuthorizationError> {
+        self.settle_recovery_question_abandonment(question_id, Some(authorization_id))
+            .await
+    }
+
+    async fn settle_recovery_question_abandonment(
+        &self,
+        question_id: &str,
+        expected_authorization_id: Option<&str>,
+    ) -> Result<(), crate::acp::recovery_authorization::RecoveryAuthorizationError> {
+        use crate::acp::recovery_authorization::{
+            recovery_cleanup_retry_delay, RecoveryAuthorizationError,
+        };
+
+        let mut claim_waits = 0_u32;
         let authorization_id = loop {
             match self.claim_question_settlement(&question_id).await {
-                QuestionSettlementClaim::Missing => return,
+                QuestionSettlementClaim::Missing => {
+                    let Some(expected_authorization_id) = expected_authorization_id else {
+                        return Ok(());
+                    };
+                    let Some(service) = self.recovery_authorization_service() else {
+                        return Err(RecoveryAuthorizationError::ChallengeConflict);
+                    };
+                    return service
+                        .abandon_until_terminal(expected_authorization_id, Some(question_id))
+                        .await;
+                }
                 QuestionSettlementClaim::InFlight => {
-                    tokio::time::sleep(question_settlement_retry_delay()).await
+                    let delay = recovery_cleanup_retry_delay(claim_waits);
+                    claim_waits = claim_waits.saturating_add(1);
+                    tokio::time::sleep(delay).await;
                 }
                 QuestionSettlementClaim::Claimed {
                     recovery_authorization_id,
                     ..
-                } => break recovery_authorization_id,
-            }
-        };
-        let Some(authorization_id) = authorization_id else {
-            self.finish_question_settlement(&question_id, None).await;
-            return;
-        };
-        let Some(service) = self.recovery_authorization_service() else {
-            self.release_question_settlement(&question_id).await;
-            return;
-        };
-        loop {
-            match service
-                .abandon_question(&authorization_id, &question_id)
-                .await
-            {
-                Ok(()) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        code = error.code(),
-                        "[recovery_authorization] parent teardown abandonment retry"
-                    );
-                    tokio::time::sleep(question_settlement_retry_delay()).await;
+                } => {
+                    let Some(authorization_id) = recovery_authorization_id else {
+                        self.finish_question_settlement(question_id, None).await;
+                        return Ok(());
+                    };
+                    if expected_authorization_id
+                        .is_some_and(|expected| expected != authorization_id)
+                    {
+                        self.release_question_settlement(question_id).await;
+                        return Err(RecoveryAuthorizationError::QuestionBindingConflict);
+                    }
+                    break authorization_id;
                 }
             }
+        };
+        let Some(service) = self.recovery_authorization_service() else {
+            self.release_question_settlement(question_id).await;
+            return Err(RecoveryAuthorizationError::ChallengeConflict);
+        };
+        if let Err(error) = service
+            .abandon_until_terminal(&authorization_id, Some(question_id))
+            .await
+        {
+            self.release_question_settlement(question_id).await;
+            return Err(error);
         }
-        self.finish_question_settlement(&question_id, None).await;
+        self.finish_question_settlement(question_id, None).await;
+        Ok(())
     }
 
     async fn claim_question_settlement(&self, question_id: &str) -> QuestionSettlementClaim {

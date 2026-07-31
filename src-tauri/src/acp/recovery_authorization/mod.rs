@@ -9,6 +9,7 @@ pub use types::*;
 #[cfg(test)]
 mod recovery_authorization {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
 
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -517,6 +518,268 @@ mod recovery_authorization {
         let rows = service.store().list_for_parent(parent).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, RecoveryAuthorizationStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn registration_refusal_cleanup_retries_after_request_is_dropped() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "registration-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("registration-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        let existing = manager
+            .register_question(
+                "registration-parent",
+                vec![crate::acp::question::generic_test_question()],
+            )
+            .await
+            .expect("occupy question channel");
+        let pause = service.pause_next_write(InjectedRecoveryWriteFailure::Abandon);
+        service.fail_next_write(InjectedRecoveryWriteFailure::Abandon);
+
+        let request_service = service.clone();
+        let request_manager = manager.clone_ref();
+        let request = tokio::spawn(async move {
+            request_service
+                .request(
+                    &request_manager,
+                    challenge(parent),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("registration rollback must reach injected abandonment");
+        let pending = service.store().list_for_parent(parent).await.unwrap()[0].clone();
+        request.abort();
+        let _ = request.await;
+        pause.release.notify_one();
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if row(&service, &pending.authorization_id).await.status
+                    == RecoveryAuthorizationStatus::Abandoned
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned registration rollback must retry to durable abandonment");
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("registration-parent")
+                .await,
+            1
+        );
+        assert_eq!(
+            manager
+                .pending_question_parent_connection_id(&existing.question_id)
+                .await
+                .as_deref(),
+            Some("registration-parent")
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rollback_retries_after_request_is_dropped_before_card_release() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "bind-retry-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("bind-retry-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        service.fail_next_write(InjectedRecoveryWriteFailure::Bind);
+        service.fail_next_write(InjectedRecoveryWriteFailure::Abandon);
+        let pause = service.pause_next_write(InjectedRecoveryWriteFailure::Abandon);
+
+        let request_service = service.clone();
+        let request_manager = manager.clone_ref();
+        let request = tokio::spawn(async move {
+            request_service
+                .request(
+                    &request_manager,
+                    challenge(parent),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("bind rollback must reach injected abandonment");
+        let pending = service.store().list_for_parent(parent).await.unwrap()[0].clone();
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("bind-retry-parent")
+                .await,
+            1
+        );
+        request.abort();
+        let _ = request.await;
+        pause.release.notify_one();
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if row(&service, &pending.authorization_id).await.status
+                    == RecoveryAuthorizationStatus::Abandoned
+                    && manager
+                        .pending_question_count_for_parent("bind-retry-parent")
+                        .await
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned bind rollback must retry before clearing the card");
+    }
+
+    #[tokio::test]
+    async fn request_token_cancellation_cleanup_survives_request_drop() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "cancel-retry-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("cancel-retry-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        let cancelled = CancellationToken::new();
+        let request_service = service.clone();
+        let request_manager = manager.clone_ref();
+        let request_cancelled = cancelled.clone();
+        let request = tokio::spawn(async move {
+            request_service
+                .request(&request_manager, challenge(parent), request_cancelled)
+                .await
+        });
+        let pending = loop {
+            let rows = service.store().list_for_parent(parent).await.unwrap();
+            if rows
+                .first()
+                .and_then(|row| row.question_id.as_ref())
+                .is_some()
+            {
+                break rows[0].clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        let pause = service.pause_next_write(InjectedRecoveryWriteFailure::Abandon);
+        service.fail_next_write(InjectedRecoveryWriteFailure::Abandon);
+        cancelled.cancel();
+        tokio::time::timeout(StdDuration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("request cancellation must reach injected abandonment");
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("cancel-retry-parent")
+                .await,
+            1
+        );
+        request.abort();
+        let _ = request.await;
+        pause.release.notify_one();
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if row(&service, &pending.authorization_id).await.status
+                    == RecoveryAuthorizationStatus::Abandoned
+                    && manager
+                        .pending_question_count_for_parent("cancel-retry-parent")
+                        .await
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cancellation cleanup must retry before clearing the card");
+    }
+
+    #[tokio::test]
+    async fn parent_teardown_not_found_completes_card_cleanup() {
+        let (db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "not-found-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("not-found-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        let (request, _pending, _answer_question_id) =
+            start_request(&service, &manager, "not-found-parent", challenge(parent)).await;
+        crate::db::entities::conversation::Entity::delete_by_id(parent)
+            .exec(&db.conn)
+            .await
+            .expect("delete parent conversation");
+        manager.cancel_questions_by_parent("not-found-parent").await;
+
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if manager
+                    .pending_question_count_for_parent("not-found-parent")
+                    .await
+                    == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("NotFound teardown is completed cleanup, not retryable");
+        let _ = request.await;
     }
 
     #[tokio::test]

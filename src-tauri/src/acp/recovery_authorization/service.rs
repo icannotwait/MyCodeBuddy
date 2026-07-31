@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration as StdDuration;
 
@@ -20,6 +22,22 @@ use super::{
 
 const PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
+pub(crate) fn recovery_cleanup_retry_delay(failed_attempts: u32) -> StdDuration {
+    let initial = if cfg!(test) {
+        StdDuration::from_millis(1)
+    } else {
+        StdDuration::from_millis(100)
+    };
+    let maximum = if cfg!(test) {
+        StdDuration::from_millis(8)
+    } else {
+        StdDuration::from_secs(5)
+    };
+    initial
+        .saturating_mul(1_u32 << failed_attempts.min(6))
+        .min(maximum)
+}
+
 pub trait RecoveryAuthorizationClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
@@ -38,7 +56,7 @@ pub struct RecoveryAuthorizationService {
     clock: Arc<dyn RecoveryAuthorizationClock>,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     #[cfg(test)]
-    injected_failure: Arc<Mutex<Option<InjectedRecoveryWriteFailure>>>,
+    injected_failures: Arc<Mutex<VecDeque<InjectedRecoveryWriteFailure>>>,
     #[cfg(test)]
     injected_pause: Arc<Mutex<Option<(InjectedRecoveryWriteFailure, InjectedRecoveryWritePause)>>>,
 }
@@ -72,7 +90,7 @@ impl RecoveryAuthorizationService {
             clock,
             notifications: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
-            injected_failure: Arc::new(Mutex::new(None)),
+            injected_failures: Arc::new(Mutex::new(VecDeque::new())),
             #[cfg(test)]
             injected_pause: Arc::new(Mutex::new(None)),
         }
@@ -80,10 +98,10 @@ impl RecoveryAuthorizationService {
 
     #[cfg(test)]
     pub fn fail_next_write(&self, failure: InjectedRecoveryWriteFailure) {
-        *self
-            .injected_failure
+        self.injected_failures
             .lock()
-            .expect("recovery failure injection lock poisoned") = Some(failure);
+            .expect("recovery failure injection lock poisoned")
+            .push_back(failure);
     }
 
     #[cfg(test)]
@@ -126,11 +144,11 @@ impl RecoveryAuthorizationService {
             pause.release.notified().await;
         }
         let mut injected = self
-            .injected_failure
+            .injected_failures
             .lock()
             .expect("recovery failure injection lock poisoned");
-        if injected.as_ref() == Some(&failure) {
-            *injected = None;
+        if injected.front() == Some(&failure) {
+            injected.pop_front();
             Err(RecoveryAuthorizationError::Database(format!(
                 "injected {failure:?} failure"
             )))
@@ -260,10 +278,8 @@ impl RecoveryAuthorizationService {
                 {
                     Ok(registration) => registration,
                     Err(_) => {
-                        self.store
-                            .abandon_pending(&row.authorization_id, None)
-                            .await?;
-                        self.notify(&row.authorization_id);
+                        let cleanup = self.spawn_unbound_abandonment(row.authorization_id);
+                        Self::await_owned_cleanup(cleanup).await?;
                         return Err(RecoveryAuthorizationError::Blocked);
                     }
                 };
@@ -271,33 +287,37 @@ impl RecoveryAuthorizationService {
                     .bind_question(&row.authorization_id, &registration.question_id)
                     .await
                 {
-                    if self
-                        .abandon_question(&row.authorization_id, &registration.question_id)
-                        .await
-                        .is_ok()
-                    {
-                        manager
-                            .finish_question_settlement(&registration.question_id, None)
-                            .await;
-                    }
-                    return Err(error);
+                    let cleanup = self.spawn_card_abandonment(
+                        manager,
+                        row.authorization_id,
+                        registration.question_id,
+                    );
+                    return match Self::await_owned_cleanup(cleanup).await {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(cleanup_error),
+                    };
                 }
                 tokio::select! {
                     biased;
                     _ = cancelled.cancelled() => {
-                        self.abandon_question(&row.authorization_id, &registration.question_id)
-                            .await?;
-                        manager
-                            .cancel_question("", &registration.question_id)
-                            .await;
+                        let cleanup = self.spawn_card_abandonment(
+                            manager,
+                            row.authorization_id,
+                            registration.question_id,
+                        );
+                        Self::await_owned_cleanup(cleanup).await?;
                         Err(RecoveryAuthorizationError::Cancelled)
                     }
                     outcome = registration.answer_rx => {
                         match outcome {
                             Ok(outcome) => self.resolve_question(&row.authorization_id, outcome).await,
                             Err(_) => {
-                                self.abandon_question(&row.authorization_id, &registration.question_id)
-                                    .await?;
+                                let cleanup = self.spawn_card_abandonment(
+                                    manager,
+                                    row.authorization_id.clone(),
+                                    registration.question_id,
+                                );
+                                Self::await_owned_cleanup(cleanup).await?;
                                 self.wait_for_resolution(&row.authorization_id, CancellationToken::new()).await
                             }
                         }
@@ -352,14 +372,107 @@ impl RecoveryAuthorizationService {
         authorization_id: &str,
         question_id: &str,
     ) -> Result<(), RecoveryAuthorizationError> {
+        self.abandon_pending_once(authorization_id, Some(question_id))
+            .await?;
+        self.notify(authorization_id);
+        Ok(())
+    }
+
+    pub(crate) async fn abandon_until_terminal(
+        &self,
+        authorization_id: &str,
+        question_id: Option<&str>,
+    ) -> Result<(), RecoveryAuthorizationError> {
+        let mut failed_attempts = 0_u32;
+        loop {
+            match self
+                .abandon_pending_once(authorization_id, question_id)
+                .await
+            {
+                Ok(row) if row.status != RecoveryAuthorizationStatus::Pending => {
+                    self.notify(authorization_id);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    let error = RecoveryAuthorizationError::QuestionBindingConflict;
+                    tracing::error!(
+                        code = error.code(),
+                        "[recovery_authorization] abandonment stopped on nonterminal row"
+                    );
+                    return Err(error);
+                }
+                Err(RecoveryAuthorizationError::NotFound) => {
+                    self.notify(authorization_id);
+                    return Ok(());
+                }
+                Err(error @ RecoveryAuthorizationError::Database(_)) => {
+                    let delay = recovery_cleanup_retry_delay(failed_attempts);
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    tracing::warn!(
+                        code = error.code(),
+                        retry_delay_ms = delay.as_millis(),
+                        "[recovery_authorization] abandonment database retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        code = error.code(),
+                        "[recovery_authorization] abandonment stopped on nontransient error"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn abandon_pending_once(
+        &self,
+        authorization_id: &str,
+        question_id: Option<&str>,
+    ) -> Result<recovery_authorization::Model, RecoveryAuthorizationError> {
         #[cfg(test)]
         self.maybe_fail_write(InjectedRecoveryWriteFailure::Abandon)
             .await?;
         self.store
-            .abandon_pending(authorization_id, Some(question_id))
-            .await?;
-        self.notify(authorization_id);
-        Ok(())
+            .abandon_pending(authorization_id, question_id)
+            .await
+    }
+
+    fn spawn_unbound_abandonment(
+        &self,
+        authorization_id: String,
+    ) -> tokio::task::JoinHandle<Result<(), RecoveryAuthorizationError>> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .abandon_until_terminal(&authorization_id, None)
+                .await
+        })
+    }
+
+    fn spawn_card_abandonment(
+        &self,
+        manager: &ConnectionManager,
+        authorization_id: String,
+        question_id: String,
+    ) -> tokio::task::JoinHandle<Result<(), RecoveryAuthorizationError>> {
+        let manager = manager.clone_ref();
+        tokio::spawn(async move {
+            manager
+                .abandon_recovery_question_until_terminal(&authorization_id, &question_id)
+                .await
+        })
+    }
+
+    async fn await_owned_cleanup(
+        cleanup: tokio::task::JoinHandle<Result<(), RecoveryAuthorizationError>>,
+    ) -> Result<(), RecoveryAuthorizationError> {
+        cleanup.await.map_err(|error| {
+            RecoveryAuthorizationError::Database(format!(
+                "owned recovery cleanup task failed: {error}"
+            ))
+        })?
     }
 
     pub async fn get(
