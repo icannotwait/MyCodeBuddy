@@ -65,15 +65,15 @@ struct PersistedPlanReviewEvidence {
     state: PlanReviewRoundState,
 }
 
-// Test-only failpoint: when true on the current thread, publish aborts after
-// writing inside the transaction so the outer commit never lands. Thread-local
-// so parallel cargo tests do not interfere.
+// Test-only failpoints are thread-local so parallel cargo tests do not interfere.
 #[cfg(test)]
 thread_local! {
     static INJECT_PUBLISH_PERSISTENCE_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static BINDING_DIFF_INVOCATION_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static INJECT_RECOVERY_MANIFEST_READ_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -99,6 +99,21 @@ fn reset_binding_diff_invocation_count() {
 #[cfg(test)]
 fn binding_diff_invocation_count() -> usize {
     BINDING_DIFF_INVOCATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn set_inject_recovery_manifest_read_failure(enabled: bool) {
+    INJECT_RECOVERY_MANIFEST_READ_FAILURE.with(|flag| flag.set(enabled));
+}
+
+#[cfg(test)]
+fn inject_recovery_manifest_read_failure() -> bool {
+    INJECT_RECOVERY_MANIFEST_READ_FAILURE.with(|flag| flag.get())
+}
+
+#[cfg(not(test))]
+fn inject_recovery_manifest_read_failure() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -839,36 +854,35 @@ pub async fn get_workflow_state_core(
                 };
 
                 let recovery_snapshot = if header.workflow_state == WorkflowState::Blocked {
-                    Some(load_workflow_recovery_snapshot_conn(txn, &header, None).await?)
+                    Some(load_workflow_recovery_snapshot_detailed_conn(txn, &header, None).await?)
                 } else {
                     None
                 };
                 let recovery = recovery_snapshot
                     .as_ref()
-                    .map(|snapshot| decide_workflow_recovery(snapshot).projection());
+                    .map(|loaded| decide_workflow_recovery(&loaded.snapshot).projection());
 
-                let doc = match load_active_manifest_document_txn(
-                    txn,
-                    &header.workflow_id,
-                    header.active_manifest_revision,
-                )
-                .await
-                {
-                    Ok(document) => document,
-                    Err(_error)
-                        if recovery_snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| !snapshot.active_manifest_valid) =>
-                    {
+                let normalized = match recovery_snapshot {
+                    Some(loaded) => match loaded.normalized {
+                        Some(normalized) => normalized,
+                        None => {
                         return Ok(project_invalid_manifest_recovery_index(
                             &header,
-                            recovery_snapshot.as_ref().expect("guarded snapshot"),
+                                &loaded.snapshot,
                             recovery.expect("blocked snapshot has projection"),
                         ));
+                        }
+                    },
+                    None => {
+                        let doc = load_active_manifest_document_txn(
+                            txn,
+                            &header.workflow_id,
+                            header.active_manifest_revision,
+                        )
+                        .await?;
+                        validate_manifest_document(&doc)?
                     }
-                    Err(error) => return Err(error),
                 };
-                let normalized = validate_manifest_document(&doc)?;
 
                 let bindings = delegation_workflow_node_binding::Entity::find()
                     .filter(
@@ -1135,8 +1149,30 @@ pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionT
     header: &delegation_workflow::Model,
     displayed_reset_reason: Option<&str>,
 ) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
+    Ok(
+        load_workflow_recovery_snapshot_detailed_conn(conn, header, displayed_reset_reason)
+            .await?
+            .snapshot,
+    )
+}
+
+struct LoadedWorkflowRecoverySnapshot {
+    snapshot: WorkflowRecoverySnapshot,
+    normalized: Option<NormalizedManifest>,
+}
+
+async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    displayed_reset_reason: Option<&str>,
+) -> Result<LoadedWorkflowRecoverySnapshot, WorkflowStoreError> {
     let mut contradictory_durable_state = false;
     let header_state = workflow_state_to_manifest(header.workflow_state.clone());
+    if inject_recovery_manifest_read_failure() {
+        return Err(WorkflowStoreError::Persistence(
+            "injected recovery manifest read failure".into(),
+        ));
+    }
     let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
         header.workflow_id.clone(),
         header.active_manifest_revision,
@@ -1195,6 +1231,11 @@ pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionT
         design_fingerprint_hash(document) == header.design_fingerprint
             && plan_fingerprint_hash(document) == header.plan_fingerprint
     });
+    if !workflow_recovery_lineage_valid(conn, header, revision.as_ref(), normalized.as_ref())
+        .await?
+    {
+        contradictory_durable_state = true;
+    }
 
     let bindings = delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
@@ -1555,7 +1596,7 @@ pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionT
             && !gate.lineage_reset_consumed
     });
 
-    Ok(WorkflowRecoverySnapshot {
+    let snapshot = WorkflowRecoverySnapshot {
         workflow_id: header.workflow_id.clone(),
         parent_conversation_id: header.parent_conversation_id,
         workflow_kind: header.workflow_kind.clone(),
@@ -1617,7 +1658,145 @@ pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionT
             .and_then(|value| u64::try_from(value).ok()),
         plan_lineage_reset_pending,
         displayed_reset_reason_hash: displayed_reset_reason.map(hash_displayed_reset_reason),
+    };
+    Ok(LoadedWorkflowRecoverySnapshot {
+        snapshot,
+        normalized: if active_manifest_valid {
+            normalized
+        } else {
+            None
+        },
     })
+}
+
+async fn workflow_recovery_lineage_valid<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    active_revision: Option<&delegation_workflow_manifest_revision::Model>,
+    active_normalized: Option<&NormalizedManifest>,
+) -> Result<bool, WorkflowStoreError> {
+    let (Some(active_revision), Some(active_normalized)) = (active_revision, active_normalized)
+    else {
+        return Ok(false);
+    };
+    if !workflow_recovery_revision_document_valid(active_revision, active_normalized) {
+        return Ok(false);
+    }
+
+    let Some(active_kind) =
+        ManifestRevisionKind::from_db(active_revision.revision_kind.as_deref()).ok()
+    else {
+        return Ok(false);
+    };
+    let structural_revision = header.structural_revision;
+    if structural_revision <= 0 || structural_revision > header.active_manifest_revision {
+        return Ok(false);
+    }
+
+    let mut current = active_revision.clone();
+    let mut current_kind = active_kind;
+    let current_publication = loop {
+        match current_kind {
+            ManifestRevisionKind::Publication => {
+                let Some(publication_normalized) = parse_valid_recovery_revision(&current) else {
+                    return Ok(false);
+                };
+                if !manifests_equal_except_state_authority(
+                    &publication_normalized,
+                    active_normalized,
+                ) || design_fingerprint_hash(&publication_normalized)
+                    != header.design_fingerprint
+                    || plan_fingerprint_hash(&publication_normalized) != header.plan_fingerprint
+                {
+                    return Ok(false);
+                }
+                break current;
+            }
+            ManifestRevisionKind::StateOnly => {
+                let Some(expected_source) = current.manifest_revision.checked_sub(1) else {
+                    return Ok(false);
+                };
+                if expected_source <= 0 || current.source_manifest_revision != Some(expected_source)
+                {
+                    return Ok(false);
+                }
+                let Some(source) = delegation_workflow_manifest_revision::Entity::find_by_id((
+                    header.workflow_id.clone(),
+                    expected_source,
+                ))
+                .one(conn)
+                .await
+                .map_err(db_err)?
+                else {
+                    return Ok(false);
+                };
+                let Some(source_normalized) = parse_valid_recovery_revision(&source) else {
+                    return Ok(false);
+                };
+                if !manifests_equal_except_state_authority(&source_normalized, active_normalized) {
+                    return Ok(false);
+                }
+                let Some(source_kind) =
+                    ManifestRevisionKind::from_db(source.revision_kind.as_deref()).ok()
+                else {
+                    return Ok(false);
+                };
+                current = source;
+                current_kind = source_kind;
+            }
+        }
+    };
+
+    if structural_revision > current_publication.manifest_revision {
+        return Ok(false);
+    }
+    let structural = if structural_revision == current_publication.manifest_revision {
+        current_publication
+    } else {
+        let Some(structural) = delegation_workflow_manifest_revision::Entity::find_by_id((
+            header.workflow_id.clone(),
+            structural_revision,
+        ))
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        else {
+            return Ok(false);
+        };
+        structural
+    };
+    if ManifestRevisionKind::from_db(structural.revision_kind.as_deref()).ok()
+        != Some(ManifestRevisionKind::Publication)
+    {
+        return Ok(false);
+    }
+    let Some(structural_normalized) = parse_valid_recovery_revision(&structural) else {
+        return Ok(false);
+    };
+    Ok(
+        plan_fingerprint_hash(&structural_normalized) == header.plan_fingerprint
+            && plan_fingerprint_hash(active_normalized) == header.plan_fingerprint,
+    )
+}
+
+fn parse_valid_recovery_revision(
+    revision: &delegation_workflow_manifest_revision::Model,
+) -> Option<NormalizedManifest> {
+    if sha256_hex(revision.document_json.as_bytes()) != revision.document_digest {
+        return None;
+    }
+    let manifest_state = parse_manifest_state(&revision.manifest_state)?;
+    let document = serde_json::from_str::<ManifestDocument>(&revision.document_json).ok()?;
+    let normalized = validate_manifest_document(&document).ok()?;
+    (normalized.workflow_state == manifest_state).then_some(normalized)
+}
+
+fn workflow_recovery_revision_document_valid(
+    revision: &delegation_workflow_manifest_revision::Model,
+    normalized: &NormalizedManifest,
+) -> bool {
+    sha256_hex(revision.document_json.as_bytes()) == revision.document_digest
+        && parse_manifest_state(&revision.manifest_state) == Some(normalized.workflow_state)
 }
 
 fn project_invalid_manifest_recovery_index(
@@ -9860,6 +10039,7 @@ mod tests {
     #[cfg(test)]
     mod workflow_state_authority {
         use super::*;
+        use crate::acp::delegation::workflow::recovery_policy::WorkflowRecoveryDisposition;
         use crate::db::test_helpers::fresh_disk_db;
         use sea_orm::ConnectionTrait;
 
@@ -9884,6 +10064,64 @@ mod tests {
                 .all(&db.conn)
                 .await
                 .expect("load workflow revisions")
+        }
+
+        async fn append_blocked_state_only(
+            db: &AppDatabase,
+            workflow_id: &str,
+        ) -> delegation_workflow::Model {
+            let header = load_header(db, workflow_id).await;
+            let txn = db.conn.begin().await.expect("begin state-only append");
+            append_state_only_revision_txn(
+                &txn,
+                &header,
+                StateOnlyRevisionRequest {
+                    target_state: ManifestWorkflowState::Blocked,
+                    transition_reason_code: WorkflowBlockCause::ExplicitManifestBlock.as_str(),
+                    recovery_authorization_id: None,
+                    consumer_correlation_id: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("append blocked state-only revision");
+            txn.commit().await.expect("commit state-only append");
+            load_header(db, workflow_id).await
+        }
+
+        async fn publish_blocked_design_only_bridge(
+            db: &AppDatabase,
+            emitter: &EventEmitter,
+            parent: i32,
+            token: &str,
+        ) -> (PublishResult, delegation_workflow::Model) {
+            let mut document = design_plan_doc(token);
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(db, emitter, parent, document.clone())
+                .await
+                .expect("publish blocked workflow");
+            document.workflow_id = Some(published.workflow_id.clone());
+            document.expected_manifest_revision = Some(published.manifest_revision);
+            document.nodes[0].title = Some("updated Design-only title".into());
+            let republished = publish_document(db, emitter, parent, document)
+                .await
+                .expect("publish Design-only structural update");
+            assert_eq!(republished.manifest_revision, 2);
+            let publication_header = load_header(db, &published.workflow_id).await;
+            assert_eq!(publication_header.structural_revision, 1);
+            let header = append_blocked_state_only(db, &published.workflow_id).await;
+            (published, header)
+        }
+
+        fn assert_inconsistent_recovery(snapshot: &WorkflowRecoverySnapshot) {
+            let decision = decide_workflow_recovery(snapshot);
+            assert_eq!(
+                decision.disposition,
+                WorkflowRecoveryDisposition::InconsistentDurableState
+            );
+            assert_eq!(decision.proposed_action(), None);
+            assert_eq!(decision.target_state(), None);
+            assert!(!decision.requires_authorization());
         }
 
         async fn load_bindings(
@@ -10756,6 +10994,213 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn task7_recovery_lineage_arbitrary_older_source_is_inconsistent() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-lineage-arbitrary-source");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            append_blocked_state_only(&db, &published.workflow_id).await;
+            let header = append_blocked_state_only(&db, &published.workflow_id).await;
+            let active = delegation_workflow_manifest_revision::Entity::find_by_id((
+                published.workflow_id.clone(),
+                header.active_manifest_revision,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut corrupt: delegation_workflow_manifest_revision::ActiveModel = active.into();
+            corrupt.source_manifest_revision = Set(Some(1));
+            corrupt.update(&db.conn).await.unwrap();
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert_inconsistent_recovery(&snapshot);
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_missing_immediate_source_is_inconsistent() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-lineage-missing-source");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            append_blocked_state_only(&db, &published.workflow_id).await;
+            let header = append_blocked_state_only(&db, &published.workflow_id).await;
+            delegation_workflow_manifest_revision::Entity::delete_by_id((
+                published.workflow_id.clone(),
+                header.active_manifest_revision - 1,
+            ))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert_inconsistent_recovery(&snapshot);
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_missing_structural_root_is_inconsistent() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let (published, header) = publish_blocked_design_only_bridge(
+                &db,
+                &emitter,
+                parent,
+                "task7-lineage-missing-root",
+            )
+            .await;
+            delegation_workflow_manifest_revision::Entity::delete_by_id((
+                published.workflow_id.clone(),
+                header.structural_revision,
+            ))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert_inconsistent_recovery(&snapshot);
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_wrong_kind_structural_root_is_inconsistent() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let (published, header) = publish_blocked_design_only_bridge(
+                &db,
+                &emitter,
+                parent,
+                "task7-lineage-wrong-root-kind",
+            )
+            .await;
+            let root = delegation_workflow_manifest_revision::Entity::find_by_id((
+                published.workflow_id.clone(),
+                header.structural_revision,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut corrupt: delegation_workflow_manifest_revision::ActiveModel = root.into();
+            corrupt.revision_kind = Set(Some(ManifestRevisionKind::StateOnly.as_str().into()));
+            corrupt.source_manifest_revision = Set(None);
+            corrupt.update(&db.conn).await.unwrap();
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert_inconsistent_recovery(&snapshot);
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_wrong_structure_root_is_inconsistent() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let (published, header) = publish_blocked_design_only_bridge(
+                &db,
+                &emitter,
+                parent,
+                "task7-lineage-wrong-root-structure",
+            )
+            .await;
+            let root = delegation_workflow_manifest_revision::Entity::find_by_id((
+                published.workflow_id.clone(),
+                header.structural_revision,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut root_document: ManifestDocument =
+                serde_json::from_str(&root.document_json).unwrap();
+            root_document.plan.as_mut().unwrap().digest = "sha256:different-plan".into();
+            validate_manifest_document(&root_document).expect("different root remains valid");
+            let document_json = serde_json::to_string(&root_document).unwrap();
+            let mut corrupt: delegation_workflow_manifest_revision::ActiveModel = root.into();
+            corrupt.document_digest = Set(sha256_hex(document_json.as_bytes()));
+            corrupt.document_json = Set(document_json);
+            corrupt.update(&db.conn).await.unwrap();
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert_inconsistent_recovery(&snapshot);
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_valid_publication_bridge_is_recoverable() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let (_published, header) = publish_blocked_design_only_bridge(
+                &db,
+                &emitter,
+                parent,
+                "task7-lineage-publication-bridge",
+            )
+            .await;
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert!(!snapshot.contradictory_durable_state, "{snapshot:#?}");
+            let decision = decide_workflow_recovery(&snapshot);
+            assert!(matches!(
+                decision.disposition,
+                WorkflowRecoveryDisposition::Recover { .. }
+            ));
+            assert!(decision.requires_authorization());
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_lineage_valid_multi_state_only_chain_is_recoverable() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-lineage-valid-chain");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            append_blocked_state_only(&db, &published.workflow_id).await;
+            let header = append_blocked_state_only(&db, &published.workflow_id).await;
+
+            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+                .await
+                .unwrap();
+            assert!(!snapshot.contradictory_durable_state, "{snapshot:#?}");
+            let decision = decide_workflow_recovery(&snapshot);
+            assert!(matches!(
+                decision.disposition,
+                WorkflowRecoveryDisposition::Recover { .. }
+            ));
+            assert!(decision.requires_authorization());
+        }
+
+        #[tokio::test]
+        async fn task7_recovery_manifest_read_failure_propagates_persistence_error() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-manifest-read-failure");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+
+            set_inject_recovery_manifest_read_failure(true);
+            let result = get_workflow_state_core(&db, parent, Some(&published.workflow_id)).await;
+            set_inject_recovery_manifest_read_failure(false);
+            assert!(matches!(result, Err(WorkflowStoreError::Persistence(_))));
+        }
+
+        #[tokio::test]
         async fn task7_corrupt_plan_evidence_blocks_approved_recovery() {
             let (db, parent) = seed_parent().await;
             let (emitter, _) = emitter_with_rx();
@@ -10970,6 +11415,76 @@ mod tests {
             let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
                 .await
                 .expect("corrupt blocked manifest still returns recovery projection");
+            let recovery = state.recovery.expect("typed recovery projection");
+            assert_eq!(recovery.disposition, "blocked");
+            assert!(!recovery.authorization_required);
+            assert!(recovery
+                .blockers
+                .contains(&"invalid_active_manifest".to_string()));
+        }
+
+        #[tokio::test]
+        async fn task7_corrupt_manifest_digest_returns_bounded_recovery_projection() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-corrupt-manifest-digest");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+                published.workflow_id.clone(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let mut corrupt: delegation_workflow_manifest_revision::ActiveModel = revision.into();
+            corrupt.document_digest = Set("invalid-digest".into());
+            corrupt.update(&db.conn).await.unwrap();
+
+            let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+                .await
+                .expect("digest-corrupt blocked manifest returns bounded projection");
+            assert!(state.payload_truncated);
+            assert!(state.evidence_truncated);
+            assert_eq!(state.omitted, vec!["invalid_active_manifest"]);
+            assert!(state.nodes.is_empty());
+            assert!(state.task_policies.is_empty());
+            let recovery = state.recovery.expect("typed recovery projection");
+            assert_eq!(recovery.disposition, "blocked");
+            assert!(!recovery.authorization_required);
+            assert!(recovery
+                .blockers
+                .contains(&"invalid_active_manifest".to_string()));
+        }
+
+        #[tokio::test]
+        async fn task7_missing_manifest_row_returns_bounded_recovery_projection() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("task7-missing-manifest-row");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            delegation_workflow_manifest_revision::Entity::delete_by_id((
+                published.workflow_id.clone(),
+                1,
+            ))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+            let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+                .await
+                .expect("missing blocked manifest returns bounded projection");
+            assert!(state.payload_truncated);
+            assert!(state.evidence_truncated);
+            assert_eq!(state.omitted, vec!["invalid_active_manifest"]);
+            assert!(state.nodes.is_empty());
+            assert!(state.task_policies.is_empty());
             let recovery = state.recovery.expect("typed recovery projection");
             assert_eq!(recovery.disposition, "blocked");
             assert!(!recovery.authorization_required);

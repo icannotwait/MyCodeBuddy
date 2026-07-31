@@ -616,21 +616,13 @@ struct CanonicalWorkflowRecoverySource<'a> {
 
 fn source_state_fingerprint(source: &WorkflowRecoverySnapshot) -> String {
     let mut canonical = source.clone();
-    canonical
-        .required_plan_reviewers
-        .sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    canonical
-        .binding_lifecycle
-        .sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    canonical
-        .active_runs
-        .sort_by(|a, b| a.task_id.cmp(&b.task_id));
-    canonical
-        .frozen_task_cohorts
-        .sort_by_key(|cohort| cohort.task_index);
     for cohort in &mut canonical.frozen_task_cohorts {
         cohort.reviewer_node_ids.sort();
     }
+    sort_canonical(&mut canonical.required_plan_reviewers);
+    sort_canonical(&mut canonical.binding_lifecycle);
+    sort_canonical(&mut canonical.active_runs);
+    sort_canonical(&mut canonical.frozen_task_cohorts);
     if let Some(gate) = canonical.latest_plan_gate.as_mut() {
         gate.required_reviewer_node_ids.sort();
     }
@@ -646,6 +638,12 @@ fn source_state_fingerprint(source: &WorkflowRecoverySnapshot) -> String {
         "{FINGERPRINT_VERSION}:{}",
         hex_lower(&Sha256::digest(bytes))
     )
+}
+
+fn sort_canonical<T: Serialize>(values: &mut [T]) {
+    values.sort_by_cached_key(|value| {
+        serde_json::to_vec(value).expect("workflow recovery fingerprint member serializes")
+    });
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1128,6 +1126,25 @@ mod workflow_recovery_policy {
         ));
     }
 
+    #[derive(Clone)]
+    struct RecoverySnapshotFixture {
+        durable: WorkflowRecoverySnapshot,
+        plan_prose: String,
+        delegation_prompt: String,
+        raw_external_session_id: String,
+        unrelated_ui_state: String,
+    }
+
+    impl RecoverySnapshotFixture {
+        fn build_snapshot(&self) -> WorkflowRecoverySnapshot {
+            self.durable.clone()
+        }
+
+        fn fingerprint(&self) -> String {
+            decide_workflow_recovery(&self.build_snapshot()).source_state_fingerprint
+        }
+    }
+
     #[test]
     fn workflow_fingerprint_changes_for_every_policy_relevant_evidence_change() {
         let source = approved_snapshot();
@@ -1299,6 +1316,49 @@ mod workflow_recovery_policy {
         });
 
         assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].node_id = "other-required-reviewer".into()
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].work_unit_key = "other-reviewer-key".into()
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].agent_type = "other-reviewer-agent".into()
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].profile_id = Some("reviewer-profile".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].active = false
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].observed = false
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].latest_task_id = Some("other-reviewer-task".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].latest_status = Some(DelegationRunStatus::Failed)
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].summary_validated = false
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].artifact_digest = Some("other-reviewer-digest".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].gate_id = Some("other-reviewer-gate".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].gate_cycle = Some(9)
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].reviewed_task_id = Some("other-reviewed-author".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.required_plan_reviewers[0].evidence_consistent = false
+        });
+
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
             value.latest_plan_gate.as_mut().unwrap().gate_id = "other-gate".into()
         });
         assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
@@ -1354,6 +1414,79 @@ mod workflow_recovery_policy {
         assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
             value
                 .latest_plan_gate
+                .as_mut()
+                .unwrap()
+                .lineage_reset_consumed = true
+        });
+
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().gate_id = "other-current-gate".into()
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().gate_cycle = 5
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().outcome =
+                GateSettlementOutcome::ChangesRequested
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .content_fingerprint = "other-current-fingerprint".into()
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().critical_count = 1
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().important_count = 1
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().minor_count = 1
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value.current_plan_gate.as_mut().unwrap().next_action =
+                Some(PlanReviewNextAction::ContinueReview)
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .covered_author_task_id = Some("other-current-author".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .covered_plan_digest = Some("other-current-plan".into())
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .required_reviewer_node_ids = vec!["other-current-reviewer".into()]
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .reviewer_evidence_count = 2
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
+                .as_mut()
+                .unwrap()
+                .evidence_consistent = false
+        });
+        assert_nested_mutation!(|value: &mut WorkflowRecoverySnapshot| {
+            value
+                .current_plan_gate
                 .as_mut()
                 .unwrap()
                 .lineage_reset_consumed = true
@@ -1437,35 +1570,145 @@ mod workflow_recovery_policy {
             value.frozen_task_cohorts[0].evidence_consistent = false
         });
 
-        let excluded_before = (
-            "Plan prose",
-            "delegation prompt",
-            "external-session-raw-1",
-            "expanded-ui-section",
-        );
-        let excluded_after = (
-            "different Plan prose",
-            "different prompt",
-            "external-session-raw-2",
-            "collapsed-ui-section",
-        );
-        assert_ne!(excluded_before, excluded_after);
-        let canonical_source = serde_json::to_string(&source).unwrap();
-        for excluded in [
-            excluded_before.0,
-            excluded_before.1,
-            excluded_before.2,
-            excluded_before.3,
-            excluded_after.0,
-            excluded_after.1,
-            excluded_after.2,
-            excluded_after.3,
-        ] {
-            assert!(!canonical_source.contains(excluded));
+        let mut canonical_order = rich.clone();
+        canonical_order
+            .required_plan_reviewers
+            .push(reviewer("plan-reviewer-z"));
+        canonical_order
+            .latest_plan_gate
+            .as_mut()
+            .unwrap()
+            .required_reviewer_node_ids
+            .push("plan-reviewer-z".into());
+        canonical_order
+            .current_plan_gate
+            .as_mut()
+            .unwrap()
+            .required_reviewer_node_ids
+            .push("plan-reviewer-z".into());
+        canonical_order.active_runs.push(WorkflowRecoveryActiveRun {
+            task_id: "z-active-task".into(),
+            node_id: "task-2-impl".into(),
+            status: DelegationRunStatus::Reserving,
+            generation: 1,
+            lineage_ordinal: 1,
+            replaced_task_id: None,
+        });
+        canonical_order
+            .frozen_task_cohorts
+            .push(WorkflowRecoveryFrozenTaskCohort {
+                task_index: 2,
+                implementer_node_id: "task-2-impl".into(),
+                reviewer_node_ids: vec!["task-2-reviewer-b".into(), "task-2-reviewer-a".into()],
+                route_complete: true,
+                unresolved: false,
+                evidence_consistent: true,
+            });
+        let canonical_order_fingerprint =
+            decide_workflow_recovery(&canonical_order).source_state_fingerprint;
+        let mut reordered = canonical_order.clone();
+        reordered.required_plan_reviewers.reverse();
+        reordered.active_runs.reverse();
+        reordered.frozen_task_cohorts.reverse();
+        reordered
+            .latest_plan_gate
+            .as_mut()
+            .unwrap()
+            .required_reviewer_node_ids
+            .reverse();
+        reordered
+            .current_plan_gate
+            .as_mut()
+            .unwrap()
+            .required_reviewer_node_ids
+            .reverse();
+        for cohort in &mut reordered.frozen_task_cohorts {
+            cohort.reviewer_node_ids.reverse();
         }
         assert_eq!(
-            baseline,
-            decide_workflow_recovery(&source).source_state_fingerprint
+            canonical_order_fingerprint,
+            decide_workflow_recovery(&reordered).source_state_fingerprint
         );
+
+        let mut repeated_node_lifecycle = rich.clone();
+        let mut historical_binding = repeated_node_lifecycle.binding_lifecycle[0].clone();
+        historical_binding.introduced_revision = 0;
+        historical_binding.retired_revision = Some(1);
+        repeated_node_lifecycle
+            .binding_lifecycle
+            .push(historical_binding);
+        let lifecycle_fingerprint =
+            decide_workflow_recovery(&repeated_node_lifecycle).source_state_fingerprint;
+        repeated_node_lifecycle.binding_lifecycle.reverse();
+        assert_eq!(
+            lifecycle_fingerprint,
+            decide_workflow_recovery(&repeated_node_lifecycle).source_state_fingerprint,
+            "lifecycle ordering is not policy evidence even when a node has history"
+        );
+
+        let mut repeated_reviewer_identity = rich.clone();
+        let mut contradictory_reviewer =
+            repeated_reviewer_identity.required_plan_reviewers[0].clone();
+        contradictory_reviewer.work_unit_key = "contradictory-reviewer-key".into();
+        repeated_reviewer_identity
+            .required_plan_reviewers
+            .push(contradictory_reviewer);
+        let repeated_reviewer_fingerprint =
+            decide_workflow_recovery(&repeated_reviewer_identity).source_state_fingerprint;
+        repeated_reviewer_identity.required_plan_reviewers.reverse();
+        assert_eq!(
+            repeated_reviewer_fingerprint,
+            decide_workflow_recovery(&repeated_reviewer_identity).source_state_fingerprint,
+            "reviewer ordering is not policy evidence even for contradictory identities"
+        );
+
+        let mut repeated_run_identity = rich.clone();
+        let mut contradictory_run = repeated_run_identity.active_runs[0].clone();
+        contradictory_run.node_id = "contradictory-active-node".into();
+        repeated_run_identity.active_runs.push(contradictory_run);
+        let repeated_run_fingerprint =
+            decide_workflow_recovery(&repeated_run_identity).source_state_fingerprint;
+        repeated_run_identity.active_runs.reverse();
+        assert_eq!(
+            repeated_run_fingerprint,
+            decide_workflow_recovery(&repeated_run_identity).source_state_fingerprint,
+            "active-run ordering is not policy evidence even for contradictory identities"
+        );
+
+        let mut repeated_cohort_identity = rich.clone();
+        let mut contradictory_cohort = repeated_cohort_identity.frozen_task_cohorts[0].clone();
+        contradictory_cohort.implementer_node_id = "contradictory-implementer".into();
+        repeated_cohort_identity
+            .frozen_task_cohorts
+            .push(contradictory_cohort);
+        let repeated_cohort_fingerprint =
+            decide_workflow_recovery(&repeated_cohort_identity).source_state_fingerprint;
+        repeated_cohort_identity.frozen_task_cohorts.reverse();
+        assert_eq!(
+            repeated_cohort_fingerprint,
+            decide_workflow_recovery(&repeated_cohort_identity).source_state_fingerprint,
+            "cohort ordering is not policy evidence even for contradictory identities"
+        );
+
+        let fixture = RecoverySnapshotFixture {
+            durable: source,
+            plan_prose: "Plan prose".into(),
+            delegation_prompt: "delegation prompt".into(),
+            raw_external_session_id: "external-session-raw-1".into(),
+            unrelated_ui_state: "expanded-ui-section".into(),
+        };
+        assert_eq!(baseline, fixture.fingerprint());
+        let mut excluded_change = fixture.clone();
+        excluded_change.plan_prose = "different Plan prose".into();
+        assert_eq!(baseline, excluded_change.fingerprint());
+        let mut excluded_change = fixture.clone();
+        excluded_change.delegation_prompt = "different prompt".into();
+        assert_eq!(baseline, excluded_change.fingerprint());
+        let mut excluded_change = fixture.clone();
+        excluded_change.raw_external_session_id = "external-session-raw-2".into();
+        assert_eq!(baseline, excluded_change.fingerprint());
+        let mut excluded_change = fixture;
+        excluded_change.unrelated_ui_state = "collapsed-ui-section".into();
+        assert_eq!(baseline, excluded_change.fingerprint());
     }
 }
