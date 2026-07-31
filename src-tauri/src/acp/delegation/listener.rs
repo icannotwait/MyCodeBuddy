@@ -1518,6 +1518,7 @@ impl DelegationListener {
                 outcome,
                 evidence,
                 summary: req.summary,
+                recovery_authorization_id: None,
             },
         )
         .await
@@ -1893,6 +1894,15 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
         WorkflowStoreError::Busy(_) => "busy",
+        WorkflowStoreError::WorkflowRecoveryNotAvailable => {
+            "workflow_recovery_not_available"
+        }
+        WorkflowStoreError::WorkflowRecoveryConflict => "workflow_recovery_conflict",
+        WorkflowStoreError::RecoveryAuthorizationRequired { .. } => {
+            "recovery_authorization_required"
+        }
+        WorkflowStoreError::RecoveryAuthorizationStale => "recovery_authorization_stale",
+        WorkflowStoreError::RecoveryAuthorizationRejected { code } => code,
         WorkflowStoreError::Persistence(_) => "persistence",
     };
     serde_json::json!({

@@ -4,6 +4,12 @@ use serde::Serialize;
 
 use crate::web::event_bridge::{emit_event, EventEmitter};
 
+#[cfg(test)]
+thread_local! {
+    static INJECT_WORKFLOW_RECOVERY_EVENT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Live clock event after a durable manifest or settlement mutation commits.
 pub const WORKFLOW_GRAPH_CHANGED_EVENT: &str = "workflow_graph://changed";
 
@@ -20,6 +26,112 @@ pub struct WorkflowGraphChangedPayload {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkflowCompatibilityNudgePayload {
     pub parent_conversation_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "event")]
+pub enum WorkflowRecoveryEvent {
+    #[serde(rename = "workflow.recovery_decision")]
+    RecoveryDecision {
+        workflow_id: String,
+        source_manifest_revision: u64,
+        graph_revision: u64,
+        action: String,
+        target_state: Option<super::types::ManifestWorkflowState>,
+        cause_code: String,
+    },
+    #[serde(rename = "workflow.recovery_confirmation_requested")]
+    RecoveryConfirmationRequested {
+        workflow_id: String,
+        recovery_authorization_id: String,
+        source_manifest_revision: u64,
+        graph_revision: u64,
+        action: String,
+        target_state: Option<super::types::ManifestWorkflowState>,
+        cause_code: String,
+    },
+    #[serde(rename = "workflow.recovery_authorization_consumed")]
+    RecoveryAuthorizationConsumed {
+        workflow_id: String,
+        recovery_authorization_id: String,
+        manifest_revision: u64,
+        graph_revision: u64,
+        action: String,
+    },
+    #[serde(rename = "workflow.recovery_rejected")]
+    RecoveryRejected {
+        workflow_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_authorization_id: Option<String>,
+        source_manifest_revision: u64,
+        graph_revision: u64,
+        action: String,
+        cause_code: String,
+        rejection_code: String,
+    },
+    #[serde(rename = "workflow.state_only_revision_created")]
+    StateOnlyRevisionCreated {
+        workflow_id: String,
+        source_manifest_revision: u64,
+        manifest_revision: u64,
+        graph_revision: u64,
+        target_state: super::types::ManifestWorkflowState,
+        cause_code: String,
+    },
+    #[serde(rename = "workflow.plan_lineage_reset")]
+    PlanLineageReset {
+        workflow_id: String,
+        recovery_authorization_id: String,
+        source_manifest_revision: u64,
+        manifest_revision: u64,
+        graph_revision: u64,
+        action: String,
+        target_state: super::types::ManifestWorkflowState,
+        cause_code: String,
+    },
+    #[serde(rename = "workflow.binding_reactivated")]
+    BindingReactivated {
+        workflow_id: String,
+        manifest_revision: u64,
+        graph_revision: u64,
+        target_state: super::types::ManifestWorkflowState,
+    },
+}
+
+impl WorkflowRecoveryEvent {
+    pub const fn channel(&self) -> &'static str {
+        match self {
+            Self::RecoveryDecision { .. } => "workflow.recovery_decision",
+            Self::RecoveryConfirmationRequested { .. } => {
+                "workflow.recovery_confirmation_requested"
+            }
+            Self::RecoveryAuthorizationConsumed { .. } => {
+                "workflow.recovery_authorization_consumed"
+            }
+            Self::RecoveryRejected { .. } => "workflow.recovery_rejected",
+            Self::StateOnlyRevisionCreated { .. } => "workflow.state_only_revision_created",
+            Self::PlanLineageReset { .. } => "workflow.plan_lineage_reset",
+            Self::BindingReactivated { .. } => "workflow.binding_reactivated",
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_inject_workflow_recovery_event_failure(enabled: bool) {
+    INJECT_WORKFLOW_RECOVERY_EVENT_FAILURE.with(|flag| flag.set(enabled));
+}
+
+pub fn emit_workflow_recovery_event(
+    emitter: &EventEmitter,
+    event: WorkflowRecoveryEvent,
+) -> Result<(), &'static str> {
+    #[cfg(test)]
+    if INJECT_WORKFLOW_RECOVERY_EVENT_FAILURE.with(std::cell::Cell::get) {
+        return Err("injected workflow recovery event failure");
+    }
+    let channel = event.channel();
+    emit_event(emitter, channel, event);
+    Ok(())
 }
 
 /// Emit `workflow_graph://changed` after a successful publish/settle commit.

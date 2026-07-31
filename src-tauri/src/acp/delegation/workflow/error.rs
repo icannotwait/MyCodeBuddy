@@ -111,6 +111,21 @@ pub enum WorkflowStoreError {
     #[error("busy (retryable): {0}")]
     Busy(String),
 
+    #[error("workflow recovery is not available")]
+    WorkflowRecoveryNotAvailable,
+
+    #[error("workflow recovery request conflicts with a committed recovery")]
+    WorkflowRecoveryConflict,
+
+    #[error("recovery authorization is required for {action}")]
+    RecoveryAuthorizationRequired { action: &'static str },
+
+    #[error("recovery authorization is stale")]
+    RecoveryAuthorizationStale,
+
+    #[error("recovery authorization rejected: {code}")]
+    RecoveryAuthorizationRejected { code: &'static str },
+
     #[error("persistence failure: {0}")]
     Persistence(String),
 }

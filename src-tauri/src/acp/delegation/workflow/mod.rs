@@ -27,8 +27,8 @@ pub use dto::{
 };
 pub use error::WorkflowStoreError;
 pub use events::{
-    emit_workflow_compatibility_nudge, emit_workflow_graph_changed, WORKFLOW_GRAPH_CHANGED_EVENT,
-    WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+    emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
+    WorkflowRecoveryEvent, WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
 };
 pub use gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
@@ -62,8 +62,9 @@ pub use state_dto::{
 };
 pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn, get_workflow_state_core,
-    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, settle_workflow_gate_core,
-    PublishResult, PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
+    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, recover_workflow_core,
+    settle_workflow_gate_core, PublishResult, PublishWorkflowRequest, RecoverWorkflowRequest,
+    RecoverWorkflowResult, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
     StateOnlyRevisionRequest, StateOnlyRevisionResult, WorkflowBlockEntryRequest,
     WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
     WORKFLOW_CAPABILITY_VERSION,
