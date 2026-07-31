@@ -1646,12 +1646,16 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         .iter()
         .filter(|n| n.kind == ManifestNodeKind::WorkUnit && n.work_unit_key.is_some())
         .collect();
-    let new_ids: HashSet<&str> = new_work_units.iter().map(|n| n.id.as_str()).collect();
+    let new_by_id: HashMap<&str, &NormalizedNode> = new_work_units
+        .iter()
+        .map(|node| (node.id.as_str(), *node))
+        .collect();
 
     let admitted_task_indices: HashSet<i64> = existing
         .iter()
         .filter(|b| {
-            b.task_index.is_some()
+            b.retired_revision.is_none()
+                && b.task_index.is_some()
                 && (b.is_observed
                     || b.retained_observed
                     || b.cohort_frozen
@@ -1681,53 +1685,59 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         let mut route = HashSet::with_capacity(prior_policy.route.reviewer_node_ids.len() + 1);
         route.insert(prior_policy.route.implementer_node_id.clone());
         route.extend(prior_policy.route.reviewer_node_ids.iter().cloned());
+        for node_id in &route {
+            let binding = existing_by_id
+                .get(node_id.as_str())
+                .filter(|binding| binding.retired_revision.is_none())
+                .ok_or_else(|| frozen_cohort_error(task_index))?;
+            let node = new_by_id
+                .get(node_id.as_str())
+                .ok_or_else(|| frozen_cohort_error(task_index))?;
+            if !binding_identity_matches(workflow_id, binding, node) {
+                return Err(frozen_cohort_error(task_index));
+            }
+        }
         frozen_routes.insert(task_index, route);
     }
 
-    for b in existing {
-        if new_ids.contains(b.node_id.as_str()) {
-            continue;
+    for binding in existing {
+        if binding.workflow_id != workflow_id {
+            return Err(binding_identity_conflict(binding));
         }
-        let is_admitted = b.is_observed || nodes_with_runs.contains(&b.node_id);
-        let route_frozen = b.task_index.is_some_and(|task_index| {
-            frozen_routes
-                .get(&task_index)
-                .is_some_and(|route| route.contains(&b.node_id))
-        });
-        let binding_protected = b.cohort_frozen
-            || b.is_observed
-            || b.retained_observed
-            || nodes_with_runs.contains(&b.node_id);
-
-        if route_frozen {
-            return Err(frozen_cohort_error(
-                b.task_index.expect("frozen route has Task index"),
-            ));
-        }
-        if binding_protected && !is_canceled_drop(normalized, b) {
-            return Err(WorkflowStoreError::CohortFrozen {
-                node_id: b.node_id.clone(),
-            });
-        }
-
-        if is_admitted || b.retained_observed || b.cohort_frozen || binding_protected {
-            let mut am: delegation_workflow_node_binding::ActiveModel = b.clone().into();
-            am.retired_revision = Set(Some(next_revision));
-            am.retained_observed = Set(true);
-            am.updated_at = Set(now);
-            am.update(conn).await.map_err(db_err)?;
-        } else {
-            delegation_workflow_node_binding::Entity::delete_by_id((
-                workflow_id.to_string(),
-                b.node_id.clone(),
-            ))
-            .exec(conn)
-            .await
-            .map_err(db_err)?;
+        let next_node = new_by_id.get(binding.node_id.as_str()).copied();
+        match (binding.retired_revision.is_some(), next_node) {
+            (true, None) => continue,
+            (true, Some(node)) => reactivate_exact_identity(conn, binding, node, now).await?,
+            (false, None) => {
+                retire_active_binding_if_legal(
+                    conn,
+                    binding,
+                    next_revision,
+                    normalized,
+                    nodes_with_runs,
+                    now,
+                )
+                .await?
+            }
+            (false, Some(node)) => {
+                retain_active_binding(
+                    conn,
+                    workflow_id,
+                    binding,
+                    node,
+                    nodes_with_runs,
+                    &frozen_routes,
+                    now,
+                )
+                .await?
+            }
         }
     }
 
     for node in new_work_units {
+        if existing_by_id.contains_key(node.id.as_str()) {
+            continue;
+        }
         let key = node.work_unit_key.as_ref().expect("work unit key");
         let role = role_str(node.role.expect("work unit role"));
         let agent = node.agent_type.as_ref().expect("agent").clone();
@@ -1741,77 +1751,160 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
                 .is_some_and(|route| route.contains(&node.id))
         });
 
-        if let Some(prev) = existing_by_id.get(node.id.as_str()) {
-            let is_admitted = prev.is_observed || nodes_with_runs.contains(&node.id);
-            let identity_changed = prev.work_unit_key != *key
-                || prev.role != role
-                || prev.agent_type != agent
-                || prev.profile_id != node.profile_id
-                || prev.phase_id != phase
-                || prev.task_index != node.task_index.map(|i| i as i64);
-            if freeze_cohort && identity_changed {
-                return Err(frozen_cohort_error(
-                    node.task_index.expect("frozen cohort Task index") as i64,
-                ));
-            }
-            if is_admitted && identity_changed {
-                return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
-                    node_id: node.id.clone(),
-                });
-            }
-            let mut am: delegation_workflow_node_binding::ActiveModel = (*prev).clone().into();
-            if !is_admitted {
-                am.work_unit_key = Set(key.clone());
-                am.role = Set(role.into());
-                am.agent_type = Set(agent);
-                am.profile_id = Set(node.profile_id.clone());
-                am.phase_id = Set(phase);
-                am.task_index = Set(node.task_index.map(|i| i as i64));
-            }
-            am.retired_revision = Set(None);
-            am.retained_observed = Set(prev.retained_observed && prev.retired_revision.is_some());
-            if freeze_cohort {
-                am.cohort_frozen = Set(true);
-            }
-            if let Some(o) = outcome {
-                am.node_outcome = Set(Some(o));
-            }
-            am.updated_at = Set(now);
-            am.update(conn).await.map_err(db_err)?;
-        } else {
-            let row = delegation_workflow_node_binding::ActiveModel {
-                workflow_id: Set(workflow_id.to_string()),
-                node_id: Set(node.id.clone()),
-                work_unit_key: Set(key.clone()),
-                role: Set(role.into()),
-                agent_type: Set(agent),
-                profile_id: Set(node.profile_id.clone()),
-                phase_id: Set(phase),
-                task_index: Set(node.task_index.map(|i| i as i64)),
-                introduced_revision: Set(next_revision),
-                retired_revision: Set(None),
-                is_observed: Set(false),
-                retained_observed: Set(false),
-                cohort_frozen: Set(freeze_cohort),
-                node_outcome: Set(outcome),
-                created_at: Set(now),
-                updated_at: Set(now),
-            };
-            row.insert(conn).await.map_err(db_err)?;
-        }
+        let row = delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set(workflow_id.to_string()),
+            node_id: Set(node.id.clone()),
+            work_unit_key: Set(key.clone()),
+            role: Set(role.into()),
+            agent_type: Set(agent),
+            profile_id: Set(node.profile_id.clone()),
+            phase_id: Set(phase),
+            task_index: Set(node.task_index.map(|i| i as i64)),
+            introduced_revision: Set(next_revision),
+            retired_revision: Set(None),
+            is_observed: Set(false),
+            retained_observed: Set(false),
+            cohort_frozen: Set(freeze_cohort),
+            node_outcome: Set(outcome),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        row.insert(conn).await.map_err(db_err)?;
     }
 
     Ok(())
 }
 
-/// Drop is legal only when cancel/block is explicit for the pair.
+fn binding_identity_matches(
+    workflow_id: &str,
+    binding: &delegation_workflow_node_binding::Model,
+    node: &NormalizedNode,
+) -> bool {
+    binding.workflow_id == workflow_id
+        && binding.node_id == node.id
+        && node.work_unit_key.as_ref() == Some(&binding.work_unit_key)
+        && node.role.map(role_str) == Some(binding.role.as_str())
+        && node.agent_type.as_ref() == Some(&binding.agent_type)
+        && node.profile_id == binding.profile_id
+        && node.phase_id.as_ref() == Some(&binding.phase_id)
+        && node.task_index.map(i64::from) == binding.task_index
+}
+
+fn binding_identity_conflict(
+    binding: &delegation_workflow_node_binding::Model,
+) -> WorkflowStoreError {
+    WorkflowStoreError::AdmittedNodeIdentityMutation {
+        node_id: binding.node_id.clone(),
+    }
+}
+
+fn require_exact_binding_identity(
+    workflow_id: &str,
+    binding: &delegation_workflow_node_binding::Model,
+    node: &NormalizedNode,
+) -> Result<(), WorkflowStoreError> {
+    binding_identity_matches(workflow_id, binding, node)
+        .then_some(())
+        .ok_or_else(|| binding_identity_conflict(binding))
+}
+
+async fn reactivate_exact_identity<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    binding: &delegation_workflow_node_binding::Model,
+    node: &NormalizedNode,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), WorkflowStoreError> {
+    require_exact_binding_identity(&binding.workflow_id, binding, node)?;
+    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
+    active.retired_revision = Set(None);
+    active.updated_at = Set(now);
+    active.update(conn).await.map_err(db_err)?;
+    Ok(())
+}
+
+async fn retire_active_binding_if_legal<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    binding: &delegation_workflow_node_binding::Model,
+    next_revision: i64,
+    normalized: &NormalizedManifest,
+    nodes_with_runs: &HashSet<String>,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), WorkflowStoreError> {
+    let is_admitted = binding.is_observed || nodes_with_runs.contains(&binding.node_id);
+    let binding_protected = binding.cohort_frozen
+        || binding.is_observed
+        || binding.retained_observed
+        || nodes_with_runs.contains(&binding.node_id);
+    if binding_protected && !is_canceled_drop(normalized, binding) {
+        return Err(WorkflowStoreError::CohortFrozen {
+            node_id: binding.node_id.clone(),
+        });
+    }
+
+    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
+    active.retired_revision = Set(Some(next_revision));
+    active.retained_observed =
+        Set(binding.retained_observed || is_admitted || binding.cohort_frozen);
+    active.updated_at = Set(now);
+    active.update(conn).await.map_err(db_err)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retain_active_binding<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    binding: &delegation_workflow_node_binding::Model,
+    node: &NormalizedNode,
+    nodes_with_runs: &HashSet<String>,
+    frozen_routes: &HashMap<i64, HashSet<String>>,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), WorkflowStoreError> {
+    let is_admitted = binding.is_observed || nodes_with_runs.contains(&node.id);
+    let identity_changed = !binding_identity_matches(workflow_id, binding, node);
+    let freeze_cohort = node.task_index.is_some_and(|task_index| {
+        frozen_routes
+            .get(&i64::from(task_index))
+            .is_some_and(|route| route.contains(&node.id))
+    });
+    if freeze_cohort && identity_changed {
+        return Err(frozen_cohort_error(i64::from(
+            node.task_index.expect("frozen cohort Task index"),
+        )));
+    }
+    if is_admitted && identity_changed {
+        return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
+            node_id: node.id.clone(),
+        });
+    }
+
+    let mut active: delegation_workflow_node_binding::ActiveModel = binding.clone().into();
+    if !is_admitted {
+        active.work_unit_key = Set(node.work_unit_key.clone().expect("work unit key"));
+        active.role = Set(role_str(node.role.expect("work unit role")).into());
+        active.agent_type = Set(node.agent_type.clone().expect("agent"));
+        active.profile_id = Set(node.profile_id.clone());
+        active.phase_id = Set(node.phase_id.clone().expect("phase"));
+        active.task_index = Set(node.task_index.map(i64::from));
+    }
+    if freeze_cohort {
+        active.cohort_frozen = Set(true);
+    }
+    if let Some(outcome) = node.node_outcome {
+        active.node_outcome = Set(Some(match outcome {
+            ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
+        }));
+    }
+    active.updated_at = Set(now);
+    active.update(conn).await.map_err(db_err)?;
+    Ok(())
+}
+
+/// Drop is legal only when cancellation is explicit for the binding or its pair.
 fn is_canceled_drop(
     normalized: &NormalizedManifest,
     binding: &delegation_workflow_node_binding::Model,
 ) -> bool {
-    if normalized.workflow_state == ManifestWorkflowState::Blocked {
-        return true;
-    }
     // Partner still listed with canceled outcome, or this node listed canceled.
     normalized
         .nodes
@@ -8160,5 +8253,465 @@ mod tests {
         .await
         .unwrap_err();
         assert!(reentry.to_string().contains("Plan review"));
+    }
+
+    #[cfg(test)]
+    mod binding_lifecycle {
+        use super::*;
+
+        async fn binding(
+            db: &AppDatabase,
+            workflow_id: &str,
+            node_id: &str,
+        ) -> delegation_workflow_node_binding::Model {
+            delegation_workflow_node_binding::Entity::find_by_id((
+                workflow_id.to_string(),
+                node_id.to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        async fn header(db: &AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
+            delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn task_cohort(
+            db: &AppDatabase,
+            workflow_id: &str,
+        ) -> Vec<delegation_workflow_node_binding::Model> {
+            delegation_workflow_node_binding::Entity::find()
+                .filter(
+                    delegation_workflow_node_binding::Column::WorkflowId
+                        .eq(workflow_id.to_string()),
+                )
+                .filter(delegation_workflow_node_binding::Column::TaskIndex.eq(1))
+                .order_by_asc(delegation_workflow_node_binding::Column::NodeId)
+                .all(&db.conn)
+                .await
+                .unwrap()
+        }
+
+        fn update_doc(doc: &mut ManifestDocument, workflow_id: &str, revision: u64, digest: &str) {
+            doc.workflow_id = Some(workflow_id.into());
+            doc.expected_manifest_revision = Some(revision);
+            doc.plan.as_mut().unwrap().digest = digest.into();
+        }
+
+        fn omit_node(doc: &mut ManifestDocument, node_id: &str) {
+            doc.nodes.retain(|node| node.id != node_id);
+            for node in &mut doc.nodes {
+                node.deps.retain(|dependency| dependency != node_id);
+            }
+            doc.edges
+                .retain(|edge| edge.from != node_id && edge.to != node_id);
+        }
+
+        async fn publish(
+            db: &AppDatabase,
+            emitter: &EventEmitter,
+            parent: i32,
+            document: ManifestDocument,
+        ) -> Result<PublishResult, WorkflowStoreError> {
+            publish_workflow_manifest_core(db, emitter, parent, PublishWorkflowRequest { document })
+                .await
+        }
+
+        async fn observe(db: &AppDatabase, workflow_id: &str, node_id: &str) {
+            let row = binding(db, workflow_id, node_id).await;
+            let mut active: delegation_workflow_node_binding::ActiveModel = row.into();
+            active.is_observed = Set(true);
+            active.update(&db.conn).await.unwrap();
+        }
+
+        async fn retire_final_fixer(
+            db: &AppDatabase,
+            emitter: &EventEmitter,
+            parent: i32,
+            workflow_id: &str,
+            source: &ManifestDocument,
+        ) -> ManifestDocument {
+            observe(db, workflow_id, "final-fixer").await;
+            let mut omitted = source.clone();
+            update_doc(&mut omitted, workflow_id, 1, "sha256:retire-final-fixer");
+            omitted
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "final-reviewer")
+                .unwrap()
+                .node_outcome = Some(ManifestNodeOutcome::Canceled);
+            omit_node(&mut omitted, "final-fixer");
+            assert_eq!(
+                publish(db, emitter, parent, omitted.clone())
+                    .await
+                    .unwrap()
+                    .manifest_revision,
+                2
+            );
+            omitted
+        }
+
+        async fn freeze_task_cohort(db: &AppDatabase, workflow_id: &str) {
+            for node_id in ["task-1-impl", "task-1-rev"] {
+                let row = binding(db, workflow_id, node_id).await;
+                let mut active: delegation_workflow_node_binding::ActiveModel = row.into();
+                active.cohort_frozen = Set(true);
+                if node_id == "task-1-impl" {
+                    active.is_observed = Set(true);
+                }
+                active.update(&db.conn).await.unwrap();
+            }
+        }
+
+        async fn frozen_rejects_without_writes(
+            db: &AppDatabase,
+            emitter: &EventEmitter,
+            parent: i32,
+            workflow_id: &str,
+            doc: ManifestDocument,
+            before_header: &delegation_workflow::Model,
+            before_cohort: &[delegation_workflow_node_binding::Model],
+        ) {
+            let error = publish(db, emitter, parent, doc).await.unwrap_err();
+            assert!(
+                matches!(error, WorkflowStoreError::CohortFrozen { .. })
+                    || matches!(
+                        error,
+                        WorkflowStoreError::Validation(WorkflowError::TaskRouteMismatch(_))
+                    ),
+                "unexpected frozen-route error: {error:?}"
+            );
+            assert_eq!(header(db, workflow_id).await, *before_header);
+            assert_eq!(task_cohort(db, workflow_id).await, before_cohort);
+        }
+
+        #[tokio::test]
+        async fn retired_omitted_binding_is_a_byte_stable_noop_across_republish() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("retired-omitted-noop");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            let mut omitted =
+                retire_final_fixer(&db, &emitter, parent, &initial.workflow_id, &source).await;
+            let snapshot = binding(&db, &initial.workflow_id, "final-fixer").await;
+
+            update_doc(
+                &mut omitted,
+                &initial.workflow_id,
+                2,
+                "sha256:retire-final-fixer",
+            );
+            publish(&db, &emitter, parent, omitted.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                binding(&db, &initial.workflow_id, "final-fixer").await,
+                snapshot
+            );
+
+            update_doc(
+                &mut omitted,
+                &initial.workflow_id,
+                3,
+                "sha256:structurally-changed-plan",
+            );
+            omitted.task_policies[0].risk.reason = "structurally changed Task plan".into();
+            publish(&db, &emitter, parent, omitted).await.unwrap();
+            assert_eq!(
+                binding(&db, &initial.workflow_id, "final-fixer").await,
+                snapshot
+            );
+        }
+
+        #[tokio::test]
+        async fn retired_present_binding_reactivates_only_exact_identity() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("retired-exact-reactivation");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            let mut retired_doc =
+                retire_final_fixer(&db, &emitter, parent, &initial.workflow_id, &source).await;
+            let retired = binding(&db, &initial.workflow_id, "final-fixer").await;
+            retired_doc.nodes.push(
+                source
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "final-fixer")
+                    .unwrap()
+                    .clone(),
+            );
+            update_doc(
+                &mut retired_doc,
+                &initial.workflow_id,
+                2,
+                "sha256:exact-reactivation",
+            );
+            publish(&db, &emitter, parent, retired_doc.clone())
+                .await
+                .unwrap();
+            let reactivated = binding(&db, &initial.workflow_id, "final-fixer").await;
+            let mut expected = retired.clone();
+            expected.retired_revision = None;
+            expected.updated_at = reactivated.updated_at;
+            assert_eq!(reactivated, expected, "only retirement state may clear");
+
+            let mut active: delegation_workflow_node_binding::ActiveModel = reactivated.into();
+            active.retired_revision = Set(Some(4));
+            active.update(&db.conn).await.unwrap();
+            let retired = binding(&db, &initial.workflow_id, "final-fixer").await;
+            let normalized = validate_manifest_document(&retired_doc).unwrap();
+            let exact = normalized
+                .nodes
+                .iter()
+                .find(|node| node.id == "final-fixer")
+                .unwrap()
+                .clone();
+            let mut wrong_workflow = retired.clone();
+            wrong_workflow.workflow_id = "different-workflow".into();
+            assert_eq!(
+                require_exact_binding_identity(&initial.workflow_id, &wrong_workflow, &exact)
+                    .unwrap_err(),
+                WorkflowStoreError::AdmittedNodeIdentityMutation {
+                    node_id: retired.node_id.clone()
+                },
+                "exact identity-conflict error for workflow_id"
+            );
+            assert_eq!(
+                binding(&db, &initial.workflow_id, "final-fixer").await,
+                retired
+            );
+            let mut mutations = Vec::new();
+            for field in [
+                "node_id",
+                "work_unit_key",
+                "role",
+                "agent_type",
+                "profile_id",
+                "phase_id",
+                "task_index",
+            ] {
+                let mut node = exact.clone();
+                match field {
+                    "node_id" => node.id = "different-node".into(),
+                    "work_unit_key" => node.work_unit_key = Some("different-key".into()),
+                    "role" => node.role = Some(ManifestNodeRole::Reviewer),
+                    "agent_type" => node.agent_type = Some("codex".into()),
+                    "profile_id" => node.profile_id = Some("different-profile".into()),
+                    "phase_id" => node.phase_id = Some(PHASE_PLAN.into()),
+                    "task_index" => node.task_index = Some(1),
+                    _ => unreachable!(),
+                }
+                mutations.push((field, node));
+            }
+            for (field, node) in mutations {
+                let error = reactivate_exact_identity(&db.conn, &retired, &node, Utc::now())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    WorkflowStoreError::AdmittedNodeIdentityMutation {
+                        node_id: retired.node_id.clone()
+                    },
+                    "exact identity-conflict error for {field}"
+                );
+                assert_eq!(
+                    binding(&db, &initial.workflow_id, "final-fixer").await,
+                    retired
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn active_observed_binding_retires_once_and_preserves_first_revision() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("active-observed-retirement");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            let mut omitted =
+                retire_final_fixer(&db, &emitter, parent, &initial.workflow_id, &source).await;
+            let first = binding(&db, &initial.workflow_id, "final-fixer").await;
+            assert_eq!(first.retired_revision, Some(2));
+            assert!(first.retained_observed);
+            for (revision, digest) in [(2, "sha256:repeat-1"), (3, "sha256:repeat-2")] {
+                update_doc(&mut omitted, &initial.workflow_id, revision, digest);
+                publish(&db, &emitter, parent, omitted.clone())
+                    .await
+                    .unwrap();
+                let after = binding(&db, &initial.workflow_id, "final-fixer").await;
+                assert_eq!(after.retired_revision, Some(2));
+                assert!(after.retained_observed);
+                assert_eq!(after.created_at, first.created_at);
+                assert_eq!(after.updated_at, first.updated_at);
+            }
+        }
+
+        #[tokio::test]
+        async fn blocked_manifest_cannot_remove_or_redefine_frozen_task_cohort() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("blocked-frozen-cohort");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            freeze_task_cohort(&db, &initial.workflow_id).await;
+            let before_header = header(&db, &initial.workflow_id).await;
+            let before_cohort = task_cohort(&db, &initial.workflow_id).await;
+
+            for side in ["task-1-impl", "task-1-rev"] {
+                let mut variants = Vec::new();
+                let mut omission = source.clone();
+                omit_node(&mut omission, side);
+                variants.push(omission);
+
+                let mut replacement = source.clone();
+                let replacement_id = format!("{side}-replacement");
+                rename_node_id(&mut replacement, side, &replacement_id);
+                let route = &mut replacement.task_policies[0].route;
+                if side == "task-1-impl" {
+                    route.implementer_node_id = replacement_id;
+                } else {
+                    route.reviewer_node_ids = vec![replacement_id];
+                }
+                variants.push(replacement);
+
+                let mut identity = source.clone();
+                let node = identity
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == side)
+                    .unwrap();
+                let profile = "different-profile";
+                node.profile_id = Some(profile.into());
+                node.work_unit_key = Some(
+                    match node.role.unwrap() {
+                        ManifestNodeRole::Implementer => {
+                            build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                                task_index: 1,
+                                agent_type: node.agent_type.as_deref().unwrap(),
+                                profile_id: Some(profile),
+                            })
+                        }
+                        ManifestNodeRole::Reviewer => {
+                            build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+                                task_index: 1,
+                                agent_type: node.agent_type.as_deref().unwrap(),
+                                profile_id: Some(profile),
+                            })
+                        }
+                        _ => unreachable!(),
+                    }
+                    .unwrap(),
+                );
+                variants.push(identity);
+
+                let mut route_reassignment = source.clone();
+                let route = &mut route_reassignment.task_policies[0].route;
+                if side == "task-1-impl" {
+                    route.implementer_node_id = "task-1-rev".into();
+                } else {
+                    route.reviewer_node_ids = vec!["task-1-impl".into()];
+                }
+                variants.push(route_reassignment);
+
+                for (variant_index, mut doc) in variants.into_iter().enumerate() {
+                    update_doc(
+                        &mut doc,
+                        &initial.workflow_id,
+                        1,
+                        &format!("sha256:blocked-{side}-{variant_index}"),
+                    );
+                    doc.workflow_state = ManifestWorkflowState::Blocked;
+                    frozen_rejects_without_writes(
+                        &db,
+                        &emitter,
+                        parent,
+                        &initial.workflow_id,
+                        doc,
+                        &before_header,
+                        &before_cohort,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn canceled_outcome_can_update_without_erasing_frozen_binding() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let source = design_plan_doc("canceled-frozen-binding");
+            let initial = publish(&db, &emitter, parent, source.clone())
+                .await
+                .unwrap();
+            freeze_task_cohort(&db, &initial.workflow_id).await;
+            let before = task_cohort(&db, &initial.workflow_id).await;
+            let mut canceled = source.clone();
+            update_doc(&mut canceled, &initial.workflow_id, 1, "sha256:canceled");
+            canceled.workflow_state = ManifestWorkflowState::Blocked;
+            canceled
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "task-1-impl")
+                .unwrap()
+                .node_outcome = Some(ManifestNodeOutcome::Canceled);
+            publish(&db, &emitter, parent, canceled.clone())
+                .await
+                .unwrap();
+            let after = task_cohort(&db, &initial.workflow_id).await;
+            assert_eq!(after.len(), 2);
+            for prior in before {
+                let current = after
+                    .iter()
+                    .find(|row| row.node_id == prior.node_id)
+                    .unwrap();
+                assert_eq!(current.work_unit_key, prior.work_unit_key);
+                assert_eq!(current.role, prior.role);
+                assert_eq!(current.agent_type, prior.agent_type);
+                assert_eq!(current.profile_id, prior.profile_id);
+                assert_eq!(current.phase_id, prior.phase_id);
+                assert_eq!(current.task_index, prior.task_index);
+                assert_eq!(current.retired_revision, None);
+            }
+            assert_eq!(
+                after
+                    .iter()
+                    .find(|row| row.node_id == "task-1-impl")
+                    .unwrap()
+                    .node_outcome,
+                Some(NodeOutcome::Canceled)
+            );
+
+            let before_header = header(&db, &initial.workflow_id).await;
+            let before_cohort = task_cohort(&db, &initial.workflow_id).await;
+            update_doc(
+                &mut canceled,
+                &initial.workflow_id,
+                2,
+                "sha256:blocked-not-drop-permission",
+            );
+            omit_node(&mut canceled, "task-1-rev");
+            frozen_rejects_without_writes(
+                &db,
+                &emitter,
+                parent,
+                &initial.workflow_id,
+                canceled,
+                &before_header,
+                &before_cohort,
+            )
+            .await;
+        }
     }
 }

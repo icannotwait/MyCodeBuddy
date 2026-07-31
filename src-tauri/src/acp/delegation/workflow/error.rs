@@ -39,7 +39,7 @@ pub enum WorkflowStoreError {
     #[error("publication token conflict: parent already has workflow {existing_workflow_id}")]
     PublicationTokenConflict { existing_workflow_id: String },
 
-    #[error("admitted-node identity mutation rejected for node {node_id}")]
+    #[error("workflow binding immutable identity conflict for node {node_id}; use a new node id")]
     AdmittedNodeIdentityMutation { node_id: String },
 
     #[error("admitted workflow binding or Task cohort policy/complete route is immutable at {node_id} (cohort_frozen)")]
