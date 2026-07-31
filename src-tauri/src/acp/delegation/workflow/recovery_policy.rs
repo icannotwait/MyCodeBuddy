@@ -1126,25 +1126,6 @@ mod workflow_recovery_policy {
         ));
     }
 
-    #[derive(Clone)]
-    struct RecoverySnapshotFixture {
-        durable: WorkflowRecoverySnapshot,
-        plan_prose: String,
-        delegation_prompt: String,
-        raw_external_session_id: String,
-        unrelated_ui_state: String,
-    }
-
-    impl RecoverySnapshotFixture {
-        fn build_snapshot(&self) -> WorkflowRecoverySnapshot {
-            self.durable.clone()
-        }
-
-        fn fingerprint(&self) -> String {
-            decide_workflow_recovery(&self.build_snapshot()).source_state_fingerprint
-        }
-    }
-
     #[test]
     fn workflow_fingerprint_changes_for_every_policy_relevant_evidence_change() {
         let source = approved_snapshot();
@@ -1689,26 +1670,5 @@ mod workflow_recovery_policy {
             decide_workflow_recovery(&repeated_cohort_identity).source_state_fingerprint,
             "cohort ordering is not policy evidence even for contradictory identities"
         );
-
-        let fixture = RecoverySnapshotFixture {
-            durable: source,
-            plan_prose: "Plan prose".into(),
-            delegation_prompt: "delegation prompt".into(),
-            raw_external_session_id: "external-session-raw-1".into(),
-            unrelated_ui_state: "expanded-ui-section".into(),
-        };
-        assert_eq!(baseline, fixture.fingerprint());
-        let mut excluded_change = fixture.clone();
-        excluded_change.plan_prose = "different Plan prose".into();
-        assert_eq!(baseline, excluded_change.fingerprint());
-        let mut excluded_change = fixture.clone();
-        excluded_change.delegation_prompt = "different prompt".into();
-        assert_eq!(baseline, excluded_change.fingerprint());
-        let mut excluded_change = fixture.clone();
-        excluded_change.raw_external_session_id = "external-session-raw-2".into();
-        assert_eq!(baseline, excluded_change.fingerprint());
-        let mut excluded_change = fixture;
-        excluded_change.unrelated_ui_state = "collapsed-ui-section".into();
-        assert_eq!(baseline, excluded_change.fingerprint());
     }
 }
