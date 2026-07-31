@@ -46,7 +46,7 @@ use super::plan_review::{
 use super::project::evidence_from_run_and_binding;
 use super::recovery_policy::{
     decide_workflow_recovery, hash_displayed_reset_reason, WorkflowRecoveryActiveRun,
-    WorkflowRecoveryBindingLifecycle, WorkflowRecoveryDisposition,
+    WorkflowRecoveryBindingLifecycle, WorkflowRecoveryCauseCode, WorkflowRecoveryDisposition,
     WorkflowRecoveryDocumentIdentity, WorkflowRecoveryFrozenTaskCohort,
     WorkflowRecoveryPlanGateEvidence, WorkflowRecoveryPlanIdentity, WorkflowRecoverySnapshot,
 };
@@ -826,6 +826,24 @@ fn designated_recovery_rejection_code(error: &WorkflowStoreError) -> Option<&str
     }
 }
 
+fn parse_workflow_recovery_cause_code(value: &str) -> Option<WorkflowRecoveryCauseCode> {
+    match value {
+        "legacy_block_with_current_plan_approval" => {
+            Some(WorkflowRecoveryCauseCode::LegacyBlockWithCurrentPlanApproval)
+        }
+        "legacy_block_with_current_plan" => {
+            Some(WorkflowRecoveryCauseCode::LegacyBlockWithCurrentPlan)
+        }
+        "legacy_block_without_plan" => Some(WorkflowRecoveryCauseCode::LegacyBlockWithoutPlan),
+        "plan_user_decision_required" => Some(WorkflowRecoveryCauseCode::PlanUserDecisionRequired),
+        "plan_gate_blocked" => Some(WorkflowRecoveryCauseCode::PlanGateBlocked),
+        "explicit_manifest_block" => Some(WorkflowRecoveryCauseCode::ExplicitManifestBlock),
+        "unresolved_task_cohort" => Some(WorkflowRecoveryCauseCode::UnresolvedTaskCohort),
+        "durable_state_inconsistent" => Some(WorkflowRecoveryCauseCode::DurableStateInconsistent),
+        _ => None,
+    }
+}
+
 async fn emit_recover_workflow_rejection_if_designated(
     db: &AppDatabase,
     emitter: &EventEmitter,
@@ -901,13 +919,16 @@ async fn emit_recover_workflow_rejection_if_designated(
     let Ok((source_manifest_revision, graph_revision, cause_code)) = context else {
         return;
     };
+    let Some(cause_code) = parse_workflow_recovery_cause_code(&cause_code) else {
+        return;
+    };
     let event = WorkflowRecoveryEvent::RecoveryRejected {
         workflow_id: req.workflow_id.clone(),
         recovery_authorization_id: Some(req.recovery_authorization_id.clone()),
         source_manifest_revision,
         graph_revision,
         action: RecoveryAllowedAction::RecoverWorkflow.as_str().to_string(),
-        cause_code,
+        cause_code: cause_code.as_str().to_string(),
         rejection_code: rejection_code.to_string(),
     };
     if let Err(emit_error) = emit_workflow_recovery_event(emitter, event) {
@@ -984,13 +1005,16 @@ async fn emit_plan_lineage_reset_rejection_if_designated(
     let Ok((source_manifest_revision, graph_revision, cause_code)) = context else {
         return;
     };
+    let Some(cause_code) = parse_workflow_recovery_cause_code(&cause_code) else {
+        return;
+    };
     let event = WorkflowRecoveryEvent::RecoveryRejected {
         workflow_id: workflow_id.to_string(),
         recovery_authorization_id: Some(recovery_authorization_id.to_string()),
         source_manifest_revision,
         graph_revision,
         action: RecoveryAllowedAction::ResetPlanLineage.as_str().to_string(),
-        cause_code,
+        cause_code: cause_code.as_str().to_string(),
         rejection_code: rejection_code.to_string(),
     };
     if let Err(emit_error) = emit_workflow_recovery_event(emitter, event) {
@@ -14538,6 +14562,118 @@ mod tests {
             assert_eq!(
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
+            );
+        }
+
+        #[tokio::test]
+        async fn rejection_events_suppress_corrupt_persisted_causes() {
+            let (db, parent, workflow_id, emitter, mut rx) = blocked_recovery_fixture(
+                ManifestWorkflowState::Estimated,
+                "corrupt-replay-rejection-cause",
+            )
+            .await;
+            let source_header = load_header(&db, &workflow_id).await;
+            let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
+            let request = RecoverWorkflowRequest {
+                workflow_id: workflow_id.clone(),
+                recovery_authorization_id: authorization_id.clone(),
+                expected_manifest_revision: source_header.active_manifest_revision as u64,
+                correlation_id: "corrupt-replay-rejection-cause".into(),
+            };
+            let recovered = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("recover before corrupting replay provenance");
+            while rx.try_recv().is_ok() {}
+
+            let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+                workflow_id.clone(),
+                recovered.manifest_revision as i64,
+            ))
+            .one(&db.conn)
+            .await
+            .expect("load recovery revision for corruption")
+            .expect("committed recovery revision");
+            let mut corrupt_revision: delegation_workflow_manifest_revision::ActiveModel =
+                revision.into();
+            corrupt_revision.transition_reason_code =
+                Set(Some("corrupt arbitrary replay cause".into()));
+            corrupt_revision
+                .update(&db.conn)
+                .await
+                .expect("corrupt persisted replay cause");
+            let before_replay = durable_state(&db, &workflow_id).await;
+            let mut conflicting_replay = request;
+            conflicting_replay.correlation_id = "corrupt-replay-rejection-conflict".into();
+            assert_eq!(
+                recover_workflow_core(&db, &emitter, parent, conflicting_replay)
+                    .await
+                    .unwrap_err(),
+                WorkflowStoreError::WorkflowRecoveryConflict
+            );
+            assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
+            let replay_rejection_channels = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| event.channel)
+                .collect::<Vec<_>>();
+
+            let reset_reason = "authorized reset reason";
+            let reset_token = "corrupt-reset-rejection-cause";
+            let (reset_db, reset_parent, reset_workflow_id, reset_emitter, mut reset_rx) =
+                plan_lineage_reset_fixture(reset_token).await;
+            insert_reset_reviewer_evidence(
+                &reset_db,
+                reset_parent,
+                &reset_workflow_id,
+                reset_token,
+            )
+            .await;
+            let (reset_authorization_id, _) = authorize_decision(
+                &reset_db,
+                reset_parent,
+                &reset_workflow_id,
+                Some(reset_reason),
+            )
+            .await;
+            let receipt = load_authorization(&reset_db, &reset_authorization_id).await;
+            let mut corrupt_receipt: recovery_authorization::ActiveModel = receipt.into();
+            corrupt_receipt.cause_code = Set("corrupt arbitrary reset cause".into());
+            corrupt_receipt
+                .update(&reset_db.conn)
+                .await
+                .expect("corrupt persisted reset cause");
+            let before_reset = durable_state(&reset_db, &reset_workflow_id).await;
+            let receipt_before_reset = load_authorization(&reset_db, &reset_authorization_id).await;
+            assert_eq!(
+                settle_reset(
+                    &reset_db,
+                    &reset_emitter,
+                    reset_parent,
+                    &reset_workflow_id,
+                    reset_token,
+                    "changed reset reason",
+                    Some(reset_authorization_id.clone()),
+                    GateSettlementOutcome::Approved,
+                    vec![],
+                )
+                .await
+                .unwrap_err(),
+                WorkflowStoreError::RecoveryAuthorizationStale
+            );
+            assert_eq!(
+                durable_state(&reset_db, &reset_workflow_id).await,
+                before_reset
+            );
+            assert_eq!(
+                load_authorization(&reset_db, &reset_authorization_id).await,
+                receipt_before_reset
+            );
+            let reset_rejection_channels = std::iter::from_fn(|| reset_rx.try_recv().ok())
+                .map(|event| event.channel)
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                (replay_rejection_channels, reset_rejection_channels),
+                (Vec::<String>::new(), Vec::<String>::new()),
+                "corrupt persisted causes must suppress rejection events"
             );
         }
 
