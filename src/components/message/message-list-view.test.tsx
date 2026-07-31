@@ -1516,6 +1516,30 @@ describe("mergeConsecutiveAssistantTurns completion metadata", () => {
     expect(item.group.completed_at).toBe("2026-07-19T05:25:22.851Z")
   })
 
+  it("preserves one reasoning effort on a merged assistant response", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a", { reasoning_effort: "high" }),
+      assistantItem("b"),
+    ])
+
+    const item = merged[0] as TurnItem
+    expect(item.group.reasoning_effort).toBe("high")
+    expect(item.group.reasoning_efforts).toBeUndefined()
+  })
+
+  it("deduplicates merged reasoning efforts in encounter order and ignores blanks", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a", { reasoning_effort: " low " }),
+      assistantItem("b", { reasoning_effort: "high" }),
+      assistantItem("c", { reasoning_effort: "low" }),
+      assistantItem("d", { reasoning_effort: "   " }),
+    ])
+
+    const item = merged[0] as TurnItem
+    expect(item.group.reasoning_effort).toBe("low")
+    expect(item.group.reasoning_efforts).toEqual(["low", "high"])
+  })
+
   it("does not fold a compaction divider into the preceding assistant reply", () => {
     // The compaction event sits BETWEEN two assistant replies (the reply before
     // `/compact` and the next). Two bare assistant turns would merge into one;

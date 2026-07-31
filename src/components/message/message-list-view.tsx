@@ -179,6 +179,8 @@ export interface ResolvedMessageGroup {
   duration_ms?: number | null
   model?: string | null
   models?: string[]
+  reasoning_effort?: string | null
+  reasoning_efforts?: string[]
   /**
    * Wall-clock completion time supplied by the Rust parser. For merged
    * sub-turns this is the latest non-null completion across the run — the
@@ -499,6 +501,8 @@ export function mergeConsecutiveAssistantTurns(
       let mergedOutcome: TurnOutcome | null | undefined
       const seenModels = new Set<string>()
       const mergedModels: string[] = []
+      const seenReasoningEfforts = new Set<string>()
+      const mergedReasoningEfforts: string[] = []
       for (const it of buffer) {
         if (it.group.completed_at) {
           mergedCompletedAt = it.group.completed_at
@@ -530,6 +534,11 @@ export function mergeConsecutiveAssistantTurns(
           seenModels.add(it.group.model)
           mergedModels.push(it.group.model)
         }
+        const effort = it.group.reasoning_effort?.trim()
+        if (effort && !seenReasoningEfforts.has(effort)) {
+          seenReasoningEfforts.add(effort)
+          mergedReasoningEfforts.push(effort)
+        }
       }
 
       const merged: AssistantTurnItem = {
@@ -550,6 +559,12 @@ export function mergeConsecutiveAssistantTurns(
           duration_ms: mergedDuration,
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
+          reasoning_effort:
+            mergedReasoningEfforts[0] ?? last.group.reasoning_effort,
+          reasoning_efforts:
+            mergedReasoningEfforts.length > 1
+              ? mergedReasoningEfforts
+              : undefined,
           completed_at: mergedCompletedAt,
           outcome: mergedOutcome,
         },
@@ -1293,6 +1308,7 @@ export function MessageListView({
           usage: msg.usage,
           duration_ms: msg.duration_ms,
           model: msg.model,
+          reasoning_effort: msg.reasoning_effort,
           completed_at: msg.completed_at,
           outcome: msg.outcome,
         }
