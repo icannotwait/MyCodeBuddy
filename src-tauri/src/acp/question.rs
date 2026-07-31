@@ -25,7 +25,8 @@
 //!   * [`QuestionRuntimeConfig`] — the hot-swappable "is the feature on?" flag,
 //!     read at MCP injection time (mirrors [`crate::acp::feedback`]).
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -36,7 +37,6 @@ use sacp::schema::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use tokio::sync::{oneshot, RwLock};
 
 /// Max questions per `ask_user_question` call. Matches Claude Code's
@@ -78,7 +78,7 @@ pub struct RecoveryQuestionPresentation {
 }
 
 /// A single multiple-choice question.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionSpec {
     /// Backend-minted stable id. Used as the answer correlation key instead of
     /// the question text (which Claude Code keys on) so duplicate question
@@ -99,89 +99,22 @@ pub struct QuestionSpec {
     /// True when the answer is a secret (codex `request_user_input` marks API
     /// keys etc. with `_meta.codex.isSecret`): the card masks the free-text
     /// input. Default false — absent on the wire for every non-secret source.
-    pub is_secret: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct QuestionSpecWire {
-    id: String,
-    question: String,
-    header: String,
-    multi_select: bool,
-    options: Vec<QuestionOption>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    is_secret: bool,
+    pub is_secret: bool,
+    /// Recovery-specific presentation codes. Authorization receipts and other
+    /// durable metadata never ride on the question card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    recovery: Option<RecoveryQuestionPresentation>,
-}
-
-fn recovery_presentations() -> &'static Mutex<BTreeMap<String, RecoveryQuestionPresentation>> {
-    static PRESENTATIONS: OnceLock<Mutex<BTreeMap<String, RecoveryQuestionPresentation>>> =
-        OnceLock::new();
-    PRESENTATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    pub recovery: Option<RecoveryQuestionPresentation>,
 }
 
 impl QuestionSpec {
-    pub fn with_recovery(self, recovery: RecoveryQuestionPresentation) -> Self {
-        recovery_presentations()
-            .lock()
-            .expect("recovery presentation lock poisoned")
-            .insert(self.id.clone(), recovery);
+    pub fn with_recovery(mut self, recovery: RecoveryQuestionPresentation) -> Self {
+        self.recovery = Some(recovery);
         self
     }
 
     pub fn recovery(&self) -> Option<RecoveryQuestionPresentation> {
-        recovery_presentations()
-            .lock()
-            .expect("recovery presentation lock poisoned")
-            .get(&self.id)
-            .cloned()
-    }
-
-    pub(crate) fn clear_recovery(&self) {
-        recovery_presentations()
-            .lock()
-            .expect("recovery presentation lock poisoned")
-            .remove(&self.id);
-    }
-}
-
-impl Serialize for QuestionSpec {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        QuestionSpecWire {
-            id: self.id.clone(),
-            question: self.question.clone(),
-            header: self.header.clone(),
-            multi_select: self.multi_select,
-            options: self.options.clone(),
-            is_secret: self.is_secret,
-            recovery: self.recovery(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for QuestionSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = QuestionSpecWire::deserialize(deserializer)?;
-        let spec = Self {
-            id: wire.id,
-            question: wire.question,
-            header: wire.header,
-            multi_select: wire.multi_select,
-            options: wire.options,
-            is_secret: wire.is_secret,
-        };
-        Ok(match wire.recovery {
-            Some(recovery) => spec.with_recovery(recovery),
-            None => spec,
-        })
+        self.recovery.clone()
     }
 }
 
@@ -270,6 +203,7 @@ pub(crate) fn generic_test_question() -> QuestionSpec {
             },
         ],
         is_secret: false,
+        recovery: None,
     }
 }
 
@@ -412,6 +346,7 @@ pub fn parse_questions(arguments: &Value) -> Result<Vec<QuestionSpec>, String> {
             multi_select,
             options,
             is_secret: false,
+            recovery: None,
         });
     }
     Ok(out)
@@ -681,6 +616,7 @@ pub fn parse_grok_ext_questions(params: &Value) -> Result<Vec<QuestionSpec>, Str
             multi_select,
             options,
             is_secret: false,
+            recovery: None,
         });
     }
     Ok(out)
@@ -1194,6 +1130,7 @@ fn parse_form_questions(
             multi_select,
             options,
             is_secret: is_secret_property(raw, id),
+            recovery: None,
         });
         fields.push(ElicitationField {
             id: id.clone(),
@@ -1869,6 +1806,7 @@ mod tests {
                 })
                 .collect(),
             is_secret: false,
+            recovery: None,
         };
 
         assert!(validate_specs(&[]).is_err(), "empty set");
@@ -1915,6 +1853,7 @@ mod tests {
                 },
             ],
             is_secret: false,
+            recovery: None,
         };
         assert!(validate_specs(&[blank_id]).is_err(), "blank id");
         // Duplicate option label within one question (parse_questions rejects it).
@@ -1934,6 +1873,7 @@ mod tests {
                 },
             ],
             is_secret: false,
+            recovery: None,
         };
         assert!(
             validate_specs(&[dup_label]).is_err(),
@@ -2392,8 +2332,8 @@ mod tests {
                 },
             ],
             is_secret: false,
-        }
-        .with_recovery(presentation.clone());
+            recovery: Some(presentation.clone()),
+        };
 
         let wire = serde_json::to_value(&spec).unwrap();
         let recovery = wire["recovery"].as_object().unwrap();
@@ -2418,6 +2358,47 @@ mod tests {
         let round_trip: QuestionSpec = serde_json::from_value(wire).unwrap();
         assert_eq!(round_trip.recovery(), Some(presentation));
         assert!(validate_specs(&[round_trip.clone()]).is_ok());
-        round_trip.clear_recovery();
+    }
+
+    #[test]
+    fn recovery_presentation_is_owned_by_each_question_value() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let presentation = RecoveryQuestionPresentation {
+            subject: "workflow".into(),
+            action: "recover_workflow".into(),
+            target: "workflow-a".into(),
+            cause: "stalled".into(),
+            risk: "state_change".into(),
+            display_reason: None,
+        };
+        let with_recovery = QuestionSpec {
+            id: id.clone(),
+            question: "recovery_authorization".into(),
+            header: "Recovery".into(),
+            multi_select: false,
+            options: Vec::new(),
+            is_secret: false,
+            recovery: Some(presentation.clone()),
+        };
+        let reused_id = QuestionSpec {
+            id,
+            question: "ordinary question".into(),
+            header: "Ordinary".into(),
+            multi_select: false,
+            options: Vec::new(),
+            is_secret: false,
+            recovery: None,
+        };
+
+        assert_eq!(with_recovery.recovery(), Some(presentation));
+        let mut cloned = with_recovery.clone();
+        cloned.recovery = None;
+        assert!(with_recovery.recovery.is_some());
+        assert!(cloned.recovery.is_none());
+        assert_eq!(reused_id.recovery(), None);
+        assert!(serde_json::to_value(reused_id)
+            .unwrap()
+            .get("recovery")
+            .is_none());
     }
 }

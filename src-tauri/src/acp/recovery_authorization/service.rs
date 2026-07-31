@@ -37,6 +37,25 @@ pub struct RecoveryAuthorizationService {
     store: RecoveryAuthorizationStore,
     clock: Arc<dyn RecoveryAuthorizationClock>,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    #[cfg(test)]
+    injected_failure: Arc<Mutex<Option<InjectedRecoveryWriteFailure>>>,
+    #[cfg(test)]
+    injected_pause: Arc<Mutex<Option<(InjectedRecoveryWriteFailure, InjectedRecoveryWritePause)>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedRecoveryWriteFailure {
+    Bind,
+    Resolve,
+    Abandon,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct InjectedRecoveryWritePause {
+    pub reached: Arc<Notify>,
+    pub release: Arc<Notify>,
 }
 
 impl RecoveryAuthorizationService {
@@ -52,6 +71,71 @@ impl RecoveryAuthorizationService {
             store: RecoveryAuthorizationStore::new(conn),
             clock,
             notifications: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            injected_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            injected_pause: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_write(&self, failure: InjectedRecoveryWriteFailure) {
+        *self
+            .injected_failure
+            .lock()
+            .expect("recovery failure injection lock poisoned") = Some(failure);
+    }
+
+    #[cfg(test)]
+    pub fn pause_next_write(
+        &self,
+        failure: InjectedRecoveryWriteFailure,
+    ) -> InjectedRecoveryWritePause {
+        let pause = InjectedRecoveryWritePause {
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .injected_pause
+            .lock()
+            .expect("recovery pause injection lock poisoned") = Some((failure, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn maybe_fail_write(
+        &self,
+        failure: InjectedRecoveryWriteFailure,
+    ) -> Result<(), RecoveryAuthorizationError> {
+        let pause = {
+            let mut injected = self
+                .injected_pause
+                .lock()
+                .expect("recovery pause injection lock poisoned");
+            if injected
+                .as_ref()
+                .is_some_and(|(write, _)| *write == failure)
+            {
+                injected.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+        let mut injected = self
+            .injected_failure
+            .lock()
+            .expect("recovery failure injection lock poisoned");
+        if injected.as_ref() == Some(&failure) {
+            *injected = None;
+            Err(RecoveryAuthorizationError::Database(format!(
+                "injected {failure:?} failure"
+            )))
+        } else {
+            Ok(())
         }
     }
 
@@ -164,8 +248,8 @@ impl RecoveryAuthorizationService {
                         },
                     ],
                     is_secret: false,
-                }
-                .with_recovery(presentation)];
+                    recovery: Some(presentation),
+                }];
                 let registration = match manager
                     .register_recovery_question(
                         parent_conversation_id,
@@ -183,8 +267,21 @@ impl RecoveryAuthorizationService {
                         return Err(RecoveryAuthorizationError::Blocked);
                     }
                 };
-                self.bind_question(&row.authorization_id, &registration.question_id)
-                    .await?;
+                if let Err(error) = self
+                    .bind_question(&row.authorization_id, &registration.question_id)
+                    .await
+                {
+                    if self
+                        .abandon_question(&row.authorization_id, &registration.question_id)
+                        .await
+                        .is_ok()
+                    {
+                        manager
+                            .finish_question_settlement(&registration.question_id, None)
+                            .await;
+                    }
+                    return Err(error);
+                }
                 tokio::select! {
                     biased;
                     _ = cancelled.cancelled() => {
@@ -218,6 +315,9 @@ impl RecoveryAuthorizationService {
         authorization_id: &str,
         question_id: &str,
     ) -> Result<(), RecoveryAuthorizationError> {
+        #[cfg(test)]
+        self.maybe_fail_write(InjectedRecoveryWriteFailure::Bind)
+            .await?;
         self.store
             .bind_question(authorization_id, question_id)
             .await?;
@@ -229,6 +329,9 @@ impl RecoveryAuthorizationService {
         authorization_id: &str,
         outcome: QuestionOutcome,
     ) -> Result<RecoveryAuthorizationResult, RecoveryAuthorizationError> {
+        #[cfg(test)]
+        self.maybe_fail_write(InjectedRecoveryWriteFailure::Resolve)
+            .await?;
         let approve = !outcome.declined
             && outcome.answers.len() == 1
             && outcome.answers[0].selected.as_slice() == [RECOVERY_APPROVE_LABEL];
@@ -249,6 +352,9 @@ impl RecoveryAuthorizationService {
         authorization_id: &str,
         question_id: &str,
     ) -> Result<(), RecoveryAuthorizationError> {
+        #[cfg(test)]
+        self.maybe_fail_write(InjectedRecoveryWriteFailure::Abandon)
+            .await?;
         self.store
             .abandon_pending(authorization_id, Some(question_id))
             .await?;

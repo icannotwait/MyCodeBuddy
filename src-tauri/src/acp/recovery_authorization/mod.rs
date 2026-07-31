@@ -160,6 +160,63 @@ mod recovery_authorization {
             .expect("row exists")
     }
 
+    async fn start_request(
+        service: &RecoveryAuthorizationService,
+        manager: &ConnectionManager,
+        parent_connection_id: &str,
+        challenge: RecoveryChallenge,
+    ) -> (
+        tokio::task::JoinHandle<Result<RecoveryAuthorizationResult, RecoveryAuthorizationError>>,
+        recovery_authorization::Model,
+        String,
+    ) {
+        let request_service = service.clone();
+        let request_manager = manager.clone_ref();
+        let request = tokio::spawn(async move {
+            request_service
+                .request(&request_manager, challenge, CancellationToken::new())
+                .await
+        });
+        let parent_conversation_id = manager
+            .get_state(parent_connection_id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .conversation_id
+            .unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rows = service
+                    .store()
+                    .list_for_parent(parent_conversation_id)
+                    .await
+                    .unwrap();
+                if let Some(row) = rows.into_iter().find(|row| {
+                    row.status == RecoveryAuthorizationStatus::Pending && row.question_id.is_some()
+                }) {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery card must bind within timeout");
+        let answer_question_id = manager
+            .get_state(parent_connection_id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .id
+            .clone();
+        (request, pending, answer_question_id)
+    }
+
     #[tokio::test]
     async fn concurrent_requests_reuse_one_pending_or_approved_challenge() {
         let (_db, parent, _clock, service) = fixture(start()).await;
@@ -323,51 +380,98 @@ mod recovery_authorization {
     #[tokio::test]
     async fn decline_dismiss_and_parent_disconnect_end_declined_or_abandoned() {
         let (_db, parent, _clock, service) = fixture(start()).await;
-        for outcome in [
-            crate::acp::question::QuestionOutcome {
-                answers: vec![crate::acp::question::QuestionAnsweredItem {
-                    question: "recovery_authorization".into(),
-                    header: "Recovery".into(),
-                    multi_select: false,
-                    selected: vec![RECOVERY_DECLINE_LABEL.into()],
-                }],
-                declined: false,
-            },
-            crate::acp::question::QuestionOutcome {
-                answers: vec![],
-                declined: true,
-            },
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "lifecycle-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("lifecycle-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+
+        let (decline, decline_row, answer_question_id) =
+            start_request(&service, &manager, "lifecycle-parent", challenge(parent)).await;
+        manager
+            .answer_question(
+                "lifecycle-parent",
+                decline_row.question_id.as_deref().unwrap(),
+                QuestionAnswer {
+                    answers: vec![QuestionAnswerItem {
+                        question_id: answer_question_id,
+                        labels: vec![RECOVERY_DECLINE_LABEL.into()],
+                    }],
+                    declined: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decline.await.unwrap().unwrap().status,
+            RecoveryAuthorizationStatus::Declined
+        );
+
+        let mut dismiss_challenge = challenge(parent);
+        dismiss_challenge.source_state_fingerprint = "lifecycle-dismiss".into();
+        let (dismiss, dismiss_row, _) =
+            start_request(&service, &manager, "lifecycle-parent", dismiss_challenge).await;
+        manager
+            .answer_question(
+                "lifecycle-parent",
+                dismiss_row.question_id.as_deref().unwrap(),
+                QuestionAnswer {
+                    answers: Vec::new(),
+                    declined: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dismiss.await.unwrap().unwrap().status,
+            RecoveryAuthorizationStatus::Declined
+        );
+
+        let mut teardown_challenge = challenge(parent);
+        teardown_challenge.source_state_fingerprint = "lifecycle-teardown".into();
+        let (teardown, teardown_row, _) =
+            start_request(&service, &manager, "lifecycle-parent", teardown_challenge).await;
+        let waiter_a =
+            service.wait_for_resolution(&teardown_row.authorization_id, CancellationToken::new());
+        let waiter_b =
+            service.wait_for_resolution(&teardown_row.authorization_id, CancellationToken::new());
+        manager.cancel_questions_by_parent("lifecycle-parent").await;
+        let (request_result, a, b) = tokio::join!(teardown, waiter_a, waiter_b);
+        let request_result = request_result.unwrap().unwrap();
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_eq!(
+            request_result.status,
+            RecoveryAuthorizationStatus::Abandoned
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, request_result);
+
+        for authorization_id in [
+            decline_row.authorization_id,
+            dismiss_row.authorization_id,
+            teardown_row.authorization_id,
         ] {
-            let id = pending_id(&service, challenge(parent)).await;
-            let result = service.resolve_question(&id, outcome).await.unwrap();
-            assert_eq!(result.status, RecoveryAuthorizationStatus::Declined);
-            let terminal = row(&service, &id).await;
+            let terminal = row(&service, &authorization_id).await;
             assert!(terminal.approved_at.is_none());
             assert!(terminal.expires_at.is_none());
             assert!(terminal.consumed_at.is_none());
+            assert!(terminal.consumed_by_kind.is_none());
+            assert!(terminal.consumed_by_id.is_none());
             assert!(terminal.consumer_correlation_id.is_none());
         }
-
-        let id = pending_id(&service, challenge(parent)).await;
-        service
-            .bind_question(&id, "question-owner-ended")
-            .await
-            .unwrap();
-        let waiter_a = service.wait_for_resolution(&id, CancellationToken::new());
-        let waiter_b = service.wait_for_resolution(&id, CancellationToken::new());
-        service
-            .abandon_question(&id, "question-owner-ended")
-            .await
-            .unwrap();
-        let (a, b) = tokio::join!(waiter_a, waiter_b);
-        let a = a.unwrap();
-        let b = b.unwrap();
-        assert_eq!(a.status, RecoveryAuthorizationStatus::Abandoned);
-        assert_eq!(a, b);
-        let terminal = row(&service, &id).await;
-        assert!(terminal.approved_at.is_none());
-        assert!(terminal.expires_at.is_none());
-        assert!(terminal.consumed_by_kind.is_none());
     }
 
     #[tokio::test]
@@ -416,11 +520,370 @@ mod recovery_authorization {
     }
 
     #[tokio::test]
+    async fn bind_failure_closes_card_and_abandons_created_row() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "bind-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("bind-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        service.fail_next_write(InjectedRecoveryWriteFailure::Bind);
+
+        let error = service
+            .request(&manager, challenge(parent), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RecoveryAuthorizationError::Database(_)));
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("bind-parent")
+                .await,
+            0
+        );
+        assert_eq!(service.store().count_active(parent).await.unwrap(), 0);
+        let rows = service.store().list_for_parent(parent).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RecoveryAuthorizationStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn settlement_failures_keep_the_recovery_card_until_durable_retry() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "settle-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("settle-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+
+        let request_service = service.clone();
+        let request_manager = manager.clone_ref();
+        let request = tokio::spawn(async move {
+            request_service
+                .request(
+                    &request_manager,
+                    challenge(parent),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let pending = loop {
+            let rows = service.store().list_for_parent(parent).await.unwrap();
+            if rows
+                .first()
+                .and_then(|row| row.question_id.as_ref())
+                .is_some()
+            {
+                break rows[0].clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        let question_id = pending.question_id.clone().unwrap();
+        let answer_question_id = manager
+            .get_state("settle-parent")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .questions[0]
+            .id
+            .clone();
+        let answer = QuestionAnswer {
+            answers: vec![QuestionAnswerItem {
+                question_id: answer_question_id,
+                labels: vec![RECOVERY_APPROVE_LABEL.into()],
+            }],
+            declined: false,
+        };
+
+        service.fail_next_write(InjectedRecoveryWriteFailure::Resolve);
+        assert!(manager
+            .answer_question("settle-parent", &question_id, answer.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("settle-parent")
+                .await,
+            1
+        );
+        assert_eq!(
+            row(&service, &pending.authorization_id).await.status,
+            RecoveryAuthorizationStatus::Pending
+        );
+
+        manager
+            .answer_question("settle-parent", &question_id, answer)
+            .await
+            .unwrap();
+        assert_eq!(
+            request.await.unwrap().unwrap().status,
+            RecoveryAuthorizationStatus::Approved
+        );
+
+        let dismiss_service = service.clone();
+        let dismiss_manager = manager.clone_ref();
+        let mut dismiss_challenge = challenge(parent);
+        dismiss_challenge.source_state_fingerprint = "dismiss-fingerprint".into();
+        let dismiss = tokio::spawn(async move {
+            dismiss_service
+                .request(
+                    &dismiss_manager,
+                    dismiss_challenge,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let dismiss_row = loop {
+            let rows = service.store().list_for_parent(parent).await.unwrap();
+            if let Some(row) = rows.iter().find(|row| {
+                row.status == RecoveryAuthorizationStatus::Pending && row.question_id.is_some()
+            }) {
+                break row.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        let dismiss_question_id = dismiss_row.question_id.clone().unwrap();
+        service.fail_next_write(InjectedRecoveryWriteFailure::Resolve);
+        assert!(manager
+            .answer_question(
+                "settle-parent",
+                &dismiss_question_id,
+                QuestionAnswer {
+                    answers: Vec::new(),
+                    declined: true,
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("settle-parent")
+                .await,
+            1
+        );
+        assert_eq!(
+            row(&service, &dismiss_row.authorization_id).await.status,
+            RecoveryAuthorizationStatus::Pending
+        );
+        manager
+            .answer_question(
+                "settle-parent",
+                &dismiss_question_id,
+                QuestionAnswer {
+                    answers: Vec::new(),
+                    declined: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dismiss.await.unwrap().unwrap().status,
+            RecoveryAuthorizationStatus::Declined
+        );
+
+        let teardown_service = service.clone();
+        let teardown_manager = manager.clone_ref();
+        let mut teardown_challenge = challenge(parent);
+        teardown_challenge.source_state_fingerprint = "teardown-fingerprint".into();
+        let teardown = tokio::spawn(async move {
+            teardown_service
+                .request(
+                    &teardown_manager,
+                    teardown_challenge,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let teardown_row = loop {
+            let rows = service.store().list_for_parent(parent).await.unwrap();
+            if let Some(row) = rows.iter().find(|row| {
+                row.status == RecoveryAuthorizationStatus::Pending && row.question_id.is_some()
+            }) {
+                break row.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        service.fail_next_write(InjectedRecoveryWriteFailure::Abandon);
+        manager.cancel_questions_by_parent("settle-parent").await;
+        let teardown_result = tokio::time::timeout(std::time::Duration::from_secs(5), teardown)
+            .await
+            .expect("teardown retry must resolve")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            teardown_result.status,
+            RecoveryAuthorizationStatus::Abandoned
+        );
+        assert_eq!(
+            row(&service, &teardown_row.authorization_id).await.status,
+            RecoveryAuthorizationStatus::Abandoned
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_teardown_waits_for_failed_inflight_answer_before_abandoning() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "race-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("race-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        let (request, pending, answer_question_id) =
+            start_request(&service, &manager, "race-parent", challenge(parent)).await;
+        let question_id = pending.question_id.clone().unwrap();
+        let pause = service.pause_next_write(InjectedRecoveryWriteFailure::Resolve);
+        service.fail_next_write(InjectedRecoveryWriteFailure::Resolve);
+
+        let answer_manager = manager.clone_ref();
+        let answer = tokio::spawn(async move {
+            answer_manager
+                .answer_question(
+                    "race-parent",
+                    &question_id,
+                    QuestionAnswer {
+                        answers: vec![QuestionAnswerItem {
+                            question_id: answer_question_id,
+                            labels: vec![RECOVERY_APPROVE_LABEL.into()],
+                        }],
+                        declined: false,
+                    },
+                )
+                .await
+        });
+        pause.reached.notified().await;
+        let teardown_manager = manager.clone_ref();
+        let teardown = tokio::spawn(async move {
+            teardown_manager
+                .cancel_questions_by_parent("race-parent")
+                .await;
+        });
+        tokio::task::yield_now().await;
+        pause.release.notify_one();
+
+        assert!(answer.await.unwrap().is_err());
+        teardown.await.unwrap();
+        let request_result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("racing teardown must resolve")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row(&service, &pending.authorization_id).await.status,
+            RecoveryAuthorizationStatus::Abandoned
+        );
+        assert_eq!(
+            request_result.status,
+            RecoveryAuthorizationStatus::Abandoned
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_answer_caller_does_not_strand_settlement_claim() {
+        let (_db, parent, _clock, service) = fixture(start()).await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "abort-parent",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        manager
+            .get_state("abort-parent")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent);
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
+        let (request, pending, answer_question_id) =
+            start_request(&service, &manager, "abort-parent", challenge(parent)).await;
+        let question_id = pending.question_id.clone().unwrap();
+        let pause = service.pause_next_write(InjectedRecoveryWriteFailure::Resolve);
+        let answer_manager = manager.clone_ref();
+        let answer = tokio::spawn(async move {
+            answer_manager
+                .answer_question(
+                    "abort-parent",
+                    &question_id,
+                    QuestionAnswer {
+                        answers: vec![QuestionAnswerItem {
+                            question_id: answer_question_id,
+                            labels: vec![RECOVERY_APPROVE_LABEL.into()],
+                        }],
+                        declined: false,
+                    },
+                )
+                .await
+        });
+        pause.reached.notified().await;
+        answer.abort();
+        let _ = answer.await;
+        pause.release.notify_one();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("owned settlement must outlive aborted caller")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, RecoveryAuthorizationStatus::Approved);
+        assert_eq!(
+            manager
+                .pending_question_count_for_parent("abort-parent")
+                .await,
+            0
+        );
+        assert_eq!(
+            row(&service, &pending.authorization_id).await.status,
+            RecoveryAuthorizationStatus::Approved
+        );
+    }
+
+    #[tokio::test]
     async fn approved_receipt_survives_connection_rebind_for_same_parent_conversation() {
         let (db, parent, _clock, service) = fixture(start()).await;
-        let id = pending_id(&service, challenge(parent)).await;
-        approve(&service, &id).await;
         let manager = ConnectionManager::new();
+        manager.install_recovery_authorization_service(Arc::new(service.clone()));
         manager
             .insert_test_connection(
                 "old-parent",
@@ -436,7 +899,26 @@ mod recovery_authorization {
             .write()
             .await
             .conversation_id = Some(parent);
-        manager.cancel_questions_by_parent("old-parent").await;
+        let (request, pending, answer_question_id) =
+            start_request(&service, &manager, "old-parent", challenge(parent)).await;
+        manager
+            .answer_question(
+                "old-parent",
+                pending.question_id.as_deref().unwrap(),
+                QuestionAnswer {
+                    answers: vec![QuestionAnswerItem {
+                        question_id: answer_question_id,
+                        labels: vec![RECOVERY_APPROVE_LABEL.into()],
+                    }],
+                    declined: false,
+                },
+            )
+            .await
+            .unwrap();
+        let approved = request.await.unwrap().unwrap();
+        let id = approved.authorization_id;
+        manager.disconnect("old-parent").await.unwrap();
+        assert!(manager.get_state("old-parent").await.is_none());
         manager
             .insert_test_connection(
                 "new-parent",
@@ -483,6 +965,8 @@ mod recovery_authorization {
 
         let mut cases: Vec<(AuthorizationConsumeExpectation<'_>, &str)> = Vec::new();
         let other_payload =
+            json!({"agent":"other","nested":{"a":1,"z":2},"reset_reason_hash":"reason-a"});
+        let other_reason =
             json!({"agent":"codex","nested":{"a":1,"z":2},"reset_reason_hash":"other"});
         let other_subject = "other-subject";
         let other_fingerprint = "other-fingerprint";
@@ -503,6 +987,9 @@ mod recovery_authorization {
         cases.push((e, "recovery_authorization_action_mismatch"));
         let mut e = expectation(&base, "mismatch");
         e.action_payload = &other_payload;
+        cases.push((e, "recovery_authorization_payload_mismatch"));
+        let mut e = expectation(&base, "mismatch");
+        e.action_payload = &other_reason;
         cases.push((e, "recovery_authorization_payload_mismatch"));
 
         for (expected, code) in cases {
@@ -647,12 +1134,27 @@ mod recovery_authorization {
         consume_txn(&txn, replay, &exact, start()).await.unwrap();
         txn.commit().await.unwrap();
 
-        let mut different = expectation(&source, "correlation-b");
-        for mutation in 0..3 {
-            if mutation == 1 {
-                different.consumer_id = "other-run";
-            } else if mutation == 2 {
-                different.allowed_action = RecoveryAllowedAction::Continue;
+        for mutation in 0..9 {
+            let mut changed_source = source.clone();
+            let correlation = if mutation == 8 {
+                "correlation-b"
+            } else {
+                "correlation-a"
+            };
+            match mutation {
+                1 => changed_source.subject_kind = RecoverySubjectKind::Workflow,
+                2 => changed_source.subject_id = "other-subject".into(),
+                3 => changed_source.source_state_fingerprint = "other-fingerprint".into(),
+                4 => changed_source.allowed_action = RecoveryAllowedAction::Continue,
+                5 => changed_source.action_payload["agent"] = json!("other"),
+                _ => {}
+            }
+            let mut different = expectation(&changed_source, correlation);
+            match mutation {
+                0 => different.parent_conversation_id += 1,
+                6 => different.consumer_kind = RecoveryConsumerKind::WorkflowManifestRevision,
+                7 => different.consumer_id = "other-run",
+                _ => {}
             }
             let txn = db.conn.begin().await.unwrap();
             let err = validate_for_consumption_txn(&txn, &id, &different, start())

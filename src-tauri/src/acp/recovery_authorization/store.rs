@@ -258,6 +258,9 @@ impl RecoveryAuthorizationStore {
                                 recovery_authorization::Column::Status
                                     .eq(RecoveryAuthorizationStatus::Declined),
                             )
+                            // Task 1 has no decline transition timestamp. Match
+                            // automation history retention by terminal status
+                            // plus creation time rather than expanding schema.
                             .add(recovery_authorization::Column::RequestedAt.lt(cutoff)),
                     )
                     .add(
@@ -282,6 +285,8 @@ impl RecoveryAuthorizationStore {
                                 recovery_authorization::Column::Status
                                     .eq(RecoveryAuthorizationStatus::Abandoned),
                             )
+                            // As above, abandonment has no transition timestamp
+                            // in the approved authorization model.
                             .add(recovery_authorization::Column::RequestedAt.lt(cutoff)),
                     ),
             )

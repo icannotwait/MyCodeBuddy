@@ -508,6 +508,24 @@ struct PendingQuestionEntry {
     questions: Vec<QuestionSpec>,
     sender: tokio::sync::oneshot::Sender<QuestionOutcome>,
     recovery_authorization_id: Option<String>,
+    settling: bool,
+}
+
+fn question_settlement_retry_delay() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_secs(1)
+    }
+}
+
+enum QuestionSettlementClaim {
+    Missing,
+    InFlight,
+    Claimed {
+        questions: Vec<QuestionSpec>,
+        recovery_authorization_id: Option<String>,
+    },
 }
 
 /// A parked Grok `exit_plan_mode` approval awaiting the user's decision. The
@@ -5259,10 +5277,10 @@ impl ConnectionManager {
         authorization_id: String,
         questions: Vec<QuestionSpec>,
     ) -> Result<RegisteredQuestion, RecoveryQuestionRegistrationError> {
-        if questions.len() != 1 || questions[0].recovery().is_none() {
-            for question in &questions {
-                question.clear_recovery();
-            }
+        if self.recovery_authorization_service().is_none()
+            || questions.len() != 1
+            || questions[0].recovery().is_none()
+        {
             return Err(RecoveryQuestionRegistrationError::Invalid);
         }
         let states: Vec<_> = self
@@ -5280,9 +5298,6 @@ impl ConnectionManager {
             }
         }
         let Some(parent_connection_id) = parent_connection_id else {
-            for question in &questions {
-                question.clear_recovery();
-            }
             return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
         };
         self.register_question_inner(&parent_connection_id, questions, Some(authorization_id))
@@ -5299,15 +5314,9 @@ impl ConnectionManager {
         // only token-gated, so refuse to broadcast malformed/oversized specs
         // (None → the listener declines the ask, as for any other None path).
         if crate::acp::question::validate_specs(&questions).is_err() {
-            for question in &questions {
-                question.clear_recovery();
-            }
             return Err(RecoveryQuestionRegistrationError::Invalid);
         }
         let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await else {
-            for question in &questions {
-                question.clear_recovery();
-            }
             return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
         };
         let question_id = uuid::Uuid::new_v4().to_string();
@@ -5315,9 +5324,6 @@ impl ConnectionManager {
         {
             let mut reg = self.pending_questions.lock().await;
             if reg.values().any(|e| e.parent_connection_id == conn_id) {
-                for question in &questions {
-                    question.clear_recovery();
-                }
                 return Err(RecoveryQuestionRegistrationError::Occupied);
             }
             reg.insert(
@@ -5327,6 +5333,7 @@ impl ConnectionManager {
                     questions: questions.clone(),
                     sender: tx,
                     recovery_authorization_id,
+                    settling: false,
                 },
             );
         }
@@ -5371,9 +5378,6 @@ impl ConnectionManager {
             .compensate_if_question_drained(&question_id, &state, &emitter)
             .await
         {
-            for question in &questions {
-                question.clear_recovery();
-            }
             return Err(RecoveryQuestionRegistrationError::ParentUnavailable);
         }
         Ok(RegisteredQuestion {
@@ -5435,10 +5439,9 @@ impl ConnectionManager {
     }
 
     /// Resolve a pending `ask_user_question` with the user's submission (from any
-    /// client). Removes the one-shot atomically (first answer wins; a duplicate /
-    /// already-resolved id is an idempotent no-op), sends the self-describing
-    /// outcome to the blocked listener, and broadcasts `QuestionResolved` so the
-    /// card clears on every client. Routing uses the entry's stored parent
+    /// client). Claims the entry atomically, persists recovery decisions before
+    /// removal, sends the self-describing outcome to the blocked listener, and
+    /// broadcasts `QuestionResolved` so the card clears on every client. Routing uses the entry's stored parent
     /// connection (the `question_id` is the authoritative key), so a stale
     /// `conn_id` from the caller can't misroute.
     ///
@@ -5453,77 +5456,190 @@ impl ConnectionManager {
         answer: QuestionAnswer,
     ) -> Result<(), AcpError> {
         let _ = conn_id;
-        let entry = self.pending_questions.lock().await.remove(question_id);
-        let Some(entry) = entry else {
-            // Already answered / canceled / gone elsewhere — idempotent success.
+        let (questions, authorization_id) = match self.claim_question_settlement(question_id).await
+        {
+            QuestionSettlementClaim::Missing => return Ok(()),
+            QuestionSettlementClaim::InFlight => {
+                return Err(AcpError::protocol(
+                    "question settlement is already in progress",
+                ))
+            }
+            QuestionSettlementClaim::Claimed {
+                questions,
+                recovery_authorization_id,
+            } => (questions, recovery_authorization_id),
+        };
+        let outcome = build_outcome(&questions, &answer);
+        let Some(authorization_id) = authorization_id else {
+            self.finish_question_settlement(question_id, Some(outcome))
+                .await;
             return Ok(());
         };
-        let outcome = build_outcome(&entry.questions, &answer);
-        if let (Some(authorization_id), Some(service)) = (
-            entry.recovery_authorization_id.as_deref(),
-            self.recovery_authorization_service(),
-        ) {
+        let Some(service) = self.recovery_authorization_service() else {
+            self.release_question_settlement(question_id).await;
+            return Err(AcpError::protocol(
+                "recovery authorization service is unavailable",
+            ));
+        };
+        let manager = self.clone_ref();
+        let question_id = question_id.to_string();
+        tokio::spawn(async move {
             if let Err(error) = service
-                .resolve_question(authorization_id, outcome.clone())
+                .resolve_question(&authorization_id, outcome.clone())
                 .await
             {
-                tracing::warn!(
-                    code = error.code(),
-                    "[recovery_authorization] question resolution persistence failed"
-                );
+                manager.release_question_settlement(&question_id).await;
+                return Err(AcpError::protocol(error.to_string()));
             }
-        }
-        for question in &entry.questions {
-            question.clear_recovery();
-        }
-        // Ignore a dropped receiver: the listener may have abandoned the wait
-        // (peer-close) at the same instant; the resolved-event below still clears
-        // the card.
-        let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self
-            .get_state_and_emitter(&entry.parent_connection_id)
-            .await
-        {
-            emit_with_state(
-                &state,
-                &emitter,
-                AcpEvent::QuestionResolved {
-                    question_id: question_id.to_string(),
-                },
-            )
-            .await;
-            tool_watchdog_resume_from_state(&state).await;
-        }
-        Ok(())
+            manager
+                .finish_question_settlement(&question_id, Some(outcome))
+                .await;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
     }
 
     /// Cancel a pending `ask_user_question` — the companion's tool call was
-    /// canceled (peer-close) or the connection is tearing down. Removes the
-    /// one-shot (dropping the sender unblocks the listener with a declined
-    /// outcome) and broadcasts `QuestionResolved` so the card clears. No-op if
-    /// the question was already answered / gone.
+    /// canceled (peer-close) or explicitly dismissed. Recovery decisions are
+    /// persisted before the one-shot is removed and the card is cleared. No-op
+    /// if the question was already answered / gone.
     pub async fn cancel_question(&self, conn_id: &str, question_id: &str) {
         let _ = conn_id;
-        let removed = self.pending_questions.lock().await.remove(question_id);
-        let Some(entry) = removed else {
+        let authorization_id = match self.claim_question_settlement(question_id).await {
+            QuestionSettlementClaim::Missing | QuestionSettlementClaim::InFlight => return,
+            QuestionSettlementClaim::Claimed {
+                recovery_authorization_id,
+                ..
+            } => recovery_authorization_id,
+        };
+        let Some(authorization_id) = authorization_id else {
+            self.finish_question_settlement(question_id, None).await;
             return;
         };
-        if let (Some(authorization_id), Some(service)) = (
-            entry.recovery_authorization_id.as_deref(),
-            self.recovery_authorization_service(),
-        ) {
-            let _ = service
+        let Some(service) = self.recovery_authorization_service() else {
+            self.release_question_settlement(question_id).await;
+            return;
+        };
+        let manager = self.clone_ref();
+        let question_id = question_id.to_string();
+        let _ = tokio::spawn(async move {
+            if service
                 .resolve_question(
-                    authorization_id,
+                    &authorization_id,
                     QuestionOutcome {
                         answers: Vec::new(),
                         declined: true,
                     },
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                manager.release_question_settlement(&question_id).await;
+                return;
+            }
+            manager.finish_question_settlement(&question_id, None).await;
+        })
+        .await;
+    }
+
+    /// Cancel every pending `ask_user_question` parked on a connection that is
+    /// tearing down. The `run_connection` cleanup guard calls this (alongside
+    /// the delegation `DelegationBroker::cancel_by_parent` cascade) so question
+    /// entries and listener tasks are reclaimed without depending on the
+    /// companion's ask socket. Recovery abandonment runs in an owned retry task
+    /// so connection teardown does not block on database recovery. No-op when
+    /// nothing is pending for this parent.
+    pub async fn cancel_questions_by_parent(&self, conn_id: &str) {
+        let ids: Vec<String> = self
+            .pending_questions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, e)| e.parent_connection_id == conn_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for question_id in ids {
+            let manager = self.clone_ref();
+            tokio::spawn(async move {
+                manager
+                    .abandon_question_for_parent_teardown(question_id)
+                    .await;
+            });
         }
-        for question in &entry.questions {
-            question.clear_recovery();
+    }
+
+    async fn abandon_question_for_parent_teardown(&self, question_id: String) {
+        let authorization_id = loop {
+            match self.claim_question_settlement(&question_id).await {
+                QuestionSettlementClaim::Missing => return,
+                QuestionSettlementClaim::InFlight => {
+                    tokio::time::sleep(question_settlement_retry_delay()).await
+                }
+                QuestionSettlementClaim::Claimed {
+                    recovery_authorization_id,
+                    ..
+                } => break recovery_authorization_id,
+            }
+        };
+        let Some(authorization_id) = authorization_id else {
+            self.finish_question_settlement(&question_id, None).await;
+            return;
+        };
+        let Some(service) = self.recovery_authorization_service() else {
+            self.release_question_settlement(&question_id).await;
+            return;
+        };
+        loop {
+            match service
+                .abandon_question(&authorization_id, &question_id)
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        code = error.code(),
+                        "[recovery_authorization] parent teardown abandonment retry"
+                    );
+                    tokio::time::sleep(question_settlement_retry_delay()).await;
+                }
+            }
+        }
+        self.finish_question_settlement(&question_id, None).await;
+    }
+
+    async fn claim_question_settlement(&self, question_id: &str) -> QuestionSettlementClaim {
+        let mut pending = self.pending_questions.lock().await;
+        let Some(entry) = pending.get_mut(question_id) else {
+            return QuestionSettlementClaim::Missing;
+        };
+        if entry.settling {
+            return QuestionSettlementClaim::InFlight;
+        }
+        entry.settling = true;
+        QuestionSettlementClaim::Claimed {
+            questions: entry.questions.clone(),
+            recovery_authorization_id: entry.recovery_authorization_id.clone(),
+        }
+    }
+
+    async fn release_question_settlement(&self, question_id: &str) {
+        if let Some(entry) = self.pending_questions.lock().await.get_mut(question_id) {
+            entry.settling = false;
+        }
+    }
+
+    pub(crate) async fn finish_question_settlement(
+        &self,
+        question_id: &str,
+        outcome: Option<QuestionOutcome>,
+    ) {
+        let entry = self.pending_questions.lock().await.remove(question_id);
+        let Some(entry) = entry else {
+            return;
+        };
+        if let Some(outcome) = outcome {
+            let _ = entry.sender.send(outcome);
         }
         if let Some((state, emitter)) = self
             .get_state_and_emitter(&entry.parent_connection_id)
@@ -5538,59 +5654,6 @@ impl ConnectionManager {
             )
             .await;
             tool_watchdog_resume_from_state(&state).await;
-        }
-    }
-
-    /// Cancel every pending `ask_user_question` parked on a connection that is
-    /// tearing down. The `run_connection` cleanup guard calls this (alongside
-    /// the delegation `DelegationBroker::cancel_by_parent` cascade) so question
-    /// entries — and the listener tasks parked on them — are reclaimed
-    /// synchronously on disconnect, instead of lingering until the companion's
-    /// ask socket happens to close. Dropping each entry's sender unblocks its
-    /// listener with a declined outcome; the `QuestionResolved` broadcast clears
-    /// the card on every client. No-op when nothing is pending for this parent.
-    pub async fn cancel_questions_by_parent(&self, conn_id: &str) {
-        // Remove every entry for this parent under the lock (dropping their
-        // senders unblocks the parked listeners), then emit outside the lock —
-        // the registry mutex is never held across an await.
-        let drained: Vec<(String, Option<String>, Vec<QuestionSpec>)> = {
-            let mut reg = self.pending_questions.lock().await;
-            let ids: Vec<String> = reg
-                .iter()
-                .filter(|(_, e)| e.parent_connection_id == conn_id)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| {
-                    reg.remove(&id)
-                        .map(|entry| (id, entry.recovery_authorization_id, entry.questions))
-                })
-                .collect()
-        };
-        if drained.is_empty() {
-            return;
-        }
-        for (question_id, authorization_id, questions) in &drained {
-            if let (Some(authorization_id), Some(service)) = (
-                authorization_id.as_deref(),
-                self.recovery_authorization_service(),
-            ) {
-                let _ = service
-                    .abandon_question(authorization_id, question_id)
-                    .await;
-            }
-            for question in questions {
-                question.clear_recovery();
-            }
-        }
-        // Best-effort card clear: depending on the teardown path the connection
-        // may already be out of the map (`disconnect` removes it before the
-        // run_connection cleanup guard fires this sweep), so tolerate `None` — the
-        // core removal above already ran and the frontend clears on disconnect.
-        if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
-            for (question_id, _, _) in drained {
-                emit_with_state(&state, &emitter, AcpEvent::QuestionResolved { question_id }).await;
-            }
         }
     }
 
@@ -14991,6 +15054,7 @@ mod tests {
                 },
             ],
             is_secret: false,
+            recovery: None,
         }]
     }
 

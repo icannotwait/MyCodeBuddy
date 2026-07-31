@@ -636,6 +636,7 @@ mod permission_push_tests {
                         },
                     ],
                     is_secret: false,
+                    recovery: None,
                 }],
             },
         }
