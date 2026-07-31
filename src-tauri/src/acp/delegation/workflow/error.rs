@@ -5,6 +5,8 @@ use thiserror::Error;
 use super::plan_review::PlanReviewError;
 pub use super::types::WorkflowError;
 
+pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
+
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkflowStoreError {
@@ -95,6 +97,14 @@ pub enum WorkflowStoreError {
 }
 
 impl WorkflowStoreError {
+    pub fn workflow_recovery_required() -> Self {
+        Self::GateNotReady(WORKFLOW_RECOVERY_REQUIRED.into())
+    }
+
+    pub fn is_workflow_recovery_required(&self) -> bool {
+        matches!(self, Self::GateNotReady(reason) if reason == WORKFLOW_RECOVERY_REQUIRED)
+    }
+
     /// True when the client may retry the same operation after a short delay.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Busy(_) | Self::Persistence(_))

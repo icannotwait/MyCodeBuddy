@@ -2,9 +2,10 @@
 //!
 //! Document gates only for settle. Execution-gate evaluation is Task 4.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -41,8 +42,9 @@ use super::state_dto::{
 };
 use super::types::{
     DocumentGateKind, ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeOutcome,
-    ManifestNodeRole, ManifestWorkflowState, NormalizedGate, NormalizedManifest, NormalizedNode,
-    ResolutionMode, MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState, NormalizedGate,
+    NormalizedManifest, NormalizedNode, ResolutionMode, WorkflowBlockCause,
+    MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -64,6 +66,8 @@ struct PersistedPlanReviewEvidence {
 thread_local! {
     static INJECT_PUBLISH_PERSISTENCE_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static BINDING_DIFF_INVOCATION_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -80,6 +84,24 @@ fn inject_publish_persistence_failure() -> bool {
 fn inject_publish_persistence_failure() -> bool {
     false
 }
+
+#[cfg(test)]
+fn reset_binding_diff_invocation_count() {
+    BINDING_DIFF_INVOCATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn binding_diff_invocation_count() -> usize {
+    BINDING_DIFF_INVOCATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_binding_diff_invocation() {
+    BINDING_DIFF_INVOCATION_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_binding_diff_invocation() {}
 
 // ---------------------------------------------------------------------------
 // Request / result types
@@ -108,6 +130,80 @@ pub struct PublishResult {
     pub graph_revision: u64,
     pub workflow_state: ManifestWorkflowState,
     pub idempotent_replay: bool,
+    pub publication_committed: bool,
+    pub disposition: WorkflowPublicationDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<WorkflowRecoveryRequiredProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPublicationDisposition {
+    Published,
+    WorkflowRecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkflowRecoveryRequiredProjection {
+    pub workflow_id: String,
+    pub workflow_state: ManifestWorkflowState,
+    pub block_cause: Option<WorkflowBlockCause>,
+    pub block_source_manifest_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateOnlyRevisionRequest<'a> {
+    pub target_state: ManifestWorkflowState,
+    pub transition_reason_code: &'a str,
+    pub recovery_authorization_id: Option<&'a str>,
+    pub consumer_correlation_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateOnlyRevisionResult {
+    pub workflow_id: String,
+    pub manifest_revision: u64,
+    pub source_manifest_revision: u64,
+    pub graph_revision: u64,
+    pub workflow_state: ManifestWorkflowState,
+    pub block_cause: Option<WorkflowBlockCause>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_result(
+    workflow_id: String,
+    manifest_revision: u64,
+    graph_revision: u64,
+    workflow_state: ManifestWorkflowState,
+    idempotent_replay: bool,
+    publication_committed: bool,
+    block_cause_code: Option<&str>,
+    block_source_manifest_revision: Option<i64>,
+) -> PublishResult {
+    let blocked = workflow_state == ManifestWorkflowState::Blocked;
+    let recovery = blocked.then(|| WorkflowRecoveryRequiredProjection {
+        workflow_id: workflow_id.clone(),
+        workflow_state,
+        block_cause: Some(
+            WorkflowBlockCause::from_db(block_cause_code)
+                .unwrap_or(WorkflowBlockCause::DurableStateInconsistent),
+        ),
+        block_source_manifest_revision: block_source_manifest_revision.map(|value| value as u64),
+    });
+    PublishResult {
+        workflow_id,
+        manifest_revision,
+        graph_revision,
+        workflow_state,
+        idempotent_replay,
+        publication_committed,
+        disposition: if blocked {
+            WorkflowPublicationDisposition::WorkflowRecoveryRequired
+        } else {
+            WorkflowPublicationDisposition::Published
+        },
+        recovery,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +224,7 @@ pub struct SettleResult {
     pub gate_id: String,
     pub gate_cycle: u64,
     pub graph_revision: u64,
+    pub manifest_revision: u64,
     pub outcome: GateSettlementOutcome,
     pub idempotent_replay: bool,
     pub plan_next_action: Option<PlanReviewNextAction>,
@@ -172,7 +269,6 @@ pub async fn publish_workflow_manifest_core(
                     txn,
                     parent_conversation_id,
                     &normalized,
-                    &document_json,
                     &document_digest,
                     now,
                 )
@@ -212,7 +308,7 @@ pub async fn publish_workflow_manifest_core(
         }
     };
 
-    if !result.idempotent_replay {
+    if result.publication_committed {
         emit_workflow_graph_changed(
             emitter,
             parent_conversation_id,
@@ -312,6 +408,7 @@ pub async fn settle_workflow_gate_core(
                         return settle_result_from_row(
                             existing,
                             header.graph_revision as u64,
+                            header.active_manifest_revision as u64,
                             true,
                         );
                     }
@@ -586,22 +683,52 @@ pub async fn settle_workflow_gate_core(
                 };
                 row.insert(txn).await.map_err(db_err)?;
 
+                let state_revision = if req.outcome == GateSettlementOutcome::Blocked {
+                    let reason =
+                        if plan_next_action == Some(PlanReviewNextAction::UserDecisionRequired) {
+                            WorkflowBlockCause::PlanUserDecisionRequired.as_str()
+                        } else {
+                            WorkflowBlockCause::PlanGateBlocked.as_str()
+                        };
+                    Some(
+                        append_state_only_revision_txn(
+                            txn,
+                            &header,
+                            StateOnlyRevisionRequest {
+                                target_state: ManifestWorkflowState::Blocked,
+                                transition_reason_code: reason,
+                                recovery_authorization_id: None,
+                                consumer_correlation_id: None,
+                            },
+                            now,
+                        )
+                        .await?,
+                    )
+                } else if gate.gate_kind == DocumentGateKind::Plan
+                    && req.outcome == GateSettlementOutcome::Approved
+                    && plan_next_action == Some(PlanReviewNextAction::Approved)
+                    && header.workflow_state != WorkflowState::Blocked
+                {
+                    Some(
+                        append_state_only_revision_txn(
+                            txn,
+                            &header,
+                            StateOnlyRevisionRequest {
+                                target_state: ManifestWorkflowState::Approved,
+                                transition_reason_code: "plan_gate_approved",
+                                recovery_authorization_id: None,
+                                consumer_correlation_id: None,
+                            },
+                            now,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+
                 let mut am: delegation_workflow::ActiveModel = header.clone().into();
                 am.graph_revision = Set(next_graph);
-                // Approved document gate may advance overall state toward approved
-                // when the published manifest already says approved.
-                if req.outcome == GateSettlementOutcome::Approved
-                    && matches!(
-                        header.workflow_state,
-                        WorkflowState::Estimated | WorkflowState::Skeleton
-                    )
-                    && normalized.workflow_state == ManifestWorkflowState::Approved
-                {
-                    am.workflow_state = Set(WorkflowState::Approved);
-                }
-                if req.outcome == GateSettlementOutcome::Blocked {
-                    am.workflow_state = Set(WorkflowState::Blocked);
-                }
                 am.updated_at = Set(now);
                 am.update(txn).await.map_err(db_err)?;
 
@@ -610,6 +737,10 @@ pub async fn settle_workflow_gate_core(
                     gate_id: req.gate_id.clone(),
                     gate_cycle: req.gate_cycle,
                     graph_revision: next_graph as u64,
+                    manifest_revision: state_revision
+                        .map_or(header.active_manifest_revision as u64, |revision| {
+                            revision.manifest_revision
+                        }),
                     outcome: req.outcome.clone(),
                     idempotent_replay: false,
                     plan_next_action,
@@ -1006,6 +1137,131 @@ async fn load_active_manifest_document_txn<C: sea_orm::ConnectionTrait>(
         .map_err(|e| WorkflowStoreError::Persistence(format!("parse manifest json: {e}")))
 }
 
+/// Append an immutable revision that changes workflow state and provenance only.
+pub async fn append_state_only_revision_txn(
+    txn: &DatabaseTransaction,
+    header: &delegation_workflow::Model,
+    request: StateOnlyRevisionRequest<'_>,
+    now: DateTime<Utc>,
+) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+    let current = delegation_workflow::Entity::find_by_id(header.workflow_id.clone())
+        .one(txn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(header.workflow_id.clone()))?;
+    if current.active_manifest_revision != header.active_manifest_revision {
+        return Err(WorkflowStoreError::StaleManifestRevision {
+            expected: header.active_manifest_revision as u64,
+            current: current.active_manifest_revision as u64,
+        });
+    }
+    if current.graph_revision != header.graph_revision {
+        return Err(WorkflowStoreError::StaleGraphRevision {
+            expected: header.graph_revision as u64,
+            current: current.graph_revision as u64,
+        });
+    }
+
+    let mut document = load_active_manifest_document_txn(
+        txn,
+        &current.workflow_id,
+        current.active_manifest_revision,
+    )
+    .await?;
+    validate_manifest_document(&document)?;
+    if document.workflow_state != workflow_state_to_manifest(current.workflow_state.clone()) {
+        return Err(WorkflowStoreError::Persistence(
+            "durable workflow header and active manifest state disagree".into(),
+        ));
+    }
+
+    let leaving_blocked = current.workflow_state == WorkflowState::Blocked
+        && request.target_state != ManifestWorkflowState::Blocked;
+    if leaving_blocked && request.recovery_authorization_id.is_none() {
+        return Err(WorkflowStoreError::workflow_recovery_required());
+    }
+
+    let block_cause = if request.target_state == ManifestWorkflowState::Blocked {
+        let cause = WorkflowBlockCause::from_transition_reason(request.transition_reason_code)
+            .map_err(WorkflowStoreError::Persistence)?;
+        if cause == WorkflowBlockCause::LegacyUnknown {
+            return Err(WorkflowStoreError::Persistence(
+                "new blocked revisions cannot use legacy_unknown".into(),
+            ));
+        }
+        Some(cause)
+    } else {
+        None
+    };
+
+    document.workflow_state = request.target_state;
+    let document_json = serde_json::to_string(&document)
+        .map_err(|error| WorkflowStoreError::Persistence(format!("serialize manifest: {error}")))?;
+    let document_digest = sha256_hex(document_json.as_bytes());
+    let source_manifest_revision = current.active_manifest_revision;
+    let next_manifest_revision = source_manifest_revision + 1;
+
+    delegation_workflow_manifest_revision::ActiveModel {
+        workflow_id: Set(current.workflow_id.clone()),
+        manifest_revision: Set(next_manifest_revision),
+        manifest_state: Set(manifest_state_str(request.target_state).into()),
+        document_json: Set(document_json),
+        document_digest: Set(document_digest),
+        revision_kind: Set(Some(ManifestRevisionKind::StateOnly.as_str().into())),
+        source_manifest_revision: Set(Some(source_manifest_revision)),
+        recovery_authorization_id: Set(request.recovery_authorization_id.map(str::to_string)),
+        transition_reason_code: Set(Some(request.transition_reason_code.to_string())),
+        consumer_correlation_id: Set(request.consumer_correlation_id.map(str::to_string)),
+        created_at: Set(now),
+    }
+    .insert(txn)
+    .await
+    .map_err(db_err)?;
+
+    let mut update = delegation_workflow::ActiveModel {
+        active_manifest_revision: Set(next_manifest_revision),
+        workflow_state: Set(manifest_state_to_db(request.target_state)),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    if let Some(cause) = block_cause {
+        update.block_cause_code = Set(Some(cause.as_str().into()));
+        update.block_source_manifest_revision = Set(Some(source_manifest_revision));
+    } else if leaving_blocked {
+        update.block_cause_code = Set(None);
+        update.block_source_manifest_revision = Set(None);
+    }
+    let changed = delegation_workflow::Entity::update_many()
+        .set(update)
+        .filter(delegation_workflow::Column::WorkflowId.eq(current.workflow_id.clone()))
+        .filter(delegation_workflow::Column::ActiveManifestRevision.eq(source_manifest_revision))
+        .filter(delegation_workflow::Column::GraphRevision.eq(current.graph_revision))
+        .exec(txn)
+        .await
+        .map_err(db_err)?;
+    if changed.rows_affected != 1 {
+        return Err(WorkflowStoreError::StaleManifestRevision {
+            expected: source_manifest_revision as u64,
+            current: current.active_manifest_revision as u64,
+        });
+    }
+
+    if inject_publish_persistence_failure() {
+        return Err(WorkflowStoreError::Persistence(
+            "injected state-only persistence failure".into(),
+        ));
+    }
+
+    Ok(StateOnlyRevisionResult {
+        workflow_id: current.workflow_id,
+        manifest_revision: next_manifest_revision as u64,
+        source_manifest_revision: source_manifest_revision as u64,
+        graph_revision: current.graph_revision as u64,
+        workflow_state: request.target_state,
+        block_cause,
+    })
+}
+
 /// Internal marker: winner not visible in this txn snapshot; outer must re-read.
 const TOKEN_RACE_RECLASSIFY_MARKER: &str = "__workflow_publication_token_race_reclassify__";
 
@@ -1043,7 +1299,6 @@ async fn publish_in_txn(
     txn: &sea_orm::DatabaseTransaction,
     parent_conversation_id: i32,
     normalized: &NormalizedManifest,
-    document_json: &str,
     document_digest: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<PublishResult, WorkflowStoreError> {
@@ -1064,15 +1319,26 @@ async fn publish_in_txn(
             by_token.active_manifest_revision,
         )
         .await?;
-        if active_digest.as_deref() == Some(document_digest) {
+        let replay_digest = if by_token.workflow_state == WorkflowState::Blocked
+            && normalized.workflow_state != ManifestWorkflowState::Blocked
+        {
+            manifest_document_digest_with_state(normalized, ManifestWorkflowState::Blocked)?
+        } else {
+            document_digest.to_string()
+        };
+        if active_digest.as_deref() == Some(replay_digest.as_str()) {
             let by_token = stamp_workflow_capability_version(txn, by_token).await?;
-            return Ok(PublishResult {
-                workflow_id: by_token.workflow_id,
-                manifest_revision: by_token.active_manifest_revision as u64,
-                graph_revision: by_token.graph_revision as u64,
-                workflow_state: workflow_state_to_manifest(by_token.workflow_state),
-                idempotent_replay: true,
-            });
+            let state = workflow_state_to_manifest(by_token.workflow_state.clone());
+            return Ok(publish_result(
+                by_token.workflow_id,
+                by_token.active_manifest_revision as u64,
+                by_token.graph_revision as u64,
+                state,
+                true,
+                false,
+                by_token.block_cause_code.as_deref(),
+                by_token.block_source_manifest_revision,
+            ));
         }
         let is_explicit_update = normalized
             .workflow_id
@@ -1156,13 +1422,17 @@ async fn publish_in_txn(
                 .await?;
                 if active_digest.as_deref() == Some(document_digest) {
                     let existing = stamp_workflow_capability_version(txn, existing).await?;
-                    return Ok(PublishResult {
-                        workflow_id: existing.workflow_id.clone(),
-                        manifest_revision: existing.active_manifest_revision as u64,
-                        graph_revision: existing.graph_revision as u64,
-                        workflow_state: workflow_state_to_manifest(existing.workflow_state.clone()),
-                        idempotent_replay: true,
-                    });
+                    let state = workflow_state_to_manifest(existing.workflow_state.clone());
+                    return Ok(publish_result(
+                        existing.workflow_id.clone(),
+                        existing.active_manifest_revision as u64,
+                        existing.graph_revision as u64,
+                        state,
+                        true,
+                        false,
+                        existing.block_cause_code.as_deref(),
+                        existing.block_source_manifest_revision,
+                    ));
                 }
                 let next_m = existing.active_manifest_revision + 1;
                 let next_g = existing.graph_revision + 1;
@@ -1177,15 +1447,43 @@ async fn publish_in_txn(
             prior.active_manifest_revision,
         )
         .await?;
-        validate_manifest_document(&document).ok()
+        Some(validate_manifest_document(&document)?)
     } else {
         None
     };
 
+    let sticky_blocked = prior_header
+        .as_ref()
+        .is_some_and(|prior| prior.workflow_state == WorkflowState::Blocked)
+        && normalized.workflow_state != ManifestWorkflowState::Blocked;
+    if sticky_blocked
+        && prior_normalized
+            .as_ref()
+            .is_some_and(|prior| manifests_equal_except_state_authority(prior, normalized))
+    {
+        let prior = prior_header
+            .as_ref()
+            .expect("sticky state has prior header");
+        return Ok(publish_result(
+            prior.workflow_id.clone(),
+            prior.active_manifest_revision as u64,
+            prior.graph_revision as u64,
+            ManifestWorkflowState::Blocked,
+            false,
+            false,
+            prior.block_cause_code.as_deref(),
+            prior.block_source_manifest_revision,
+        ));
+    }
+
     // A8: material Plan structure change forces demotion when previously
     // approved or already demoted (supersedes set). Design fingerprint is
     // independent so Design settlements survive plan-only rewrites.
-    let mut effective_state = normalized.workflow_state;
+    let mut effective_state = if sticky_blocked {
+        ManifestWorkflowState::Blocked
+    } else {
+        normalized.workflow_state
+    };
     let mut supersedes =
         compute_supersedes(prior_header.as_ref(), effective_state, next_manifest_rev);
     let next_design_fp = design_fingerprint_hash(normalized);
@@ -1219,6 +1517,28 @@ async fn publish_in_txn(
         }
     }
     let workflow_state = manifest_state_to_db(effective_state);
+    let mut effective_normalized = normalized.clone();
+    effective_normalized.workflow_state = effective_state;
+    let effective_document = normalized_to_document(&effective_normalized);
+    let effective_document_json = serde_json::to_string(&effective_document)
+        .map_err(|error| WorkflowStoreError::Persistence(format!("serialize manifest: {error}")))?;
+    let effective_document_digest = sha256_hex(effective_document_json.as_bytes());
+
+    let (active_block_cause, active_block_source) = match prior_header.as_ref() {
+        Some(prior) if prior.workflow_state == WorkflowState::Blocked => (
+            prior.block_cause_code.clone(),
+            prior.block_source_manifest_revision,
+        ),
+        Some(prior) if effective_state == ManifestWorkflowState::Blocked => (
+            Some(WorkflowBlockCause::ExplicitManifestBlock.as_str().into()),
+            Some(prior.active_manifest_revision),
+        ),
+        None if effective_state == ManifestWorkflowState::Blocked => (
+            Some(WorkflowBlockCause::ExplicitManifestBlock.as_str().into()),
+            Some(next_manifest_rev),
+        ),
+        _ => (None, None),
+    };
 
     let existing_bindings = if prior_header.is_some() {
         delegation_workflow_node_binding::Entity::find()
@@ -1238,7 +1558,7 @@ async fn publish_in_txn(
 
     let binding_diff = plan_binding_diff(
         &workflow_id,
-        normalized,
+        &effective_normalized,
         prior_normalized.as_ref(),
         &existing_bindings,
         &has_run_bindings,
@@ -1255,6 +1575,10 @@ async fn publish_in_txn(
         am.structural_revision = Set(next_structural_rev);
         am.design_fingerprint = Set(next_design_fp);
         am.plan_fingerprint = Set(next_plan_fp);
+        if effective_state == ManifestWorkflowState::Blocked {
+            am.block_cause_code = Set(active_block_cause.clone());
+            am.block_source_manifest_revision = Set(active_block_source);
+        }
         am.updated_at = Set(now);
         am.update(txn).await.map_err(db_err)?;
     } else {
@@ -1263,11 +1587,11 @@ async fn publish_in_txn(
             txn,
             &workflow_id,
             parent_conversation_id,
-            normalized,
+            &effective_normalized,
             next_manifest_rev,
             next_graph_rev,
             workflow_state,
-            document_digest,
+            &effective_document_digest,
             now,
         )
         .await?
@@ -1282,12 +1606,20 @@ async fn publish_in_txn(
         workflow_id: Set(workflow_id.clone()),
         manifest_revision: Set(next_manifest_rev),
         manifest_state: Set(manifest_state_str(effective_state).into()),
-        document_json: Set(document_json.to_string()),
-        document_digest: Set(document_digest.to_string()),
-        revision_kind: Set(None),
-        source_manifest_revision: Set(None),
+        document_json: Set(effective_document_json),
+        document_digest: Set(effective_document_digest),
+        revision_kind: Set(Some(ManifestRevisionKind::Publication.as_str().into())),
+        source_manifest_revision: Set(if effective_state == ManifestWorkflowState::Blocked {
+            active_block_source
+        } else {
+            None
+        }),
         recovery_authorization_id: Set(None),
-        transition_reason_code: Set(None),
+        transition_reason_code: Set(if effective_state == ManifestWorkflowState::Blocked {
+            active_block_cause.clone()
+        } else {
+            None
+        }),
         consumer_correlation_id: Set(None),
         created_at: Set(now),
     };
@@ -1299,13 +1631,16 @@ async fn publish_in_txn(
         ));
     }
 
-    Ok(PublishResult {
-        workflow_id: workflow_id.clone(),
-        manifest_revision: next_manifest_rev as u64,
-        graph_revision: next_graph_rev as u64,
-        workflow_state: effective_state,
-        idempotent_replay: false,
-    })
+    Ok(publish_result(
+        workflow_id.clone(),
+        next_manifest_rev as u64,
+        next_graph_rev as u64,
+        effective_state,
+        false,
+        true,
+        active_block_cause.as_deref(),
+        active_block_source,
+    ))
 }
 
 /// Insert create header under SAVEPOINT.
@@ -1358,15 +1693,18 @@ async fn insert_header_create_or_reclassify(
         schema_version: Set(normalized.schema_version as i64),
         active_manifest_revision: Set(next_manifest_rev),
         graph_revision: Set(next_graph_rev),
-        workflow_state: Set(workflow_state),
+        workflow_state: Set(workflow_state.clone()),
         capability_version: Set(WORKFLOW_CAPABILITY_VERSION.into()),
         publication_token: Set(normalized.publication_token.clone()),
         supersedes_approved_revision: Set(None),
         structural_revision: Set(next_manifest_rev),
         design_fingerprint: Set(design_fingerprint_hash(normalized)),
         plan_fingerprint: Set(plan_fingerprint_hash(normalized)),
-        block_cause_code: Set(None),
-        block_source_manifest_revision: Set(None),
+        block_cause_code: Set((workflow_state == WorkflowState::Blocked)
+            .then(|| WorkflowBlockCause::ExplicitManifestBlock.as_str().into())),
+        block_source_manifest_revision: Set(
+            (workflow_state == WorkflowState::Blocked).then_some(next_manifest_rev)
+        ),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -1474,7 +1812,9 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     {
         header = stamp_workflow_capability_version(conn, header).await?;
     }
-    classify_header_against_digest(
+    let block_cause_code = header.block_cause_code.clone();
+    let block_source_manifest_revision = header.block_source_manifest_revision;
+    let result = classify_header_against_digest(
         token,
         parent_conversation_id,
         header.parent_conversation_id,
@@ -1484,7 +1824,20 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
         header.active_manifest_revision as u64,
         header.graph_revision as u64,
         workflow_state_to_manifest(header.workflow_state),
-    )
+    )?;
+    if result.workflow_state == ManifestWorkflowState::Blocked {
+        return Ok(publish_result(
+            result.workflow_id,
+            result.manifest_revision,
+            result.graph_revision,
+            result.workflow_state,
+            result.idempotent_replay,
+            result.publication_committed,
+            block_cause_code.as_deref(),
+            block_source_manifest_revision,
+        ));
+    }
+    Ok(result)
 }
 
 async fn stamp_workflow_capability_version<C: sea_orm::ConnectionTrait>(
@@ -1523,13 +1876,16 @@ pub(crate) fn classify_header_against_digest(
         });
     }
     if active_digest == Some(document_digest) {
-        return Ok(PublishResult {
+        return Ok(publish_result(
             workflow_id,
             manifest_revision,
             graph_revision,
             workflow_state,
-            idempotent_replay: true,
-        });
+            true,
+            false,
+            None,
+            None,
+        ));
     }
     // Different digest for the same token → B8 Mismatch (requires durable row).
     Err(WorkflowStoreError::PublicationTokenMismatch {
@@ -1684,6 +2040,7 @@ fn plan_binding_diff(
     existing: &[delegation_workflow_node_binding::Model],
     nodes_with_runs: &HashSet<String>,
 ) -> Result<BindingDiffPlan, WorkflowStoreError> {
+    note_binding_diff_invocation();
     let existing_by_id: HashMap<&str, &delegation_workflow_node_binding::Model> =
         existing.iter().map(|b| (b.node_id.as_str(), b)).collect();
     let existing_by_key: HashMap<&str, &delegation_workflow_node_binding::Model> = existing
@@ -2264,6 +2621,7 @@ fn settlement_payload_matches(
 fn settle_result_from_row(
     row: &delegation_workflow_gate_settlement::Model,
     graph_revision: u64,
+    manifest_revision: u64,
     idempotent_replay: bool,
 ) -> Result<SettleResult, WorkflowStoreError> {
     let plan_state = row
@@ -2277,6 +2635,7 @@ fn settle_result_from_row(
         gate_id: row.gate_id.clone(),
         gate_cycle: row.gate_cycle as u64,
         graph_revision,
+        manifest_revision,
         outcome: row.outcome.clone(),
         idempotent_replay,
         plan_next_action: plan_state.as_ref().map(|state| state.next_action),
@@ -2713,6 +3072,32 @@ fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
             .collect(),
         task_policies: m.task_policies.clone(),
     }
+}
+
+fn manifest_document_digest_with_state(
+    normalized: &NormalizedManifest,
+    workflow_state: ManifestWorkflowState,
+) -> Result<String, WorkflowStoreError> {
+    let mut document = normalized_to_document(normalized);
+    document.workflow_state = workflow_state;
+    let document_json = serde_json::to_string(&document)
+        .map_err(|error| WorkflowStoreError::Persistence(format!("serialize manifest: {error}")))?;
+    Ok(sha256_hex(document_json.as_bytes()))
+}
+
+fn manifests_equal_except_state_authority(
+    prior: &NormalizedManifest,
+    requested: &NormalizedManifest,
+) -> bool {
+    let mut prior = normalized_to_document(prior);
+    let mut requested = normalized_to_document(requested);
+    prior.workflow_id = None;
+    requested.workflow_id = None;
+    prior.expected_manifest_revision = None;
+    requested.expected_manifest_revision = None;
+    prior.workflow_state = ManifestWorkflowState::Blocked;
+    requested.workflow_state = ManifestWorkflowState::Blocked;
+    prior == requested
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -7437,7 +7822,7 @@ mod tests {
 
         let mut doc_b = doc_a.clone();
         doc_b.workflow_id = Some(published.workflow_id.clone());
-        doc_b.expected_manifest_revision = Some(1);
+        doc_b.expected_manifest_revision = Some(2);
         doc_b.publication_token = "tok-task4-historical-b".into();
         doc_b.task_policies[0].risk.reason = "fingerprint B risk".into();
         let published_b = publish_workflow_manifest_core(
@@ -7455,7 +7840,7 @@ mod tests {
             "plan-reviewer-1",
             "review-historical-b",
             2,
-            2,
+            3,
             "sha256:plan",
             "author-task-historical",
             "request_changes",
@@ -7469,7 +7854,7 @@ mod tests {
             parent,
             &published.workflow_id,
             "plan",
-            2,
+            3,
             published_b.graph_revision,
             2,
             GateSettlementOutcome::ChangesRequested,
@@ -7492,7 +7877,7 @@ mod tests {
         .unwrap();
 
         doc_a.workflow_id = Some(published.workflow_id.clone());
-        doc_a.expected_manifest_revision = Some(2);
+        doc_a.expected_manifest_revision = Some(3);
         doc_a.publication_token = "tok-task4-historical-a-again".into();
         let published_a_again = publish_workflow_manifest_core(
             &db,
@@ -7519,7 +7904,7 @@ mod tests {
             "plan-reviewer-1",
             "review-historical-a2",
             3,
-            3,
+            4,
             "sha256:plan",
             "author-task-historical",
             "approve",
@@ -7534,7 +7919,7 @@ mod tests {
             parent,
             &published.workflow_id,
             "plan",
-            3,
+            4,
             published_a_again.graph_revision,
             3,
             GateSettlementOutcome::Approved,
@@ -7627,7 +8012,7 @@ mod tests {
         .unwrap();
 
         doc.workflow_id = Some(published.workflow_id.clone());
-        doc.expected_manifest_revision = Some(1);
+        doc.expected_manifest_revision = Some(2);
         doc.task_policies[0].risk.reason = "material risk-policy correction".into();
         let updated = publish_workflow_manifest_core(
             &db,
@@ -7645,7 +8030,7 @@ mod tests {
             "plan-reviewer-1",
             "review-material-reapprove-c2",
             2,
-            2,
+            3,
             "sha256:plan",
             "author-task-material-reapprove",
             "approve",
@@ -7659,7 +8044,7 @@ mod tests {
             parent,
             &published.workflow_id,
             "plan",
-            2,
+            3,
             updated.graph_revision,
             2,
             GateSettlementOutcome::Approved,
@@ -8287,7 +8672,7 @@ mod tests {
             parent,
             &published.workflow_id,
             "plan",
-            1,
+            2,
             approved.graph_revision,
             2,
             GateSettlementOutcome::Approved,
@@ -8831,6 +9216,632 @@ mod tests {
                 &before_cohort,
             )
             .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod workflow_state_authority {
+        use super::*;
+        use crate::db::test_helpers::fresh_disk_db;
+
+        async fn load_header(db: &AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
+            delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+                .one(&db.conn)
+                .await
+                .expect("load workflow header")
+                .expect("persisted workflow header")
+        }
+
+        async fn load_revisions(
+            db: &AppDatabase,
+            workflow_id: &str,
+        ) -> Vec<delegation_workflow_manifest_revision::Model> {
+            delegation_workflow_manifest_revision::Entity::find()
+                .filter(
+                    delegation_workflow_manifest_revision::Column::WorkflowId
+                        .eq(workflow_id.to_string()),
+                )
+                .order_by_asc(delegation_workflow_manifest_revision::Column::ManifestRevision)
+                .all(&db.conn)
+                .await
+                .expect("load workflow revisions")
+        }
+
+        async fn load_bindings(
+            db: &AppDatabase,
+            workflow_id: &str,
+        ) -> Vec<delegation_workflow_node_binding::Model> {
+            delegation_workflow_node_binding::Entity::find()
+                .filter(
+                    delegation_workflow_node_binding::Column::WorkflowId
+                        .eq(workflow_id.to_string()),
+                )
+                .order_by_asc(delegation_workflow_node_binding::Column::NodeId)
+                .all(&db.conn)
+                .await
+                .expect("load workflow bindings")
+        }
+
+        async fn publish_document(
+            db: &AppDatabase,
+            emitter: &EventEmitter,
+            parent: i32,
+            document: ManifestDocument,
+        ) -> Result<PublishResult, WorkflowStoreError> {
+            publish_workflow_manifest_core(db, emitter, parent, PublishWorkflowRequest { document })
+                .await
+        }
+
+        async fn seed_ready_plan_round(
+            db: &AppDatabase,
+            parent: i32,
+            workflow_id: &str,
+            suffix: &str,
+        ) {
+            let author_task_id = format!("author-state-authority-{suffix}");
+            insert_plan_author_evidence(
+                db,
+                parent,
+                workflow_id,
+                &author_task_id,
+                1,
+                "sha256:plan",
+                &format!("reports/author-state-authority-{suffix}.md"),
+                0,
+            )
+            .await;
+            insert_plan_reviewer_evidence(
+                db,
+                parent,
+                workflow_id,
+                "plan-reviewer-1",
+                &format!("review-state-authority-{suffix}"),
+                1,
+                1,
+                "sha256:plan",
+                &author_task_id,
+                "approve",
+                &format!("reports/review-state-authority-{suffix}.md"),
+                1,
+            )
+            .await;
+        }
+
+        fn approved_plan_submission(suffix: &str) -> SettleGateEvidence {
+            SettleGateEvidence::Plan(plan_submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Initial,
+                &["plan-reviewer-1"],
+                vec![],
+                &format!("author-state-authority-{suffix}"),
+                "sha256:plan",
+            ))
+        }
+
+        #[tokio::test]
+        async fn ordinary_publication_cannot_leave_blocked_or_call_binding_diff_for_state_only_change(
+        ) {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut blocked = design_plan_doc("sticky-state-only-publication");
+            blocked.workflow_state = ManifestWorkflowState::Blocked;
+            let initial = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("publish blocked workflow");
+            let before_header = load_header(&db, &initial.workflow_id).await;
+            let before_revisions = load_revisions(&db, &initial.workflow_id).await;
+            let before_bindings = load_bindings(&db, &initial.workflow_id).await;
+
+            blocked.workflow_id = Some(initial.workflow_id.clone());
+            blocked.expected_manifest_revision = Some(initial.manifest_revision);
+            blocked.workflow_state = ManifestWorkflowState::Estimated;
+            reset_binding_diff_invocation_count();
+            let rejected = publish_document(&db, &emitter, parent, blocked)
+                .await
+                .expect("sticky state rejection is a typed publish response");
+
+            assert_eq!(
+                rejected.disposition,
+                WorkflowPublicationDisposition::WorkflowRecoveryRequired
+            );
+            assert!(!rejected.publication_committed);
+            assert_eq!(rejected.manifest_revision, initial.manifest_revision);
+            assert_eq!(binding_diff_invocation_count(), 0);
+            assert_eq!(load_header(&db, &initial.workflow_id).await, before_header);
+            assert_eq!(
+                load_revisions(&db, &initial.workflow_id).await,
+                before_revisions
+            );
+            assert_eq!(
+                load_bindings(&db, &initial.workflow_id).await,
+                before_bindings
+            );
+        }
+
+        #[tokio::test]
+        async fn blocked_workflow_can_publish_real_plan_structure_but_effective_state_stays_blocked(
+        ) {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut blocked = design_plan_doc("sticky-structural-publication");
+            blocked.workflow_state = ManifestWorkflowState::Blocked;
+            let initial = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("publish blocked workflow");
+            let source_header = load_header(&db, &initial.workflow_id).await;
+
+            blocked.workflow_id = Some(initial.workflow_id.clone());
+            blocked.expected_manifest_revision = Some(initial.manifest_revision);
+            blocked.workflow_state = ManifestWorkflowState::Approved;
+            blocked.plan.as_mut().expect("Plan document").digest =
+                "sha256:material-plan-rewrite".into();
+            let published = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("material structure remains publishable while blocked");
+
+            assert!(published.publication_committed);
+            assert_eq!(published.manifest_revision, initial.manifest_revision + 1);
+            assert_eq!(published.workflow_state, ManifestWorkflowState::Blocked);
+            assert_eq!(
+                published.disposition,
+                WorkflowPublicationDisposition::WorkflowRecoveryRequired
+            );
+            let recovery = published.recovery.expect("read-only recovery projection");
+            assert_eq!(recovery.workflow_id, initial.workflow_id);
+            assert_eq!(recovery.workflow_state, ManifestWorkflowState::Blocked);
+            assert_eq!(
+                recovery.block_cause,
+                Some(WorkflowBlockCause::ExplicitManifestBlock)
+            );
+            assert_eq!(
+                recovery.block_source_manifest_revision,
+                source_header
+                    .block_source_manifest_revision
+                    .map(|value| value as u64)
+            );
+
+            let header = load_header(&db, &recovery.workflow_id).await;
+            assert_eq!(header.workflow_state, WorkflowState::Blocked);
+            assert_eq!(header.block_cause_code, source_header.block_cause_code);
+            assert_eq!(
+                header.block_source_manifest_revision,
+                source_header.block_source_manifest_revision
+            );
+            let active = load_active_manifest_document_txn(
+                &db.conn,
+                &recovery.workflow_id,
+                header.active_manifest_revision,
+            )
+            .await
+            .expect("load active blocked publication");
+            assert_eq!(active.workflow_state, ManifestWorkflowState::Blocked);
+            assert_eq!(
+                active.plan.expect("Plan document").digest,
+                "sha256:material-plan-rewrite"
+            );
+
+            reset_binding_diff_invocation_count();
+            let replay = publish_document(&db, &emitter, parent, blocked.clone())
+                .await
+                .expect("exact retry after lost structural response");
+            assert!(replay.idempotent_replay);
+            assert!(!replay.publication_committed);
+            assert_eq!(replay.manifest_revision, published.manifest_revision);
+            assert_eq!(replay.graph_revision, published.graph_revision);
+            assert_eq!(replay.workflow_state, ManifestWorkflowState::Blocked);
+            assert_eq!(
+                replay.recovery.as_ref().and_then(|value| value.block_cause),
+                Some(WorkflowBlockCause::ExplicitManifestBlock)
+            );
+            assert_eq!(binding_diff_invocation_count(), 0);
+
+            let active_digest = load_active_manifest_digest_txn(
+                &db.conn,
+                &recovery.workflow_id,
+                header.active_manifest_revision,
+            )
+            .await
+            .expect("load active digest")
+            .expect("active digest");
+            let reclassified = classify_existing_header(
+                &db.conn,
+                header,
+                parent,
+                &blocked.publication_token,
+                &active_digest,
+            )
+            .await
+            .expect("race reclassifies blocked publication");
+            let reclassified_recovery = reclassified
+                .recovery
+                .expect("race result retains recovery provenance");
+            assert_eq!(
+                reclassified_recovery.block_cause,
+                Some(WorkflowBlockCause::ExplicitManifestBlock)
+            );
+            assert_eq!(
+                reclassified_recovery.block_source_manifest_revision,
+                source_header
+                    .block_source_manifest_revision
+                    .map(|value| value as u64)
+            );
+        }
+
+        #[tokio::test]
+        async fn nonblocked_plan_approval_atomically_appends_approved_state_only_revision() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let published = publish_document(
+                &db,
+                &emitter,
+                parent,
+                design_plan_doc("plan-approval-state-only"),
+            )
+            .await
+            .expect("publish estimated workflow");
+            seed_ready_plan_round(&db, parent, &published.workflow_id, "commit").await;
+
+            let settled = settle_workflow_gate_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowRequest {
+                    workflow_id: published.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: published.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Approved,
+                    evidence: approved_plan_submission("commit"),
+                    summary: "exact current Plan approved".into(),
+                },
+            )
+            .await
+            .expect("settle Plan approval");
+            assert_eq!(settled.manifest_revision, 2);
+
+            let header = load_header(&db, &published.workflow_id).await;
+            assert_eq!(header.active_manifest_revision, 2);
+            assert_eq!(header.workflow_state, WorkflowState::Approved);
+            let revisions = load_revisions(&db, &published.workflow_id).await;
+            assert_eq!(revisions.len(), 2);
+            assert_eq!(
+                ManifestRevisionKind::from_db(revisions[1].revision_kind.as_deref())
+                    .expect("typed revision kind"),
+                ManifestRevisionKind::StateOnly
+            );
+            assert_eq!(revisions[1].manifest_state, "approved");
+            assert_eq!(revisions[1].source_manifest_revision, Some(1));
+            let approved_doc: ManifestDocument =
+                serde_json::from_str(&revisions[1].document_json).expect("approved document");
+            assert_eq!(approved_doc.workflow_state, ManifestWorkflowState::Approved);
+            assert!(delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "plan".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .expect("load Plan settlement")
+            .is_some());
+
+            let (rollback_db, rollback_parent) = seed_parent().await;
+            let rollback_published = publish_document(
+                &rollback_db,
+                &emitter,
+                rollback_parent,
+                design_plan_doc("plan-approval-state-only-rollback"),
+            )
+            .await
+            .expect("publish rollback fixture");
+            seed_ready_plan_round(
+                &rollback_db,
+                rollback_parent,
+                &rollback_published.workflow_id,
+                "rollback",
+            )
+            .await;
+            set_inject_publish_persistence_failure(true);
+            let error = settle_workflow_gate_core(
+                &rollback_db,
+                &emitter,
+                rollback_parent,
+                SettleWorkflowRequest {
+                    workflow_id: rollback_published.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: rollback_published.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Approved,
+                    evidence: approved_plan_submission("rollback"),
+                    summary: "injected rollback".into(),
+                },
+            )
+            .await
+            .expect_err("injected failure must roll back settlement and state revision");
+            set_inject_publish_persistence_failure(false);
+            assert!(matches!(error, WorkflowStoreError::Persistence(_)));
+            let rollback_header = load_header(&rollback_db, &rollback_published.workflow_id).await;
+            assert_eq!(rollback_header.active_manifest_revision, 1);
+            assert_eq!(rollback_header.workflow_state, WorkflowState::Estimated);
+            assert_eq!(
+                load_revisions(&rollback_db, &rollback_published.workflow_id)
+                    .await
+                    .len(),
+                1
+            );
+            assert!(delegation_workflow_gate_settlement::Entity::find()
+                .filter(
+                    delegation_workflow_gate_settlement::Column::WorkflowId
+                        .eq(rollback_published.workflow_id),
+                )
+                .all(&rollback_db.conn)
+                .await
+                .expect("load rolled-back settlements")
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn approval_while_blocked_persists_gate_evidence_without_unblocking() {
+            let (db, parent) = seed_parent().await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc("blocked-plan-approval");
+            document.workflow_state = ManifestWorkflowState::Blocked;
+            let published = publish_document(&db, &emitter, parent, document)
+                .await
+                .expect("publish blocked workflow");
+            seed_ready_plan_round(&db, parent, &published.workflow_id, "blocked").await;
+
+            let settled = settle_workflow_gate_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowRequest {
+                    workflow_id: published.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "plan".into(),
+                    expected_graph_revision: published.graph_revision,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::Approved,
+                    evidence: approved_plan_submission("blocked"),
+                    summary: "approval evidence while blocked".into(),
+                },
+            )
+            .await
+            .expect("persist blocked Plan approval evidence");
+            assert_eq!(settled.manifest_revision, 1);
+            assert_eq!(
+                settled.plan_next_action,
+                Some(PlanReviewNextAction::Approved)
+            );
+            let header = load_header(&db, &published.workflow_id).await;
+            assert_eq!(header.active_manifest_revision, 1);
+            assert_eq!(header.workflow_state, WorkflowState::Blocked);
+            let revisions = load_revisions(&db, &published.workflow_id).await;
+            assert_eq!(revisions.len(), 1);
+            let active: ManifestDocument =
+                serde_json::from_str(&revisions[0].document_json).expect("blocked document");
+            assert_eq!(active.workflow_state, ManifestWorkflowState::Blocked);
+            let recovery_state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+                .await
+                .expect("load later recovery evidence");
+            let plan = recovery_state
+                .latest_plan_review
+                .expect("approved Plan evidence remains derivable");
+            assert_eq!(plan.next_action, PlanReviewNextAction::Approved);
+            assert_eq!(plan.covered_plan_digest, "sha256:plan");
+        }
+
+        #[tokio::test]
+        async fn state_only_revision_preserves_structural_revision_and_fingerprints_across_restart()
+        {
+            let temp = tempfile::tempdir().expect("temporary workflow database");
+            let db = fresh_disk_db(temp.path()).await;
+            let folder = seed_folder(&db, "/tmp/wf-state-only-restart").await;
+            let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+            let (emitter, _) = emitter_with_rx();
+            let published =
+                publish_document(&db, &emitter, parent, design_plan_doc("state-only-restart"))
+                    .await
+                    .expect("publish restart fixture");
+            let source_header = load_header(&db, &published.workflow_id).await;
+            let source_doc = load_active_manifest_document_txn(
+                &db.conn,
+                &published.workflow_id,
+                source_header.active_manifest_revision,
+            )
+            .await
+            .expect("load source document");
+            let source_bindings = load_bindings(&db, &published.workflow_id).await;
+
+            let txn = db.conn.begin().await.expect("begin state-only transaction");
+            let result = append_state_only_revision_txn(
+                &txn,
+                &source_header,
+                StateOnlyRevisionRequest {
+                    target_state: ManifestWorkflowState::Approved,
+                    transition_reason_code: "plan_gate_approved",
+                    recovery_authorization_id: None,
+                    consumer_correlation_id: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("append approved state-only revision");
+            txn.commit().await.expect("commit state-only revision");
+            assert_eq!(result.manifest_revision, 2);
+            assert_eq!(result.source_manifest_revision, 1);
+
+            db.conn.close().await.expect("close source database");
+            let reopened = fresh_disk_db(temp.path()).await;
+            let header = load_header(&reopened, &published.workflow_id).await;
+            let revisions = load_revisions(&reopened, &published.workflow_id).await;
+            let active: ManifestDocument = serde_json::from_str(&revisions[1].document_json)
+                .expect("reopened active document");
+            assert_eq!(
+                header.structural_revision,
+                source_header.structural_revision
+            );
+            assert_eq!(header.graph_revision, source_header.graph_revision);
+            assert_eq!(header.design_fingerprint, source_header.design_fingerprint);
+            assert_eq!(header.plan_fingerprint, source_header.plan_fingerprint);
+            assert_eq!(active.plan_target_rel_path, source_doc.plan_target_rel_path);
+            assert_eq!(active.plan, source_doc.plan);
+            assert_eq!(active.nodes, source_doc.nodes);
+            assert_eq!(active.task_policies, source_doc.task_policies);
+            assert_eq!(
+                load_bindings(&reopened, &published.workflow_id).await,
+                source_bindings
+            );
+            assert_eq!(header.active_manifest_revision, 2);
+            assert_eq!(active.workflow_state, ManifestWorkflowState::Approved);
+            assert_eq!(revisions[1].source_manifest_revision, Some(1));
+            assert_eq!(
+                revisions[1].transition_reason_code.as_deref(),
+                Some("plan_gate_approved")
+            );
+            assert_ne!(revisions[1].document_digest, revisions[0].document_digest);
+        }
+
+        #[tokio::test]
+        async fn blocked_settlement_records_typed_cause_in_a_state_only_revision() {
+            let cases = [
+                (
+                    WorkflowBlockCause::PlanUserDecisionRequired,
+                    "plan_user_decision_required",
+                ),
+                (WorkflowBlockCause::PlanGateBlocked, "plan_gate_blocked"),
+                (
+                    WorkflowBlockCause::ExplicitManifestBlock,
+                    "explicit_manifest_block",
+                ),
+                (
+                    WorkflowBlockCause::UnresolvedTaskCohort,
+                    "unresolved_task_cohort",
+                ),
+                (
+                    WorkflowBlockCause::DurableStateInconsistent,
+                    "durable_state_inconsistent",
+                ),
+            ];
+
+            for (index, (expected_cause, reason)) in cases.into_iter().enumerate() {
+                let (db, parent) = seed_parent().await;
+                let (emitter, _) = emitter_with_rx();
+                let published = publish_document(
+                    &db,
+                    &emitter,
+                    parent,
+                    design_plan_doc(&format!("typed-block-cause-{index}")),
+                )
+                .await
+                .expect("publish block-cause fixture");
+                let source = load_header(&db, &published.workflow_id).await;
+                let txn = db.conn.begin().await.expect("begin block transition");
+                let result = append_state_only_revision_txn(
+                    &txn,
+                    &source,
+                    StateOnlyRevisionRequest {
+                        target_state: ManifestWorkflowState::Blocked,
+                        transition_reason_code: reason,
+                        recovery_authorization_id: None,
+                        consumer_correlation_id: None,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .expect("append typed blocked state-only revision");
+                txn.commit().await.expect("commit block transition");
+
+                assert_eq!(result.block_cause, Some(expected_cause));
+                assert_eq!(result.source_manifest_revision, 1);
+                let header = load_header(&db, &published.workflow_id).await;
+                assert_eq!(
+                    WorkflowBlockCause::from_db(header.block_cause_code.as_deref())
+                        .expect("typed active block cause"),
+                    expected_cause
+                );
+                assert_eq!(header.block_source_manifest_revision, Some(1));
+                let revisions = load_revisions(&db, &published.workflow_id).await;
+                assert_eq!(revisions.len(), 2);
+                assert_eq!(revisions[1].source_manifest_revision, Some(1));
+                assert_eq!(revisions[1].transition_reason_code.as_deref(), Some(reason));
+                assert_eq!(
+                    ManifestRevisionKind::from_db(revisions[1].revision_kind.as_deref())
+                        .expect("state-only revision kind"),
+                    ManifestRevisionKind::StateOnly
+                );
+
+                let unauthorized = db.conn.begin().await.expect("begin unauthorized recovery");
+                let error = append_state_only_revision_txn(
+                    &unauthorized,
+                    &header,
+                    StateOnlyRevisionRequest {
+                        target_state: ManifestWorkflowState::Estimated,
+                        transition_reason_code: "recover_workflow",
+                        recovery_authorization_id: None,
+                        consumer_correlation_id: None,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .expect_err("blocked transition requires recovery authorization");
+                assert!(error.is_workflow_recovery_required());
+                unauthorized
+                    .rollback()
+                    .await
+                    .expect("rollback unauthorized recovery");
+                assert_eq!(load_revisions(&db, &published.workflow_id).await.len(), 2);
+
+                let authorized = db.conn.begin().await.expect("begin authorized recovery");
+                let recovered = append_state_only_revision_txn(
+                    &authorized,
+                    &header,
+                    StateOnlyRevisionRequest {
+                        target_state: ManifestWorkflowState::Estimated,
+                        transition_reason_code: "recover_workflow",
+                        recovery_authorization_id: Some("recovery-authorization"),
+                        consumer_correlation_id: Some("recovery-correlation"),
+                    },
+                    Utc::now(),
+                )
+                .await
+                .expect("authorized recovery state revision");
+                authorized
+                    .commit()
+                    .await
+                    .expect("commit authorized recovery");
+                assert_eq!(recovered.source_manifest_revision, 2);
+                let recovered_header = load_header(&db, &published.workflow_id).await;
+                assert_eq!(recovered_header.workflow_state, WorkflowState::Estimated);
+                assert_eq!(recovered_header.block_cause_code, None);
+                assert_eq!(recovered_header.block_source_manifest_revision, None);
+                let recovered_revisions = load_revisions(&db, &published.workflow_id).await;
+                assert_eq!(
+                    recovered_revisions[1].transition_reason_code.as_deref(),
+                    Some(reason),
+                    "immutable blocked provenance must remain"
+                );
+                assert_eq!(
+                    recovered_revisions[2].recovery_authorization_id.as_deref(),
+                    Some("recovery-authorization")
+                );
+                assert_eq!(
+                    recovered_revisions[2].consumer_correlation_id.as_deref(),
+                    Some("recovery-correlation")
+                );
+            }
+
+            assert_eq!(
+                ManifestRevisionKind::from_db(None).expect("historical revision kind"),
+                ManifestRevisionKind::Publication
+            );
+            assert_eq!(
+                WorkflowBlockCause::from_db(None).expect("legacy NULL block cause"),
+                WorkflowBlockCause::LegacyUnknown
+            );
+            assert!(WorkflowBlockCause::from_db(Some("legacy_unknown")).is_err());
+            assert!(WorkflowBlockCause::from_db(Some("unknown_future_cause")).is_err());
         }
     }
 }
