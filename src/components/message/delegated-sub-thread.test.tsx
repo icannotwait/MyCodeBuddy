@@ -518,7 +518,11 @@ describe("DelegatedSubThread", () => {
     "localizes error code %s on the failed card badge",
     (errorCode, label) => {
       mockedHook.mockReturnValue({
-        binding: bindingOf({ status: "err", errorCode }),
+        binding: bindingOf({
+          parentToolUseId: `pt-${errorCode}`,
+          status: "err",
+          errorCode,
+        }),
         detail: null,
         loading: false,
         error: null,

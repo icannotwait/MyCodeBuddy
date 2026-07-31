@@ -50,11 +50,7 @@ describe("TurnStats jump-to-previous-user gating", () => {
 describe("TurnStats model and reasoning effort metadata", () => {
   it("shows model and archived reasoning effort in the footer", () => {
     const view = renderStats(
-      <TurnStats
-        copyText="reply"
-        model="gpt-5.6-sol"
-        reasoningEffort="high"
-      />
+      <TurnStats copyText="reply" model="gpt-5.6-sol" reasoningEffort="high" />
     )
 
     expect(screen.getByLabelText("Model")).toBeInTheDocument()
@@ -67,9 +63,7 @@ describe("TurnStats model and reasoning effort metadata", () => {
         </MessageScrollProvider>
       </NextIntlClientProvider>
     )
-    expect(
-      screen.queryByLabelText("Reasoning effort")
-    ).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("Reasoning effort")).not.toBeInTheDocument()
   })
 
   it("renders metadata even when a turn has no copyable body", () => {

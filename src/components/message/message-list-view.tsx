@@ -934,9 +934,7 @@ const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
       waitingArmedAtMs ??
       Date.now()
     const message =
-      activeLive ??
-      latchedLive ??
-      waitingPlaceholderLiveMessage(startedAt)
+      activeLive ?? latchedLive ?? waitingPlaceholderLiveMessage(startedAt)
     return (
       <LiveTurnStats
         message={message}

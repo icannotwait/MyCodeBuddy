@@ -1369,7 +1369,9 @@ describe("MessageListView waiting-for-subagents bottom banner", () => {
       startedAt: 1_700_000_000_000,
     }
     liveTranscriptStore.rebuild(CID, "c1", live, 1)
-    useConversationRuntimeStore.getState().actions.setLiveMessage(CID, live, true)
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, live, true)
 
     const { rerender } = renderMessageList({
       waitingForSubagentsArmedAtMs: null,
@@ -1382,7 +1384,9 @@ describe("MessageListView waiting-for-subagents bottom banner", () => {
 
     // Clear live stream (suspend) but keep waiting banner.
     liveTranscriptStore.remove(CID)
-    useConversationRuntimeStore.getState().actions.setLiveMessage(CID, null, true)
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, null, true)
     rerender(
       messageListUi({
         waitingForSubagentsArmedAtMs: Date.parse("2026-05-28T00:01:00.000Z"),
