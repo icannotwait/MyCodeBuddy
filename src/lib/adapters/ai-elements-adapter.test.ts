@@ -1699,3 +1699,49 @@ describe("adaptMessageTurn — TurnOutcome presentation path", () => {
     expect(second).toBe(first)
   })
 })
+
+describe("adaptMessageTurn reasoning effort metadata", () => {
+  const msgText = {
+    attachedResources: "Attached resources",
+    toolCallFailed: "Tool failed",
+  }
+
+  it("copies reasoning effort onto the adapted message", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "a-effort",
+        role: "assistant",
+        timestamp: "2026-07-31T12:00:00.000Z",
+        blocks: [{ type: "text", text: "reply" }],
+        reasoning_effort: "high",
+      },
+      msgText
+    )
+
+    expect(adapted.reasoning_effort).toBe("high")
+  })
+
+  it("misses the turn cache when only reasoning effort changes", () => {
+    const adapter = createMessageTurnAdapter()
+    const blocks = [{ type: "text" as const, text: "reply" }]
+    const baseTurn = {
+      id: "a-effort-cache",
+      role: "assistant" as const,
+      timestamp: "2026-07-31T12:00:00.000Z",
+      blocks,
+    }
+
+    const [first] = adapter.adapt(
+      [{ ...baseTurn, reasoning_effort: "low" }],
+      msgText
+    )
+    const [second] = adapter.adapt(
+      [{ ...baseTurn, reasoning_effort: "high" }],
+      msgText
+    )
+
+    expect(second).not.toBe(first)
+    expect(first.reasoning_effort).toBe("low")
+    expect(second.reasoning_effort).toBe("high")
+  })
+})

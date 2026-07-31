@@ -205,6 +205,7 @@ export interface AdaptedMessage {
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
+  reasoning_effort?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
   completed_at?: string | null
   /**
@@ -1977,6 +1978,7 @@ export function adaptMessageTurn(
     usage: turn.usage,
     duration_ms: turn.duration_ms,
     model: turn.model,
+    reasoning_effort: turn.reasoning_effort,
     completed_at: turn.completed_at,
     // Carry full TurnOutcome so list footers survive adaptation; never fold
     // it into content parts (copy/markdown must stay free of status text).
@@ -2039,6 +2041,7 @@ interface TurnCacheEntry {
   usage: TurnUsage | null | undefined
   duration_ms: number | null | undefined
   model: string | null | undefined
+  reasoning_effort: string | null | undefined
   completed_at: string | null | undefined
   /** Full-outcome fingerprint; null when the turn has no outcome. */
   outcomeFp: string | null
@@ -2067,7 +2070,8 @@ export interface MessageTurnAdapter {
  * survives across re-renders triggered by streaming deltas.
  *
  * Cache invalidation: an entry is reused only when `(text, blocks,
- * blocksLen, timestamp, role, usage, duration_ms, model, completed_at,
+ * blocksLen, timestamp, role, usage, duration_ms, model, reasoning_effort,
+ * completed_at,
  * outcome fingerprint)` all match. The blocks reference catches whole-turn
  * rewrites (e.g. detail refetch replacing `detail.turns`) where
  * blocksLen/timestamp may stay equal but a tool's output_preview was updated.
@@ -2112,6 +2116,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
             cached.model === turn.model &&
+            cached.reasoning_effort === turn.reasoning_effort &&
             cached.completed_at === turn.completed_at &&
             cached.outcomeFp === outcomeFp
           ) {
@@ -2147,6 +2152,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             usage: turn.usage,
             duration_ms: turn.duration_ms,
             model: turn.model,
+            reasoning_effort: turn.reasoning_effort,
             completed_at: turn.completed_at,
             outcomeFp,
             adapted,
