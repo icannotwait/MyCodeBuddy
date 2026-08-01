@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use sea_orm::EntityTrait;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(any(test, feature = "test-utils"))]
+use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -213,6 +215,68 @@ enum ArmStatus {
     Suspended,
 }
 
+enum StatusReleaseDecision {
+    WaitCancelled(crate::acp::tool_watchdog::CancelCause),
+    Suspended,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code, reason = "constructed only by listener test builds")]
+pub(crate) struct StatusReleaseDecisionGateHandle {
+    pub before_select_entered: oneshot::Receiver<()>,
+    pub arm_suspended_ready: oneshot::Receiver<()>,
+    pub allow_select: oneshot::Sender<()>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+struct StatusReleaseDecisionGate {
+    before_select: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+    arm_ready: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    allow_select: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl StatusReleaseDecisionGate {
+    #[allow(dead_code, reason = "called only by listener test builds")]
+    async fn install(&self) -> StatusReleaseDecisionGateHandle {
+        let (before_tx, before_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (allow_tx, allow_rx) = oneshot::channel();
+        *self.before_select.lock().await = Some(before_tx);
+        *self
+            .arm_ready
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ready_tx);
+        *self.allow_select.lock().await = Some(allow_rx);
+        StatusReleaseDecisionGateHandle {
+            before_select_entered: before_rx,
+            arm_suspended_ready: ready_rx,
+            allow_select: allow_tx,
+        }
+    }
+
+    async fn before_select(&self) {
+        if let Some(entered) = self.before_select.lock().await.take() {
+            let _ = entered.send(());
+        }
+        if let Some(allow) = self.allow_select.lock().await.take() {
+            let _ = allow.await;
+        }
+    }
+
+    fn arm_suspended_ready(&self) {
+        if let Some(ready) = self
+            .arm_ready
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = ready.send(());
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct StatusErrorBody {
     code: &'static str,
@@ -266,6 +330,8 @@ pub struct DelegationListener {
     /// Shared `EventEmitter` for workflow graph live events (publish/settle).
     pub workflow_emitter: EventEmitter,
     recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    status_release_decision_gate: Arc<StatusReleaseDecisionGate>,
 }
 
 impl DelegationListener {
@@ -345,7 +411,17 @@ impl DelegationListener {
             metrics,
             workflow_emitter,
             recovery_authorizations,
+            #[cfg(any(test, feature = "test-utils"))]
+            status_release_decision_gate: Arc::new(StatusReleaseDecisionGate::default()),
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code, reason = "called only by listener test builds")]
+    pub(crate) async fn install_status_release_decision_gate(
+        &self,
+    ) -> StatusReleaseDecisionGateHandle {
+        self.status_release_decision_gate.install().await
     }
 
     /// Run the accept loop until the socket is unbound. Errors on accept are
@@ -1094,6 +1170,8 @@ impl DelegationListener {
                 // Drop cannot deregister the coordinator-owned wait via guard.
                 // TransferredWait owns post-transfer registration cleanup.
                 let transfer_disarm = wait_guard.drop_armed_flag();
+                #[cfg(any(test, feature = "test-utils"))]
+                let status_release_decision_gate = Arc::clone(&self.status_release_decision_gate);
                 // JoinHandle must stay addressable in select: dropping without
                 // abort() detaches the task in Tokio and can still transfer/suspend.
                 let mut arm_task = tokio::spawn(async move {
@@ -1161,6 +1239,8 @@ impl DelegationListener {
                                     completion
                                         .await
                                         .map_err(|_| ContinuationError::ArmWorkerDropped)??;
+                                    #[cfg(any(test, feature = "test-utils"))]
+                                    status_release_decision_gate.arm_suspended_ready();
                                     Ok::<ArmStatus, ContinuationError>(ArmStatus::Suspended)
                                 }
                                 Err(_) => {
@@ -1175,76 +1255,59 @@ impl DelegationListener {
                         }
                     }
                 });
-                let status = tokio::select! {
+                #[cfg(any(test, feature = "test-utils"))]
+                self.status_release_decision_gate.before_select().await;
+                let decision = tokio::select! {
                     biased;
-                    joined = &mut arm_task => {
-                        joined.map_err(|_| ContinuationError::ArmWorkerDropped)?
-                    }
-                    _ = cancel_rx.changed() => {
-                        if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
-                            let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(
-                                &cancel_rx,
-                            )
-                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
-                            // Signal pre-insert races; abort+join so transfer
-                            // cannot complete after cancel (JoinHandle drop
-                            // would only detach).
-                            waiter_closed_for_cancel.cancel();
-                            arm_task.abort();
-                            let _ = arm_task.await;
+                    joined = &mut arm_task => match joined
+                        .map_err(|_| ContinuationError::ArmWorkerDropped)??
+                    {
+                        ArmStatus::Suspended => StatusReleaseDecision::Suspended,
+                        ArmStatus::Immediate(batch) => {
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            return Ok(DelegationStatusBatch::joined(
-                                canonical_task_ids
-                                    .iter()
-                                    .map(|id| wait_cancel_report(id, cause))
-                                    .collect(),
-                                DelegationWakeReason::Unavailable,
-                                Vec::new(),
-                            ));
+                            return Ok(batch);
                         }
-                        Err(ContinuationError::ArmWorkerDropped)
+                    },
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err()
+                            || !crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx)
+                        {
+                            return Err(ContinuationError::ArmWorkerDropped);
+                        }
+                        StatusReleaseDecision::WaitCancelled(
+                            crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
+                                .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout),
+                        )
                     }
                 };
-                match status {
-                    Ok(ArmStatus::Immediate(batch)) => {
+                match decision {
+                    StatusReleaseDecision::WaitCancelled(cause) => {
+                        // Signal pre-insert races; abort+join so transfer cannot
+                        // complete after cancel (JoinHandle drop would detach).
+                        waiter_closed_for_cancel.cancel();
+                        arm_task.abort();
+                        let _ = arm_task.await;
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         wait_guard.disarm();
-                        Ok(batch)
+                        Ok(DelegationStatusBatch::joined(
+                            canonical_task_ids
+                                .iter()
+                                .map(|task_id| wait_cancel_report(task_id, cause))
+                                .collect(),
+                            DelegationWakeReason::Unavailable,
+                            Vec::new(),
+                        ))
                     }
-                    Ok(ArmStatus::Suspended) => {
-                        // Transfer already disarmed drop_armed; clear stamp too.
+                    StatusReleaseDecision::Suspended => {
                         wait_guard.disarm();
-                        // MCP status stays open until wait cancel (host timeout).
-                        loop {
-                            if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
-                                break;
-                            }
-                            if cancel_rx.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                        let cause =
-                            crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx);
-                        // Coordinator may still own the registration; deregister
-                        // is idempotent via stamp match / NotFound.
-                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
-                        drop(_cancel_waiter_on_drop);
                         Ok(self
                             .continuation_release_batch(
                                 &entry.parent_connection_id,
                                 parent_conversation_id,
                                 &canonical_task_ids,
-                                cause,
                             )
                             .await)
-                    }
-                    Err(error) => {
-                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
-                        wait_guard.disarm();
-                        // Non-suspended failure: surface explicit continuation arm
-                        // tool error (serve_one maps to continuation_arm_failed).
-                        Err(error)
                     }
                 }
             }
@@ -1256,26 +1319,13 @@ impl DelegationListener {
         parent_connection_id: &str,
         parent_conversation_id: i32,
         canonical_task_ids: &[String],
-        cause: Option<crate::acp::tool_watchdog::CancelCause>,
     ) -> DelegationStatusBatch {
-        if let Some(cause) = cause {
-            return DelegationStatusBatch::joined(
-                canonical_task_ids
-                    .iter()
-                    .map(|id| wait_cancel_report(id, cause))
-                    .collect(),
-                DelegationWakeReason::Unavailable,
-                Vec::new(),
-            );
-        }
-
         let tasks = self
             .broker
-            .get_tasks_status(
+            .get_tasks_status_snapshot(
                 parent_connection_id,
                 Some(parent_conversation_id),
                 canonical_task_ids,
-                StatusWait::Snapshot,
             )
             .await;
         DelegationStatusBatch::joined(tasks, DelegationWakeReason::Unavailable, Vec::new())
@@ -2773,7 +2823,8 @@ mod tests {
         SystemContinuationClock,
     };
     use crate::acp::delegation::continuation::store::{
-        ContinuationStore, InMemoryContinuationStore,
+        ContStoreError, ContinuationPatch, ContinuationRecord, ContinuationStore,
+        InMemoryContinuationStore, NewContinuation,
     };
     use crate::acp::delegation::continuation::types::{
         ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
@@ -2782,6 +2833,7 @@ mod tests {
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
     };
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+    use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
     use chrono::Utc;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3234,13 +3286,167 @@ mod tests {
         }
     }
 
-    fn continuation_registry(
+    struct ReleaseObservedStore {
+        inner: InMemoryContinuationStore,
+        ownership_wins: AtomicUsize,
+    }
+
+    impl ReleaseObservedStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryContinuationStore::default(),
+                ownership_wins: AtomicUsize::new(0),
+            })
+        }
+
+        fn ownership_wins(&self) -> usize {
+            self.ownership_wins.load(Ordering::SeqCst)
+        }
+
+        fn record_selected_transition(
+            &self,
+            expected: ContinuationState,
+            target: ContinuationState,
+            won: bool,
+        ) {
+            if won
+                && expected != target
+                && matches!(
+                    target,
+                    ContinuationState::WakePending
+                        | ContinuationState::Cancelled
+                        | ContinuationState::Failed
+                )
+            {
+                self.ownership_wins.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContinuationStore for ReleaseObservedStore {
+        async fn insert_arming(
+            &self,
+            new: NewContinuation,
+        ) -> Result<ContinuationRecord, ContStoreError> {
+            self.inner.insert_arming(new).await
+        }
+
+        async fn load(
+            &self,
+            continuation_id: &str,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner.load(continuation_id).await
+        }
+
+        async fn load_active_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .load_active_for_conversation(conversation_id)
+                .await
+        }
+
+        async fn list_non_terminal(&self) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+            self.inner.list_non_terminal().await
+        }
+
+        async fn cas_transition(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+            patch: ContinuationPatch,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            let target = patch.state;
+            let result = self
+                .inner
+                .cas_transition(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    patch,
+                )
+                .await?;
+            self.record_selected_transition(expected_state, target, result.is_some());
+            Ok(result)
+        }
+
+        async fn cas_fail_and_cancel_parent(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+            failure_code: ContinuationFailureCode,
+            finished_at: chrono::DateTime<Utc>,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            let result = self
+                .inner
+                .cas_fail_and_cancel_parent(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    failure_code,
+                    finished_at,
+                )
+                .await?;
+            self.record_selected_transition(
+                expected_state,
+                ContinuationState::Failed,
+                result.is_some(),
+            );
+            Ok(result)
+        }
+
+        async fn cas_claim_cleanup(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .cas_claim_cleanup(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                )
+                .await
+        }
+
+        async fn matches_admitted_marker(
+            &self,
+            conversation_id: i32,
+            marker: &str,
+        ) -> Result<bool, ContStoreError> {
+            self.inner
+                .matches_admitted_marker(conversation_id, marker)
+                .await
+        }
+
+        async fn load_latest_failure_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .load_latest_failure_for_conversation(conversation_id)
+                .await
+        }
+    }
+
+    fn continuation_registry_with_store(
         broker: Arc<DelegationBroker>,
-        store: Arc<InMemoryContinuationStore>,
+        store: Arc<dyn ContinuationStore>,
         port: Arc<ContinuationTestPort>,
     ) -> (Arc<TokenRegistry>, Arc<DelegationContinuationCoordinator>) {
         let coordinator = Arc::new(DelegationContinuationCoordinator::new(
-            store as Arc<dyn ContinuationStore>,
+            store,
             broker,
             Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
             port,
@@ -3252,6 +3458,14 @@ mod tests {
         (tokens, coordinator)
     }
 
+    fn continuation_registry(
+        broker: Arc<DelegationBroker>,
+        store: Arc<InMemoryContinuationStore>,
+        port: Arc<ContinuationTestPort>,
+    ) -> (Arc<TokenRegistry>, Arc<DelegationContinuationCoordinator>) {
+        continuation_registry_with_store(broker, store as Arc<dyn ContinuationStore>, port)
+    }
+
     fn continuation_token_entry(enabled: bool) -> TokenEntry {
         TokenEntry {
             parent_connection_id: "parent-conn".into(),
@@ -3260,6 +3474,223 @@ mod tests {
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
             workflow_v2: false,
+        }
+    }
+
+    struct ContinuationReleaseHarness {
+        broker: Arc<DelegationBroker>,
+        spawner: Arc<MockSpawner>,
+        store: Arc<ReleaseObservedStore>,
+        coordinator: Arc<DelegationContinuationCoordinator>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+        task_id: String,
+        stamp: WaitStamp,
+        status_task:
+            Option<tokio::task::JoinHandle<Result<DelegationStatusBatch, ContinuationError>>>,
+        response_count: Arc<AtomicUsize>,
+        suspend_release: Option<oneshot::Sender<()>>,
+        arm_suspended_ready: Option<oneshot::Receiver<()>>,
+        allow_decision: Option<oneshot::Sender<()>>,
+        snapshot_before: Option<oneshot::Receiver<()>>,
+        snapshot_allow_read: Option<oneshot::Sender<()>>,
+        snapshot_after: Option<oneshot::Receiver<()>>,
+        snapshot_allow_assemble: Option<oneshot::Sender<()>>,
+    }
+
+    impl ContinuationReleaseHarness {
+        async fn new(label: &str, gate_snapshot: bool) -> Self {
+            let spawner = Arc::new(MockSpawner::new());
+            let broker = make_broker(spawner.clone()).await;
+            let task_id = broker.seed_live_task_for_test("parent-conn", label).await;
+            let store = ReleaseObservedStore::new();
+            let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+            let (tokens, coordinator) = continuation_registry_with_store(
+                broker.clone(),
+                store.clone() as Arc<dyn ContinuationStore>,
+                port,
+            );
+            tokens
+                .register("tok".into(), continuation_token_entry(true))
+                .await;
+            let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+            let listener = make_listener_with_wait_cancel(
+                broker.clone(),
+                tokens,
+                Some(1),
+                wait_cancel.clone(),
+            );
+            let decision = listener.install_status_release_decision_gate().await;
+            let snapshot = if gate_snapshot {
+                Some(broker.install_status_snapshot_gate().await)
+            } else {
+                None
+            };
+            let response_count = Arc::new(AtomicUsize::new(0));
+            let parent_tool_use_id = format!("wait-{label}");
+            let status_task = tokio::spawn({
+                let listener = listener.clone();
+                let task_id = task_id.clone();
+                let response_count = response_count.clone();
+                async move {
+                    let result = listener
+                        .process_status(BrokerStatusRequest {
+                            token: "tok".into(),
+                            task_ids: vec![task_id],
+                            wait_ms: Some(0),
+                            return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                            parent_tool_use_id,
+                        })
+                        .await;
+                    if result.is_ok() {
+                        response_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    result
+                }
+            });
+            decision
+                .before_select_entered
+                .await
+                .expect("status reaches the gated release decision");
+            suspend_entered
+                .await
+                .expect("durable arm reaches the suspension port");
+            let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(stamp) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                        break stamp;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("exact wait stamp is registered");
+            let (snapshot_before, snapshot_allow_read, snapshot_after, snapshot_allow_assemble) =
+                match snapshot {
+                    Some(gate) => (
+                        Some(gate.before_read_entered),
+                        Some(gate.allow_read),
+                        Some(gate.after_classification_entered),
+                        Some(gate.allow_assemble),
+                    ),
+                    None => (None, None, None, None),
+                };
+            Self {
+                broker,
+                spawner,
+                store,
+                coordinator,
+                wait_cancel,
+                task_id,
+                stamp,
+                status_task: Some(status_task),
+                response_count,
+                suspend_release: Some(suspend_release),
+                arm_suspended_ready: Some(decision.arm_suspended_ready),
+                allow_decision: Some(decision.allow_select),
+                snapshot_before,
+                snapshot_allow_read,
+                snapshot_after,
+                snapshot_allow_assemble,
+            }
+        }
+
+        fn release_suspension(&mut self) {
+            self.suspend_release.take().unwrap().send(()).unwrap();
+        }
+
+        async fn await_arm_suspended(&mut self) {
+            self.arm_suspended_ready
+                .take()
+                .unwrap()
+                .await
+                .expect("ArmStatus::Suspended is ready");
+        }
+
+        fn release_decision(&mut self) {
+            self.allow_decision.take().unwrap().send(()).unwrap();
+        }
+
+        async fn cancel_exact(&self) {
+            assert_eq!(
+                self.wait_cancel
+                    .cancel(&self.stamp, CancelCause::AutoTimeout)
+                    .await,
+                WaitCancelResult::Cancelled
+            );
+        }
+
+        async fn await_snapshot_before(&mut self) {
+            self.snapshot_before.take().unwrap().await.unwrap();
+        }
+
+        fn allow_snapshot_read(&mut self) {
+            self.snapshot_allow_read.take().unwrap().send(()).unwrap();
+        }
+
+        async fn await_snapshot_after(&mut self) {
+            self.snapshot_after.take().unwrap().await.unwrap();
+        }
+
+        fn allow_snapshot_assemble(&mut self) {
+            self.snapshot_allow_assemble
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+        }
+
+        async fn finish_status(&mut self) -> DelegationStatusBatch {
+            tokio::time::timeout(Duration::from_secs(2), self.status_task.take().unwrap())
+                .await
+                .expect("one foreground response")
+                .expect("status task joins")
+                .expect("status result")
+        }
+
+        async fn await_waiting(&self) -> ContinuationRecord {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(row) = self.store.load_active_for_conversation(1).await.unwrap() {
+                        if row.state == ContinuationState::Waiting {
+                            break row;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("released suspension commits the durable Waiting owner")
+        }
+
+        async fn assert_common(&self, expected_child_cancels: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.wait_cancel.contains(&self.stamp.wait_id).await
+                    || self.store.ownership_wins() != 1
+                    || self.spawner.cancels.lock().await.len() != expected_child_cancels
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("release invariants settle deterministically");
+            assert_eq!(self.response_count.load(Ordering::SeqCst), 1);
+            assert_eq!(self.store.ownership_wins(), 1);
+            assert_eq!(
+                self.spawner.cancels.lock().await.len(),
+                expected_child_cancels
+            );
+            assert_eq!(
+                self.spawner.disconnects.lock().await.len(),
+                1,
+                "only the explicit terminal/Stop lifecycle tears down the child"
+            );
+            assert_eq!(
+                self.wait_cancel
+                    .cancel(&self.stamp, CancelCause::AutoTimeout)
+                    .await,
+                WaitCancelResult::NotFound,
+                "the exact WaitStamp is cleaned, not merely a same-id replacement"
+            );
         }
     }
 
@@ -4072,7 +4503,7 @@ mod tests {
         );
 
         let batch = listener
-            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id), None)
+            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id))
             .await;
 
         assert_eq!(batch.tasks[0].status, TaskStatus::Running);
@@ -4092,7 +4523,7 @@ mod tests {
         );
 
         let batch = listener
-            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id), None)
+            .continuation_release_batch("parent-conn", 1, std::slice::from_ref(&task_id))
             .await;
 
         assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
@@ -4103,40 +4534,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_explicit_release_causes_keep_wire_error_codes() {
-        let (broker, tokens, task_id) = running_task_fixture().await;
-        let listener = make_listener_with_wait_cancel(
-            broker,
-            tokens,
-            Some(1),
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
-        );
+    async fn continuation_release_wait_cancel_before_decision_wins_once() {
+        let mut fx = ContinuationReleaseHarness::new("cancel-first", false).await;
+        fx.cancel_exact().await;
+        fx.release_decision();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks.len(), 1);
+        assert_eq!(batch.tasks[0].status, TaskStatus::Canceled);
+        fx.release_suspension();
+        let waiting = fx.await_waiting().await;
+        assert_eq!(waiting.state, ContinuationState::Waiting);
+        assert_eq!(fx.store.ownership_wins(), 0);
+        assert_eq!(fx.broker.pending_count().await, 1);
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.assert_common(0).await;
+        assert_eq!(fx.broker.pending_count().await, 0);
+    }
 
-        let timeout = listener
-            .continuation_release_batch(
-                "parent-conn",
-                1,
-                std::slice::from_ref(&task_id),
-                Some(crate::acp::tool_watchdog::CancelCause::AutoTimeout),
-            )
-            .await;
-        assert_eq!(
-            timeout.tasks[0].error_code.as_deref(),
-            Some("tool_stalled_timeout")
-        );
+    #[tokio::test]
+    async fn continuation_release_suspended_wins_simultaneous_wait_cancel() {
+        let mut fx = ContinuationReleaseHarness::new("simultaneous", false).await;
+        fx.release_suspension();
+        fx.await_arm_suspended().await;
+        fx.cancel_exact().await;
+        fx.release_decision();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks[0].status, TaskStatus::Running);
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.assert_common(0).await;
+    }
 
-        let stopped = listener
-            .continuation_release_batch(
-                "parent-conn",
-                1,
-                std::slice::from_ref(&task_id),
-                Some(crate::acp::tool_watchdog::CancelCause::UserStop),
-            )
-            .await;
+    #[tokio::test]
+    async fn continuation_release_post_ack_cancel_is_cleanup_only() {
+        let mut fx = ContinuationReleaseHarness::new("post-ack", true).await;
+        fx.release_suspension();
+        fx.await_arm_suspended().await;
+        fx.release_decision();
+        fx.await_snapshot_before().await;
+        fx.cancel_exact().await;
+        fx.allow_snapshot_read();
+        fx.await_snapshot_after().await;
+        fx.allow_snapshot_assemble();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks[0].status, TaskStatus::Running);
+        let row = fx
+            .store
+            .load_active_for_conversation(1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ContinuationState::Waiting);
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.assert_common(0).await;
+    }
+
+    #[tokio::test]
+    async fn continuation_release_user_stop_keeps_one_observational_response() {
+        let mut fx = ContinuationReleaseHarness::new("user-stop", true).await;
+        fx.release_suspension();
+        fx.await_arm_suspended().await;
+        fx.release_decision();
+        fx.await_snapshot_before().await;
+        fx.allow_snapshot_read();
+        fx.await_snapshot_after().await;
         assert_eq!(
-            stopped.tasks[0].error_code.as_deref(),
-            Some("user_cancelled")
+            fx.coordinator
+                .handle_parent_stop("parent-conn", 1)
+                .await
+                .unwrap(),
+            1
         );
+        fx.allow_snapshot_assemble();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks.len(), 1);
+        assert_eq!(batch.tasks[0].status, TaskStatus::Running);
+        fx.assert_common(1).await;
+        assert_eq!(fx.broker.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continuation_release_terminal_before_snapshot_is_terminal() {
+        let mut fx = ContinuationReleaseHarness::new("terminal-before", true).await;
+        fx.release_suspension();
+        fx.await_arm_suspended().await;
+        fx.release_decision();
+        fx.await_snapshot_before().await;
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.allow_snapshot_read();
+        fx.await_snapshot_after().await;
+        fx.allow_snapshot_assemble();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+        fx.assert_common(0).await;
+    }
+
+    #[tokio::test]
+    async fn continuation_release_terminal_after_snapshot_keeps_running_observation() {
+        let mut fx = ContinuationReleaseHarness::new("terminal-after", true).await;
+        fx.release_suspension();
+        fx.await_arm_suspended().await;
+        fx.release_decision();
+        fx.await_snapshot_before().await;
+        fx.allow_snapshot_read();
+        fx.await_snapshot_after().await;
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.allow_snapshot_assemble();
+        let batch = fx.finish_status().await;
+        assert_eq!(batch.tasks[0].status, TaskStatus::Running);
+        fx.assert_common(0).await;
     }
 
     #[tokio::test]

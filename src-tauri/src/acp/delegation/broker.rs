@@ -58,6 +58,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+#[cfg(any(test, feature = "test-utils"))]
+use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
 use crate::acp::delegation::attention::{
@@ -3229,6 +3231,23 @@ const CLAIM_POLL_ATTEMPTS: usize = 200; // 2 s production
 /// hosts that never announce identity-less calls at zero cost.
 const IDENTITYLESS_RENAME_POLL_ATTEMPTS: usize = 30;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code, reason = "constructed only by Broker test builds")]
+pub(crate) struct StatusSnapshotGateHandle {
+    pub before_read_entered: oneshot::Receiver<()>,
+    pub allow_read: oneshot::Sender<()>,
+    pub after_classification_entered: oneshot::Receiver<()>,
+    pub allow_assemble: oneshot::Sender<()>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct StatusSnapshotTestGate {
+    before_read: oneshot::Sender<()>,
+    allow_read: oneshot::Receiver<()>,
+    after_classification: oneshot::Sender<()>,
+    allow_assemble: oneshot::Receiver<()>,
+}
+
 /// The broker is intentionally `Clone` (cheap — only `Arc`s inside) so
 /// listener/handler code can hand copies to spawned tasks without lifetime
 /// gymnastics.
@@ -3321,6 +3340,8 @@ pub struct DelegationBroker {
     /// Woken after durable attention open / reply / terminal closure so a
     /// parked `request_parent_decision` rechecks `wait_snapshot`.
     attention_notify: Arc<Notify>,
+    #[cfg(any(test, feature = "test-utils"))]
+    status_snapshot_gate: Arc<Mutex<Option<StatusSnapshotTestGate>>>,
     /// Count of persistence-retry workers actually spawned (single-flight
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
@@ -3475,6 +3496,8 @@ impl DelegationBroker {
             metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
             attention_store: Arc::new(NoopDelegationAttentionStore),
             attention_notify: Arc::new(Notify::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            status_snapshot_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -13706,6 +13729,42 @@ impl DelegationBroker {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code, reason = "called only by Broker test builds")]
+    pub(crate) async fn install_status_snapshot_gate(&self) -> StatusSnapshotGateHandle {
+        let (before_tx, before_rx) = oneshot::channel();
+        let (allow_read_tx, allow_read_rx) = oneshot::channel();
+        let (after_tx, after_rx) = oneshot::channel();
+        let (allow_assemble_tx, allow_assemble_rx) = oneshot::channel();
+        *self.status_snapshot_gate.lock().await = Some(StatusSnapshotTestGate {
+            before_read: before_tx,
+            allow_read: allow_read_rx,
+            after_classification: after_tx,
+            allow_assemble: allow_assemble_rx,
+        });
+        StatusSnapshotGateHandle {
+            before_read_entered: before_rx,
+            allow_read: allow_read_tx,
+            after_classification_entered: after_rx,
+            allow_assemble: allow_assemble_tx,
+        }
+    }
+
+    pub(crate) async fn get_tasks_status_snapshot(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_ids: &[String],
+    ) -> Vec<DelegationTaskReport> {
+        self.get_tasks_status(
+            parent_connection_id,
+            parent_conversation_id,
+            task_ids,
+            StatusWait::Snapshot,
+        )
+        .await
+    }
+
     /// Backs the batch `get_delegation_status` tool. Resolves the status of one
     /// or many task ids in a single pass — each from the completed-cache, then
     /// the running set, then the DB fallback — scoped to the calling parent (a
@@ -13770,6 +13829,17 @@ impl DelegationBroker {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            #[cfg(any(test, feature = "test-utils"))]
+            let snapshot_gate = self.status_snapshot_gate.lock().await.take();
+            #[cfg(any(test, feature = "test-utils"))]
+            let after_gate = if let Some(gate) = snapshot_gate {
+                let _ = gate.before_read.send(());
+                let _ = gate.allow_read.await;
+                Some((gate.after_classification, gate.allow_assemble))
+            } else {
+                None
+            };
+
             let classes: Vec<StatusClass> = {
                 let inner = self.pending.inner.lock().await;
                 Self::classify_status_task_ids(
@@ -13779,6 +13849,12 @@ impl DelegationBroker {
                     &unknown_causes,
                 )
             };
+
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some((after_classification, allow_assemble)) = after_gate {
+                let _ = after_classification.send(());
+                let _ = allow_assemble.await;
+            }
             // Park only on live in-memory Running (running ∪ settling). Any
             // NotInMemory/Settled id forces an immediate return of the assemble
             // for every mode (cold DB Running has no terminal notify producer).
