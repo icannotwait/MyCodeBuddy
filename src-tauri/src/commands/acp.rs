@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
 use crate::acp::binary_cache;
+use crate::acp::custom_registry;
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::opencode_plugins::{self, PluginCheckSummary};
@@ -45,7 +46,7 @@ struct AcpAgentsUpdatedEventPayload {
     agent_type: Option<AgentType>,
 }
 
-fn emit_acp_agents_updated(
+pub(crate) fn emit_acp_agents_updated(
     emitter: &EventEmitter,
     reason: &'static str,
     agent_type: Option<AgentType>,
@@ -205,10 +206,13 @@ pub(crate) fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
     which::which(cmd).ok()
 }
 
-/// Resolve a dir-tree binary agent's user-installed CLI (e.g. `cursor-agent`
-/// from Cursor's official install script). Checks PATH first, then
-/// `~/.local/bin` — the script's install target, which a macOS GUI app's
-/// PATH typically lacks.
+/// Resolve a binary agent's user-installed CLI (e.g. `cursor-agent` from
+/// Cursor's official install script, a brew `opencode`, or a custom agent's
+/// own tool). Every binary agent may fall back to this when nothing is
+/// cached — the managed cache always wins, the system CLI only fills the
+/// gap, mirroring how npx agents already prefer a PATH install at launch.
+/// Checks PATH first, then `~/.local/bin` — a common install-script target
+/// a macOS GUI app's PATH typically lacks.
 pub(crate) fn resolve_system_agent_binary(cmd: &str) -> Option<PathBuf> {
     if let Some(path) = resolve_command_on_path(cmd) {
         return Some(path);
@@ -488,12 +492,7 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             Ok(())
         }
-        registry::AgentDistribution::Binary {
-            cmd,
-            platforms,
-            dir_entry,
-            ..
-        } => {
+        registry::AgentDistribution::Binary { cmd, platforms, .. } => {
             let platform = registry::current_platform();
             if !platforms.iter().any(|p| p.platform == platform) {
                 return Err(AcpError::PlatformNotSupported(format!(
@@ -503,12 +502,11 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             // Accept any cached version — the Settings page will still
             // surface "upgrade available" for stale caches via its own
-            // version-badge flow. Dir-tree agents (Cursor) additionally
-            // accept a user-installed CLI (official install script), the
-            // same fallback `build_agent` launches with.
+            // version-badge flow. A user-installed CLI also counts, the same
+            // fallback `build_agent` launches with.
             let launchable = binary_cache::find_best_cached_binary_for_agent(agent_type, cmd)?
                 .is_some()
-                || (dir_entry.is_some() && resolve_system_agent_binary(cmd).is_some());
+                || resolve_system_agent_binary(cmd).is_some();
             if !launchable {
                 // INVARIANT: see note above — "is not installed" is a
                 // stable substring the frontend matches against.
@@ -619,12 +617,18 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
     let meta = registry::get_agent_meta(agent_type);
     match meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
-            if !is_cmd_available(cmd).await {
-                return None;
-            }
+            let resolved = resolve_npx_command(cmd).await?;
             // Try `npm list -g <package_name> --json` to get the real installed version.
             let pkg_name = package_name_from_spec(package);
-            detect_npm_global_version(&pkg_name).await
+            let mut version = detect_npm_global_version(&pkg_name).await;
+            // Same system-install probe the status/list paths run (covers
+            // installs npm can't see: bun/pnpm globals, brew, …), so this
+            // detection agrees with them (a disagreement here clears/flips
+            // the persisted version back and forth).
+            if version.is_none() {
+                version = system_probed_version(agent_type, &resolved, Some(package)).await;
+            }
+            version
         }
         registry::AgentDistribution::Binary { cmd, dir_entry, .. } => {
             let cached = binary_cache::detect_installed_version(agent_type, cmd)
@@ -633,13 +637,32 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
             if cached.is_some() {
                 return cached;
             }
-            // Dir-tree agents: a user-installed CLI (no codeg cache) still
-            // reports a version via `<cmd> --version` (e.g. cursor-agent →
-            // "2026.07.20-8cc9c0b").
+            // A user-installed CLI (no codeg cache) still reports a version
+            // via `<cmd> --version` (e.g. cursor-agent → "2026.07.20-8cc9c0b").
+            // Mirrors the status/list paths — missing a fallback here would
+            // CLEAR the persisted system version below and the next list
+            // would write it back, churning events forever.
             if dir_entry.is_some() {
                 return system_dir_agent_version(cmd).await;
             }
-            None
+            let bin = resolve_system_agent_binary(cmd)?;
+            system_probed_version(agent_type, &bin, None).await
+        }
+        registry::AgentDistribution::Uvx {
+            cmd, system_cmd, ..
+        } => {
+            let mut version = binary_cache::uvx_prepared_version(agent_type);
+            // No prepared marker: probe the package's console script on PATH,
+            // then the system-fallback command a launch would actually use
+            // (Hermes: `hermes-acp` from the uvx package vs a pipx `hermes`).
+            if version.is_none() {
+                let bin = resolve_command_on_path(cmd)
+                    .or_else(|| system_cmd.and_then(|(c, _)| resolve_command_on_path(c)));
+                if let Some(bin) = bin {
+                    version = system_probed_version(agent_type, &bin, None).await;
+                }
+            }
+            version
         }
         registry::AgentDistribution::Bundled {
             version,
@@ -650,7 +673,6 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
             .ok()
             .flatten()
             .map(|_| version.to_string()),
-        registry::AgentDistribution::Uvx { .. } => binary_cache::uvx_prepared_version(agent_type),
     }
 }
 
@@ -977,21 +999,16 @@ async fn collect_agent_diag(
             .ok()
             .flatten();
         }
-        registry::AgentDistribution::Binary {
-            cmd,
-            platforms,
-            dir_entry,
-            ..
-        } => {
+        registry::AgentDistribution::Binary { cmd, platforms, .. } => {
             diag.cmd = cmd.to_string();
             diag.distribution = "binary";
             // Mirror verify_agent_installed exactly: it first rejects unsupported
             // platforms, then evaluates
-            // `find_best_cached_binary_for_agent(..)?.is_some() || (dir_entry &&
-            // system)`. So an unsupported platform — and a cache-read *error* —
-            // both FAIL the gate (the latter propagated via `?`) rather than
-            // falling through to the system binary. Reflect both here so
-            // diagnostics never reports "ok" for a case where connect errors out.
+            // `find_best_cached_binary_for_agent(..)?.is_some() || system`. So
+            // an unsupported platform — and a cache-read *error* — both FAIL
+            // the gate (the latter propagated via `?`) rather than falling
+            // through to the system binary. Reflect both here so diagnostics
+            // never reports "ok" for a case where connect errors out.
             let supported = platforms
                 .iter()
                 .any(|p| p.platform == registry::current_platform());
@@ -1000,8 +1017,8 @@ async fn collect_agent_diag(
             } else {
                 match binary_cache::find_best_cached_binary_for_agent(agent_type, cmd) {
                     Ok(Some((path, _version))) => Some(path),
-                    Ok(None) if dir_entry.is_some() => resolve_system_agent_binary(cmd),
-                    Ok(None) | Err(_) => None,
+                    Ok(None) => resolve_system_agent_binary(cmd),
+                    Err(_) => None,
                 }
                 .map(|p| p.to_string_lossy().to_string())
             };
@@ -1823,6 +1840,165 @@ pub(crate) async fn system_dir_agent_version(cmd: &str) -> Option<String> {
         *cache = Some((bin, mtime, version.clone()));
     }
     Some(version)
+}
+
+/// Process-local cache for system-CLI version probes, keyed by the agent
+/// command's resolved path and invalidated by its mtime. Failures are cached
+/// too — a CLI that does not understand `--version` must not be re-spawned on
+/// every settings refresh — and unlike the single-slot dir-tree cache above,
+/// this one holds an entry per agent so several agents don't evict each other.
+/// One probe result: the binary's mtime when probed, and the version it
+/// reported (`None` = the probe failed, cached so it isn't retried until the
+/// binary changes).
+type ProbeCacheEntry = (std::time::SystemTime, Option<String>);
+
+/// Cache key for a system version probe. The binary path alone is NOT
+/// enough: the declared probe command is editable, so an edit must be a cache
+/// miss rather than a stale hit until the binary's mtime changes — and two
+/// agents sharing a launcher path must not read each other's results when
+/// their probes or npm packages differ.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ProbeCacheKey {
+    bin: PathBuf,
+    /// The declared `version_probe` in force when the entry was written.
+    probe: Option<String>,
+    /// The npm package the npm-list step consults. Part of the key even when
+    /// a probe is declared — a failing probe falls back to the package
+    /// conventions, so the package still shapes the result.
+    package: Option<String>,
+}
+
+fn probe_cache_key(
+    resolved_bin: &std::path::Path,
+    declared_probe: Option<&str>,
+    npm_package: Option<&str>,
+) -> ProbeCacheKey {
+    ProbeCacheKey {
+        bin: resolved_bin.to_path_buf(),
+        probe: declared_probe.map(str::to_string),
+        package: npm_package.map(str::to_string),
+    }
+}
+
+static SYSTEM_PROBE_CACHE: std::sync::Mutex<Option<HashMap<ProbeCacheKey, ProbeCacheEntry>>> =
+    std::sync::Mutex::new(None);
+
+/// First version-looking token in probe output: starts with a digit (a leading
+/// `v` is tolerated and stripped), is dotted, and is drawn from the semver /
+/// calendar-version alphabet. Whitespace tokens are additionally split on `/`
+/// and `@` so `name/version` banners (curl-style `omp/17.1.7`) and npm-style
+/// `package@1.2.3` match; URL-shaped tokens are skipped entirely so a help
+/// link's path segment never reads as a version. Scans lines top-down so a
+/// banner's real version wins over trailing build metadata.
+fn extract_version_token(text: &str) -> Option<String> {
+    fn version_candidate(piece: &str) -> Option<String> {
+        let piece = piece.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';' | ':'));
+        let candidate = piece
+            .strip_prefix('v')
+            .or_else(|| piece.strip_prefix('V'))
+            .unwrap_or(piece);
+        let starts_digit = candidate.chars().next().is_some_and(|c| c.is_ascii_digit());
+        (starts_digit
+            && candidate.contains('.')
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+        .then(|| candidate.to_string())
+    }
+    for line in text.lines() {
+        for token in line.split_whitespace() {
+            if token.contains("://") {
+                continue;
+            }
+            if let Some(version) = token.split(['/', '@']).find_map(version_candidate) {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+/// Run a CLI with version args and extract a version token from stdout, then
+/// stderr (some CLIs print their banner there). Bounded like every other
+/// status-path probe.
+async fn probe_cli_version_token(bin: &std::path::Path, args: &[String]) -> Option<String> {
+    let mut cmd = crate::process::tokio_command(bin);
+    cmd.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    extract_version_token(&String::from_utf8_lossy(&output.stdout))
+        .or_else(|| extract_version_token(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// Version of an agent's SYSTEM install (the user's own `npm -g`, bun, brew,
+/// installer script, …), for the status/list paths when codeg has no managed
+/// install record. Works for built-ins and custom agents alike — a declared
+/// `version_probe` only exists on custom definitions, so built-ins always
+/// take the convention path. Cached per (binary, probe, package) (see
+/// [`SYSTEM_PROBE_CACHE`]).
+pub(crate) async fn system_probed_version(
+    agent_type: AgentType,
+    resolved_bin: &std::path::Path,
+    npm_package: Option<&str>,
+) -> Option<String> {
+    let declared_probe = agent_type
+        .custom_id()
+        .and_then(crate::acp::custom_registry::version_probe_of);
+    system_probed_version_with(declared_probe, resolved_bin, npm_package).await
+}
+
+/// Probe order: the declared `version_probe` command wins when it yields a
+/// version; then `npm list -g` for npx packages (exact installed version,
+/// both prefixes); then the near-universal `<cmd> --version` convention. A
+/// declared probe that fails (unknown flag, unparsable banner) falls through
+/// to the conventions rather than reading as "not installed".
+async fn system_probed_version_with(
+    declared_probe: Option<&str>,
+    resolved_bin: &std::path::Path,
+    npm_package: Option<&str>,
+) -> Option<String> {
+    let mtime = std::fs::metadata(resolved_bin).ok()?.modified().ok()?;
+    let key = probe_cache_key(resolved_bin, declared_probe, npm_package);
+    if let Ok(cache) = SYSTEM_PROBE_CACHE.lock() {
+        if let Some((cached_mtime, version)) = cache.as_ref().and_then(|map| map.get(&key)) {
+            if *cached_mtime == mtime {
+                return version.clone();
+            }
+        }
+    }
+
+    let mut version = None;
+    if let Some(probe) = declared_probe {
+        // The declared probe is a full command line (`agent-cli --version`);
+        // its program resolves like an agent command (PATH, then npm prefix).
+        let mut parts = probe.split_whitespace();
+        if let Some(program) = parts.next() {
+            let args: Vec<String> = parts.map(str::to_string).collect();
+            if let Some(path) = resolve_npx_command(program).await {
+                version = probe_cli_version_token(&path, &args).await;
+            }
+        }
+    }
+    if version.is_none() {
+        if let Some(package) = npm_package {
+            version = detect_npm_global_version(&package_name_from_spec(package)).await;
+        }
+    }
+    if version.is_none() {
+        version = probe_cli_version_token(resolved_bin, &["--version".to_string()]).await;
+    }
+
+    if let Ok(mut cache) = SYSTEM_PROBE_CACHE.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(key, (mtime, version.clone()));
+    }
+    version
 }
 
 /// Run `<binary> --version` and return the first non-empty stdout line.
@@ -3912,7 +4088,32 @@ struct KimiManagedSpec {
     env: BTreeMap<String, String>,
     model: String,
     max_context_size: Option<i64>,
+    /// `[models.<alias>].capabilities`. Empty ⇒ omit the key entirely, which is
+    /// what "reasoning off" means — see `KIMI_BASE_CAPABILITIES`.
+    capabilities: Vec<String>,
+    /// `[models.<alias>].support_efforts` — the reasoning levels the composer's
+    /// Thinking picker offers. Empty ⇒ omit (kimi degrades to an Off/On toggle).
+    support_efforts: Vec<String>,
+    /// `[models.<alias>].default_effort`. Only written when it is one of
+    /// `support_efforts`; kimi otherwise falls back to the middle entry anyway.
+    default_effort: Option<String>,
 }
+
+/// Input modalities always declared alongside a thinking capability.
+///
+/// kimi reads capabilities permissively — `if (capabilities === undefined) return true`
+/// — so an ABSENT key allows everything, but a PRESENT array allows only what it
+/// lists. Declaring `thinking` therefore has to re-declare the modalities that
+/// were implicitly allowed before, or enabling reasoning would silently revoke
+/// image/video input. `tool_use` mirrors kimi's own `capabilitiesForModel`,
+/// which defaults it on (`model.supportsToolUse ?? true`). Users who need a
+/// narrower set can hand-edit config.toml.
+const KIMI_BASE_CAPABILITIES: &[&str] = &["image_in", "video_in", "tool_use"];
+/// Capability that makes kimi advertise the Thinking picker over ACP at all
+/// (`supportsThinking` = capabilities ∋ thinking | always_thinking).
+const KIMI_CAPABILITY_THINKING: &str = "thinking";
+/// Same, but kimi drops the `Off` row: the model cannot stop reasoning.
+const KIMI_CAPABILITY_ALWAYS_THINKING: &str = "always_thinking";
 
 /// Upsert (`Some`) or remove (`None`) the codeg-managed `[providers.codeg]` +
 /// `[models.codeg-managed]` block in a parsed config.toml document, preserving
@@ -3994,6 +4195,38 @@ fn apply_kimi_managed_block(
                 .filter(|c| *c > 0)
                 .unwrap_or(KIMI_DEFAULT_MAX_CONTEXT_SIZE);
             model_table.insert("max_context_size".to_string(), toml::Value::Integer(ctx));
+            // Reasoning metadata. Each key is omitted when empty so the block
+            // stays byte-identical to the pre-reasoning shape when the feature
+            // is off — kimi treats an absent `capabilities` as "allow all" and
+            // an absent `support_efforts` as "no effort levels".
+            if !spec.capabilities.is_empty() {
+                model_table.insert(
+                    "capabilities".to_string(),
+                    toml::Value::Array(
+                        spec.capabilities
+                            .iter()
+                            .map(|c| toml::Value::String(c.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !spec.support_efforts.is_empty() {
+                model_table.insert(
+                    "support_efforts".to_string(),
+                    toml::Value::Array(
+                        spec.support_efforts
+                            .iter()
+                            .map(|e| toml::Value::String(e.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(effort) = &spec.default_effort {
+                model_table.insert(
+                    "default_effort".to_string(),
+                    toml::Value::String(effort.clone()),
+                );
+            }
             models.insert(
                 KIMI_MANAGED_MODEL_ALIAS.to_string(),
                 toml::Value::Table(model_table),
@@ -4279,6 +4512,42 @@ fn project_kimi_managed_config(value: &toml::Value) -> serde_json::Map<String, s
                 serde_json::Value::Number(ctx.into()),
             );
         }
+        // Reasoning metadata. `capabilities` round-trips so the panel can tell
+        // whether reasoning is on (and whether it is the always-on flavour)
+        // without re-deriving it from the effort list.
+        let string_array = |key: &str| -> Option<Vec<serde_json::Value>> {
+            Some(
+                model
+                    .get(key)?
+                    .as_array()?
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect(),
+            )
+        };
+        if let Some(caps) = string_array("capabilities") {
+            merged.insert("capabilities".to_string(), serde_json::Value::Array(caps));
+        }
+        if let Some(efforts) = string_array("support_efforts") {
+            merged.insert(
+                "supportEfforts".to_string(),
+                serde_json::Value::Array(efforts),
+            );
+        }
+        if let Some(effort) = model
+            .get("default_effort")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            merged.insert(
+                "defaultEffort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+        }
     }
 
     let has_managed = merged.contains_key("interfaceType");
@@ -4341,6 +4610,17 @@ pub(crate) struct KimiCodeConfigUpdate {
     pub vertex_project: Option<String>,
     pub vertex_location: Option<String>,
     pub raw_config_toml: Option<String>,
+    /// Declare a thinking capability so `kimi acp` advertises its Thinking
+    /// picker at all. `None`/`false` writes no `capabilities` key, leaving
+    /// kimi's permissive default (and no picker) exactly as before.
+    pub reasoning_enabled: Option<bool>,
+    /// Use `always_thinking` instead of `thinking`, dropping the `Off` row.
+    pub always_thinking: Option<bool>,
+    /// The reasoning levels offered in the composer. Passed through to the
+    /// provider verbatim — kimi does no client-side mapping for non-Kimi
+    /// providers, so an unsupported level fails at request time, not here.
+    pub support_efforts: Option<Vec<String>>,
+    pub default_effort: Option<String>,
 }
 
 /// Validate + resolve a `native`-mode update into the managed block to write.
@@ -4421,6 +4701,55 @@ fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedS
         }
     }
 
+    // ---- Reasoning metadata ----
+    // `kimi acp` suppresses its Thinking picker unless the model declares a
+    // thinking capability, and sources the picker's rows from `support_efforts`
+    // ("the single source of truth for efforts"). Both only apply when the user
+    // turned reasoning on; otherwise every key is left out and the block keeps
+    // its previous shape.
+    let reasoning_enabled = update.reasoning_enabled.unwrap_or(false);
+    let mut capabilities: Vec<String> = Vec::new();
+    let mut support_efforts: Vec<String> = Vec::new();
+    let mut default_effort: Option<String> = None;
+
+    if reasoning_enabled {
+        capabilities.push(
+            if update.always_thinking.unwrap_or(false) {
+                KIMI_CAPABILITY_ALWAYS_THINKING
+            } else {
+                KIMI_CAPABILITY_THINKING
+            }
+            .to_string(),
+        );
+        capabilities.extend(KIMI_BASE_CAPABILITIES.iter().map(|c| c.to_string()));
+
+        for raw in update.support_efforts.iter().flatten() {
+            let effort = raw.trim();
+            if effort.is_empty() {
+                continue;
+            }
+            if effort.contains(['\n', '\r']) {
+                return Err(AcpError::protocol(
+                    "kimi thinking effort must not contain newlines",
+                ));
+            }
+            if !support_efforts.iter().any(|e| e == effort) {
+                support_efforts.push(effort.to_string());
+            }
+        }
+
+        // kimi clamps an out-of-range default back to the middle entry, so an
+        // unlisted value is dropped rather than rejected — writing it would
+        // only misrepresent what the composer will actually show.
+        default_effort = update
+            .default_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|s| support_efforts.iter().any(|e| e == s))
+            .map(str::to_string);
+    }
+
     Ok(KimiManagedSpec {
         interface_type: interface_type.to_string(),
         base_url,
@@ -4428,6 +4757,9 @@ fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedS
         env,
         model,
         max_context_size: update.max_context_size.filter(|c| *c > 0),
+        capabilities,
+        support_efforts,
+        default_effort,
     })
 }
 
@@ -6559,6 +6891,48 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".cursor/skills", ".agents/skills"],
         }),
+        // codeg cannot detect where an arbitrary ACP agent loads skills from,
+        // so custom agents are gated on the user's own declaration: that the
+        // agent reads the shared `.agents/skills` store (the cross-agent
+        // convention OpenCode, Gemini, Cline, Codex, pi, and Cursor already
+        // follow), that it reads a dedicated directory of its own, or both.
+        // The dedicated directory is listed first so linking targets it
+        // without cross-agent side effects on the shared store — the same
+        // ordering rationale as pi and Cursor. Undeclared (or deleted) agents
+        // return `None`, which is also the gate that keeps them out of the
+        // experts / office / science matrices (`supported_agents` derives from
+        // this function). The dedicated path was normalized to absolute at
+        // save time; a non-absolute value (a hand-edited database) is ignored
+        // rather than resolved against an arbitrary working directory.
+        AgentType::Custom(id) => {
+            let decl = crate::acp::custom_registry::skills_decl(id);
+            let mut global_dirs = Vec::new();
+            if let Some(dir) = decl
+                .dir
+                .map(std::path::Path::new)
+                .filter(|p| p.is_absolute())
+            {
+                global_dirs.push(dir.to_path_buf());
+            }
+            if decl.shared_store {
+                global_dirs.push(home_dir_or_default().join(".agents").join("skills"));
+            }
+            if global_dirs.is_empty() {
+                None
+            } else {
+                Some(SkillStorageSpec {
+                    kind: SkillStorageKind::SkillDirectoryOnly,
+                    global_dirs,
+                    // Only the shared convention has a project-local layout;
+                    // a dedicated directory is global by definition.
+                    project_rel_dirs: if decl.shared_store {
+                        vec![".agents/skills"]
+                    } else {
+                        vec![]
+                    },
+                })
+            }
+        }
     }
 }
 
@@ -7771,6 +8145,12 @@ fn cascade_update_agent_config(
             // (`acpUpdateAgentEnv`); it does not write provider creds into
             // ~/.grok/config.toml and does not participate in the cascade.
         }
+        AgentType::Custom(_) => {
+            // Custom agents are deliberately configuration-free: codeg writes
+            // no config file for them and they are excluded from the
+            // model-provider surface, so there is nothing to cascade. Whatever
+            // credentials they need go through the generic launch-env panel.
+        }
     }
     Ok(())
 }
@@ -8694,12 +9074,23 @@ pub(crate) async fn acp_get_agent_status_core(
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
     let (available, installed_version) = match &meta.distribution {
-        registry::AgentDistribution::Npx { cmd, .. } => (
-            true,
-            resolve_npx_command(cmd)
-                .await
-                .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone())),
-        ),
+        registry::AgentDistribution::Npx { cmd, package, .. } => {
+            let resolved = resolve_npx_command(cmd).await;
+            let mut version = resolved
+                .as_ref()
+                .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone()));
+            // An agent the user installed themselves (npm -g, bun, brew, …)
+            // resolves but has no managed install record — probe the system
+            // install so it reads as installed rather than demanding a
+            // second, managed copy. Launch already prefers the PATH
+            // resolution, so this only makes the UI agree with what runs.
+            if version.is_none() {
+                if let Some(bin) = &resolved {
+                    version = system_probed_version(agent_type, bin, Some(package)).await;
+                }
+            }
+            (true, version)
+        }
         registry::AgentDistribution::Binary {
             platforms,
             cmd,
@@ -8709,12 +9100,18 @@ pub(crate) async fn acp_get_agent_status_core(
             let mut detected = binary_cache::detect_installed_version(agent_type, cmd)
                 .ok()
                 .flatten();
-            // Dir-tree agents (Cursor): a system install is launchable via the
-            // connect path's PATH fallback, and the frontend gates connect on a
-            // non-null installed_version — report the probed system version so
-            // an official-script install isn't blocked as "not installed".
-            if detected.is_none() && dir_entry.is_some() {
-                detected = system_dir_agent_version(cmd).await;
+            // A system install is launchable via the connect path's PATH
+            // fallback, and the frontend gates connect on a non-null
+            // installed_version — report the probed system version so such an
+            // install isn't blocked as "not installed". Dir-tree agents
+            // (Cursor) keep their dedicated probe; everyone else (custom or
+            // built-in) goes through the per-agent probe cache.
+            if detected.is_none() {
+                if dir_entry.is_some() {
+                    detected = system_dir_agent_version(cmd).await;
+                } else if let Some(bin) = resolve_system_agent_binary(cmd) {
+                    detected = system_probed_version(agent_type, &bin, None).await;
+                }
             }
             (platforms.iter().any(|p| p.platform == platform), detected)
         }
@@ -8732,10 +9129,23 @@ pub(crate) async fn acp_get_agent_status_core(
                     .is_some();
             (available, available.then(|| version.to_string()))
         }
-        registry::AgentDistribution::Uvx { system_cmd, .. } => (
-            uvx_agent_launchable(*system_cmd),
-            binary_cache::uvx_prepared_version(agent_type),
-        ),
+        registry::AgentDistribution::Uvx {
+            cmd, system_cmd, ..
+        } => {
+            let mut version = binary_cache::uvx_prepared_version(agent_type);
+            // Same story as npx: a CLI installed by the user (pipx, uv tool
+            // install, …) is a real install. Probe the package's console
+            // script first, then the system-fallback command a launch would
+            // actually use (Hermes: `hermes-acp` vs a pipx `hermes`).
+            if version.is_none() {
+                let bin = resolve_command_on_path(cmd)
+                    .or_else(|| (*system_cmd).and_then(|(c, _)| resolve_command_on_path(c)));
+                if let Some(bin) = bin {
+                    version = system_probed_version(agent_type, &bin, None).await;
+                }
+            }
+            (uvx_agent_launchable(*system_cmd), version)
+        }
     };
 
     Ok(crate::acp::types::AcpAgentStatus {
@@ -8784,15 +9194,22 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         let setting = settings_map.get(&agent_type);
         let meta = registry::get_agent_meta(agent_type);
         let (available, dist_type, local_installed_version) = match &meta.distribution {
-            registry::AgentDistribution::Npx { cmd, .. } => {
+            registry::AgentDistribution::Npx { cmd, package, .. } => {
                 // Keep the list path bounded: each list request probes npm
                 // global prefix at most once, then reuses the result across
                 // all NPX agents in the loop.
-                let cached = npx_resolver
-                    .resolve_for_list(cmd)
-                    .await
+                let resolved = npx_resolver.resolve_for_list(cmd).await;
+                let mut version = resolved
+                    .as_ref()
                     .and_then(|_| setting.and_then(|m| m.installed_version.clone()));
-                (true, "npx", cached)
+                // Mirror the status path: an agent's own system install
+                // counts as installed (per-agent cached probe).
+                if version.is_none() {
+                    if let Some(bin) = &resolved {
+                        version = system_probed_version(agent_type, bin, Some(package)).await;
+                    }
+                }
+                (true, "npx", version)
             }
             registry::AgentDistribution::Binary {
                 platforms,
@@ -8803,12 +9220,16 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                 let mut detected = binary_cache::detect_installed_version(agent_type, cmd)
                     .ok()
                     .flatten();
-                // Mirror the status path: a dir-tree agent's system install
-                // counts as installed (cached probe — no per-list subprocess
-                // after the first call). Without this, the list would also
-                // persist `installed_version = None` over the detected value.
-                if detected.is_none() && dir_entry.is_some() {
-                    detected = system_dir_agent_version(cmd).await;
+                // Mirror the status path: a system install counts as installed
+                // (cached probes — no per-list subprocess after the first
+                // call). Without this, the list would also persist
+                // `installed_version = None` over the detected value.
+                if detected.is_none() {
+                    if dir_entry.is_some() {
+                        detected = system_dir_agent_version(cmd).await;
+                    } else if let Some(bin) = resolve_system_agent_binary(cmd) {
+                        detected = system_probed_version(agent_type, &bin, None).await;
+                    }
                 }
                 (
                     platforms.iter().any(|p| p.platform == platform),
@@ -8830,11 +9251,19 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                         .is_some();
                 (available, "bundled", available.then(|| version.to_string()))
             }
-            registry::AgentDistribution::Uvx { system_cmd, .. } => (
-                uvx_agent_launchable(*system_cmd),
-                "uvx",
-                binary_cache::uvx_prepared_version(agent_type),
-            ),
+            registry::AgentDistribution::Uvx {
+                cmd, system_cmd, ..
+            } => {
+                let mut version = binary_cache::uvx_prepared_version(agent_type);
+                if version.is_none() {
+                    let bin = resolve_command_on_path(cmd)
+                        .or_else(|| (*system_cmd).and_then(|(c, _)| resolve_command_on_path(c)));
+                    if let Some(bin) = bin {
+                        version = system_probed_version(agent_type, &bin, None).await;
+                    }
+                }
+                (uvx_agent_launchable(*system_cmd), "uvx", version)
+            }
         };
 
         let mut env = setting
@@ -8957,6 +9386,10 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             description: meta.description.to_string(),
             available,
             distribution_type: dist_type.to_string(),
+            custom_source: agent_type
+                .custom_id()
+                .and_then(crate::acp::custom_registry::source_of)
+                .map(|s| s.as_str().to_string()),
             enabled: setting.map(|m| m.enabled).unwrap_or(true),
             show_thinking: setting.map(|model| model.show_thinking).unwrap_or(false),
             sort_order,
@@ -8977,6 +9410,15 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             cursor_cli_config_json,
             cursor_settings,
             model_provider_id: setting.and_then(|m| m.model_provider_id),
+            icon_url: agent_type
+                .custom_id()
+                .and_then(custom_registry::icon_for)
+                .map(ToString::to_string),
+            // Derived server-side so the skills surfaces need no frontend
+            // knowledge of which agents keep a skill store: all builtins do
+            // today, customs only when the user declared the shared
+            // `.agents/skills` store.
+            skills_capable: skill_storage_spec(agent_type).is_some(),
         });
     }
 
@@ -9729,6 +10171,10 @@ pub async fn acp_update_kimi_code_config(
     vertex_project: Option<String>,
     vertex_location: Option<String>,
     raw_config_toml: Option<String>,
+    reasoning_enabled: Option<bool>,
+    always_thinking: Option<bool>,
+    support_efforts: Option<Vec<String>>,
+    default_effort: Option<String>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
@@ -9751,6 +10197,10 @@ pub async fn acp_update_kimi_code_config(
             vertex_project,
             vertex_location,
             raw_config_toml,
+            reasoning_enabled,
+            always_thinking,
+            support_efforts,
+            default_effort,
         },
         &db,
         &manager,
@@ -10005,6 +10455,10 @@ pub(crate) async fn acp_download_agent_binary_core(
                 effective_version,
                 &archive_url,
                 cmd,
+                // A custom version rewrites the URL, so the registry's digest
+                // no longer describes what we are about to fetch — only verify
+                // against the pinned release.
+                custom.is_none().then_some(fallback.sha256).flatten(),
                 move |msg| {
                     emit_agent_install_event(
                         &emitter_clone,
@@ -11100,6 +11554,120 @@ mod tests {
         assert_eq!(event.channel, ACP_AGENTS_UPDATED_EVENT);
         assert_eq!(event.payload["reason"], "display_preferences_updated");
         assert_eq!(event.payload["agent_type"], "codex");
+    }
+
+    #[test]
+    fn extract_version_token_finds_the_version_in_common_banners() {
+        assert_eq!(extract_version_token("0.21.0").as_deref(), Some("0.21.0"));
+        assert_eq!(
+            extract_version_token("qwen version 0.21.0\n").as_deref(),
+            Some("0.21.0")
+        );
+        assert_eq!(
+            extract_version_token("goose v1.44.0 (release)").as_deref(),
+            Some("1.44.0")
+        );
+        assert_eq!(
+            extract_version_token("Foo CLI\nversion: 2.3.4-beta.1").as_deref(),
+            Some("2.3.4-beta.1")
+        );
+        // A leading `v` is stripped; the word "version" is not mistaken for one.
+        assert_eq!(
+            extract_version_token("version v10.2.30").as_deref(),
+            Some("10.2.30")
+        );
+        // curl-style `name/version` banners (omp prints exactly this).
+        assert_eq!(
+            extract_version_token("omp/17.1.7").as_deref(),
+            Some("17.1.7")
+        );
+        // npm-style `package@version`, scoped packages included.
+        assert_eq!(
+            extract_version_token("@oh-my-pi/pi-coding-agent@17.1.7").as_deref(),
+            Some("17.1.7")
+        );
+    }
+
+    #[test]
+    fn extract_version_token_rejects_non_versions() {
+        assert!(extract_version_token("").is_none());
+        assert!(extract_version_token("usage: foo [args]").is_none());
+        // Dotted but not digit-led, and digit-led but not dotted.
+        assert!(extract_version_token("node.js required").is_none());
+        assert!(extract_version_token("exit 1").is_none());
+        // A URL's path segment must not read as a version, and slash-split
+        // pieces without a dot don't qualify either.
+        assert!(extract_version_token("docs: https://example.com/2.0/setup").is_none());
+        assert!(extract_version_token("built 2026/07").is_none());
+    }
+
+    #[test]
+    fn probe_cache_key_misses_when_the_declared_probe_or_package_changes() {
+        let bin = std::path::Path::new("/usr/local/bin/agent");
+        // Editing the declared probe MUST be a cache miss — this was the bug:
+        // a path+mtime key kept serving the old probe's result.
+        let auto = probe_cache_key(bin, None, None);
+        let probe_a = probe_cache_key(bin, Some("agent --version"), None);
+        let probe_b = probe_cache_key(bin, Some("agent -V"), None);
+        assert_ne!(auto, probe_a);
+        assert_ne!(probe_a, probe_b);
+        // Removing the probe again returns to the auto key.
+        assert_eq!(probe_cache_key(bin, None, None), auto);
+        // Two agents sharing a launcher but naming different npm packages must
+        // not read each other's auto-path result…
+        let pkg_a = probe_cache_key(bin, None, Some("@scope/a"));
+        let pkg_b = probe_cache_key(bin, None, Some("@scope/b"));
+        assert_ne!(pkg_a, pkg_b);
+        // …and the package stays in the key even with a declared probe: a
+        // failing probe falls back to the package conventions, so the package
+        // still shapes the cached result.
+        assert_ne!(
+            probe_cache_key(bin, Some("agent --version"), Some("@scope/a")),
+            probe_cache_key(bin, Some("agent --version"), Some("@scope/b")),
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_version_script(dir: &std::path::Path, name: &str, banner: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join(name);
+        {
+            let mut f = std::fs::File::create(&bin).expect("create script");
+            f.write_all(format!("#!/bin/sh\necho \"{banner}\"\n").as_bytes())
+                .expect("write script");
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        bin
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_probed_version_reads_a_system_cli_via_the_version_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_version_script(dir.path(), "fake-agent", "fake-agent version 1.2.3");
+
+        // Unregistered custom id → no declared probe → the auto `--version`
+        // path, exactly what a hand-added agent without a probe gets. The
+        // same path serves built-ins, which can never declare a probe.
+        let version = system_probed_version(AgentType::Custom("probe-e2e-test"), &bin, None).await;
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_declared_probe_falls_back_to_the_version_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `name/version` banner — the shape that motivated the token split.
+        let bin = fake_version_script(dir.path(), "fallback-agent", "fallback-agent/3.2.1");
+
+        // The declared probe's program doesn't exist, so the probe yields
+        // nothing; the convention path must still read the real install.
+        let version =
+            system_probed_version_with(Some("codeg-missing-probe-cmd-e2e --version"), &bin, None)
+                .await;
+        assert_eq!(version.as_deref(), Some("3.2.1"));
     }
 
     #[test]
@@ -14309,6 +14877,9 @@ wire_api = "chat"
             env: BTreeMap::new(),
             model: "claude-opus-4-7".to_string(),
             max_context_size: Some(200_000),
+            capabilities: Vec::new(),
+            support_efforts: Vec::new(),
+            default_effort: None,
         };
         let mut doc = toml::Value::Table(toml::map::Map::new());
         // Pre-existing user content that must survive a managed-block write.
@@ -14376,6 +14947,9 @@ wire_api = "chat"
                 env: BTreeMap::new(),
                 model: "kimi-k2.7-code".to_string(),
                 max_context_size: ctx,
+                capabilities: Vec::new(),
+                support_efforts: Vec::new(),
+                default_effort: None,
             };
             let mut doc = toml::Value::Table(toml::map::Map::new());
             apply_kimi_managed_block(&mut doc, Some(&spec)).expect("write managed block");
@@ -14462,6 +15036,10 @@ model = "kimi-for-coding"
             vertex_project: None,
             vertex_location: None,
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         let spec = build_kimi_managed_spec(&update).expect("valid spec");
         // env auth → key lands in the provider env sub-table, NOT the inline field.
@@ -14482,6 +15060,10 @@ model = "kimi-for-coding"
             vertex_project: Some("my-proj".to_string()),
             vertex_location: Some("us-central1".to_string()),
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         let spec = build_kimi_managed_spec(&update).expect("valid vertex spec");
         assert!(spec.api_key.is_none());
@@ -14508,6 +15090,10 @@ model = "kimi-for-coding"
             vertex_project: None,
             vertex_location: None,
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         assert!(build_kimi_managed_spec(&base).is_err());
         let no_model = KimiCodeConfigUpdate {
@@ -14516,6 +15102,226 @@ model = "kimi-for-coding"
             ..base.clone()
         };
         assert!(build_kimi_managed_spec(&no_model).is_err());
+    }
+
+    /// A minimal valid api-key update; reasoning fields are filled per test.
+    fn kimi_reasoning_update(
+        reasoning_enabled: Option<bool>,
+        always_thinking: Option<bool>,
+        support_efforts: Option<Vec<String>>,
+        default_effort: Option<&str>,
+    ) -> KimiCodeConfigUpdate {
+        KimiCodeConfigUpdate {
+            mode: "apikey".to_string(),
+            interface_type: Some("kimi".to_string()),
+            auth_type: None,
+            base_url: None,
+            api_key: Some("sk-x".to_string()),
+            model: Some("kimi-k2".to_string()),
+            max_context_size: None,
+            vertex_project: None,
+            vertex_location: None,
+            raw_config_toml: None,
+            reasoning_enabled,
+            always_thinking,
+            support_efforts,
+            default_effort: default_effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kimi_reasoning_off_writes_no_capability_keys() {
+        // With reasoning off the model block must stay byte-identical to the
+        // pre-feature shape: an ABSENT `capabilities` is what keeps kimi's
+        // permissive "allow every modality" default in force.
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(None, None, None, None))
+            .expect("valid spec");
+        assert!(spec.capabilities.is_empty());
+        assert!(spec.support_efforts.is_empty());
+        assert!(spec.default_effort.is_none());
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        apply_kimi_managed_block(&mut doc, Some(&spec)).expect("applied");
+        let model = doc
+            .get("models")
+            .and_then(|m| m.get(KIMI_MANAGED_MODEL_ALIAS))
+            .and_then(toml::Value::as_table)
+            .expect("model block");
+        assert!(model.get("capabilities").is_none());
+        assert!(model.get("support_efforts").is_none());
+        assert!(model.get("default_effort").is_none());
+    }
+
+    #[test]
+    fn kimi_reasoning_on_declares_thinking_plus_the_permissive_modalities() {
+        // `thinking` alone would REVOKE image/video input, because kimi only
+        // treats an absent capabilities array as "allow all".
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec!["low".into(), "high".into()]),
+            Some("high"),
+        ))
+        .expect("valid spec");
+        assert_eq!(
+            spec.capabilities,
+            vec!["thinking", "image_in", "video_in", "tool_use"]
+        );
+        assert_eq!(spec.support_efforts, vec!["low", "high"]);
+        assert_eq!(spec.default_effort.as_deref(), Some("high"));
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        apply_kimi_managed_block(&mut doc, Some(&spec)).expect("applied");
+        let model = doc
+            .get("models")
+            .and_then(|m| m.get(KIMI_MANAGED_MODEL_ALIAS))
+            .and_then(toml::Value::as_table)
+            .expect("model block");
+        let caps: Vec<&str> = model["capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(caps.contains(&"thinking") && caps.contains(&"image_in"));
+        assert_eq!(
+            model["default_effort"].as_str(),
+            Some("high"),
+            "default_effort must reach config.toml"
+        );
+    }
+
+    #[test]
+    fn kimi_reasoning_off_clears_keys_a_previous_save_wrote() {
+        // Turning reasoning back off must REMOVE the keys, not just stop
+        // refreshing them: a lingering `capabilities` array would keep kimi in
+        // whitelist mode (and keep advertising a Thinking picker) forever.
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let on = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            Some(true),
+            Some(vec!["low".into(), "high".into()]),
+            Some("high"),
+        ))
+        .expect("valid spec");
+        apply_kimi_managed_block(&mut doc, Some(&on)).expect("write reasoning on");
+        assert!(doc["models"][KIMI_MANAGED_MODEL_ALIAS]
+            .get("capabilities")
+            .is_some());
+
+        let off = build_kimi_managed_spec(&kimi_reasoning_update(Some(false), None, None, None))
+            .expect("valid spec");
+        apply_kimi_managed_block(&mut doc, Some(&off)).expect("write reasoning off");
+        let model = doc["models"][KIMI_MANAGED_MODEL_ALIAS]
+            .as_table()
+            .expect("model block");
+        assert!(model.get("capabilities").is_none(), "capabilities must go");
+        assert!(model.get("support_efforts").is_none());
+        assert!(model.get("default_effort").is_none());
+        // The keys that are NOT part of reasoning must survive the rewrite.
+        assert_eq!(model["model"].as_str(), Some("kimi-k2"));
+        assert!(model.get("max_context_size").is_some());
+    }
+
+    #[test]
+    fn kimi_reasoning_always_thinking_swaps_the_capability() {
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            Some(true),
+            Some(vec!["high".into()]),
+            None,
+        ))
+        .expect("valid spec");
+        assert!(spec.capabilities.contains(&"always_thinking".to_string()));
+        assert!(!spec.capabilities.contains(&"thinking".to_string()));
+    }
+
+    #[test]
+    fn kimi_reasoning_normalizes_efforts_and_drops_an_unlisted_default() {
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec![
+                "  low  ".into(),
+                "".into(),
+                "low".into(),
+                "high".into(),
+            ]),
+            // kimi clamps an unlisted default to the middle entry anyway, so
+            // writing it would only misreport what the composer will show.
+            Some("max"),
+        ))
+        .expect("valid spec");
+        assert_eq!(spec.support_efforts, vec!["low", "high"]);
+        assert!(spec.default_effort.is_none());
+    }
+
+    #[test]
+    fn kimi_reasoning_rejects_a_newline_in_an_effort() {
+        let err = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec!["hi\ngh".into()]),
+            None,
+        ));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn kimi_project_managed_config_round_trips_reasoning_metadata() {
+        let value: toml::Value = r#"
+default_model = "codeg-managed"
+[providers.codeg]
+type = "openai_responses"
+[models.codeg-managed]
+provider = "codeg"
+model = "gpt-5.6-sol"
+max_context_size = 1000000
+capabilities = ["thinking", "image_in", "video_in", "tool_use"]
+support_efforts = ["low", "medium", "high"]
+default_effort = "high"
+"#
+        .parse()
+        .expect("valid toml");
+        let proj = project_kimi_managed_config(&value);
+        let caps: Vec<&str> = proj["capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(caps.contains(&"thinking"));
+        let efforts: Vec<&str> = proj["supportEfforts"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high"]);
+        assert_eq!(
+            proj.get("defaultEffort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn kimi_project_managed_config_omits_reasoning_keys_when_absent() {
+        // The shape the panel wrote before this feature — the projection must
+        // not invent empty arrays, or the panel would read reasoning as "on".
+        let value: toml::Value = r#"
+[providers.codeg]
+type = "kimi"
+[models.codeg-managed]
+provider = "codeg"
+model = "kimi-k2"
+max_context_size = 262144
+"#
+        .parse()
+        .expect("valid toml");
+        let proj = project_kimi_managed_config(&value);
+        assert!(proj.get("capabilities").is_none());
+        assert!(proj.get("supportEfforts").is_none());
+        assert!(proj.get("defaultEffort").is_none());
     }
 
     #[test]

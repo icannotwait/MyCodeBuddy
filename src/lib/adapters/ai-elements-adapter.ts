@@ -5,6 +5,7 @@ import type {
   TurnUsage,
   TurnOutcome,
   AgentExecutionStats,
+  AgentTranscriptEntry,
   ToolCallStatus,
   PlanEntryInfo,
   ImageData,
@@ -26,6 +27,7 @@ import {
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
+  unwrapReferenceDestination,
 } from "@/lib/reference-link"
 
 /**
@@ -65,6 +67,12 @@ export type AdaptedToolCallPart = {
    * live DelegationContext entry is missing (page refresh, late mount).
    */
   meta?: Record<string, unknown> | null
+  /**
+   * Live subagent transcript (claude-agent-acp ≥0.63), forwarded from
+   * `ContentBlock.tool_result.agent_transcript`. Present only on a RUNNING
+   * Agent card during streaming — promotion and history never carry it.
+   */
+  agentTranscript?: AgentTranscriptEntry[] | null
 }
 
 /**
@@ -205,6 +213,7 @@ export interface AdaptedMessage {
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
+  reasoning_effort?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
   completed_at?: string | null
   /**
@@ -865,14 +874,11 @@ function handleMarkdownLink(
   resources: UserResourceDisplay[]
 ): string {
   const normalizedLabel = label.trim()
-  // Unwrap a CommonMark angle-bracket destination (`<uri>`) to the bare uri so
-  // scheme tests and the stored value are clean. `match` (returned for
-  // inline-kept refs) keeps the original bracketed form untouched.
-  const rawUri = uri.trim()
-  const normalizedUri =
-    rawUri.startsWith("<") && rawUri.endsWith(">")
-      ? rawUri.slice(1, -1).trim()
-      : rawUri
+  // Unwrap a CommonMark angle-bracket destination (`<uri>`) — and decode the
+  // `\`/`<`/`>` escapes it carries — so scheme tests and the stored chip uri see
+  // the real path, not `file:///C:\\dir`. `match` (returned for inline-kept
+  // refs) keeps the original bracketed form untouched.
+  const normalizedUri = unwrapReferenceDestination(uri)
   // A `codeg://` reference (session / commit / agent) renders as an inline badge
   // in the transcript (markdown-link → ReferenceBadge); never lift it to the
   // bottom resource-chip row. The guard mirrors markdown-link's interception
@@ -1848,6 +1854,7 @@ export function adaptMessageTurn(
             : undefined,
           agentStats: matchedResult.agent_stats ?? undefined,
           meta: block.meta ?? null,
+          agentTranscript: matchedResult.agent_transcript ?? undefined,
         })
       } else {
         // Position-based matching: if this tool_use has no ID, check next block
@@ -1882,6 +1889,7 @@ export function adaptMessageTurn(
               : undefined,
             agentStats: positionalResult.agent_stats ?? undefined,
             meta: block.meta ?? null,
+            agentTranscript: positionalResult.agent_transcript ?? undefined,
           })
         } else {
           // For live streaming, unmatched tools are still running.
@@ -1977,6 +1985,7 @@ export function adaptMessageTurn(
     usage: turn.usage,
     duration_ms: turn.duration_ms,
     model: turn.model,
+    reasoning_effort: turn.reasoning_effort,
     completed_at: turn.completed_at,
     // Carry full TurnOutcome so list footers survive adaptation; never fold
     // it into content parts (copy/markdown must stay free of status text).
@@ -2039,6 +2048,7 @@ interface TurnCacheEntry {
   usage: TurnUsage | null | undefined
   duration_ms: number | null | undefined
   model: string | null | undefined
+  reasoning_effort: string | null | undefined
   completed_at: string | null | undefined
   /** Full-outcome fingerprint; null when the turn has no outcome. */
   outcomeFp: string | null
@@ -2067,7 +2077,8 @@ export interface MessageTurnAdapter {
  * survives across re-renders triggered by streaming deltas.
  *
  * Cache invalidation: an entry is reused only when `(text, blocks,
- * blocksLen, timestamp, role, usage, duration_ms, model, completed_at,
+ * blocksLen, timestamp, role, usage, duration_ms, model, reasoning_effort,
+ * completed_at,
  * outcome fingerprint)` all match. The blocks reference catches whole-turn
  * rewrites (e.g. detail refetch replacing `detail.turns`) where
  * blocksLen/timestamp may stay equal but a tool's output_preview was updated.
@@ -2112,6 +2123,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
             cached.model === turn.model &&
+            cached.reasoning_effort === turn.reasoning_effort &&
             cached.completed_at === turn.completed_at &&
             cached.outcomeFp === outcomeFp
           ) {
@@ -2147,6 +2159,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             usage: turn.usage,
             duration_ms: turn.duration_ms,
             model: turn.model,
+            reasoning_effort: turn.reasoning_effort,
             completed_at: turn.completed_at,
             outcomeFp,
             adapted,

@@ -906,9 +906,9 @@ pub async fn soft_delete_provisional_child(
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
-    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
-        Ok(at) => at,
-        Err(_) => {
+    match AgentType::from_wire(s) {
+        Some(at) => at,
+        None => {
             // DB has a value the enum does not recognise (manual edit or removed variant).
             // Fall back to ClaudeCode so the row stays readable, but log so resume-as-wrong-agent
             // regressions are traceable.

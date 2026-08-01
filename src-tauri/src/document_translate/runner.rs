@@ -502,7 +502,7 @@ async fn collect_translate_output(
                 match msg {
                     Ok(envelope) => {
                         match &envelope.payload {
-                            AcpEvent::ContentDelta { text } => {
+                            AcpEvent::ContentDelta { text, .. } => {
                                 let next_len = buf.len().saturating_add(text.len());
                                 if next_len > MAX_OUTPUT_BYTES {
                                     return Err(DocumentTranslateError::OutputTooLarge);
@@ -639,14 +639,21 @@ mod tests {
             })
         };
 
-        tx.send(event(1, AcpEvent::ContentDelta { text: "old".into() }))
-            .unwrap();
+        tx.send(event(
+            1,
+            AcpEvent::ContentDelta {
+                text: "old".into(),
+                parent_tool_use_id: None,
+            },
+        ))
+        .unwrap();
         tx.send(event(2, AcpEvent::TurnAttemptRollback { attempt: 1 }))
             .unwrap();
         tx.send(event(
             3,
             AcpEvent::ContentDelta {
                 text: "accepted".into(),
+                parent_tool_use_id: None,
             },
         ))
         .unwrap();
@@ -853,7 +860,10 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::task::yield_now().await;
                     agent
-                        .emit(AcpEvent::ContentDelta { text: text.clone() })
+                        .emit(AcpEvent::ContentDelta {
+                            text: text.clone(),
+                            parent_tool_use_id: None,
+                        })
                         .await;
                     agent
                         .emit(AcpEvent::TurnComplete {

@@ -7,6 +7,7 @@ import {
   CheckIcon,
   Coins,
   CopyIcon,
+  Gauge,
   Timer,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
@@ -27,6 +28,8 @@ interface TurnStatsProps {
   duration_ms?: number | null
   model?: string | null
   models?: string[]
+  reasoningEffort?: string | null
+  reasoningEfforts?: string[]
   previousUserIndex?: number | null
   isResponseComplete?: boolean
   copyText?: string
@@ -42,6 +45,8 @@ export function TurnStats({
   duration_ms,
   model,
   models,
+  reasoningEffort,
+  reasoningEfforts,
   previousUserIndex,
   isResponseComplete = true,
   copyText = "",
@@ -87,7 +92,18 @@ export function TurnStats({
     : null
 
   const displayModels = models?.length ? models : model ? [model] : []
+  const displayEfforts = (
+    reasoningEfforts?.length
+      ? reasoningEfforts
+      : reasoningEffort?.trim()
+        ? [reasoningEffort]
+        : []
+  )
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
   const hasCopy = copyText.trim().length > 0
+  const hasModel = displayModels.length > 0
+  const hasEffort = displayEfforts.length > 0
   const hasUsage = Boolean(usage)
   const hasDuration = typeof duration_ms === "number" && duration_ms > 0
   const hasCompletedAt = Boolean(completedLabel)
@@ -122,7 +138,15 @@ export function TurnStats({
   )
 
   if (!isResponseComplete) return null
-  if (!hasCopy && !hasUsage && !hasDuration && !hasCompletedAt && !hasJump)
+  if (
+    !hasCopy &&
+    !hasModel &&
+    !hasEffort &&
+    !hasUsage &&
+    !hasDuration &&
+    !hasCompletedAt &&
+    !hasJump
+  )
     return null
 
   return (
@@ -163,6 +187,24 @@ export function TurnStats({
             <TooltipContent side="top" className="max-w-xs break-words">
               <span className="font-medium" translate="no">
                 {displayModels.join(", ")}
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {hasEffort && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(iconButtonClass, "cursor-default")}
+                aria-label={t("reasoningEffort")}
+              >
+                <Gauge aria-hidden="true" className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs break-words">
+              <span className="font-medium" translate="no">
+                {displayEfforts.join(", ")}
               </span>
             </TooltipContent>
           </Tooltip>

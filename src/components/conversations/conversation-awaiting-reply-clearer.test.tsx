@@ -1,6 +1,7 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { DbConversationSummary } from "@/lib/types"
+import { firstLeafId } from "@/lib/tab-group-layout"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -95,12 +96,15 @@ function seedActiveConversation(opts: {
   awaiting_reply_token: string
 }) {
   const tab = makeTab(opts.id)
+  const groupId = firstLeafId(useTabStore.getState().groupLayout)
   useTabStore.setState({
     tabsHydrated: true,
-    isTileMode: false,
     activeTabId: tab.id,
     rawTabs: [tab],
     tabs: [tab],
+    groupOf: { [tab.id]: groupId },
+    groupSelection: { [groupId]: tab.id },
+    tileByGroup: { [groupId]: false },
   })
   useAppWorkspaceStore.getState().applyConversationUpsert(
     makeSummary({
@@ -117,12 +121,18 @@ function seedTiledConversations(opts: {
 }) {
   const activeTab = makeTab(opts.activeId)
   const inactiveTab = makeTab(opts.inactiveId)
+  const groupId = firstLeafId(useTabStore.getState().groupLayout)
   useTabStore.setState({
     tabsHydrated: true,
-    isTileMode: true,
     activeTabId: activeTab.id,
     rawTabs: [activeTab, inactiveTab],
     tabs: [activeTab, inactiveTab],
+    groupOf: {
+      [activeTab.id]: groupId,
+      [inactiveTab.id]: groupId,
+    },
+    groupSelection: { [groupId]: activeTab.id },
+    tileByGroup: { [groupId]: true },
   })
   useAppWorkspaceStore.getState().applyConversationUpsert(
     makeSummary({
@@ -278,6 +288,36 @@ describe("ConversationAwaitingReplyClearer", () => {
       expect(clearAwaitingReply).toHaveBeenCalledWith(10, "generation-10")
     )
     expect(clearAwaitingReply).toHaveBeenCalledTimes(1)
+  })
+
+  it("clears via sidebarSelection for a detached conversation without main focus", async () => {
+    // Pop-out re-click: no main tab for the conversation, main window loses
+    // focus after focusing the detached window, but sidebarSelection is set.
+    useTabStore.setState({
+      tabsHydrated: true,
+      activeTabId: null,
+      rawTabs: [],
+      tabs: [],
+      tileByGroup: {},
+      sidebarSelection: { id: 77, agentType: "claude_code" },
+    })
+    useAppWorkspaceStore.getState().applyConversationUpsert(
+      makeSummary({
+        id: 77,
+        awaiting_reply_token: "generation-77",
+      })
+    )
+    documentHasFocus.mockReturnValue(false)
+    routeMock.isConversations = false
+    workspaceMock.filesMaximized = true
+    render(<ConversationAwaitingReplyClearer />)
+
+    await waitFor(() =>
+      expect(clearAwaitingReply).toHaveBeenCalledWith(77, "generation-77")
+    )
+    expect(
+      useAppWorkspaceStore.getState().conversations[0].awaiting_reply_token
+    ).toBeNull()
   })
 
   it("retries a failed clear only after transport reconnect", async () => {

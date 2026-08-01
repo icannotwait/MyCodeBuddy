@@ -193,7 +193,16 @@ async fn handle_acp_envelope(
             }
         }
 
-        AcpEvent::ContentDelta { text } => {
+        AcpEvent::ContentDelta {
+            text,
+            parent_tool_use_id,
+        } => {
+            // Chat channels mirror the MAIN thread only: a Claude subagent's
+            // parented transcript chunks belong to the Agent capsule, not the
+            // channel message stream.
+            if parent_tool_use_id.is_some() {
+                return;
+            }
             // Collect flush info under the lock, then release before any IO.
             let flush_info: Option<(ChannelMessageTarget, String, Option<String>)> = {
                 let mut guard = bridge.lock().await;
@@ -1322,6 +1331,7 @@ mod async_relay_dedup_tests {
                 1,
                 AcpEvent::ContentDelta {
                     text: "accepted prefix".into(),
+                    parent_tool_use_id: None,
                 },
             ),
             envelope(
@@ -1343,6 +1353,7 @@ mod async_relay_dedup_tests {
                 3,
                 AcpEvent::ContentDelta {
                     text: "stale candidate".into(),
+                    parent_tool_use_id: None,
                 },
             ),
             envelope(4, AcpEvent::TurnAttemptRollback { attempt: 1 }),
@@ -1350,6 +1361,7 @@ mod async_relay_dedup_tests {
                 5,
                 AcpEvent::ContentDelta {
                     text: "accepted answer".into(),
+                    parent_tool_use_id: None,
                 },
             ),
         ];

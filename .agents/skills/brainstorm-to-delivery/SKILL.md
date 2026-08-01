@@ -59,13 +59,18 @@ Keys are workspace-relative, NFC/B1-normalized, `|`-separated, ≤200 scalars:
 | Final reviewer   | `final_review\|reviewer\|{agent}\|{profile\|none}`  |
 | Final fixer      | `final_review\|fixer\|{agent}\|{profile\|none}`     |
 
-Prefer `continue_delegation` when the ledger shows a recoverable thread. Same
-key cold `delegate_to_agent` without `replaces_task_id` is invalid once lineage
-exists. Replacement only for `unresumable` | `budget_exhausted_continue` |
-`not_supported`, same key/role/profile, at most one replacement and two
-unexpected continues per work unit. Recovery is a **new turn**: re-inspect
-disk, treat prior reasoning as provisional, rebuild missing reports, re-run
-covering tests before claiming done.
+Prefer `continue_delegation` when the ledger shows a recoverable thread
+(including `canceled` + `parent_disconnected` after the child reached running).
+Same key cold `delegate_to_agent` without `replaces_task_id` is invalid once
+lineage exists. Replacement only for `unresumable` | `budget_exhausted_continue`
+| `not_supported` (and admission_* reasons), same key/role/profile, at most one
+replacement and two unexpected continues per work unit. Use
+`replacement_reason=unresumable` also for parent-end / explicit-cancel /
+stall codes that block continue (`parent_canceled`, `parent_turn_failed`,
+`join_abandoned`, `user_cancelled`, `tool_stalled_timeout`, and
+`parent_disconnected` when continue is not viable). Recovery is a **new turn**:
+re-inspect disk, treat prior reasoning as provisional, rebuild missing reports,
+re-run covering tests before claiming done.
 
 ## Workflow capability (v2 only)
 
@@ -99,9 +104,19 @@ complete historical node lists. Use the ledger for durable thread bookkeeping,
 and never invent a second active workflow from memory.
 
 Every Design/Plan/Task/Final child must emit one validated terminal
-`<!-- codeg-card-summary-v1 ... -->` block. Parent advances only on platform-
-validated summaries. Review pass set: `approve` | `approve_with_minors`.
+`<!-- codeg-card-summary-v1 ... -->` block **in the final assistant message
+text** (not only inside a report file). Parent advances only on platform-
+validated summaries. Platform may harvest a missing chat card from a
+markdown-linked or touched report `.md` as a fallback; still require chat
+emission in child prompts. Review pass set: `approve` | `approve_with_minors`.
 Implementation pass set: `done` | `done_with_concerns`.
+
+If Final (or any review work unit) completes and the platform summary is
+missing/unvalidated, **do not** treat prose verdicts as authoritative. Prefer
+`continue_delegation` on that reviewer to re-emit the card in chat (and keep
+the report). For Final `request_changes`/`block` only: after a validated
+non-pass card is present, dispatch Final fixer. Never start Final fixer on
+chat prose alone.
 
 Respect platform bounds (Tasks≤100, nodes≤400, edges≤800, gates≤50, adj≤4KiB,
 JSON≤512KiB). Details of wire fields live in tools/validation—do not restate
@@ -257,6 +272,8 @@ worktree, blockers.
 | Plan Gate approved | Immediately run the Workspace gate, then dispatch the first eligible Task. Do not request extra user approval. |
 | Task Gate passed | Immediately dispatch the next eligible Task; after all active Task gates pass, dispatch a new Final reviewer. Do not request extra user approval. |
 | Final review approved | Immediately verify, commit, and report. Do not request extra user approval. |
+| Final request_changes / block with validated card | Immediately dispatch Final fixer (Grok). Do not request extra user approval. |
+| Final completed but card missing / unvalidated | `continue_delegation` Final reviewer to re-emit `codeg-card-summary-v1` in chat (report alone is not enough for the parent to advance). Platform may auto-harvest from the report file; still rebind if admission fails. |
 | Any phase could continue | Only pause for a platform hard block, `user_decision_required`, or a change to requirements, scope, architecture, or user data handling; otherwise continue. |
 | Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
 | Context compacted / recovery resumed | One index read for gates, counts, reviewer sets, and current/next routes; read referenced reports and bounded secondary detail before settle |
@@ -277,6 +294,7 @@ worktree, blockers.
 | “`spawn_agent` can’t pick Grok.” | Use Codeg `delegate_to_agent`. |
 | “The Gate is approved, but I should ask the user to confirm the next phase.” | An approved Gate is not a user gate. Dispatch the next admissible work unit in the same parent turn. |
 | “A ledger or document still says pending, so I should stop.” | Reconcile with `get_workflow_state`; only its hard block or an explicit pause condition may stop advancement. |
+| “Final said request_changes in prose / report; start fixer.” | Need platform-validated card (`summary_validated` + verdict). Rebind Final reviewer if missing; then Final fixer. |
 
 ## Red flags — stop
 

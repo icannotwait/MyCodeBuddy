@@ -69,7 +69,6 @@ export interface LiveTranscriptRowProps {
   /** Test / perf hook: called once per LiveToolCard render with toolCallId. */
   onToolRender?: (toolCallId: string) => void
   delegationIdentityIndex?: DelegationIdentityIndex | null
-  isDelegatedChild?: boolean
 }
 
 const PendingTypingIndicator = memo(function PendingTypingIndicator() {
@@ -483,7 +482,6 @@ function buildLiveFooterItems(
   segmentIds: readonly string[],
   groupIds: readonly string[],
   showThinking: boolean,
-  isDelegatedChild: boolean,
   delegationIdentityIndex?: DelegationIdentityIndex | null
 ): LiveFooterItem[] {
   // Only multi-tool runs collapse into a summary chip. Lone tools keep a
@@ -504,9 +502,9 @@ function buildLiveFooterItems(
   for (const segmentId of segmentIds) {
     const segment = liveTranscriptStore.getSegment(conversationId, segmentId)
     if (segment?.type === "thinking" && !showThinking) continue
+    // Parent and child: pure interrupt fence is not a useful live answer.
     if (
       segment?.type === "text" &&
-      isDelegatedChild &&
       isConversationInterruptedAgentText(segment.text)
     ) {
       continue
@@ -551,7 +549,6 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   showThinking,
   onToolRender,
   delegationIdentityIndex,
-  isDelegatedChild = false,
 }: LiveTranscriptRowProps) {
   const segmentIds = useLiveTranscriptSegmentIds(conversationId)
   const groupIds = useLiveTranscriptToolGroupIds(conversationId)
@@ -577,7 +574,6 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
         segmentIds,
         groupIds,
         showThinking,
-        isDelegatedChild,
         delegationIdentityIndex
       ),
     [
@@ -585,7 +581,6 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
       segmentIds,
       groupIds,
       showThinking,
-      isDelegatedChild,
       delegationIdentityIndex,
     ]
   )

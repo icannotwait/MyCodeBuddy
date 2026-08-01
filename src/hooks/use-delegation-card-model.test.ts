@@ -4,6 +4,7 @@ import {
   buildDelegationCardModel,
   isTickerEligible,
   mergeDelegationWorkUnitModel,
+  scopeDelegationBindingForCard,
   type DelegationCardSource,
 } from "@/hooks/use-delegation-card-model"
 import type { DelegationBinding } from "@/lib/delegation-binding-reduce"
@@ -1108,5 +1109,87 @@ describe("buildDelegationCardModel — identity + secondary", () => {
       (second as typeof second & { cardSummary?: CardSummary | null })
         .cardSummary
     ).toEqual(secondSummary)
+  })
+
+  it("prefers this run's snapshot summary over a later continue's live binding", () => {
+    // Simulates what would happen if child-fallback incorrectly attached the
+    // gen-2 live binding to a gen-1 card: after scoping, binding is dropped
+    // and Critical/Important counts stay on this run's snapshot.
+    const firstSummary: CardSummary = {
+      kind: "review",
+      verdict: "request_changes",
+      critical: 2,
+      important: 1,
+      minor: 0,
+      summary: "Mirror still diverges on path handling.",
+    }
+    const laterBinding = binding({
+      parentToolUseId: "pt-2",
+      taskId: "run-2",
+      status: "running",
+      task: "Continue fixing",
+      cardSummary: {
+        kind: "review",
+        verdict: "approve",
+        critical: 0,
+        important: 0,
+        minor: 0,
+        summary: "Later run — must not paint over turn 1.",
+      },
+    })
+    const scoped = scopeDelegationBindingForCard(laterBinding, "pt-1", "run-1")
+    expect(scoped).toBeUndefined()
+
+    const model = build({
+      binding: scoped,
+      parsedMeta: meta({
+        status: "ok",
+        taskId: "run-1",
+        finishedAt: FINISHED_AT,
+        runtimeStats: { ...LIVE_STATS, finished_at: FINISHED_AT },
+      }),
+      runSnapshot: {
+        task_id: "run-1",
+        root_task_id: "run-1",
+        previous_task_id: null,
+        generation: 1,
+        parent_tool_use_id: "pt-1",
+        child_conversation_id: 99,
+        agent_type: "codex",
+        profile_id: null,
+        task_preview: "review turn 1",
+        status: "completed",
+        error_code: null,
+        started_at: STARTED_AT,
+        finished_at: FINISHED_AT,
+        runtime_stats: emptyRuntimeStats(STARTED_AT),
+        card_summary: firstSummary,
+        child_turn_anchor: null,
+        replaced_task_id: null,
+        replacement_reason: null,
+      },
+    })
+
+    expect(model.cardSummary).toEqual(firstSummary)
+    expect(model.cardSummary).toMatchObject({
+      kind: "review",
+      critical: 2,
+      important: 1,
+      summary: "Mirror still diverges on path handling.",
+    })
+  })
+})
+
+describe("scopeDelegationBindingForCard", () => {
+  it("accepts only the binding for this parent tool-use id and task id", () => {
+    const own = binding({ parentToolUseId: "pt-1", taskId: "run-1" })
+    expect(scopeDelegationBindingForCard(own, "pt-1", "run-1")).toBe(own)
+    expect(scopeDelegationBindingForCard(own, "pt-1", null)).toBe(own)
+    expect(
+      scopeDelegationBindingForCard(own, "pt-other", "run-1")
+    ).toBeUndefined()
+    expect(
+      scopeDelegationBindingForCard(own, "pt-1", "run-other")
+    ).toBeUndefined()
   })
 })

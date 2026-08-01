@@ -96,13 +96,15 @@ pub(crate) fn capture_tag(re: &Regex, text: &str) -> Option<String> {
 
 /// Strip system-injected XML tags from text content.
 /// Returns None if the text becomes empty after stripping.
+///
+/// Leading whitespace is preserved so mandatory-route classification (column
+/// zero) can still distinguish composer directives from indented quotations.
 fn strip_system_tags(text: &str) -> Option<String> {
     let cleaned = system_tag_regex().replace_all(text, "");
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
+    if cleaned.trim().is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(cleaned.trim_end().to_string())
     }
 }
 
@@ -2853,5 +2855,24 @@ earlier terminal context records.\n\
         assert!(visible_user_texts
             .iter()
             .any(|text| text.contains("partial")));
+    }
+
+    #[test]
+    fn indented_mandatory_route_survives_strip_system_tags_pipeline() {
+        use crate::parsers::visible_user_text;
+
+        let route = "Codeg mandatory delegation route: profile_id=\"a\"";
+        let indented = format!("  {route}");
+        let cleaned = strip_system_tags(&indented).expect("non-empty after strip");
+        assert!(
+            cleaned.starts_with(' '),
+            "strip_system_tags must preserve leading whitespace, got {cleaned:?}"
+        );
+        assert_eq!(visible_user_text(&cleaned).as_deref(), Some(route));
+        // User history path: strip_system_tags then visible_user_text.
+        assert_eq!(
+            strip_system_tags(&indented).and_then(|t| visible_user_text(&t)),
+            Some(route.to_string())
+        );
     }
 }

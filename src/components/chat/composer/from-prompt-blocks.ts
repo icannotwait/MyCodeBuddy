@@ -13,12 +13,13 @@ import type { ReferenceAttrs } from "./types"
  * intact.
  *
  * The split mirrors the send rule:
- * - `text` blocks → plain-text segments replayed into the editor verbatim. Every
- *   inline reference that was serialized *as text* comes back in that text form:
- *   file links `[name](file://…)` (which `docToPromptBlocks` keeps inline) and
- *   session/commit/agent/skill references alike replay as their inline link/token
- *   text, not re-hydrated badges — consistent across every reference kind on a
- *   queue-edit.
+ * - `text` blocks → plain-text segments, carrying every inline reference that
+ *   was serialized *as text*: file links `[name](file://…)` (which
+ *   `docToPromptBlocks` keeps inline) and session/commit/agent/skill references
+ *   alike. The host re-hydrates those tokens into badges when it replays the
+ *   segment (`restoreBlocksIntoEditor` → `textToSeededInlineContent`), so a
+ *   queue-edit shows the same badges the sender composed; this function stays
+ *   text-level and kind-agnostic.
  * - `resource_link` blocks whose uri is a composer scheme (`file:` / `codeg:`)
  *   → reference badge segments. `docToPromptBlocks` no longer emits file
  *   resource_links (files stay inline above), but this branch still restores any
@@ -27,9 +28,9 @@ import type { ReferenceAttrs } from "./types"
  * - everything else (`image`, embedded `resource`, non-composer `resource_link`)
  *   → out-of-band attachments.
  *
- * The host replays `segments` in order against a live editor (text via
- * `insertTextAtCursor`, references via `insertReference`) and sets
- * `attachments`. Pure and deterministic given an injected `makeId`.
+ * The host replays `segments` in order against a live editor (see
+ * `restoreBlocksIntoEditor`) and sets `attachments`. Pure and deterministic
+ * given an injected `makeId`.
  */
 export type RestoreSegment =
   | { kind: "text"; text: string }

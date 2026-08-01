@@ -21,7 +21,8 @@
 
 Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, etc.) into one workspace, supporting conversation aggregation and multi-agent collaboration, with desktop installation plus server/Docker deployment.
 
-![gallery](./docs/images/gallery.svg)
+![gallery](./docs/images/workspace-light.png#gh-light-mode-only)
+![gallery](./docs/images/workspace-dark.png#gh-dark-mode-only)
 
 ## Sponsors
 
@@ -60,13 +61,13 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 
 ## Main Interface
 
-![Codeg Light](./docs/images/main-light.png#gh-light-mode-only)
-![Codeg Dark](./docs/images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](./docs/images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](./docs/images/workspace-dark.png#gh-dark-mode-only)
 
 ## Multi-Agent Collaboration
 
-![Codeg Light](./docs/images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](./docs/images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](./docs/images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](./docs/images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## Office Workflow
 
@@ -110,13 +111,22 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 
 > Note: environment variables take precedence over fallback paths.
 
+Not on the list? Add it yourself. Pick any agent from the public ACP registry or paste its distribution JSON, and Codeg installs it, checks it can launch, and treats it like a built-in — it shows up in the picker, takes `@` delegation and skills, and gets its conversations recorded and searchable even when the agent keeps no history of its own. → [Custom Agents](https://docs.codeg.app/guide/custom-agents)
+
+## 🪟 Split View
+
+One tab strip isn't always enough. Right-click a conversation tab to split the view **right** or **down**, as many times as you like: two panes side by side, a stack of three, a grid. Each group is a workspace of its own — its own tabs, its own header, its own new-conversation button — so Claude Code can refactor in one pane while Codex reviews a diff in the next.
+
+Drag a tab from one group into another and its session keeps streaming through the move; drag the divider between two groups to change how they share the space. Your layout is remembered per workspace, drafts included: reopen Codeg and the split comes back, with the text you never sent still in the box.
+
+![Splitting the conversation area into a grid of tab groups](./docs/images/split-light.gif#gh-light-mode-only)
+![Splitting the conversation area into a grid of tab groups](./docs/images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>Project Boot</h2></summary>
 
 Create new projects visually with a split-pane interface: configure on the left, preview in real time on the right.
 
-![Project Boot Light](./docs/images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](./docs/images/project-boot-dark.png#gh-dark-mode-only)
 
 ### What it does
 
@@ -296,7 +306,7 @@ that asset; if download fails, use Docker or source build instead.
 
 ```powershell
 # Only works when a matching zip still exists (legacy / self-packaged):
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### Option 1: Docker

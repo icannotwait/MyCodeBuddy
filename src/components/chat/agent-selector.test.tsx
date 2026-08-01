@@ -20,12 +20,14 @@ function agent(
 ): AcpAgentInfo {
   return {
     agent_type: agentType,
+    skills_capable: true,
     registry_id: `${agentType}-registry`,
     registry_version: null,
     name: agentType,
     description: "",
     available: true,
     distribution_type: "system",
+    custom_source: null,
     enabled: true,
     sort_order: 0,
     installed_version: null,
@@ -45,6 +47,7 @@ function agent(
     cursor_settings: null,
     model_provider_id: null,
     show_thinking: false,
+    icon_url: null,
     ...overrides,
   }
 }
@@ -115,6 +118,31 @@ describe("AgentSelector", () => {
     fireEvent.click(buttons[1])
     expect(onSelect).toHaveBeenCalledTimes(1)
     expect(onSelect).toHaveBeenCalledWith("codex")
+  })
+
+  it("shows enabled custom agents beside builtins and omits disabled customs", () => {
+    mockUseAcpAgents.mockReturnValue({
+      agents: [
+        agent("codex"),
+        agent("custom:goose"),
+        agent("custom:hidden", { enabled: false }),
+      ],
+      fresh: true,
+      refresh: async () => {},
+    })
+    const onSelect = vi.fn()
+    renderWithIntl(
+      <AgentSelector defaultAgentType="codex" onSelect={onSelect} />
+    )
+
+    expect(screen.getAllByRole("button")).toHaveLength(2)
+    const goose = screen.getByRole("button", { name: "Goose" })
+    expect(
+      screen.queryByRole("button", { name: "Hidden" })
+    ).not.toBeInTheDocument()
+
+    fireEvent.click(goose)
+    expect(onSelect).toHaveBeenCalledWith("custom:goose")
   })
 
   it("fires onFallback (not onSelect) when the preferred agent is unavailable", async () => {

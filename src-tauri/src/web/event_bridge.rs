@@ -594,6 +594,7 @@ mod tests {
                 &self.emitter,
                 AcpEvent::ContentDelta {
                     text: text.to_string(),
+                    parent_tool_use_id: None,
                 },
             )
             .await;
@@ -760,6 +761,7 @@ mod tests {
             &emitter,
             AcpEvent::ContentDelta {
                 text: "hello".to_string(),
+                parent_tool_use_id: None,
             },
         )
         .await;
@@ -823,6 +825,7 @@ mod tests {
             &emitter,
             AcpEvent::ContentDelta {
                 text: "hello".to_string(),
+                parent_tool_use_id: None,
             },
         )
         .await;

@@ -25,6 +25,7 @@ import {
   Loader2,
   Minus,
   PackagePlus,
+  Pencil,
   Plug,
   Plus,
   RefreshCw,
@@ -37,7 +38,14 @@ import { isDesktop, openUrl } from "@/lib/platform"
 
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { toast } from "sonner"
+import {
+  customAgentId,
+  isCustomAgentType,
+  setCustomAgentDisplay,
+} from "@/lib/custom-agents"
 import { AgentIcon } from "@/components/agent-icon"
+import { AddCustomAgentDialog } from "@/components/settings/add-custom-agent-dialog"
+import { CustomAgentSkillsToggle } from "@/components/settings/custom-agent-skills-toggle"
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -87,12 +95,11 @@ import {
   acpPreflight,
   acpPrepareNpxAgent,
   acpReorderAgents,
+  acpDeleteCustomAgent,
   acpUninstallAgent,
   acpUpdateAgentConfig,
   acpUpdateAgentEnv,
   acpUpdateHermesConfig,
-  acpUpdateKimiCodeConfig,
-  acpFetchKimiModels,
   acpRevealHermesHome,
   acpOpenHermesSetupTerminal,
   codexPollDeviceCode,
@@ -142,6 +149,7 @@ import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
 import { CursorConfigPanel } from "./cursor-config-panel"
+import { KimiCodeConfigPanel } from "./kimi-code-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
 import { AgentThinkingVisibilitySwitch } from "./agent-thinking-visibility-switch"
 
@@ -288,6 +296,25 @@ interface UiCheckItem {
   fixes: UiFixAction[]
 }
 
+/**
+ * Fix kinds that run a package operation. Only one of these may run at a time
+ * across ALL agents, so while any of them is busy anywhere, every button whose
+ * kind is listed here is disabled — and dimmed, so the lockout is visible on
+ * agents other than the busy one.
+ */
+const PACKAGE_ACTION_FIX_KINDS: ReadonlyArray<UiFixAction["kind"]> = [
+  "download_binary",
+  "upgrade_binary",
+  "install_npx",
+  "upgrade_npx",
+  "uninstall_binary",
+  "uninstall_npx",
+  "redownload_binary",
+  "install_opencode_plugins",
+  "custom_install",
+  "install_uv",
+]
+
 type AcpTranslator = (
   key: string,
   values?: Record<string, string | number>
@@ -302,6 +329,23 @@ function acpText(
 ): string {
   if (!acpTranslator) return fallback
   return acpTranslator(key, values)
+}
+
+/**
+ * Publish a freshly fetched agent list into the custom-agent display map
+ * (names + icons behind `getAgentLabel` / `getAgentIconUrl`). The map is
+ * normally hydrated by `useAcpAgents`, but that hook lives in the workspace
+ * surfaces — the settings window fetches its own list, so without this every
+ * custom agent here falls back to the initial-letter glyph.
+ */
+function publishAgentDisplay(list: AcpAgentInfo[]): void {
+  setCustomAgentDisplay(
+    list.map((agent) => ({
+      agentType: agent.agent_type,
+      name: agent.name,
+      iconUrl: agent.icon_url,
+    }))
+  )
 }
 
 function statusTone(status: CheckStatus): string {
@@ -1201,7 +1245,7 @@ function markRemovedKeysNull(
 
 /**
  * Build the `config_json` payload for a merge-strategy agent save (Claude Code /
- * Gemini / OpenClaw). Diffs the current config against the original so removed
+ * Gemini). Diffs the current config against the original so removed
  * keys become explicit `null`s the backend merge deletes from disk — crucially
  * even when the current config emptied to "" (e.g. the last env flag toggled
  * off), which would otherwise serialize to a null `config_json` no-op and leave
@@ -3320,11 +3364,17 @@ export function buildVersionCheck(
   const remoteVersion = agent.registry_version ?? "unknown"
   const localVersion =
     agent.installed_version ?? acpText("version.notInstalled", "Not installed")
-  const versionText = acpText(
-    "version.remoteLocal",
-    "Remote: {remoteVersion} · Local: {localVersion}",
-    { remoteVersion, localVersion }
-  )
+  // A manually written definition has no registry behind it — its stored
+  // version is whatever the user typed — so "Remote:" would be comparing
+  // against noise. Every message shows the local side alone.
+  const manualSource = agent.custom_source === "manual"
+  const versionText = manualSource
+    ? acpText("version.localOnly", "Local: {localVersion}", { localVersion })
+    : acpText(
+        "version.remoteLocal",
+        "Remote: {remoteVersion} · Local: {localVersion}",
+        { remoteVersion, localVersion }
+      )
   const installAction: RunningActionKind =
     agent.distribution_type === "binary" ? "download_binary" : "install_npx"
   const upgradeAction: RunningActionKind =
@@ -3416,6 +3466,27 @@ export function buildVersionCheck(
         {
           label: acpText("actions.install", "Install"),
           kind: installAction,
+          payload: agent.agent_type,
+        },
+      ]),
+    }
+  }
+
+  // Manual definitions stop here: installed is the whole story, and the
+  // registry-comparison branches below would only manufacture "upgrade
+  // available" noise against a user-typed version.
+  if (manualSource) {
+    return {
+      check_id: "version_status",
+      label: acpText("version.statusLabel", "Version Status"),
+      status: "pass",
+      message: acpText("version.localInstalled", "{versionText}. Installed.", {
+        versionText,
+      }),
+      fixes: withCustomInstall([
+        {
+          label: acpText("actions.uninstall", "Uninstall"),
+          kind: uninstallAction,
           payload: agent.agent_type,
         },
       ]),
@@ -3611,686 +3682,6 @@ function AgentReorderItem({
   )
 }
 
-const KIMI_BASE_URL_INTERNATIONAL = "https://api.moonshot.ai/v1"
-const KIMI_BASE_URL_CHINA = "https://api.moonshot.cn/v1"
-/** Placeholder model id (a real Moonshot coding model) for the model input. */
-const KIMI_MODEL_PLACEHOLDER = "kimi-k2.7-code"
-
-/**
- * Kimi credential mode. `apikey` writes a codeg-managed config.toml provider/model
- * block AND seeds a synthetic gate token, so the API key actually authenticates
- * `kimi acp` — whose session gate only checks for a stored token and rejects an
- * API key on its own. `login` clears the managed block and removes our synthetic
- * token so a real OAuth login (`kimi login`, needs a Kimi subscription) governs.
- * Exactly one is authoritative — saving clears the rest. A raw config.toml editor
- * is the escape hatch.
- */
-export type KimiAuthMode = "apikey" | "login"
-/** The six provider `type` values Kimi's config.toml `[providers]` accepts. */
-export type KimiInterfaceType =
-  | "kimi"
-  | "openai"
-  | "openai_responses"
-  | "anthropic"
-  | "google-genai"
-  | "vertexai"
-/** Native-provider credential placement: inline `api_key` vs the env sub-table. */
-export type KimiNativeAuthType = "api_key" | "env"
-/** Env-mode endpoint: the two Moonshot regions or a custom OpenAI-compatible URL. */
-export type KimiEndpointRegion = "international" | "china" | "custom"
-
-export interface KimiInterfaceTypeMeta {
-  value: KimiInterfaceType
-  /** Product label (proper noun — intentionally not localized). */
-  label: string
-  /** Base URL pre-filled when this interface is selected ("" → SDK default). */
-  defaultBaseUrl: string
-  /** vertexai authenticates via GCP ADC, so it exposes no API key field. */
-  usesApiKey: boolean
-}
-
-export const KIMI_INTERFACE_TYPES: KimiInterfaceTypeMeta[] = [
-  {
-    value: "kimi",
-    label: "Kimi / Moonshot",
-    defaultBaseUrl: KIMI_BASE_URL_INTERNATIONAL,
-    usesApiKey: true,
-  },
-  {
-    value: "openai",
-    label: "OpenAI (Chat Completions)",
-    defaultBaseUrl: "https://api.openai.com/v1",
-    usesApiKey: true,
-  },
-  {
-    value: "openai_responses",
-    label: "OpenAI (Responses)",
-    defaultBaseUrl: "https://api.openai.com/v1",
-    usesApiKey: true,
-  },
-  {
-    value: "anthropic",
-    label: "Anthropic",
-    defaultBaseUrl: "",
-    usesApiKey: true,
-  },
-  {
-    value: "google-genai",
-    label: "Google Gemini",
-    defaultBaseUrl: "",
-    usesApiKey: true,
-  },
-  {
-    value: "vertexai",
-    label: "Google Vertex AI",
-    defaultBaseUrl: "",
-    usesApiKey: false,
-  },
-]
-
-export function kimiInterfaceMeta(
-  type: KimiInterfaceType
-): KimiInterfaceTypeMeta {
-  return (
-    KIMI_INTERFACE_TYPES.find((meta) => meta.value === type) ??
-    KIMI_INTERFACE_TYPES[0]
-  )
-}
-
-/**
- * Region implied by an env-mode base URL: `.cn` → china, `.ai` or empty →
- * international, any other non-empty endpoint → custom (an OpenAI-compatible
- * third party such as DeepSeek / OpenRouter / a local server).
- */
-export function kimiEndpointRegionFromBaseUrl(
-  baseUrl: string
-): KimiEndpointRegion {
-  const raw = baseUrl.trim().toLowerCase()
-  if (!raw) return "international"
-  if (raw.includes("moonshot.cn")) return "china"
-  if (raw.includes("moonshot.ai")) return "international"
-  return "custom"
-}
-
-export function kimiBaseUrlForRegion(
-  region: KimiEndpointRegion,
-  customUrl: string
-): string {
-  if (region === "china") return KIMI_BASE_URL_CHINA
-  if (region === "custom") return customUrl.trim()
-  return KIMI_BASE_URL_INTERNATIONAL
-}
-
-/**
- * Mirror of the backend `load_kimi_code_config_json` projection. Keys are
- * deliberately NOT `apiKey` / `apiBaseUrl` / `model` / `env` so the projected
- * config.toml block never leaks back into the `KIMI_MODEL_*` runtime env.
- */
-export interface KimiManagedConfig {
-  interfaceType?: KimiInterfaceType
-  baseUrl?: string
-  key?: string
-  authType?: KimiNativeAuthType
-  modelId?: string
-  maxContextSize?: number
-  vertexProject?: string
-  vertexLocation?: string
-  hasManagedBlock?: boolean
-  /** Whether `kimi acp`'s session gate is satisfied (a token file is present). */
-  credentialPresent?: boolean
-  /** Whether that gate token is codeg's synthetic one (vs a real OAuth login). */
-  credentialSynthetic?: boolean
-  rawConfigToml?: string
-}
-
-export function parseKimiManagedConfig(
-  configJson: string | null | undefined
-): KimiManagedConfig {
-  if (!configJson || !configJson.trim()) return {}
-  try {
-    return JSON.parse(configJson) as KimiManagedConfig
-  } catch {
-    return {}
-  }
-}
-
-/**
- * Initial panel mode: the codeg-managed API-key block wins; otherwise, when a
- * real (non-synthetic) OAuth login is already present, show login; else default
- * to the API-key form.
- */
-export function kimiInitialMode(config: KimiManagedConfig): KimiAuthMode {
-  if (config.hasManagedBlock) return "apikey"
-  if (config.credentialPresent && !config.credentialSynthetic) return "login"
-  return "apikey"
-}
-
-/**
- * Settings panel for Kimi Code (Moonshot AI).
- *
- * `kimi acp` gates every session on a stored OAuth-style token and rejects API
- * keys on their own, so to support API-key users codeg manages BOTH a
- * `~/.kimi-code/config.toml` provider/model block (routing inference to the key)
- * AND a synthetic gate token under `credentials/` (so the session opens). The
- * panel keeps exactly one source authoritative (enforced server-side by
- * `acpUpdateKimiCodeConfig`):
- *   • apikey — write the codeg-managed config.toml block (any of the six
- *     interface types) + seed the gate token. The working path for a plain key.
- *   • login — clear the managed block + remove our synthetic token, so a real
- *     OAuth login (`kimi login`, needs a Kimi subscription) governs.
- * A `<details>` raw config.toml editor is the escape hatch. Initial state is
- * derived from the projected `agent.config_json`; it resets on remount when a
- * different agent is selected.
- */
-function KimiCodeConfigPanel({
-  agent,
-  onSaved,
-}: {
-  agent: AcpAgentInfo
-  onSaved: () => Promise<void>
-}) {
-  const t = useTranslations("AcpAgentSettings")
-  const config = useMemo(
-    () => parseKimiManagedConfig(agent.config_json),
-    [agent.config_json]
-  )
-
-  const [mode, setMode] = useState<KimiAuthMode>(() => kimiInitialMode(config))
-  const [saving, setSaving] = useState(false)
-  const [showKey, setShowKey] = useState(false)
-
-  // api-key mode (codeg-managed config.toml provider + model)
-  const [interfaceType, setInterfaceType] = useState<KimiInterfaceType>(
-    () => config.interfaceType ?? "kimi"
-  )
-  const [region, setRegion] = useState<KimiEndpointRegion>(() =>
-    kimiEndpointRegionFromBaseUrl(config.baseUrl ?? "")
-  )
-  // Editable base URL for kimi+custom and for non-kimi interface types.
-  const [baseUrl, setBaseUrl] = useState(
-    () =>
-      config.baseUrl ??
-      kimiInterfaceMeta(config.interfaceType ?? "kimi").defaultBaseUrl
-  )
-  const [authType, setAuthType] = useState<KimiNativeAuthType>(
-    () => config.authType ?? "api_key"
-  )
-  const [apiKey, setApiKey] = useState(() => config.key ?? "")
-  const [model, setModel] = useState(() => config.modelId ?? "")
-  const [maxContext, setMaxContext] = useState(() =>
-    config.maxContextSize ? String(config.maxContextSize) : ""
-  )
-  const [vertexProject, setVertexProject] = useState(
-    () => config.vertexProject ?? ""
-  )
-  const [vertexLocation, setVertexLocation] = useState(
-    () => config.vertexLocation ?? ""
-  )
-
-  // Models discovered via the provider's /models endpoint (doubles as a key test).
-  const [models, setModels] = useState<string[]>([])
-  const [fetchingModels, setFetchingModels] = useState(false)
-
-  // raw editor
-  const [rawConfig, setRawConfig] = useState(() => config.rawConfigToml ?? "")
-
-  const meta = kimiInterfaceMeta(interfaceType)
-  const isKimi = interfaceType === "kimi"
-  const isVertex = interfaceType === "vertexai"
-  // Resolved endpoint: kimi uses the region quick-select (custom falls back to
-  // the editable field); other interfaces use the editable field directly.
-  const effectiveBaseUrl = isKimi
-    ? kimiBaseUrlForRegion(region, baseUrl)
-    : baseUrl.trim()
-
-  const handleInterfaceChange = useCallback((value: string) => {
-    const next = value as KimiInterfaceType
-    setInterfaceType(next)
-    setModels([])
-    if (next === "kimi") {
-      setRegion("international")
-      setBaseUrl("")
-    } else {
-      // Pre-fill the documented default base URL for the new interface.
-      setBaseUrl(kimiInterfaceMeta(next).defaultBaseUrl)
-    }
-  }, [])
-
-  const runSave = useCallback(
-    async (params: Parameters<typeof acpUpdateKimiCodeConfig>[0]) => {
-      setSaving(true)
-      try {
-        await acpUpdateKimiCodeConfig(params)
-        await onSaved()
-        toast.success(t("toasts.kimiCodeSaved"))
-      } catch (error) {
-        console.error("[KimiCode] save config failed", error)
-        toast.error(t("toasts.saveKimiCodeFailed"))
-      } finally {
-        setSaving(false)
-      }
-    },
-    [onSaved, t]
-  )
-
-  const handleSave = useCallback(() => {
-    if (mode === "login") {
-      void runSave({ mode: "login" })
-      return
-    }
-    void runSave({
-      mode: "apikey",
-      interfaceType,
-      authType: meta.usesApiKey ? authType : null,
-      baseUrl: effectiveBaseUrl,
-      apiKey: meta.usesApiKey ? apiKey : null,
-      model,
-      maxContextSize: maxContext.trim() ? Number(maxContext) : null,
-      vertexProject: isVertex ? vertexProject : null,
-      vertexLocation: isVertex ? vertexLocation : null,
-    })
-  }, [
-    mode,
-    interfaceType,
-    meta,
-    authType,
-    effectiveBaseUrl,
-    apiKey,
-    model,
-    maxContext,
-    isVertex,
-    vertexProject,
-    vertexLocation,
-    runSave,
-  ])
-
-  const handleSaveRaw = useCallback(() => {
-    void runSave({ mode: "raw", rawConfigToml: rawConfig })
-  }, [rawConfig, runSave])
-
-  const handleFetchModels = useCallback(async () => {
-    const url = effectiveBaseUrl
-    const key = apiKey.trim()
-    if (!url || !key) {
-      toast.error(t("kimiCode.fetchModelsNeedsKey"))
-      return
-    }
-    setFetchingModels(true)
-    try {
-      const list = await acpFetchKimiModels({ baseUrl: url, apiKey: key })
-      setModels(list)
-      toast.success(
-        list.length
-          ? t("kimiCode.fetchModelsOk", { count: list.length })
-          : t("kimiCode.fetchModelsEmpty")
-      )
-    } catch (error) {
-      console.error("[KimiCode] fetch models failed", error)
-      toast.error(t("kimiCode.fetchModelsFailed"))
-    } finally {
-      setFetchingModels(false)
-    }
-  }, [effectiveBaseUrl, apiKey, t])
-
-  const keyToggle = (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      onClick={() => setShowKey((prev) => !prev)}
-      title={showKey ? t("actions.hideApiKey") : t("actions.showApiKey")}
-    >
-      {showKey ? (
-        <EyeOff className="h-3.5 w-3.5" />
-      ) : (
-        <Eye className="h-3.5 w-3.5" />
-      )}
-    </Button>
-  )
-
-  return (
-    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-      <div>
-        <label className="text-xs font-medium">
-          {t("kimiCode.configManagement")}
-        </label>
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          {t("kimiCode.configDescription")}
-        </p>
-      </div>
-
-      <div
-        className={cn(
-          "rounded-md border px-2.5 py-1.5 text-[11px]",
-          config.credentialPresent
-            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-            : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-        )}
-      >
-        {config.credentialPresent
-          ? mode === "login"
-            ? t("kimiCode.gateReadyLogin")
-            : t("kimiCode.gateReadyApiKey")
-          : t("kimiCode.gateNotReady")}
-      </div>
-
-      <div className="space-y-1.5">
-        <label className="text-[11px] text-muted-foreground">
-          {t("kimiCode.authModeLabel")}
-        </label>
-        <Select
-          value={mode}
-          onValueChange={(value) => setMode(value as KimiAuthMode)}
-          disabled={saving}
-        >
-          <SelectTrigger className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent align="start">
-            <SelectItem value="apikey">
-              {t("kimiCode.authModeApiKey")}
-            </SelectItem>
-            <SelectItem value="login">{t("kimiCode.authModeLogin")}</SelectItem>
-          </SelectContent>
-        </Select>
-        <p className="text-[11px] text-muted-foreground">
-          {t("kimiCode.authModeHint")}
-        </p>
-      </div>
-
-      {mode === "apikey" && (
-        <>
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.interfaceTypeLabel")}
-            </label>
-            <Select
-              value={interfaceType}
-              onValueChange={handleInterfaceChange}
-              disabled={saving}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="start">
-                {KIMI_INTERFACE_TYPES.map((it) => (
-                  <SelectItem key={it.value} value={it.value}>
-                    {it.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.interfaceTypeHint")}
-            </p>
-          </div>
-
-          {isKimi ? (
-            <div className="space-y-1.5">
-              <label className="text-[11px] text-muted-foreground">
-                {t("kimiCode.endpointLabel")}
-              </label>
-              <Select
-                value={region}
-                onValueChange={(value) =>
-                  setRegion(value as KimiEndpointRegion)
-                }
-                disabled={saving}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent align="start">
-                  <SelectItem value="international">
-                    {t("kimiCode.regionInternational")}
-                  </SelectItem>
-                  <SelectItem value="china">
-                    {t("kimiCode.regionChina")}
-                  </SelectItem>
-                  <SelectItem value="custom">
-                    {t("kimiCode.endpointCustom")}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              {region === "custom" && (
-                <Input
-                  value={baseUrl}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  placeholder="https://api.example.com/v1"
-                  disabled={saving}
-                />
-              )}
-              <p className="text-[11px] text-muted-foreground">
-                {t("kimiCode.endpointHint")}
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-1.5">
-              <label className="text-[11px] text-muted-foreground">
-                {t("kimiCode.baseUrlLabel")}
-              </label>
-              <Input
-                value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
-                placeholder="https://api.example.com/v1"
-                disabled={saving}
-              />
-              <p className="text-[11px] text-muted-foreground">
-                {t("kimiCode.baseUrlHint")}
-              </p>
-            </div>
-          )}
-
-          {meta.usesApiKey ? (
-            <>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.apiKeyLabel")}
-                </label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    type={showKey ? "text" : "password"}
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder="sk-..."
-                    disabled={saving}
-                  />
-                  {keyToggle}
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.apiKeyHint")}
-                </p>
-              </div>
-
-              <details className="rounded-md border bg-background/40 p-2">
-                <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-                  {t("kimiCode.authTypeLabel")}
-                </summary>
-                <div className="mt-2 space-y-1.5">
-                  <Select
-                    value={authType}
-                    onValueChange={(value) =>
-                      setAuthType(value as KimiNativeAuthType)
-                    }
-                    disabled={saving}
-                  >
-                    <SelectTrigger className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent align="start">
-                      <SelectItem value="api_key">
-                        {t("kimiCode.authTypeApiKey")}
-                      </SelectItem>
-                      <SelectItem value="env">
-                        {t("kimiCode.authTypeEnv")}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-[11px] text-muted-foreground">
-                    {t("kimiCode.authTypeHint")}
-                  </p>
-                </div>
-              </details>
-            </>
-          ) : (
-            <>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexProjectLabel")}
-                </label>
-                <Input
-                  value={vertexProject}
-                  onChange={(event) => setVertexProject(event.target.value)}
-                  placeholder="my-gcp-project"
-                  disabled={saving}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexLocationLabel")}
-                </label>
-                <Input
-                  value={vertexLocation}
-                  onChange={(event) => setVertexLocation(event.target.value)}
-                  placeholder="us-central1"
-                  disabled={saving}
-                />
-                <p className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexHint")}
-                </p>
-              </div>
-            </>
-          )}
-
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.modelLabel")}
-            </label>
-            <div className="flex items-center gap-2">
-              <Input
-                list="kimi-model-options"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                placeholder={KIMI_MODEL_PLACEHOLDER}
-                disabled={saving}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => void handleFetchModels()}
-                disabled={saving || fetchingModels}
-                className="shrink-0 gap-1.5"
-              >
-                {fetchingModels ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" />
-                )}
-                {t("kimiCode.fetchModels")}
-              </Button>
-            </div>
-            {models.length > 0 && (
-              <datalist id="kimi-model-options">
-                {models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-            )}
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.modelHint")}
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.maxContextLabel")}
-            </label>
-            <Input
-              type="number"
-              value={maxContext}
-              onChange={(event) => setMaxContext(event.target.value)}
-              placeholder="262144"
-              disabled={saving}
-            />
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.maxContextHint")}
-            </p>
-          </div>
-        </>
-      )}
-
-      {mode === "login" && (
-        <p className="text-[11px] text-muted-foreground">
-          {t("kimiCode.loginHint")}
-        </p>
-      )}
-
-      <div className="flex justify-end">
-        <Button
-          type="button"
-          size="sm"
-          onClick={handleSave}
-          disabled={saving}
-          className="gap-1.5"
-        >
-          {saving ? (
-            <>
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {t("actions.saving")}
-            </>
-          ) : (
-            <>
-              <Save className="h-3.5 w-3.5" />
-              {t("actions.saveKimiCodeConfig")}
-            </>
-          )}
-        </Button>
-      </div>
-
-      <details className="rounded-md border bg-background/40 p-2">
-        <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-          {t("kimiCode.rawEditorLabel")}
-        </summary>
-        <div className="mt-2 space-y-1.5">
-          <Textarea
-            value={rawConfig}
-            onChange={(event) => setRawConfig(event.target.value)}
-            placeholder={t("kimiCode.rawEditorPlaceholder")}
-            className="min-h-[140px] font-mono text-[11px]"
-            disabled={saving}
-          />
-          <p className="text-[11px] text-muted-foreground">
-            {t("kimiCode.rawEditorHint")}
-          </p>
-          <div className="flex justify-end">
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={handleSaveRaw}
-              disabled={saving}
-              className="gap-1.5"
-            >
-              {saving ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  {t("actions.saving")}
-                </>
-              ) : (
-                <>
-                  <Save className="h-3.5 w-3.5" />
-                  {t("actions.saveKimiCodeRawConfig")}
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
-      </details>
-    </div>
-  )
-}
-
 export function AcpAgentSettings() {
   const locale = useLocale()
   const t = useTranslations("AcpAgentSettings")
@@ -4300,6 +3691,14 @@ export function AcpAgentSettings() {
   const codexCliRuntimeDefault = codexCliRuntimeDefaultOn()
   const [agents, setAgents] = useState<AcpAgentInfo[]>([])
   const [loadingAgents, setLoadingAgents] = useState(true)
+  const [addCustomOpen, setAddCustomOpen] = useState(false)
+  // Registry id of the custom agent being edited; non-null renders the edit
+  // instance of the add dialog (its own instance so the two flows never share
+  // form state).
+  const [editCustomAgentId, setEditCustomAgentId] = useState<string | null>(
+    null
+  )
+  const [removingCustomAgent, setRemovingCustomAgent] = useState(false)
   const [loadingError, setLoadingError] = useState<string | null>(null)
   const [checkState, setCheckState] = useState<
     Partial<Record<AgentType, AgentCheckState>>
@@ -4321,6 +3720,8 @@ export function AcpAgentSettings() {
   >({})
   const [modelProviders, setModelProviders] = useState<ModelProviderInfo[]>([])
   const [uninstallConfirmAgent, setUninstallConfirmAgent] =
+    useState<AcpAgentInfo | null>(null)
+  const [removeConfirmAgent, setRemoveConfirmAgent] =
     useState<AcpAgentInfo | null>(null)
   const [customInstallAgent, setCustomInstallAgent] =
     useState<AcpAgentInfo | null>(null)
@@ -4438,6 +3839,7 @@ export function AcpAgentSettings() {
         listModelProviders().catch(() => [] as ModelProviderInfo[]),
       ])
       setAgents(next)
+      publishAgentDisplay(next)
       setModelProviders(providers)
       setDrafts((prev) => {
         const updated = { ...prev }
@@ -4821,6 +4223,7 @@ export function AcpAgentSettings() {
     try {
       const fresh = await acpListAgents()
       setAgents(fresh)
+      publishAgentDisplay(fresh)
       const grok = fresh.find((a) => a.agent_type === "grok")
       if (grok) {
         setDrafts((prev) => ({ ...prev, grok: buildAgentDraft(grok) }))
@@ -5047,6 +4450,34 @@ export function AcpAgentSettings() {
     [runPreflight, t, installStream.start]
   )
 
+  /**
+   * Remove a custom agent's definition. Recorded transcripts are kept — the
+   * conversations that reference this agent are still readable afterwards,
+   * they just cannot be resumed. Deleting them is a separate, explicit action.
+   *
+   * Confirmation happens in the `removeConfirmAgent` AlertDialog, never via
+   * `window.confirm`: the Tauri webview does not reliably block on the native
+   * prompt, so the deletion used to run before the user answered.
+   */
+  const handleRemoveCustomAgent = useCallback(
+    async (agent: AcpAgentInfo) => {
+      const id = customAgentId(agent.agent_type)
+      if (!id) return
+      setRemovingCustomAgent(true)
+      try {
+        await acpDeleteCustomAgent(id, false)
+        toast.success(t("customAgentRemoved", { name: agent.name }))
+        setSelectedAgentType(null)
+        await refreshAgents()
+      } catch (err) {
+        toast.error(toErrorMessage(err))
+      } finally {
+        setRemovingCustomAgent(false)
+      }
+    },
+    [refreshAgents, t]
+  )
+
   const runUninstallAction = useCallback(
     async (agent: AcpAgentInfo) => {
       if (busyActionRef.current.has(agent.agent_type)) return
@@ -5190,6 +4621,18 @@ export function AcpAgentSettings() {
     await runPreflight(agent.agent_type)
   }
 
+  const confirmRemoveCustomAgent = useCallback(() => {
+    if (!removeConfirmAgent) return
+    const target = removeConfirmAgent
+    handleRemoveCustomAgent(target)
+      .catch((err) => {
+        console.error("[Settings] remove custom agent failed:", err)
+      })
+      .finally(() => {
+        setRemoveConfirmAgent(null)
+      })
+  }, [handleRemoveCustomAgent, removeConfirmAgent])
+
   const confirmUninstall = useCallback(() => {
     if (!uninstallConfirmAgent) return
     const target = uninstallConfirmAgent
@@ -5261,6 +4704,13 @@ export function AcpAgentSettings() {
     []
   )
 
+  // One package operation at a time across ALL agents: while any
+  // install/upgrade/uninstall runs, every agent's package-action buttons are
+  // disabled — the busy flag is keyed per agent, so without this, selecting
+  // another agent in the list offers a second, concurrent install. The
+  // spinner stays precise via the per-agent `runningActionKind`.
+  const anyBinaryActionBusy = Object.values(busyBinaryAction).some(Boolean)
+
   const renderCheck = (agent: AcpAgentInfo, check: UiCheckItem) => {
     const checkKey = `${agent.agent_type}:${check.check_id}`
     const expanded = expandedChecks[checkKey] ?? check.status !== "pass"
@@ -5302,55 +4752,62 @@ export function AcpAgentSettings() {
             </div>
             {check.fixes.length > 0 && (
               <div className="flex flex-wrap gap-1.5 justify-end max-w-[220px] shrink-0">
-                {check.fixes.map((fix, index) => (
-                  <Button
-                    key={`${fix.label}-${index}`}
-                    size="xs"
-                    variant="outline"
-                    className="h-6 bg-muted/30 hover:bg-muted/50 disabled:bg-muted/30 disabled:opacity-100"
-                    disabled={
-                      ("disabled" in fix && fix.disabled === true) ||
-                      (Boolean(busyBinaryAction[agent.agent_type]) &&
-                        [
-                          "download_binary",
-                          "upgrade_binary",
-                          "install_npx",
-                          "upgrade_npx",
-                          "uninstall_binary",
-                          "uninstall_npx",
-                          "redownload_binary",
-                          "install_opencode_plugins",
-                          "custom_install",
-                          "install_uv",
-                        ].includes(fix.kind))
-                    }
-                    onClick={() => {
-                      handleFixAction(agent, fix).catch((err) => {
-                        console.error("[Settings] fix action failed:", err)
-                      })
-                    }}
-                  >
-                    {runningActionKind[agent.agent_type] === fix.kind ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : fix.kind === "download_binary" ||
-                      fix.kind === "install_npx" ||
-                      fix.kind === "install_uv" ? (
-                      <Download className="h-3 w-3" />
-                    ) : fix.kind === "upgrade_binary" ||
-                      fix.kind === "upgrade_npx" ||
-                      fix.kind === "redownload_binary" ? (
-                      <Wrench className="h-3 w-3" />
-                    ) : fix.kind === "uninstall_binary" ||
-                      fix.kind === "uninstall_npx" ? (
-                      <Trash2 className="h-3 w-3" />
-                    ) : fix.kind === "install_opencode_plugins" ? (
-                      <Download className="h-3 w-3" />
-                    ) : fix.kind === "custom_install" ? (
-                      <PackagePlus className="h-3 w-3" />
-                    ) : null}
-                    {fix.label}
-                  </Button>
-                ))}
+                {check.fixes.map((fix, index) => {
+                  const busyGated =
+                    anyBinaryActionBusy &&
+                    PACKAGE_ACTION_FIX_KINDS.includes(fix.kind)
+                  const running =
+                    runningActionKind[agent.agent_type] === fix.kind
+                  return (
+                    <Button
+                      key={`${fix.label}-${index}`}
+                      size="xs"
+                      variant="outline"
+                      className={cn(
+                        "h-6 bg-muted/30 hover:bg-muted/50",
+                        // Two disabled looks: while the global one-package-op-
+                        // at-a-time gate is busy, every parked package action
+                        // dims (backend-disabled or not) so the lockout shows
+                        // on agents other than the busy one; only the button
+                        // showing the spinner, and — when the gate is idle — a
+                        // backend-declared inapplicable fix, keep the full-
+                        // opacity chip look.
+                        busyGated && !running
+                          ? "disabled:opacity-50"
+                          : "disabled:bg-muted/30 disabled:opacity-100"
+                      )}
+                      disabled={
+                        ("disabled" in fix && fix.disabled === true) ||
+                        busyGated
+                      }
+                      onClick={() => {
+                        handleFixAction(agent, fix).catch((err) => {
+                          console.error("[Settings] fix action failed:", err)
+                        })
+                      }}
+                    >
+                      {runningActionKind[agent.agent_type] === fix.kind ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : fix.kind === "download_binary" ||
+                        fix.kind === "install_npx" ||
+                        fix.kind === "install_uv" ? (
+                        <Download className="h-3 w-3" />
+                      ) : fix.kind === "upgrade_binary" ||
+                        fix.kind === "upgrade_npx" ||
+                        fix.kind === "redownload_binary" ? (
+                        <Wrench className="h-3 w-3" />
+                      ) : fix.kind === "uninstall_binary" ||
+                        fix.kind === "uninstall_npx" ? (
+                        <Trash2 className="h-3 w-3" />
+                      ) : fix.kind === "install_opencode_plugins" ? (
+                        <Download className="h-3 w-3" />
+                      ) : fix.kind === "custom_install" ? (
+                        <PackagePlus className="h-3 w-3" />
+                      ) : null}
+                      {fix.label}
+                    </Button>
+                  )
+                })}
               </div>
             )}
           </div>
@@ -7507,7 +6964,35 @@ export function AcpAgentSettings() {
             {t("description")}
           </p>
         </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 text-xs shrink-0"
+          onClick={() => setAddCustomOpen(true)}
+        >
+          <Plus className="h-3.5 w-3.5 mr-1" />
+          {t("addCustomAgent")}
+        </Button>
       </div>
+
+      <AddCustomAgentDialog
+        open={addCustomOpen}
+        onOpenChange={setAddCustomOpen}
+        onAdded={() => void refreshAgents()}
+      />
+
+      {/* Keyed by the id so switching agents never leaks a previous form. */}
+      {editCustomAgentId !== null && (
+        <AddCustomAgentDialog
+          key={editCustomAgentId}
+          open
+          editRegistryId={editCustomAgentId}
+          onOpenChange={(next) => {
+            if (!next) setEditCustomAgentId(null)
+          }}
+          onAdded={() => void refreshAgents()}
+        />
+      )}
 
       {loadingError && (
         <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
@@ -7675,7 +7160,16 @@ export function AcpAgentSettings() {
                     <Badge variant="outline" className="shrink-0">
                       {selectedAgent.distribution_type}
                     </Badge>
+                    {isCustomAgentType(selectedAgent.agent_type) && (
+                      <Badge variant="secondary" className="shrink-0">
+                        {t("customAgentBadge")}
+                      </Badge>
+                    )}
                   </div>
+                  {/* Removing a custom agent lives in the danger row at the
+                      bottom of the panel, not here: this line already carries
+                      the name, the distribution badge, the Custom badge and
+                      the enable switch. */}
                   <div className="flex items-center gap-2 shrink-0">
                     <button
                       type="button"
@@ -10777,6 +10271,66 @@ supports_websockets = true`}
                       </Button>
                     </div>
                   </div>
+                ) : isCustomAgentType(selectedAgent.agent_type) ? (
+                  // A custom agent is driven purely by the ACP protocol: codeg
+                  // knows nothing about its config file layout or auth model,
+                  // so the generic "config management" editor below would be
+                  // offering to write a file that may not exist in a format it
+                  // cannot know. Environment variables (above) are the one
+                  // channel that works for every agent, so they are the whole
+                  // surface — plus the skills declaration and removing the
+                  // agent.
+                  <>
+                    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
+                      <div>
+                        <label className="text-xs font-medium">
+                          {t("customAgentEdit")}
+                        </label>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {t("customAgentEditHint")}
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setEditCustomAgentId(
+                            customAgentId(selectedAgent.agent_type)
+                          )
+                        }
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        {t("customAgentEdit")}
+                      </Button>
+                    </div>
+                    <CustomAgentSkillsToggle
+                      registryId={customAgentId(selectedAgent.agent_type) ?? ""}
+                    />
+                    <div className="space-y-3 rounded-md border border-destructive/30 bg-destructive/5 p-3">
+                      <div>
+                        <label className="text-xs font-medium text-destructive">
+                          {t("customAgentRemove")}
+                        </label>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {t("customAgentRemoveHint")}
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-destructive hover:text-destructive"
+                        disabled={removingCustomAgent}
+                        onClick={() => setRemoveConfirmAgent(selectedAgent)}
+                      >
+                        {removingCustomAgent ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                        {t("customAgentRemove")}
+                      </Button>
+                    </div>
+                  </>
                 ) : (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
@@ -11471,6 +11025,41 @@ supports_websockets = true`}
                   {t("actions.confirmUninstall")}
                 </>
               )}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={Boolean(removeConfirmAgent)}
+        onOpenChange={(open) => {
+          if (!open) setRemoveConfirmAgent(null)
+        }}
+      >
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("customAgentRemove")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("customAgentRemoveConfirm", {
+                name: removeConfirmAgent?.name ?? "Agent",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={removingCustomAgent}>
+              {t("actions.cancel")}
+            </AlertDialogCancel>
+            <Button
+              variant="destructive"
+              onClick={confirmRemoveCustomAgent}
+              disabled={removingCustomAgent}
+            >
+              {removingCustomAgent ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              {t("customAgentRemove")}
             </Button>
           </AlertDialogFooter>
         </AlertDialogContent>

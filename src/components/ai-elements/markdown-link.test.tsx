@@ -9,13 +9,19 @@ const mocks = vi.hoisted(() => ({
   ),
 }))
 
-vi.mock("./link-safety", () => ({
-  useStreamdownLinkSafety: () => ({
-    enabled: true,
-    onLinkCheck: mocks.onLinkCheck,
-    renderModal: mocks.renderModal,
-  }),
-}))
+vi.mock("./link-safety", async (importOriginal) => {
+  // Only the streamdown hook is stubbed — `parseLocalFileTarget` stays real, so
+  // the file badge's hover-actions anchor wraps it exactly as it would in the app.
+  const actual = await importOriginal<typeof import("./link-safety")>()
+  return {
+    ...actual,
+    useStreamdownLinkSafety: () => ({
+      enabled: true,
+      onLinkCheck: mocks.onLinkCheck,
+      renderModal: mocks.renderModal,
+    }),
+  }
+})
 
 import { MarkdownLink } from "./markdown-link"
 
@@ -168,6 +174,22 @@ describe("MarkdownLink", () => {
       const badge = screen.getByRole("img", { name: "file: app.ts" })
       expect(badge).toHaveAttribute("data-reference-badge")
       expect(badge).toHaveAttribute("data-ref-type", "file")
+    })
+
+    it("wraps the badge in the hover anchor that pops its file actions", () => {
+      const { container } = render(
+        <MarkdownLink href="file:///repo/app.ts">app.ts</MarkdownLink>
+      )
+      const hoverAnchor = container.querySelector("[data-file-actions]")
+      expect(hoverAnchor).not.toBeNull()
+      expect(hoverAnchor?.contains(screen.getByRole("button"))).toBe(true)
+    })
+
+    it("adds no hover anchor to a web link", () => {
+      const { container } = render(
+        <MarkdownLink href="https://example.com">docs</MarkdownLink>
+      )
+      expect(container.querySelector("[data-file-actions]")).toBeNull()
     })
 
     it("routes a file badge click through the link-safety modal hook", async () => {

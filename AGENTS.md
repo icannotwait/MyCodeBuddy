@@ -119,3 +119,29 @@ INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 - ESLint：next/core-web-vitals + typescript + prettier
 - TypeScript：strict 模式，启用 `noUnusedLocals` 和 `noUnusedParameters`
 - Rust：2021 edition，使用 `thiserror` 定义错误类型
+
+## 长命令与 wait 策略（Codex code-mode）
+
+后台 `exec` / `wait` 在命令未结束时会把控制权交回模型；每次短轮询都会带着
+完整上下文再唤醒一轮 LLM。空输出不等于卡住——`cargo test` 等常在结束前几乎
+无增量输出。
+
+### 必须遵守
+
+- 优先使用默认：`yield_time_ms` **默认 20000**；够用时不要显式传更小值。
+- 长任务用**一次较长 wait**，禁止高频短轮询：
+  - `cargo build` / `cargo test` / `cargo clippy` / 全量套件：**30000–60000**
+  - `pnpm test` / `pnpm build` / 大体量安装：**30000–60000**
+  - 未知长命令：至少 **20000**，优先 **30000**
+- **禁止**用 `yield_time_ms=1000`（或任何小于 **10000** 的值）去轮询编译/测试，
+  除非命令本身预期数秒内结束且需要近实时输出。
+- 仍在 running 时再次 wait，应保持**相同或更大**的 `yield_time_ms`，不要降到 1s。
+
+### 实操建议
+
+1. 冷编译场景先做小范围 `cargo check` / 定向编译，再跑长测试。
+2. 优先窄过滤器（单测 / `--exact` / 模块级 filter），尽量落在首段 yield 窗口内完成。
+3. 仅在要主动取消 cell 时使用 `terminate: true`。
+
+说明：Codex 对 code-mode `wait` **不走 PreToolUse 改写**（源码 opt-out），因此
+本策略是避免 1s 高频唤醒的软约束，无法被 hook 硬拦截。

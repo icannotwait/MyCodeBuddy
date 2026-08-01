@@ -22,6 +22,7 @@ import {
   ALL_AGENT_TYPES,
   type AgentType,
   type AttentionRequestSummary,
+  type BuiltinAgentType,
   type CardSummary,
   type DelegationRunSnapshot,
   type DelegationRuntimeStats,
@@ -139,6 +140,24 @@ export function isTickerEligible(
   )
 }
 
+/**
+ * Live bindings are indexed by parent tool-use id, but `useDelegatedSubSession`
+ * may also surface a later continue on the **same child conversation**. Multi-
+ * turn cards must only adopt a binding that belongs to this exact turn so
+ * card_summary / lifecycle / stats (Critical·Important·…) never bleed across
+ * generations.
+ */
+export function scopeDelegationBindingForCard(
+  binding: DelegationBinding | undefined,
+  parentToolUseId: string,
+  knownTaskId: string | null
+): DelegationBinding | undefined {
+  if (!binding) return undefined
+  if (binding.parentToolUseId !== parentToolUseId) return undefined
+  if (knownTaskId && binding.taskId !== knownTaskId) return undefined
+  return binding
+}
+
 function lifecycleFromProjection(
   projection: ChildCardProjection
 ): DelegationLifecycleStatus | null {
@@ -183,10 +202,18 @@ function cardStatusFromLifecycle(
   }
 }
 
+const BUILTIN_AGENT_TYPE_IDS = new Set<string>(ALL_AGENT_TYPES)
+
+function isBuiltinAgentType(
+  agentType: AgentType
+): agentType is BuiltinAgentType {
+  return BUILTIN_AGENT_TYPE_IDS.has(agentType)
+}
+
 function agentTypeFromRunSnapshot(
   snapshot: DelegationRunSnapshot | null
 ): AgentType | null {
-  if (!snapshot || !ALL_AGENT_TYPES.includes(snapshot.agent_type)) return null
+  if (!snapshot || !isBuiltinAgentType(snapshot.agent_type)) return null
   return snapshot.agent_type
 }
 
@@ -885,14 +912,25 @@ export function useDelegationCardModel(
       toolOutput?.childConversationId ??
       null)
 
+  // Source-local task id before live binding (may be contaminated by a later
+  // continue on the shared child). Used to scope binding + snapshot fetch.
+  const sourceTaskId = parsedMeta?.taskId ?? displayTaskId
+
   // `enabled: false` — the model never fetches the child's persisted detail
   // here; cold title/stats come from `delegationChildProjectionCache`.
-  const { binding } = useDelegatedSubSession(parentToolUseId, {
+  // Still pass fallbackChildConversationId for the hook's internal child id
+  // resolution path, but discard any binding that is not this exact turn.
+  const { binding: rawBinding } = useDelegatedSubSession(parentToolUseId, {
     enabled: false,
     fallbackChildConversationId,
   })
+  const binding = scopeDelegationBindingForCard(
+    rawBinding,
+    parentToolUseId,
+    sourceTaskId
+  )
 
-  const snapshotTaskId = binding?.taskId ?? parsedMeta?.taskId ?? displayTaskId
+  const snapshotTaskId = binding?.taskId ?? sourceTaskId
   const runSnapshot = useDelegationRunSnapshot(
     parentConversationId,
     snapshotTaskId

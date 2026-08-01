@@ -1885,6 +1885,146 @@ describe("buildStreamingTurnsFromLiveMessage — orphan status provenance", () =
   })
 })
 
+describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (claude-agent-acp ≥0.63)", () => {
+  function toolInfo(overrides: Partial<ToolCallInfo> = {}): ToolCallInfo {
+    return {
+      tool_call_id: "toolu_x",
+      title: "Bash",
+      kind: "execute",
+      status: "in_progress",
+      content: null,
+      raw_input: null,
+      raw_output_chunks: [],
+      raw_output_total_bytes: 0,
+      locations: null,
+      meta: null,
+      images: [],
+      ...overrides,
+    }
+  }
+  const agentCall = (id: string): LiveContentBlock => ({
+    type: "tool_call",
+    info: toolInfo({ tool_call_id: id, title: "Agent", kind: "other" }),
+  })
+  const build = (
+    content: LiveContentBlock[],
+    opts?: { attachAgentTranscripts?: boolean }
+  ) =>
+    buildStreamingTurnsFromLiveMessage(
+      1,
+      { id: "lm-sub", role: "assistant", startedAt: 0, content },
+      opts
+    )
+
+  it("routes parented text/thinking out of the main thread and attaches them in order", () => {
+    const result = build([
+      agentCall("toolu_agent"),
+      { type: "thinking", text: "planning", parentToolUseId: "toolu_agent" },
+      { type: "text", text: "found it", parentToolUseId: "toolu_agent" },
+    ])
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    // No main-thread text/thinking leaked.
+    expect(blocks.some((b) => b.type === "text" || b.type === "thinking")).toBe(
+      false
+    )
+    const carrier = blocks.find((b) => b.type === "tool_result")
+    expect(
+      carrier?.type === "tool_result" ? carrier.agent_transcript : null
+    ).toEqual([
+      { type: "thinking", text: "planning" },
+      { type: "text", text: "found it" },
+    ])
+    // The carrier keeps the card in its running state.
+    expect(result.inProgressToolCallIds.has("toolu_agent")).toBe(true)
+  })
+
+  it("does not split a new turn group on parented text after a completed tool", () => {
+    const result = build([
+      {
+        type: "tool_call",
+        info: toolInfo({ tool_call_id: "toolu_done", status: "completed" }),
+      },
+      agentCall("toolu_agent"),
+      { type: "text", text: "sub prose", parentToolUseId: "toolu_agent" },
+    ])
+    expect(result.turns).toHaveLength(1)
+  })
+
+  it("keeps positional child capture alive across parented blocks", () => {
+    // Agent (in progress) → subagent text → child tool call WITHOUT explicit
+    // parent meta: the positional fallback must still nest the child.
+    const result = build([
+      agentCall("toolu_agent"),
+      { type: "text", text: "sub prose", parentToolUseId: "toolu_agent" },
+      {
+        type: "tool_call",
+        info: toolInfo({ tool_call_id: "toolu_child", title: "Read" }),
+      },
+    ])
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    // The child folded into the agent card (no standalone tool_use for it).
+    const standalone = blocks.filter(
+      (b) => b.type === "tool_use" && b.tool_use_id === "toolu_child"
+    )
+    expect(standalone).toHaveLength(0)
+    const carrier = blocks.find((b) => b.type === "tool_result")
+    expect(
+      carrier?.type === "tool_result"
+        ? (carrier.agent_stats?.tool_calls ?? []).map((c) => c.tool_name)
+        : []
+    ).toEqual(["read"])
+  })
+
+  it("emits the carrier block for a text-only subagent (no child tools yet)", () => {
+    const result = build([
+      agentCall("toolu_agent"),
+      { type: "text", text: "just prose", parentToolUseId: "toolu_agent" },
+    ])
+    const carrier = result.turns
+      .flatMap((t) => t.blocks)
+      .find((b) => b.type === "tool_result")
+    expect(carrier).toBeDefined()
+    expect(
+      carrier?.type === "tool_result" ? carrier.agent_transcript : null
+    ).toEqual([{ type: "text", text: "just prose" }])
+  })
+
+  it("attachAgentTranscripts:false (promotion) routes blocks out but attaches nothing", () => {
+    const result = build(
+      [
+        agentCall("toolu_agent"),
+        { type: "text", text: "sub prose", parentToolUseId: "toolu_agent" },
+      ],
+      { attachAgentTranscripts: false }
+    )
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    expect(blocks.some((b) => b.type === "text")).toBe(false)
+    for (const b of blocks) {
+      if (b.type === "tool_result") {
+        expect(b.agent_transcript).toBeUndefined()
+      }
+    }
+  })
+
+  it("drops a parented block whose parent is not a classified agent", () => {
+    const result = build([
+      {
+        type: "tool_call",
+        info: toolInfo({ tool_call_id: "toolu_bash" }),
+      },
+      { type: "text", text: "stray", parentToolUseId: "toolu_bash" },
+      { type: "text", text: "stray2", parentToolUseId: "toolu_gone" },
+    ])
+    const blocks = result.turns.flatMap((t) => t.blocks)
+    expect(blocks.some((b) => b.type === "text")).toBe(false)
+    for (const b of blocks) {
+      if (b.type === "tool_result") {
+        expect(b.agent_transcript).toBeUndefined()
+      }
+    }
+  })
+})
+
 describe("buildStreamingTurnsFromLiveMessage — Kimi TodoList suppression", () => {
   function kimiToolCall(
     rawInput: string | null,
@@ -2156,5 +2296,84 @@ describe("buildStreamingTurnsFromLiveMessage — cursor task title folding", () 
       cursorTaskCall(claude, "Task: something else"),
     ])
     expect(input).toBe(claude)
+  })
+})
+
+describe("buildStreamingTurnsFromLiveMessage — codex search/list-files command actions", () => {
+  // codex-acp announces a search-classified shell command with kind="search", a
+  // human title, and NO raw_input / locations (createCommandActionEvent), then
+  // completes it with rawOutput `{formatted_output, exit_code}`. The query and
+  // path exist nowhere but the title, so the store has to recover them — without
+  // that the card's "tool name" was the whole title (wrench icon, "other" group
+  // tally) and its body dumped the raw envelope as JSON.
+  function build(title: string, kind: string, output: string) {
+    return buildStreamingTurnsFromLiveMessage(1, {
+      id: "lm-search",
+      role: "assistant",
+      startedAt: 0,
+      content: [
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "tc-search",
+            title,
+            kind,
+            status: "completed",
+            content: null,
+            raw_input: null,
+            raw_output_chunks: [output],
+            raw_output_total_bytes: output.length,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+    }).turns.flatMap((t) => t.blocks)
+  }
+
+  it("classifies a search command action as grep with a synthesized pattern/path", () => {
+    const blocks = build(
+      "Search for 'Tests run:' in com.forwayaudio.app",
+      "search",
+      JSON.stringify({ exit_code: 0, formatted_output: "Foo.java:42:hit" })
+    )
+
+    const toolUse = blocks.find((b) => b.type === "tool_use")
+    expect(toolUse?.type === "tool_use" ? toolUse.tool_name : null).toBe("grep")
+    expect(
+      JSON.parse(
+        (toolUse?.type === "tool_use" ? toolUse.input_preview : null) ?? "null"
+      )
+    ).toEqual({ pattern: "Tests run:", path: "com.forwayaudio.app" })
+  })
+
+  it("classifies a list-files command action as glob with a synthesized path", () => {
+    const blocks = build(
+      "List files in 'src/components'",
+      "read",
+      JSON.stringify({ exit_code: 0, formatted_output: "src/components/a.tsx" })
+    )
+
+    const toolUse = blocks.find((b) => b.type === "tool_use")
+    expect(toolUse?.type === "tool_use" ? toolUse.tool_name : null).toBe("glob")
+    expect(
+      JSON.parse(
+        (toolUse?.type === "tool_use" ? toolUse.input_preview : null) ?? "null"
+      )
+    ).toEqual({ path: "src/components" })
+  })
+
+  it("keeps the raw envelope on the result block for the renderer to unwrap", () => {
+    const output = JSON.stringify({
+      exit_code: 1,
+      formatted_output: "",
+    })
+    const blocks = build("Search for 'nothing'", "search", output)
+
+    const result = blocks.find((b) => b.type === "tool_result")
+    expect(result?.type === "tool_result" ? result.output_preview : null).toBe(
+      output
+    )
   })
 })

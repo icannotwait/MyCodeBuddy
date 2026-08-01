@@ -198,6 +198,9 @@ pub fn build_delegation_stack(
         as Arc<dyn DelegationTaskStore>;
     let attention_store = Arc::new(DbDelegationAttentionStore::new(db_arc.clone()))
         as Arc<dyn DelegationAttentionStore>;
+    let agent_availability =
+        Arc::new(crate::acp::connection::DbAgentAvailabilityLookup { db: db_arc.clone() })
+            as Arc<dyn crate::acp::connection::AgentAvailabilityLookup>;
     let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
         manager: cm_arc.clone(),
@@ -255,6 +258,7 @@ pub fn build_delegation_stack(
         tokens: tokens.clone(),
         leases: leases.clone(),
         socket_path: socket_path.clone(),
+        agent_availability,
         feedback: feedback.clone(),
         ask: ask.clone(),
         sessions: sessions.clone(),

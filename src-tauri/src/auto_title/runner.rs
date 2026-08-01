@@ -558,7 +558,7 @@ async fn collect_title_output(
                 match msg {
                     Ok(envelope) => {
                         match &envelope.payload {
-                            AcpEvent::ContentDelta { text } => {
+                            AcpEvent::ContentDelta { text, .. } => {
                                 buf.push_str(text);
                             }
                             AcpEvent::TurnAttemptRollback { .. } => {
@@ -1139,7 +1139,12 @@ mod tests {
                                 .unwrap()
                                 .clone()
                                 .unwrap_or_else(|| "default title".into());
-                            agent.emit(AcpEvent::ContentDelta { text }).await;
+                            agent
+                                .emit(AcpEvent::ContentDelta {
+                                    text,
+                                    parent_tool_use_id: None,
+                                })
+                                .await;
                             agent
                                 .emit(AcpEvent::TurnComplete {
                                     session_id: agent.external_id.clone(),
@@ -1193,6 +1198,7 @@ mod tests {
                             agent
                                 .emit(AcpEvent::ContentDelta {
                                     text: "   \n\t  ".into(),
+                                    parent_tool_use_id: None,
                                 })
                                 .await;
                             agent
@@ -2180,12 +2186,14 @@ mod tests {
             1,
             AcpEvent::ContentDelta {
                 text: "partial-title".into(),
+                parent_tool_use_id: None,
             },
         ));
         let _ = tx.send(make(
             2,
             AcpEvent::ContentDelta {
                 text: "more".into(),
+                parent_tool_use_id: None,
             },
         ));
         let _ = tx.send(make(
@@ -2226,14 +2234,21 @@ mod tests {
             })
         };
 
-        tx.send(event(1, AcpEvent::ContentDelta { text: "old".into() }))
-            .unwrap();
+        tx.send(event(
+            1,
+            AcpEvent::ContentDelta {
+                text: "old".into(),
+                parent_tool_use_id: None,
+            },
+        ))
+        .unwrap();
         tx.send(event(2, AcpEvent::TurnAttemptRollback { attempt: 1 }))
             .unwrap();
         tx.send(event(
             3,
             AcpEvent::ContentDelta {
                 text: "accepted".into(),
+                parent_tool_use_id: None,
             },
         ))
         .unwrap();

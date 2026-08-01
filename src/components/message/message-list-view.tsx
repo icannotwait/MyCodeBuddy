@@ -62,7 +62,7 @@ import {
   deriveNativeActivitiesFromToolCalls,
 } from "@/lib/delegation-activity"
 import { projectDelegationTranscript } from "@/lib/delegation-transcript-projection"
-import { filterDelegatedInterruptParts } from "@/lib/delegation-conversation-interrupted"
+import { filterConversationInterruptedParts } from "@/lib/delegation-conversation-interrupted"
 import type { DelegationActivityView } from "@/lib/types"
 import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
@@ -142,8 +142,14 @@ interface MessageListViewProps {
   historyLoadComplete?: boolean
   /** Optional durable child turn id to reveal after the transcript loads. */
   focusTurnAnchor?: string | null
-  /** Display-only filtering for delegated child conversation artifacts. */
-  isDelegatedChild?: boolean
+  /**
+   * Parent continuation owns admission while subagents run (suspend + join).
+   * When set, the bottom LiveTurnStats banner swaps the streaming label for
+   * "waiting for subagents" while keeping elapsed / files / tool metrics.
+   * Value is `armed_at` epoch ms for timer fallback when no latched live
+   * message remains.
+   */
+  waitingForSubagentsArmedAtMs?: number | null
 }
 
 export function canReloadSessionLoadError(
@@ -173,6 +179,8 @@ export interface ResolvedMessageGroup {
   duration_ms?: number | null
   model?: string | null
   models?: string[]
+  reasoning_effort?: string | null
+  reasoning_efforts?: string[]
   /**
    * Wall-clock completion time supplied by the Rust parser. For merged
    * sub-turns this is the latest non-null completion across the run — the
@@ -493,6 +501,8 @@ export function mergeConsecutiveAssistantTurns(
       let mergedOutcome: TurnOutcome | null | undefined
       const seenModels = new Set<string>()
       const mergedModels: string[] = []
+      const seenReasoningEfforts = new Set<string>()
+      const mergedReasoningEfforts: string[] = []
       for (const it of buffer) {
         if (it.group.completed_at) {
           mergedCompletedAt = it.group.completed_at
@@ -524,6 +534,11 @@ export function mergeConsecutiveAssistantTurns(
           seenModels.add(it.group.model)
           mergedModels.push(it.group.model)
         }
+        const effort = it.group.reasoning_effort?.trim()
+        if (effort && !seenReasoningEfforts.has(effort)) {
+          seenReasoningEfforts.add(effort)
+          mergedReasoningEfforts.push(effort)
+        }
       }
 
       const merged: AssistantTurnItem = {
@@ -544,6 +559,12 @@ export function mergeConsecutiveAssistantTurns(
           duration_ms: mergedDuration,
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
+          reasoning_effort:
+            mergedReasoningEfforts[0] ?? last.group.reasoning_effort,
+          reasoning_efforts:
+            mergedReasoningEfforts.length > 1
+              ? mergedReasoningEfforts
+              : undefined,
           completed_at: mergedCompletedAt,
           outcome: mergedOutcome,
         },
@@ -728,6 +749,8 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           duration_ms={group.duration_ms}
           model={group.model}
           models={group.models}
+          reasoningEffort={group.reasoning_effort}
+          reasoningEfforts={group.reasoning_efforts}
           previousUserIndex={previousUserIndex}
           isResponseComplete={isResponseComplete}
           copyText={extractTextFromParts(group.parts)}
@@ -751,6 +774,15 @@ const PendingTypingIndicator = memo(function PendingTypingIndicator() {
     </Message>
   )
 })
+
+function waitingPlaceholderLiveMessage(startedAtMs: number): LiveMessage {
+  return {
+    id: "waiting-for-subagents",
+    role: "assistant",
+    content: [],
+    startedAt: startedAtMs,
+  }
+}
 
 const AutoScrollOnSend = memo(function AutoScrollOnSend({
   signal,
@@ -853,21 +885,80 @@ function extractLiveDelegationSources(
 
 const EMPTY_ACTIVITIES: DelegationActivityView[] = []
 
-/** Narrow-subscription live stats — parent list does not re-render per token. */
-const LiveTurnStatsFromTranscript = memo(function LiveTurnStatsFromTranscript({
+/**
+ * Bottom live-turn banner. While streaming, tracks the live transcript.
+ * While waiting for subagents, keeps the same layout but swaps the status
+ * label; metrics come from the latched pre-suspend live message when
+ * available, otherwise a timer-only placeholder from `armed_at`.
+ */
+const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
   conversationId,
   agentType,
+  isStreaming,
+  isWaitingForSubagents,
+  waitingArmedAtMs,
 }: {
   conversationId: number
   agentType: AgentType
+  isStreaming: boolean
+  isWaitingForSubagents: boolean
+  waitingArmedAtMs: number | null
 }) {
   const snap = useLiveTranscriptConversation(conversationId)
-  const message = useMemo(
+  const liveMessage = useMemo(
     () => (snap ? liveSnapshotToLiveMessage(snap) : null),
     [snap]
   )
-  if (!message) return null
-  return <LiveTurnStats message={message} agentType={agentType} isStreaming />
+  // Compatibility path may still publish session.liveMessage without incremental
+  // transcript; keep it as a latch source.
+  const runtimeLiveMessage = useConversationRuntimeStore(
+    (s) => s.byConversationId.get(conversationId)?.liveMessage ?? null
+  )
+  const activeLive = liveMessage ?? runtimeLiveMessage
+  const [latchedLive, setLatchedLive] = useState<LiveMessage | null>(null)
+
+  useEffect(() => {
+    // Preserve the last live metrics when the runtime clears them before waiting.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (activeLive) setLatchedLive(activeLive)
+  }, [activeLive])
+
+  useEffect(() => {
+    if (!isWaitingForSubagents && !isStreaming) {
+      // Reset only after both live display modes have ended.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setLatchedLive(null)
+    }
+  }, [isWaitingForSubagents, isStreaming])
+
+  if (isWaitingForSubagents) {
+    const startedAt =
+      activeLive?.startedAt ?? latchedLive?.startedAt ?? waitingArmedAtMs
+    if (startedAt == null) return null
+    const message =
+      activeLive ?? latchedLive ?? waitingPlaceholderLiveMessage(startedAt)
+    return (
+      <LiveTurnStats
+        message={message}
+        agentType={agentType}
+        isStreaming
+        statusMode="waiting_for_subagents"
+      />
+    )
+  }
+
+  if (isStreaming && activeLive) {
+    return (
+      <LiveTurnStats
+        message={activeLive}
+        agentType={agentType}
+        isStreaming
+        statusMode="auto"
+      />
+    )
+  }
+
+  return null
 })
 
 /** Narrow-subscription plan overlay driven by live transcript segments. */
@@ -1026,8 +1117,11 @@ export function MessageListView({
   initialHistoryScrollEligible = false,
   historyLoadComplete = false,
   focusTurnAnchor = null,
-  isDelegatedChild = false,
+  waitingForSubagentsArmedAtMs = null,
 }: MessageListViewProps) {
+  const isWaitingForSubagents =
+    waitingForSubagentsArmedAtMs != null &&
+    Number.isFinite(waitingForSubagentsArmedAtMs)
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
   const useIncrementalLive = useStreamingPerformanceFlag(
@@ -1187,13 +1281,13 @@ export function MessageListView({
     const nonStreaming = allAdapted.filter(
       (_, index) => timelineTurns[index].phase !== "streaming"
     )
-    const displayAdapted = isDelegatedChild
-      ? allAdapted.map((message) => {
-          if (message.role !== "assistant") return message
-          const content = filterDelegatedInterruptParts(message.content, true)
-          return content === message.content ? message : { ...message, content }
-        })
-      : allAdapted
+    // Drop exact Codex interrupt markers on every session (parent + child).
+    // The marker is a turn-abort fence, not a user-facing answer.
+    const displayAdapted = allAdapted.map((message) => {
+      if (message.role !== "assistant") return message
+      const content = filterConversationInterruptedParts(message.content)
+      return content === message.content ? message : { ...message, content }
+    })
     const projected = projectDelegationTranscript(
       displayAdapted,
       conversationId
@@ -1216,6 +1310,7 @@ export function MessageListView({
           usage: msg.usage,
           duration_ms: msg.duration_ms,
           model: msg.model,
+          reasoning_effort: msg.reasoning_effort,
           completed_at: msg.completed_at,
           outcome: msg.outcome,
         }
@@ -1311,7 +1406,6 @@ export function MessageListView({
     useIncrementalLive,
     mergedRunCache,
     conversationId,
-    isDelegatedChild,
   ])
   const { threadItems, nonStreamingAdapted, delegationIdentityIndex } =
     adaptedThread
@@ -1331,7 +1425,6 @@ export function MessageListView({
         conversationId={conversationId}
         agentType={agentType}
         showThinking={showThinking}
-        isDelegatedChild={isDelegatedChild}
         delegationIdentityIndex={delegationIdentityIndex}
       />
     )
@@ -1340,7 +1433,6 @@ export function MessageListView({
     conversationId,
     agentType,
     showThinking,
-    isDelegatedChild,
     delegationIdentityIndex,
   ])
 
@@ -1706,22 +1798,18 @@ export function MessageListView({
           }}
         />
       </MessageThread>
-      {useIncrementalLive
-        ? hasLiveTranscript &&
-          connStatus === "prompting" && (
-            <LiveTurnStatsFromTranscript
-              conversationId={conversationId}
-              agentType={agentType}
-            />
-          )
-        : liveMessage &&
-          connStatus === "prompting" && (
-            <LiveTurnStats
-              message={liveMessage}
-              agentType={agentType}
-              isStreaming={connStatus === "prompting"}
-            />
-          )}
+      <LiveTurnStatsBanner
+        conversationId={conversationId}
+        agentType={agentType}
+        isStreaming={
+          connStatus === "prompting" &&
+          (useIncrementalLive ? hasLiveTranscript : Boolean(liveMessage))
+        }
+        isWaitingForSubagents={isWaitingForSubagents}
+        waitingArmedAtMs={
+          isWaitingForSubagents ? waitingForSubagentsArmedAtMs : null
+        }
+      />
       {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
           top-right in RTL). A flex column keeps the order stable regardless of
           each panel's expand/collapse height: the message navigator first, then

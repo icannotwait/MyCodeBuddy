@@ -21,6 +21,10 @@ Design Gate cycles 1 and 2 resolved these requirements before Plan authoring:
 - strict bridge bootstrap failures are typed terminal outcomes, never
   safe-native fallback candidates;
 - collision preflight covers both forwarded and Grok-native MCP names;
+- the required real-Grok smoke proves the Grok-native collision only, while
+  forwarded-Wire collision coverage remains deterministic unit/ACP integration
+  testing because Grok's user MCP configuration is intentionally native-filtered
+  before Codeg constructs `session/*` `mcpServers`;
 - bridge readiness uses the existing stdio-style shared post-attach deadline,
   with a neutral diagnostic when peer startup has delayed reverse traffic;
 - every strict bridge waits for its ready latch before `Connected`, including
@@ -714,9 +718,10 @@ Against the inspected or newer Grok build:
 4. Run delegation, status, feedback, and explicit cancel flows.
 5. Repeat with the local `codeg-mcp` binary unavailable; the bridge must still
    work.
-6. Add a user MCP named `codeg-mcp`; connection must fail with the collision
-   diagnostic. Repeat with the name in Grok-native configuration so it is not
-   forwarded on the wire.
+6. Add exact `[mcp_servers.codeg-mcp]` to the disposable Grok-native
+   configuration; connection must fail before attach with
+   `grok_mcp_name_conflict`, identify the source as `GrokNative`, and instruct
+   the user to rename it. A mixed-case `Codeg-Mcp` entry must not collide.
 7. Force bridge bootstrap failure; connection must fail without either
    fallback.
 8. Include a deliberately slow ordinary user MCP and verify it shares the
@@ -725,6 +730,16 @@ Against the inspected or newer Grok build:
 
 This manual smoke is a release/acceptance gate, not an optional exploratory
 test. No Grok source modification is part of it.
+
+The real smoke deliberately does not manufacture a forwarded-Wire collision.
+For Grok, `read_servers_for_agent_type(AgentType::Grok)` and
+`agent_native_mcp_server_names(AgentType::Grok)` read the same user
+configuration, and Codeg removes those native names before constructing the
+session wire list. The unit and mock-ACP integration fixtures must therefore
+exercise a distinct forwarded `codeg-mcp` entry, assert the local
+`grok_mcp_name_conflict` diagnostic identifies `Wire`, and retain the
+case-sensitive non-collision check. This preserves both collision-source
+contracts without an unreliable filesystem race or a post-preflight proxy.
 
 ### Repository verification
 
@@ -782,8 +797,9 @@ inside a live connection.
 7. User Stop preserves the runtime while canceling the active turn/task tree.
 8. Connection teardown leaves no bridge request task, ready hold, token, lease,
    or parent-owned delegation running.
-9. An exact custom `codeg-mcp` collision from either the forwarded wire list
-   or Grok-native configuration fails visibly rather than shadowing the bridge.
+9. An exact custom `codeg-mcp` collision from a deterministic forwarded-Wire
+   test fixture or Grok-native configuration fails visibly rather than
+   shadowing the bridge.
 10. Simulated T1 abandonment does not destabilize Codeg or claim a cancellation
     signal; later lifecycle cleanup remains effective.
 11. Shared-dispatch parity tests prove that ACP and stdio expose the same tools

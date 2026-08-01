@@ -5,6 +5,7 @@ import {
   isBackgroundTaskToolCall,
   parseBackgroundLaunch,
   parseBackgroundTaskEnvelope,
+  parseBackgroundTaskEnvelopes,
 } from "@/lib/background-task"
 import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
 
@@ -53,6 +54,39 @@ const STOP_JSON = JSON.stringify({
 const LAUNCH =
   "Command running in background with ID: be7lh91re. Output is being written to: /private/tmp/x/tasks/be7lh91re.output. You will be notified when it completes."
 
+// Grok's shapes, captured from a real session (~/.grok/…/019fb314…): the launch
+// acknowledgement, and the poll's JSON `TaskOutput` envelope.
+const GROK_LAUNCH =
+  "Background task term_b0d9512484964551a5bac4f82a805ae2 started"
+
+const GROK_FAILED = JSON.stringify({
+  type: "TaskOutput",
+  Result: {
+    task_id: "term_b0d",
+    command: "/bin/bash -lc 'pnpm dev -- --port 3001'",
+    status: "failed",
+    exit_code: 1,
+    started: "2026-07-30T12:52:48Z",
+    ended: "2026-07-30T12:52:49Z",
+    duration_secs: 0.787718,
+    output:
+      "$ next dev --turbopack -- --port 3001\nInvalid project directory provided, no such directory: /Users/me/proj/--port\n",
+    truncated: false,
+  },
+})
+
+const GROK_RUNNING = JSON.stringify({
+  type: "TaskOutput",
+  Result: {
+    task_id: "term_273",
+    command: "/bin/bash -lc 'pnpm exec next dev -p 3001'",
+    status: "running",
+    exit_code: null,
+    output:
+      "▲ Next.js 16.0.0\n- Local: http://localhost:3001\n✓ Ready in 1.2s\n",
+  },
+})
+
 function poll(over: Partial<AdaptedToolCallPart> = {}): AdaptedToolCallPart {
   return {
     type: "tool-call",
@@ -67,6 +101,18 @@ function poll(over: Partial<AdaptedToolCallPart> = {}): AdaptedToolCallPart {
     state: "output-available",
     ...over,
   }
+}
+
+/** A Grok `get_command_or_subagent_output` poll of the failed dev-server task. */
+function grokPoll(
+  over: Partial<AdaptedToolCallPart> = {}
+): AdaptedToolCallPart {
+  return poll({
+    toolName: "get_command_or_subagent_output",
+    input: JSON.stringify({ task_ids: ["term_b0d"], timeout_ms: 15000 }),
+    output: GROK_FAILED,
+    ...over,
+  })
 }
 
 describe("parseBackgroundTaskEnvelope", () => {
@@ -123,9 +169,158 @@ describe("parseBackgroundLaunch", () => {
   it("extracts the task id from a background launch result", () => {
     expect(parseBackgroundLaunch(LAUNCH)).toEqual({ taskId: "be7lh91re" })
   })
+  it("extracts the task id from Grok's launch acknowledgement", () => {
+    expect(parseBackgroundLaunch(GROK_LAUNCH)).toEqual({
+      taskId: "term_b0d9512484964551a5bac4f82a805ae2",
+    })
+  })
   it("returns null for non-launch text", () => {
     expect(parseBackgroundLaunch(COMPLETED)).toBeNull()
     expect(parseBackgroundLaunch(null)).toBeNull()
+  })
+})
+
+describe("Grok TaskOutput envelopes", () => {
+  it("parses a failed poll (command, exit code, output)", () => {
+    const env = parseBackgroundTaskEnvelope(GROK_FAILED)
+    expect(env).not.toBeNull()
+    expect(env!.kind).toBe("poll")
+    expect(env!.taskId).toBe("term_b0d")
+    expect(env!.command).toBe("/bin/bash -lc 'pnpm dev -- --port 3001'")
+    expect(env!.status).toBe("failed")
+    expect(env!.exitCode).toBe(1)
+    expect(env!.output).toContain("Invalid project directory")
+  })
+
+  it("parses a still-running poll", () => {
+    const env = parseBackgroundTaskEnvelope(GROK_RUNNING)
+    expect(env!.status).toBe("running")
+    expect(env!.exitCode).toBeNull()
+    expect(env!.output).toContain("Ready in")
+  })
+
+  it("expands a MultiResult into one envelope per task", () => {
+    const envs = parseBackgroundTaskEnvelopes(
+      JSON.stringify({
+        type: "TaskOutput",
+        MultiResult: {
+          result_count: 2,
+          results: [
+            { task_id: "term_a", status: "completed", exit_code: 0 },
+            { task_id: "term_b", status: "running" },
+          ],
+        },
+      })
+    )
+    expect(envs.map((e) => e.taskId)).toEqual(["term_a", "term_b"])
+  })
+
+  it("maps a killed task to the stopped kind", () => {
+    const env = parseBackgroundTaskEnvelope(
+      JSON.stringify({
+        type: "TaskOutput",
+        Result: { task_id: "term_a", status: "killed", command: "sleep 900" },
+      })
+    )
+    expect(env!.kind).toBe("stop")
+  })
+
+  it("ignores non-TaskOutput JSON, TaskNotFound, and truncated envelopes", () => {
+    // A sub-agent poll of the SAME tool: different payload → generic rendering.
+    expect(
+      parseBackgroundTaskEnvelope(
+        JSON.stringify({
+          type: "SubagentCompleted",
+          Result: { subagent_id: "s1", turns: 3 },
+        })
+      )
+    ).toBeNull()
+    expect(
+      parseBackgroundTaskEnvelope(
+        JSON.stringify({ type: "TaskOutput", TaskNotFound: { task_id: "x" } })
+      )
+    ).toBeNull()
+    expect(
+      parseBackgroundTaskEnvelope(GROK_FAILED.slice(0, GROK_FAILED.length - 20))
+    ).toBeNull()
+  })
+
+  it("routes Grok polls into the background lane, sub-agent polls out of it", () => {
+    // Settled poll → matched by its envelope.
+    expect(isBackgroundTaskToolCall(grokPoll())).toBe(true)
+    // In-flight poll → matched by `{task_ids, timeout_ms}` before any output.
+    expect(
+      isBackgroundTaskToolCall(
+        grokPoll({ output: null, state: "input-available" })
+      )
+    ).toBe(true)
+    // Same tool polling a sub-agent: its result is a different payload, so the
+    // call leaves the lane as soon as it settles.
+    expect(
+      isBackgroundTaskToolCall(
+        grokPoll({
+          output: JSON.stringify({
+            type: "SubagentCompleted",
+            Result: { subagent_id: "s1", turns: 3 },
+          }),
+        })
+      )
+    ).toBe(false)
+    // …and it leaves the lane even when the sub-agent payload never reaches
+    // `output` at all: no backend path serializes a `SubagentCompleted`
+    // rawOutput, so the settled poll arrives with an empty result. Keying the
+    // input-shape claim on "still in flight" (not on "has foreign output") is
+    // what stops it from rendering as a permanently running background row.
+    expect(
+      isBackgroundTaskToolCall(
+        grokPoll({ output: null, state: "output-available" })
+      )
+    ).toBe(false)
+    expect(
+      isBackgroundTaskToolCall(
+        grokPoll({ output: null, state: "output-available", errorText: "" })
+      )
+    ).toBe(false)
+  })
+
+  it("keeps a live poll whose status has not settled yet", () => {
+    // A promoted orphan: re-adapted with state output-available at COMPLETE_TURN
+    // while its forwarded ACP status is still in_progress.
+    expect(
+      isBackgroundTaskToolCall(
+        grokPoll({
+          output: null,
+          state: "output-available",
+          toolStatus: "in_progress",
+        })
+      )
+    ).toBe(true)
+  })
+
+  it("builds a failed row carrying the command and exit code", () => {
+    const rows = buildBackgroundTaskRows([
+      grokPoll({ toolCallId: "c1", output: null, state: "input-available" }),
+      grokPoll({ toolCallId: "c2" }),
+    ])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].taskId).toBe("term_b0d")
+    expect(rows[0].badge).toBe("failed")
+    expect(rows[0].exitCode).toBe(1)
+    expect(rows[0].command).toBe("/bin/bash -lc 'pnpm dev -- --port 3001'")
+    expect(rows[0].output).toContain("Invalid project directory")
+    expect(rows[0].pollCount).toBe(2)
+  })
+
+  it("marks a failure with no exit code as failed, not completed", () => {
+    const rows = buildBackgroundTaskRows([
+      grokPoll({
+        output: JSON.stringify({
+          type: "TaskOutput",
+          Result: { task_id: "term_z", status: "failed", command: "x" },
+        }),
+      }),
+    ])
+    expect(rows[0].badge).toBe("failed")
   })
 })
 

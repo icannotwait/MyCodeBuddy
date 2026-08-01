@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest"
 
-import { inferLiveToolName, normalizeToolName } from "./tool-call-normalization"
+import {
+  claudeCodeMarksSubagent,
+  extractClaudeCodeMetaTitle,
+  inferLiveToolName,
+  normalizeToolName,
+} from "./tool-call-normalization"
 
 describe("inferLiveToolName meta.claudeCode.toolName override", () => {
   it("returns memory_recall for synthesized recall events without rawInput", () => {
@@ -115,6 +120,63 @@ describe("inferLiveToolName meta.claudeCode.toolName override", () => {
         meta: { claudeCode: { toolName: "Task" } },
       })
     ).toBe("agent")
+  })
+
+  it("classifies via the authoritative subagent marker before any input shape (≥0.63)", () => {
+    // Frame 1 of an Agent/Task launch: rawInput hasn't streamed, the meta
+    // toolName may be the legacy "Task" — the `subagent: true` marker alone
+    // must classify. (claude-agent-acp ≥0.63, _meta.claudeCode.subagent.)
+    expect(
+      inferLiveToolName({
+        title: "Implement feature X",
+        kind: "other",
+        rawInput: null,
+        meta: { claudeCode: { toolName: "Task", subagent: true } },
+      })
+    ).toBe("agent")
+    // The marker is authoritative even over a misleading input shape (a
+    // command-bearing payload would otherwise classify as bash).
+    expect(
+      inferLiveToolName({
+        title: "Run checks",
+        kind: "other",
+        rawInput: JSON.stringify({ command: "pnpm test" }),
+        meta: { claudeCode: { toolName: "Agent", subagent: true } },
+      })
+    ).toBe("agent")
+    // Strict `=== true`: any other shape leaves classification untouched.
+    expect(
+      inferLiveToolName({
+        title: "bash",
+        kind: "execute",
+        rawInput: JSON.stringify({ command: "ls" }),
+        meta: { claudeCode: { toolName: "Bash", subagent: "yes" } },
+      })
+    ).toBe("bash")
+  })
+
+  it("claudeCodeMarksSubagent / extractClaudeCodeMetaTitle guard their shapes", () => {
+    expect(claudeCodeMarksSubagent({ claudeCode: { subagent: true } })).toBe(
+      true
+    )
+    expect(claudeCodeMarksSubagent({ claudeCode: { subagent: false } })).toBe(
+      false
+    )
+    expect(claudeCodeMarksSubagent({ claudeCode: {} })).toBe(false)
+    expect(claudeCodeMarksSubagent(null)).toBe(false)
+    expect(claudeCodeMarksSubagent({ claudeCode: "subagent" })).toBe(false)
+
+    expect(
+      extractClaudeCodeMetaTitle({
+        claudeCode: { title: "Show current diff" },
+      })
+    ).toBe("Show current diff")
+    expect(extractClaudeCodeMetaTitle({ claudeCode: { title: "   " } })).toBe(
+      null
+    )
+    expect(extractClaudeCodeMetaTitle({ claudeCode: { title: 42 } })).toBe(null)
+    expect(extractClaudeCodeMetaTitle({ claudeCode: {} })).toBe(null)
+    expect(extractClaudeCodeMetaTitle(undefined)).toBe(null)
   })
 
   it("resolves delegation companion tools from meta over the input-shape heuristic", () => {
@@ -544,5 +606,148 @@ describe("inferLiveToolName Grok plan-mode via x.ai/tool.kind", () => {
         },
       })
     ).toBe("bash")
+  })
+})
+
+describe("inferLiveToolName Grok identity via x.ai/tool.name", () => {
+  // The three frames of ONE background-task poll, captured from a real session
+  // (~/.grok/…/019fb314…). Grok rewrites `title` on every update, so the title
+  // fallback named this single call three different things — the last one
+  // colliding with the bash card it was polling.
+  const meta = {
+    "x.ai/tool": {
+      version: 1,
+      name: "get_command_or_subagent_output",
+      kind: "background_task_action",
+      namespace: "grok_build",
+      label: "Background Task",
+      read_only: true,
+    },
+  }
+
+  it("keeps one identity across the whole mutating lifecycle", () => {
+    const announced = inferLiveToolName({
+      title: "get_command_or_subagent_output",
+      kind: null,
+      rawInput: JSON.stringify({ task_ids: ["term_b0d"], timeout_ms: 15000 }),
+      meta,
+    })
+    const inFlight = inferLiveToolName({
+      title: "Get task output: term_b0d9512484964551a5bac4f82a805ae2",
+      kind: "other",
+      rawInput: JSON.stringify({
+        variant: "TaskOutput",
+        task_ids: ["term_b0d"],
+        timeout_ms: 15000,
+      }),
+      meta,
+    })
+    // Completed: the title becomes the polled command — this used to collapse
+    // to "bash" and fold into the launching command's tool group.
+    const completed = inferLiveToolName({
+      title: "/bin/bash -lc 'pnpm dev -- --port 3001' (term_b0d)",
+      kind: "other",
+      rawInput: JSON.stringify({
+        variant: "TaskOutput",
+        task_ids: ["term_b0d"],
+        timeout_ms: 15000,
+      }),
+      meta,
+    })
+
+    expect(announced).toBe("get_command_or_subagent_output")
+    expect(inFlight).toBe(announced)
+    expect(completed).toBe(announced)
+  })
+
+  it("lets the input shape keep priority over the meta name", () => {
+    // Grok's edit tool: the meta name (`search_replace`) has no card of its own,
+    // while the input shape routes it to the diff card. Input wins.
+    expect(
+      inferLiveToolName({
+        title: "Edit `/tmp/a.ts`",
+        kind: "edit",
+        rawInput: JSON.stringify({
+          file_path: "/tmp/a.ts",
+          old_string: "a",
+          new_string: "b",
+        }),
+        meta: { "x.ai/tool": { name: "search_replace", kind: "edit" } },
+      })
+    ).toBe("edit")
+  })
+
+  it("resolves an arg-less frame from the meta name", () => {
+    // Before rawInput streams in there is nothing else to go on.
+    expect(
+      inferLiveToolName({
+        title: "read_file",
+        kind: null,
+        rawInput: null,
+        meta: { "x.ai/tool": { name: "read_file", kind: "read" } },
+      })
+    ).toBe("read")
+  })
+
+  it("ignores the generic `use_tool` MCP envelope", () => {
+    // The backend unwraps the envelope into the title; the envelope name would
+    // send every MCP call to the generic tool card instead.
+    expect(
+      inferLiveToolName({
+        title: "codeg-mcp__delegate_to_agent",
+        kind: "other",
+        rawInput: JSON.stringify({ agent_type: "codex", task: "run build" }),
+        meta: { "x.ai/tool": { name: "use_tool", kind: "use_tool" } },
+      })
+    ).toBe("delegate_to_agent")
+  })
+})
+
+describe("normalizeToolName codex command-action titles", () => {
+  it("resolves search command actions to grep", () => {
+    // codex-acp announces a search-classified shell command with NO rawInput and
+    // no tool name — only the title. Without this the whole title became the
+    // "tool name": no search icon, an "other" tool-group tally, and a body that
+    // dumped the raw {formatted_output, exit_code} envelope.
+    for (const title of [
+      "Search for 'Tests run:' in com.forwayaudio.app",
+      "Search for 'TODO'",
+      "Search in 'src/lib'",
+      "Search",
+    ]) {
+      expect(normalizeToolName(title)).toBe("grep")
+    }
+  })
+
+  it("resolves list-files command actions to glob", () => {
+    expect(normalizeToolName("List files in 'src/components'")).toBe("glob")
+    expect(normalizeToolName("List files")).toBe("glob")
+  })
+
+  it("keeps the sibling read command action on read", () => {
+    expect(normalizeToolName("Read file 'src/lib/a.ts'")).toBe("read")
+  })
+
+  it("leaves unrelated titles alone", () => {
+    // Note the trailing-quote strip normalizeToolName applies to unmatched names.
+    expect(normalizeToolName("Research 'x' in y")).toBe("Research 'x' in y")
+    expect(normalizeToolName("Searching for 'x'")).toBe("Searching for 'x")
+  })
+
+  it("infers the live name from the title when there is no rawInput", () => {
+    expect(
+      inferLiveToolName({
+        title: "Search for 'Tests run:' in com.forwayaudio.app",
+        kind: "search",
+        rawInput: null,
+      })
+    ).toBe("grep")
+    expect(
+      inferLiveToolName({
+        title: "List files in 'src'",
+        kind: "read",
+        rawInput: null,
+      })
+    ).toBe("glob")
   })
 })

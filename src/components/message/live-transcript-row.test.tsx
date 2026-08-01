@@ -286,7 +286,7 @@ describe("LiveTranscriptRow", () => {
     )
   })
 
-  it("hides a mapped continuation while keeping an unrelated shell tool", () => {
+  it("keeps a mapped continuation visible as its own card alongside shell tools", () => {
     seedLiveTools(CID, [
       tool("continue", {
         title: "continue_delegation",
@@ -307,7 +307,8 @@ describe("LiveTranscriptRow", () => {
 
     renderRow(undefined, true, index)
 
-    expect(screen.queryByTestId("tool-part-continue")).not.toBeInTheDocument()
+    // Continuations are first-class turn cards — only status polls fold away.
+    expect(screen.getByTestId("tool-part-continue")).toBeInTheDocument()
     expect(screen.getByTestId("tool-part-shell")).toBeInTheDocument()
   })
 
@@ -355,31 +356,26 @@ describe("LiveTranscriptRow", () => {
     expect(screen.getByTestId("message-response")).toHaveTextContent("hello")
   })
 
-  it("hides the exact live marker only for delegated children", () => {
+  it("hides the exact live interrupt marker on parent and child sessions", () => {
     liveTranscriptStore.rebuild(
       CID,
       "c1",
       liveMessage("*Conversation interrupted*"),
       1
     )
-    const ui = (isDelegatedChild: boolean) => (
+    render(
       <NextIntlClientProvider locale="en" messages={enMessages}>
         <LiveTranscriptRow
           conversationId={CID}
           agentType="codex"
           showThinking
-          isDelegatedChild={isDelegatedChild}
         />
       </NextIntlClientProvider>
     )
-    const { rerender } = render(ui(true))
 
     expect(
       screen.queryByText(/Conversation interrupted/)
     ).not.toBeInTheDocument()
-
-    rerender(ui(false))
-    expect(screen.getByText(/Conversation interrupted/)).toBeInTheDocument()
   })
 
   it("updates text without remounting the row when chunks append", () => {

@@ -1,7 +1,10 @@
 import { render, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 
-vi.mock("@/components/ai-elements/link-safety", () => ({
+vi.mock("@/components/ai-elements/link-safety", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("@/components/ai-elements/link-safety")
+  >()),
   useStreamdownLinkSafety: () => ({ enabled: false }),
 }))
 

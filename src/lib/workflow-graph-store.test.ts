@@ -330,6 +330,77 @@ describe("workflow activation lifecycle", () => {
     vi.useRealTimers()
   })
 
+  it("first-seeds overlay interest after readiness only without a numbered graph", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 4 })
+    )
+
+    const release = useWorkflowGraphStore.getState().activateOverlayInterest(90)
+    changed.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(90)
+    release()
+
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(91, baseSnapshot({ graph_revision: 7 }))
+    getWorkflowGraphSnapshot.mockClear()
+    const seededRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(91)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    seededRelease()
+  })
+
+  it("refreshes overlay interest when only an unnumbered snapshot is cached", async () => {
+    useWorkflowGraphStore.getState().applyFromDetail(
+      95,
+      baseSnapshot({
+        graph_revision: null,
+        compatibility: "observed_only",
+        overall_state: "observed_only",
+        workflow_id: null,
+      })
+    )
+    getWorkflowGraphSnapshot.mockResolvedValue(null)
+
+    const release = useWorkflowGraphStore.getState().activateOverlayInterest(95)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(95)
+    release()
+  })
+
+  it("duplicate overlay leases share one pending first seed", async () => {
+    const changed = deferred<() => void>()
+    const nudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
+    subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+
+    const creatorRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(96)
+    const remainingRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(96)
+    creatorRelease()
+    changed.resolve(vi.fn())
+    nudge.resolve(vi.fn())
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    remainingRelease()
+  })
+
   it("waits for both listener attempts before the first activation refresh", async () => {
     const changed = deferred<() => void>()
     const nudge = deferred<() => void>()
@@ -575,6 +646,140 @@ describe("active workflow refresh scheduling", () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it("overlay-only interest handles newer events without a fallback timer", async () => {
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(92, baseSnapshot({ graph_revision: 2 }))
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 3 })
+    )
+    const release = useWorkflowGraphStore.getState().activateOverlayInterest(92)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 92,
+      workflow_id: "wf-1",
+      graph_revision: 3,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    release()
+  })
+
+  it("seeds the first publish event after an overlay mount resolves null", async () => {
+    const changedDispose = vi.fn()
+    const nudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged.mockResolvedValue(changedDispose)
+    subscribeWorkflowCompatibilityNudge.mockResolvedValue(nudgeDispose)
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+
+    const release = useWorkflowGraphStore.getState().activateOverlayInterest(98)
+    await flushMicrotasks()
+
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenNthCalledWith(1, 98)
+    expect(useWorkflowGraphStore.getState().getSnapshot(98)).toBeNull()
+
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 98,
+      workflow_id: "wf-1",
+      graph_revision: 1,
+    })
+    await flushMicrotasks()
+
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenNthCalledWith(2, 98)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(98)?.graph_revision
+    ).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    release()
+    expect(changedDispose).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+    useWorkflowGraphStore.getState().handleGraphChanged({
+      parent_conversation_id: 98,
+      workflow_id: "wf-1",
+      graph_revision: 2,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+  })
+
+  it("releasing expanded interest keeps overlay events but stops fallback", async () => {
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(93, baseSnapshot({ graph_revision: 5 }))
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 6 })
+    )
+
+    const releaseOverlay = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(93)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    const releaseExpanded = useWorkflowGraphStore
+      .getState()
+      .activateConversation(93)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    releaseExpanded()
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 93,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    releaseOverlay()
+    useWorkflowGraphStore.getState().handleCompatibilityNudge({
+      parent_conversation_id: 93,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+  })
+
+  it("late expanded completion updates cache but cannot arm an overlay timer", async () => {
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(97, baseSnapshot({ graph_revision: 1 }))
+    const pending = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot.mockReturnValue(pending.promise)
+    const releaseOverlay = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(97)
+    await flushMicrotasks()
+    const releaseExpanded = useWorkflowGraphStore
+      .getState()
+      .activateConversation(97)
+    await flushMicrotasks()
+    releaseExpanded()
+    pending.resolve(baseSnapshot({ graph_revision: 2 }))
+    await flushMicrotasks()
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(97)?.graph_revision
+    ).toBe(2)
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    releaseOverlay()
   })
 
   it("refreshes every ten minutes and resets the clock after event convergence", async () => {

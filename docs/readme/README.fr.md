@@ -21,7 +21,8 @@
 
 Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réunit plusieurs agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, etc.) dans un seul espace de travail, prend en charge l'agrégation des conversations et la collaboration multi-agent, ainsi que l'installation desktop et le déploiement serveur/Docker.
 
-![gallery](../images/gallery.svg)
+![gallery](../images/workspace-light.png#gh-light-mode-only)
+![gallery](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## Sponsors
 
@@ -60,13 +61,13 @@ Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réun
 
 ## Interface principale
 
-![Codeg Light](../images/main-light.png#gh-light-mode-only)
-![Codeg Dark](../images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## Collaboration multi-agents
 
-![Codeg Light](../images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## Flux de travail Office
 
@@ -110,13 +111,23 @@ Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réun
 
 > Remarque : les variables d'environnement ont priorité sur les chemins par défaut.
 
+
+Pas dans la liste ? Ajoutez-le vous-même. Choisissez un agent dans le registre public ACP ou collez son JSON de distribution : Codeg l'installe, vérifie qu'il démarre et le traite comme un agent intégré — il apparaît dans le sélecteur, accepte la délégation `@` et les skills, et ses conversations sont enregistrées et consultables même quand l'agent ne conserve aucun historique. → [Agents personnalisés](https://docs.codeg.app/guide/custom-agents)
+
+## 🪟 Vue divisée
+
+Une seule barre d'onglets ne suffit pas toujours. Faites un clic droit sur un onglet de conversation pour diviser la vue **à droite** ou **vers le bas**, autant de fois que vous voulez : deux volets côte à côte, une pile de trois, une grille. Chaque groupe est un espace de travail à part entière — ses onglets, son en-tête, son propre bouton de nouvelle conversation — Claude Code peut donc refactoriser dans un volet pendant que Codex relit un diff dans le suivant.
+
+Faites glisser un onglet d'un groupe à l'autre : sa session continue de streamer pendant le déménagement. Faites glisser la séparation entre deux groupes pour changer le partage de l'espace. Votre disposition est mémorisée par espace de travail, brouillons compris : rouvrez Codeg et la division revient, avec le texte jamais envoyé toujours dans le champ.
+
+![Division de la zone de conversation en une grille de groupes d'onglets](../images/split-light.gif#gh-light-mode-only)
+![Division de la zone de conversation en une grille de groupes d'onglets](../images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>Lanceur de projet</h2></summary>
 
 Créez visuellement de nouveaux projets avec une interface à panneaux divisés : configuration à gauche, aperçu en temps réel à droite.
 
-![Project Boot Light](../images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](../images/project-boot-dark.png#gh-dark-mode-only)
 
 ### Fonctionnalités
 
@@ -290,7 +301,7 @@ GitHub Releases for this fork ship **desktop only**. They do **not** attach
 (`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### Option 3 : Docker

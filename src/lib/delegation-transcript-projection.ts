@@ -8,7 +8,6 @@ import {
   isDelegateToAgentToolName,
   parseCancelDelegationReason,
   parseDelegateRunIdentity,
-  parseInput,
 } from "@/lib/delegation-card"
 import {
   buildDelegationTaskRows,
@@ -61,22 +60,18 @@ function successfulCancellation(part: AdaptedToolCallPart): boolean {
   return part.state === "output-available" && !part.errorText?.trim()
 }
 
-function cancellationUnitKeys(
-  messages: readonly AdaptedMessage[],
-  index: DelegationIdentityIndex
-): Set<string> {
+/** Task ids that received a successful explicit user cancel (not timeout). */
+function cancellationTaskIds(messages: readonly AdaptedMessage[]): Set<string> {
   const keys = new Set<string>()
   for (const message of messages) {
     walkToolCalls(message.content, (part) => {
       if (normalizeToolName(part.toolName) !== "cancel_delegation") return
       if (!successfulCancellation(part)) return
-      const taskIds = new Set(parseTaskIds(part.input))
-      for (const report of parseStatusReports(part.output, part.errorText)) {
-        if (report.taskId) taskIds.add(report.taskId)
+      for (const taskId of parseTaskIds(part.input)) {
+        if (taskId) keys.add(taskId)
       }
-      for (const taskId of taskIds) {
-        const unitKey = index.taskToUnitKey.get(taskId)
-        if (unitKey) keys.add(unitKey)
+      for (const report of parseStatusReports(part.output, part.errorText)) {
+        if (report.taskId) keys.add(report.taskId)
       }
     })
   }
@@ -164,22 +159,33 @@ export function projectDelegationTranscript(
   }
 
   const grouped = groupDelegationRuns(records)
-  const canceledUnits = cancellationUnitKeys(messages, grouped.index)
+  // Identity grouping still folds status polls / live residual rows, but each
+  // turn (run) keeps its own card at its original transcript position so multi-
+  // turn continue/re-entry results stay visible as separate cards.
+  const canceledTaskIds = cancellationTaskIds(messages)
   const sourceReplacement = new Map<
     AdaptedToolCallPart,
     AdaptedDelegationWorkUnitPart | null
   >()
   for (const unit of grouped.units) {
-    const sources = unit.runs.map((run) => run.value)
-    const canonical: AdaptedDelegationWorkUnitPart = {
-      type: "delegation-work-unit",
-      key: `wu:${unit.key}`,
-      sources,
-      explicitUserCancel: canceledUnits.has(unit.key),
+    for (const run of unit.runs) {
+      const runId =
+        run.identity.taskId ??
+        run.identity.parentToolUseId ??
+        run.value.toolCallId
+      const sources = [run.value]
+      const canonical: AdaptedDelegationWorkUnitPart = {
+        type: "delegation-work-unit",
+        // Per-run key keeps React list identity stable when a work unit has
+        // multiple turns; unit.key alone would collide across cards.
+        key: `wu:${unit.key}:${runId}`,
+        sources,
+        explicitUserCancel: Boolean(
+          run.identity.taskId && canceledTaskIds.has(run.identity.taskId)
+        ),
+      }
+      sourceReplacement.set(run.value, canonical)
     }
-    sources.forEach((source, index) => {
-      sourceReplacement.set(source, index === 0 ? canonical : null)
-    })
   }
 
   return {
@@ -198,7 +204,7 @@ export function projectDelegationTranscript(
 export function shouldFoldLiveDelegationTool(
   part: AdaptedToolCallPart,
   index: DelegationIdentityIndex,
-  parentConversationId: number
+  _parentConversationId: number
 ): boolean {
   const toolName = normalizeToolName(part.toolName)
   if (toolName === "get_delegation_status") {
@@ -212,17 +218,7 @@ export function shouldFoldLiveDelegationTool(
     )
   }
 
-  if (!isDelegateToAgentToolName(part.toolName)) return false
-  const parsedInput = parseInput(part.input)
-  const isContinuation =
-    toolName === "continue_delegation" || parsedInput.replacesTaskId !== null
-  if (!isContinuation) return false
-  const identity = runRecord(part, parentConversationId).identity
-  if (
-    identity.workUnitKey &&
-    index.knownWorkUnitKeys.has(identity.workUnitKey)
-  ) {
-    return true
-  }
-  return identity.linkedTaskIds.some((taskId) => index.knownTaskIds.has(taskId))
+  // Each delegate / continue turn is a first-class card. Only status polls
+  // above fold into residual rows; never hide a live re-entry tool call.
+  return false
 }

@@ -2731,8 +2731,7 @@ async fn seed_resuming_continuation(store: &InMemoryContinuationStore) -> Contin
             parent_turn_generation: 3,
             task_ids: super::types::ContinuationTaskIds(vec!["task".into()]),
             armed_at: now,
-            wake_at: now
-                + ChronoDuration::milliseconds(CONTINUATION_CHECKPOINT_MS as i64),
+            wake_at: now + ChronoDuration::milliseconds(CONTINUATION_CHECKPOINT_MS as i64),
             internal_prompt_id: "prompt-admission".into(),
             internal_prompt_marker: internal_prompt_marker(
                 "continuation-admission",

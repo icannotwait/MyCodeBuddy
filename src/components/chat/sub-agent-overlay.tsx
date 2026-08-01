@@ -69,8 +69,8 @@ import {
   type OverlaySize,
 } from "@/lib/overlay-size-storage"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
+import { getAgentLabel } from "@/lib/custom-agents"
 import {
-  AGENT_LABELS,
   type AgentType,
   type DelegationActivityView,
   type WorkflowGraphSnapshot,
@@ -379,12 +379,10 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const userCollapsed = collapsedByKey[stateKey]
   const isExpanded =
     userCollapsed !== undefined ? !userCollapsed : defaultExpanded
-  const workflowRefreshActive =
-    conversationId != null &&
-    conversationId > 0 &&
-    isExpanded &&
-    activeSegment === "workflow" &&
-    graphExpanded
+  const overlayInterestActive =
+    conversationId != null && conversationId > 0 && isExpanded
+  const expandedGraphInterestActive =
+    overlayInterestActive && activeSegment === "workflow" && graphExpanded
 
   // Detail seed only — never installs listener/activation cleanup.
   useEffect(() => {
@@ -396,11 +394,19 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     }
   }, [conversationId, workflowGraph])
 
-  // Active expanded-graph refresh interest; React runs the lease cleanup.
+  // Open-overlay interest discovers the first graph and receives live nudges.
   useEffect(() => {
-    if (!workflowRefreshActive || conversationId == null) return
+    if (!overlayInterestActive || conversationId == null) return
+    return useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(conversationId)
+  }, [conversationId, overlayInterestActive])
+
+  // Full-graph interest adds immediate refresh and fallback timer ownership.
+  useEffect(() => {
+    if (!expandedGraphInterestActive || conversationId == null) return
     return useWorkflowGraphStore.getState().activateConversation(conversationId)
-  }, [conversationId, workflowRefreshActive])
+  }, [conversationId, expandedGraphInterestActive])
 
   useEffect(() => {
     sizeRef.current = size
@@ -1009,7 +1015,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           </span>
           <span className="min-w-0 break-words text-xs font-semibold text-foreground">
             {agentDisplayLabel ??
-              (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
+              (agentType ? getAgentLabel(agentType) : t("unknownAgent"))}
           </span>
           {taskId && (
             <span
@@ -1091,7 +1097,7 @@ const NativeActivityRow = memo(function NativeActivityRow({
             <AgentIcon agentType={activity.platform} className="h-3.5 w-3.5" />
           </span>
           <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-            {AGENT_LABELS[activity.platform] ?? tDel("unknownAgent")}
+            {getAgentLabel(activity.platform) ?? tDel("unknownAgent")}
           </span>
           {activity.task_id && (
             <span

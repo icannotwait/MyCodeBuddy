@@ -5,7 +5,9 @@ const mockTransport = vi.hoisted(() => ({
 }))
 
 vi.mock("@/lib/transport", () => ({
+  getActiveRemoteConnectionId: () => null,
   getTransport: () => mockTransport,
+  isDesktop: () => true,
 }))
 
 // Import only after the mock declaration so callers close over it.

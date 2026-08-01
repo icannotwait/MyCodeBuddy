@@ -46,6 +46,14 @@ type RunPeaks = {
   lineCountsComplete: boolean
 }
 
+/** Per-run wall anchors used to sum active durations (excludes inter-run idle). */
+type RunTiming = {
+  started: TimedValue | null
+  finished: TimedValue | null
+  /** True when this run is the current observation and still open for sticky tick. */
+  isCurrentOpen: boolean
+}
+
 function finiteNonNegative(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
@@ -95,13 +103,53 @@ function isRecoverable(
   return RECOVERABLE_ERROR_CODES.has(observation.errorCode)
 }
 
-function elapsedBetween(
-  started: TimedValue | null,
-  finishedMs: number
+function foldRunTiming(
+  current: RunTiming | undefined,
+  observation: WorkUnitRunObservation
+): RunTiming {
+  const stats = observation.runtimeStats
+  let started = current?.started ?? null
+  let finished = current?.finished ?? null
+  started = earlier(started, observation.startedAt)
+  finished = later(finished, observation.finishedAt)
+  if (stats) {
+    started = earlier(started, stats.started_at)
+    finished = later(finished, stats.finished_at)
+  }
+  // Current observation wins for "open" — last writer in the scan may not be
+  // current, so only set true when this observation is current+running.
+  const isCurrentOpen =
+    observation.current && observation.lifecycleStatus === "running"
+      ? true
+      : (current?.isCurrentOpen ?? false)
+  return { started, finished, isCurrentOpen }
+}
+
+/**
+ * Sum each run's active span (finished−started, or now−started for the open
+ * current run). Inter-run idle gaps are excluded so multi-turn / continue
+ * work units report accumulated turn time, matching per-run tool peaks.
+ */
+function sumPerRunElapsedMs(
+  timings: Iterable<RunTiming>,
+  nowMs: number
 ): number | null {
-  if (!started || !Number.isFinite(finishedMs)) return null
-  const elapsed = finishedMs - started.ms
-  return elapsed >= 0 ? elapsed : null
+  let total = 0
+  let any = false
+  for (const timing of timings) {
+    if (!timing.started) continue
+    // Open current run ticks against now; completed runs use finish.
+    const resolvedEnd =
+      timing.isCurrentOpen && Number.isFinite(nowMs)
+        ? nowMs
+        : timing.finished?.ms
+    if (resolvedEnd == null) continue
+    const elapsed = resolvedEnd - timing.started.ms
+    if (elapsed < 0) continue
+    total += elapsed
+    any = true
+  }
+  return any ? total : null
 }
 
 export function buildDelegationWorkUnitRuntime(input: {
@@ -111,6 +159,7 @@ export function buildDelegationWorkUnitRuntime(input: {
   explicitUserCancel: boolean
 }): WorkUnitRuntimeProjection {
   const peaksByRun = new Map<string, RunPeaks>()
+  const timingByRun = new Map<string, RunTiming>()
   const touchedFiles = new Map<string, DelegationTouchedFile>()
   let touchedFilesTruncated = false
   let startedAt: TimedValue | null = null
@@ -126,6 +175,9 @@ export function buildDelegationWorkUnitRuntime(input: {
     orphanReference = later(orphanReference, observation.lastAgentActivityAt)
     orphanReference = later(orphanReference, observation.startedAt)
 
+    const runKey = observation.taskId ?? observation.identity
+    timingByRun.set(runKey, foldRunTiming(timingByRun.get(runKey), observation))
+
     const stats = observation.runtimeStats
     if (!stats) continue
     startedAt = earlier(startedAt, stats.started_at)
@@ -137,7 +189,6 @@ export function buildDelegationWorkUnitRuntime(input: {
       touchedFiles.set(file.path, { ...file })
     }
 
-    const runKey = observation.taskId ?? observation.identity
     const runPeaks = peaksByRun.get(runKey) ?? {
       hasStats: false,
       toolCallCount: null,
@@ -177,11 +228,9 @@ export function buildDelegationWorkUnitRuntime(input: {
   }
 
   const finishedAt = activeSticky ? null : (latestFinishedAt?.value ?? null)
-  const elapsedMs = activeSticky
-    ? elapsedBetween(startedAt, input.nowMs)
-    : latestFinishedAt
-      ? elapsedBetween(startedAt, latestFinishedAt.ms)
-      : null
+  // Prefer sum of per-run active spans over unit wall-clock so idle gaps
+  // between continue/replace turns are not counted as work time.
+  const elapsedMs = sumPerRunElapsedMs(timingByRun.values(), input.nowMs)
 
   const runPeaks = [...peaksByRun.values()].filter((entry) => entry.hasStats)
   const toolPeaks = runPeaks

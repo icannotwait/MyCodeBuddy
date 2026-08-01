@@ -547,6 +547,10 @@ fn agent_root_slots(agent_type: AgentType) -> &'static [RootSlot] {
                 default_rel: &[".pi", "agent", "sessions"],
             },
         ],
+        // A custom ACP agent has no codeg-known private directory layout —
+        // codeg never reads its store (history comes from codeg's own ACP
+        // transcript), so there is nothing to widen the sandbox roots for.
+        AgentType::Custom(_) => &[],
     }
 }
 

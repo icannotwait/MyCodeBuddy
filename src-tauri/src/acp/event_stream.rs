@@ -355,7 +355,14 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
     // UUID-shaped ones production emits. (`ENVELOPE_OVERHEAD` covers its key.)
     let base = ENVELOPE_OVERHEAD + json_str_len(&envelope.connection_id);
     let payload = match &envelope.payload {
-        AcpEvent::ContentDelta { text } | AcpEvent::Thinking { text } => json_str_len(text),
+        AcpEvent::ContentDelta {
+            text,
+            parent_tool_use_id,
+        }
+        | AcpEvent::Thinking {
+            text,
+            parent_tool_use_id,
+        } => json_str_len(text) + opt_str_size(parent_tool_use_id),
         AcpEvent::ClaudeSdkMessage {
             session_id,
             message,
@@ -670,7 +677,10 @@ mod tests {
         Arc::new(EventEnvelope {
             seq,
             connection_id: "c".into(),
-            payload: AcpEvent::ContentDelta { text: text.into() },
+            payload: AcpEvent::ContentDelta {
+                text: text.into(),
+                parent_tool_use_id: None,
+            },
         })
     }
 
@@ -963,6 +973,25 @@ mod tests {
                 connection_id: "conn-xyz".into(),
                 payload: AcpEvent::Thinking {
                     text: "reason\"ing\n".into(),
+                    parent_tool_use_id: None,
+                },
+            }),
+            // Parented (subagent-attributed) chunks: the optional id is a
+            // sized string field, including an escape-heavy id.
+            Arc::new(EventEnvelope {
+                seq: 31,
+                connection_id: "conn-xyz".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "sub text".into(),
+                    parent_tool_use_id: Some("toolu_01ABC".into()),
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 32,
+                connection_id: "conn-xyz".into(),
+                payload: AcpEvent::Thinking {
+                    text: "sub think".into(),
+                    parent_tool_use_id: Some("id\"with\\escapes\n".into()),
                 },
             }),
             Arc::new(EventEnvelope {
@@ -1259,6 +1288,7 @@ mod tests {
             connection_id: "\"".repeat(65_200),
             payload: AcpEvent::ContentDelta {
                 text: String::new(),
+                parent_tool_use_id: None,
             },
         });
         let serialized = serde_json::to_vec(&*env).expect("serialize").len();

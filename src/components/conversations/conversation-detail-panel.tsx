@@ -22,10 +22,23 @@ import {
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
+import { groupOfTab } from "@/stores/tab-store"
+import { computeRects, leafIds } from "@/lib/tab-group-layout"
 import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextFromMenu } from "@/lib/utils"
 import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 import { TileScrollContainer } from "@/components/conversations/tile-scroll-container"
+import { GroupSplitHandle } from "@/components/conversations/group-split-handle"
+import { TabBar } from "@/components/tabs/tab-bar"
+import { TabDragGhost } from "@/components/tabs/tab-drag-ghost"
+import { useSidebarContext } from "@/contexts/sidebar-context"
+import { useAuxPanelContext } from "@/contexts/aux-panel-context"
+import { useWorkspaceView } from "@/contexts/workspace-context"
+import { useIsMobile } from "@/hooks/use-mobile"
+import { usePlatform } from "@/hooks/use-platform"
+import { useZoomLevel } from "@/hooks/use-appearance"
+import { isDesktop } from "@/lib/platform"
+import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
@@ -69,6 +82,7 @@ const ConversationTabView = memo(function ConversationTabView({
   isActive,
   showActiveFlow,
   reloadSignal,
+  groupId,
 }: {
   tabId: string
   conversationId: number | null
@@ -77,6 +91,7 @@ const ConversationTabView = memo(function ConversationTabView({
   isActive: boolean
   showActiveFlow: boolean
   reloadSignal: number
+  groupId: string
 }) {
   const ownTab = useTabStore(
     (s) => s.tabs.find((tab) => tab.id === tabId) ?? null
@@ -92,9 +107,38 @@ const ConversationTabView = memo(function ConversationTabView({
       isActive={isActive}
       showActiveFlow={showActiveFlow}
       reloadSignal={reloadSignal}
+      groupId={groupId}
     />
   )
 })
+
+const GROUP_EDGE_EPSILON = 0.1
+
+function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
+  const isMobile = useIsMobile()
+  const { isOpen: sidebarOpen } = useSidebarContext()
+  const { isOpen: auxOpen } = useAuxPanelContext()
+  const { mode } = useWorkspaceView()
+  const { isMac, isWindows, isLinux } = usePlatform()
+  const { zoomLevel } = useZoomLevel()
+  if (isMobile) return null
+  const width =
+    side === "left"
+      ? sidebarOpen
+        ? 0
+        : leftChromeReserve(isMac && isDesktop(), zoomLevel)
+      : !auxOpen && mode === "conversation"
+        ? rightChromeReserve(isDesktop() && (isWindows || isLinux), zoomLevel)
+        : 0
+  if (width <= 0) return null
+  return (
+    <div
+      data-tauri-drag-region
+      className="h-full shrink-0 ws-strip-line"
+      style={{ width }}
+    />
+  )
+}
 
 export function ConversationDetailPanel() {
   const t = useTranslations("Folder.conversation")
@@ -106,11 +150,16 @@ export function ConversationDetailPanel() {
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
-  const isTileMode = useTabStore((s) => s.isTileMode)
+  const groupLayout = useTabStore((s) => s.groupLayout)
+  const groupOf = useTabStore((s) => s.groupOf)
+  const groupSelection = useTabStore((s) => s.groupSelection)
+  const tileByGroup = useTabStore((s) => s.tileByGroup)
+  const dragOverGroupId = useTabStore((s) => s.tabDrag?.overGroupId ?? null)
   const {
     openNewConversationTab,
     closeTab,
     switchTab,
+    resizeGroupSplit,
     onPreviewTabReplaced,
     setDraftDelegationRoute,
   } = useTabActions()
@@ -417,27 +466,69 @@ export function ConversationDetailPanel() {
     }
   }, [folder, hasNoTabs, newConversation?.workingDir, openNewConversationTab])
 
-  const canTile = isTileMode && tabs.length > 1
-
+  const { groups: groupRects, handles: groupHandles } = useMemo(
+    () => computeRects(groupLayout),
+    [groupLayout]
+  )
+  const orderedGroupIds = useMemo(() => leafIds(groupLayout), [groupLayout])
+  const isSplit = orderedGroupIds.length > 1
+  const tabsByGroup = useMemo(() => {
+    const byGroup = new Map<string, typeof tabs>()
+    for (const groupId of orderedGroupIds) byGroup.set(groupId, [])
+    for (const tab of tabs) {
+      const groupId = groupOfTab(groupOf, groupLayout, tab.id)
+      const bucket = byGroup.get(groupId)
+      if (bucket) bucket.push(tab)
+      else byGroup.set(groupId, [tab])
+    }
+    return byGroup
+  }, [tabs, groupOf, groupLayout, orderedGroupIds])
   const tileTabRefs = useRef<Map<string, HTMLDivElement | null>>(new Map())
+  const groupContainerRef = useRef<HTMLDivElement | null>(null)
+
+  const tiledSelectionKey = useMemo(
+    () =>
+      orderedGroupIds
+        .filter(
+          (groupId) =>
+            tileByGroup[groupId] &&
+            (tabsByGroup.get(groupId)?.length ?? 0) > 1 &&
+            groupSelection[groupId] != null
+        )
+        .map((groupId) => groupSelection[groupId])
+        .join("|"),
+    [orderedGroupIds, tileByGroup, tabsByGroup, groupSelection]
+  )
+  useEffect(() => {
+    if (!tiledSelectionKey) return
+    for (const selectedId of tiledSelectionKey.split("|")) {
+      tileTabRefs.current.get(selectedId)?.scrollIntoView({
+        behavior: "smooth",
+        inline: "center",
+        block: "nearest",
+      })
+    }
+  }, [tiledSelectionKey])
 
   useEffect(() => {
-    if (!canTile || !activeTabId) return
-    const el = tileTabRefs.current.get(activeTabId)
-    if (!el) return
-    el.scrollIntoView({
-      behavior: "smooth",
-      inline: "center",
-      block: "nearest",
-    })
-  }, [canTile, activeTabId])
+    const state = useTabStore.getState()
+    if (state.tabDrag && !tabs.some((tab) => tab.id === state.tabDrag?.tabId)) {
+      state.endTabDrag()
+    }
+  }, [tabs])
 
   if (hasNoTabs) {
     return null
   }
 
-  const tabElements = tabs.map((tab, index) => {
+  const renderTabWrapper = (
+    tab: (typeof tabs)[number],
+    indexInGroup: number,
+    groupId: string,
+    canTileGroup: boolean
+  ) => {
     const active = tab.id === activeTabId
+    const visible = canTileGroup || tab.id === groupSelection[groupId]
     const folderPath = allFolders.find((f) => f.id === tab.folderId)?.path
     const view = (
       <ConversationTabView
@@ -446,14 +537,15 @@ export function ConversationDetailPanel() {
         agentType={tab.agentType}
         workingDir={tab.workingDir ?? folderPath}
         isActive={active}
-        showActiveFlow={canTile && active}
+        showActiveFlow={(isSplit || canTileGroup) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
+        groupId={groupId}
       />
     )
     return (
       <div
         key={tab.id}
-        hidden={!canTile && !active}
+        hidden={!visible}
         ref={(el) => {
           if (el) {
             tileTabRefs.current.set(tab.id, el)
@@ -462,33 +554,109 @@ export function ConversationDetailPanel() {
           }
         }}
         className={cn(
-          canTile
+          canTileGroup
             ? cn(
                 "relative h-full min-w-[24rem] flex-1 overflow-hidden",
-                index > 0 && "border-l border-border/50"
+                indexInGroup > 0 && "border-l border-border/50"
               )
-            : active
+            : visible
               ? "h-full"
               : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
         )}
         onPointerDownCapture={
-          canTile && !active ? () => switchTab(tab.id) : undefined
+          visible && !active ? () => switchTab(tab.id) : undefined
         }
       >
         {/* The visible active cue is now the composer's flowing gradient border
             (see message-input.tsx); keep a non-visual cue for assistive tech in
             tiled mode, where the old top-center icon used to provide it. */}
-        {canTile && active && (
+        {(isSplit || canTileGroup) && active && (
           <span className="sr-only">{t("activeConversationIndicator")}</span>
         )}
         {view}
       </div>
     )
-  })
+  }
 
-  // A single header sits fixed above the horizontally-scrolling tile row, so it
-  // never scrolls on the x-axis when conversations are tiled. It reflects the
-  // active conversation; on mobile it is the sole conversation's header.
+  const renderGroupShell = (groupId: string) => {
+    const rect = groupRects.get(groupId)
+    if (!rect) return null
+    const groupTabs = tabsByGroup.get(groupId) ?? []
+    const canTileGroup = !!tileByGroup[groupId] && groupTabs.length > 1
+    const touchesTop = rect.y <= GROUP_EDGE_EPSILON
+    const touchesLeft = touchesTop && rect.x <= GROUP_EDGE_EPSILON
+    const touchesRight =
+      touchesTop && rect.x + rect.w >= 100 - GROUP_EDGE_EPSILON
+    const selectedTab =
+      groupTabs.find((tab) => tab.id === groupSelection[groupId]) ??
+      groupTabs[0] ??
+      null
+    const selectedFolder = selectedTab
+      ? allFolders.find((item) => item.id === selectedTab.folderId)
+      : undefined
+
+    return (
+      <div
+        key={groupId}
+        data-conv-group-shell={groupId}
+        className="absolute flex min-h-0 flex-col overflow-hidden"
+        style={{
+          left: `${rect.x}%`,
+          top: `${rect.y}%`,
+          width: `${rect.w}%`,
+          height: `${rect.h}%`,
+        }}
+      >
+        {isSplit && (
+          <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+            {touchesLeft && <SplitStripCornerReserve side="left" />}
+            <TabBar groupId={groupId} />
+            {touchesRight && <SplitStripCornerReserve side="right" />}
+          </div>
+        )}
+        {isSplit && selectedTab && (
+          <div
+            className="shrink-0"
+            onPointerDownCapture={() => {
+              const selected = groupSelection[groupId]
+              if (selected && selected !== useTabStore.getState().activeTabId) {
+                switchTab(selected)
+              }
+            }}
+          >
+            <ConversationDetailHeader
+              tabId={selectedTab.id}
+              conversationId={selectedTab.conversationId}
+              runtimeConversationId={selectedTab.runtimeConversationId ?? null}
+              folderId={selectedTab.folderId}
+              folderPath={selectedFolder?.path}
+              title={selectedTab.title}
+              status={selectedTab.status as ConversationStatus | undefined}
+            />
+          </div>
+        )}
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          <TileScrollContainer canTile={canTileGroup}>
+            <div
+              className={cn(
+                "relative h-full",
+                canTileGroup && "flex min-w-full flex-row"
+              )}
+            >
+              {groupTabs.map((tab, indexInGroup) =>
+                renderTabWrapper(tab, indexInGroup, groupId, canTileGroup)
+              )}
+            </div>
+          </TileScrollContainer>
+          {dragOverGroupId === groupId && (
+            <div className="pointer-events-none absolute inset-0 z-30 bg-primary/5 ring-2 ring-inset ring-primary/30" />
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // While unsplit the active conversation keeps the shared global header.
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null
   const activeTabFolder = activeTab
     ? allFolders.find((f) => f.id === activeTab.folderId)
@@ -497,7 +665,7 @@ export function ConversationDetailPanel() {
   return (
     <>
       <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        {activeTab && (
+        {!isSplit && activeTab && (
           <ConversationDetailHeader
             tabId={activeTab.id}
             conversationId={activeTab.conversationId}
@@ -511,20 +679,20 @@ export function ConversationDetailPanel() {
         <ContextMenu onOpenChange={handleContextMenuOpenChange}>
           <ContextMenuTrigger asChild>
             <div
+              ref={groupContainerRef}
               className="relative min-h-0 flex-1 overflow-hidden"
               onPointerDown={handleContextMenuTriggerPointerDown}
             >
-              {/* Stable wrapper across canTile flip — otherwise sibling tabs remount and a live streaming response is torn down. */}
-              <TileScrollContainer canTile={canTile}>
-                <div
-                  className={cn(
-                    "relative h-full",
-                    canTile && "flex min-w-full flex-row"
-                  )}
-                >
-                  {tabElements}
-                </div>
-              </TileScrollContainer>
+              {orderedGroupIds.map((groupId) => renderGroupShell(groupId))}
+              {isSplit &&
+                groupHandles.map((handle) => (
+                  <GroupSplitHandle
+                    key={`${handle.splitId}:${handle.index}`}
+                    handle={handle}
+                    containerRef={groupContainerRef}
+                    onResize={resizeGroupSplit}
+                  />
+                ))}
             </div>
           </ContextMenuTrigger>
           <ContextMenuContent>
@@ -604,6 +772,7 @@ export function ConversationDetailPanel() {
           </ContextMenuContent>
         </ContextMenu>
       </div>
+      <TabDragGhost />
       {activeSessionSummary && (
         <SessionDetailsDialog
           open={detailsOpen}

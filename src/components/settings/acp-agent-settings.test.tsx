@@ -24,12 +24,14 @@ import type { AcpAgentInfo, AgentType, PreflightResult } from "@/lib/types"
 function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
   return {
     agent_type: "hermes" as AgentType,
+    skills_capable: true,
     registry_id: "hermes",
     registry_version: "0.16.0",
     name: "Hermes Agent",
     description: "",
     available: true,
     distribution_type: "uvx",
+    custom_source: null,
     enabled: true,
     sort_order: 0,
     installed_version: null,
@@ -49,6 +51,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     cursor_settings: null,
     model_provider_id: null,
     show_thinking: false,
+    icon_url: null,
     ...overrides,
   }
 }
@@ -592,6 +595,66 @@ describe("buildVersionCheck", () => {
 
     expect(check?.status).toBe("fail")
     expect(check?.fixes).toEqual([])
+  })
+
+  // A manually written definition has no registry behind it — its stored
+  // version is user-typed — so the check must show the local side alone and
+  // never manufacture an "upgrade available" against that noise.
+  it("shows only the local version for a manually added custom agent", () => {
+    const installed = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "manual",
+        registry_version: "0.0.0",
+        installed_version: "1.44.0",
+      })
+    )
+    expect(installed?.status).toBe("pass")
+    // The manual pass message, not the generic "Already latest" (there is no
+    // "latest" to be at). The mocked translator returns raw templates, so
+    // assertions stay at the template level.
+    expect(installed?.message).toContain("Installed")
+    expect(installed?.message).not.toContain("Already latest")
+    // The registry-comparison flow would have produced an upgrade hint here
+    // (0.0.0 < 1.44.0 is "not latest" in the generic flow's terms).
+    expect(installed?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(
+      false
+    )
+    expect(installed?.fixes.some((fix) => fix.kind === "uninstall_npx")).toBe(
+      true
+    )
+  })
+
+  it("still demands an install for a manual custom agent with no local version", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "manual",
+        registry_version: "0.0.0",
+        installed_version: null,
+      })
+    )
+    expect(check?.status).toBe("fail")
+    expect(check?.fixes.some((fix) => fix.kind === "install_npx")).toBe(true)
+  })
+
+  // A registry-added custom agent keeps the full remote/local comparison — its
+  // stored version is a real registry snapshot.
+  it("keeps the remote comparison for a registry-added custom agent", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "registry",
+        registry_version: "2.0.0",
+        installed_version: "1.0.0",
+      })
+    )
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain("Upgrade available")
+    expect(check?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(true)
   })
 
   // uv runtime not ready: a uvx agent (Hermes) must surface a blocked

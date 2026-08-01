@@ -1235,6 +1235,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn shared_sanitize_hides_gemini_route_blocks_but_keeps_mixed_text() {
+        let route = "Codeg mandatory delegation route: profile_id=\"profile-a\"";
+        let route_only = serde_json::json!({"content": [{"text": route}]});
+        assert!(GeminiParser::parse_user_blocks(&route_only).is_empty());
+
+        let mixed = format!("{route}\nPlease keep this prose");
+        let mixed_message = serde_json::json!({"content": [{"text": mixed}]});
+        let blocks = GeminiParser::parse_user_blocks(&mixed_message);
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == &mixed
+        ));
+    }
+
     fn test_codeg_terminal_context() -> String {
         "<codeg_terminal_context version=\"1\">\n\
 Selected shell: PowerShell 7\n\

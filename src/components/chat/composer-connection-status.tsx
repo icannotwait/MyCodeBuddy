@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useSyncExternalStore } from "react"
+import { getAgentLabel } from "@/lib/custom-agents"
 import {
   HeartHandshake,
   HeartPulse,
@@ -10,7 +11,6 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useConnectionStore } from "@/contexts/acp-connections-context"
-import { AGENT_LABELS } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 // Connection-only states. The session "prompting" state is intentionally
@@ -80,7 +80,7 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
   const statusKey = toConnStatus(conn?.status ?? null)
   const statusLabel = t(statusKey)
   const agentType = conn?.agentType ?? null
-  const agentLabel = agentType ? AGENT_LABELS[agentType] : null
+  const agentLabel = agentType ? getAgentLabel(agentType) : null
   const titleText = !agentLabel
     ? statusLabel
     : statusKey === "error" && conn?.error

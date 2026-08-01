@@ -40,6 +40,12 @@ import {
 } from "@/stores/tab-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 
+function resetTabStoreForTest(): void {
+  localStorage.removeItem("workspace:tab-groups:v1")
+  localStorage.removeItem("workspace:tile-mode")
+  resetTabStore()
+}
+
 function openedItem(
   conversationId: number,
   opts: {
@@ -177,7 +183,7 @@ describe("evictTabsToLimit", () => {
 
 describe("local open paths under limit", () => {
   beforeEach(() => {
-    resetTabStore()
+    resetTabStoreForTest()
     useTabStore.setState({ tabsHydrated: true })
   })
 
@@ -464,7 +470,7 @@ describe("local open paths under limit", () => {
 
 describe("hydrate / remote over limit", () => {
   beforeEach(() => {
-    resetTabStore()
+    resetTabStoreForTest()
     vi.useFakeTimers()
     vi.mocked(listOpenedTabs).mockReset()
     vi.mocked(saveOpenedTabs).mockReset()

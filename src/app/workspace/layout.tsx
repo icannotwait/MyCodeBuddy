@@ -23,6 +23,7 @@ import {
 import { DelegationProvider } from "@/contexts/delegation-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { TabProvider, useTabStore, useTabActions } from "@/contexts/tab-context"
+import { selectIsSplit } from "@/stores/tab-store"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
@@ -264,6 +265,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { isMac, isWindows, isLinux } = usePlatform()
   const { zoomLevel } = useZoomLevel()
   const hasConvTabs = useTabStore((s) => s.tabs.length > 0)
+  const isConvSplit = useTabStore(selectIsSplit)
   const winLinuxControls = isDesktop() && (isWindows || isLinux)
   // The window chrome (toggle/remote left, terminal/aux/settings right) now
   // lives in fixed corner overlays (see FolderLayoutShell) that never move on
@@ -312,47 +314,54 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
               )}
               inert={filesMaximized || undefined}
             >
-              {/* Conversation column top bar: the tab strip, plus a left reserve
-                  (only when the sidebar is collapsed, so this column owns the
-                  window's left edge) and a right reserve (only when it's the
-                  window's right edge) for the fixed corner overlays. The detail
-                  header + tiles render inside {children}, directly below.
-                  `bg-muted` shades the strip like a browser tab bar (matching
-                  the bottom StatusBar) — the active tab (bg-background) reads as
-                  a white tab seated on it, with reverse bottom corners. With a
-                  workspace background image on, the strip + every tab go
-                  transparent (reveal the image); a hairline bottom border
-                  (ws-strip-line) runs under the reserves and inactive tabs while
-                  the active tab omits it and the border arches over its top
-                  (the active browser-tab-item's `::after`) instead. */}
-              <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
-                {!sidebarOpen && (
-                  <div
-                    data-tauri-drag-region
-                    className="h-full shrink-0 ws-strip-line"
-                    style={{ width: leftReserve }}
-                  />
-                )}
-                <div className="flex min-w-0 flex-1 items-stretch">
-                  {hasConvTabs ? (
-                    <TabBar />
-                  ) : (
-                    // No tabs → TabBar renders null; keep a drag region so the
-                    // empty bar can still move the window.
+              {/* Conversation column top bar (UNSPLIT only): the tab strip,
+                  plus a left reserve (only when the sidebar is collapsed, so
+                  this column owns the window's left edge) and a right reserve
+                  (only when it's the window's right edge) for the fixed corner
+                  overlays. The detail header + tiles render inside {children},
+                  directly below. `bg-muted` shades the strip like a browser tab
+                  bar (matching the bottom StatusBar) — the active tab
+                  (bg-background) reads as a white tab seated on it, with
+                  reverse bottom corners. With a workspace background image on,
+                  the strip + every tab go transparent (reveal the image); a
+                  hairline bottom border (ws-strip-line) runs under the reserves
+                  and inactive tabs while the active tab omits it and the border
+                  arches over its top (the active browser-tab-item's `::after`)
+                  instead. While SPLIT this row disappears entirely (no blank
+                  drag strip above the shells): each group shell hosts its own
+                  strip whose tail spacer is a window-drag region, and the
+                  TOP-edge strips re-create the corner reserves themselves (see
+                  SplitStripCornerReserve in conversation-detail-panel). */}
+              {!isConvSplit && (
+                <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+                  {!sidebarOpen && (
                     <div
                       data-tauri-drag-region
-                      className="h-full min-w-0 flex-1 ws-strip-line"
+                      className="h-full shrink-0 ws-strip-line"
+                      style={{ width: leftReserve }}
+                    />
+                  )}
+                  <div className="flex min-w-0 flex-1 items-stretch">
+                    {hasConvTabs ? (
+                      <TabBar />
+                    ) : (
+                      // No tabs → TabBar renders null; keep a drag region so
+                      // the title bar can still move the window.
+                      <div
+                        data-tauri-drag-region
+                        className="h-full min-w-0 flex-1 ws-strip-line"
+                      />
+                    )}
+                  </div>
+                  {convReservesRight && (
+                    <div
+                      data-tauri-drag-region
+                      className="h-full shrink-0 ws-strip-line"
+                      style={{ width: rightReserve }}
                     />
                   )}
                 </div>
-                {convReservesRight && (
-                  <div
-                    data-tauri-drag-region
-                    className="h-full shrink-0 ws-strip-line"
-                    style={{ width: rightReserve }}
-                  />
-                )}
-              </div>
+              )}
               {/* Pane activation lives on the CONTENT, not the top bar: clicking
                   edge chrome (terminal/settings/toggles) or grabbing a drag
                   region stays pane-neutral so it never hijacks close-tab /

@@ -181,6 +181,16 @@ export const ChatInput = memo(function ChatInput({
     <div
       className={cn("pt-0", flush ? "pb-1" : "px-4 pb-1")}
       onContextMenu={(event) => event.stopPropagation()}
+      // Touch and pen open a context menu from a LONG PRESS, which Radix arms on
+      // pointerdown — and the whole conversation panel (composer included) sits
+      // inside its own context-menu trigger. Without this, a slow tap on any
+      // composer control (the agent icon, the send button, …) pops the
+      // conversation menu. Mouse presses keep bubbling, so the panel's
+      // selection bookkeeping is untouched; the composer's OWN context menu
+      // still arms, since its trigger is nested below this wrapper.
+      onPointerDown={(event) => {
+        if (event.pointerType !== "mouse") event.stopPropagation()
+      }}
     >
       {queue &&
         queue.length > 0 &&

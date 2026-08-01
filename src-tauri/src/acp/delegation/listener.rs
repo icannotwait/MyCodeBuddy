@@ -6412,6 +6412,7 @@ mod tests {
             token: "workflow-v2-token".into(),
             features: CompanionFeatures::parse(Some("workflow_v2")),
             role: CompanionRole::Root,
+            disabled_agents: Vec::new(),
         };
         let inflight = Arc::new(InflightCalls::new());
 

@@ -61,7 +61,7 @@ import type {
   ConversationStatus,
   DbConversationSummary,
 } from "@/lib/types"
-import { AGENT_LABELS } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import {
   loadFolderExpanded,
   saveFolderExpanded,
@@ -548,7 +548,7 @@ const FolderHeader = memo(function FolderHeader({
                         className="gap-2"
                       >
                         <span className="min-w-0 flex-1 truncate">
-                          {AGENT_LABELS[agent]}
+                          {getAgentLabel(agent)}
                         </span>
                         {active ? (
                           <Check className="h-3.5 w-3.5 shrink-0" />
@@ -563,7 +563,7 @@ const FolderHeader = memo(function FolderHeader({
                       className="gap-2 opacity-60"
                     >
                       <span className="min-w-0 flex-1 truncate">
-                        {`${AGENT_LABELS[currentDefaultAgent]} ${t("folderHeaderMenu.agentUnavailableSuffix")}`}
+                        {`${getAgentLabel(currentDefaultAgent)} ${t("folderHeaderMenu.agentUnavailableSuffix")}`}
                       </span>
                       <Check className="h-3.5 w-3.5 shrink-0" />
                     </ContextMenuItem>
@@ -735,6 +735,9 @@ export function SidebarConversationList({
 
   const activeTabId = useTabStore((s) => s.activeTabId)
   const tabs = useTabStore((s) => s.tabs)
+  // Detached pop-out focus has no main tab; openTab stamps this so the card
+  // still shows selected chrome / suppresses the awaiting-reply red dot.
+  const sidebarSelection = useTabStore((s) => s.sidebarSelection)
   const {
     openTab,
     closeConversationTab,
@@ -775,15 +778,23 @@ export function SidebarConversationList({
   // (render-phase ref cache; idempotent under StrictMode's double invoke).
   const selectedConvRef = useRef<{ id: number; agentType: string } | null>(null)
   const selectedConversation = useMemo(() => {
-    const activeTab = tabs.find((tab) => tab.id === activeTabId)
-    const next =
-      !activeTab || activeTab.conversationId == null
-        ? null
-        : { id: activeTab.conversationId, agentType: activeTab.agentType }
+    // Prefer detached sidebar selection (no main-tab mirror) over the active
+    // main tab so a pop-out re-click highlights the focused conversation.
+    const next = sidebarSelection
+      ? {
+          id: sidebarSelection.id,
+          agentType: sidebarSelection.agentType,
+        }
+      : (() => {
+          const activeTab = tabs.find((tab) => tab.id === activeTabId)
+          return !activeTab || activeTab.conversationId == null
+            ? null
+            : { id: activeTab.conversationId, agentType: activeTab.agentType }
+        })()
     const reused = reuseSelected(selectedConvRef.current, next)
     selectedConvRef.current = reused
     return reused
-  }, [tabs, activeTabId])
+  }, [tabs, activeTabId, sidebarSelection])
 
   const openTabKeysRef = useRef<Set<string>>(new Set())
   const openTabKeys = useMemo(() => {
@@ -2420,6 +2431,15 @@ export function SidebarConversationList({
             <Rocket className="h-3.5 w-3.5 mr-1.5" />
             {tFolderDropdown("projectBoot")}
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full max-w-[14rem] justify-start"
+            onClick={handleOpenImportWindow}
+          >
+            <Download className="h-3.5 w-3.5 mr-1.5" />
+            {t("importLocalSessions")}
+          </Button>
         </div>
       ) : (
         <ContextMenu>
@@ -2555,6 +2575,10 @@ export function SidebarConversationList({
             <ContextMenuItem onSelect={handleProjectBoot}>
               <Rocket className="h-4 w-4" />
               {tFolderDropdown("projectBoot")}
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={handleOpenImportWindow}>
+              <Download className="h-4 w-4" />
+              {t("importLocalSessions")}
             </ContextMenuItem>
           </ContextMenuContent>
         </ContextMenu>

@@ -12,6 +12,7 @@ use crate::db::service::{conversation_service, folder_service, import_service, t
 use crate::db::AppDatabase;
 use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
+use crate::parsers::acp_native::AcpNativeParser;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
@@ -235,7 +236,7 @@ fn list_conversations_sync(
     let mut all_rows: Vec<(AgentType, ConversationSummary)> = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
+    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
         (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
         (AgentType::Codex, Box::new(CodexParser::new())),
         (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
@@ -248,6 +249,11 @@ fn list_conversations_sync(
         (AgentType::Grok, Box::new(GrokParser::new())),
         (AgentType::Cursor, Box::new(CursorParser::new())),
     ];
+    // Registered custom agents read back from codeg's own ACP transcripts, so
+    // their sessions participate in folder grouping and stats like any other.
+    for custom in crate::acp::custom_registry::all() {
+        parsers.push((custom, Box::new(AcpNativeParser::new(custom))));
+    }
 
     for (at, parser) in &parsers {
         if let Some(ref agent_filter) = agent_type {
@@ -393,6 +399,9 @@ pub async fn get_conversation_core(
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
             AgentType::Cursor => Box::new(CursorParser::new()),
+            // Custom ACP agents have no native store to reverse-engineer;
+            // their history is codeg's own ACP transcript.
+            AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
         };
 
         let detail = parser
@@ -1479,6 +1488,7 @@ pub async fn get_folder_conversation_core(
                     AgentType::Pi => Box::new(PiParser::new()),
                     AgentType::Grok => Box::new(GrokParser::new()),
                     AgentType::Cursor => Box::new(CursorParser::new()),
+                    AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
                 };
                 match parser.get_conversation(&eid) {
                     Ok(d) => {
@@ -2864,6 +2874,11 @@ mod tests {
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // These tests exercise the process-wide production import guard directly.
+    // Rust runs unit tests concurrently, so serialize only this small group to
+    // prevent one test's intentional lock hold from invalidating another.
+    static IMPORT_GUARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Empty registry for pre-existing folder-conversation tests.
     async fn inert_internal_session_registry(
@@ -5130,6 +5145,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn import_local_conversations_core_missing_folder_errors() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         let db = fresh_in_memory_db().await;
         let data_dir = TempDir::new().expect("tempdir");
         let registry =
@@ -5692,10 +5708,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 continue;
             }
             let p = &*evt.payload;
-            if p["kind"] == "close"
-                && p["folder_id"] == folder_id
-                && p["cause"] == "auto_empty"
-            {
+            if p["kind"] == "close" && p["folder_id"] == folder_id && p["cause"] == "auto_empty" {
                 saw_auto_empty_close = true;
             }
         }
@@ -6422,14 +6435,14 @@ Call get_delegation_status with the returned task_id to collect the result.";
                     upsert_before_close = true;
                 }
             }
-            if p["kind"] == "close"
-                && p["folder_id"] == folder_id
-                && p["cause"] == "auto_empty"
-            {
+            if p["kind"] == "close" && p["folder_id"] == folder_id && p["cause"] == "auto_empty" {
                 saw_auto_empty_close = true;
             }
         }
-        assert!(saw_upsert, "empty-group import still Upserts the reopened folder");
+        assert!(
+            saw_upsert,
+            "empty-group import still Upserts the reopened folder"
+        );
         assert!(
             saw_auto_empty_close,
             "zero-live import group must emit Close{{AutoEmpty}}"
@@ -6442,6 +6455,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn import_selected_sessions_core_rejects_concurrent_and_empty() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         let db = fresh_in_memory_db().await;
         let data_dir = TempDir::new().expect("tempdir");
         let registry = inert_internal_session_registry(&db, data_dir.path()).await;
@@ -6474,6 +6488,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn legacy_import_shares_the_guard_with_batch_import() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         // The retained legacy command must NOT bypass IMPORT_GUARD — otherwise a
         // legacy import racing a batch import could double-insert on a DB with no
         // unique index. With the guard held it is rejected BEFORE the folder

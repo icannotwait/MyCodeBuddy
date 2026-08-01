@@ -206,7 +206,15 @@
       "downloadFailed": "下載更新包失敗，請稍後再試。",
       "installFailed": "安裝更新失敗，請關閉應用後重試。",
       "unknown": "更新失敗，請稍後再試。"
-    }
+    },
+    "newVersionBadge": "新版本 v{version}",
+    "updateAvailableTitle": "發現新版本",
+    "releaseNotesTitle": "更新內容",
+    "remindLater": "稍後",
+    "retry": "重試",
+    "stepDownload": "下載",
+    "stepInstall": "安裝",
+    "stepRestart": "重新啟動"
   },
   "VersionControlSettings": {
     "loading": "載入中...",
@@ -540,6 +548,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK管理",
     "description": "統一管理 Agent 的連接SDK、啟用狀態、環境變數、配置管理與版本預檢資訊。",
+    "showThinking": "Show thinking",
     "loadingAgents": "載入 Agent 列表中...",
     "agentList": "Agent 列表",
     "emptyNoAgent": "暫無可用 Agent。",
@@ -751,7 +760,9 @@
       "loggedIn": "帳號已登入",
       "loginRelogin": "重新登入 / 切換帳號",
       "loginTimeout": "登入逾時，請重試",
-      "loginSaveFailed": "登入成功但配置儲存失敗"
+      "loginSaveFailed": "登入成功但配置儲存失敗",
+      "enableFast": "啟用 Fast",
+      "enableFastAria": "Codex 啟用 Fast 服務等級"
     },
     "gemini": {
       "authConfig": "Gemini 認證配置",
@@ -882,14 +893,20 @@
     },
     "kimiCode": {
       "configManagement": "Kimi Code 設定",
-      "configDescription": "`kimi acp` 僅憑已儲存的登入權杖鑒權，單獨的 API Key 不被接受。為支援 API Key，codeg 會寫入受管的 ~/.kimi-code/config.toml 供應商，並在本機播種一個閘道權杖以開啟工作階段——推理仍走你的 Key。",
-      "gateReadyApiKey": "已透過 API Key 鑒權（codeg 已播種本機閘道權杖）。",
-      "gateReadyLogin": "已透過 Kimi 帳號登入鑒權。",
-      "gateNotReady": "尚未鑒權——請在下方儲存 API Key（或登入）以開啟 Kimi 工作階段。",
-      "authModeLabel": "鑒權方式",
+      "configDescription": "`kimi acp` 只認已儲存的登入權杖，所以 codeg 會在 ~/.kimi-code/config.toml 寫入受管供應商，並在本機植入一個門控權杖——推論仍然走你自己的 Key。",
+      "statusUnconfigured": "尚未設定",
+      "statusDirty": "有未儲存的變更",
+      "summaryLabel": "生效設定",
+      "gateReadyApiKey": "API Key 已寫入 config.toml",
+      "gateReadyLogin": "已透過 Kimi 帳號登入",
+      "revealConfig": "在資料夾中顯示",
+      "envOverrideWarning": "偵測到 {keys}，其優先權高於 config.toml。在此儲存會自動清除它。",
+      "authModeLabel": "驗證方式",
       "authModeApiKey": "API Key",
       "authModeLogin": "Kimi 帳號登入（訂閱）",
-      "authModeHint": "「API Key」寫入受管 config.toml 供應商並播種閘道權杖；「登入」會清除它並改用真實的 `kimi login` 工作階段（需要 Kimi 訂閱）。",
+      "authModeApiKeyHint": "在 config.toml 寫入受管供應商，並植入門控權杖以便工作階段能夠開啟。",
+      "loginHint": "在終端機執行 `kimi login`，用 Kimi 訂閱帳號登入。codeg 不儲存任何憑證，沿用 Kimi 自己的登入。在此儲存會移除 codeg 的 API Key 門控權杖。",
+      "credentialTitle": "憑證",
       "interfaceTypeLabel": "供應商類型",
       "interfaceTypeHint": "Kimi 使用的供應商協定（config.toml 的 `type`）。Moonshot / platform.kimi.com 的 Key 請選「Kimi / Moonshot」。",
       "endpointLabel": "接入點",
@@ -900,27 +917,53 @@
       "baseUrlLabel": "Base URL",
       "baseUrlHint": "留空則使用供應商 SDK 預設值。",
       "apiKeyLabel": "API Key",
-      "apiKeyHint": "寫入 ~/.kimi-code/config.toml 並用於推理。來自 platform.kimi.com 或 platform.kimi.ai。",
-      "authTypeLabel": "進階：憑證寫入位置",
+      "apiKeyHint": "寫入 ~/.kimi-code/config.toml 並用於推論。來自 platform.kimi.com 或 platform.kimi.ai。",
+      "vertexProjectLabel": "GCP 專案（GOOGLE_CLOUD_PROJECT）",
+      "vertexLocationLabel": "GCP 區域（GOOGLE_CLOUD_LOCATION）",
+      "vertexHint": "Vertex AI 使用 Google 應用程式預設憑證——執行 `gcloud auth application-default login`（不需 API Key）。",
+      "modelTitle": "模型",
+      "modelLabel": "模型",
+      "modelHint": "寫入 config.toml 的模型 id。點「測試並取得模型」可查看你的 Key 實際能存取哪些模型。",
+      "maxContextLabel": "最大上下文長度",
+      "maxContextHint": "Kimi 的設定 schema 要求必填：缺少會讓 Kimi 丟棄整個模型區塊，導致每次對話都沒有回覆。預設 262144。",
+      "fetchModels": "測試並取得模型",
+      "fetchModelsOk": "Key 可用——共 {count} 個模型",
+      "fetchModelsEmpty": "Key 可用，但未回傳任何模型",
+      "fetchModelsFailed": "測試失敗",
+      "fetchModelsNeedsKey": "請先填寫 API Key 和接入點",
+      "modelNotInList": "該模型不在你的 Key 可存取清單中，Kimi 會回報「模型不存在」。",
+      "reasoningTitle": "推理",
+      "reasoningEnableLabel": "啟用",
+      "reasoningDescription": "只有當模型宣告了推理能力，Kimi 才會在輸入框顯示「Thinking」選擇器，所以這裡由 codeg 寫入該宣告。對新建工作階段生效。",
+      "effortsLabel": "可選檔位",
+      "effortsHint": "這些會成為輸入框「Thinking」選擇器裡的檔位。Kimi 會把檔位原樣轉傳給供應商，請選你的模型能接受的值。",
+      "effortsEmptyHint": "一個檔位都不選時，輸入框只會退化成 Off / On 兩檔開關。",
+      "effortsCustomPlaceholder": "新增其他檔位",
+      "effortsAdd": "新增",
+      "defaultEffortLabel": "預設檔位",
+      "defaultEffortAuto": "由 Kimi 決定",
+      "alwaysThinkingLabel": "模型始終推理——從選擇器中移除 Off 檔",
+      "fixErrorsFirst": "請先修正標紅的欄位",
+      "errorModelRequired": "模型為必填欄位",
+      "errorMaxContextRequired": "最大上下文長度為必填欄位",
+      "errorMaxContextInvalid": "必須是正整數",
+      "errorApiKeyRequired": "API Key 為必填欄位",
+      "errorApiKeyInvalid": "API Key 不能包含換行",
+      "errorBaseUrlRequired": "Base URL 為必填欄位",
+      "errorBaseUrlInvalid": "必須以 http:// 或 https:// 開頭",
+      "errorVertexProjectRequired": "GCP 專案為必填欄位",
+      "errorDefaultEffortUnlisted": "必須是上面已選取的檔位之一",
+      "advancedTitle": "進階",
+      "authTypeLabel": "憑證寫入位置",
       "authTypeApiKey": "內聯 api_key",
       "authTypeEnv": "供應商 env 子表",
       "authTypeHint": "API Key 在 config.toml 中的寫入位置。",
-      "vertexProjectLabel": "GCP 專案（GOOGLE_CLOUD_PROJECT）",
-      "vertexLocationLabel": "GCP 區域（GOOGLE_CLOUD_LOCATION）",
-      "vertexHint": "Vertex AI 使用 Google 應用程式預設憑證——執行 `gcloud auth application-default login`（無需 API Key）。",
-      "modelLabel": "模型",
-      "modelHint": "要使用的模型 id。點擊「取得」可列出你的 Key 可存取的模型（如 kimi-k2.7-code），避免「模型不存在」錯誤。",
-      "fetchModels": "取得",
-      "fetchModelsOk": "找到 {count} 個模型",
-      "fetchModelsEmpty": "Key 有效，但未回傳任何模型",
-      "fetchModelsFailed": "無法列出模型——請檢查 Key 與接入點",
-      "fetchModelsNeedsKey": "請先填寫 API Key 和接入點",
-      "maxContextLabel": "最大上下文長度（選填）",
-      "maxContextHint": "Token 數，例如 262144。留空則使用模型預設值。",
-      "loginHint": "在終端機執行 `kimi login`，用 Kimi 訂閱帳號登入（裝置碼 OAuth）。codeg 不儲存任何憑證，重用 Kimi 自己的登入。在此儲存會移除 codeg 的 API Key 閘道權杖。",
-      "rawEditorLabel": "進階：直接編輯 config.toml",
-      "rawEditorHint": "逐字寫入（保留註解）並依 TOML 驗證。codeg 同時會播種閘道權杖以開啟工作階段。",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "rawEditorLabel": "直接編輯 config.toml",
+      "rawEditorWarning": "在此儲存會按原文覆寫整個檔案，取代掉上方的結構化設定。",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "尚未鑒權——請在下方儲存 API Key（或登入）以開啟 Kimi 工作階段。",
+      "authModeHint": "「API Key」寫入受管 config.toml 供應商並播種閘道權杖；「登入」會清除它並改用真實的 `kimi login` 工作階段（需要 Kimi 訂閱）。",
+      "rawEditorHint": "逐字寫入（保留註解）並依 TOML 驗證。codeg 同時會播種閘道權杖以開啟工作階段。"
     },
     "authModeOfficialSubscription": "官網訂閱",
     "authModeCustomEndpoint": "自定義介面",
@@ -994,6 +1037,7 @@
       "localVersionRemoved": "本地版本已移除",
       "saveAgentOrderFailed": "儲存 Agent 排序失敗",
       "saveAgentSwitchFailed": "儲存 Agent 開關失敗",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "儲存環境變數失敗",
       "grokSaved": "Grok 設定已儲存",
       "saveGrokNativeFailed": "儲存 Grok 原生設定失敗",
@@ -1037,7 +1081,6 @@
       "piBinaryUninstalled": "pi 已解除安裝",
       "piBinaryUninstallFailed": "pi 解除安裝失敗",
       "savePiTrustFailed": "儲存工作區信任失敗",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "cursorSaved": "Cursor 設定已儲存",
       "saveCursorConfigFailed": "儲存 Cursor 設定失敗"
     },
@@ -1053,7 +1096,9 @@
       "remoteUnavailable": "{versionText}。遠端版本暫不可用。",
       "latest": "{versionText}。已是最新版本。",
       "bundled": "內建版本：{version}",
-      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 DrawCode。"
+      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 DrawCode。",
+      "localOnly": "本機：{localVersion}",
+      "localInstalled": "{versionText}。已安裝。"
     },
     "cline": {
       "configDescription": "配置 Cline API 提供商和憑證。設定將儲存到 ~/.cline/data/。"
@@ -1129,7 +1174,6 @@
       "trustHint": "僅信任你在此開啟的目錄，絕不涉及整台機器；且只影響設定載入，不影響 pi 能執行什麼。",
       "configDirSkillsNote": "設定自訂組態目錄後，設定頁中管理的技能、專家與辦公工具將不會套用至該 pi；請直接在該目錄中管理其技能。"
     },
-    "showThinking": "Show thinking",
     "cursor": {
       "configDescription": "在此設定 Cursor。先選擇驗證方式——官網訂閱（瀏覽器登入）或用於無頭/伺服器的 Cursor API 金鑰——然後選擇模型並編輯 CLI 的權限規則與沙箱。codeg 會寫入 ~/.cursor/cli-config.json，與 cursor-agent CLI 共用。",
       "authTitle": "驗證",
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "沒有相符的模型",
       "modelsNeedAuth": "登入後載入模型清單。",
       "modelDefaultBadge": "預設"
-    }
+    },
+    "addCustomAgent": "新增自訂智慧體",
+    "addCustomAgentHint": "接入任何相容 ACP 的智慧體。可從公開 ACP 註冊表中選擇，或直接貼上其註冊表資訊。",
+    "customAgentFromRegistry": "ACP 註冊表",
+    "customAgentManual": "手動填寫",
+    "customAgentSearchPlaceholder": "搜尋智慧體…",
+    "customAgentLoadingCatalog": "正在載入 ACP 註冊表…",
+    "customAgentRetry": "重試",
+    "customAgentNoResults": "沒有符合的智慧體",
+    "customAgentAdd": "新增",
+    "customAgentAlreadyAdded": "已新增",
+    "customAgentUnsupportedPlatform": "目前平台沒有可用的建置",
+    "customAgentAdded": "已新增 {name}",
+    "customAgentIdLabel": "註冊表 ID",
+    "customAgentNameLabel": "顯示名稱",
+    "customAgentVersionLabel": "版本",
+    "customAgentSpecLabel": "散發資訊（JSON）",
+    "customAgentSpecHint": "與 ACP 註冊表 distribution 物件同構：支援 npx、uvx、binary 三種通道，也可整筆貼上註冊表條目。npx/uvx 的 cmd 為套件安裝的可執行命令名稱，預設按套件名稱推導，與套件名稱不同時需填寫。binary 按平台鍵區分（本機為 {platform}），cmd 為壓縮檔內啟動路徑，sha256 可選用於驗證下載。",
+    "customAgentTemplateLabel": "範本",
+    "customAgentKindLabel": "啟動方式",
+    "customAgentInvalidJson": "不是合法的 JSON",
+    "customAgentNoDistribution": "找不到 npx、uvx 或 binary 散發方式",
+    "customAgentCancel": "取消",
+    "customAgentSave": "新增智慧體",
+    "customAgentSaveChanges": "儲存變更",
+    "customAgentEdit": "編輯智慧體",
+    "customAgentEditHint": "修改名稱、圖示、分發資訊與技能宣告；智慧體 ID 不可修改。",
+    "customAgentEditNotFound": "找不到自訂智慧體 {id}",
+    "customAgentSaved": "已儲存 {name}",
+    "customAgentVersionProbeLabel": "版本查詢命令（可選）",
+    "customAgentVersionProbeHint": "查詢本機安裝版本的命令；留空時預設執行智慧體命令加 --version。",
+    "customAgentRemove": "移除智慧體",
+    "customAgentRemoveHint": "刪除該智慧體定義。既有工作階段的歷史會保留，只是該智慧體無法再啟動。",
+    "customAgentIconLabel": "圖示（選填）",
+    "customAgentIconUpload": "上傳",
+    "customAgentIconReplace": "更換",
+    "customAgentIconClear": "移除圖示",
+    "customAgentIconHint": "隨智慧體一併儲存，離線也能顯示。未上傳則使用彩色首字母。",
+    "customAgentSkillsLabel": "Skills（共享 .agents/skills）",
+    "customAgentSkillsHint": "聲明該智能體會讀取共享的 .agents/skills 目錄（全域與專案級），並將其加入所有技能矩陣。連結到共享目錄的技能對讀取該目錄的其他智能體同樣可見。",
+    "customAgentSkillsDirLabel": "專屬技能目錄",
+    "customAgentSkillsDirHint": "該智慧體自身載入技能的目錄絕對路徑 —— 可與共享目錄並存，也可單獨使用。~ 會展開為主目錄；連結技能時優先放入此目錄。",
+    "customAgentIconNotAnImage": "請選擇圖片檔案。",
+    "customAgentIconTooLarge": "圖示需小於 {limit} KB。",
+    "customAgentIconReadFailed": "無法讀取該圖片。",
+    "customAgentRemoveConfirm": "確定移除 {name}？既有會話會保留，但該智慧體將無法再啟動。",
+    "customAgentRemoveWithData": "同時刪除已記錄的會話歷史",
+    "customAgentRemoved": "已移除 {name}",
+    "customAgentBadge": "自訂",
+    "customAgentNotLaunchable": "該智慧體在此環境無法啟動：{reason}"
   },
   "SettingsPages": {
     "agentsLoading": "載入 Agent 設定中...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "關閉其它",
       "closeAll": "關閉所有",
       "tileDisplay": "平鋪顯示",
-      "untileDisplay": "取消平鋪"
+      "untileDisplay": "取消平鋪",
+      "splitRight": "向右拆分",
+      "splitDown": "向下拆分",
+      "splitAndMoveRight": "拆分並右移",
+      "splitAndMoveDown": "拆分並下移",
+      "moveToOppositeGroup": "移動到對側分組",
+      "moveToGroup": "移動到分組",
+      "groupLabel": "分組 {index}",
+      "changeSplitterOrientation": "切換分隔方向",
+      "unsplit": "取消拆分",
+      "unsplitAll": "全部取消拆分"
     },
     "fileWorkspace": {
       "files": "檔案",
@@ -1995,7 +2098,10 @@
         "current": "目前",
         "remoteBranches": "遠端分支",
         "refreshCommitHistory": "刷新提交記錄",
-        "clearBranchFilterAria": "清除分支篩選"
+        "clearBranchFilterAria": "清除分支篩選",
+        "head": "HEAD",
+        "headHint": "跟隨目前分支",
+        "headHintWithBranch": "跟隨目前分支（{branch}）"
       },
       "dialogs": {
         "newBranchTitle": "新增分支",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "正在建立會話並載入設定"
         },
         "errors": {
-          "connectionFailed": "連線失敗"
+          "connectionFailed": "連線失敗",
+          "sendPromptFailed": "訊息傳送失敗：{error}"
         }
       },
       "shared": {
@@ -2382,6 +2489,8 @@
         "askAnything": "請開始輸入...",
         "removeAttachmentAria": "移除 {name}",
         "attachFiles": "附加檔案",
+        "attachLocalUpload": "附加本機檔案",
+        "attachServerFile": "附加伺服器檔案",
         "addActions": "新增",
         "quickMessages": "快捷訊息",
         "quickMessagesEmpty": "尚無快捷訊息",
@@ -2413,8 +2522,6 @@
         "experts": "專家",
         "office": "日常辦公",
         "research": "科學研究",
-        "attachLocalUpload": "附加本機檔案",
-        "attachServerFile": "附加伺服器檔案",
         "attachUploadTooLarge": "{names} 超過 {limit}MB 上傳上限，已略過。",
         "attachUploadFailed": "上傳失敗：{names}。",
         "attachUploadNotAFile": "{names} 不是常規檔案（目錄或特殊檔案），已略過。",
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "技能",
         "mentionInvalidPattern": "規則運算式無效",
         "mentionSourceError": "無法重新整理此來源",
-        "mentionProfileError": "無法載入委派設定檔"
+        "mentionProfileError": "無法載入委派設定檔",
+        "attachUploadInProgress": "圖片仍在上傳中，請稍候再傳送。"
       },
       "messageQueue": {
         "addToQueue": "加入佇列",
@@ -2726,6 +2834,7 @@
         "imageGenerationPending": "正在生成圖片…",
         "imageGenerationFailed": "圖片生成失敗",
         "model": "模型",
+        "reasoningEffort": "推理級別",
         "tokenStats": "Token 使用情況",
         "tokenInput": "輸入",
         "tokenOutput": "輸出",
@@ -2736,11 +2845,13 @@
         "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息",
         "showMore": "展開",
         "showLess": "收合",
-        "responseInterrupted": "回應已中斷"
+        "responseInterrupted": "回應已中斷",
+        "waitingForSubagents": "等待子任務中…"
       },
       "liveTurnStats": {
         "thinking": "思考中...",
         "streaming": "生成中",
+        "waitingForSubagents": "等待子任務中…",
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
@@ -2960,7 +3071,8 @@
           "webSearchWithQuery": "網頁搜尋：{query}",
           "todosProgress": "待辦（{done}/{total}）",
           "skillWithName": "Skill：{name}",
-          "genericWithContext": "{tool}：{context}"
+          "genericWithContext": "{tool}：{context}",
+          "listFilesWithPath": "列出檔案 {path}"
         },
         "toolGroup": {
           "search": "搜尋 {count} 次",
@@ -2993,6 +3105,13 @@
           "polledTimes": "輪詢 {count} 次",
           "runningInBackground": "背景執行",
           "launchNote": "已在背景執行 · {id}"
+        },
+        "agentLiveTranscript": "即時活動",
+        "search": {
+          "noMatches": "無相符結果",
+          "matchSummary": "{matches} 處相符 · {files} 個檔案",
+          "fileSummary": "{files} 個檔案",
+          "moreResults": "另有 {count} 筆結果未顯示"
         }
       },
       "messageNav": {
@@ -3129,6 +3248,16 @@
       "proposedPlan": {
         "title": "計劃提案",
         "planning": "規劃中…"
+      },
+      "fileActions": {
+        "openInFinder": "在 Finder 開啟",
+        "openInExplorer": "在檔案總管開啟",
+        "openInFileManager": "在檔案管理器開啟",
+        "copyRelativePath": "複製相對路徑",
+        "copyAbsolutePath": "複製絕對路徑",
+        "pathCopied": "已複製路徑",
+        "copyPathFailed": "複製路徑失敗",
+        "openFailed": "開啟本地檔案失敗"
       }
     },
     "diffPreview": {
@@ -3300,6 +3429,18 @@
     "emptyDirectory": "此目錄為空",
     "errorLoadingDir": "載入目錄失敗",
     "permissionDenied": "權限不足"
+  },
+  "ServerFileBrowser": {
+    "title": "選擇伺服器檔案",
+    "pathPlaceholder": "輸入目錄路徑...",
+    "goHome": "回到主目錄",
+    "navigateUp": "返回上層目錄",
+    "select": "選擇",
+    "cancel": "取消",
+    "loading": "載入中...",
+    "emptyDirectory": "此目錄為空",
+    "errorLoadingDir": "載入目錄失敗",
+    "selectedCount": "已選 {count} 項"
   },
   "ChatChannelSettings": {
     "loading": "載入中...",
@@ -3881,18 +4022,6 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
-  },
-  "ServerFileBrowser": {
-    "title": "選擇伺服器檔案",
-    "pathPlaceholder": "輸入目錄路徑...",
-    "goHome": "回到主目錄",
-    "navigateUp": "返回上層目錄",
-    "select": "選擇",
-    "cancel": "取消",
-    "loading": "載入中...",
-    "emptyDirectory": "此目錄為空",
-    "errorLoadingDir": "載入目錄失敗",
-    "selectedCount": "已選 {count} 項"
   },
   "BackupSettings": {
     "title": "備份與還原",

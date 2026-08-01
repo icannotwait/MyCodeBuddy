@@ -53,6 +53,28 @@ describe("PermissionDialog", () => {
     ).toBeInTheDocument()
   })
 
+  it("prefers the _meta.claudeCode.title description over the command title (≥0.63)", () => {
+    // claude-agent-acp ≥0.63 eager permission tool_call: ACP `title` is the
+    // shell command, `_meta.claudeCode.title` the human description. The
+    // header shows the description; the command still renders in its block.
+    const permission: PendingPermission = {
+      request_id: "req-desc",
+      tool_call: {
+        title: "git diff",
+        kind: "execute",
+        rawInput: { command: "git diff", description: "Show current diff" },
+        _meta: { claudeCode: { toolName: "Bash", title: "Show current diff" } },
+      },
+      options: baseOptions,
+    }
+    renderWithIntl(
+      <PermissionDialog permission={permission} onRespond={() => {}} />
+    )
+    expect(screen.getByText("Show current diff")).toBeInTheDocument()
+    // The command surfaces in the CodeBlock, not as the header.
+    expect(screen.queryByText("git diff")).toBeInTheDocument()
+  })
+
   it("renders every option as a button", () => {
     const permission: PendingPermission = {
       request_id: "req-2",

@@ -3067,7 +3067,13 @@ fn strip_blocked_resource_mentions(input: &str) -> String {
     let text = blocked_re.replace_all(input, "").to_string();
     let text = image_tag_re.replace_all(&text, "").to_string();
     let text = collapsed_ws_re.replace_all(&text, " ").to_string();
-    text.trim().to_string()
+    // Preserve leading whitespace for column-zero mandatory-route classification
+    // in `visible_user_text` (indented exact-prefix quotes must stay visible).
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        text.trim_end().to_string()
+    }
 }
 
 /// Group flat messages into conversation turns.
@@ -3303,6 +3309,27 @@ mod tests {
         let input = "这个图片里面是什么\n</image>\n<image>\n";
         let got = strip_blocked_resource_mentions(input);
         assert_eq!(got, "这个图片里面是什么");
+    }
+
+    #[test]
+    fn indented_mandatory_route_survives_strip_blocked_pipeline() {
+        use crate::parsers::visible_user_text;
+
+        let route = "Codeg mandatory delegation route: profile_id=\"a\"";
+        // Single leading space (collapse of multi-space still leaves ≥1).
+        let indented = format!("  {route}");
+        let cleaned = strip_blocked_resource_mentions(&indented);
+        assert!(
+            !cleaned.is_empty() && cleaned.chars().next().is_some_and(|c| c.is_whitespace()),
+            "strip_blocked_resource_mentions must preserve leading whitespace, got {cleaned:?}"
+        );
+        assert_eq!(visible_user_text(&cleaned).as_deref(), Some(route));
+
+        // Pure column-zero routes still drop after the same pipeline.
+        assert_eq!(
+            visible_user_text(&strip_blocked_resource_mentions(route)),
+            None
+        );
     }
 
     #[test]

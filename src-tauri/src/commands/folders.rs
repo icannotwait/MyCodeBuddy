@@ -913,8 +913,7 @@ pub async fn close_folder_if_empty(
     db: tauri::State<'_, AppDatabase>,
     folder_id: i32,
 ) -> Result<CloseFolderIfEmptyResult, AppCommandError> {
-    let closed =
-        close_folder_if_empty_core(&db, &EventEmitter::Tauri(app), folder_id).await?;
+    let closed = close_folder_if_empty_core(&db, &EventEmitter::Tauri(app), folder_id).await?;
     Ok(CloseFolderIfEmptyResult { closed })
 }
 
@@ -5449,6 +5448,16 @@ async fn get_unpushed_hashes(
 ) -> Result<(Option<HashSet<String>>, bool), AppCommandError> {
     let limit_arg = format!("-{}", limit);
 
+    // `HEAD` as the log's rev is the git-log tab's dynamic "current branch"
+    // filter — a rev, not a branch NAME. Push status needs the name (to find the
+    // branch's remote and its `<remote>/<branch>` ref), so normalize it to "no
+    // branch specified", which resolves the real checked-out branch below and
+    // reports unknown when detached. Taken literally it would instead look up
+    // `branch.HEAD.remote` and compare against `refs/remotes/origin/HEAD` — the
+    // remote's DEFAULT branch — so on a feature branch with no upstream every
+    // commit missing from origin/main would wrongly read "not pushed".
+    let branch = branch.filter(|b| *b != "HEAD");
+
     // All-branches view: a commit counts as "pushed" iff it is reachable from any
     // remote-tracking ref. "unpushed" = commits the log (`git log --all`) shows
     // that sit on no remote. Two things must line up with git_log so every
@@ -5860,7 +5869,9 @@ mod tests {
             .expect("live conv on kept");
 
         // Precondition: both open before barrier.
-        let before = list_open_folder_details_core(&db).await.expect("list before");
+        let before = list_open_folder_details_core(&db)
+            .await
+            .expect("list before");
         let before_ids: Vec<i32> = before.iter().map(|f| f.id).collect();
         assert!(before_ids.contains(&empty.id));
         assert!(before_ids.contains(&kept.id));
@@ -5872,7 +5883,9 @@ mod tests {
         assert_eq!(closed, vec![empty.id]);
 
         // First client-visible open list: no empty regular opens remain.
-        let after = list_open_folder_details_core(&db).await.expect("list after");
+        let after = list_open_folder_details_core(&db)
+            .await
+            .expect("list after");
         let after_ids: Vec<i32> = after.iter().map(|f| f.id).collect();
         assert!(
             !after_ids.contains(&empty.id),
@@ -5999,11 +6012,11 @@ mod tests {
     /// shared with the registered `close_folder_if_empty` command).
     #[test]
     fn close_folder_if_empty_result_serializes_closed_field() {
-        let true_body = serde_json::to_value(CloseFolderIfEmptyResult { closed: true })
-            .expect("serialize");
+        let true_body =
+            serde_json::to_value(CloseFolderIfEmptyResult { closed: true }).expect("serialize");
         assert_eq!(true_body, serde_json::json!({ "closed": true }));
-        let false_body = serde_json::to_value(CloseFolderIfEmptyResult { closed: false })
-            .expect("serialize");
+        let false_body =
+            serde_json::to_value(CloseFolderIfEmptyResult { closed: false }).expect("serialize");
         assert_eq!(false_body, serde_json::json!({ "closed": false }));
     }
 
@@ -6038,15 +6051,10 @@ mod tests {
 
         // Conversation + persisted tab, then soft-delete the conversation *without*
         // tab cleanup so the folder is empty-for-live while tabs still exist.
-        let conv = conversation_service::create(
-            &db.conn,
-            folder_id,
-            AgentType::ClaudeCode,
-            None,
-            None,
-        )
-        .await
-        .expect("create conv");
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conv");
         let conv_id = conv.id;
         crate::commands::conversations::save_opened_tabs_core(
             &db.conn,
@@ -6159,8 +6167,8 @@ mod tests {
     /// watches under the root, emits `Close{{UserRemove}}`, leaves
     /// `deleted_at` alone (not a history soft-delete), and does not wipe disk.
     #[tokio::test]
-    async fn remove_folder_from_workspace_core_cascades_tabs_watches_and_emits_user_remove_for_nonempty()
-    {
+    async fn remove_folder_from_workspace_core_cascades_tabs_watches_and_emits_user_remove_for_nonempty(
+    ) {
         use crate::db::entities::folder as folder_entity;
         use crate::db::service::conversation_service;
         use crate::db::service::folder_service as fs;
@@ -6188,15 +6196,10 @@ mod tests {
         let folder_id = entry.id;
 
         // Live conversation so the folder is non-empty — UserRemove must still work.
-        let conv = conversation_service::create(
-            &db.conn,
-            folder_id,
-            AgentType::ClaudeCode,
-            None,
-            None,
-        )
-        .await
-        .expect("create live conv");
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create live conv");
         let conv_id = conv.id;
         assert_eq!(
             fs::count_live_conversations_for_folder(&db.conn, folder_id)
@@ -6267,7 +6270,10 @@ mod tests {
                 saw_user_remove = true;
             }
         }
-        assert!(saw_tabs, "UserRemove must cascade tab deletion + emit tabs://changed");
+        assert!(
+            saw_tabs,
+            "UserRemove must cascade tab deletion + emit tabs://changed"
+        );
         assert!(
             saw_user_remove,
             "UserRemove must emit Close{{UserRemove}} for non-empty folder"
@@ -6744,6 +6750,147 @@ mod tests {
             Some(false),
             "author-filtered match past the unfiltered window must read not-pushed"
         );
+    }
+
+    // The git-log tab's dynamic "current branch" filter sends the literal `HEAD`
+    // rev. Push status must resolve it to the CHECKED-OUT branch, i.e. read the
+    // same as selecting that branch by name. Taken literally it would look up
+    // `refs/remotes/origin/HEAD` — the remote's default branch — and mislabel a
+    // feature branch's already-pushed commits "not pushed" whenever the branch
+    // has no upstream configured.
+    #[tokio::test]
+    async fn git_log_head_rev_scores_push_status_against_the_checked_out_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        git_run(p, &["init", "-q", "-b", "main"]);
+        git_run(p, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = git_capture(p, &["rev-parse", "HEAD"]);
+        // A cloned repo's remote HEAD (origin/main) plus a feature branch that is
+        // fully pushed to origin/feature but has NO upstream configured — the
+        // combination that made the literal-HEAD comparison wrong. Remote-tracking
+        // refs are faked with update-ref so the test needs no network.
+        git_run(p, &["update-ref", "refs/remotes/origin/main", &base]);
+        git_run(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_run(p, &["checkout", "-q", "-b", "feature"]);
+        git_run(p, &["commit", "-q", "--allow-empty", "-m", "f1"]);
+        let f1 = git_capture(p, &["rev-parse", "HEAD"]);
+        git_run(p, &["update-ref", "refs/remotes/origin/feature", &f1]);
+        git_run(p, &["commit", "-q", "--allow-empty", "-m", "f2"]);
+        let f2 = git_capture(p, &["rev-parse", "HEAD"]);
+
+        let by_head = git_log(
+            p.to_string_lossy().to_string(),
+            None,
+            Some("HEAD".to_string()), // the dynamic current-branch filter
+            None,
+            None,
+            None,
+            Some(false),
+            Some(false),
+        )
+        .await
+        .expect("git_log HEAD");
+
+        let pushed_of = |result: &GitLogResult, hash: &str| {
+            result
+                .entries
+                .iter()
+                .find(|e| e.full_hash == hash)
+                .unwrap_or_else(|| panic!("commit {hash} missing from log"))
+                .pushed
+        };
+        assert_eq!(
+            pushed_of(&by_head, &f1),
+            Some(true),
+            "f1 is on origin/feature → pushed (not scored against origin/HEAD)"
+        );
+        assert_eq!(
+            pushed_of(&by_head, &f2),
+            Some(false),
+            "f2 is ahead of origin/feature → not pushed"
+        );
+
+        // …and it agrees with selecting the same branch by name.
+        let by_name = git_log(
+            p.to_string_lossy().to_string(),
+            None,
+            Some("feature".to_string()),
+            None,
+            None,
+            None,
+            Some(false),
+            Some(false),
+        )
+        .await
+        .expect("git_log feature");
+        assert_eq!(
+            by_head
+                .entries
+                .iter()
+                .map(|e| (e.full_hash.clone(), e.pushed))
+                .collect::<Vec<_>>(),
+            by_name
+                .entries
+                .iter()
+                .map(|e| (e.full_hash.clone(), e.pushed))
+                .collect::<Vec<_>>(),
+            "the HEAD rev must read exactly like the branch it points at"
+        );
+    }
+
+    // A detached HEAD has no branch, so push status is genuinely unknown — the
+    // literal `HEAD` rev must not fall back to comparing against the remote's
+    // default branch (which would report a definite, wrong badge).
+    #[tokio::test]
+    async fn git_log_head_rev_reports_unknown_push_status_when_detached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        git_run(p, &["init", "-q", "-b", "main"]);
+        git_run(p, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let c1 = git_capture(p, &["rev-parse", "HEAD"]);
+        git_run(p, &["update-ref", "refs/remotes/origin/main", &c1]);
+        git_run(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_run(p, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+        git_run(p, &["checkout", "-q", "--detach"]);
+
+        let result = git_log(
+            p.to_string_lossy().to_string(),
+            None,
+            Some("HEAD".to_string()),
+            None,
+            None,
+            None,
+            Some(false),
+            Some(false),
+        )
+        .await
+        .expect("git_log HEAD detached");
+
+        assert!(
+            !result.entries.is_empty(),
+            "a detached HEAD still logs its history"
+        );
+        for e in &result.entries {
+            assert_eq!(
+                e.pushed, None,
+                "commit {} must read unknown while detached, got {:?}",
+                e.hash, e.pushed
+            );
+        }
     }
 
     #[tokio::test]

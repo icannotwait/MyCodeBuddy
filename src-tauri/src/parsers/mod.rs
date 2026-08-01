@@ -1,3 +1,4 @@
+pub mod acp_native;
 pub mod claude;
 pub mod cline;
 pub mod codebuddy;
@@ -423,10 +424,30 @@ pub fn strip_codeg_terminal_context(text: &str) -> Cow<'_, str> {
     terminal_context_regex().replace_all(text, "\n")
 }
 
-/// User-visible prompt text after removing complete terminal context envelopes.
-/// Returns `None` when nothing remains after strip + trim.
+const MANDATORY_ROUTE_PREFIX: &str = "Codeg mandatory delegation route:";
+
+fn is_pure_mandatory_route_text(text: &str) -> bool {
+    let mut saw_non_empty = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        saw_non_empty = true;
+        if !line.starts_with(MANDATORY_ROUTE_PREFIX) {
+            return false;
+        }
+    }
+    saw_non_empty
+}
+
+/// User-visible prompt text after removing complete terminal context envelopes
+/// and pure mandatory-route blocks. Returns `None` when nothing visible remains.
 pub fn visible_user_text(text: &str) -> Option<String> {
     let stripped = strip_codeg_terminal_context(text);
+    if is_pure_mandatory_route_text(&stripped) {
+        return None;
+    }
     let visible = stripped.trim();
     (!visible.is_empty()).then(|| visible.to_string())
 }
@@ -437,7 +458,7 @@ pub fn visible_title(title: Option<String>) -> Option<String> {
     title.and_then(|value| visible_user_text(&value))
 }
 
-/// Strip terminal context from text blocks; drop empty text blocks.
+/// Strip terminal context and pure mandatory routes from text blocks; drop empty text blocks.
 /// Returns whether any visible content remains (images/tools count as visible).
 pub fn sanitize_user_blocks(blocks: &mut Vec<ContentBlock>) -> bool {
     for block in blocks.iter_mut() {
@@ -1150,9 +1171,9 @@ mod tests {
     use super::{
         fold_reference_links, infer_context_window_max_tokens, is_safe_subagent_id,
         latest_turn_total_usage_tokens, merge_context_window_stats, path_eq_for_matching,
-        title_from_user_text, visible_user_text,
+        sanitize_user_blocks, title_from_user_text, visible_user_text,
     };
-    use crate::models::{MessageTurn, SessionStats, TurnRole, TurnUsage};
+    use crate::models::{ContentBlock, MessageTurn, SessionStats, TurnRole, TurnUsage};
 
     fn test_terminal_context() -> String {
         test_terminal_context_for("PowerShell 7", "powershell", "PowerShell")
@@ -1222,6 +1243,55 @@ earlier terminal context records.\n\
         ] {
             assert_eq!(visible_user_text(text), Some(text.to_string()));
         }
+    }
+
+    #[test]
+    fn mandatory_route_filter_drops_only_pure_column_zero_blocks() {
+        let route_a = "Codeg mandatory delegation route: profile_id=\"a\"";
+        let route_b = "Codeg mandatory delegation route: profile_id=\"b\"";
+
+        assert_eq!(visible_user_text(route_a), None);
+        assert_eq!(
+            visible_user_text(&format!("{route_a}  \n  \n{route_b}\t")),
+            None
+        );
+
+        let mixed = format!("{route_a}\nPlease fix the bug");
+        assert_eq!(visible_user_text(&mixed), Some(mixed.clone()));
+        let mentioned = format!("Please quote {route_a}");
+        assert_eq!(visible_user_text(&mentioned), Some(mentioned.clone()));
+        let indented = format!("  {route_a}");
+        assert_eq!(visible_user_text(&indented), Some(route_a.to_string()));
+    }
+
+    #[test]
+    fn sanitize_user_blocks_drops_routes_but_keeps_prose_and_media() {
+        let mut blocks = vec![
+            ContentBlock::Text {
+                text: "Codeg mandatory delegation route: profile_id=\"a\"".into(),
+            },
+            ContentBlock::Image {
+                data: "QUJD".into(),
+                mime_type: "image/png".into(),
+                uri: Some("clipboard://image.png".into()),
+            },
+            ContentBlock::Text {
+                text: "Please inspect this".into(),
+            },
+        ];
+        assert!(sanitize_user_blocks(&mut blocks));
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "Please inspect this"
+        ));
+
+        let mut route_only = vec![ContentBlock::Text {
+            text: "Codeg mandatory delegation route: profile_id=\"a\"".into(),
+        }];
+        assert!(!sanitize_user_blocks(&mut route_only));
+        assert!(route_only.is_empty());
     }
 
     #[test]

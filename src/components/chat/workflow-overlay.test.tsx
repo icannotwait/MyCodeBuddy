@@ -1,10 +1,17 @@
-import { fireEvent, render, screen, within } from "@testing-library/react"
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
+import { getWorkflowGraphSnapshot } from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
 import {
@@ -335,6 +342,8 @@ function renderWithIntl(ui: React.ReactElement) {
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   vi.mocked(openDelegatedChildSession).mockClear()
+  vi.mocked(getWorkflowGraphSnapshot).mockReset()
+  vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
 })
 
 afterEach(() => {
@@ -342,6 +351,34 @@ afterEach(() => {
 })
 
 describe("SubAgentOverlay A13 workflow mount", () => {
+  it("first-seeds a graphless open overlay without expanding the full graph", async () => {
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(skeletonGraph())
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={94}
+        workflowGraph={null}
+        defaultExpanded
+      />
+    )
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sub-agent-overlay")).toHaveAttribute(
+        "data-has-workflow",
+        "true"
+      )
+    )
+    expect(screen.getByTestId("workflow-segment-workflow")).toHaveAttribute(
+      "aria-selected",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-phase-rail")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    ).toBeInTheDocument()
+  })
+
   it("mounts with graph even when session/activity count is zero", () => {
     renderWithIntl(
       <SubAgentOverlay
@@ -1214,11 +1251,15 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(screen.getByTestId("workflow-node-detail")).toBeInTheDocument()
   })
 
-  it("activates once only after the full workflow graph expands", () => {
-    const release = vi.fn()
-    const activate = vi
+  it("holds overlay interest while open and expanded interest only for the full graph", () => {
+    const releaseOverlay = vi.fn()
+    const releaseExpanded = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
+    const activateExpanded = vi
       .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
+      .mockReturnValue(releaseExpanded)
 
     renderWithIntl(
       <SubAgentOverlay
@@ -1229,20 +1270,37 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded
       />
     )
-    expect(activate).not.toHaveBeenCalled()
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
+    expect(activateOverlay).toHaveBeenCalledWith(42)
+    expect(activateExpanded).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId("workflow-segment-sessions"))
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
+    expect(activateExpanded).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId("workflow-segment-workflow"))
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(activate).toHaveBeenCalledWith(42)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateExpanded).toHaveBeenCalledTimes(1)
+    expect(activateExpanded).toHaveBeenCalledWith(42)
+    fireEvent.click(
+      screen.getByRole("button", { name: "Collapse workflow graph" })
+    )
+    expect(releaseExpanded).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sub-agents" }))
+    expect(releaseOverlay).toHaveBeenCalledTimes(1)
   })
 
-  it("does not activate for a collapsed overlay, Sessions segment, or compact graph", () => {
-    const activate = vi.spyOn(
+  it("chip-collapsed overlays acquire no interest", () => {
+    const activateOverlay = vi.spyOn(
+      useWorkflowGraphStore.getState(),
+      "activateOverlayInterest"
+    )
+    const activateExpanded = vi.spyOn(
       useWorkflowGraphStore.getState(),
       "activateConversation"
     )
-
-    const { unmount: unmountCollapsed } = renderWithIntl(
+    const { unmount } = renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
         activities={[]}
@@ -1251,58 +1309,19 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded={false}
       />
     )
-    expect(activate).not.toHaveBeenCalled()
-    unmountCollapsed()
-    activate.mockClear()
-
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        activities={[]}
-        conversationId={42}
-        workflowGraph={skeletonGraph()}
-        defaultExpanded
-      />
-    )
-    // Compact graph (default graphExpanded=false) must stay passive.
-    expect(activate).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByTestId("workflow-segment-sessions"))
-    expect(activate).not.toHaveBeenCalled()
-    expect(
-      screen.queryByTestId("workflow-expand-toggle")
-    ).not.toBeInTheDocument()
-  })
-
-  it("collapsing the full workflow graph releases its active lease", () => {
-    const release = vi.fn()
-    const activate = vi
-      .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
-
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        activities={[]}
-        conversationId={42}
-        workflowGraph={skeletonGraph()}
-        defaultExpanded
-      />
-    )
-    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(release).not.toHaveBeenCalled()
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Collapse workflow graph" })
-    )
-    expect(release).toHaveBeenCalledTimes(1)
-    expect(activate).toHaveBeenCalledTimes(1)
+    expect(activateOverlay).not.toHaveBeenCalled()
+    expect(activateExpanded).not.toHaveBeenCalled()
+    unmount()
   })
 
   it.each([0, -1])(
-    "does not activate non-positive conversation id %s",
+    "non-positive id %s acquires no interest",
     (conversationId) => {
-      const activate = vi.spyOn(
+      const activateOverlay = vi.spyOn(
+        useWorkflowGraphStore.getState(),
+        "activateOverlayInterest"
+      )
+      const activateExpanded = vi.spyOn(
         useWorkflowGraphStore.getState(),
         "activateConversation"
       )
@@ -1315,16 +1334,25 @@ describe("SubAgentOverlay A13 workflow mount", () => {
           defaultExpanded
         />
       )
+      expect(activateOverlay).not.toHaveBeenCalled()
+      expect(activateExpanded).not.toHaveBeenCalled()
       fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-      expect(activate).not.toHaveBeenCalled()
+      expect(activateOverlay).not.toHaveBeenCalled()
+      expect(activateExpanded).not.toHaveBeenCalled()
     }
   )
 
   it("switching segments and collapsing the overlay releases the active lease", () => {
-    const release = vi.fn()
-    const activate = vi
+    const releaseOverlay = vi.fn()
+    const releaseExpanded1 = vi.fn()
+    const releaseExpanded2 = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
+    const activateExpanded = vi
       .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
+      .mockReturnValueOnce(releaseExpanded1)
+      .mockReturnValueOnce(releaseExpanded2)
 
     renderWithIntl(
       <SubAgentOverlay
@@ -1335,26 +1363,35 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded
       />
     )
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateExpanded).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByTestId("workflow-segment-sessions"))
-    expect(release).toHaveBeenCalledTimes(1)
+    expect(releaseExpanded1).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByTestId("workflow-segment-workflow"))
-    expect(activate).toHaveBeenCalledTimes(2)
-    expect(activate).toHaveBeenLastCalledWith(42)
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
+    expect(activateExpanded).toHaveBeenCalledTimes(2)
+    expect(activateExpanded.mock.calls.map((call) => call[0])).toEqual([42, 42])
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse sub-agents" }))
-    expect(release).toHaveBeenCalledTimes(2)
+    expect(releaseExpanded1).toHaveBeenCalledTimes(1)
+    expect(releaseExpanded2).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).toHaveBeenCalledTimes(1)
   })
 
   it("detail updates reseed without reinstalling active interest", () => {
-    const release = vi.fn()
-    const activate = vi
+    const releaseOverlay = vi.fn()
+    const releaseExpanded = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
+    const activateExpanded = vi
       .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
+      .mockReturnValue(releaseExpanded)
 
     const { rerender } = renderWithIntl(
       <SubAgentOverlay
@@ -1365,9 +1402,9 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded
       />
     )
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateExpanded).toHaveBeenCalledTimes(1)
 
     const revision2: WorkflowGraphSnapshot = {
       ...skeletonGraph(),
@@ -1387,17 +1424,27 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(
       useWorkflowGraphStore.getState().getSnapshot(42)?.graph_revision
     ).toBe(2)
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
+    expect(activateExpanded).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
+    expect(releaseExpanded).not.toHaveBeenCalled()
   })
 
   it("changing conversation id releases the old lease and activates the new id", () => {
-    const release = vi.fn()
-    const activate = vi
+    const releaseOverlay81 = vi.fn()
+    const releaseOverlay82 = vi.fn()
+    const releaseExpanded81 = vi.fn()
+    const releaseExpanded82 = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValueOnce(releaseOverlay81)
+      .mockReturnValueOnce(releaseOverlay82)
+    const activateExpanded = vi
       .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
+      .mockReturnValueOnce(releaseExpanded81)
+      .mockReturnValueOnce(releaseExpanded82)
 
-    const { rerender } = renderWithIntl(
+    const { rerender, unmount } = renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
         activities={[]}
@@ -1407,9 +1454,8 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       />
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(activate).toHaveBeenCalledWith(81)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateOverlay.mock.calls.map((call) => call[0])).toEqual([81])
+    expect(activateExpanded.mock.calls.map((call) => call[0])).toEqual([81])
 
     rerender(
       <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -1422,16 +1468,27 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         />
       </NextIntlClientProvider>
     )
-    expect(release).toHaveBeenCalledTimes(1)
-    expect(activate).toHaveBeenCalledTimes(2)
-    expect(activate.mock.calls.map((call) => call[0])).toEqual([81, 82])
+    expect(releaseOverlay81).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay82).not.toHaveBeenCalled()
+    expect(releaseExpanded81).toHaveBeenCalledTimes(1)
+    expect(releaseExpanded82).not.toHaveBeenCalled()
+    expect(activateOverlay.mock.calls.map((call) => call[0])).toEqual([81, 82])
+    expect(activateExpanded.mock.calls.map((call) => call[0])).toEqual([81, 82])
+
+    unmount()
+    expect(releaseOverlay82).toHaveBeenCalledTimes(1)
+    expect(releaseExpanded82).toHaveBeenCalledTimes(1)
   })
 
-  it("unmount releases the expanded workflow lease", () => {
-    const release = vi.fn()
-    const activate = vi
+  it("unmount releases overlay and expanded workflow leases", () => {
+    const releaseOverlay = vi.fn()
+    const releaseExpanded = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
+    const activateExpanded = vi
       .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
-      .mockReturnValue(release)
+      .mockReturnValue(releaseExpanded)
 
     const { unmount } = renderWithIntl(
       <SubAgentOverlay
@@ -1442,11 +1499,14 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded
       />
     )
+    expect(activateOverlay).toHaveBeenCalledTimes(1)
+    expect(activateOverlay).toHaveBeenCalledWith(42)
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    expect(activate).toHaveBeenCalledTimes(1)
-    expect(release).not.toHaveBeenCalled()
+    expect(activateExpanded).toHaveBeenCalledTimes(1)
+    expect(activateExpanded).toHaveBeenCalledWith(42)
 
     unmount()
-    expect(release).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).toHaveBeenCalledTimes(1)
+    expect(releaseExpanded).toHaveBeenCalledTimes(1)
   })
 })

@@ -41,7 +41,7 @@ pub struct CasOutcome {
 }
 
 fn parse_agent_type(s: &str) -> Option<AgentType> {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    AgentType::from_wire(s)
 }
 
 /// Read the current tab-set version (0 when never written).

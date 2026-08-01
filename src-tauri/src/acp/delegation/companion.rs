@@ -315,6 +315,9 @@ pub struct CompanionContext {
     pub features: CompanionFeatures,
     /// Immutable launch role (`--role root|delegation_child`).
     pub role: CompanionRole,
+    /// Built-in agent slugs disabled in settings. These may only narrow the
+    /// embedded closed enum; launch inputs never add new delegate targets.
+    pub disabled_agents: Vec<String>,
 }
 
 impl CompanionContext {
@@ -494,7 +497,7 @@ pub async fn dispatch_line(
                     ));
                 }
             };
-            let tools = match all.as_array() {
+            let mut tools = match all.as_array() {
                 Some(arr) => {
                     let mut filtered: Vec<Value> = arr
                         .iter()
@@ -555,11 +558,36 @@ pub async fn dispatch_line(
                 }
                 None => all,
             };
+            remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
             LineAction::Respond(ok(id, json!({ "tools": tools })))
         }
         "tools/call" => build_tools_call_spawn(ctx.clone(), inflight, id, req.params).await,
         _ => LineAction::Respond(err(id, -32601, format!("method not found: {}", req.method))),
     }
+}
+
+fn remove_disabled_agents_from_delegate_enum(tools: &mut Value, disabled_agents: &[String]) {
+    if disabled_agents.is_empty() {
+        return;
+    }
+    let Some(variants) = tools
+        .as_array_mut()
+        .and_then(|tools| {
+            tools
+                .iter_mut()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some("delegate_to_agent"))
+        })
+        .and_then(|tool| tool.pointer_mut("/inputSchema/properties/agent_type/enum"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    variants.retain(|variant| {
+        variant
+            .as_str()
+            .is_none_or(|slug| !disabled_agents.iter().any(|disabled| disabled == slug))
+    });
 }
 
 /// Build the spawned-call descriptor for a `tools/call` (or, when the
@@ -2117,6 +2145,7 @@ mod tests {
             token: "tok".into(),
             features,
             role: CompanionRole::Root,
+            disabled_agents: Vec::new(),
         }
     }
 
@@ -2374,13 +2403,23 @@ mod tests {
         let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(agents.len(), 11);
-        assert!(agents.iter().any(|a| a == "hermes"));
-        assert!(agents.iter().any(|a| a == "code_buddy"));
-        assert!(agents.iter().any(|a| a == "kimi_code"));
-        assert!(agents.iter().any(|a| a == "pi"));
-        assert!(agents.iter().any(|a| a == "grok"));
-        assert!(agents.iter().any(|a| a == "cursor"));
+        let agent_slugs: Vec<&str> = agents.iter().filter_map(Value::as_str).collect();
+        assert_eq!(
+            agent_slugs,
+            vec![
+                "claude_code",
+                "codex",
+                "open_code",
+                "gemini",
+                "cline",
+                "hermes",
+                "code_buddy",
+                "kimi_code",
+                "pi",
+                "grok",
+                "cursor",
+            ]
+        );
         assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
         assert!(!delegate["inputSchema"]["required"]
             .as_array()
@@ -2514,6 +2553,45 @@ mod tests {
             cancel["inputSchema"]["properties"]["reason"]["enum"],
             json!(["timeout", "taskfail", "usercancel", "others"])
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_builtins_narrow_the_closed_delegate_enum() {
+        let mut context = ctx();
+        context.disabled_agents = vec![
+            "codex".into(),
+            "grok".into(),
+            "custom:disabled-agent".into(),
+            "not-an-agent".into(),
+        ];
+
+        let response = unwrap_respond(
+            dispatch_line(
+                &context,
+                Arc::new(InflightCalls::new()),
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tools = response.result.unwrap()["tools"].clone();
+        let agents = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "delegate_to_agent")
+            .unwrap()["inputSchema"]["properties"]["agent_type"]["enum"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(agents.len(), 9);
+        assert!(!agents.iter().any(|agent| agent == "codex"));
+        assert!(!agents.iter().any(|agent| agent == "grok"));
+        assert!(agents.iter().any(|agent| agent == "code_buddy"));
+        assert!(!agents.iter().any(|agent| {
+            agent
+                .as_str()
+                .is_some_and(|slug| slug.starts_with("custom:"))
+        }));
     }
 
     #[tokio::test]
@@ -5026,6 +5104,7 @@ mod tests {
             token: "tok".into(),
             features: FEEDBACK_ONLY,
             role: CompanionRole::Root,
+            disabled_agents: Vec::new(),
         };
         let inflight = Arc::new(InflightCalls::new());
         // tools/call → Spawn (registers the inflight entry).

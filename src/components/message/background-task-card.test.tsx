@@ -68,4 +68,33 @@ describe("BackgroundTaskCard", () => {
     renderCard([poll({ output: null, state: "input-available" })])
     expect(screen.getByText("Running")).toBeInTheDocument()
   })
+
+  it("renders a Grok TaskOutput poll with its command, badge and output", () => {
+    // Grok reports the same lifecycle as a JSON envelope; the row is titled by
+    // the command it polled (Claude's polls carry no command, hence the id
+    // fallback in the test above).
+    renderCard([
+      poll({
+        toolName: "get_command_or_subagent_output",
+        input: JSON.stringify({ task_ids: ["term_b0d"], timeout_ms: 15000 }),
+        output: JSON.stringify({
+          type: "TaskOutput",
+          Result: {
+            task_id: "term_b0d",
+            command: "/bin/bash -lc 'pnpm dev -- --port 3001'",
+            status: "failed",
+            exit_code: 1,
+            output: "INVALID DIRECTORY MARKER",
+          },
+        }),
+      }),
+    ])
+    expect(
+      screen.getByText("/bin/bash -lc 'pnpm dev -- --port 3001'")
+    ).toBeInTheDocument()
+    expect(screen.getByText("Failed")).toBeInTheDocument()
+    expect(screen.getByText("exit 1")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText("INVALID DIRECTORY MARKER")).toBeInTheDocument()
+  })
 })

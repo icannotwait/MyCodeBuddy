@@ -96,8 +96,7 @@ fn to_entry(m: folder::Model) -> FolderHistoryEntry {
 }
 
 fn parse_agent_type(s: &Option<String>) -> Option<AgentType> {
-    s.as_deref()
-        .and_then(|v| serde_json::from_value(serde_json::Value::String(v.to_string())).ok())
+    s.as_deref().and_then(AgentType::from_wire)
 }
 
 fn to_detail(m: folder::Model) -> FolderDetail {
@@ -1024,10 +1023,7 @@ mod tests {
             normalize_folder_storage_path(r"\\?\UNC\server\share\proj"),
             r"\\server\share\proj"
         );
-        assert_eq!(
-            normalize_folder_storage_path("//?/C:/work"),
-            "C:/work"
-        );
+        assert_eq!(normalize_folder_storage_path("//?/C:/work"), "C:/work");
         assert_eq!(
             normalize_folder_storage_path(r"D:\MyCodeBuddy"),
             r"D:\MyCodeBuddy"
@@ -1067,8 +1063,7 @@ mod tests {
         assert_eq!(opened.id, id);
         let row = raw_folder(&db.conn, id).await;
         assert_eq!(
-            row.path,
-            r"D:\codeg-legacy-rewrite",
+            row.path, r"D:\codeg-legacy-rewrite",
             "safe rewrite to storage-normalized path"
         );
     }

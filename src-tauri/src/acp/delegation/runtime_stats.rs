@@ -265,6 +265,11 @@ impl RuntimeStatsProjector {
         self.stats.clone()
     }
 
+    /// Workspace root used for relative path normalization (card harvest, etc.).
+    pub fn working_dir(&self) -> &Path {
+        &self.workspace
+    }
+
     pub fn apply(&mut self, event: &AcpEvent) -> bool {
         let before = self.stats.clone();
         let tool_call_id = match event {

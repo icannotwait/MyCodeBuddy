@@ -5,6 +5,7 @@ import type {
   AdaptedToolCallPart,
 } from "@/lib/adapters/ai-elements-adapter"
 import {
+  filterConversationInterruptedParts,
   filterDelegatedInterruptParts,
   isConversationInterruptedAgentText,
 } from "@/lib/delegation-conversation-interrupted"
@@ -32,7 +33,7 @@ describe("isConversationInterruptedAgentText", () => {
   })
 })
 
-describe("filterDelegatedInterruptParts", () => {
+describe("filterConversationInterruptedParts", () => {
   const goalStart: AdaptedToolCallPart = {
     type: "tool-call",
     toolCallId: "goal-1",
@@ -68,7 +69,7 @@ describe("filterDelegatedInterruptParts", () => {
       },
     ]
 
-    const filtered = filterDelegatedInterruptParts(parts, true)
+    const filtered = filterConversationInterruptedParts(parts)
 
     expect(filtered).not.toBe(parts)
     expect(filtered).toContainEqual({
@@ -93,10 +94,13 @@ describe("filterDelegatedInterruptParts", () => {
     expect(goal.items).toEqual([{ type: "text", text: "nested result stays" }])
   })
 
-  it("returns the original array for standalone conversations", () => {
+  it("filters for parent (standalone) sessions as well as delegated children", () => {
     const parts: AdaptedContentPart[] = [
       { type: "text", text: "Conversation interrupted" },
     ]
-    expect(filterDelegatedInterruptParts(parts, false)).toBe(parts)
+    expect(filterConversationInterruptedParts(parts)).toEqual([])
+    // Legacy alias: second arg is ignored; always filters.
+    expect(filterDelegatedInterruptParts(parts, false)).toEqual([])
+    expect(filterDelegatedInterruptParts(parts, true)).toEqual([])
   })
 })

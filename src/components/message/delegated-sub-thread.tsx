@@ -18,11 +18,11 @@
  */
 
 import { useCallback, useState } from "react"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { Eye } from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
-import { AGENT_LABELS } from "@/lib/types"
 import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
 import { DelegationRunSummary } from "@/components/message/delegation-run-summary"
@@ -149,7 +149,7 @@ export function DelegatedSubThread({
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-semibold text-foreground">
                 {agentDisplayLabel ??
-                  (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
+                  (agentType ? getAgentLabel(agentType) : t("unknownAgent"))}
               </span>
               {taskId && (
                 <span

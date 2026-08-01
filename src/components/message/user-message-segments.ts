@@ -4,6 +4,7 @@ import { INVOCATION_TOKEN_RE } from "@/lib/invocation-token"
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
+  unwrapReferenceDestination,
 } from "@/lib/reference-link"
 
 /**
@@ -20,16 +21,6 @@ export type UserMessageSegment =
  * are always inserted via the `@`·`/`·`$` menus and serialize to `file:`/`codeg:`).
  */
 const REFERENCE_SCHEME = /^(?:file:|codeg:)/i
-
-/** Strip a CommonMark angle-bracket destination (`<uri>`) to the bare uri, so the
- *  scheme test and `parseCodegReferenceUri` see a clean value (mirrors the reload
- *  adapter's unwrap in `ai-elements-adapter.handleMarkdownLink`). */
-function unwrapDestination(destination: string): string {
-  const trimmed = destination.trim()
-  return trimmed.startsWith("<") && trimmed.endsWith(">")
-    ? trimmed.slice(1, -1).trim()
-    : trimmed
-}
 
 /**
  * Split a plain-prose run into literal text and bare `/slug`·`$slug` skill
@@ -86,7 +77,7 @@ export function parseUserMessageSegments(text: string): UserMessageSegment[] {
   const out: UserMessageSegment[] = []
   for (const token of tokenizeReferenceLinks(text)) {
     if (token.type === "link") {
-      const destination = unwrapDestination(token.destination)
+      const destination = unwrapReferenceDestination(token.destination)
       if (REFERENCE_SCHEME.test(destination)) {
         const attrs = parseCodegReferenceUri(
           destination,

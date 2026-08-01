@@ -8,6 +8,7 @@
 #![recursion_limit = "256"]
 
 pub mod acp;
+pub mod acp_transcript;
 pub use acp::{
     idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
 };
@@ -24,6 +25,7 @@ pub mod db;
 pub mod document_translate;
 pub mod git_credential;
 pub mod git_repo;
+pub mod intern;
 pub mod keyring_store;
 pub mod logging;
 pub mod models;
@@ -1432,6 +1434,12 @@ mod tauri_app {
                 acp_commands::acp_open_hermes_setup_terminal,
                 acp_commands::acp_reveal_hermes_home,
                 acp_commands::acp_reorder_agents,
+                crate::commands::custom_agents::acp_list_custom_agents,
+                crate::commands::custom_agents::acp_save_custom_agent,
+                crate::commands::custom_agents::acp_delete_custom_agent,
+                crate::commands::custom_agents::acp_fetch_registry_catalog,
+                crate::commands::custom_agents::acp_add_registry_agent,
+                crate::commands::custom_agents::acp_current_platform,
                 acp_commands::acp_list_agent_skills,
                 acp_commands::acp_read_agent_skill,
                 acp_commands::acp_save_agent_skill,

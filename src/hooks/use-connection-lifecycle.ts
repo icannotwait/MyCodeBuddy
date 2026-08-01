@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   useAcpActions,
   type ConnectionIntent,
@@ -11,12 +12,13 @@ import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { ContinuationWaitingError } from "@/lib/continuation-waiting"
 import { getCurrentEffectiveAppLocale } from "@/lib/i18n"
+import { extractAppCommandError } from "@/lib/app-error"
 import {
-  AGENT_LABELS,
   type AgentType,
   type DelegationRoutePolicy,
   type PromptDraft,
 } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 
 interface UseConnectionLifecycleOptions {
@@ -65,6 +67,8 @@ interface UseConnectionLifecycleOptions {
    * non-prompt paths (cancel / config). Prompt paths may override via send opts.
    */
   onDelegateViewerOnly?: () => void
+  /** True only while a split-group move reparents this still-open tab. */
+  isTransientUnmount?: () => boolean
 }
 
 export interface UseConnectionLifecycleReturn {
@@ -95,6 +99,8 @@ export interface UseConnectionLifecycleReturn {
        * access. Prefer this over the top-level option for prompt paths.
        */
       onDelegateViewerOnly?: () => void
+      /** Settles caller-owned optimistic state after any other send failure. */
+      onSendFailed?: (error: unknown) => void
     }
   ) => void
   handleSetConfigOption: (configId: string, valueId: string) => void
@@ -117,7 +123,9 @@ export function shouldDisconnectOnUnmount(args: {
   status: string | null
   isViewer: boolean
   backgroundOutstanding: number
+  transientUnmount?: boolean
 }): boolean {
+  if (args.transientUnmount) return false
   if (args.isViewer) return true
   const ownerBusy =
     args.status === "prompting" || args.backgroundOutstanding > 0
@@ -147,6 +155,7 @@ export function useConnectionLifecycle({
   connectionIntent = "own_or_observe",
   retryObserverDiscovery = false,
   onDelegateViewerOnly,
+  isTransientUnmount,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
   const { setActiveKey, touchActivity } = useAcpActions()
@@ -317,7 +326,7 @@ export function useConnectionLifecycle({
       if (!taskIdRef.current) {
         const id = `acp-connect-${Date.now()}`
         taskIdRef.current = id
-        const agent = AGENT_LABELS[agentType]
+        const agent = getAgentLabel(agentType)
         addTask(
           id,
           t("tasks.connectingTitle", { agent }),
@@ -368,7 +377,7 @@ export function useConnectionLifecycle({
     if (!selectorTaskIdRef.current) {
       const id = `acp-session-init-${Date.now()}`
       selectorTaskIdRef.current = id
-      const agent = AGENT_LABELS[agentType]
+      const agent = getAgentLabel(agentType)
       addTask(
         id,
         t("tasks.initSessionTitle", { agent }),
@@ -392,6 +401,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     connDisconnectRef.current = connDisconnect
   }, [connDisconnect])
+  const isTransientUnmountRef = useRef(isTransientUnmount)
+  useEffect(() => {
+    isTransientUnmountRef.current = isTransientUnmount
+  }, [isTransientUnmount])
 
   // Clean up on unmount (e.g. tab closed): disconnect the ACP connection
   // so it doesn't leak, and remove lingering tasks.
@@ -417,6 +430,7 @@ export function useConnectionLifecycle({
           status: statusRef.current,
           isViewer: isViewerRef.current,
           backgroundOutstanding: backgroundOutstandingRef.current,
+          transientUnmount: isTransientUnmountRef.current?.() === true,
         })
       ) {
         connDisconnectRef.current().catch(() => {})
@@ -528,6 +542,7 @@ export function useConnectionLifecycle({
         onTurnInProgress?: () => void
         onContinuationWaiting?: () => void
         onDelegateViewerOnly?: () => void
+        onSendFailed?: (error: unknown) => void
       }
     ) => {
       touchActivity(contextKey)
@@ -536,6 +551,7 @@ export function useConnectionLifecycle({
       const onViewerOnly =
         opts?.onDelegateViewerOnly ??
         (() => onDelegateViewerOnlyRef.current?.())
+      const onSendFailed = opts?.onSendFailed
       void (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -571,9 +587,15 @@ export function useConnectionLifecycle({
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
+        const appError = extractAppCommandError(e)
+        const message =
+          appError?.message ??
+          (e instanceof Error ? e.message : String(e ?? "unknown error"))
+        toast.error(t("errors.sendPromptFailed", { error: message }))
+        onSendFailed?.(e)
       })
     },
-    [connSetMode, sendPrompt, contextKey, touchActivity]
+    [connSetMode, sendPrompt, contextKey, touchActivity, t]
   )
 
   const handleCancel = useCallback(() => {

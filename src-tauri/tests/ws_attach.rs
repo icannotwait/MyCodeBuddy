@@ -193,6 +193,7 @@ async fn ws_cold_attach_receives_snapshot_then_live_events() {
         &state.emitter,
         AcpEvent::ContentDelta {
             text: "hello-world".into(),
+            parent_tool_use_id: None,
         },
     )
     .await;
@@ -235,6 +236,7 @@ async fn ws_hot_attach_with_cursor_receives_replay() {
             &state.emitter,
             AcpEvent::ContentDelta {
                 text: format!("delta-{i}"),
+                parent_tool_use_id: None,
             },
         )
         .await;
@@ -413,7 +415,10 @@ fn content_delta_envelope_serializes_to_expected_shape() {
     let env = EventEnvelope {
         seq: 7,
         connection_id: "c".into(),
-        payload: AcpEvent::ContentDelta { text: "x".into() },
+        payload: AcpEvent::ContentDelta {
+            text: "x".into(),
+            parent_tool_use_id: None,
+        },
     };
     let v = serde_json::to_value(&env).unwrap();
     assert_eq!(v["seq"], 7);

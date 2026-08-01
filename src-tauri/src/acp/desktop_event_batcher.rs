@@ -897,7 +897,10 @@ mod tests {
         test_envelope(
             connection_id,
             seq,
-            AcpEvent::ContentDelta { text: "x".into() },
+            AcpEvent::ContentDelta {
+                text: "x".into(),
+                parent_tool_use_id: None,
+            },
             estimated_bytes,
         )
     }
@@ -1142,6 +1145,7 @@ mod tests {
                     connection_id: "c1".into(),
                     payload: AcpEvent::ContentDelta {
                         text: "secret".into(),
+                        parent_tool_use_id: None,
                     },
                 }),
                 1,
@@ -1237,7 +1241,8 @@ mod tests {
             images: None,
         }));
         assert!(!is_flush_sensitive(&AcpEvent::ContentDelta {
-            text: "x".into()
+            text: "x".into(),
+            parent_tool_use_id: None,
         }));
         assert!(is_flush_sensitive(&AcpEvent::SessionLoadFailed {
             session_id: "s".into(),

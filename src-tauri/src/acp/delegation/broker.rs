@@ -66,7 +66,8 @@ use crate::acp::delegation::attention::{
     NoopDelegationAttentionStore,
 };
 use crate::acp::delegation::card_summary::{
-    card_summary_to_json, extract_card_summary, strip_card_summary_comments, CardSummary,
+    card_summary_to_json, extract_card_summary_with_report_fallback, strip_card_summary_comments,
+    CardSummary,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::launch_snapshot::{
@@ -1816,20 +1817,58 @@ fn terminal_from_handoff_disposition(
 /// Extract validated card summary onto the terminal write and strip summary
 /// HTML comments from parent-facing MCP result text. Applied on **every**
 /// settlement path that carries result text (including setup-window).
+///
+/// When chat text has no card, harvest from markdown-linked / touched report
+/// files (`extra_report_paths`, optional `workspace_path` for relative links).
 fn prepare_terminal_with_card_summary(
     mut terminal: TerminalTaskWrite,
     result_text: Option<String>,
+    extra_report_paths: &[std::path::PathBuf],
+    workspace_path: Option<&std::path::Path>,
 ) -> (TerminalTaskWrite, Option<String>, Option<CardSummary>) {
-    let Some(raw) = result_text else {
-        return (terminal, None, None);
-    };
-    let summary = extract_card_summary(&raw);
+    let had_text = result_text.is_some();
+    let raw = result_text.unwrap_or_default();
+    let summary =
+        extract_card_summary_with_report_fallback(&raw, extra_report_paths, workspace_path);
     if let Some(ref s) = summary {
         if let Ok(json) = card_summary_to_json(s) {
             terminal = terminal.with_card_summary_json(json);
         }
     }
-    (terminal, Some(strip_card_summary_comments(&raw)), summary)
+    // Preserve prior semantics: `None` input stays `None` for parent MCP text.
+    let parent_text = if had_text {
+        Some(strip_card_summary_comments(&raw))
+    } else {
+        None
+    };
+    (terminal, parent_text, summary)
+}
+
+/// Harvest candidates + workspace root from a live runtime projector.
+///
+/// Uses `try_lock` so settlement never blocks on a contended projector;
+/// missing extras only degrade to chat-only / markdown-link harvest.
+fn report_harvest_context_from_runtime(
+    runtime: Option<&Arc<LiveRuntimeState>>,
+) -> (Vec<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let Some(runtime) = runtime else {
+        return (Vec::new(), None);
+    };
+    let Ok(guard) = runtime.projector.try_lock() else {
+        return (Vec::new(), None);
+    };
+    let workspace = Some(guard.working_dir().to_path_buf());
+    let paths = guard
+        .snapshot()
+        .touched_files
+        .into_iter()
+        .filter(|f| {
+            let lower = f.path.to_ascii_lowercase();
+            lower.ends_with(".md") || lower.ends_with(".markdown")
+        })
+        .map(|f| std::path::PathBuf::from(f.path))
+        .collect();
+    (paths, workspace)
 }
 
 /// Convert an admission-window terminal into a settlement outcome.
@@ -6671,8 +6710,13 @@ impl DelegationBroker {
             // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
                 let (terminal, result_text) = terminal_from_outcome(&outcome);
-                let (terminal, result_text, card_summary) =
-                    prepare_terminal_with_card_summary(terminal, result_text);
+                let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
+                let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                    terminal,
+                    result_text,
+                    &extra_paths,
+                    workspace.as_deref(),
+                );
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -9105,8 +9149,13 @@ impl DelegationBroker {
                 }
             }
             let (terminal, result_text) = terminal_from_outcome(&outcome);
-            let (terminal, result_text, card_summary) =
-                prepare_terminal_with_card_summary(terminal, result_text);
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
+            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                terminal,
+                result_text,
+                &extra_paths,
+                workspace.as_deref(),
+            );
             let mut ctx = SettleContext {
                 parent_connection_id: req.parent_connection_id.clone(),
                 parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -11619,10 +11668,15 @@ impl DelegationBroker {
         };
         if let Some((task, duration_ms)) = task {
             let (terminal, result_text) = terminal_from_outcome(&outcome);
-            // Extract validated card summary and strip comments from parent MCP
-            // text on every normal completion path (shared helper).
-            let (terminal, result_text, card_summary) =
-                prepare_terminal_with_card_summary(terminal, result_text);
+            // Extract validated card summary (chat first, report-file harvest
+            // fallback) and strip comments from parent MCP text.
+            let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
+            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                terminal,
+                result_text,
+                &extra_paths,
+                workspace.as_deref(),
+            );
             let mut ctx = SettleContext::from_running(&task, duration_ms, false);
             ctx.card_summary = card_summary;
             tracing::info!(
@@ -27999,6 +28053,85 @@ mod tests {
             CardSummary::Review { minor, .. } => assert_eq!(*minor, 2),
             other => panic!("expected review summary, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn emitter_harvests_card_summary_from_linked_report_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-broker-card-harvest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("final-review.md");
+        std::fs::write(
+            &report,
+            r#"<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"TS build fails on nullable taskIndex.","report_file":".superpowers/sdd/final-review.md"}
+-->
+"#,
+        )
+        .unwrap();
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-harvest".into())).await;
+        mock.queue_send(Ok(accepted(44, Utc::now()))).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
+
+        // Chat has prose + link only (no card) — mirrors session 2534 Final reviewer.
+        let raw_text = format!(
+            "Verdict: `request_changes`.\n\nReport: [final-review.md]({})",
+            report.display()
+        );
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-harvest")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: raw_text,
+                    child_conversation_id: 44,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 10,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let report_out = driver.await.unwrap();
+        assert!(
+            matches!(report_out, DelegationOutcome::Ok(_)),
+            "expected Ok, got {report_out:?}"
+        );
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        let summary = calls[0]
+            .card_summary
+            .as_ref()
+            .expect("report-file harvest must populate card_summary");
+        match summary {
+            CardSummary::Review {
+                verdict: crate::acp::delegation::card_summary::ReviewVerdict::RequestChanges,
+                important,
+                ..
+            } => assert_eq!(*important, 1),
+            other => panic!("expected request_changes review, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

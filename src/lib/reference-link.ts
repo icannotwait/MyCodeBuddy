@@ -18,6 +18,33 @@
  */
 
 /**
+ * Drop a Windows extended-length ("verbatim") prefix from an already
+ * slash-normalized path.
+ *
+ * Rust's `fs::canonicalize` always hands back this form on Windows, so a path
+ * that reached us from the backend can be `//?/C:/…` (drive) or `//?/UNC/srv/
+ * share/…` (network share). Both must lose the prefix BEFORE the `//` check
+ * below, which would otherwise read the `?` as a uri authority and emit
+ * `file://%3F/C%3A/…` — a uri that decodes back to the unopenable path
+ * `?/C:/…` (issue #392). The backend strips the prefix at its own boundary
+ * too; doing it here as well keeps a fixed client working against an
+ * unfixed server.
+ *
+ * `//?/Volume{…}` and other device paths have no plain equivalent, so they are
+ * left alone (and still serialize as they did before).
+ */
+function stripVerbatimPrefix(normalized: string): string {
+  // Windows accepts `//?/unc/` in any casing.
+  const unc = /^\/\/\?\/UNC\//i.exec(normalized)
+  if (unc) return `//${normalized.slice(unc[0].length)}`
+  if (normalized.startsWith("//?/")) {
+    const rest = normalized.slice(4)
+    if (/^[a-zA-Z]:/.test(rest)) return rest
+  }
+  return normalized
+}
+
+/**
  * Build a `file://` uri from an absolute path (POSIX or Windows), percent-
  * encoding each path segment so spaces / `#` / `?` / `%` can't corrupt the uri.
  * A POSIX path (leading `/`) yields `file://<encoded>`; anything else (a Windows
@@ -28,9 +55,12 @@
  * would parse back with an EMPTY authority and a `//`-prefixed pathname —
  * indistinguishable from a protocol-relative web url once re-serialized
  * into chat markdown, so the reference would open as a web link.
+ *
+ * A Windows verbatim path (`\\?\C:\…`) is reduced to its plain form first —
+ * see {@link stripVerbatimPrefix}.
  */
 export function buildFileUri(absolutePath: string): string {
-  const normalized = absolutePath.replace(/\\/g, "/")
+  const normalized = stripVerbatimPrefix(absolutePath.replace(/\\/g, "/"))
   if (normalized.startsWith("//")) {
     const encoded = normalized
       .slice(2)
@@ -101,6 +131,27 @@ export function formatFileRangeLabel(
  */
 export function unescapeReferenceLabel(label: string): string {
   return label.replace(/\\([\\`*_~[\]()<>])/g, "$1")
+}
+
+/**
+ * Reverse `escapeLinkDestination` (reference-text.ts): unwrap a CommonMark
+ * angle-bracket destination (`<uri>`) AND drop the backslashes it escapes with,
+ * yielding the bare uri. A destination that isn't angle-wrapped carries no
+ * escapes (the serializer only wraps when it must) and is returned trimmed.
+ *
+ * The escape set mirrors the serializer's exactly: inside `<…>` it escapes `\`,
+ * `<` and `>`. Unwrapping without decoding them would hand back a uri whose
+ * backslashes are doubled — a wrong path on the badge/chip (`file:///C:\\dir`
+ * instead of `file:///C:\dir`), and one more doubling on every
+ * serialize → parse → serialize round-trip.
+ */
+export function unwrapReferenceDestination(destination: string): string {
+  const trimmed = destination.trim()
+  if (!trimmed.startsWith("<") || !trimmed.endsWith(">")) return trimmed
+  return trimmed
+    .slice(1, -1)
+    .trim()
+    .replace(/\\([\\<>])/g, "$1")
 }
 
 /**

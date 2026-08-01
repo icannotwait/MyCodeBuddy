@@ -76,7 +76,75 @@ describe("remarkAutolinkLocalPaths", () => {
     ])
   })
 
-  it("does not descend into links, link references, code, or html", () => {
+  it("converts a path-only inlineCode node into a local file link", () => {
+    const path =
+      "docs/superpowers/specs/2026-07-30-workflow-overlay-ui-design.md"
+    const tree: Node = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [
+            { type: "text", value: "设计稿已写入并提交到 " },
+            { type: "inlineCode", value: path },
+            { type: "text", value: "（commit `70853244`）。" },
+          ],
+        },
+      ],
+    }
+    remarkAutolinkLocalPaths()(tree)
+    expect(tree.children?.[0].children).toEqual([
+      { type: "text", value: "设计稿已写入并提交到 " },
+      {
+        type: "link",
+        url: path,
+        children: [{ type: "text", value: path }],
+      },
+      { type: "text", value: "（commit `70853244`）。" },
+    ])
+  })
+
+  it("converts a Windows absolute path-only inlineCode node", () => {
+    const path = String.raw`D:\repo\src\app.ts`
+    const tree: Node = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [{ type: "inlineCode", value: path }],
+        },
+      ],
+    }
+    remarkAutolinkLocalPaths()(tree)
+    expect(tree.children?.[0].children).toEqual([
+      {
+        type: "link",
+        url: "/D:/repo/src/app.ts",
+        children: [{ type: "text", value: path }],
+      },
+    ])
+  })
+
+  it("leaves non-path inlineCode unchanged", () => {
+    const tree: Node = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [
+            { type: "inlineCode", value: "npm run build" },
+            { type: "inlineCode", value: "const x = src/app.ts" },
+            { type: "inlineCode", value: "README.md" },
+          ],
+        },
+      ],
+    }
+    const before = structuredClone(tree)
+    remarkAutolinkLocalPaths()(tree)
+    expect(tree).toEqual(before)
+  })
+
+  it("does not descend into links, link references, fenced code, or html", () => {
     const path = String.raw`D:\repo\src\app.ts`
     const tree: Node = {
       type: "root",
@@ -93,7 +161,6 @@ describe("remarkAutolinkLocalPaths", () => {
               type: "linkReference",
               children: [{ type: "text", value: path }],
             },
-            { type: "inlineCode", value: path },
             { type: "html", value: `<span>${path}</span>` },
             { type: "image", url: path },
             { type: "imageReference" },

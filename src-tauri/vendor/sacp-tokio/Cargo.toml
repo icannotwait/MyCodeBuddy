@@ -37,10 +37,6 @@ resolver = "2"
 name = "sacp_tokio"
 path = "src/lib.rs"
 
-[[test]]
-name = "debug_logging"
-path = "tests/debug_logging.rs"
-
 [dependencies.futures]
 version = "0.3.31"
 

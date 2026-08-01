@@ -21,7 +21,8 @@
 
 Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
 
-![gallery](../images/gallery.svg)
+![gallery](../images/workspace-light.png#gh-light-mode-only)
+![gallery](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## 赞助
 
@@ -60,13 +61,13 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 
 ## 主界面
 
-![Codeg Light](../images/main-light.png#gh-light-mode-only)
-![Codeg Dark](../images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## 多智能体协作
 
-![Codeg Light](../images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## 日常办公
 
@@ -110,13 +111,23 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 
 > 注意：环境变量的优先级高于默认路径。
 
+
+名单之外的呢？自己加就行。从公开的 ACP 注册表里挑一个，或者粘贴它的 distribution JSON，Codeg 会安装它、预检它能否启动，然后像对待内置智能体一样对待它——出现在选择器里，接受 `@` 委派与技能配置；即便这个智能体本身不留下任何历史，它的会话也会被记录下来并可搜索。→ [自定义智能体](https://docs.codeg.app/zh/guide/custom-agents)
+
+## 🪟 分屏
+
+一条标签栏不总是够用。右键点击会话标签，即可把视图**向右**或**向下**拆分，想拆几次就拆几次：左右两栏、上下三格，或者一整片网格。每个分组都是独立的工作区——自己的标签、自己的标题栏、自己的新建会话按钮——所以左边这格可以让 Claude Code 重构，右边那格让 Codex 审阅 diff。
+
+把标签从一个分组拖到另一个分组，它的会话在搬家途中也不会中断；拖动两个分组之间的分隔条，就能改变它们分配空间的方式。布局会按工作区记住，草稿也包含在内：重新打开 Codeg，拆分原样回来，没发出去的文字还在输入框里。
+
+![把会话区拆分成标签分组构成的网格](../images/split-light.gif#gh-light-mode-only)
+![把会话区拆分成标签分组构成的网格](../images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>项目启动器</h2></summary>
 
 可视化创建新项目：左侧配置面板，右侧实时预览。
 
-![Project Boot Light](../images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](../images/project-boot-dark.png#gh-dark-mode-only)
 
 ### 功能特性
 
@@ -290,7 +301,7 @@ GitHub Releases for this fork ship **desktop only**. They do **not** attach
 (`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### 方式三：Docker

@@ -32,24 +32,37 @@ function getServerDocumentActivity(): boolean {
  * Always-mounted observer: when the active persisted conversation is genuinely
  * visible (hydrated active tab, conversations route, non-maximized files,
  * document visible + focused), CAS-clear its awaiting-reply token once per
- * exact (conversationId, token). Does not clear inactive tiles or background
- * details getters — only the global active tab qualifies.
+ * exact (conversationId, token). Also clears when the sidebar highlights a
+ * detached pop-out conversation (no main tab / main window may have lost
+ * focus after focusing the detached window). Does not clear inactive tiles or
+ * background details getters.
  */
 export function ConversationAwaitingReplyClearer() {
-  const { activeTabId, tabsHydrated, activeConversationId } = useTabStore(
+  const {
+    activeTabId,
+    tabsHydrated,
+    activeConversationId,
+    sidebarSelectionId,
+  } = useTabStore(
     useShallow((state) => {
       const active = state.tabs.find((tab) => tab.id === state.activeTabId)
       return {
         activeTabId: state.activeTabId,
         tabsHydrated: state.tabsHydrated,
         activeConversationId: active?.conversationId ?? null,
+        sidebarSelectionId: state.sidebarSelection?.id ?? null,
       }
     })
   )
+  // Detached pop-out re-click stamps sidebarSelection without a main tab.
+  // Prefer that target so the red-dot token clears even when focus moved to
+  // the detached window (main `document.hasFocus()` is then false).
+  const targetConversationId = sidebarSelectionId ?? activeConversationId
+  const viaSidebarSelection = sidebarSelectionId != null
   const token = useAppWorkspaceStore((state) =>
-    activeConversationId == null
+    targetConversationId == null
       ? null
-      : (state.conversations.find((item) => item.id === activeConversationId)
+      : (state.conversations.find((item) => item.id === targetConversationId)
           ?.awaiting_reply_token ?? null)
   )
   const applyPatch = useAppWorkspaceStore(
@@ -77,14 +90,23 @@ export function ConversationAwaitingReplyClearer() {
   }, [])
 
   useEffect(() => {
-    if (!tabsHydrated || !activeTabId || activeConversationId == null || !token)
+    if (!tabsHydrated || targetConversationId == null || !token) return
+    if (viaSidebarSelection) {
+      // Explicit sidebar selection of a (typically detached) conversation —
+      // user intent to view; do not require main-window focus/route guards.
+    } else if (
+      !activeTabId ||
+      !isConversations ||
+      filesMaximized ||
+      !documentActive
+    ) {
       return
-    if (!isConversations || filesMaximized || !documentActive) return
-    const key = `${activeConversationId}:${token}`
+    }
+    const key = `${targetConversationId}:${token}`
     if (inFlight.current.has(key)) return
     inFlight.current.add(key)
     const startedGeneration = reconnectGeneration.current
-    void clearAwaitingReply(activeConversationId, token)
+    void clearAwaitingReply(targetConversationId, token)
       .then(applyPatch)
       .catch((error) => {
         console.warn("[AwaitingReply] clear failed", error)
@@ -98,7 +120,6 @@ export function ConversationAwaitingReplyClearer() {
         }
       })
   }, [
-    activeConversationId,
     activeTabId,
     applyPatch,
     documentActive,
@@ -106,7 +127,9 @@ export function ConversationAwaitingReplyClearer() {
     isConversations,
     retryEpoch,
     tabsHydrated,
+    targetConversationId,
     token,
+    viaSidebarSelection,
   ])
 
   return null

@@ -21,7 +21,8 @@
 
 Codeg (Code Generation) هو مساحة عمل للبرمجة متعددة الوكلاء. يجمع عدة وكلاء (Claude Code، Codex CLI، OpenCode، Gemini CLI، Cline، Hermes Agent، CodeBuddy، Kimi Code، Pi، Grok Build، وغيرها) في مساحة عمل واحدة، ويدعم تجميع المحادثات والتعاون بين عدة وكلاء، مع دعم التثبيت على سطح المكتب والنشر على الخادم/Docker.
 
-![gallery](../images/gallery.svg)
+![gallery](../images/workspace-light.png#gh-light-mode-only)
+![gallery](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## الرعاة
 
@@ -60,13 +61,13 @@ Codeg (Code Generation) هو مساحة عمل للبرمجة متعددة ال�
 
 ## الواجهة الرئيسية
 
-![Codeg Light](../images/main-light.png#gh-light-mode-only)
-![Codeg Dark](../images/main-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
+![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
 
 ## التعاون متعدد الوكلاء
 
-![Codeg Light](../images/collaboration-light.png#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.png#gh-dark-mode-only)
+![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
+![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
 
 ## سير عمل المكتب
 
@@ -110,13 +111,23 @@ Codeg (Code Generation) هو مساحة عمل للبرمجة متعددة ال�
 
 > ملاحظة: متغيرات البيئة لها الأولوية على المسارات الافتراضية.
 
+
+ليس في القائمة؟ أضِفه بنفسك. اختر أي وكيل من سجل ACP العام أو الصق ملف distribution JSON الخاص به، فيتولّى Codeg تثبيته والتحقّق مسبقًا من قدرته على الإقلاع، ثم يعامله كوكيل مدمج — يظهر في المُحدِّد، ويقبل التفويض بـ `@` والمهارات، وتُسجَّل محادثاته وتصبح قابلة للبحث حتى لو لم يحتفظ الوكيل نفسه بأي سجل. → [الوكلاء المخصّصون](https://docs.codeg.app/guide/custom-agents)
+
+## 🪟 العرض المُقسَّم
+
+شريط تبويبات واحد لا يكفي دائمًا. انقر بزر الفأرة الأيمن على تبويب محادثة لتقسيم العرض **يمينًا** أو **أسفل**، بأي عدد تريده: لوحان جنبًا إلى جنب، أو ثلاثة مرصوفة، أو شبكة كاملة. كل مجموعة مساحة عمل مكتملة بذاتها — تبويباتها الخاصة، ورأسها الخاص، وزر محادثة جديدة خاص بها — فيتولّى Claude Code إعادة الهيكلة في لوح بينما يراجع Codex فرقًا في اللوح المجاور.
+
+اسحب تبويبًا من مجموعة إلى أخرى وستواصل جلسته البثّ أثناء الانتقال، واسحب الفاصل بين مجموعتين لتغيير طريقة تقاسمهما المساحة. يُحفظ تخطيطك لكل مساحة عمل، بما في ذلك المسودات: أعِد فتح Codeg فيعود التقسيم كما كان، والنص الذي لم ترسله لا يزال في الصندوق.
+
+![تقسيم منطقة المحادثة إلى شبكة من مجموعات التبويبات](../images/split-light.gif#gh-light-mode-only)
+![تقسيم منطقة المحادثة إلى شبكة من مجموعات التبويبات](../images/split-dark.gif#gh-dark-mode-only)
+
 <details>
 <summary><h2>مُنشئ المشروع</h2></summary>
 
 أنشئ مشاريع جديدة بصريًا من خلال واجهة مقسّمة: التكوين على اليسار، والمعاينة الحية على اليمين.
 
-![Project Boot Light](../images/project-boot-light.png#gh-light-mode-only)
-![Project Boot Dark](../images/project-boot-dark.png#gh-dark-mode-only)
 
 ### الميزات
 
@@ -289,7 +300,7 @@ GitHub Releases for this fork ship **desktop only**. They do **not** attach
 (`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
 
 ```powershell
-.\install.ps1 -Version v0.21.9-mycodebuddy.1
+.\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
 #### الخيار 3: Docker

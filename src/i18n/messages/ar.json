@@ -206,7 +206,15 @@
       "downloadFailed": "فشل تنزيل حزمة التحديث. يرجى المحاولة مرة أخرى لاحقًا.",
       "installFailed": "فشل تثبيت التحديث. يرجى إغلاق التطبيق ثم إعادة المحاولة.",
       "unknown": "فشل التحديث. يرجى المحاولة مرة أخرى لاحقًا."
-    }
+    },
+    "newVersionBadge": "إصدار جديد v{version}",
+    "updateAvailableTitle": "يتوفر تحديث",
+    "releaseNotesTitle": "ما الجديد",
+    "remindLater": "لاحقًا",
+    "retry": "إعادة المحاولة",
+    "stepDownload": "التنزيل",
+    "stepInstall": "التثبيت",
+    "stepRestart": "إعادة التشغيل"
   },
   "VersionControlSettings": {
     "loading": "جارٍ التحميل...",
@@ -540,6 +548,7 @@
   "AcpAgentSettings": {
     "title": "إدارة Agent SDK",
     "description": "أدر اتصال Agent SDK وحالة التمكين ومتغيرات البيئة وإدارة الإعدادات ومعلومات فحص الإصدار المسبق في مكان واحد.",
+    "showThinking": "Show thinking",
     "loadingAgents": "جارٍ تحميل قائمة الوكلاء...",
     "agentList": "قائمة الوكلاء",
     "emptyNoAgent": "لا يوجد وكيل متاح.",
@@ -751,7 +760,9 @@
       "loggedIn": "تم تسجيل الدخول",
       "loginRelogin": "إعادة تسجيل الدخول / تبديل الحساب",
       "loginTimeout": "انتهت مهلة تسجيل الدخول، يرجى المحاولة مرة أخرى",
-      "loginSaveFailed": "تم تسجيل الدخول بنجاح ولكن فشل حفظ الإعدادات"
+      "loginSaveFailed": "تم تسجيل الدخول بنجاح ولكن فشل حفظ الإعدادات",
+      "enableFast": "تفعيل Fast",
+      "enableFastAria": "تفعيل مستوى خدمة Fast لـ Codex"
     },
     "gemini": {
       "authConfig": "إعداد مصادقة Gemini",
@@ -881,46 +892,78 @@
       "loginHint": "لا تملك مفتاح API؟ شغّل «codebuddy» في الطرفية لتسجيل الدخول بحساب Tencent بدلاً من ذلك."
     },
     "kimiCode": {
-      "configManagement": "Kimi Code Configuration",
-      "configDescription": "`kimi acp` only authenticates with a stored login token and rejects API keys on their own. To use an API key, codeg writes a managed ~/.kimi-code/config.toml provider AND seeds a local gate token so the session opens — inference still runs on your key.",
-      "gateReadyApiKey": "Authenticated via API key (codeg seeded the local gate token).",
-      "gateReadyLogin": "Authenticated via a Kimi account login.",
+      "configManagement": "إعدادات Kimi Code",
+      "configDescription": "لا يقبل `kimi acp` سوى رمز تسجيل دخول مخزَّن، لذا يكتب codeg مزوّدًا مُدارًا في ~/.kimi-code/config.toml ويزرع رمز بوابة محليًا — أما الاستدلال فيظل يعمل بمفتاحك أنت.",
+      "statusUnconfigured": "لم يُضبط بعد",
+      "statusDirty": "تغييرات غير محفوظة",
+      "summaryLabel": "المطبَّق حاليًا",
+      "gateReadyApiKey": "تمت كتابة مفتاح API في config.toml",
+      "gateReadyLogin": "تم تسجيل الدخول بحساب Kimi",
+      "revealConfig": "إظهار في المجلد",
+      "envOverrideWarning": "المتغير {keys} مضبوط وله أولوية على config.toml. الحفظ هنا يزيله.",
+      "authModeLabel": "طريقة المصادقة",
+      "authModeApiKey": "مفتاح API",
+      "authModeLogin": "تسجيل الدخول بحساب Kimi (اشتراك)",
+      "authModeApiKeyHint": "يكتب مزوّدًا مُدارًا في config.toml ويزرع رمز البوابة كي تتمكن الجلسات من الفتح.",
+      "loginHint": "شغّل `kimi login` في الطرفية لتسجيل الدخول بحساب اشتراك Kimi. لا يخزّن codeg أي بيانات اعتماد بل يعيد استخدام تسجيل دخول Kimi نفسه. الحفظ هنا يزيل رمز بوابة مفتاح API الخاص بـ codeg.",
+      "credentialTitle": "بيانات الاعتماد",
+      "interfaceTypeLabel": "نوع المزوّد",
+      "interfaceTypeHint": "بروتوكول المزوّد الذي يتحدث به Kimi (الحقل `type` في config.toml). اختر Kimi / Moonshot لمفتاح من Moonshot أو platform.kimi.com.",
+      "endpointLabel": "نقطة النهاية",
+      "endpointCustom": "مخصّص (متوافق مع OpenAI)",
+      "endpointHint": "دولي = api.moonshot.ai؛ الصين (مفاتيح platform.kimi.com) = api.moonshot.cn. أما المخصّص فيشير إلى أي نقطة نهاية متوافقة مع OpenAI.",
+      "regionInternational": "دولي (api.moonshot.ai)",
+      "regionChina": "الصين (api.moonshot.cn)",
+      "baseUrlLabel": "عنوان URL الأساسي",
+      "baseUrlHint": "اتركه فارغًا لاستخدام القيمة الافتراضية لحزمة SDK الخاصة بالمزوّد.",
+      "apiKeyLabel": "مفتاح API",
+      "apiKeyHint": "يُكتب في ~/.kimi-code/config.toml ويُستخدم للاستدلال. من platform.kimi.com أو platform.kimi.ai.",
+      "vertexProjectLabel": "مشروع GCP‏ (GOOGLE_CLOUD_PROJECT)",
+      "vertexLocationLabel": "منطقة GCP‏ (GOOGLE_CLOUD_LOCATION)",
+      "vertexHint": "يستخدم Vertex AI بيانات اعتماد التطبيق الافتراضية من Google — شغّل `gcloud auth application-default login` (بدون مفتاح API).",
+      "modelTitle": "النموذج",
+      "modelLabel": "النموذج",
+      "modelHint": "معرّف النموذج الذي يُكتب في config.toml. استخدم «اختبار وجلب النماذج» لمعرفة ما يمكن لمفتاحك الوصول إليه فعليًا.",
+      "maxContextLabel": "أقصى حجم للسياق",
+      "maxContextHint": "مطلوب وفق مخطط Kimi: بدونه يتجاهل Kimi كتلة النموذج بالكامل فلا يعود أي طلب بإجابة. القيمة الافتراضية 262144.",
+      "fetchModels": "اختبار وجلب النماذج",
+      "fetchModelsOk": "المفتاح يعمل — {count} نموذجًا متاحًا",
+      "fetchModelsEmpty": "المفتاح يعمل، لكن لم تُرجَع أي نماذج",
+      "fetchModelsFailed": "فشل الاختبار",
+      "fetchModelsNeedsKey": "أدخل أولًا مفتاح API ونقطة النهاية",
+      "modelNotInList": "هذا النموذج ليس ضمن القائمة التي يستطيع مفتاحك الوصول إليها — سيفشل Kimi برسالة «النموذج غير موجود».",
+      "reasoningTitle": "الاستدلال",
+      "reasoningEnableLabel": "تفعيل",
+      "reasoningDescription": "لا يعرض Kimi محدِّد «Thinking» في صندوق الإدخال إلا إذا أعلن النموذج عن قدرة استدلال، ولذلك يكتبها codeg هنا. يسري على الجلسات الجديدة.",
+      "effortsLabel": "المستويات المتاحة",
+      "effortsHint": "تصبح هذه المستويات خيارات محدِّد «Thinking». يمرِّر Kimi المستوى إلى المزوّد كما هو، فاختر ما يقبله نموذجك.",
+      "effortsEmptyHint": "من دون اختيار أي مستوى، يتراجع صندوق الإدخال إلى مفتاح Off / On فقط.",
+      "effortsCustomPlaceholder": "أضف مستوى آخر",
+      "effortsAdd": "إضافة",
+      "defaultEffortLabel": "المستوى الافتراضي",
+      "defaultEffortAuto": "اترك الاختيار لـ Kimi",
+      "alwaysThinkingLabel": "النموذج يستدل دائمًا — أزل خيار Off من المحدِّد",
+      "fixErrorsFirst": "صحّح الحقول المميّزة أولًا",
+      "errorModelRequired": "النموذج حقل مطلوب",
+      "errorMaxContextRequired": "أقصى حجم للسياق حقل مطلوب",
+      "errorMaxContextInvalid": "يجب أن يكون عددًا صحيحًا موجبًا",
+      "errorApiKeyRequired": "مفتاح API حقل مطلوب",
+      "errorApiKeyInvalid": "يجب ألا يحتوي مفتاح API على فواصل أسطر",
+      "errorBaseUrlRequired": "عنوان URL الأساسي حقل مطلوب",
+      "errorBaseUrlInvalid": "يجب أن يبدأ بـ http:// أو https://",
+      "errorVertexProjectRequired": "مشروع GCP حقل مطلوب",
+      "errorDefaultEffortUnlisted": "اختر أحد المستويات المحددة أعلاه",
+      "advancedTitle": "خيارات متقدمة",
+      "authTypeLabel": "موضع كتابة بيانات الاعتماد",
+      "authTypeApiKey": "‏api_key مضمَّن",
+      "authTypeEnv": "جدول env الفرعي للمزوّد",
+      "authTypeHint": "الموضع الذي يُكتب فيه مفتاح API داخل config.toml.",
+      "rawEditorLabel": "تحرير config.toml مباشرة",
+      "rawEditorWarning": "الحفظ هنا يستبدل الملف بأكمله حرفيًا، ويحل محل الإعدادات المنظَّمة أعلاه.",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
-      "authModeLabel": "Authentication method",
-      "authModeApiKey": "API key",
-      "authModeLogin": "Kimi account login (subscription)",
       "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "interfaceTypeLabel": "Provider type",
-      "interfaceTypeHint": "The provider protocol Kimi speaks (config.toml `type`). Use Kimi / Moonshot for a Moonshot / platform.kimi.com key.",
-      "endpointLabel": "Endpoint",
-      "endpointCustom": "Custom (OpenAI-compatible)",
-      "endpointHint": "International = api.moonshot.ai; China (platform.kimi.com keys) = api.moonshot.cn. Custom points at any OpenAI-compatible endpoint.",
-      "regionInternational": "International (api.moonshot.ai)",
-      "regionChina": "China (api.moonshot.cn)",
-      "baseUrlLabel": "Base URL",
-      "baseUrlHint": "Leave blank to use the provider SDK default.",
-      "apiKeyLabel": "API Key",
-      "apiKeyHint": "Written to ~/.kimi-code/config.toml and used for inference. From platform.kimi.com or platform.kimi.ai.",
-      "authTypeLabel": "Advanced: credential placement",
-      "authTypeApiKey": "Inline api_key",
-      "authTypeEnv": "Provider env sub-table",
-      "authTypeHint": "Where the API key is written inside config.toml.",
-      "vertexProjectLabel": "GCP project (GOOGLE_CLOUD_PROJECT)",
-      "vertexLocationLabel": "GCP location (GOOGLE_CLOUD_LOCATION)",
-      "vertexHint": "Vertex AI uses Google Application Default Credentials — run `gcloud auth application-default login` (no API key).",
-      "modelLabel": "Model",
-      "modelHint": "The model id to use. Click Fetch to list the models your key can access (e.g. kimi-k2.7-code) — avoids “model not found” errors.",
-      "fetchModels": "Fetch",
-      "fetchModelsOk": "Found {count} models",
-      "fetchModelsEmpty": "Key works, but no models were returned",
-      "fetchModelsFailed": "Couldn’t list models — check the key and endpoint",
-      "fetchModelsNeedsKey": "Enter an API key and endpoint first",
-      "maxContextLabel": "Max context size (optional)",
-      "maxContextHint": "Tokens, e.g. 262144. Leave blank to use the model default.",
-      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account (device-code OAuth). codeg stores nothing and reuses Kimi’s own login. Saving here removes codeg’s API-key gate token.",
-      "rawEditorLabel": "Advanced: edit config.toml directly",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
     },
     "authModeOfficialSubscription": "الاشتراك الرسمي",
     "authModeCustomEndpoint": "نقطة نهاية مخصصة",
@@ -994,6 +1037,7 @@
       "localVersionRemoved": "تمت إزالة الإصدار المحلي",
       "saveAgentOrderFailed": "فشل حفظ ترتيب Agent",
       "saveAgentSwitchFailed": "فشل حفظ مفتاح Agent",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "فشل حفظ متغيرات البيئة",
       "grokSaved": "تم حفظ إعدادات Grok",
       "saveGrokNativeFailed": "فشل حفظ إعدادات Grok الأصلية",
@@ -1037,7 +1081,6 @@
       "piBinaryUninstalled": "تم إلغاء تثبيت pi",
       "piBinaryUninstallFailed": "فشل إلغاء تثبيت pi",
       "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "cursorSaved": "تم حفظ إعدادات Cursor",
       "saveCursorConfigFailed": "فشل حفظ إعدادات Cursor"
     },
@@ -1053,7 +1096,9 @@
       "remoteUnavailable": "{versionText}. الإصدار البعيد غير متاح حاليًا.",
       "latest": "{versionText}. أنت على أحدث إصدار.",
       "bundled": "مدمج: {version}",
-      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت DrawCode أو حدّثه."
+      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت DrawCode أو حدّثه.",
+      "localOnly": "المحلي: {localVersion}",
+      "localInstalled": "{versionText}. مثبت."
     },
     "cline": {
       "configDescription": "تكوين مزود واجهة برمجة التطبيقات وبيانات اعتماد Cline. يتم حفظ الإعدادات في ~/.cline/data/."
@@ -1129,7 +1174,6 @@
       "trustHint": "يُوثَق فقط بالمجلدات التي تفتحها هنا، وليس جهازك بالكامل، كما أن ذلك يؤثر على تحميل الإعدادات فقط، لا على ما يُسمح لـ pi بتشغيله.",
       "configDirSkillsNote": "عند تحديد دليل إعدادات مخصص، لن تنطبق المهارات والخبراء وأدوات المكتب المُدارة في الإعدادات على pi هذا — أدِر مهاراته مباشرةً في ذلك المجلد."
     },
-    "showThinking": "Show thinking",
     "cursor": {
       "configDescription": "اضبط Cursor هنا. اختر طريقة مصادقة — اشتراك رسمي (تسجيل دخول عبر المتصفح) أو مفتاح Cursor API للأجهزة بدون واجهة أو الخوادم — ثم اختر نموذجًا وحرّر قواعد أذونات CLI وبيئة الحماية. يكتبها codeg في ~/.cursor/cli-config.json، بالمشاركة مع أداة cursor-agent.",
       "authTitle": "المصادقة",
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "لا يوجد نموذج مطابق",
       "modelsNeedAuth": "سجّل الدخول لتحميل قائمة النماذج.",
       "modelDefaultBadge": "افتراضي"
-    }
+    },
+    "addCustomAgent": "إضافة وكيل مخصص",
+    "addCustomAgentHint": "سجّل أي وكيل متوافق مع ACP. اختر واحدًا من سجل ACP العام، أو الصق معلومات السجل الخاصة به.",
+    "customAgentFromRegistry": "سجل ACP",
+    "customAgentManual": "يدوي",
+    "customAgentSearchPlaceholder": "البحث عن الوكلاء…",
+    "customAgentLoadingCatalog": "جارٍ تحميل سجل ACP…",
+    "customAgentRetry": "إعادة المحاولة",
+    "customAgentNoResults": "لا يوجد وكلاء مطابقون",
+    "customAgentAdd": "إضافة",
+    "customAgentAlreadyAdded": "تمت الإضافة",
+    "customAgentUnsupportedPlatform": "لا يوجد إصدار متاح لهذه المنصة",
+    "customAgentAdded": "تمت إضافة {name}",
+    "customAgentIdLabel": "معرّف السجل",
+    "customAgentNameLabel": "الاسم المعروض",
+    "customAgentVersionLabel": "الإصدار",
+    "customAgentSpecLabel": "التوزيع (JSON)",
+    "customAgentSpecHint": "بنفس شكل كائن distribution في سجل ACP: قنوات npx وuvx وbinary، أو الصق مدخل سجل كاملًا. في npx/uvx يكون cmd هو الأمر التنفيذي الذي تثبته الحزمة — يُشتق من اسم الحزمة عند إغفاله، فحدده عندما يختلفان. يُنظَّم binary حسب مفتاح المنصة (هذا الجهاز: {platform})؛ cmd هو مسار التشغيل داخل الأرشيف، وsha256 اختياري للتحقق من التنزيل.",
+    "customAgentTemplateLabel": "قوالب",
+    "customAgentKindLabel": "التشغيل عبر",
+    "customAgentInvalidJson": "JSON غير صالح",
+    "customAgentNoDistribution": "لم يتم العثور على توزيع npx أو uvx أو binary",
+    "customAgentCancel": "إلغاء",
+    "customAgentSave": "إضافة الوكيل",
+    "customAgentSaveChanges": "حفظ التغييرات",
+    "customAgentEdit": "تحرير الوكيل",
+    "customAgentEditHint": "حدّث الاسم والأيقونة ومعلومات التوزيع وإعلانات المهارات. لا يمكن تغيير معرّف الوكيل.",
+    "customAgentEditNotFound": "لم يُعثر على الوكيل المخصص {id}",
+    "customAgentSaved": "تم حفظ {name}",
+    "customAgentVersionProbeLabel": "أمر الاستعلام عن الإصدار (اختياري)",
+    "customAgentVersionProbeHint": "أمر يطبع الإصدار المثبت محليًا. عند تركه فارغًا يشغّل codeg أمر الوكيل مع ‎--version.",
+    "customAgentRemove": "إزالة الوكيل",
+    "customAgentRemoveHint": "يحذف تعريف الوكيل. تحتفظ المحادثات الحالية بسجلها، ولن يصبح بالإمكان تشغيل الوكيل فحسب.",
+    "customAgentIconLabel": "الأيقونة (اختياري)",
+    "customAgentIconUpload": "رفع",
+    "customAgentIconReplace": "استبدال",
+    "customAgentIconClear": "إزالة الأيقونة",
+    "customAgentIconHint": "يُحفظ مع الوكيل، لذا يعمل دون اتصال. وبدونه يُستخدم حرف أول ملوّن.",
+    "customAgentSkillsLabel": "Skills (‎.agents/skills المشترك)",
+    "customAgentSkillsHint": "يُعلن أن هذا الوكيل يقرأ مخزن .agents/skills المشترك (المجلدين العام والخاص بالمشروع) ويضيفه إلى جميع مصفوفات المهارات. المهارات المرتبطة هناك تكون مرئية لكل وكيل يقرأ هذا المخزن المشترك.",
+    "customAgentSkillsDirLabel": "دليل مهارات مخصص",
+    "customAgentSkillsDirHint": "المسار المطلق للدليل الذي يحمّل منه هذا الوكيل المهارات — مخزنه الخاص، إضافةً إلى المخزن المشترك أو بدلًا منه. يتم توسيع ~ إلى الدليل الرئيسي؛ وتوضع المهارات المرتبطة هنا أولًا.",
+    "customAgentIconNotAnImage": "اختر ملف صورة.",
+    "customAgentIconTooLarge": "يجب أن يكون حجم الأيقونة أقل من {limit} كيلوبايت.",
+    "customAgentIconReadFailed": "تعذّرت قراءة تلك الصورة.",
+    "customAgentRemoveConfirm": "إزالة {name}؟ ستبقى المحادثات الحالية، لكن لن يمكن تشغيل الوكيل بعد الآن.",
+    "customAgentRemoveWithData": "حذف سجل المحادثات المسجل أيضًا",
+    "customAgentRemoved": "تمت إزالة {name}",
+    "customAgentBadge": "مخصص",
+    "customAgentNotLaunchable": "لا يمكن تشغيل هذا الوكيل هنا: {reason}"
   },
   "SettingsPages": {
     "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "إغلاق البقية",
       "closeAll": "إغلاق الكل",
       "tileDisplay": "عرض متجانب",
-      "untileDisplay": "إلغاء التجانب"
+      "untileDisplay": "إلغاء التجانب",
+      "splitRight": "تقسيم لليمين",
+      "splitDown": "تقسيم للأسفل",
+      "splitAndMoveRight": "تقسيم ونقل لليمين",
+      "splitAndMoveDown": "تقسيم ونقل للأسفل",
+      "moveToOppositeGroup": "نقل إلى المجموعة المقابلة",
+      "moveToGroup": "نقل إلى مجموعة",
+      "groupLabel": "المجموعة {index}",
+      "changeSplitterOrientation": "تبديل اتجاه الفاصل",
+      "unsplit": "إلغاء التقسيم",
+      "unsplitAll": "إلغاء كل التقسيمات"
     },
     "fileWorkspace": {
       "files": "الملفات",
@@ -1995,7 +2098,10 @@
         "current": "الحالي",
         "remoteBranches": "الفروع البعيدة",
         "refreshCommitHistory": "تحديث سجل الالتزامات",
-        "clearBranchFilterAria": "مسح تصفية الفرع"
+        "clearBranchFilterAria": "مسح تصفية الفرع",
+        "head": "HEAD",
+        "headHint": "يتبع الفرع الحالي",
+        "headHintWithBranch": "يتبع الفرع الحالي ({branch})"
       },
       "dialogs": {
         "newBranchTitle": "فرع جديد",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "جارٍ إنشاء الجلسة وتحميل الإعدادات"
         },
         "errors": {
-          "connectionFailed": "فشل الاتصال"
+          "connectionFailed": "فشل الاتصال",
+          "sendPromptFailed": "فشل إرسال الرسالة: {error}"
         }
       },
       "shared": {
@@ -2382,6 +2489,8 @@
         "askAnything": "اسأل أي شيء...",
         "removeAttachmentAria": "إزالة {name}",
         "attachFiles": "إرفاق ملفات",
+        "attachLocalUpload": "تحميل ملف محلي",
+        "attachServerFile": "اختيار ملف من الخادم",
         "addActions": "إضافة",
         "quickMessages": "الرسائل السريعة",
         "quickMessagesEmpty": "لا توجد رسائل سريعة بعد",
@@ -2413,8 +2522,6 @@
         "experts": "الخبراء",
         "office": "الأعمال المكتبية",
         "research": "البحث العلمي",
-        "attachLocalUpload": "تحميل ملف محلي",
-        "attachServerFile": "اختيار ملف من الخادم",
         "attachUploadTooLarge": "{names} يتجاوز حد التحميل {limit}MB وتم تخطيه.",
         "attachUploadFailed": "فشل تحميل {names}.",
         "attachUploadNotAFile": "{names} ليس ملفاً عادياً (مجلد أو ملف خاص) وتم تخطيه.",
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "المهارات",
         "mentionInvalidPattern": "تعبير نمطي غير صالح",
         "mentionSourceError": "تعذر تحديث هذا المصدر",
-        "mentionProfileError": "تعذر تحميل ملفات تعريف التفويض"
+        "mentionProfileError": "تعذر تحميل ملفات تعريف التفويض",
+        "attachUploadInProgress": "لا تزال الصور قيد الرفع — حاول مرة أخرى بعد قليل."
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",
@@ -2726,6 +2834,7 @@
         "imageGenerationPending": "جارٍ إنشاء الصورة…",
         "imageGenerationFailed": "فشل إنشاء الصورة",
         "model": "النموذج",
+        "reasoningEffort": "جهد الاستدلال",
         "tokenStats": "استخدام الرموز",
         "tokenInput": "الإدخال",
         "tokenOutput": "الإخراج",
@@ -2736,11 +2845,13 @@
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
         "showLess": "طي",
-        "responseInterrupted": "تمت مقاطعة الاستجابة"
+        "responseInterrupted": "تمت مقاطعة الاستجابة",
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…"
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",
         "streaming": "جارٍ البث",
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…",
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
@@ -2960,7 +3071,8 @@
           "webSearchWithQuery": "بحث الويب: {query}",
           "todosProgress": "المهام ({done}/{total})",
           "skillWithName": "Skill: {name}",
-          "genericWithContext": "{tool} ({context})"
+          "genericWithContext": "{tool} ({context})",
+          "listFilesWithPath": "عرض الملفات {path}"
         },
         "toolGroup": {
           "search": "{count, plural, zero {بحث صفر مرة} one {بحث مرة واحدة} two {بحث مرتين} few {بحث # مرات} many {بحث # مرة} other {بحث # مرة}}",
@@ -2993,6 +3105,13 @@
           "polledTimes": "تم الاستعلام {count} مرة",
           "runningInBackground": "في الخلفية",
           "launchNote": "قيد التشغيل في الخلفية · {id}"
+        },
+        "agentLiveTranscript": "النشاط المباشر",
+        "search": {
+          "noMatches": "لا توجد نتائج مطابقة",
+          "matchSummary": "{matches, plural, zero {صفر تطابق} one {تطابق واحد} two {تطابقان} few {# تطابقات} many {# تطابقاً} other {# تطابق}} في {files, plural, zero {صفر ملف} one {ملف واحد} two {ملفان} few {# ملفات} many {# ملفاً} other {# ملف}}",
+          "fileSummary": "{files, plural, zero {صفر ملف} one {ملف واحد} two {ملفان} few {# ملفات} many {# ملفاً} other {# ملف}}",
+          "moreResults": "{count, plural, zero {لا نتائج إضافية} one {نتيجة إضافية واحدة غير معروضة} two {نتيجتان إضافيتان غير معروضتين} few {# نتائج إضافية غير معروضة} many {# نتيجة إضافية غير معروضة} other {# نتيجة إضافية غير معروضة}}"
         }
       },
       "messageNav": {
@@ -3129,6 +3248,16 @@
       "proposedPlan": {
         "title": "الخطة المقترحة",
         "planning": "جارٍ التخطيط…"
+      },
+      "fileActions": {
+        "openInFinder": "فتح في Finder",
+        "openInExplorer": "فتح في Explorer",
+        "openInFileManager": "فتح في مدير الملفات",
+        "copyRelativePath": "نسخ المسار النسبي",
+        "copyAbsolutePath": "نسخ المسار المطلق",
+        "pathCopied": "تم نسخ المسار",
+        "copyPathFailed": "فشل نسخ المسار",
+        "openFailed": "فشل فتح الملف المحلي"
       }
     },
     "diffPreview": {
@@ -3300,6 +3429,18 @@
     "emptyDirectory": "هذا المجلد فارغ",
     "errorLoadingDir": "فشل في تحميل المجلد",
     "permissionDenied": "تم رفض الإذن"
+  },
+  "ServerFileBrowser": {
+    "title": "اختر ملفًا من الخادم",
+    "pathPlaceholder": "أدخل مسار الدليل...",
+    "goHome": "اذهب إلى المجلد الرئيسي",
+    "navigateUp": "اذهب إلى المجلد الأعلى",
+    "select": "اختر",
+    "cancel": "إلغاء",
+    "loading": "جارٍ التحميل...",
+    "emptyDirectory": "هذا المجلد فارغ",
+    "errorLoadingDir": "فشل تحميل المجلد",
+    "selectedCount": "{count} محدد"
   },
   "ChatChannelSettings": {
     "loading": "جاري التحميل...",
@@ -3881,18 +4022,6 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
-  },
-  "ServerFileBrowser": {
-    "title": "اختر ملفًا من الخادم",
-    "pathPlaceholder": "أدخل مسار الدليل...",
-    "goHome": "اذهب إلى المجلد الرئيسي",
-    "navigateUp": "اذهب إلى المجلد الأعلى",
-    "select": "اختر",
-    "cancel": "إلغاء",
-    "loading": "جارٍ التحميل...",
-    "emptyDirectory": "هذا المجلد فارغ",
-    "errorLoadingDir": "فشل تحميل المجلد",
-    "selectedCount": "{count} محدد"
   },
   "BackupSettings": {
     "title": "النسخ الاحتياطي والاستعادة",

@@ -218,11 +218,15 @@ fn build_events(final_text: &str, seed: u64) -> (Vec<AcpEvent>, usize, bool) {
     let mut tool_index = 0usize;
 
     for (index, text) in chunks.into_iter().enumerate() {
-        events.push(AcpEvent::ContentDelta { text });
+        events.push(AcpEvent::ContentDelta {
+            text,
+            parent_tool_use_id: None,
+        });
 
         if index % 20 == 19 {
             events.push(AcpEvent::Thinking {
                 text: format!("thinking-{index}\n"),
+                parent_tool_use_id: None,
             });
         }
         if index % 19 == 18 && tool_index < TOOL_CALLS {
@@ -396,7 +400,7 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        LiveContentBlock::Text { text } => Some(text.as_str()),
+                        LiveContentBlock::Text { text, .. } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect()

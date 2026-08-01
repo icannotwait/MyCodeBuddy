@@ -15,8 +15,10 @@ use sea_orm::{
 };
 
 use crate::acp::delegation::card_summary::{
+    card_summary_to_json, extract_card_summary_with_report_fallback,
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
+use crate::acp::delegation::runtime_stats::DelegationTouchedFile;
 use crate::acp::delegation::store::TaskStoreError;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
@@ -797,19 +799,141 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
     // B6: Final fixer only after Final reviewer terminal request_changes / block.
     // Failed/canceled alone does **not** open a fix cycle.
     let rev = load_latest_final_reviewer_evidence(conn, header).await?;
-    let Some(rev) = rev else {
+    let Some(mut rev) = rev else {
         return Err(admission_err(
             "final_fixer_before_non_pass",
             "Final fixer blocked: no Final reviewer terminal yet",
         ));
     };
     if !reviewer_is_request_changes_or_block(&rev) {
-        return Err(admission_err(
-            "final_fixer_before_non_pass",
-            "Final fixer blocked: Final reviewer has not terminal request_changes/block",
-        ));
+        // Defense in depth for already-settled runs that wrote a valid card
+        // only into a report file (not chat). Re-harvest and persist once.
+        if matches!(rev.status, TerminalRunStatus::Completed) && !rev.summary_validated {
+            if let Some(repaired) =
+                reharvest_final_reviewer_card_if_missing(conn, header, &rev).await?
+            {
+                rev = repaired;
+            }
+        }
+    }
+    if !reviewer_is_request_changes_or_block(&rev) {
+        let detail = if matches!(rev.status, TerminalRunStatus::Completed) && !rev.summary_validated
+        {
+            "Final fixer blocked: Final reviewer completed without a validated request_changes/block card summary (chat or report harvest)"
+        } else {
+            "Final fixer blocked: Final reviewer has not terminal request_changes/block"
+        };
+        return Err(admission_err("final_fixer_before_non_pass", detail));
     }
     Ok(())
+}
+
+/// If Final reviewer completed without a validated chat card, try harvesting
+/// from touched report paths and persist onto the run + run_binding.
+async fn reharvest_final_reviewer_card_if_missing<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    rev: &ExecutionGateRunEvidence,
+) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
+    let run = delegation_task_run::Entity::find_by_id(rev.task_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    if run
+        .card_summary_json
+        .as_deref()
+        .and_then(parse_and_validate_summary_json)
+        .is_some()
+    {
+        // Binding said unvalidated but JSON exists — re-apply settle validation.
+        return finalize_reharvested_reviewer_summary(conn, header, &run, None).await;
+    }
+
+    let mut paths = Vec::new();
+    if let Some(json) = run.touched_files_json.as_deref() {
+        if let Ok(files) = serde_json::from_str::<Vec<DelegationTouchedFile>>(json) {
+            for f in files {
+                let lower = f.path.to_ascii_lowercase();
+                if lower.ends_with(".md") || lower.ends_with(".markdown") {
+                    paths.push(std::path::PathBuf::from(f.path));
+                }
+            }
+        }
+    }
+    let workspace = run
+        .workspace_path
+        .as_deref()
+        .map(std::path::Path::new)
+        .map(|p| {
+            // Strip Windows extended path prefix for join stability.
+            let s = p.to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r"\\?\") {
+                std::path::PathBuf::from(rest)
+            } else {
+                p.to_path_buf()
+            }
+        });
+    let summary = extract_card_summary_with_report_fallback("", &paths, workspace.as_deref());
+    let Some(summary) = summary else {
+        return Ok(None);
+    };
+    finalize_reharvested_reviewer_summary(conn, header, &run, Some(summary)).await
+}
+
+async fn finalize_reharvested_reviewer_summary<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    run: &delegation_task_run::Model,
+    harvested: Option<CardSummary>,
+) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
+    let summary = match harvested {
+        Some(s) => s,
+        None => match run
+            .card_summary_json
+            .as_deref()
+            .and_then(parse_and_validate_summary_json)
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        },
+    };
+    // Only Review cards unlock Final fixer; ignore impl/author harvests.
+    if !matches!(summary, CardSummary::Review { .. }) {
+        return Ok(None);
+    }
+
+    let json = card_summary_to_json(&summary).map_err(|e| {
+        admission_err(
+            "card_summary_serialize",
+            format!("failed to serialize reharvested card summary: {e}"),
+        )
+    })?;
+
+    let mut run_am: delegation_task_run::ActiveModel = run.clone().into();
+    run_am.card_summary_json = Set(Some(json));
+    run_am.updated_at = Set(Utc::now());
+    let run = run_am.update(conn).await.map_err(map_db)?;
+
+    // Mirror on_terminal_settle_txn reviewer validation for Final (report optional).
+    let rb = delegation_workflow_run_binding::Entity::find_by_id(run.task_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    let Some(rb) = rb else {
+        return Ok(None);
+    };
+    let mut rb_am: delegation_workflow_run_binding::ActiveModel = rb.into();
+    rb_am.summary_validated = Set(true);
+    rb_am.updated_at = Set(Utc::now());
+    let rb = rb_am.update(conn).await.map_err(map_db)?;
+
+    // Bump graph so UI/projection see the repaired evidence.
+    let _ = bump_graph_revision(conn, &header.workflow_id, Utc::now()).await?;
+
+    Ok(Some(evidence_from_run_and_binding(&run, &rb)))
 }
 
 /// Design/Plan admission stamps the gate content fingerprint for evidence filtering.
@@ -3287,6 +3411,121 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// Session-2534 regression: Final reviewer completed with request_changes
+    /// only in a report file (chat had no card → summary_validated=false).
+    /// Final fixer admission must reharvest and open the fix cycle.
+    #[tokio::test]
+    async fn final_fixer_admits_after_report_file_card_reharvest() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-fixer-reharvest").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codeg-final-reharvest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("final-review.md");
+        std::fs::write(
+            &report,
+            r#"# Final
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"build fails TS","report_file":".superpowers/sdd/final-review.md"}
+-->
+"#,
+        )
+        .unwrap();
+
+        let key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let c = child_for(&db, AgentType::Codex).await;
+        let reviewer_task = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00d1";
+        // Empty card + unvalidated binding, but report path in touched_files.
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            c,
+            reviewer_task,
+            &wf_id,
+            "final-reviewer",
+            &key,
+            "codex",
+            "{}", // not a valid summary shape
+            false,
+        )
+        .await;
+        let run = delegation_task_run::Entity::find_by_id(reviewer_task.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut am: delegation_task_run::ActiveModel = run.into();
+        am.card_summary_json = Set(None);
+        am.touched_files_json = Set(Some(format!(
+            r#"[{{"path":"{}","outside_workspace":false}}]"#,
+            report.display().to_string().replace('\\', "/")
+        )));
+        am.workspace_path = Set(Some(dir.display().to_string()));
+        am.update(&db.conn).await.unwrap();
+
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let fixer_key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00d2",
+                "grok",
+                Some(&fixer_key),
+                None,
+            ))
+            .await
+            .expect("final fixer should admit after report reharvest");
+
+        // Reharvest must durable-write validated card for projection/gates.
+        let repaired = delegation_task_run::Entity::find_by_id(reviewer_task.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let card = repaired
+            .card_summary_json
+            .as_deref()
+            .and_then(parse_and_validate_summary_json)
+            .expect("persisted card");
+        match card {
+            CardSummary::Review {
+                verdict: ReviewVerdict::RequestChanges,
+                ..
+            } => {}
+            other => panic!("expected request_changes review, got {other:?}"),
+        }
+        let rb = delegation_workflow_run_binding::Entity::find_by_id(reviewer_task.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rb.summary_validated);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn replace_with_active_final_binding(

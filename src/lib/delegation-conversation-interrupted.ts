@@ -19,12 +19,14 @@ export function isConversationInterruptedAgentText(text: string): boolean {
   return false
 }
 
-export function filterDelegatedInterruptParts(
-  parts: AdaptedContentPart[],
-  isDelegatedChild: boolean
+/**
+ * Drop exact Codex `Conversation interrupted` agent text parts from display.
+ * Applies to both parent and delegated-child sessions — the marker is a
+ * turn-abort fence, not a useful assistant answer.
+ */
+export function filterConversationInterruptedParts(
+  parts: AdaptedContentPart[]
 ): AdaptedContentPart[] {
-  if (!isDelegatedChild) return parts
-
   let changed = false
   const filtered: AdaptedContentPart[] = []
   for (const part of parts) {
@@ -33,7 +35,7 @@ export function filterDelegatedInterruptParts(
       continue
     }
     if (part.type === "goal-run") {
-      const items = filterDelegatedInterruptParts(part.items, true)
+      const items = filterConversationInterruptedParts(part.items)
       if (items !== part.items) {
         changed = true
         filtered.push({ ...part, items })
@@ -43,4 +45,12 @@ export function filterDelegatedInterruptParts(
     filtered.push(part)
   }
   return changed ? filtered : parts
+}
+
+/** @deprecated Prefer {@link filterConversationInterruptedParts}. */
+export function filterDelegatedInterruptParts(
+  parts: AdaptedContentPart[],
+  _isDelegatedChild = true
+): AdaptedContentPart[] {
+  return filterConversationInterruptedParts(parts)
 }

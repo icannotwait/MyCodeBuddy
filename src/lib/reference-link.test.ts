@@ -7,6 +7,7 @@ import {
   formatFileRangeLabel,
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
+  unwrapReferenceDestination,
 } from "./reference-link"
 
 describe("buildFileUri", () => {
@@ -29,6 +30,27 @@ describe("buildFileUri", () => {
       "file://server/share/doc.md"
     )
   })
+  it("reduces a Windows verbatim drive path to its plain form", () => {
+    // What `fs::canonicalize` returns on Windows. Without the strip this hit
+    // the UNC branch and produced file://%3F/C%3A/... — a uri that decodes
+    // back to "?/C:/..." and fails to open (issue #392).
+    expect(buildFileUri("\\\\?\\C:\\Users\\song\\uploads\\img.png")).toBe(
+      "file:///C%3A/Users/song/uploads/img.png"
+    )
+  })
+  it("reduces a Windows verbatim UNC path to the authority form", () => {
+    expect(buildFileUri("\\\\?\\UNC\\server\\share\\doc.md")).toBe(
+      "file://server/share/doc.md"
+    )
+    expect(buildFileUri("\\\\?\\unc\\server\\share\\doc.md")).toBe(
+      "file://server/share/doc.md"
+    )
+  })
+  it("leaves a verbatim device path alone (it has no plain form)", () => {
+    expect(buildFileUri("\\\\?\\Volume{7b2f1c40}\\img.png")).toBe(
+      "file://%3F/Volume%7B7b2f1c40%7D/img.png"
+    )
+  })
 })
 
 describe("unescapeReferenceLabel", () => {
@@ -40,6 +62,36 @@ describe("unescapeReferenceLabel", () => {
   })
   it("leaves unescaped text untouched", () => {
     expect(unescapeReferenceLabel("plain name.ts")).toBe("plain name.ts")
+  })
+})
+
+describe("unwrapReferenceDestination", () => {
+  it("returns a bare destination trimmed and untouched", () => {
+    expect(unwrapReferenceDestination("file:///x/foo.ts")).toBe(
+      "file:///x/foo.ts"
+    )
+    expect(unwrapReferenceDestination("  codeg://session/42  ")).toBe(
+      "codeg://session/42"
+    )
+    // Not angle-wrapped: a lone backslash is part of the uri, not an escape.
+    expect(unwrapReferenceDestination("file:///x\\y")).toBe("file:///x\\y")
+  })
+
+  it("unwraps an angle-bracket destination", () => {
+    expect(unwrapReferenceDestination("<file:///x/a b.ts>")).toBe(
+      "file:///x/a b.ts"
+    )
+  })
+
+  it("decodes the escapes the serializer adds inside `<…>`", () => {
+    // escapeLinkDestination escapes `\`, `<` and `>` there; leaving them in
+    // would double the backslashes of a Windows path on every round-trip.
+    expect(unwrapReferenceDestination("<file:///C:\\\\repo\\\\app.ts>")).toBe(
+      "file:///C:\\repo\\app.ts"
+    )
+    expect(unwrapReferenceDestination("<file:///x/a\\<b\\>c.ts>")).toBe(
+      "file:///x/a<b>c.ts"
+    )
   })
 })
 
@@ -61,7 +113,8 @@ describe("tokenizeReferenceLinks", () => {
 
   it("keeps the angle brackets in a <…>-wrapped destination", () => {
     // The destination must equal the old regex group `(<[^>]*>|[^)]*)` exactly —
-    // including the `<…>` — so handleMarkdownLink's own unwrap still applies.
+    // including the `<…>` — so consumers can unwrap it themselves (see
+    // {@link unwrapReferenceDestination}).
     expect(tokenizeReferenceLinks("[a b.ts](<file:///x/a b.ts>)")).toEqual([
       {
         type: "link",

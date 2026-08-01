@@ -206,7 +206,15 @@
       "downloadFailed": "更新パッケージのダウンロードに失敗しました。しばらくしてから再試行してください。",
       "installFailed": "更新のインストールに失敗しました。アプリを閉じて再試行してください。",
       "unknown": "更新に失敗しました。しばらくしてから再試行してください。"
-    }
+    },
+    "newVersionBadge": "新バージョン v{version}",
+    "updateAvailableTitle": "アップデートがあります",
+    "releaseNotesTitle": "更新内容",
+    "remindLater": "後で",
+    "retry": "再試行",
+    "stepDownload": "ダウンロード",
+    "stepInstall": "インストール",
+    "stepRestart": "再起動"
   },
   "VersionControlSettings": {
     "loading": "読み込み中...",
@@ -540,6 +548,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK 管理",
     "description": "Agent SDK の接続、有効化状態、環境変数、設定管理、バージョン事前チェック情報を一元管理します。",
+    "showThinking": "Show thinking",
     "loadingAgents": "エージェント一覧を読み込み中...",
     "agentList": "エージェント一覧",
     "emptyNoAgent": "利用可能なエージェントがありません。",
@@ -751,7 +760,9 @@
       "loggedIn": "アカウントにログイン済み",
       "loginRelogin": "再ログイン / アカウント切替",
       "loginTimeout": "ログインがタイムアウトしました。再試行してください",
-      "loginSaveFailed": "ログインは成功しましたが、設定の保存に失敗しました"
+      "loginSaveFailed": "ログインは成功しましたが、設定の保存に失敗しました",
+      "enableFast": "Fast を有効化",
+      "enableFastAria": "Codex の Fast サービスティアを有効化"
     },
     "gemini": {
       "authConfig": "Gemini 認証設定",
@@ -881,46 +892,78 @@
       "loginHint": "API キーがない場合は、ターミナルで「codebuddy」を実行して Tencent アカウントでサインインすることもできます。"
     },
     "kimiCode": {
-      "configManagement": "Kimi Code Configuration",
-      "configDescription": "`kimi acp` only authenticates with a stored login token and rejects API keys on their own. To use an API key, codeg writes a managed ~/.kimi-code/config.toml provider AND seeds a local gate token so the session opens — inference still runs on your key.",
-      "gateReadyApiKey": "Authenticated via API key (codeg seeded the local gate token).",
-      "gateReadyLogin": "Authenticated via a Kimi account login.",
-      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
-      "authModeLabel": "Authentication method",
-      "authModeApiKey": "API key",
-      "authModeLogin": "Kimi account login (subscription)",
-      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "interfaceTypeLabel": "Provider type",
-      "interfaceTypeHint": "The provider protocol Kimi speaks (config.toml `type`). Use Kimi / Moonshot for a Moonshot / platform.kimi.com key.",
-      "endpointLabel": "Endpoint",
-      "endpointCustom": "Custom (OpenAI-compatible)",
-      "endpointHint": "International = api.moonshot.ai; China (platform.kimi.com keys) = api.moonshot.cn. Custom points at any OpenAI-compatible endpoint.",
-      "regionInternational": "International (api.moonshot.ai)",
-      "regionChina": "China (api.moonshot.cn)",
+      "configManagement": "Kimi Code の設定",
+      "configDescription": "`kimi acp` は保存済みのログイントークンしか受け付けないため、codeg は ~/.kimi-code/config.toml に管理対象プロバイダーを書き込み、ローカルにゲートトークンを配置します。推論は引き続きご自身のキーで実行されます。",
+      "statusUnconfigured": "未設定",
+      "statusDirty": "未保存の変更あり",
+      "summaryLabel": "有効な設定",
+      "gateReadyApiKey": "API キーを config.toml に書き込み済み",
+      "gateReadyLogin": "Kimi アカウントでログイン済み",
+      "revealConfig": "フォルダーで表示",
+      "envOverrideWarning": "{keys} が設定されており、config.toml より優先されます。ここで保存すると自動的に削除されます。",
+      "authModeLabel": "認証方式",
+      "authModeApiKey": "API キー",
+      "authModeLogin": "Kimi アカウントログイン（サブスクリプション）",
+      "authModeApiKeyHint": "config.toml に管理対象プロバイダーを書き込み、セッションを開けるようゲートトークンを配置します。",
+      "loginHint": "ターミナルで `kimi login` を実行し、Kimi サブスクリプションアカウントでログインしてください。codeg は資格情報を保存せず、Kimi 自身のログインを再利用します。ここで保存すると codeg の API キー用ゲートトークンが削除されます。",
+      "credentialTitle": "資格情報",
+      "interfaceTypeLabel": "プロバイダー種別",
+      "interfaceTypeHint": "Kimi が話すプロバイダープロトコル（config.toml の `type`）。Moonshot / platform.kimi.com のキーには「Kimi / Moonshot」を選びます。",
+      "endpointLabel": "エンドポイント",
+      "endpointCustom": "カスタム（OpenAI 互換）",
+      "endpointHint": "国際 = api.moonshot.ai、中国（platform.kimi.com のキー）= api.moonshot.cn。カスタムは任意の OpenAI 互換エンドポイントを指定できます。",
+      "regionInternational": "国際（api.moonshot.ai）",
+      "regionChina": "中国（api.moonshot.cn）",
       "baseUrlLabel": "Base URL",
-      "baseUrlHint": "Leave blank to use the provider SDK default.",
-      "apiKeyLabel": "API Key",
-      "apiKeyHint": "Written to ~/.kimi-code/config.toml and used for inference. From platform.kimi.com or platform.kimi.ai.",
-      "authTypeLabel": "Advanced: credential placement",
-      "authTypeApiKey": "Inline api_key",
-      "authTypeEnv": "Provider env sub-table",
-      "authTypeHint": "Where the API key is written inside config.toml.",
-      "vertexProjectLabel": "GCP project (GOOGLE_CLOUD_PROJECT)",
-      "vertexLocationLabel": "GCP location (GOOGLE_CLOUD_LOCATION)",
-      "vertexHint": "Vertex AI uses Google Application Default Credentials — run `gcloud auth application-default login` (no API key).",
-      "modelLabel": "Model",
-      "modelHint": "The model id to use. Click Fetch to list the models your key can access (e.g. kimi-k2.7-code) — avoids “model not found” errors.",
-      "fetchModels": "Fetch",
-      "fetchModelsOk": "Found {count} models",
-      "fetchModelsEmpty": "Key works, but no models were returned",
-      "fetchModelsFailed": "Couldn’t list models — check the key and endpoint",
-      "fetchModelsNeedsKey": "Enter an API key and endpoint first",
-      "maxContextLabel": "Max context size (optional)",
-      "maxContextHint": "Tokens, e.g. 262144. Leave blank to use the model default.",
-      "loginHint": "Run `kimi login` in a terminal to sign in with a Kimi subscription account (device-code OAuth). codeg stores nothing and reuses Kimi’s own login. Saving here removes codeg’s API-key gate token.",
-      "rawEditorLabel": "Advanced: edit config.toml directly",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
-      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\""
+      "baseUrlHint": "空欄の場合はプロバイダー SDK の既定値を使用します。",
+      "apiKeyLabel": "API キー",
+      "apiKeyHint": "~/.kimi-code/config.toml に書き込まれ、推論に使用されます。platform.kimi.com または platform.kimi.ai で取得できます。",
+      "vertexProjectLabel": "GCP プロジェクト（GOOGLE_CLOUD_PROJECT）",
+      "vertexLocationLabel": "GCP リージョン（GOOGLE_CLOUD_LOCATION）",
+      "vertexHint": "Vertex AI は Google のアプリケーションデフォルト認証情報を使用します。`gcloud auth application-default login` を実行してください（API キー不要）。",
+      "modelTitle": "モデル",
+      "modelLabel": "モデル",
+      "modelHint": "config.toml に書き込まれるモデル id。「テストしてモデルを取得」でキーが実際にアクセスできるモデルを確認できます。",
+      "maxContextLabel": "最大コンテキスト長",
+      "maxContextHint": "Kimi のスキーマ上必須です。未指定だと Kimi がモデルブロック全体を破棄し、どのプロンプトも応答が返らなくなります。既定値は 262144。",
+      "fetchModels": "テストしてモデルを取得",
+      "fetchModelsOk": "キーは有効です — {count} 件のモデルが利用可能",
+      "fetchModelsEmpty": "キーは有効ですが、モデルが返されませんでした",
+      "fetchModelsFailed": "テストに失敗しました",
+      "fetchModelsNeedsKey": "先に API キーとエンドポイントを入力してください",
+      "modelNotInList": "このモデルはキーがアクセスできる一覧に含まれていません。Kimi は「モデルが見つかりません」で失敗します。",
+      "reasoningTitle": "推論",
+      "reasoningEnableLabel": "有効にする",
+      "reasoningDescription": "モデルが推論機能を宣言している場合にのみ Kimi は入力欄に「Thinking」ピッカーを表示するため、その宣言を codeg がここで書き込みます。新しいセッションから有効になります。",
+      "effortsLabel": "選択できるレベル",
+      "effortsHint": "ここで選んだ値が入力欄の「Thinking」ピッカーの項目になります。Kimi はレベルをそのままプロバイダーへ渡すので、モデルが受け付ける値を選んでください。",
+      "effortsEmptyHint": "レベルを 1 つも選ばない場合、入力欄は Off / On の 2 段トグルに退化します。",
+      "effortsCustomPlaceholder": "他のレベルを追加",
+      "effortsAdd": "追加",
+      "defaultEffortLabel": "既定のレベル",
+      "defaultEffortAuto": "Kimi に任せる",
+      "alwaysThinkingLabel": "モデルは常に推論する — ピッカーから Off を削除",
+      "fixErrorsFirst": "先に赤色の項目を修正してください",
+      "errorModelRequired": "モデルは必須です",
+      "errorMaxContextRequired": "最大コンテキスト長は必須です",
+      "errorMaxContextInvalid": "正の整数を入力してください",
+      "errorApiKeyRequired": "API キーは必須です",
+      "errorApiKeyInvalid": "API キーに改行を含めることはできません",
+      "errorBaseUrlRequired": "Base URL は必須です",
+      "errorBaseUrlInvalid": "http:// または https:// で始める必要があります",
+      "errorVertexProjectRequired": "GCP プロジェクトは必須です",
+      "errorDefaultEffortUnlisted": "上で選択したレベルのいずれかを指定してください",
+      "advancedTitle": "詳細設定",
+      "authTypeLabel": "資格情報の書き込み先",
+      "authTypeApiKey": "インライン api_key",
+      "authTypeEnv": "プロバイダーの env サブテーブル",
+      "authTypeHint": "config.toml 内で API キーを書き込む場所。",
+      "rawEditorLabel": "config.toml を直接編集",
+      "rawEditorWarning": "ここで保存するとファイル全体がそのまま上書きされ、上の構造化設定が置き換えられます。",
+      "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
+      "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
+      "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
     },
     "authModeOfficialSubscription": "公式サブスクリプション",
     "authModeCustomEndpoint": "カスタムエンドポイント",
@@ -994,6 +1037,7 @@
       "localVersionRemoved": "ローカルバージョンを削除しました",
       "saveAgentOrderFailed": "Agent の並び順の保存に失敗しました",
       "saveAgentSwitchFailed": "Agent の有効スイッチ保存に失敗しました",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "環境変数の保存に失敗しました",
       "grokSaved": "Grok 設定を保存しました",
       "saveGrokNativeFailed": "Grok のネイティブ設定の保存に失敗しました",
@@ -1037,7 +1081,6 @@
       "piBinaryUninstalled": "pi をアンインストールしました",
       "piBinaryUninstallFailed": "pi のアンインストールに失敗しました",
       "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "cursorSaved": "Cursor の設定を保存しました",
       "saveCursorConfigFailed": "Cursor の設定の保存に失敗しました"
     },
@@ -1053,7 +1096,9 @@
       "remoteUnavailable": "{versionText}。現在リモートバージョンは取得できません。",
       "latest": "{versionText}。すでに最新です。",
       "bundled": "内蔵バージョン: {version}",
-      "bundledMissing": "内蔵アダプターがありません。DrawCode を再インストールまたは更新してください。"
+      "bundledMissing": "内蔵アダプターがありません。DrawCode を再インストールまたは更新してください。",
+      "localOnly": "ローカル：{localVersion}",
+      "localInstalled": "{versionText}。インストール済みです。"
     },
     "cline": {
       "configDescription": "Cline API プロバイダーと認証情報を設定します。設定は ~/.cline/data/ に保存されます。"
@@ -1129,7 +1174,6 @@
       "trustHint": "信頼されるのはここで開いたフォルダーのみで、マシン全体ではありません。また影響するのは設定の読み込みだけで、pi が実行できる内容には影響しません。",
       "configDirSkillsNote": "カスタム設定ディレクトリを指定すると、設定画面で管理するスキル・エキスパート・オフィスツールはこの pi に適用されません。スキルはそのフォルダー内で直接管理してください。"
     },
-    "showThinking": "Show thinking",
     "cursor": {
       "configDescription": "ここで Cursor を設定します。まず認証方式を選択し——公式サブスクリプション（ブラウザログイン）またはヘッドレス/サーバー用の Cursor API キー——次にモデルを選び、CLI の権限ルールとサンドボックスを編集します。codeg はこれらを ~/.cursor/cli-config.json に書き込み、cursor-agent CLI と共有します。",
       "authTitle": "認証",
@@ -1172,7 +1216,56 @@
       "modelNoMatch": "一致するモデルがありません",
       "modelsNeedAuth": "サインインするとモデル一覧を読み込みます。",
       "modelDefaultBadge": "既定"
-    }
+    },
+    "addCustomAgent": "カスタムエージェントを追加",
+    "addCustomAgentHint": "ACP 対応のエージェントを追加できます。公開 ACP レジストリから選ぶか、レジストリ情報を貼り付けてください。",
+    "customAgentFromRegistry": "ACP レジストリ",
+    "customAgentManual": "手動入力",
+    "customAgentSearchPlaceholder": "エージェントを検索…",
+    "customAgentLoadingCatalog": "ACP レジストリを読み込み中…",
+    "customAgentRetry": "再試行",
+    "customAgentNoResults": "該当するエージェントがありません",
+    "customAgentAdd": "追加",
+    "customAgentAlreadyAdded": "追加済み",
+    "customAgentUnsupportedPlatform": "このプラットフォーム向けのビルドがありません",
+    "customAgentAdded": "{name} を追加しました",
+    "customAgentIdLabel": "レジストリ ID",
+    "customAgentNameLabel": "表示名",
+    "customAgentVersionLabel": "バージョン",
+    "customAgentSpecLabel": "配布情報（JSON）",
+    "customAgentSpecHint": "ACP レジストリの distribution オブジェクトと同じ形式です。npx・uvx・binary の各チャネルに対応し、レジストリ項目全体の貼り付けも可能です。npx/uvx の cmd はパッケージがインストールする実行コマンド名で、省略時はパッケージ名から導出されるため、異なる場合は指定してください。binary はプラットフォームキーごとに指定し（このマシンは {platform}）、cmd はアーカイブ内の起動パス、sha256 は任意でダウンロードを検証します。",
+    "customAgentTemplateLabel": "テンプレート",
+    "customAgentKindLabel": "起動方法",
+    "customAgentInvalidJson": "JSON として不正です",
+    "customAgentNoDistribution": "npx・uvx・binary のいずれの配布も見つかりません",
+    "customAgentCancel": "キャンセル",
+    "customAgentSave": "エージェントを追加",
+    "customAgentSaveChanges": "変更を保存",
+    "customAgentEdit": "エージェントを編集",
+    "customAgentEditHint": "名前・アイコン・配布情報・スキル宣言を変更できます。エージェント ID は変更できません。",
+    "customAgentEditNotFound": "カスタムエージェント {id} が見つかりません",
+    "customAgentSaved": "{name} を保存しました",
+    "customAgentVersionProbeLabel": "バージョン確認コマンド（任意）",
+    "customAgentVersionProbeHint": "ローカルにインストールされたバージョンを表示するコマンドです。空欄の場合はエージェントコマンドに --version を付けて実行します。",
+    "customAgentRemove": "エージェントを削除",
+    "customAgentRemoveHint": "エージェント定義を削除します。既存の会話の履歴は残り、エージェントを起動できなくなるだけです。",
+    "customAgentIconLabel": "アイコン（任意）",
+    "customAgentIconUpload": "アップロード",
+    "customAgentIconReplace": "変更",
+    "customAgentIconClear": "アイコンを削除",
+    "customAgentIconHint": "エージェントと共に保存されるためオフラインでも表示できます。指定しない場合は色付きの頭文字を使います。",
+    "customAgentSkillsLabel": "Skills（共有 .agents/skills）",
+    "customAgentSkillsHint": "このエージェントが共有の .agents/skills ディレクトリ（グローバルおよびプロジェクト）を読み取ることを宣言し、すべてのスキルマトリクスに追加します。共有ディレクトリにリンクしたスキルは、同じディレクトリを読むほかのエージェントからも見えます。",
+    "customAgentSkillsDirLabel": "専用スキルディレクトリ",
+    "customAgentSkillsDirHint": "このエージェントがスキルを読み込むディレクトリの絶対パスです。共有ストアと併用も単独利用も可能です。~ はホームディレクトリに展開され、リンクしたスキルはまずここに配置されます。",
+    "customAgentIconNotAnImage": "画像ファイルを選んでください。",
+    "customAgentIconTooLarge": "アイコンは {limit} KB 未満にしてください。",
+    "customAgentIconReadFailed": "その画像を読み込めませんでした。",
+    "customAgentRemoveConfirm": "{name} を削除しますか？既存の会話は残りますが、起動できなくなります。",
+    "customAgentRemoveWithData": "記録された会話履歴も削除する",
+    "customAgentRemoved": "{name} を削除しました",
+    "customAgentBadge": "カスタム",
+    "customAgentNotLaunchable": "この環境では起動できません: {reason}"
   },
   "SettingsPages": {
     "agentsLoading": "エージェント設定を読み込み中...",
@@ -1645,7 +1738,17 @@
       "closeOthers": "他を閉じる",
       "closeAll": "すべて閉じる",
       "tileDisplay": "タイル表示",
-      "untileDisplay": "タイル解除"
+      "untileDisplay": "タイル解除",
+      "splitRight": "右に分割",
+      "splitDown": "下に分割",
+      "splitAndMoveRight": "分割して右へ移動",
+      "splitAndMoveDown": "分割して下へ移動",
+      "moveToOppositeGroup": "反対側のグループへ移動",
+      "moveToGroup": "グループへ移動",
+      "groupLabel": "グループ {index}",
+      "changeSplitterOrientation": "分割方向を切り替え",
+      "unsplit": "分割を解除",
+      "unsplitAll": "すべての分割を解除"
     },
     "fileWorkspace": {
       "files": "ファイル",
@@ -1995,7 +2098,10 @@
         "current": "現在",
         "remoteBranches": "リモートブランチ",
         "refreshCommitHistory": "コミット履歴を更新",
-        "clearBranchFilterAria": "ブランチフィルターをクリア"
+        "clearBranchFilterAria": "ブランチフィルターをクリア",
+        "head": "HEAD",
+        "headHint": "現在のブランチに追従",
+        "headHintWithBranch": "現在のブランチに追従（{branch}）"
       },
       "dialogs": {
         "newBranchTitle": "新規ブランチ",
@@ -2359,7 +2465,8 @@
           "initSessionDescription": "セッションを作成し設定を読み込んでいます"
         },
         "errors": {
-          "connectionFailed": "接続に失敗しました"
+          "connectionFailed": "接続に失敗しました",
+          "sendPromptFailed": "メッセージの送信に失敗しました: {error}"
         }
       },
       "shared": {
@@ -2382,6 +2489,8 @@
         "askAnything": "何でも質問してください...",
         "removeAttachmentAria": "{name} を削除",
         "attachFiles": "ファイルを添付",
+        "attachLocalUpload": "ローカルファイルを添付",
+        "attachServerFile": "サーバーファイルを添付",
         "addActions": "追加",
         "quickMessages": "クイックメッセージ",
         "quickMessagesEmpty": "クイックメッセージはありません",
@@ -2413,8 +2522,6 @@
         "experts": "エキスパート",
         "office": "日常業務",
         "research": "科学研究",
-        "attachLocalUpload": "ローカルファイルを添付",
-        "attachServerFile": "サーバーファイルを添付",
         "attachUploadTooLarge": "{names} は {limit}MB のアップロード上限を超えたためスキップしました。",
         "attachUploadFailed": "{names} のアップロードに失敗しました。",
         "attachUploadNotAFile": "{names} は通常ファイルではなく（ディレクトリまたは特殊ファイル）、スキップされました。",
@@ -2431,7 +2538,8 @@
         "mentionGroupSkill": "スキル",
         "mentionInvalidPattern": "正規表現が無効です",
         "mentionSourceError": "このソースを更新できませんでした",
-        "mentionProfileError": "委任プロファイルを読み込めませんでした"
+        "mentionProfileError": "委任プロファイルを読み込めませんでした",
+        "attachUploadInProgress": "画像はまだアップロード中です。しばらくしてからもう一度お試しください。"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
@@ -2726,6 +2834,7 @@
         "imageGenerationPending": "画像を生成中…",
         "imageGenerationFailed": "画像生成に失敗しました",
         "model": "モデル",
+        "reasoningEffort": "推論レベル",
         "tokenStats": "トークン使用量",
         "tokenInput": "入力",
         "tokenOutput": "出力",
@@ -2736,11 +2845,13 @@
         "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
         "showMore": "もっと見る",
         "showLess": "折りたたむ",
-        "responseInterrupted": "応答が中断されました"
+        "responseInterrupted": "応答が中断されました",
+        "waitingForSubagents": "サブエージェントを待機中…"
       },
       "liveTurnStats": {
         "thinking": "考え中...",
         "streaming": "ストリーミング中",
+        "waitingForSubagents": "サブエージェントを待機中…",
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
@@ -2960,7 +3071,8 @@
           "webSearchWithQuery": "WebSearch（{query}）",
           "todosProgress": "タスク ({done}/{total})",
           "skillWithName": "Skill: {name}",
-          "genericWithContext": "{tool}（{context}）"
+          "genericWithContext": "{tool}（{context}）",
+          "listFilesWithPath": "ファイル一覧 {path}"
         },
         "toolGroup": {
           "search": "{count} 件を検索",
@@ -2993,6 +3105,13 @@
           "polledTimes": "{count} 回ポーリング",
           "runningInBackground": "バックグラウンド",
           "launchNote": "バックグラウンドで実行中 · {id}"
+        },
+        "agentLiveTranscript": "ライブアクティビティ",
+        "search": {
+          "noMatches": "一致する結果なし",
+          "matchSummary": "{matches} 件の一致 · {files} 件のファイル",
+          "fileSummary": "{files} 件のファイル",
+          "moreResults": "他に {count} 件の結果は非表示"
         }
       },
       "messageNav": {
@@ -3129,6 +3248,16 @@
       "proposedPlan": {
         "title": "提案された計画",
         "planning": "計画中…"
+      },
+      "fileActions": {
+        "openInFinder": "Finderで開く",
+        "openInExplorer": "エクスプローラーで開く",
+        "openInFileManager": "ファイルマネージャーで開く",
+        "copyRelativePath": "相対パスをコピー",
+        "copyAbsolutePath": "絶対パスをコピー",
+        "pathCopied": "パスをコピーしました",
+        "copyPathFailed": "パスのコピーに失敗しました",
+        "openFailed": "ローカルファイルを開けませんでした"
       }
     },
     "diffPreview": {
@@ -3300,6 +3429,18 @@
     "emptyDirectory": "このディレクトリは空です",
     "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
     "permissionDenied": "アクセス権がありません"
+  },
+  "ServerFileBrowser": {
+    "title": "サーバーファイルを選択",
+    "pathPlaceholder": "ディレクトリパスを入力...",
+    "goHome": "ホームディレクトリへ",
+    "navigateUp": "上の階層へ",
+    "select": "選択",
+    "cancel": "キャンセル",
+    "loading": "読み込み中...",
+    "emptyDirectory": "このディレクトリは空です",
+    "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
+    "selectedCount": "{count} 件選択中"
   },
   "ChatChannelSettings": {
     "loading": "読み込み中...",
@@ -3881,18 +4022,6 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
-  },
-  "ServerFileBrowser": {
-    "title": "サーバーファイルを選択",
-    "pathPlaceholder": "ディレクトリパスを入力...",
-    "goHome": "ホームディレクトリへ",
-    "navigateUp": "上の階層へ",
-    "select": "選択",
-    "cancel": "キャンセル",
-    "loading": "読み込み中...",
-    "emptyDirectory": "このディレクトリは空です",
-    "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
-    "selectedCount": "{count} 件選択中"
   },
   "BackupSettings": {
     "title": "バックアップと復元",

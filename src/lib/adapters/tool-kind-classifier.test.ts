@@ -119,6 +119,14 @@ describe("isAgentLikeToolName", () => {
     expect(isAgentLikeToolName("request_user_input")).toBe(true)
   })
 
+  it("matches Kimi's native AskUserQuestion history name", () => {
+    // The Kimi Code wire.jsonl (and Claude's SDK) record the camel-case tool
+    // name; history passes it raw, so without this the answered capsule was
+    // wrapped inside a generic tool-group (the reported bug).
+    expect(isAgentLikeToolName("AskUserQuestion")).toBe(true)
+    expect(isAgentLikeToolName("askuserquestion")).toBe(true)
+  })
+
   it("matches check_user_feedback across host naming conventions", () => {
     expect(isAgentLikeToolName("check_user_feedback")).toBe(true)
     expect(isAgentLikeToolName("mcp__codeg-mcp__check_user_feedback")).toBe(

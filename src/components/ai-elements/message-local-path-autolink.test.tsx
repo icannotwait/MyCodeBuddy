@@ -124,21 +124,51 @@ describe("MessageResponse local-path autolinking", () => {
     }
   )
 
-  it("does not autolink inline code or slash commands", async () => {
+  it("autolinks path-only inline code and still ignores slash commands", async () => {
     const { container } = render(
       <MessageResponse autolinkLocalPaths>
         {"`D:\\repo\\src\\app.ts` and /review"}
       </MessageResponse>
     )
     await waitFor(() => {
-      expect(container.querySelector("code")).not.toBeNull()
-      expect(container.querySelector("code")?.textContent).toContain(
-        String.raw`D:\repo\src\app.ts`
-      )
+      expect(
+        container.querySelector("[data-reference-badge][data-ref-type='file']")
+      ).not.toBeNull()
     })
+    expect(container.textContent).toContain("/review")
+    expect(container.textContent).toContain(String.raw`D:\repo\src\app.ts`)
+    // Slash commands stay plain; non-path inline code is not required here.
+    expect(container.textContent).toMatch(/\/review/)
+  })
+
+  it("autolinks relative path-only inline code from assistant prose", async () => {
+    const rel =
+      "docs/superpowers/specs/2026-07-30-workflow-overlay-ui-design.md"
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths>
+        {`设计稿已写入并提交到 \`${rel}\`（commit \`70853244\`）。`}
+      </MessageResponse>
+    )
+    const badge = await waitFor(() => {
+      const el = container.querySelector<HTMLElement>(
+        "[data-reference-badge][data-ref-type='file']"
+      )
+      expect(el).not.toBeNull()
+      return el!
+    })
+    // Badge label may ellipsize long paths; click must open the full path.
+    fireEvent.click(badge)
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(rel, {
+        line: undefined,
+      })
+    })
+    // Commit hash stays inline code, not a second file badge.
     expect(
-      container.querySelector("[data-reference-badge][data-ref-type='file']")
-    ).toBeNull()
+      container.querySelectorAll("[data-reference-badge][data-ref-type='file']")
+        .length
+    ).toBe(1)
+    expect(container.querySelector("code")?.textContent).toBe("70853244")
   })
 
   it("fails closed after CommonMark consumes a Windows separator", async () => {
@@ -225,14 +255,16 @@ describe("MessageResponse local-path autolinking", () => {
     ).toBeNull()
   })
 
-  it("does not autolink relative path in inline code", async () => {
+  it("autolinks a bare relative path-only inline code token", async () => {
     const { container } = render(
       <MessageResponse autolinkLocalPaths>{"`docs/a.md`"}</MessageResponse>
     )
-    await waitFor(() => expect(container.querySelector("code")).not.toBeNull())
-    expect(
-      container.querySelector("[data-reference-badge][data-ref-type='file']")
-    ).toBeNull()
+    await waitFor(() => {
+      expect(
+        container.querySelector("[data-reference-badge][data-ref-type='file']")
+      ).not.toBeNull()
+    })
+    expect(container.querySelector("code")).toBeNull()
   })
 
   it("opens explicit bare relative markdown link [x](docs/a.md)", async () => {

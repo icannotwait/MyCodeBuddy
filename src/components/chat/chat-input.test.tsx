@@ -394,3 +394,68 @@ describe("ChatInput terminal reconnect control", () => {
     expect(onReconnect).toHaveBeenCalledTimes(1)
   })
 })
+
+/** jsdom drops pointerType from fireEvent.pointerDown, so pin it explicitly. */
+function pointerDown(element: Element, pointerType: string) {
+  const event = new MouseEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+  })
+  Object.defineProperty(event, "pointerType", { value: pointerType })
+  fireEvent(element, event)
+}
+
+function renderComposer(onPointerDown: () => void, onContextMenu: () => void) {
+  return render(
+    <div onPointerDown={onPointerDown} onContextMenu={onContextMenu}>
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ChatInput
+          status="connected"
+          promptCapabilities={CAPS}
+          onSend={() => {}}
+          onCancel={() => {}}
+        />
+      </NextIntlClientProvider>
+    </div>
+  )
+}
+
+describe("ChatInput event containment", () => {
+  afterEach(() => cleanup())
+
+  it("keeps a touch press from arming the conversation panel's long-press menu", async () => {
+    const onPointerDown = vi.fn()
+    const onContextMenu = vi.fn()
+    const { container } = renderComposer(onPointerDown, onContextMenu)
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    pointerDown(container.querySelector('[role="textbox"]')!, "touch")
+    expect(onPointerDown).not.toHaveBeenCalled()
+  })
+
+  it("lets a mouse press through", async () => {
+    const onPointerDown = vi.fn()
+    const onContextMenu = vi.fn()
+    const { container } = renderComposer(onPointerDown, onContextMenu)
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    pointerDown(container.querySelector('[role="textbox"]')!, "mouse")
+    expect(onPointerDown).toHaveBeenCalled()
+  })
+
+  it("keeps a right-click inside the composer out of the conversation menu", async () => {
+    const onPointerDown = vi.fn()
+    const onContextMenu = vi.fn()
+    const { container } = renderComposer(onPointerDown, onContextMenu)
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    fireEvent.contextMenu(container.querySelector('[role="textbox"]')!)
+    expect(onContextMenu).not.toHaveBeenCalled()
+  })
+})

@@ -12,6 +12,7 @@ import {
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
+import { isReparentUnmount } from "@/stores/tab-store"
 import { randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
@@ -36,6 +37,7 @@ import { AgentSelector } from "@/components/chat/agent-selector"
 import { ChatInput } from "@/components/chat/chat-input"
 import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
 import { QuickActions } from "@/components/chat/quick-actions"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import type { ComposerInjectContent } from "@/components/chat/message-input"
 import {
   acpFork,
@@ -72,7 +74,6 @@ import {
   getPromptDraftDisplayText,
 } from "@/lib/prompt-draft"
 import {
-  AGENT_LABELS,
   type AgentType,
   type ContentBlock,
   type DbConversationSummary,
@@ -84,6 +85,7 @@ import {
   type QuestionAnswer,
   type UserMessageBlock,
 } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import type { ConnectionIntent } from "@/contexts/acp-connections-context"
 import { useDelegateAccess } from "@/hooks/use-delegate-access"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
@@ -258,6 +260,8 @@ export interface ConversationSessionSurfaceProps {
    *  also governs auto-focus/connect and is true even for a lone session. */
   showActiveFlow: boolean
   reloadSignal: number
+  /** Split-group owner used to fence transient reparent unmounts. */
+  groupId?: string | null
   /**
    * Detached pop-out operation id. When set (cold path after commit-ack),
    * ACP connect stamps the incarnation so window-close can reap it.
@@ -335,6 +339,7 @@ export const ConversationSessionSurface = memo(
     isActive,
     showActiveFlow,
     reloadSignal,
+    groupId = null,
     ownerOperationId = null,
   }: ConversationSessionSurfaceProps) {
     // One-shot intent from openDelegatedChildSession (live ownership + turn focus).
@@ -697,8 +702,8 @@ export const ConversationSessionSurface = memo(
       if (dbConversationId != null) {
         return buildConversationDraftStorageKey(dbConversationId)
       }
-      return buildNewConversationDraftStorageKey()
-    }, [dbConversationId])
+      return buildNewConversationDraftStorageKey(tabId)
+    }, [dbConversationId, tabId])
     // Use the per-tab workingDir (derived from the tab's own folderId by the
     // parent) rather than the active folder's path — otherwise switching tabs
     // briefly exposes the previous folder's path to the ACP auto-connect
@@ -754,6 +759,12 @@ export const ConversationSessionSurface = memo(
     >(() => {
       void refreshDelegateAccess()
     })
+    const isTransientUnmount = useCallback(
+      () =>
+        groupId != null &&
+        isReparentUnmount(useTabStore.getState(), tabId, groupId),
+      [tabId, groupId]
+    )
 
     const {
       conn,
@@ -787,6 +798,7 @@ export const ConversationSessionSurface = memo(
       ownerOperationId: ownerOperationId ?? undefined,
       connectionIntent: delegatePolicy.intent,
       retryObserverDiscovery: delegatePolicy.retryObserverDiscovery,
+      isTransientUnmount,
       onDelegateViewerOnly: () =>
         handleDelegateViewerOnlyRejectionRef.current(),
     })
@@ -923,7 +935,7 @@ export const ConversationSessionSurface = memo(
     // appears the moment a not-installed agent is selected, independent of whether
     // a (deduped/superseded) connect attempt ever reached the preflight.
     const composerBlockedMessage = selectedAgentNotInstalled
-      ? tWelcome("agentNotInstalled", { agent: AGENT_LABELS[selectedAgent] })
+      ? tWelcome("agentNotInstalled", { agent: getAgentLabel(selectedAgent) })
       : (autoConnectError ?? agentConnectError)
 
     useEffect(() => {
@@ -1450,6 +1462,10 @@ export const ConversationSessionSurface = memo(
           }
         }
 
+        const onSendFailed = () => {
+          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        }
+
         // Pin the tab if it was a temporary preview (single-click opened)
         if (ownTab && !ownTab.isPinned) {
           pinTab(tabId)
@@ -1469,6 +1485,7 @@ export const ConversationSessionSurface = memo(
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
             onContinuationWaiting,
+            onSendFailed,
             onDelegateViewerOnly: () =>
               handleDelegateViewerOnlyRejection({
                 optimisticTurnId: optimisticTurn.id,
@@ -1576,7 +1593,7 @@ export const ConversationSessionSurface = memo(
                 effectiveConversationId
               )
             }
-            clearMessageInputDraft(buildNewConversationDraftStorageKey())
+            clearMessageInputDraft(draftStorageKey)
             refreshConversations()
 
             // Now that the row exists, kick off the actual prompt with the
@@ -1588,6 +1605,7 @@ export const ConversationSessionSurface = memo(
               clientMessageId: optimisticTurn.id,
               onTurnInProgress,
               onContinuationWaiting,
+              onSendFailed,
               onDelegateViewerOnly: () =>
                 handleDelegateViewerOnlyRejection({
                   optimisticTurnId: optimisticTurn.id,
@@ -1615,10 +1633,7 @@ export const ConversationSessionSurface = memo(
             setHasSentMessage(false)
             const draftText = draft.displayText.trim()
             if (draftText) {
-              saveMessageInputDraft(
-                buildNewConversationDraftStorageKey(),
-                draftText
-              )
+              saveMessageInputDraft(draftStorageKey, draftText)
             }
             if (mountedRef.current) {
               setAgentConnectError(tWelcome("createConversationFailed"))
@@ -1638,6 +1653,7 @@ export const ConversationSessionSurface = memo(
         canAutoConnect,
         connectionReady,
         conn.waitingForSubagents,
+        draftStorageKey,
         effectiveConversationId,
         folderId,
         handleDelegateViewerOnlyRejection,
@@ -1926,6 +1942,9 @@ export const ConversationSessionSurface = memo(
             // re-queues at the front.)
             mqEnqueue(draft, null)
           },
+          onSendFailed: () => {
+            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          },
           onDelegateViewerOnly: () =>
             handleDelegateViewerOnlyRejection({
               optimisticTurnId: optimisticTurn.id,
@@ -2015,6 +2034,9 @@ export const ConversationSessionSurface = memo(
             lastFlushBounceAtRef.current = Date.now()
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
             mqEnqueue(draft, null)
+          },
+          onSendFailed: () => {
+            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
           },
           onDelegateViewerOnly: () =>
             handleDelegateViewerOnlyRejection({
@@ -2165,6 +2187,13 @@ export const ConversationSessionSurface = memo(
       tabId,
     ])
 
+    const waitingForSubagentsArmedAtMs = (() => {
+      const waiting = conn.waitingForSubagents
+      if (!waiting) return null
+      const armedAtMs = Date.parse(waiting.armed_at)
+      return Number.isFinite(armedAtMs) ? armedAtMs : Date.now()
+    })()
+
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
@@ -2185,9 +2214,7 @@ export const ConversationSessionSurface = memo(
           initialHistoryScrollEligible={initialHistoryScrollEligible}
           historyLoadComplete={detail != null}
           focusTurnAnchor={focusTurnAnchor}
-          isDelegatedChild={
-            detail?.summary.parent_id != null || conn.isDelegationChild === true
-          }
+          waitingForSubagentsArmedAtMs={waitingForSubagentsArmedAtMs}
         />
       </GoalControlProvider>
     )
@@ -2248,7 +2275,7 @@ export const ConversationSessionSurface = memo(
         promptCapabilities={conn.promptCapabilities}
         defaultPath={workingDirForConnection}
         folderId={ownFolderId}
-        agentName={AGENT_LABELS[selectedAgent]}
+        agentName={getAgentLabel(selectedAgent)}
         error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
         pendingPermission={conn.pendingPermission}
@@ -2318,95 +2345,102 @@ export const ConversationSessionSurface = memo(
         }
       >
         {isWelcomeMode ? (
-          <div className="relative isolate flex h-full min-h-0 flex-col overflow-x-hidden overflow-y-auto">
-            <div className="flex-1" />
-            <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-6 px-4 py-4">
-              <WelcomeHero />
-              <QuickActions
-                onSelect={handleQuickAction}
-                agentType={selectedAgent}
-              />
-              <div className="flex justify-center">
-                <AgentSelector
-                  defaultAgentType={selectedAgent}
-                  onSelect={handleAgentSelect}
-                  onFallback={handleAgentFallback}
-                  onAgentsLoaded={(agents) => {
-                    setAgentsLoaded(true)
-                    setUsableAgentCount(
-                      agents.filter((agent) => agent.enabled && agent.available)
-                        .length
-                    )
-                  }}
-                  onOpenAgentsSettings={handleOpenAgentsSettings}
-                  disabled={isConnecting || dbConversationId != null}
+          <ScrollArea
+            className="relative isolate h-full min-h-0"
+            x="hidden"
+            y="scroll"
+          >
+            <div className="flex min-h-full flex-col">
+              <div className="flex-1" />
+              <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-6 px-4 py-4">
+                <WelcomeHero />
+                <QuickActions
+                  onSelect={handleQuickAction}
+                  agentType={selectedAgent}
                 />
-              </div>
-              {composerBlockedMessage ? (
-                <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                  <button
-                    type="button"
-                    onClick={handleOpenAgentsSettings}
-                    title={composerBlockedMessage}
-                    className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
-                  >
-                    {composerBlockedMessage}
-                  </button>
-                  {selectedAgentNotInstalled ? (
+                <div className="flex justify-center">
+                  <AgentSelector
+                    defaultAgentType={selectedAgent}
+                    onSelect={handleAgentSelect}
+                    onFallback={handleAgentFallback}
+                    onAgentsLoaded={(agents) => {
+                      setAgentsLoaded(true)
+                      setUsableAgentCount(
+                        agents.filter(
+                          (agent) => agent.enabled && agent.available
+                        ).length
+                      )
+                    }}
+                    onOpenAgentsSettings={handleOpenAgentsSettings}
+                    disabled={isConnecting || dbConversationId != null}
+                  />
+                </div>
+                {composerBlockedMessage ? (
+                  <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
                     <button
                       type="button"
-                      onClick={() => setComposerDiagnosticsOpen(true)}
-                      className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                      onClick={handleOpenAgentsSettings}
+                      title={composerBlockedMessage}
+                      className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
                     >
-                      {tDiag("button")}
+                      {composerBlockedMessage}
                     </button>
-                  ) : null}
-                </div>
-              ) : null}
-              <ChatInput
-                // composerConnStatus (not connStatus): a chat draft mid-reconnect
-                // reads "connecting" until the connection's cwd matches, so the
-                // send affordance stays disabled until handleSend would accept it.
-                status={composerConnStatus}
-                promptCapabilities={conn.promptCapabilities}
-                defaultPath={workingDirForConnection}
-                folderId={ownFolderId}
-                agentName={AGENT_LABELS[selectedAgent]}
-                onFocus={handleFocus}
-                onSend={handleSend}
-                onCancel={handleCancel}
-                waitingForSubagents={conn.waitingForSubagents}
-                draftRestore={promptDraftRestore}
-                interactionLocked={interactionLocked}
-                modes={connectionModes}
-                configOptions={connectionConfigOptions}
-                modeLoading={modeLoading}
-                configOptionsLoading={configOptionsLoading}
-                selectorsLoading={selectorsLoading}
-                selectedModeId={selectedModeId}
-                onModeChange={handleModeChange}
-                onConfigOptionChange={handleSetConfigOption}
-                agentType={selectedAgent}
-                availableCommands={connectionCommands}
-                attachmentTabId={tabId}
-                draftStorageKey={draftStorageKey}
-                isActive={isActive}
-                showActiveFlow={showActiveFlow}
-                onAddFeedback={
-                  feedback.featureEnabled ? feedback.openDialog : undefined
-                }
-                feedbackAddDisabled={!feedback.canSubmit}
-                injectContent={quickActionInject}
-                onInjectConsumed={handleQuickActionConsumed}
-                flush
-                tall
-              />
+                    {selectedAgentNotInstalled ? (
+                      <button
+                        type="button"
+                        onClick={() => setComposerDiagnosticsOpen(true)}
+                        className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                      >
+                        {tDiag("button")}
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                <ChatInput
+                  // composerConnStatus (not connStatus): a chat draft mid-reconnect
+                  // reads "connecting" until the connection's cwd matches, so the
+                  // send affordance stays disabled until handleSend would accept it.
+                  status={composerConnStatus}
+                  promptCapabilities={conn.promptCapabilities}
+                  defaultPath={workingDirForConnection}
+                  folderId={ownFolderId}
+                  agentName={getAgentLabel(selectedAgent)}
+                  onFocus={handleFocus}
+                  onSend={handleSend}
+                  onCancel={handleCancel}
+                  waitingForSubagents={conn.waitingForSubagents}
+                  draftRestore={promptDraftRestore}
+                  interactionLocked={interactionLocked}
+                  modes={connectionModes}
+                  configOptions={connectionConfigOptions}
+                  modeLoading={modeLoading}
+                  configOptionsLoading={configOptionsLoading}
+                  selectorsLoading={selectorsLoading}
+                  selectedModeId={selectedModeId}
+                  onModeChange={handleModeChange}
+                  onConfigOptionChange={handleSetConfigOption}
+                  agentType={selectedAgent}
+                  availableCommands={connectionCommands}
+                  attachmentTabId={tabId}
+                  draftStorageKey={draftStorageKey}
+                  isActive={isActive}
+                  showActiveFlow={showActiveFlow}
+                  onAddFeedback={
+                    feedback.featureEnabled ? feedback.openDialog : undefined
+                  }
+                  feedbackAddDisabled={!feedback.canSubmit}
+                  injectContent={quickActionInject}
+                  onInjectConsumed={handleQuickActionConsumed}
+                  flush
+                  tall
+                />
+              </div>
+              <div className="flex-1" />
+              <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-6">
+                <WelcomeTip />
+              </div>
             </div>
-            <div className="flex-1" />
-            <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-6">
-              <WelcomeTip />
-            </div>
-          </div>
+          </ScrollArea>
         ) : showDraftHeader ? (
           <div className="flex h-full min-h-0 flex-col">
             <div className="px-4 pt-3 pb-2">
@@ -2459,7 +2493,7 @@ export const ConversationSessionSurface = memo(
           }}
           onSubmit={feedback.submit}
           submitting={feedback.submitting}
-          agentName={AGENT_LABELS[selectedAgent]}
+          agentName={getAgentLabel(selectedAgent)}
         />
         <AgentDiagnosticsDialog
           open={composerDiagnosticsOpen}

@@ -136,6 +136,11 @@ describe("openTab focus-before-open", () => {
     expect(focusDetachedConversation).toHaveBeenCalledWith(42)
     expect(useTabStore.getState().rawTabs).toEqual([])
     expect(useTabStore.getState().activeTabId).toBeNull()
+    // Sidebar must still highlight the focused detached conversation.
+    expect(useTabStore.getState().sidebarSelection).toEqual({
+      id: 42,
+      agentType: "claude_code",
+    })
   })
 
   it("opens a main tab and returns true when focus misses", async () => {
@@ -150,6 +155,23 @@ describe("openTab focus-before-open", () => {
     expect(useTabStore.getState().rawTabs).toHaveLength(1)
     expect(useTabStore.getState().rawTabs[0]?.conversationId).toBe(42)
     expect(useTabStore.getState().activeTabId).toBeTruthy()
+    expect(useTabStore.getState().sidebarSelection).toBeNull()
+  })
+
+  it("clears detached sidebarSelection when a main tab is later activated", async () => {
+    focusDetachedConversation.mockResolvedValueOnce(true)
+    await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", false, "Detached")
+    expect(useTabStore.getState().sidebarSelection).toEqual({
+      id: 42,
+      agentType: "claude_code",
+    })
+
+    focusDetachedConversation.mockResolvedValue(false)
+    await useTabStore.getState().openTab(1, 99, "claude_code", true, "Main")
+    expect(useTabStore.getState().sidebarSelection).toBeNull()
+    expect(useTabStore.getState().rawTabs[0]?.conversationId).toBe(99)
   })
 
   it("skips focus gate for non-positive conversation ids (drafts)", async () => {
@@ -227,6 +249,10 @@ describe("openTab focus-before-open", () => {
     expect(openedMain).toBe(false)
     expect(focusDetachedConversation).toHaveBeenCalledWith(55)
     expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(useTabStore.getState().sidebarSelection).toEqual({
+      id: 55,
+      agentType: "claude_code",
+    })
   })
 
   it("after focus miss, re-checks fence and does not create main tab if transfer ran", async () => {

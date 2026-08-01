@@ -264,6 +264,21 @@ describe("restoreBlocksIntoEditor", () => {
     expect(attachments).toEqual([])
   })
 
+  it("re-hydrates the references a text block carries inline into badges", () => {
+    // docToPromptBlocks emits ONE text block with every badge serialized inline,
+    // so a queue-edit has to parse them back out to show the sender's badges.
+    const text = "run /review on [app.ts](file:///repo/app.ts)"
+    const attachments = restoreBlocksIntoEditor(editor, [
+      { type: "text", text },
+    ])
+    expect(
+      JSON.stringify(editor.getJSON()).match(/"type":"reference"/g)
+    ).toHaveLength(2)
+    // Lossless: re-serializing reproduces the block text verbatim.
+    expect(serialized(editor)).toBe(text)
+    expect(attachments).toEqual([])
+  })
+
   it("restores a non-composer resource_link as an attachment, not a badge", () => {
     const blocks: PromptInputBlock[] = [
       {

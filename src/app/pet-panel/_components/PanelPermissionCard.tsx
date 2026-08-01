@@ -60,7 +60,9 @@ export function PanelPermissionCard({
     <div className="mt-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-2">
       <div className="flex items-center gap-1.5 text-xs font-medium">
         <ShieldAlert className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-        <span className="truncate">{parsed.title}</span>
+        {/* Same precedence as PermissionDialog: description (≥0.63 meta)
+            over the raw command title — the command row below shows it. */}
+        <span className="truncate">{parsed.description ?? parsed.title}</span>
       </div>
 
       {parsed.command ? (
