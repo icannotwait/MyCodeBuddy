@@ -6147,15 +6147,11 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// Conversation 2582 characterization: raw status audit shape remains
-    /// reconstructable — delegate + two timeout status results + one structured
-    /// running snapshot with stable task identity. Test-only baseline; no RED
-    /// requirement and no production parser changes under this fixture.
-    #[test]
-    fn conversation_2582_status_audit_shape_remains_reconstructable() {
-        let task_id = "81cb187d-1473-43bf-be66-43072f554407";
-        let child_conversation_id = 2583;
-        let lines = vec![
+    /// Brief-pinned conversation 2582 audit fixture: delegate + two status
+    /// timeouts + intervening `response_item.message` assistant `output_text`
+    /// checkpoint + structured running status snapshot.
+    fn conversation_2582_audit_lines(task_id: &str, child_conversation_id: i32) -> Vec<String> {
+        vec![
             rollout_line(
                 "2026-08-01T00:00:00Z",
                 "session_meta",
@@ -6180,13 +6176,8 @@ mod tests {
                 }),
             ),
             status_timeout_rollout_line("2026-08-01T00:05:01Z", "status-call-timeout-1", task_id),
-            // Brief-pinned checkpoint shape: response_item / message / assistant
-            // output_text. Do NOT substitute event_msg.agent_message — that would
-            // hide a characterization gap. Status ToolResult correlation is the
-            // hard requirement of this audit fixture. Checkpoint reconstruction
-            // is observed below: if the text is missing, record the gap without
-            // failing the whole test and escalate parser fidelity separately
-            // (this task forbids production parser changes).
+            // Brief-pinned checkpoint: response_item / message / assistant
+            // output_text. Do NOT substitute event_msg.agent_message.
             rollout_line(
                 "2026-08-01T00:10:01Z",
                 "response_item",
@@ -6203,7 +6194,43 @@ mod tests {
                 task_id,
                 child_conversation_id,
             ),
-        ];
+        ]
+    }
+
+    /// Conversation 2582 characterization: status ToolResult correlation remains
+    /// reconstructable — delegate + two timeout results + structured running
+    /// snapshot. Also hard-asserts the raw fixture still carries the brief-pinned
+    /// response_item checkpoint carrier (without requiring that text to reconstruct).
+    #[test]
+    fn conversation_2582_status_audit_shape_remains_reconstructable() {
+        let task_id = "81cb187d-1473-43bf-be66-43072f554407";
+        let child_conversation_id = 2583;
+        let lines = conversation_2582_audit_lines(task_id, child_conversation_id);
+
+        // Hard: raw fixture pins response_item assistant output_text checkpoint.
+        let checkpoint_line = lines
+            .iter()
+            .find(|line| line.contains("continuation checkpoint"))
+            .expect("fixture includes checkpoint line");
+        assert!(
+            checkpoint_line.contains("\"type\":\"response_item\"")
+                || checkpoint_line.contains("\"type\": \"response_item\""),
+            "checkpoint must be a response_item carrier: {checkpoint_line}"
+        );
+        assert!(
+            checkpoint_line.contains("\"role\":\"assistant\"")
+                || checkpoint_line.contains("\"role\": \"assistant\""),
+            "checkpoint must be role assistant: {checkpoint_line}"
+        );
+        assert!(
+            checkpoint_line.contains("\"type\":\"output_text\"")
+                || checkpoint_line.contains("\"type\": \"output_text\""),
+            "checkpoint must use output_text: {checkpoint_line}"
+        );
+        assert!(
+            !checkpoint_line.contains("agent_message"),
+            "must not silently substitute event_msg.agent_message: {checkpoint_line}"
+        );
 
         let path = write_temp_rollout("conversation-2582", &lines);
         let detail = CodexParser::new()
@@ -6253,30 +6280,38 @@ mod tests {
         assert_eq!(report["task_id"], task_id);
         assert_eq!(report["status"], "running");
         assert_eq!(report["child_conversation_id"], child_conversation_id);
+        let _ = std::fs::remove_file(path);
+    }
 
-        // Characterization observation: brief-pinned response_item assistant
-        // output_text is not reconstructed by the current detail parser (only
-        // image-bearing user response_item.message is handled). Escalate as a
-        // separate parser-fidelity task — do not change production parsing here.
-        let checkpoint_reconstructed = blocks.iter().any(|block| {
-            matches!(
+    /// Escalated parser-fidelity gap: brief-pinned response_item.message assistant
+    /// output_text is not reconstructed as ContentBlock::Text by the current detail
+    /// parser (only image-bearing user response_item.message is handled). Run with
+    /// `--include-ignored` to re-check; do not un-ignore without fixing production
+    /// reconstruction or amending the brief. Production parser changes are out of
+    /// scope for Task 6.
+    #[test]
+    #[ignore = "escalated: response_item.message checkpoint not reconstructed by current detail parser; separate fidelity task"]
+    fn conversation_2582_response_item_checkpoint_message_is_reconstructed() {
+        let task_id = "81cb187d-1473-43bf-be66-43072f554407";
+        let child_conversation_id = 2583;
+        let lines = conversation_2582_audit_lines(task_id, child_conversation_id);
+
+        let path = write_temp_rollout("conversation-2582-checkpoint", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "conversation-2582")
+            .expect("conversation 2582 fixture parses");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|turn| &turn.blocks).collect();
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            blocks.iter().any(|block| matches!(
                 block,
                 ContentBlock::Text { text, .. } if text.contains("continuation checkpoint")
-            )
-        });
-        if !checkpoint_reconstructed {
-            eprintln!(
-                "characterization gap (escalated, not failing this audit): \
-                 brief-pinned response_item.message assistant output_text \
-                 \"continuation checkpoint\" was not reconstructed as ContentBlock::Text; \
-                 status ToolResult correlation still passes. Escalate parser fidelity \
-                 for response_item assistant text as a separately risk-classified task."
-            );
-        }
-        // `checkpoint_reconstructed` is the explicit observation flag for the
-        // escalated gap (true once response_item assistant text is reconstructed).
-        let _ = checkpoint_reconstructed;
-        let _ = std::fs::remove_file(path);
+            )),
+            "response_item.message assistant output_text must reconstruct as \
+             ContentBlock::Text containing \"continuation checkpoint\""
+        );
     }
 
     /// An errored wait marks BOTH its own wait capsule and the execution capsule
