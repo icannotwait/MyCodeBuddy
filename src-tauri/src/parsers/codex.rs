@@ -4682,6 +4682,95 @@ mod tests {
         serde_json::json!({ "timestamp": ts, "type": msg_type, "payload": payload }).to_string()
     }
 
+    /// Conversation 2582 audit: status poll that timed out awaiting tools/call.
+    fn status_timeout_rollout_line(timestamp: &str, call_id: &str, task_id: &str) -> String {
+        rollout_line(
+            timestamp,
+            "event_msg",
+            serde_json::json!({
+                "type":"mcp_tool_call_end",
+                "call_id":call_id,
+                "invocation":{
+                    "server":"codeg-mcp",
+                    "tool":"get_delegation_status",
+                    "arguments":{
+                        "task_ids":[task_id],
+                        "wait_ms":0,
+                        "return_when":"all_terminal_or_attention"
+                    }
+                },
+                "result":{"Err":"timed out awaiting tools/call after 300s"}
+            }),
+        )
+    }
+
+    /// Conversation 2582 audit: status poll with structured running snapshot.
+    fn status_running_rollout_line(
+        timestamp: &str,
+        call_id: &str,
+        task_id: &str,
+        child_conversation_id: i32,
+    ) -> String {
+        rollout_line(
+            timestamp,
+            "event_msg",
+            serde_json::json!({
+                "type":"mcp_tool_call_end",
+                "call_id":call_id,
+                "invocation":{
+                    "server":"codeg-mcp",
+                    "tool":"get_delegation_status",
+                    "arguments":{
+                        "task_ids":[task_id],
+                        "wait_ms":0,
+                        "return_when":"all_terminal_or_attention"
+                    }
+                },
+                "result":{"Ok":{
+                    "content":[{"type":"text","text":"Running."}],
+                    "structuredContent":{"tasks":[{
+                        "task_id":task_id,
+                        "status":"running",
+                        "message":"Running.",
+                        "child_conversation_id":child_conversation_id
+                    }]},
+                    "isError":false
+                }}
+            }),
+        )
+    }
+
+    fn tool_use_ids<'a>(blocks: &[&'a ContentBlock], tool: &str) -> Vec<&'a str> {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    ..
+                } if tool_name == tool => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_results<'a>(
+        blocks: &[&'a ContentBlock],
+    ) -> std::collections::HashMap<&'a str, (&'a str, bool)> {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview: Some(output),
+                    is_error,
+                    ..
+                } => Some((id.as_str(), (output.as_str(), *is_error))),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn thinking_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
         detail
             .turns
@@ -6056,6 +6145,112 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    /// Conversation 2582 characterization: raw status audit shape remains
+    /// reconstructable — delegate + two timeout status results + one structured
+    /// running snapshot with stable task identity. Test-only baseline; no RED
+    /// requirement and no production parser changes under this fixture.
+    #[test]
+    fn conversation_2582_status_audit_shape_remains_reconstructable() {
+        let task_id = "81cb187d-1473-43bf-be66-43072f554407";
+        let child_conversation_id = 2583;
+        let lines = vec![
+            rollout_line(
+                "2026-08-01T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"conversation-2582","cwd":"D:/MyCodeBuddy"}),
+            ),
+            rollout_line(
+                "2026-08-01T00:00:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"delegate-call-1",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"delegate_to_agent",
+                        "arguments":{"task":"inspect continuation release"}
+                    },
+                    "result":{"Ok":{"structuredContent":{
+                        "task_id":task_id,
+                        "status":"running",
+                        "child_conversation_id":child_conversation_id
+                    },"content":[{"type":"text","text":"delegated"}],"isError":false}}
+                }),
+            ),
+            status_timeout_rollout_line("2026-08-01T00:05:01Z", "status-call-timeout-1", task_id),
+            // Checkpoint narration between status polls. Detail reconstruction
+            // surfaces assistant text from `event_msg.agent_message` (not from
+            // `response_item.message` + `output_text`, which the parser only
+            // handles for image-bearing user turns). Characterization uses the
+            // reconstructable carrier so the baseline stays GREEN without
+            // production parser changes.
+            rollout_line(
+                "2026-08-01T00:10:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"agent_message",
+                    "message":"continuation checkpoint"
+                }),
+            ),
+            status_timeout_rollout_line("2026-08-01T00:15:01Z", "status-call-timeout-2", task_id),
+            status_running_rollout_line(
+                "2026-08-01T00:20:01Z",
+                "status-call-running-3",
+                task_id,
+                child_conversation_id,
+            ),
+        ];
+
+        let path = write_temp_rollout("conversation-2582", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "conversation-2582")
+            .expect("conversation 2582 fixture parses");
+        let blocks: Vec<&ContentBlock> = detail.turns.iter().flat_map(|turn| &turn.blocks).collect();
+        let delegate_calls = tool_use_ids(&blocks, "delegate_to_agent");
+        let status_calls = tool_use_ids(&blocks, "get_delegation_status");
+
+        assert_eq!(delegate_calls, vec!["delegate-call-1"]);
+        assert_eq!(
+            status_calls,
+            vec![
+                "status-call-timeout-1",
+                "status-call-timeout-2",
+                "status-call-running-3",
+            ]
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Text { text, .. } if text.contains("continuation checkpoint")
+        )));
+
+        let results = tool_results(&blocks);
+        assert_eq!(results.len(), 4, "delegate plus three status results");
+        for call_id in ["status-call-timeout-1", "status-call-timeout-2"] {
+            let (output, is_error) = results
+                .get(call_id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing correlated ToolResult for {call_id}"));
+            assert!(is_error, "{call_id} must retain is_error=true");
+            assert!(
+                output.contains("timed out awaiting tools/call after 300s"),
+                "{call_id} must retain its timeout result: {output}"
+            );
+        }
+
+        let (running_output, running_is_error) = results
+            .get("status-call-running-3")
+            .copied()
+            .expect("running status has a correlated ToolResult");
+        assert!(!running_is_error, "running snapshot must retain is_error=false");
+        let running: serde_json::Value =
+            serde_json::from_str(running_output).expect("running ToolResult is structured JSON");
+        let report = &running["structuredContent"]["tasks"][0];
+        assert_eq!(report["task_id"], task_id);
+        assert_eq!(report["status"], "running");
+        assert_eq!(report["child_conversation_id"], child_conversation_id);
+        let _ = std::fs::remove_file(path);
     }
 
     /// An errored wait marks BOTH its own wait capsule and the execution capsule
