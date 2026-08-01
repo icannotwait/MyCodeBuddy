@@ -206,6 +206,8 @@ pub struct StateOnlyRevisionRequest<'a> {
     pub transition_reason_code: &'a str,
     pub recovery_authorization_id: Option<&'a str>,
     pub consumer_correlation_id: Option<&'a str>,
+    pub recovery_source_state_fingerprint: Option<&'a str>,
+    pub recovery_risk_class: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +497,8 @@ pub async fn recover_workflow_core(
                         transition_reason_code: decision.cause_code.as_str(),
                         recovery_authorization_id: Some(&req.recovery_authorization_id),
                         consumer_correlation_id: Some(&req.correlation_id),
+                        recovery_source_state_fingerprint: Some(&decision.source_state_fingerprint),
+                        recovery_risk_class: Some(decision.risk_class.as_str()),
                     },
                     now,
                 )
@@ -604,39 +608,41 @@ async fn load_committed_recovery_replay_txn(
         .transition_reason_code
         .as_deref()
         .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-    let source_block_cause = replay_source_block_cause(recovery_cause)
+    replay_source_block_cause(recovery_cause)
         .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    if !matches!(
+        new_state,
+        ManifestWorkflowState::Skeleton
+            | ManifestWorkflowState::Estimated
+            | ManifestWorkflowState::Approved
+    ) {
+        return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+    }
     let recovery_graph_revision = revision
         .graph_revision
         .filter(|value| *value > 0)
         .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-    let source_header = reconstruct_replay_source_header_txn(
-        txn,
-        header,
-        &source,
-        source_block_cause,
-        recovery_graph_revision,
-    )
-    .await?;
-
-    let source_snapshot = load_workflow_recovery_snapshot_at_revision_txn(
-        txn,
-        &source_header,
-        None,
-        source_manifest_revision,
-    )
-    .await?;
-    let decision = decide_workflow_recovery(&source_snapshot);
-    let WorkflowRecoveryDisposition::Recover { target_state } = decision.disposition else {
+    let recovery_source_state_fingerprint = revision
+        .recovery_source_state_fingerprint
+        .as_deref()
+        .unwrap_or(receipt.source_state_fingerprint.as_str());
+    let recovery_risk_class = revision
+        .recovery_risk_class
+        .as_deref()
+        .unwrap_or(receipt.risk_class.as_str());
+    if recovery_source_state_fingerprint.is_empty() || recovery_risk_class.is_empty() {
         return Err(WorkflowStoreError::WorkflowRecoveryConflict);
-    };
-    let expected_payload = decision
-        .action_payload()
-        .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
+    }
+    let expected_payload = serde_json::json!({ "target_state": new_state });
     let expected_recovery_document = {
         let mut document = serde_json::from_str::<ManifestDocument>(&source.document_json)
             .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?;
-        document.workflow_state = target_state;
+        if document.workflow_state != ManifestWorkflowState::Blocked
+            || source.document_digest != sha256_hex(source.document_json.as_bytes())
+        {
+            return Err(WorkflowStoreError::WorkflowRecoveryConflict);
+        }
+        document.workflow_state = new_state;
         serde_json::to_string(&document)
             .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?
     };
@@ -658,13 +664,13 @@ async fn load_committed_recovery_replay_txn(
         || receipt.child_conversation_id.is_some()
         || receipt.lineage_root_task_id.is_some()
         || receipt.work_unit_key.is_some()
-        || receipt.source_state_fingerprint != decision.source_state_fingerprint
+        || receipt.source_state_fingerprint != recovery_source_state_fingerprint
         || receipt.allowed_action != RecoveryAllowedAction::RecoverWorkflow.as_str()
         || receipt.action_payload_json
             != canonical_json(&expected_payload)
                 .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?
-        || receipt.cause_code != decision.cause_code.as_str()
-        || receipt.risk_class != decision.risk_class.as_str()
+        || receipt.cause_code != recovery_cause
+        || receipt.risk_class != recovery_risk_class
         || receipt.display_reason.is_some()
         || !receipt_timestamps_valid
         || receipt.consumed_at != Some(revision.created_at)
@@ -673,8 +679,6 @@ async fn load_committed_recovery_replay_txn(
         || receipt.consumed_by_id.as_deref()
             != Some(revision.manifest_revision.to_string().as_str())
         || receipt.consumer_correlation_id.as_deref() != Some(req.correlation_id.as_str())
-        || target_state != new_state
-        || recovery_cause != decision.cause_code.as_str()
         || revision.document_json != expected_recovery_document
         || revision.document_digest != sha256_hex(revision.document_json.as_bytes())
         || revision.recovery_authorization_id.as_deref()
@@ -695,92 +699,15 @@ async fn load_committed_recovery_replay_txn(
     }))
 }
 
-async fn reconstruct_replay_source_header_txn(
-    txn: &DatabaseTransaction,
-    current: &delegation_workflow::Model,
-    source: &delegation_workflow_manifest_revision::Model,
-    source_block_cause: WorkflowBlockCause,
-    graph_revision: i64,
-) -> Result<delegation_workflow::Model, WorkflowStoreError> {
-    let revisions = delegation_workflow_manifest_revision::Entity::find()
-        .filter(
-            delegation_workflow_manifest_revision::Column::WorkflowId
-                .eq(source.workflow_id.clone()),
-        )
-        .filter(
-            delegation_workflow_manifest_revision::Column::ManifestRevision
-                .lte(source.manifest_revision),
-        )
-        .order_by_asc(delegation_workflow_manifest_revision::Column::ManifestRevision)
-        .all(txn)
-        .await
-        .map_err(db_err)?;
-    if revisions.len() != usize::try_from(source.manifest_revision).unwrap_or_default() {
-        return Err(WorkflowStoreError::WorkflowRecoveryConflict);
-    }
-
-    let mut prior_state = None;
-    let mut prior_revision = None;
-    let mut prior_publication_plan_fingerprint = None;
-    let mut structural_revision = None;
-    let mut latest_publication = None;
-    let mut supersedes_approved_revision = None;
-    for (index, row) in revisions.iter().enumerate() {
-        if row.manifest_revision != i64::try_from(index + 1).unwrap_or(i64::MAX) {
-            return Err(WorkflowStoreError::WorkflowRecoveryConflict);
-        }
-        let kind = ManifestRevisionKind::from_db(row.revision_kind.as_deref())
-            .map_err(|_| WorkflowStoreError::WorkflowRecoveryConflict)?;
-        let normalized = parse_valid_recovery_revision(row)
-            .ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-        let state = normalized.workflow_state;
-        if kind == ManifestRevisionKind::Publication {
-            if prior_state == Some(ManifestWorkflowState::Approved)
-                && matches!(
-                    state,
-                    ManifestWorkflowState::Estimated | ManifestWorkflowState::Skeleton
-                )
-            {
-                supersedes_approved_revision = prior_revision;
-            }
-            let plan_fingerprint = plan_fingerprint_hash(&normalized);
-            if prior_publication_plan_fingerprint.as_ref() != Some(&plan_fingerprint) {
-                structural_revision = Some(row.manifest_revision);
-            }
-            prior_publication_plan_fingerprint = Some(plan_fingerprint);
-            latest_publication = Some(normalized);
-        }
-        prior_state = Some(state);
-        prior_revision = Some(row.manifest_revision);
-    }
-    let latest_publication =
-        latest_publication.ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-
-    let mut reconstructed = current.clone();
-    reconstructed.workflow_kind = latest_publication.workflow_kind.clone();
-    reconstructed.schema_version = i64::from(latest_publication.schema_version);
-    reconstructed.active_manifest_revision = source.manifest_revision;
-    reconstructed.graph_revision = graph_revision;
-    reconstructed.workflow_state = WorkflowState::Blocked;
-    reconstructed.capability_version = WORKFLOW_CAPABILITY_VERSION.into();
-    reconstructed.supersedes_approved_revision = supersedes_approved_revision;
-    reconstructed.structural_revision =
-        structural_revision.ok_or(WorkflowStoreError::WorkflowRecoveryConflict)?;
-    reconstructed.design_fingerprint = design_fingerprint_hash(&latest_publication);
-    reconstructed.plan_fingerprint = plan_fingerprint_hash(&latest_publication);
-    reconstructed.block_cause_code = (source_block_cause != WorkflowBlockCause::LegacyUnknown)
-        .then(|| source_block_cause.as_str().to_string());
-    reconstructed.block_source_manifest_revision = source.source_manifest_revision;
-    reconstructed.updated_at = source.created_at;
-    Ok(reconstructed)
-}
-
 fn replay_source_block_cause(recovery_cause: &str) -> Option<WorkflowBlockCause> {
     match recovery_cause {
         "legacy_block_with_current_plan_approval"
         | "legacy_block_with_current_plan"
         | "legacy_block_without_plan" => Some(WorkflowBlockCause::LegacyUnknown),
-        other => WorkflowBlockCause::from_transition_reason(other).ok(),
+        "plan_gate_blocked" => Some(WorkflowBlockCause::PlanGateBlocked),
+        "explicit_manifest_block" => Some(WorkflowBlockCause::ExplicitManifestBlock),
+        "unresolved_task_cohort" => Some(WorkflowBlockCause::UnresolvedTaskCohort),
+        _ => None,
     }
 }
 
@@ -1576,6 +1503,8 @@ pub async fn settle_workflow_gate_core(
                                         .recovery_authorization_id
                                         .as_deref(),
                                     consumer_correlation_id: Some(&reset.consumer_correlation_id),
+                                    recovery_source_state_fingerprint: None,
+                                    recovery_risk_class: None,
                                 },
                                 now,
                             )
@@ -1617,6 +1546,8 @@ pub async fn settle_workflow_gate_core(
                                     transition_reason_code: "plan_gate_approved",
                                     recovery_authorization_id: None,
                                     consumer_correlation_id: None,
+                                    recovery_source_state_fingerprint: None,
+                                    recovery_risk_class: None,
                                 },
                                 now,
                             )
@@ -2074,22 +2005,6 @@ pub async fn load_workflow_recovery_snapshot_txn(
     displayed_reset_reason: Option<&str>,
 ) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
     load_workflow_recovery_snapshot_conn(txn, header, displayed_reset_reason).await
-}
-
-async fn load_workflow_recovery_snapshot_at_revision_txn(
-    txn: &DatabaseTransaction,
-    header: &delegation_workflow::Model,
-    displayed_reset_reason: Option<&str>,
-    revision_ceiling: i64,
-) -> Result<WorkflowRecoverySnapshot, WorkflowStoreError> {
-    Ok(load_workflow_recovery_snapshot_detailed_conn(
-        txn,
-        header,
-        displayed_reset_reason,
-        Some(revision_ceiling),
-    )
-    .await?
-    .snapshot)
 }
 
 pub(crate) async fn load_workflow_recovery_snapshot_conn<C: sea_orm::ConnectionTrait>(
@@ -2928,6 +2843,10 @@ pub async fn append_state_only_revision_txn(
         transition_reason_code: Set(Some(request.transition_reason_code.to_string())),
         consumer_correlation_id: Set(request.consumer_correlation_id.map(str::to_string)),
         graph_revision: Set(Some(current.graph_revision)),
+        recovery_source_state_fingerprint: Set(request
+            .recovery_source_state_fingerprint
+            .map(str::to_string)),
+        recovery_risk_class: Set(request.recovery_risk_class.map(str::to_string)),
         created_at: Set(now),
     }
     .insert(txn)
@@ -2998,6 +2917,8 @@ pub async fn append_workflow_block_revision_txn(
             transition_reason_code: request.cause.as_str(),
             recovery_authorization_id: None,
             consumer_correlation_id: request.consumer_correlation_id,
+            recovery_source_state_fingerprint: None,
+            recovery_risk_class: None,
         },
         now,
     )
@@ -3368,6 +3289,8 @@ async fn publish_in_txn(
         }),
         consumer_correlation_id: Set(None),
         graph_revision: Set(Some(next_graph_rev)),
+        recovery_source_state_fingerprint: Set(None),
+        recovery_risk_class: Set(None),
         created_at: Set(now),
     };
     rev_row.insert(txn).await.map_err(db_err)?;
@@ -11031,6 +10954,8 @@ mod tests {
                     transition_reason_code: WorkflowBlockCause::ExplicitManifestBlock.as_str(),
                     recovery_authorization_id: None,
                     consumer_correlation_id: None,
+                    recovery_source_state_fingerprint: None,
+                    recovery_risk_class: None,
                 },
                 Utc::now(),
             )
@@ -11653,6 +11578,8 @@ mod tests {
                     transition_reason_code: "plan_gate_approved",
                     recovery_authorization_id: None,
                     consumer_correlation_id: None,
+                    recovery_source_state_fingerprint: None,
+                    recovery_risk_class: None,
                 },
                 Utc::now(),
             )
@@ -13050,6 +12977,8 @@ mod tests {
                     transition_reason_code: WorkflowBlockCause::ExplicitManifestBlock.as_str(),
                     recovery_authorization_id: None,
                     consumer_correlation_id: None,
+                    recovery_source_state_fingerprint: None,
+                    recovery_risk_class: None,
                 },
                 Utc::now(),
             )
@@ -13687,6 +13616,8 @@ mod tests {
                 transition_reason_code: Set(Some("plan_gate_blocked".into())),
                 consumer_correlation_id: Set(None),
                 graph_revision: Set(Some(header.graph_revision)),
+                recovery_source_state_fingerprint: Set(None),
+                recovery_risk_class: Set(None),
                 created_at: Set(Utc::now()),
             }
             .insert(&db.conn)
@@ -13934,6 +13865,8 @@ mod tests {
                     transition_reason_code: "plan_gate_approved",
                     recovery_authorization_id: None,
                     consumer_correlation_id: None,
+                    recovery_source_state_fingerprint: None,
+                    recovery_risk_class: None,
                 },
                 Utc::now(),
             )
@@ -13965,7 +13898,8 @@ mod tests {
                 "receipt_consumed_at",
                 "receipt_consumed_at_value",
                 "revision_digest",
-                "binding_evidence",
+                "revision_fingerprint",
+                "revision_risk",
             ] {
                 let token = format!("exact-replay-{mutation}");
                 let (db, parent, workflow_id, emitter, mut rx) =
@@ -14028,7 +13962,7 @@ mod tests {
                             .await
                             .expect("tamper consumed recovery receipt");
                     }
-                    "revision_digest" => {
+                    "revision_digest" | "revision_fingerprint" | "revision_risk" => {
                         let header = load_header(&db, &workflow_id).await;
                         let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
                             workflow_id.clone(),
@@ -14040,29 +13974,23 @@ mod tests {
                         .expect("recovered revision");
                         let mut tampered: delegation_workflow_manifest_revision::ActiveModel =
                             revision.into();
-                        tampered.document_digest = Set("tampered-digest".into());
+                        match mutation {
+                            "revision_digest" => {
+                                tampered.document_digest = Set("tampered-digest".into())
+                            }
+                            "revision_fingerprint" => {
+                                tampered.recovery_source_state_fingerprint =
+                                    Set(Some("workflow_recovery_v1:tampered".into()))
+                            }
+                            "revision_risk" => {
+                                tampered.recovery_risk_class = Set(Some("tampered_risk".into()))
+                            }
+                            _ => unreachable!(),
+                        }
                         tampered
                             .update(&db.conn)
                             .await
                             .expect("tamper recovered revision digest");
-                    }
-                    "binding_evidence" => {
-                        let binding = delegation_workflow_node_binding::Entity::find()
-                            .filter(
-                                delegation_workflow_node_binding::Column::WorkflowId
-                                    .eq(workflow_id.clone()),
-                            )
-                            .one(&db.conn)
-                            .await
-                            .expect("load workflow binding")
-                            .expect("workflow binding");
-                        let mut tampered: delegation_workflow_node_binding::ActiveModel =
-                            binding.into();
-                        tampered.work_unit_key = Set("tampered-work-unit".into());
-                        tampered
-                            .update(&db.conn)
-                            .await
-                            .expect("tamper binding evidence");
                     }
                     _ => unreachable!(),
                 }
@@ -14094,6 +14022,61 @@ mod tests {
                 );
                 assert!(rx.try_recv().is_err());
             }
+        }
+
+        #[tokio::test]
+        async fn exact_replay_accepts_pre_upgrade_nullable_revision_evidence() {
+            let (db, parent, workflow_id, emitter, mut rx) = blocked_recovery_fixture(
+                ManifestWorkflowState::Estimated,
+                "nullable-replay-evidence",
+            )
+            .await;
+            let source_header = load_header(&db, &workflow_id).await;
+            let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
+            let request = RecoverWorkflowRequest {
+                workflow_id: workflow_id.clone(),
+                recovery_authorization_id: authorization_id,
+                expected_manifest_revision: source_header.active_manifest_revision as u64,
+                correlation_id: "nullable-replay-evidence".into(),
+            };
+            let first = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("initial recovery");
+            while rx.try_recv().is_ok() {}
+
+            let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+                workflow_id.clone(),
+                first.manifest_revision as i64,
+            ))
+            .one(&db.conn)
+            .await
+            .expect("load recovery revision")
+            .expect("recovery revision");
+            let mut pre_upgrade: delegation_workflow_manifest_revision::ActiveModel =
+                revision.into();
+            pre_upgrade.recovery_source_state_fingerprint = Set(None);
+            pre_upgrade.recovery_risk_class = Set(None);
+            pre_upgrade
+                .update(&db.conn)
+                .await
+                .expect("simulate pre-upgrade nullable recovery evidence");
+            let before_replay = durable_state(&db, &workflow_id).await;
+
+            let replay = recover_workflow_core(&db, &emitter, parent, request)
+                .await
+                .expect("replay using consumed receipt compatibility evidence");
+            assert_eq!(
+                replay,
+                RecoverWorkflowResult {
+                    idempotent_replay: true,
+                    ..first
+                }
+            );
+            assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
+            assert!(
+                rx.try_recv().is_err(),
+                "compatibility replay emits no event"
+            );
         }
 
         #[tokio::test]
@@ -14163,6 +14146,154 @@ mod tests {
             );
             assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
             assert!(rx.try_recv().is_err(), "exact replay emits no event");
+        }
+
+        #[tokio::test]
+        async fn exact_replay_survives_later_task_admission_and_active_run() {
+            use crate::acp::delegation::workflow::{
+                admit_workflow_run_txn, AdmissionDispatchKind, WorkflowAdmitInput,
+            };
+
+            let (db, parent, workflow_id, emitter, mut rx) =
+                blocked_recovery_fixture(ManifestWorkflowState::Approved, "later-admission").await;
+            let source_header = load_header(&db, &workflow_id).await;
+            let (authorization_id, _) = authorize_decision(&db, parent, &workflow_id, None).await;
+            let request = RecoverWorkflowRequest {
+                workflow_id: workflow_id.clone(),
+                recovery_authorization_id: authorization_id.clone(),
+                expected_manifest_revision: source_header.active_manifest_revision as u64,
+                correlation_id: "later-admission-replay".into(),
+            };
+            let first = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("initial workflow recovery");
+            while rx.try_recv().is_ok() {}
+
+            let task_binding = delegation_workflow_node_binding::Entity::find_by_id((
+                workflow_id.clone(),
+                "task-1-impl".to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .expect("load Task binding")
+            .expect("Task binding");
+            let task_id = "later-admission-task";
+            let task_child = seed_conversation(
+                &db,
+                seed_folder(&db, "/tmp/later-admission-task").await,
+                AgentType::Grok,
+            )
+            .await;
+            let now = Utc::now();
+            delegation_task_run::ActiveModel {
+                task_id: Set(task_id.into()),
+                root_task_id: Set(task_id.into()),
+                previous_task_id: Set(None),
+                generation: Set(1),
+                parent_conversation_id: Set(parent),
+                parent_tool_use_id: Set(Some("pt-later-admission".into())),
+                child_conversation_id: Set(task_child),
+                agent_type: Set("grok".into()),
+                profile_id: Set(None),
+                workspace_path: Set(Some("/tmp/later-admission-task".into())),
+                route_fingerprint: Set(Some("route-later-admission".into())),
+                launch_snapshot_version: Set(Some("v1".into())),
+                mode_id: Set(Some("default".into())),
+                config_values_json: Set(Some("{}".into())),
+                task_preview: Set(Some("execute Task 1".into())),
+                request_fingerprint: Set(Some("request-later-admission".into())),
+                admission_class: Set(AdmissionClass::NormalRevision),
+                reached_running_at: Set(None),
+                lineage_root_task_id: Set(task_id.into()),
+                work_unit_key: Set(Some(task_binding.work_unit_key.clone())),
+                legacy_parent_tool_use_id: Set(None),
+                history_only: Set(false),
+                status: Set(DelegationRunStatus::Reserving),
+                error_code: Set(None),
+                termination_audit_json: Set(None),
+                started_at: Set(Some(now)),
+                finished_at: Set(None),
+                tool_call_count: Set(None),
+                edit_tool_call_count: Set(None),
+                touched_files_json: Set(None),
+                touched_files_truncated: Set(None),
+                additions: Set(None),
+                deletions: Set(None),
+                line_counts_complete: Set(None),
+                card_summary_json: Set(None),
+                child_turn_anchor: Set(None),
+                child_connection_id: Set(None),
+                replaced_task_id: Set(None),
+                replacement_reason: Set(None),
+                recovery_authorization_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("insert reserving Task run");
+            let txn = db.conn.begin().await.expect("begin Task admission");
+            admit_workflow_run_txn(
+                &txn,
+                &WorkflowAdmitInput {
+                    parent_conversation_id: parent,
+                    child_conversation_id: task_child,
+                    task_id,
+                    work_unit_key: Some(&task_binding.work_unit_key),
+                    agent_type: "grok",
+                    profile_id: None,
+                    lineage_root_task_id: task_id,
+                    generation: 1,
+                    kind: AdmissionDispatchKind::FirstDispatch,
+                    admission_class: AdmissionClass::NormalRevision,
+                    workspace_path: Some("/tmp/later-admission-task"),
+                },
+            )
+            .await
+            .expect("admit Task after recovery");
+            txn.commit().await.expect("commit Task admission");
+            let evolved_header = load_header(&db, &workflow_id).await;
+            assert!(evolved_header.graph_revision > first.graph_revision as i64);
+            let active = delegation_task_run::Entity::find_by_id(task_id)
+                .one(&db.conn)
+                .await
+                .expect("load active Task run")
+                .expect("active Task run");
+            assert_eq!(active.status, DelegationRunStatus::Reserving);
+            while rx.try_recv().is_ok() {}
+
+            let before_replay = durable_state(&db, &workflow_id).await;
+            let receipt_before = load_authorization(&db, &authorization_id).await;
+            let replay = recover_workflow_core(&db, &emitter, parent, request.clone())
+                .await
+                .expect("exact replay after Task admission");
+            assert_eq!(
+                replay,
+                RecoverWorkflowResult {
+                    idempotent_replay: true,
+                    ..first
+                }
+            );
+            assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
+            assert_eq!(
+                load_authorization(&db, &authorization_id).await,
+                receipt_before
+            );
+            assert!(rx.try_recv().is_err(), "exact replay emits no event");
+
+            let mut changed = request;
+            changed.correlation_id = "later-admission-changed".into();
+            assert_eq!(
+                recover_workflow_core(&db, &emitter, parent, changed)
+                    .await
+                    .unwrap_err(),
+                WorkflowStoreError::WorkflowRecoveryConflict
+            );
+            assert_eq!(durable_state(&db, &workflow_id).await, before_replay);
+            assert_eq!(
+                load_authorization(&db, &authorization_id).await,
+                receipt_before
+            );
         }
 
         #[tokio::test]

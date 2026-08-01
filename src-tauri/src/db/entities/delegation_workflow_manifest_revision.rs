@@ -17,6 +17,8 @@ pub struct Model {
     pub transition_reason_code: Option<String>,
     pub consumer_correlation_id: Option<String>,
     pub graph_revision: Option<i64>,
+    pub recovery_source_state_fingerprint: Option<String>,
+    pub recovery_risk_class: Option<String>,
     pub created_at: DateTimeUtc,
 }
 

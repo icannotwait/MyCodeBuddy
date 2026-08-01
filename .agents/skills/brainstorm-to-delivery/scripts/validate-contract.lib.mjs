@@ -107,6 +107,42 @@ function sameMultiset(left, right) {
   )
 }
 
+function normalizedRecoveryClause(clause) {
+  return clause
+    .replace(/[`*]/g, "")
+    .replace(/^\s*(?:[-+]\s+|\d+[.)]\s+)?/, "")
+    .replace(/[.!?;]+\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isSafeNegatedRecoveryClause(clause, token) {
+  const normalized = normalizedRecoveryClause(clause)
+  if (token === "recovery_authorization_id") {
+    const target =
+      "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics)"
+    const targetList = `${target}(?:\\s*(?:,\\s*(?:and|or)?\\s*|\\s+(?:and|or)\\s+)${target})*`
+    return new RegExp(
+      `^(?:never|do not|must not|should not)\\s+` +
+        `(?:persist|store|project|expose|include|write|record)\\s+` +
+        `(?:the\\s+)?recovery_authorization_id\\s+` +
+        `(?:in|into|on|to)\\s+(?:the\\s+)?${targetList}$`,
+      "i"
+    ).test(normalized)
+  }
+  if (token === "recover_workflow") {
+    return (
+      /^(?:an?\s+)?enabled\s+catalog\s+missing\s+recover_workflow\s+hard[- ]blocks?$/i.test(
+        normalized
+      ) ||
+      /^recover_workflow\s+(?:never|(?:(?:must|should|does|do|will|would|can|could|may)\s+not))\s+(?:generates?|creates?|opens?|mints?)\s+(?:a\s+)?challenge$/i.test(
+        normalized
+      )
+    )
+  }
+  return false
+}
+
 function recoveryTokenMentions(skill, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   const exactToken = new RegExp(
@@ -132,35 +168,29 @@ function recoveryTokenMentions(skill, token) {
         /^\s*(?:[,():-]\s*)?(?:(?:must|should|does|do|is|are|was|were|will|would|can|could|may)\s+)?(?:not|never|cannot|can't)\b/i.test(
           after
         )
-      let negated = prefixNegated || suffixNegated
-
-      if (negated && token === "recovery_authorization_id") {
-        const bounded = `${before} ${after}`
-        if (/\b(?:persist|status|ledger|report|card)\b/i.test(bounded)) {
-          negated = false
-        }
-      }
-      if (negated && token === "recover_workflow") {
-        const missingHardBlock =
-          /\bmissing\s*$/i.test(before) && /\bhard[- ]blocks?\b/i.test(after)
-        const challengeBoundary =
-          /\b(?:generate|create|open|mint)s?\s+(?:a\s+)?challenge\b/i.test(
-            `${before} ${after}`
-          )
-        if (missingHardBlock || challengeBoundary) negated = false
-      }
-      mentions.push({ negated })
+      const negated = prefixNegated || suffixNegated
+      const polarity =
+        negated && isSafeNegatedRecoveryClause(clause, token)
+          ? "neutral"
+          : negated
+            ? "negated"
+            : "affirmative"
+      mentions.push({ polarity })
     }
   }
   return mentions
 }
 
 function affirmativeTokenMention(skill, token) {
-  return recoveryTokenMentions(skill, token).some((mention) => !mention.negated)
+  return recoveryTokenMentions(skill, token).some(
+    (mention) => mention.polarity === "affirmative"
+  )
 }
 
 function hasNegatedTokenMention(skill, token) {
-  return recoveryTokenMentions(skill, token).some((mention) => mention.negated)
+  return recoveryTokenMentions(skill, token).some(
+    (mention) => mention.polarity === "negated"
+  )
 }
 
 function hasUnsafeCancellationMapping(skill) {

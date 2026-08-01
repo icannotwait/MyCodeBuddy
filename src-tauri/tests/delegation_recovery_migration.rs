@@ -349,9 +349,18 @@ async fn recovery_migration_preserves_existing_workflow_and_run_bytes() {
         }),
         "migration 43 must add immutable manifest graph_revision evidence"
     );
+    for column in ["recovery_source_state_fingerprint", "recovery_risk_class"] {
+        assert!(
+            manifest_columns
+                .iter()
+                .any(|row| { row.try_get::<String>("", "name").expect("column name") == column }),
+            "migration 43 must add immutable manifest recovery evidence column {column}"
+        );
+    }
     let historical_graph_revision = db
         .query_one(sql(
-            "SELECT graph_revision FROM delegation_workflow_manifest_revisions \
+            "SELECT graph_revision,recovery_source_state_fingerprint,recovery_risk_class \
+             FROM delegation_workflow_manifest_revisions \
              WHERE workflow_id='workflow-recovery' AND manifest_revision=8",
         ))
         .await
@@ -360,6 +369,21 @@ async fn recovery_migration_preserves_existing_workflow_and_run_bytes() {
         .try_get::<Option<i64>>("", "graph_revision")
         .expect("nullable graph revision");
     assert_eq!(historical_graph_revision, None);
+    for column in ["recovery_source_state_fingerprint", "recovery_risk_class"] {
+        assert_eq!(
+            db.query_one(sql(format!(
+                "SELECT {column} FROM delegation_workflow_manifest_revisions \
+                 WHERE workflow_id='workflow-recovery' AND manifest_revision=8"
+            )))
+            .await
+            .expect("historical manifest recovery evidence")
+            .expect("historical manifest row")
+            .try_get::<Option<String>>("", column)
+            .expect("nullable recovery evidence"),
+            None,
+            "historical revision must retain NULL {column}"
+        );
+    }
     assert_eq!(selected_historical_bytes(&db).await, before);
 }
 
@@ -544,7 +568,8 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
     let revision = db
         .query_one(sql(
             "SELECT revision_kind,source_manifest_revision,recovery_authorization_id,\
-                    transition_reason_code,consumer_correlation_id \
+                    transition_reason_code,consumer_correlation_id,\
+                    recovery_source_state_fingerprint,recovery_risk_class \
              FROM delegation_workflow_manifest_revisions \
              WHERE workflow_id='workflow-recovery' AND manifest_revision=8",
         ))
@@ -556,6 +581,8 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
         "recovery_authorization_id",
         "transition_reason_code",
         "consumer_correlation_id",
+        "recovery_source_state_fingerprint",
+        "recovery_risk_class",
     ] {
         assert_eq!(
             revision.try_get::<Option<String>>("", column).unwrap(),

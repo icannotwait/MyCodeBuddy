@@ -1732,7 +1732,6 @@ fn parent_end_setup_report(
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
     let context = context.into_parent_end_context();
-    let reason = context.reason;
     DelegationTaskReport {
         task_id: None,
         continued_from_task_id: None,
@@ -1741,8 +1740,8 @@ fn parent_end_setup_report(
         child_conversation_id,
         agent_type: Some(agent_type),
         text: None,
-        error_code: Some(reason.error_code().to_string()),
-        message: Some(reason.message().to_string()),
+        error_code: Some(context.durable_error_code().to_string()),
+        message: Some(context.reason.message().to_string()),
         duration_ms: None,
         observation: None,
         last_agent_activity_at: None,
@@ -3368,6 +3367,10 @@ pub struct DelegationBroker {
     /// race the pure reserving claim deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_post_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold gen-1 after durable admission has completed all local
+    /// cancel checks and immediately before setup checkpoint #1.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_before_spawn_checkpoint_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: hold gen-1 after durable pre-send bind succeeds and before
     /// the post-bind cancel recheck / prompt send, so parent cancel can stamp
     /// inflight during the bind→send window deterministically.
@@ -3494,6 +3497,8 @@ impl DelegationBroker {
             gen1_pre_admit_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_admit_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_before_spawn_checkpoint_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_bind_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -6330,6 +6335,11 @@ impl DelegationBroker {
             }
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.gen1_before_spawn_checkpoint_gate).await;
+        }
+
         // Checkpoint #1 (opportunistic): if a parent end already landed
         // during the claim/depth/reserve phase, bail before spawning a child
         // the parent has abandoned. For admitted gen-1 pure reserving claims,
@@ -6356,7 +6366,7 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            reason.reason.error_code(),
+                            reason.durable_error_code(),
                             reason.termination.observed_at,
                             reason.audit(
                                 DelegationRunStatus::Reserving,
@@ -6452,7 +6462,7 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            reason.reason.error_code(),
+                            reason.durable_error_code(),
                             reason.termination.observed_at,
                             reason.audit(
                                 DelegationRunStatus::Reserving,
@@ -13441,6 +13451,20 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.gen1_post_admit_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold immediately before setup checkpoint #1 after durable
+    /// admission and its earlier cancel fences have completed.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_before_spawn_checkpoint_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_before_spawn_checkpoint_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -29092,6 +29116,319 @@ mod tests {
         );
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_child_count().await, 0);
+    }
+
+    fn audited_setup_parent_loss(
+        source: AcpTerminationSource,
+        reason: AcpTerminationReason,
+        classification: AcpTerminationClassification,
+    ) -> ParentEndContext {
+        let mut termination =
+            AcpTerminationSummaryV1::new(source, reason, classification, false, Utc::now());
+        if source == AcpTerminationSource::Frontend {
+            termination.frontend_origin =
+                Some(crate::acp::termination::AcpDisconnectOrigin::ExplicitUser);
+        }
+        ParentEndContext {
+            reason: ParentTurnEndReason::ParentDisconnected,
+            termination,
+        }
+    }
+
+    async fn setup_window_fixture(
+        token: &str,
+    ) -> (
+        Arc<crate::db::AppDatabase>,
+        crate::db::entities::conversation::Model,
+        Arc<RunStore>,
+        Arc<MockSpawner>,
+        Arc<DelegationBroker>,
+    ) {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-modern-setup-{token}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("modern setup {token}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        (db, parent, runs, mock, broker)
+    }
+
+    fn assert_setup_loss_is_policy_compatible(
+        error_code: &str,
+        persisted_audit: DelegationTerminationAuditV1,
+        expect_automatic_continue: bool,
+    ) {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
+            RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::termination::ParsedDelegationTermination;
+
+        assert_eq!(persisted_audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(!persisted_audit.termination.prompt_may_have_executed);
+
+        // Pre-spawn rows remain behind the reached-running fence. Re-project
+        // only that execution phase to prove the persisted code and typed
+        // cause agree with the automatic-running-loss policy; this must not
+        // turn cold setup loss itself into a resumable continue.
+        let mut running_audit = persisted_audit;
+        running_audit.prior_status = DelegationRunStatus::Running;
+        running_audit.termination.prompt_may_have_executed = true;
+        let source = RecoverySourceSnapshot {
+            source_task_id: "policy-source".into(),
+            lineage_root_task_id: "policy-source".into(),
+            generation: 1,
+            parent_conversation_id: 1,
+            child_conversation_id: 2,
+            agent_type: "codex".into(),
+            profile_id: None,
+            workspace_path: Some("C:/workspace".into()),
+            route_fingerprint: Some("route-1".into()),
+            work_unit_key: Some("policy-work-unit".into()),
+            parent_tool_use_id: Some("parent-tool".into()),
+            child_connection_id: Some("policy-running-connection".into()),
+            history_only: false,
+            is_latest: true,
+            has_active_run: false,
+            child_superseded: false,
+            child_ownership_valid: true,
+            agent_type_matches: true,
+            run_status: DelegationRunStatus::Canceled,
+            error_code: Some(error_code.into()),
+            admission_class: AdmissionClass::NormalRevision,
+            parsed_termination: ParsedDelegationTermination::Typed(running_audit),
+            reached_running: true,
+            launch_snapshot_complete: true,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: Some("default".into()),
+            config_values_json: Some("{}".into()),
+            external_session_identity_hash: Some(hash_external_session_identity("session-1")),
+            replaced_task_id: None,
+            replacement_reason: None,
+            recovery_authorization_id: None,
+        };
+        let decision = decide_delegation_recovery(
+            &source,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: true,
+                unexpected_continue_budget_available: true,
+                replacement_budget_available: true,
+            },
+            RequestedRecoveryOperation::Inspect,
+        );
+        if expect_automatic_continue {
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue
+                }
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+        } else {
+            assert_eq!(decision.confirmation, RecoveryConfirmation::Required);
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_pre_spawn_parent_loss_before_spawn_checkpoint_uses_typed_code() {
+        let cases = [
+            (
+                "transport",
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                "transport_disconnected",
+            ),
+            (
+                "process",
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+                "process_exited",
+            ),
+            (
+                "session",
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                "session_lost",
+            ),
+            (
+                "frontend",
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                "parent_disconnected",
+            ),
+        ];
+
+        for (token, source, reason, classification, expected_code) in cases {
+            let (_db, parent, _runs, mock, broker) = setup_window_fixture(token).await;
+            mock.queue_spawn(Ok(format!("unused-{token}"))).await;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            broker
+                .install_gen1_before_spawn_checkpoint_gate(entered_tx, release_rx)
+                .await;
+
+            let driver = {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    let mut req = request(parent.id, &format!("pt-before-spawn-{token}"));
+                    req.working_dir = Some(test_working_dir());
+                    broker.start_delegation(req).await
+                })
+            };
+            entered_rx
+                .await
+                .expect("before-spawn checkpoint gate entered");
+            let context = audited_setup_parent_loss(source, reason, classification);
+            let policy_audit = context.audit(
+                DelegationRunStatus::Reserving,
+                AdmissionClass::NormalRevision,
+                Some(format!("pt-before-spawn-{token}")),
+                None,
+            );
+            broker
+                .cancel_by_parent_with_context("parent-conn", context)
+                .await;
+            release_tx.send(()).expect("release before-spawn gate");
+
+            let report = driver.await.expect("join before-spawn request");
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some(expected_code),
+                "setup checkpoint #1 must preserve {token} evidence: {report:?}"
+            );
+            assert!(
+                mock.spawn_args.lock().await.is_empty(),
+                "checkpoint #1 must return before spawn for {token}"
+            );
+            assert_setup_loss_is_policy_compatible(
+                report
+                    .error_code
+                    .as_deref()
+                    .expect("typed setup report code"),
+                policy_audit,
+                token != "frontend",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_pre_spawn_parent_loss_during_spawn_persists_typed_code() {
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let cases = [
+            (
+                "transport",
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                "transport_disconnected",
+            ),
+            (
+                "process",
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+                "process_exited",
+            ),
+            (
+                "session",
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                "session_lost",
+            ),
+            (
+                "frontend",
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                "parent_disconnected",
+            ),
+        ];
+
+        for (token, source, reason, classification, expected_code) in cases {
+            let (db, parent, runs, mock, broker) = setup_window_fixture(token).await;
+            mock.queue_spawn(Ok(format!("spawned-{token}"))).await;
+            let release = mock.install_spawn_gate().await;
+            let driver = {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    let mut req = request(parent.id, &format!("pt-during-spawn-{token}"));
+                    req.working_dir = Some(test_working_dir());
+                    broker.start_delegation(req).await
+                })
+            };
+            while mock.spawn_args.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let run = DelegationTaskRun::find()
+                .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+                .one(&db.conn)
+                .await
+                .expect("load setup run")
+                .expect("durable setup run");
+
+            broker
+                .cancel_by_parent_with_context(
+                    "parent-conn",
+                    audited_setup_parent_loss(source, reason, classification),
+                )
+                .await;
+            release.send(()).expect("release spawn gate");
+            let report = driver.await.expect("join spawn-window request");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code));
+
+            let terminal = runs
+                .load_by_task_id(&run.task_id)
+                .await
+                .expect("load terminal setup run")
+                .expect("terminal setup run remains durable");
+            assert_eq!(terminal.error_code.as_deref(), Some(expected_code));
+            let terminal_row = DelegationTaskRun::find_by_id(&run.task_id)
+                .one(&db.conn)
+                .await
+                .expect("load terminal setup row")
+                .expect("terminal setup row");
+            let audit = serde_json::from_str::<DelegationTerminationAuditV1>(
+                terminal_row
+                    .termination_audit_json
+                    .as_deref()
+                    .expect("typed setup termination audit"),
+            )
+            .expect("parse typed setup termination audit");
+            assert_eq!(audit.termination.source, source);
+            assert_eq!(audit.termination.reason, reason);
+            assert_eq!(audit.termination.classification, classification);
+            assert_setup_loss_is_policy_compatible(
+                terminal_row
+                    .error_code
+                    .as_deref()
+                    .expect("durable setup code"),
+                audit,
+                token != "frontend",
+            );
+            assert_eq!(
+                mock.disconnects.lock().await.as_slice(),
+                &[format!("spawned-{token}")]
+            );
+        }
     }
 
     /// Finding 2 (remaining): external MCP cancel while `start_delegation` is

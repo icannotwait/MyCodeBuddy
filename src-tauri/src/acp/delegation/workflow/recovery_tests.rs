@@ -665,6 +665,8 @@ async fn append_session_revisions(db: &crate::db::AppDatabase, workflow_id: &str
                 },
                 recovery_authorization_id: None,
                 consumer_correlation_id: None,
+                recovery_source_state_fingerprint: None,
+                recovery_risk_class: None,
             },
             Utc::now(),
         )

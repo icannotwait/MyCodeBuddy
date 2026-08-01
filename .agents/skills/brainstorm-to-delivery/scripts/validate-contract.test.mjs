@@ -1181,6 +1181,56 @@ describe("authorized recovery validator contract", () => {
     })
   }
 
+  for (const [token, mutation] of [
+    [
+      "request_recovery_authorization",
+      "request_recovery_authorization must never be called during recovery, even when a status report permits replay.",
+    ],
+    [
+      "recovery_authorization_id",
+      "recovery_authorization_id must never be supplied to a recovery call, even when status permits replay.",
+    ],
+    [
+      "recovery_confirmation_required",
+      "recovery_confirmation_required must never be honored during recovery, even when a report permits replay.",
+    ],
+    [
+      "recover_workflow",
+      "recover_workflow must never be called during recovery, even when the process may create a challenge.",
+    ],
+  ]) {
+    it(`uses B2D-R001 for ambiguous negation of ${token}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  for (const [token, safeNegative] of [
+    [
+      "recovery_authorization_id",
+      "Never persist recovery_authorization_id in status, ledger, report, or card.",
+    ],
+    [
+      "recover_workflow",
+      "An enabled catalog missing recover_workflow hard-blocks. recover_workflow never generates a challenge.",
+    ],
+  ]) {
+    it(`does not count safe negative ${token} guidance as affirmative`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const restoredSafeNegative = safeNegative.replaceAll(
+        `missing_${token}`,
+        token
+      )
+      assertHasRuleId(
+        validateSkillMarkdown(`${stripped}\n${restoredSafeNegative}\n`).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
   const sequenceMutations = [
     "Call request_recovery_authorization before recovery_confirmation_required.",
     "After authorization, construct a similar replacement call instead of replaying the exact rejected call.",
