@@ -6,6 +6,10 @@
  *   in-flight fetch cannot overwrite a newer nudge result.
  * - Cold detail installs via `applyFromDetail`; live clock via graph-changed
  *   + snapshot refetch; compatibility_nudge triggers the same refetch path.
+ * - 10-minute fallback refresh: always armed for expanded-graph interest;
+ *   also armed for overlay-only interest while the graph is still undiscovered
+ *   (`appliedGraphRevision == null`) so a missed first-publish event cannot
+ *   leave the sessions chip stuck forever (e.g. b2d / writing-plans handoff).
  */
 
 import { create } from "zustand"
@@ -304,7 +308,9 @@ function releaseConversation(
   } else {
     if (active.expandedCount <= 0) return
     active.expandedCount -= 1
-    if (active.expandedCount === 0) clearFallbackTimer(active)
+    // Do not clear the fallback solely because expanded interest dropped:
+    // overlay-only discovery still needs the 10-minute safety net while
+    // `appliedGraphRevision` is null. The timer callback re-checks need.
   }
   if (totalInterest(active) > 0) return
   clearFallbackTimer(active)
@@ -438,16 +444,33 @@ async function runRefresh(
   }
 
   const currentActive = activeConversations.get(conversationId)
-  if (
-    !currentActive ||
-    !hasExpandedInterestEpoch(conversationId, activationEpoch)
-  ) {
+  if (!currentActive || !isActiveEpoch(conversationId, activationEpoch)) {
+    return
+  }
+  // Expanded interest always converges on a 10-minute timer. Overlay interest
+  // only needs the same safety net while the graph is still undiscovered —
+  // once a revision is known, overlay relies on graph-changed / nudge events.
+  if (!needsFallbackRefresh(conversationId, activationEpoch, get)) {
     return
   }
   currentActive.fallbackTimer = setTimeout(() => {
-    if (!hasExpandedInterestEpoch(conversationId, activationEpoch)) return
+    if (!needsFallbackRefresh(conversationId, activationEpoch, get)) return
     void get().refresh(conversationId)
   }, FALLBACK_REFRESH_MS)
+}
+
+/**
+ * Whether the active lease still warrants a 10-minute fallback poll.
+ * Expanded interest always does; overlay-only only while graph is unknown.
+ */
+function needsFallbackRefresh(
+  conversationId: number,
+  epoch: number,
+  get: () => WorkflowGraphState
+): boolean {
+  if (!isActiveEpoch(conversationId, epoch)) return false
+  if (hasExpandedInterestEpoch(conversationId, epoch)) return true
+  return get().getEntry(conversationId)?.appliedGraphRevision == null
 }
 
 export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({

@@ -673,6 +673,40 @@ describe("active workflow refresh scheduling", () => {
     release()
   })
 
+  it("overlay-only discovery re-arms the 10-minute fallback until a graph appears", async () => {
+    // b2d / writing-plans handoff: overlay opens on sessions while the
+    // workflow is not yet published. If the first-publish event is missed,
+    // the 10-minute safety net must still discover the graph so the chip
+    // can leave the sub-agent-only state.
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+
+    const release = useWorkflowGraphStore.getState().activateOverlayInterest(94)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(useWorkflowGraphStore.getState().getSnapshot(94)).toBeNull()
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(useWorkflowGraphStore.getState().getSnapshot(94)).toBeNull()
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(94)?.graph_revision
+    ).toBe(1)
+
+    // Discovered graph under overlay-only: no further fallback polls.
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+    release()
+  })
+
   it("seeds the first publish event after an overlay mount resolves null", async () => {
     const changedDispose = vi.fn()
     const nudgeDispose = vi.fn()
@@ -702,6 +736,7 @@ describe("active workflow refresh scheduling", () => {
       useWorkflowGraphStore.getState().getSnapshot(98)?.graph_revision
     ).toBe(1)
 
+    // Event discovery disarms the overlay-only fallback once a revision lands.
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
