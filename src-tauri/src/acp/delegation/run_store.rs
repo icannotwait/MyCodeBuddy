@@ -11040,11 +11040,20 @@ mod tests {
     #[tokio::test]
     async fn parent_disconnected_source_rejects_unresumable_replacement_without_authorization() {
         use crate::db::service::conversation_service;
+        use sea_orm::IntoActiveModel;
 
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) = seed_parent_child(&db, "pd-root-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let root = "pd-root-4111-8111-111111111111";
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-pd-root".into()));
+        child.update(&db.conn).await.unwrap();
         store
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
@@ -11066,6 +11075,18 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let projection = store
+            .recovery_projection_for_task(root)
+            .await
+            .unwrap()
+            .expect("legacy parent disconnect recovery projection");
+        assert_eq!(projection.disposition, "confirmation_required");
+        assert_eq!(projection.proposed_action.as_deref(), Some("continue"));
+        assert_eq!(projection.replacement_reason, None);
+        assert_eq!(projection.cause_code, "legacy_parent_disconnect");
+        assert_eq!(projection.risk_class, "legacy_unknown_origin");
+        assert!(projection.authorization_required);
 
         let folder = seed_folder(&db, "/tmp/codeg-pd-replacement").await;
         let child = conversation_service::create_with_delegation(
@@ -11092,8 +11113,13 @@ mod tests {
         let err = store
             .admit_gen1_reserving(replacement)
             .await
-            .expect_err("temporary adapter has no authorization input and must reject");
-        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+            .expect_err("resume-first policy must reject direct unresumable replacement");
+        assert!(
+            matches!(&err, TaskStoreError::InvalidReplacement(_)),
+            "resume-first source must reject direct unresumable replacement: {err:?}"
+        );
+        assert_eq!(err.wire_code(), Some("invalid_replacement"));
+        assert!(err.recovery_projection().is_none());
         assert!(
             DelegationTaskRun::find_by_id("pd-replacement-1")
                 .one(&db.conn)
@@ -14509,7 +14535,7 @@ mod termination_audit {
                 "explicit-cancel-replace",
             )
             .await;
-            replacement.replacement_reason = Some(REPLACEMENT_REASON_NOT_SUPPORTED.into());
+            replacement.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
             let error = store
                 .admit_gen1_reserving(replacement)
                 .await
@@ -14520,7 +14546,7 @@ mod termination_audit {
             assert_eq!(projection.proposed_action.as_deref(), Some("replace"));
             assert_eq!(
                 projection.replacement_reason,
-                Some(ReplacementReason::NotSupported)
+                Some(ReplacementReason::Unresumable)
             );
             assert_eq!(projection.cause_code, "user_cancelled");
             assert_eq!(projection.risk_class, "explicit_user_stop");
