@@ -313,6 +313,185 @@ function validStatus(obj: Record<string, unknown> | null): TaskStatus | null {
     : null
 }
 
+export interface DelegationStatusIdentity {
+  requestIds: string[]
+  reportIds: string[]
+  candidateIds: string[]
+  valid: boolean
+}
+
+type StrictIdentityIds = { ids: string[]; valid: boolean }
+
+function uniqueTrimmed(values: readonly unknown[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const value of values) {
+    if (typeof value !== "string") continue
+    const id = value.trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    result.push(id)
+  }
+  return result
+}
+
+function strictRequestIds(value: unknown, depth = 0): StrictIdentityIds {
+  if (depth > 4) return { ids: [], valid: false }
+  if (typeof value === "string") {
+    try {
+      return strictRequestIds(JSON.parse(value), depth + 1)
+    } catch {
+      return { ids: [], valid: false }
+    }
+  }
+  const obj = asObject(value)
+  if (!obj) return { ids: [], valid: false }
+  const hasBatch = Object.prototype.hasOwnProperty.call(obj, "task_ids")
+  const hasLegacy = Object.prototype.hasOwnProperty.call(obj, "task_id")
+  if (hasBatch || hasLegacy) {
+    if (hasBatch && !Array.isArray(obj.task_ids)) {
+      return { ids: [], valid: false }
+    }
+    if (hasLegacy && typeof obj.task_id !== "string") {
+      return { ids: [], valid: false }
+    }
+    const raw = [
+      ...(Array.isArray(obj.task_ids) ? obj.task_ids : []),
+      ...(hasLegacy ? [obj.task_id] : []),
+    ]
+    if (raw.some((id) => typeof id !== "string" || id.trim() === "")) {
+      return { ids: [], valid: false }
+    }
+    return { ids: uniqueTrimmed(raw), valid: true }
+  }
+  for (const key of TASK_ID_WRAPPER_KEYS) {
+    if (obj[key] !== undefined) return strictRequestIds(obj[key], depth + 1)
+  }
+  return { ids: [], valid: true }
+}
+
+function parseStrictStatusRequest(
+  raw: string | null | undefined
+): StrictIdentityIds {
+  if (!raw?.trim()) return { ids: [], valid: true }
+  try {
+    return strictRequestIds(JSON.parse(raw))
+  } catch {
+    return { ids: [], valid: false }
+  }
+}
+
+function strictReportId(value: unknown): StrictIdentityIds {
+  const report = asObject(value)
+  if (!report || validStatus(report) === null) {
+    return { ids: [], valid: false }
+  }
+  const taskId = typeof report.task_id === "string" ? report.task_id.trim() : ""
+  return taskId ? { ids: [taskId], valid: true } : { ids: [], valid: false }
+}
+
+function strictReportArray(value: unknown): StrictIdentityIds {
+  if (!Array.isArray(value)) return { ids: [], valid: false }
+  const parsed = value.map(strictReportId)
+  if (parsed.some((entry) => !entry.valid)) {
+    return { ids: [], valid: false }
+  }
+  return {
+    ids: uniqueTrimmed(parsed.flatMap((entry) => entry.ids)),
+    valid: true,
+  }
+}
+
+const hasOwn = (obj: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(obj, key)
+
+function reportIdsFromObject(obj: Record<string, unknown>): StrictIdentityIds {
+  if (hasOwn(obj, "structuredContent")) {
+    const structured = asObject(obj.structuredContent)
+    if (!structured) return { ids: [], valid: false }
+    if (hasOwn(structured, "tasks")) return strictReportArray(structured.tasks)
+    if (validStatus(structured) !== null) return strictReportId(structured)
+    return { ids: [], valid: false }
+  }
+  if (hasOwn(obj, "tasks")) {
+    return strictReportArray(obj.tasks)
+  }
+  if (validStatus(obj) !== null) return strictReportId(obj)
+  if (hasOwn(obj, "result") || hasOwn(obj, "Ok")) {
+    return { ids: [], valid: false }
+  }
+  const contentText = firstContentText(obj)
+  if (!contentText) return { ids: [], valid: true }
+  const embedded = extractEmbeddedJsonObject(contentText)
+  if (!embedded) return { ids: [], valid: true }
+  if (
+    hasOwn(embedded, "structuredContent") ||
+    hasOwn(embedded, "tasks") ||
+    validStatus(embedded) !== null
+  ) {
+    return reportIdsFromObject(embedded)
+  }
+  return { ids: [], valid: true }
+}
+
+function parseRawOutputObject(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed === "string") {
+      try {
+        return asObject(JSON.parse(parsed)) ?? extractEmbeddedJsonObject(parsed)
+      } catch {
+        return extractEmbeddedJsonObject(parsed)
+      }
+    }
+    return asObject(parsed)
+  } catch {
+    return extractEmbeddedJsonObject(raw)
+  }
+}
+
+function isIdentityBearingResultContainer(
+  obj: Record<string, unknown>
+): boolean {
+  return (
+    hasOwn(obj, "structuredContent") ||
+    hasOwn(obj, "tasks") ||
+    validStatus(obj) !== null ||
+    hasOwn(obj, "result") ||
+    hasOwn(obj, "Ok")
+  )
+}
+
+function parseStructuredStatusReportIds(
+  output: string | null | undefined
+): StrictIdentityIds {
+  if (!output?.trim()) return { ids: [], valid: true }
+  const { obj } = parseResultObject(output)
+  if (obj) return reportIdsFromObject(obj)
+
+  // Free-form timeout/error prose has no structured identity. A recoverable
+  // identity-bearing container that could not be peeled invalidates the call.
+  const rawObject = parseRawOutputObject(output)
+  return rawObject && isIdentityBearingResultContainer(rawObject)
+    ? { ids: [], valid: false }
+    : { ids: [], valid: true }
+}
+
+export function parseDelegationStatusIdentity(
+  part: Pick<AdaptedToolCallPart, "input" | "output" | "errorText">
+): DelegationStatusIdentity {
+  const request = parseStrictStatusRequest(part.input)
+  const reports = parseStructuredStatusReportIds(part.output)
+  const requestIds = request.ids
+  const reportIds = reports.ids
+  return {
+    requestIds,
+    reportIds,
+    candidateIds: uniqueTrimmed([...requestIds, ...reportIds]),
+    valid: request.valid && reports.valid,
+  }
+}
+
 /**
  * Whether `obj` is a delegation report. `structuredContent` is trusted (the
  * host only surfaces it for an actual `CallToolResult`). An UNtrusted source —

@@ -7,6 +7,7 @@ export interface DelegationRunRecord<T> {
 
 export interface DelegationIdentityIndex {
   taskToUnitKey: ReadonlyMap<string, string>
+  taskToRunKey: ReadonlyMap<string, string>
   workUnitToUnitKey: ReadonlyMap<string, string>
   knownTaskIds: ReadonlySet<string>
   knownWorkUnitKeys: ReadonlySet<string>
@@ -134,9 +135,17 @@ export function groupDelegationRuns<T>(
     return { key: displayKey(runs), runs }
   })
   const taskToUnitKey = new Map<string, string>()
+  const taskToRunKey = new Map<string, string>()
   const workUnitToUnitKey = new Map<string, string>()
   const ambiguousTaskIds = new Set<string>()
+  const ambiguousExactTaskIds = new Set<string>()
   const ambiguousWorkUnitKeys = new Set<string>()
+  for (const record of records) {
+    const taskId = record.identity.taskId?.trim()
+    if (!taskId) continue
+    const runKey = `${record.identity.parentConversationId}\u0000run\u0000${record.identity.parentToolUseId}`
+    addUniqueIndex(taskToRunKey, ambiguousExactTaskIds, taskId, runKey)
+  }
   for (const unit of units) {
     for (const run of unit.runs) {
       if (run.identity.taskId) {
@@ -165,8 +174,9 @@ export function groupDelegationRuns<T>(
     units,
     index: {
       taskToUnitKey,
+      taskToRunKey,
       workUnitToUnitKey,
-      knownTaskIds: new Set(taskToUnitKey.keys()),
+      knownTaskIds: new Set(taskToRunKey.keys()),
       knownWorkUnitKeys: new Set(workUnitToUnitKey.keys()),
     },
   }

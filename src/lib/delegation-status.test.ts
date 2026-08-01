@@ -4,6 +4,7 @@ import {
   buildDelegationTaskRows,
   deriveBadge,
   formatDuration,
+  parseDelegationStatusIdentity,
   parseStatusReport,
   parseStatusReports,
   parseTaskId,
@@ -93,6 +94,120 @@ describe("parseTaskIds", () => {
     expect(parseTaskIds("not json")).toEqual([])
     expect(parseTaskIds(null)).toEqual([])
     expect(parseTaskIds(undefined)).toEqual([])
+  })
+})
+
+describe("parseDelegationStatusIdentity", () => {
+  it("trims and de-duplicates batch plus legacy request ids", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({
+          task_ids: [" run-a ", "run-a"],
+          task_id: "run-b",
+        }),
+        output: null,
+        errorText: null,
+      })
+    ).toEqual({
+      requestIds: ["run-a", "run-b"],
+      reportIds: [],
+      candidateIds: ["run-a", "run-b"],
+      valid: true,
+    })
+  })
+
+  it("collects every structured report id and ignores timeout prose", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a", "run-b"] }),
+        output: JSON.stringify({
+          structuredContent: {
+            tasks: [
+              { task_id: " run-a ", status: "running" },
+              { task_id: "run-b", status: "completed" },
+            ],
+          },
+        }),
+        errorText: "timed out awaiting tools/call after 300s; task run-foreign",
+      })
+    ).toEqual({
+      requestIds: ["run-a", "run-b"],
+      reportIds: ["run-a", "run-b"],
+      candidateIds: ["run-a", "run-b"],
+      valid: true,
+    })
+  })
+
+  it("invalidates the whole identity when one structured report lacks an id", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a"] }),
+        output: JSON.stringify({
+          structuredContent: {
+            tasks: [
+              { task_id: "run-a", status: "running" },
+              { status: "unknown" },
+            ],
+          },
+        }),
+        errorText: null,
+      }).valid
+    ).toBe(false)
+  })
+
+  it.each([
+    ["wrong-typed structuredContent", { structuredContent: "broken" }],
+    [
+      "wrong-typed structuredContent.tasks",
+      { structuredContent: { tasks: {} } },
+    ],
+    [
+      "malformed structured report array",
+      {
+        structuredContent: {
+          tasks: [{ task_id: 17, status: "running" }],
+        },
+      },
+    ],
+    [
+      "unrecoverable identity-bearing result",
+      {
+        result: { Ok: { structuredContent: { tasks: "broken" } } },
+      },
+    ],
+  ])("fails open for %s", (_name, output) => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a"] }),
+        output: JSON.stringify(output),
+        errorText: null,
+      })
+    ).toEqual({
+      requestIds: ["run-a"],
+      reportIds: [],
+      candidateIds: ["run-a"],
+      valid: false,
+    })
+  })
+
+  it("treats free-form timeout output as non-identity-bearing", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_id: "run-a" }),
+        output: null,
+        errorText: "timed out awaiting tools/call after 300s for run-unknown",
+      })
+    ).toMatchObject({ requestIds: ["run-a"], reportIds: [], valid: true })
+  })
+
+  it("fails closed for malformed identity-bearing request JSON", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: "{task_ids:[",
+        output: null,
+        errorText: null,
+      }).valid
+    ).toBe(false)
   })
 })
 

@@ -94,4 +94,34 @@ describe("groupDelegationRuns", () => {
     expect(grouped.units).toHaveLength(2)
     expect(grouped.units[0].key).not.toBe(grouped.units[1].key)
   })
+
+  it("marks only exact primary task ids as known", () => {
+    const grouped = groupDelegationRuns([
+      run("tool-a", "run-a", "unit-a", 3001, ["linked-only"]),
+    ])
+
+    expect(grouped.index.knownTaskIds.has("run-a")).toBe(true)
+    expect(grouped.index.knownTaskIds.has("linked-only")).toBe(false)
+    expect(grouped.index.knownTaskIds.has("run")).toBe(false)
+    expect(grouped.index.knownTaskIds.has("3001")).toBe(false)
+  })
+
+  it("rejects one exact task id owned by two distinct runs", () => {
+    const grouped = groupDelegationRuns([
+      run("tool-a", "duplicate", "unit-a", null, []),
+      run("tool-b", "duplicate", "unit-a", null, []),
+    ])
+
+    expect(grouped.index.taskToRunKey.has("duplicate")).toBe(false)
+    expect(grouped.index.knownTaskIds.has("duplicate")).toBe(false)
+  })
+
+  it("does not let a foreign parent make an ambiguous local id known", () => {
+    const grouped = groupDelegationRuns([
+      run("tool-a", "same", null, null, [], 2075),
+      run("tool-b", "same", null, null, [], 2076),
+    ])
+
+    expect(grouped.index.knownTaskIds.has("same")).toBe(false)
+  })
 })
