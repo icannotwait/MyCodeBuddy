@@ -109,6 +109,7 @@ function sameMultiset(left, right) {
 
 function normalizedRecoveryClause(clause) {
   return clause
+    .replace(/[’‘ʼ]/g, "'")
     .replace(/[`*]/g, "")
     .replace(/^\s*(?:[-+]\s+|\d+[.)]\s+)?/, "")
     .replace(/[.!?;]+\s*$/, "")
@@ -130,13 +131,14 @@ function isAuthorizationIdPrivacyClause(normalized) {
   const activeSubject =
     "(?:the\\s+)?(?:runtime|system|workflow|implementation|validator|broker|client|codeg)"
   const subjectControl =
-    "(?:(?:must|should|shall|may|does|will|can)\\s+(?:not|never)|(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances)"
+    "(?:(?:must|should|shall|may|does|will|can)\\s+(?:not|never)|(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances|(?:doesn't|can't|won't|wouldn't|shouldn't|mustn't))"
   const passiveControl =
     `(?:` +
     `(?:must|should|shall|may|will|can)\\s+(?:not|never)\\s+be\\s+${passiveAction}|` +
     `(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances\\s+be\\s+${passiveAction}|` +
     `is\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}|` +
     `is\\s+not\\s+(?:allowed|permitted)\\s+to\\s+be\\s+${passiveAction}|` +
+    `isn't\\s+(?:allowed|permitted)\\s+to\\s+be\\s+${passiveAction}|` +
     `(?:must|should|shall|may)\\s+be\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}` +
     `)\\s+${destination}`
 
@@ -156,8 +158,7 @@ function isAuthorizationIdPrivacyClause(normalized) {
   )
 }
 
-function isSafeNeutralRecoveryClause(clause, token) {
-  const normalized = normalizedRecoveryClause(clause)
+function isSafeNeutralRecoveryClause(normalized, token) {
   if (token === "recovery_authorization_id") {
     return isAuthorizationIdPrivacyClause(normalized)
   }
@@ -169,10 +170,10 @@ function isSafeNeutralRecoveryClause(clause, token) {
       /^recover_workflow\s+(?:never|(?:(?:must|should|does|do|will|would|can|could|may)\s+not))\s+(?:generates?|creates?|opens?|mints?)\s+(?:a\s+)?challenge$/i.test(
         normalized
       ) ||
-      /^Require\s+(?:the\s+)?full\s+v2\s+tool\s+set\s+\([^)]*\brecover_workflow\b[^)]*\)$/i.test(
+      /^Require the full v2 tool set \(get_workflow_capabilities, get_workflow_state, publish_workflow_manifest, settle_workflow_gate, recover_workflow\)$/i.test(
         normalized
       ) ||
-      /(?:^|\|\s*)Workflow\s+recovery\s+requires\s+recover_workflow$/i.test(
+      /^(?:["”]\s*\|\s*)?Workflow recovery requires recover_workflow$/i.test(
         normalized
       )
     )
@@ -180,63 +181,95 @@ function isSafeNeutralRecoveryClause(clause, token) {
   return false
 }
 
-function hasExplicitNegativeRecoverySemantics(clause) {
-  const normalized = normalizedRecoveryClause(clause)
+function hasExplicitNegativeRecoverySemantics(normalized) {
   return (
-    /\b(?:never|cannot|can't|forbid(?:s|den|ding)?|prohibit(?:s|ed|ing)?|disallow(?:s|ed|ing)?|avoid(?:s|ed|ing)?)\b/i.test(
+    /\bnot\b/i.test(normalized) ||
+    /\b(?:isn't|aren't|wasn't|weren't|can't|don't|doesn't|won't|wouldn't|shouldn't|mustn't)\b/i.test(
       normalized
     ) ||
+    /\b(?:never|cannot|forbid(?:s|den|ding)?|prohibit(?:s|ed|ing)?|disallow(?:s|ed|ing)?|avoid(?:s|ed|ing)?)\b/i.test(
+      normalized
+    ) ||
+    /\bby\s+no\s+means\b/i.test(normalized) ||
     /\bunder\s+no\s+circumstances\b/i.test(normalized) ||
-    /\b(?:do|does|did|must|shall|should|may|can|could|will|would|is|are|was|were|be|being)\s+(?:\w+\s+){0,2}not\b/i.test(
-      normalized
-    ) ||
-    /\bnot\s+(?:allowed|permitted)\b/i.test(normalized)
+    /\bwithout\b/i.test(normalized)
   )
 }
 
-function isExplicitPositiveRecoveryClause(clause, token) {
-  const normalized = normalizedRecoveryClause(clause)
+function isExplicitPositiveRecoveryClause(normalized, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const arrowTransition = new RegExp(
-    `(?:->|→)\\s*(?:typed\\s+|receipt-required\\s+)?${escaped}\\s*(?:->|→)`,
-    "i"
-  )
+  const delegationTable =
+    "^\\|\\s*Typed delegation recovery challenge\\s*\\|\\s*" +
+    "Projected call\\s*(?:->|→)\\s*recovery_confirmation_required\\s*" +
+    "(?:->|→)\\s*request_recovery_authorization\\s*(?:->|→)\\s*" +
+    "exact rejected call replay with the ID$"
+  const workflowTable =
+    "^\\|\\s*Workflow recovery\\s*\\|\\s*get_workflow_state\\s*" +
+    "(?:->|→)\\s*request_recovery_authorization\\s*(?:->|→)\\s*" +
+    "receipt-required recover_workflow$"
 
   if (token === "recovery_confirmation_required") {
     return (
       new RegExp(
-        `\\b(?:receive|emit|surface|return|project)(?:s|d|ed)?\\s+(?:a\\s+)?(?:typed\\s+)?${escaped}\\b`,
+        `^(?:receive(?:s|d)?|emit(?:s|ted)?|surface(?:s|d)?)\\s+` +
+          `(?:a\\s+)?typed\\s+${escaped}` +
+          `(?:\\s+from\\s+(?:the\\s+)?projected call)?$`,
         "i"
-      ).test(normalized) || arrowTransition.test(normalized)
+      ).test(normalized) || new RegExp(delegationTable, "i").test(normalized)
     )
   }
   if (token === "request_recovery_authorization") {
     return (
-      new RegExp(`\\b(?:call|invoke)\\s+(?:the\\s+)?${escaped}\\b`, "i").test(
-        normalized
-      ) || arrowTransition.test(normalized)
+      new RegExp(
+        `^(?:then\\s+)?(?:call|invoke)\\s+${escaped}` +
+          `(?:\\s+for\\s+(?:the\\s+)?rejected action)?$`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(delegationTable, "i").test(normalized) ||
+      new RegExp(workflowTable, "i").test(normalized)
     )
   }
   if (token === "recovery_authorization_id") {
-    const exactReplay = /\b(?:exact|replay|rejected)\b/i.test(normalized)
-    const supplied = new RegExp(
-      `\\b(?:supply|pass|use)(?:es|s|ed|ing)?\\s+(?:the\\s+)?${escaped}\\b`,
+    const id = `(?:the\\s+)?${escaped}`
+    const replayKind =
+      "(?:recovery|continue|replacement|recover_workflow|continue\\s+or\\s+replacement)"
+    const replayLed = new RegExp(
+      `^(?:then\\s+)?replay\\s+the\\s+exact\\s+rejected\\s+` +
+        `${replayKind}\\s+call\\s+(?:` +
+        `(?:with|using)\\s+${id}(?:\\s+and\\s+the\\s+same\\s+key,\\s*profile,\\s*and\\s*action)?|` +
+        `and\\s+(?:supply|pass|use)\\s+${id}(?:\\s+as\\s+(?:an?\\s+)?input)?` +
+        `)$`,
       "i"
-    ).test(normalized)
-    const replayWithId = new RegExp(
-      `\\b(?:replay|call)\\b[^.!?;]{0,140}\\b(?:with|using)\\s+(?:the\\s+)?${escaped}\\b`,
+    )
+    const inputLed = new RegExp(
+      `^(?:supply|pass|use)\\s+${id}(?:\\s+as\\s+(?:an?\\s+)?input)?\\s+` +
+        `(?:on|to|for)\\s+the\\s+exact\\s+rejected\\s+` +
+        `(?:recovery|continue|replacement|recover_workflow)\\s+replay\\s+call$`,
       "i"
-    ).test(normalized)
-    return exactReplay && (supplied || replayWithId)
+    )
+    return replayLed.test(normalized) || inputLed.test(normalized)
   }
   if (token === "recover_workflow") {
     return (
       new RegExp(
-        `\\b(?:call|invoke)\\s+(?:receipt-required\\s+)?${escaped}\\b`,
+        `^(?:(?:then|after authorization,)\\s+)?` +
+          `(?:call|invoke)\\s+receipt-required\\s+${escaped}$`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(workflowTable, "i").test(normalized) ||
+      new RegExp(
+        `^(?:supply|pass|use)\\s+(?:the\\s+)?recovery_authorization_id` +
+          `(?:\\s+as\\s+(?:an?\\s+)?input)?\\s+(?:on|to|for)\\s+` +
+          `the\\s+exact\\s+rejected\\s+${escaped}\\s+replay\\s+call$`,
         "i"
       ).test(normalized) ||
       new RegExp(
-        `\\brequest_recovery_authorization\\b\\s*(?:->|→)\\s*receipt-required\\s+${escaped}\\b`,
+        `^(?:then\\s+)?replay\\s+the\\s+exact\\s+rejected\\s+${escaped}` +
+          `\\s+call\\s+(?:(?:with|using)\\s+(?:the\\s+)?` +
+          `recovery_authorization_id(?:\\s+and\\s+the\\s+same\\s+key,` +
+          `\\s*profile,\\s*and\\s*action)?|and\\s+(?:supply|pass|use)` +
+          `\\s+(?:the\\s+)?recovery_authorization_id` +
+          `(?:\\s+as\\s+(?:an?\\s+)?input)?)$`,
         "i"
       ).test(normalized)
     )
@@ -265,11 +298,16 @@ function recoveryTokenMentions(skill, token) {
   for (const clause of clauses) {
     exactToken.lastIndex = 0
     if (!exactToken.test(clause)) continue
-    const polarity = isSafeNeutralRecoveryClause(clause, token)
-      ? "neutral"
-      : hasExplicitNegativeRecoverySemantics(clause)
-        ? "negated"
-        : isExplicitPositiveRecoveryClause(clause, token)
+    const normalized = normalizedRecoveryClause(clause)
+    const negative = hasExplicitNegativeRecoverySemantics(normalized)
+    const safeNeutral = isSafeNeutralRecoveryClause(normalized, token)
+    const polarity = negative
+      ? safeNeutral
+        ? "neutral"
+        : "negated"
+      : safeNeutral
+        ? "neutral"
+        : isExplicitPositiveRecoveryClause(normalized, token)
           ? "affirmative"
           : "invalid"
     mentions.push({ polarity })
