@@ -88,3 +88,79 @@ pre-existing formatting drift; Task 12 formatted only owned Rust paths.
   full matrix from the diff package, so the controller retained the direct
   command evidence above as the authoritative verification record.
 - Whole-branch review: pending.
+
+## Whole-branch Important fix wave (2026-08-01)
+
+Implementation commit:
+
+- `143f27c610e2bff5e684c5fdab99ab57a7fbb150` `fix: close authorized recovery review findings`
+
+### RED evidence
+
+Rust commands below ran from `src-tauri/`; other commands ran from the
+repository root.
+
+- `cargo test delegation_recovery_policy --lib -- --nocapture`: RED, 15
+  selected; 13 passed and 2 intended regressions failed (completed rows with
+  non-protected errors, and missing structural resume identity).
+- `cargo test typed_transport_cleanup_projects_automatic_unexpected_continue --lib -- --nocapture`:
+  RED, 1 selected and 1 intended failure because cleanup persisted
+  `parent_disconnected` instead of typed unexpected transport loss.
+- `cargo test exact_replay_survives_ordinary_later_workflow_activity --lib -- --nocapture`:
+  RED, 1 selected and 1 intended `WorkflowRecoveryConflict` failure after
+  later ordinary workflow activity.
+- `pnpm test -- src/components/chat/ask-question-card.test.tsx`: RED, 29
+  selected; 28 passed and 1 intended recovery-card presentation failure.
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED, 256 selected; 252 passed and 4 intended post-token-negation mutations
+  failed.
+- `cargo test recovery_tool_contract --lib -- --nocapture`: RED, 6 selected;
+  2 passed and 4 intended structured-result contract regressions failed.
+
+### GREEN list gates and tests
+
+Every filtered Rust GREEN was preceded by the identical filter with
+`-- --list`, and each list was nonzero:
+
+- `cargo test delegation_recovery_policy --lib -- --list`: 15 tests listed.
+- `cargo test delegation_recovery_policy --lib -- --nocapture`: 15 passed.
+- `cargo test typed_transport_cleanup_projects_automatic_unexpected_continue --lib -- --list`:
+  1 test listed.
+- `cargo test typed_transport_cleanup_projects_automatic_unexpected_continue --lib -- --nocapture`:
+  1 passed.
+- `cargo test authorized_workflow_recovery --lib -- --list`: 10 tests listed.
+- `cargo test authorized_workflow_recovery --lib -- --nocapture`: 10 passed.
+- `cargo test recovery_tool_contract --lib -- --list`: 8 tests listed.
+- `cargo test recovery_tool_contract --lib -- --nocapture`: 8 passed.
+- `cargo test recovery_authorization --lib -- --list`: 19 tests listed.
+- `cargo test recovery_authorization --lib -- --nocapture`: 19 passed.
+- `cargo test --test delegation_recovery_migration recovery_migration_preserves_existing_workflow_and_run_bytes -- --list`:
+  1 test listed.
+- `cargo test --test delegation_recovery_migration recovery_migration_preserves_existing_workflow_and_run_bytes -- --nocapture`:
+  1 passed.
+
+Additional focused GREEN verification:
+
+- `pnpm test -- src/components/chat/ask-question-card.test.tsx`: 1 file and
+  29 tests passed.
+- `pnpm eslint src/components/chat/ask-question-card.tsx src/components/chat/ask-question-card.test.tsx src/lib/types.ts`:
+  exit 0 with no findings.
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  12 suites and 256 tests passed.
+- `cargo check`: passed.
+- `cargo check --no-default-features --features server --bin codeg-server`:
+  passed.
+- `cargo check --no-default-features --bin codeg-mcp`: passed.
+- `cargo clippy --lib --features test-utils -- -D warnings`: passed.
+- `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
+  passed.
+- `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings`:
+  passed.
+- `rustfmt --edition 2021 --check src/acp/delegation/broker.rs src/acp/delegation/companion.rs src/acp/delegation/listener.rs src/acp/delegation/recovery_policy.rs src/acp/delegation/workflow/store.rs src/acp/recovery_authorization/mod.rs src/acp/recovery_authorization/service.rs src/acp/recovery_authorization/types.rs src/acp/termination.rs src/db/entities/delegation_workflow_manifest_revision.rs src/db/migration/m20260730_000001_recovery_authorizations.rs tests/delegation_recovery_migration.rs`:
+  passed.
+- `git diff --check`: passed.
+
+The only diagnostics were the already documented development sidecar
+placeholder warning and Cargo's upstream `proc-macro-error2`
+future-incompatibility warning. The approved Designs and implementation plan
+were not modified. Controller whole-branch review remains pending.
