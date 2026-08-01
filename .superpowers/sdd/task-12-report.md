@@ -283,3 +283,64 @@ Commands ran from the repository root.
 Only the validator library, its tests, and this report changed. Rust,
 frontend, approved Designs, implementation plan, and shipped Skill prose were
 not modified. No full repository matrix was run.
+
+## Whole-branch Important fix wave, round 4 (2026-08-01)
+
+Validator implementation commit:
+
+- `c156072ca0a3a060e41007f8d3a21a86d7bd4966` `fix validator recovery polarity grammar`
+
+### Design rationale
+
+The previous classifier treated every token mention not recognized by a
+negative prefix/suffix as affirmative. The corrected classifier bounds clauses
+at prose punctuation and Markdown table rows, then assigns one of four states
+in fail-closed order: an entire-clause safe-neutral grammar, explicit negative
+semantics, a token-specific positive recovery-use grammar, or invalid. Both
+negative and invalid mentions fail stable rule `B2D-R001`, even when a separate
+positive recipe remains present.
+
+Positive recognition is limited to the shipped recovery flow: receive, emit,
+or surface the typed confirmation; call the authorization request; supply or
+pass the authorization ID on the exact rejected-call replay; and call
+receipt-required workflow recovery after authorization. Safe-neutral handling
+is anchored to whole clauses: active/passive authorization-ID privacy controls
+may target only status projections, ledgers, reports, cards, or metrics; the
+enabled-catalog hard block and challenge-generation prohibition remain narrow.
+Privacy-looking clauses that prohibit supplying an ID to replay are therefore
+negative, not neutral. The shipped Skill did not require a prose change.
+
+### RED evidence
+
+Commands ran from the repository root.
+
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED, 364 selected; 319 passed and 45 intended regressions failed. Failures
+  covered the generated `shall not`, forbidden/prohibited/avoided,
+  disallowed, and forbidden-usage constructions for all four recovery terms;
+  ambiguous mentions; mixed positive-prefix/negative-suffix clauses; and the
+  new passive/compound authorization-ID privacy allowlist cases.
+
+### GREEN evidence
+
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  12 suites and 365 tests passed, 0 failed.
+- `node --test --test-name-pattern "production recovery polarity probes" .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  1 selected test passed. Against the real Skill it executed 86 direct
+  assertions: all 3 exact reviewer prohibitions, a generated 72-case negative
+  matrix over all 4 required terms, 4 ambiguous clauses, and 4 mixed-polarity
+  clauses were rejected with `B2D-R001`; all 3 bounded active/passive privacy
+  clauses were accepted.
+- `node .agents/skills/brainstorm-to-delivery/scripts/validate-contract.mjs`:
+  the real shipped Skill passed 36 checks with 0 failures.
+- `node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs; node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  both files passed Node syntax checks.
+- `pnpm exec prettier --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  both files passed.
+- `pnpm exec eslint --no-ignore .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  passed with no findings.
+- `git diff --check`: passed.
+
+Only the validator library, its tests, and this report changed. Rust,
+frontend, approved Designs, implementation plan, stashes, and shipped Skill
+prose were not modified. No full repository matrix was run.
