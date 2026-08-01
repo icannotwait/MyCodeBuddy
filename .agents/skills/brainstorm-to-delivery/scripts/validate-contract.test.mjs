@@ -1048,7 +1048,10 @@ describe("stable validator rule ids", () => {
     [
       "B2D-010",
       (skill) =>
-        skill.replace(/Two non-improving rounds trigger stagnation handling\./, ""),
+        skill.replace(
+          /Two non-improving rounds trigger stagnation handling\./,
+          ""
+        ),
     ],
     [
       "B2D-011",

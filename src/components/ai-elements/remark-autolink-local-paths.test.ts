@@ -77,7 +77,8 @@ describe("remarkAutolinkLocalPaths", () => {
   })
 
   it("converts a path-only inlineCode node into a local file link", () => {
-    const path = "docs/superpowers/specs/2026-07-30-workflow-overlay-ui-design.md"
+    const path =
+      "docs/superpowers/specs/2026-07-30-workflow-overlay-ui-design.md"
     const tree: Node = {
       type: "root",
       children: [

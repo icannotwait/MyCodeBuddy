@@ -59,12 +59,17 @@ function canonicalNumberedRoutes(taskRouteSection) {
   const routes = []
   for (const [heading, route] of [
     ["normal", [...tables.keys()].find((key) => /^normal route\b/i.test(key))],
-    ["high", [...tables.keys()].find((key) => /^high(?:-risk)? route\b/i.test(key))],
+    [
+      "high",
+      [...tables.keys()].find((key) => /^high(?:-risk)? route\b/i.test(key)),
+    ],
   ]) {
     for (const row of tables.get(route) ?? []) {
       const role = classifyRole(roleCell(row.cells))
       if (!role) continue
-      routes.push(`${heading}|${role}|${stableAgent(parseExactAgentIdentity(agentCell(row.cells)))}`)
+      routes.push(
+        `${heading}|${role}|${stableAgent(parseExactAgentIdentity(agentCell(row.cells)))}`
+      )
     }
   }
   return routes.sort()
@@ -104,51 +109,46 @@ function sameMultiset(left, right) {
 
 function affirmativeTokenMention(skill, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const exactToken = new RegExp(
-    `(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`
-  )
-  return skill
-    .split(/(?<=[.!?;])|\r?\n/)
-    .some((clause) => {
-      const match = exactToken.exec(clause)
-      if (!match) return false
-      const before = clause.slice(0, match.index + match[1].length).toLowerCase()
-      return !/(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?)\s+(?:\w+\s+){0,12}$/.test(
-        before
-      )
-    })
+  const exactToken = new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`)
+  return skill.split(/(?<=[.!?;])|\r?\n/).some((clause) => {
+    const match = exactToken.exec(clause)
+    if (!match) return false
+    const before = clause.slice(0, match.index + match[1].length).toLowerCase()
+    return !/(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?)\s+(?:\w+\s+){0,12}$/.test(
+      before
+    )
+  })
 }
 
 function hasNegatedTokenMention(skill, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const exactToken = new RegExp(
-    `(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`
-  )
-  return skill
-    .split(/(?<=[.!?;])|\r?\n/)
-    .some((clause) => {
-      const match = exactToken.exec(clause)
-      if (!match) return false
-      const before = clause
-        .slice(Math.max(0, match.index + match[1].length - 180), match.index + match[1].length)
-        .toLowerCase()
-      if (
-        token === "recovery_authorization_id" &&
-        /\b(?:persist|status|ledger|report|card)\b[^.!?;\r\n]{0,80}$/.test(before)
-      ) {
-        return false
-      }
-      if (
-        token === "recover_workflow" &&
-        /\bmissing\s*$/.test(before) &&
-        /\bhard[- ]blocks?\b/i.test(clause.slice(match.index + match[0].length))
-      ) {
-        return false
-      }
-      return /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\b/.test(
-        before
+  const exactToken = new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`)
+  return skill.split(/(?<=[.!?;])|\r?\n/).some((clause) => {
+    const match = exactToken.exec(clause)
+    if (!match) return false
+    const before = clause
+      .slice(
+        Math.max(0, match.index + match[1].length - 180),
+        match.index + match[1].length
       )
-    })
+      .toLowerCase()
+    if (
+      token === "recovery_authorization_id" &&
+      /\b(?:persist|status|ledger|report|card)\b[^.!?;\r\n]{0,80}$/.test(before)
+    ) {
+      return false
+    }
+    if (
+      token === "recover_workflow" &&
+      /\bmissing\s*$/.test(before) &&
+      /\bhard[- ]blocks?\b/i.test(clause.slice(match.index + match[0].length))
+    ) {
+      return false
+    }
+    return /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\b/.test(
+      before
+    )
+  })
 }
 
 function hasUnsafeCancellationMapping(skill) {
@@ -161,9 +161,7 @@ function hasUnsafeCancellationMapping(skill) {
   ]
   return skill.split(/[.,;\r\n]+/).some((clause) => {
     const lower = clause.toLowerCase()
-    const matches = [
-      ...lower.matchAll(new RegExp(causes.join("|"), "g")),
-    ]
+    const matches = [...lower.matchAll(new RegExp(causes.join("|"), "g"))]
     return matches.some((match, index) => {
       const cause = match[0]
       const causeIndex = match.index
@@ -953,7 +951,10 @@ export function findParentPermissionViolations(skill) {
       /父会话[^。；;]*?(起草|拟写|编写|撰写|创作|生成|改写|重写|编辑|修改)[^。；;]*?(Plan|Task\s*code|代码)/i
     )
     const chinesePrefix = chineseAction
-      ? line.slice(line.indexOf("父会话"), chineseAction.index + chineseAction[0].indexOf(chineseAction[1]))
+      ? line.slice(
+          line.indexOf("父会话"),
+          chineseAction.index + chineseAction[0].indexOf(chineseAction[1])
+        )
       : ""
     if (
       chineseAction &&
@@ -1224,8 +1225,15 @@ export function validateSkillMarkdown(skill) {
       "user_decision_required must appear in both recovery and pause contracts"
     )
   }
-  if (/pause[^.\n]{0,80}(?:user approval|approval)[^.\n]{0,80}(?:phase|next)/i.test(quickReference)) {
-    fail("B2D-012", "adds a user-approval pause outside the exact hard conditions")
+  if (
+    /pause[^.\n]{0,80}(?:user approval|approval)[^.\n]{0,80}(?:phase|next)/i.test(
+      quickReference
+    )
+  ) {
+    fail(
+      "B2D-012",
+      "adds a user-approval pause outside the exact hard conditions"
+    )
   }
 
   for (const token of RECOVERY_CONTRACT_TERMS) {
@@ -1240,26 +1248,42 @@ export function validateSkillMarkdown(skill) {
   const delegationSequenceValid =
     /projected call[\s\S]{0,160}recovery_confirmation_required[\s\S]{0,160}request_recovery_authorization[\s\S]{0,220}replay the exact rejected (?:continue or\s*)?replacement call|projected call[\s\S]{0,160}recovery_confirmation_required[\s\S]{0,160}request_recovery_authorization[\s\S]{0,220}replay the exact rejected continue or\s*replacement call/i.test(
       skill
-    ) &&
-    /same key, profile, and\s*action/i.test(skill)
+    ) && /same key, profile, and\s*action/i.test(skill)
   const unsafeDelegationSequence =
-    /request_recovery_authorization before recovery_confirmation_required/i.test(skill) ||
-    /similar replacement call instead of replaying the exact rejected call/i.test(skill) ||
+    /request_recovery_authorization before recovery_confirmation_required/i.test(
+      skill
+    ) ||
+    /similar replacement call instead of replaying the exact rejected call/i.test(
+      skill
+    ) ||
     /change the key and profile before replaying the action/i.test(skill)
   if (!delegationSequenceValid || unsafeDelegationSequence) {
-    fail("B2D-R002", "delegation challenge, authorization, and exact replay order is invalid")
+    fail(
+      "B2D-R002",
+      "delegation challenge, authorization, and exact replay order is invalid"
+    )
   }
 
   if (hasUnsafeCancellationMapping(skill)) {
-    fail("B2D-R003", "cancellation or stall evidence maps affirmatively to replacement/unresumable")
+    fail(
+      "B2D-R003",
+      "cancellation or stall evidence maps affirmatively to replacement/unresumable"
+    )
   }
 
   if (
-    !/tool_stalled_timeout[\s\S]{0,100}confirmed same-key continue/i.test(skill) ||
-    /tool_stalled_timeout continues (?:without confirmation|automatically)/i.test(skill) ||
+    !/tool_stalled_timeout[\s\S]{0,100}confirmed same-key continue/i.test(
+      skill
+    ) ||
+    /tool_stalled_timeout continues (?:without confirmation|automatically)/i.test(
+      skill
+    ) ||
     /tool_stalled_timeout uses replacement before continue/i.test(skill)
   ) {
-    fail("B2D-R004", "tool_stalled_timeout must be confirmed, resume-first, and same-key")
+    fail(
+      "B2D-R004",
+      "tool_stalled_timeout must be confirmed, resume-first, and same-key"
+    )
   }
 
   const workflowSequenceValid =
@@ -1274,7 +1298,10 @@ export function validateSkillMarkdown(skill) {
     /skip get_workflow_state/i.test(skill) ||
     /missing recover_workflow may proceed/i.test(skill)
   ) {
-    fail("B2D-R005", "workflow status, authorization, recovery, or catalog contract is invalid")
+    fail(
+      "B2D-R005",
+      "workflow status, authorization, recovery, or catalog contract is invalid"
+    )
   }
 
   if (
@@ -1284,20 +1311,32 @@ export function validateSkillMarkdown(skill) {
     !/receipt is the durable[\s\S]{0,100}reason[\s\S]{0,100}new authorized stagnation baseline/i.test(
       skill
     ) ||
-    /user_decision_required may reset[\s\S]{0,180}without reset_plan_lineage/i.test(skill)
+    /user_decision_required may reset[\s\S]{0,180}without reset_plan_lineage/i.test(
+      skill
+    )
   ) {
-    fail("B2D-R006", "user_decision_required lineage reset lacks exact receipt/reason/baseline")
+    fail(
+      "B2D-R006",
+      "user_decision_required lineage reset lacks exact receipt/reason/baseline"
+    )
   }
 
   if (
     !/First admission freezes the key, role, agent, profile[\s\S]{0,120}inherited continue[\s\S]{0,80}replacement counters/i.test(
       skill
     ) ||
-    !/Recovery never changes key\/profile or resets inherited\s*consumption/i.test(skill) ||
+    !/Recovery never changes key\/profile or resets inherited\s*consumption/i.test(
+      skill
+    ) ||
     /Recovery may change the admitted key or profile/i.test(skill) ||
-    /Recovery resets inherited continue and replacement consumption/i.test(skill)
+    /Recovery resets inherited continue and replacement consumption/i.test(
+      skill
+    )
   ) {
-    fail("B2D-R007", "admitted identity/profile or inherited counters are mutable")
+    fail(
+      "B2D-R007",
+      "admitted identity/profile or inherited counters are mutable"
+    )
   }
 
   if (
@@ -1310,7 +1349,10 @@ export function validateSkillMarkdown(skill) {
     /Prose approval settles the recovery card/i.test(skill) ||
     /degraded child may finish without same-child card re-emission/i.test(skill)
   ) {
-    fail("B2D-R008", "harvest, prose, or degraded-child card contract is invalid")
+    fail(
+      "B2D-R008",
+      "harvest, prose, or degraded-child card contract is invalid"
+    )
   }
 
   const designTriggers = [
@@ -1322,12 +1364,17 @@ export function validateSkillMarkdown(skill) {
     "ambiguity",
   ]
   if (
-    !/Normal Task review independently recomputes b2d_task_risk_v1/i.test(skill) ||
+    !/Normal Task review independently recomputes b2d_task_risk_v1/i.test(
+      skill
+    ) ||
     designTriggers.some((trigger) => !skill.toLowerCase().includes(trigger)) ||
     /Normal Task review copies b2d_task_risk_v1/i.test(skill) ||
     designTriggers.some((trigger) => hasNegatedDesignTrigger(skill, trigger))
   ) {
-    fail("B2D-R009", "Task risk recomputation or deterministic Design trigger is invalid")
+    fail(
+      "B2D-R009",
+      "Task risk recomputation or deterministic Design trigger is invalid"
+    )
   }
 
   if (
@@ -1336,7 +1383,9 @@ export function validateSkillMarkdown(skill) {
     ) ||
     !/after replacement consumption, block/i.test(skill) ||
     /continue exhaustion, mint a new key and profile/i.test(skill) ||
-    /continue exhaustion, replace with replacement_reason=unresumable/i.test(skill) ||
+    /continue exhaustion, replace with replacement_reason=unresumable/i.test(
+      skill
+    ) ||
     /After replacement consumption, replace again/i.test(skill)
   ) {
     fail("B2D-R010", "continue/replacement exhaustion contract is invalid")
@@ -1352,7 +1401,10 @@ export function validateSkillMarkdown(skill) {
     /Ledger intent may omit intended action and identity/i.test(skill) ||
     /Skip platform-state reconciliation after recovery/i.test(skill)
   ) {
-    fail("B2D-R011", "ledger intent or post-recovery reconciliation contract is invalid")
+    fail(
+      "B2D-R011",
+      "ledger intent or post-recovery reconciliation contract is invalid"
+    )
   }
 
   return { failures, notes }
