@@ -77,6 +77,7 @@ describe("delegation route API parameter order + wire payloads", () => {
       expectedOwnerWindow: "conversation-7",
       expectedOperationId: "opA",
       expectedOwnershipGeneration: 3,
+      origin: "legacy_unspecified",
     })
   })
 
@@ -88,6 +89,7 @@ describe("delegation route API parameter order + wire payloads", () => {
       expectedOwnerWindow: null,
       expectedOperationId: null,
       expectedOwnershipGeneration: null,
+      origin: "legacy_unspecified",
     })
   })
 

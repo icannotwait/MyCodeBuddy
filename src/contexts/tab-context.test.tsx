@@ -515,7 +515,10 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent(replacementTabId)
 
     await waitFor(() => {
-      expect(disconnectMock).toHaveBeenCalledWith(replacementTabId)
+      expect(disconnectMock).toHaveBeenCalledWith(
+        replacementTabId,
+        "draft_retarget"
+      )
       expect(screen.getByTestId("active-folder")).toHaveTextContent("2")
     })
   })
