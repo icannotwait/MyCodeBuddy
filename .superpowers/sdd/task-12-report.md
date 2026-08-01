@@ -239,3 +239,47 @@ The only diagnostics were the already documented development sidecar
 placeholder warning and Cargo's upstream `proc-macro-error2`
 future-incompatibility warning. The approved Designs and implementation plan
 were not modified. Controller whole-branch review remains pending.
+
+## Whole-branch Important fix wave, round 3 (2026-08-01)
+
+Validator implementation commit:
+
+- `3d369b7b6d5814b2644b05f2345023e2ec55a311` `fix validator suffix polarity`
+
+### RED evidence
+
+Commands ran from the repository root.
+
+- Direct production-validator probe against the real `SKILL.md`: all 3
+  reviewer examples were incorrectly accepted (0/3 rejected with
+  `B2D-R001`): `recover_workflow is forbidden`,
+  `request_recovery_authorization is prohibited`, and
+  `recovery_authorization_id must under no circumstances be supplied`.
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED, 310 selected; 298 passed and 12 intended failures. Exactly the
+  `forbidden`, `prohibited`, and `under no circumstances` suffix families
+  failed for each of the 4 required recovery tokens.
+
+### GREEN evidence
+
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  12 suites and 310 tests passed, 0 failed.
+- `node .agents/skills/brainstorm-to-delivery/scripts/validate-contract.mjs`:
+  the real shipped Skill passed 36 checks with 0 failures; Skill prose was not
+  changed.
+- Direct production-validator probe against the real `SKILL.md`: the 3 exact
+  reviewer examples plus 4 representative variants spanning all required
+  tokens were rejected with `B2D-R001` (7/7).
+- `node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs`:
+  passed.
+- `node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  passed.
+- `pnpm exec prettier --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  both files passed.
+- `pnpm exec eslint --no-ignore .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  passed with no findings.
+- `git diff --check`: passed.
+
+Only the validator library, its tests, and this report changed. Rust,
+frontend, approved Designs, implementation plan, and shipped Skill prose were
+not modified. No full repository matrix was run.
