@@ -19,6 +19,7 @@ use super::types::{
     ContinuationFailureCode, ContinuationState, ContinuationTaskIds, ContinuationWaitingProjection,
     ContinuationWakeReason, CONTINUATION_CHECKPOINT_MS,
 };
+use super::ForegroundMcpReleaseWaiter;
 use crate::acp::connection::SuspensionAck;
 use crate::acp::delegation::broker::{DelegationBroker, JoinEvaluation};
 use crate::acp::delegation::metrics::DelegationMetrics;
@@ -334,6 +335,7 @@ pub(crate) struct JoinArmRequest {
     pub transferred_wait_rx: Option<
         tokio::sync::oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
     >,
+    pub foreground_release: ForegroundMcpReleaseWaiter,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -357,6 +359,8 @@ pub(crate) enum ContinuationError {
     SuspendRejected(String),
     #[error("continuation prompt delivery failed: {0}")]
     PromptDelivery(#[source] AcpError),
+    #[error("parent session is still clearing the foreground MCP call")]
+    PromptBusy,
     #[error("continuation state changed before this operation committed")]
     StateConflict,
     #[error("status waiter closed before continuation persistence")]
@@ -770,6 +774,7 @@ impl DelegationContinuationCoordinator {
             record,
             completion_tx,
             request.transferred_wait_rx,
+            request.foreground_release,
         ));
 
         Ok(JoinArmOutcome::Arming {
@@ -1017,13 +1022,21 @@ async fn run_worker(
     transferred_wait_rx: Option<
         oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
     >,
+    foreground_release: ForegroundMcpReleaseWaiter,
 ) {
     let _guard = WorkerRegistryGuard {
         workers: context.workers.clone(),
         key: (record.continuation_id.clone(), record.generation),
         instance_id: context.instance_id,
     };
-    run_worker_owned(&context, record, completion, transferred_wait_rx).await;
+    run_worker_owned(
+        &context,
+        record,
+        completion,
+        transferred_wait_rx,
+        foreground_release,
+    )
+    .await;
 }
 
 #[allow(dead_code, reason = "Task 7 activates coordinator workers")]
@@ -1034,6 +1047,7 @@ async fn run_worker_owned(
     transferred_wait_rx: Option<
         oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
     >,
+    foreground_release: ForegroundMcpReleaseWaiter,
 ) {
     if context.cancel.is_cancelled() || completion.is_closed() {
         fail_cancelled_before_suspension(context, &record, completion).await;
@@ -1492,11 +1506,15 @@ async fn run_worker_owned(
     if context.cancel.is_cancelled() {
         return;
     }
-    resume_and_finish(context, record).await;
+    resume_and_finish(context, record, foreground_release).await;
 }
 
 #[allow(dead_code, reason = "Task 7 activates coordinator prompt resumption")]
-async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationRecord) {
+async fn resume_and_finish(
+    context: &WorkerContext,
+    mut record: ContinuationRecord,
+    foreground_release: ForegroundMcpReleaseWaiter,
+) {
     if context.cancel.is_cancelled() {
         return;
     }
@@ -1511,6 +1529,20 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             return;
         }
     }
+    if context.cancel.is_cancelled() {
+        return;
+    }
+    let release_outcome = tokio::select! {
+        biased;
+        _ = context.cancel.cancelled() => return,
+        outcome = foreground_release.wait() => outcome,
+    };
+    tracing::debug!(
+        continuation_id = %record.continuation_id,
+        generation = record.generation,
+        ?release_outcome,
+        "foreground MCP release fence opened"
+    );
     if context.cancel.is_cancelled() {
         return;
     }
@@ -1671,7 +1703,11 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
                 }
                 return;
             }
-            Err(ContinuationError::PromptDelivery(_)) if attempt < retry_delays_ms.len() => {}
+            Err(ContinuationError::PromptBusy) if attempt < retry_delays_ms.len() => {}
+            Err(ContinuationError::PromptBusy) => {
+                terminal_failure = Some((ContinuationFailureCode::PromptDeliveryFailed, current));
+                break;
+            }
             Err(ContinuationError::PromptDelivery(_)) => {
                 terminal_failure = Some((ContinuationFailureCode::PromptDeliveryFailed, current));
                 break;
@@ -1706,6 +1742,9 @@ mod cleanup_tests {
     use crate::acp::connection::SuspensionAck;
     use crate::acp::delegation::broker::ConversationDepthLookup;
     use crate::acp::delegation::continuation::store::InMemoryContinuationStore;
+    use crate::acp::delegation::continuation::{
+        foreground_mcp_release_fence, ForegroundMcpReleaseOwner, ForegroundMcpReleaseWaiter,
+    };
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
     use crate::models::AgentType;
@@ -2788,7 +2827,7 @@ mod cleanup_tests {
         ) -> Result<PromptAdmissionResult, ContinuationError> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt == 1 {
-                return Err(ContinuationError::PromptDelivery(AcpError::ProcessExited));
+                return Err(ContinuationError::PromptBusy);
             }
             if let Some(tx) = self
                 .retry_entered
@@ -2888,6 +2927,278 @@ mod cleanup_tests {
             .await;
     }
 
+    struct ScriptedAdmissionPort {
+        clock: Arc<SystemContinuationClock>,
+        script: std::sync::Mutex<
+            std::collections::VecDeque<Result<PromptAdmissionResult, ContinuationError>>,
+        >,
+        attempts: std::sync::Mutex<Vec<(DateTime<Utc>, String)>>,
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for ScriptedAdmissionPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: true,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((
+                    self.clock.now_utc(),
+                    request.origin.internal_prompt_id().to_string(),
+                ));
+            self.script
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .expect("one scripted result per admission attempt")
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    fn already_released_foreground_waiter() -> ForegroundMcpReleaseWaiter {
+        let (owner, waiter) = foreground_mcp_release_fence();
+        owner.frame_flushed();
+        waiter
+    }
+
+    struct ScriptedRetryCase {
+        store: Arc<InMemoryContinuationStore>,
+        port: Arc<ScriptedAdmissionPort>,
+        _coordinator: Arc<DelegationContinuationCoordinator>,
+        release_owner: Option<ForegroundMcpReleaseOwner>,
+        continuation_id: String,
+    }
+
+    impl ScriptedRetryCase {
+        async fn new(script: Vec<Result<PromptAdmissionResult, ContinuationError>>) -> Self {
+            let broker = Arc::new(DelegationBroker::new(
+                Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+            ));
+            broker.seed_live_task_for_test("parent", "retry-task").await;
+            let store = Arc::new(InMemoryContinuationStore::default());
+            let clock = Arc::new(SystemContinuationClock::new());
+            let port = Arc::new(ScriptedAdmissionPort {
+                clock: clock.clone(),
+                script: std::sync::Mutex::new(script.into()),
+                attempts: std::sync::Mutex::new(Vec::new()),
+            });
+            let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+                store.clone() as Arc<dyn ContinuationStore>,
+                broker.clone(),
+                Arc::new(DelegationMetrics::default()),
+                port.clone() as Arc<dyn ParentContinuationPort>,
+                clock,
+            ));
+            let (release_owner, foreground_release) = foreground_mcp_release_fence();
+            let outcome = coordinator
+                .begin_arm_from_join(JoinArmRequest {
+                    parent_connection_id: "parent".into(),
+                    parent_conversation_id: 1,
+                    task_ids: vec!["retry-task".into()],
+                    waiter_closed: CancellationToken::new(),
+                    transferred_wait_rx: None,
+                    foreground_release,
+                })
+                .await
+                .unwrap();
+            let JoinArmOutcome::Arming {
+                continuation_id,
+                completion,
+            } = outcome
+            else {
+                panic!("running task must arm")
+            };
+            completion.await.unwrap().unwrap();
+            complete_cleanup_task(&broker, "retry-task").await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while store.load(&continuation_id).await.unwrap().unwrap().state
+                    != ContinuationState::WakePending
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("wake is claimed while foreground fence is closed");
+            assert!(port.attempts.lock().unwrap().is_empty());
+            Self {
+                store,
+                port,
+                _coordinator: coordinator,
+                release_owner: Some(release_owner),
+                continuation_id,
+            }
+        }
+
+        fn open_frame_fence(&mut self) {
+            self.release_owner.take().unwrap().frame_flushed();
+        }
+
+        async fn await_attempts(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while self.port.attempts.lock().unwrap().len() != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        fn attempt_snapshot(&self) -> Vec<(DateTime<Utc>, String)> {
+            self.port.attempts.lock().unwrap().clone()
+        }
+
+        async fn terminal_row(&self) -> ContinuationRecord {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let row = self
+                        .store
+                        .load(&self.continuation_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if matches!(
+                        row.state,
+                        ContinuationState::Completed | ContinuationState::Failed
+                    ) {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_release_retries_only_prompt_busy_at_exact_delays() {
+        let mut case = ScriptedRetryCase::new(vec![
+            Err(ContinuationError::PromptBusy),
+            Err(ContinuationError::PromptBusy),
+            Err(ContinuationError::PromptBusy),
+            Ok(PromptAdmissionResult::Admitted),
+        ])
+        .await;
+        case.open_frame_fence();
+        case.await_attempts(1).await;
+        tokio::time::advance(std::time::Duration::from_millis(99)).await;
+        assert_eq!(case.attempt_snapshot().len(), 1);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        case.await_attempts(2).await;
+        tokio::time::advance(std::time::Duration::from_millis(499)).await;
+        assert_eq!(case.attempt_snapshot().len(), 2);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        case.await_attempts(3).await;
+        tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
+        assert_eq!(case.attempt_snapshot().len(), 3);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        case.await_attempts(4).await;
+
+        let attempts = case.attempt_snapshot();
+        let first = attempts[0].0;
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(at, _)| at.signed_duration_since(first).num_milliseconds())
+                .collect::<Vec<_>>(),
+            vec![0, 100, 600, 2_600]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(
+            case.terminal_row().await.state,
+            ContinuationState::Completed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_release_busy_exhaustion_fails_after_four_attempts() {
+        let mut case = ScriptedRetryCase::new(vec![
+            Err(ContinuationError::PromptBusy),
+            Err(ContinuationError::PromptBusy),
+            Err(ContinuationError::PromptBusy),
+            Err(ContinuationError::PromptBusy),
+        ])
+        .await;
+        case.open_frame_fence();
+        case.await_attempts(1).await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        case.await_attempts(2).await;
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        case.await_attempts(3).await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        case.await_attempts(4).await;
+        let row = case.terminal_row().await;
+        assert_eq!(row.state, ContinuationState::Failed);
+        assert_eq!(
+            row.failure_code,
+            Some(ContinuationFailureCode::PromptDeliveryFailed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_release_does_not_retry_non_busy_prompt_delivery() {
+        let mut case = ScriptedRetryCase::new(vec![Err(ContinuationError::PromptDelivery(
+            AcpError::ProcessExited,
+        ))])
+        .await;
+        case.open_frame_fence();
+        case.await_attempts(1).await;
+        tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+        assert_eq!(case.attempt_snapshot().len(), 1);
+        assert_eq!(
+            case.terminal_row().await.failure_code,
+            Some(ContinuationFailureCode::PromptDeliveryFailed)
+        );
+    }
+
     #[tokio::test]
     async fn continuation_cleanup_stop_after_admission_before_completed_preserves_completed() {
         let inner = Arc::new(InMemoryContinuationStore::default());
@@ -2919,6 +3230,7 @@ mod cleanup_tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();
@@ -3038,6 +3350,7 @@ mod cleanup_tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();
@@ -3113,6 +3426,7 @@ mod cleanup_tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();
@@ -3216,6 +3530,7 @@ mod cleanup_tests {
                         task_ids: vec!["task-1".into()],
                         waiter_closed: CancellationToken::new(),
                         transferred_wait_rx: None,
+                        foreground_release: already_released_foreground_waiter(),
                     })
                     .await
             }
@@ -3310,6 +3625,7 @@ mod cleanup_tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();
@@ -3383,6 +3699,7 @@ mod cleanup_tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();
@@ -3396,7 +3713,7 @@ mod cleanup_tests {
         completion.await.unwrap().unwrap();
         complete_cleanup_task(&broker, "task-1").await;
 
-        // Attempt zero fails PromptDelivery; InstantRetryClock completes the
+        // Attempt zero fails PromptBusy; InstantRetryClock completes the
         // backoff sleep immediately; attempt one enters the retry admit gate.
         retry_entered_rx
             .await

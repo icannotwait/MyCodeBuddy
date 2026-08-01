@@ -20,7 +20,8 @@ use super::types::{
     ContinuationWakeReason, CONTINUATION_CHECKPOINT_MS,
 };
 use super::{
-    build_continuation_prompt_text, filter_internal_continuation_turns, internal_prompt_marker,
+    build_continuation_prompt_text, filter_internal_continuation_turns,
+    foreground_mcp_release_fence, internal_prompt_marker, ForegroundMcpReleaseWaiter,
 };
 use crate::acp::connection::{ConnectionControl, SuspensionAck};
 use crate::acp::delegation::attention::{
@@ -53,6 +54,19 @@ fn test_broker() -> DelegationBroker {
         Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
         Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>,
     )
+}
+
+fn test_broker_with_spawner(spawner: Arc<MockSpawner>) -> DelegationBroker {
+    DelegationBroker::new(
+        spawner as Arc<dyn ConnectionSpawner>,
+        Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>,
+    )
+}
+
+fn already_released_foreground_waiter() -> ForegroundMcpReleaseWaiter {
+    let (owner, waiter) = foreground_mcp_release_fence();
+    owner.frame_flushed();
+    waiter
 }
 
 async fn complete_seeded_task(broker: &DelegationBroker, task_id: &str) {
@@ -92,6 +106,7 @@ async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
             task_ids: vec!["task-terminal".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -139,6 +154,7 @@ async fn continuation_broker_immediate_attention_snapshot_is_ready() {
             task_ids: vec!["task-attention".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -171,6 +187,7 @@ async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
             task_ids: vec!["missing-task".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -843,7 +860,7 @@ impl ParentContinuationPort for RetryPort {
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.attempt_tx.send(request.admitted_at);
         if attempt < self.succeed_on {
-            Err(ContinuationError::PromptDelivery(AcpError::ProcessExited))
+            Err(ContinuationError::PromptBusy)
         } else {
             Ok(PromptAdmissionResult::Admitted)
         }
@@ -927,7 +944,7 @@ impl ParentContinuationPort for FinalFailureGatePort {
                 let _ = release.await;
             }
         }
-        Err(ContinuationError::PromptDelivery(AcpError::ProcessExited))
+        Err(ContinuationError::PromptBusy)
     }
 
     async fn publish_waiting(
@@ -1255,6 +1272,7 @@ async fn continuation_coordinator_waiter_close_before_insert_creates_no_row() {
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
                     transferred_wait_rx: None,
+                    foreground_release: already_released_foreground_waiter(),
                 })
                 .await
         }
@@ -1311,6 +1329,7 @@ async fn continuation_coordinator_waiter_close_after_insert_entry_keeps_owned_wo
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
                     transferred_wait_rx: None,
+                    foreground_release: already_released_foreground_waiter(),
                 })
                 .await
         }
@@ -1369,6 +1388,7 @@ async fn continuation_coordinator_post_registration_completion_claims_before_sus
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1397,7 +1417,7 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
         .seed_live_task_for_test("parent", "task-running")
         .await;
     let (store, mut wake_pending) = ObservedStore::new();
-    let (port, suspend_started, suspend_release, admission_started) = GatedPort::new();
+    let (port, suspend_started, suspend_release, mut admission_started) = GatedPort::new();
     let coordinator = DelegationContinuationCoordinator::new(
         store.clone() as Arc<dyn ContinuationStore>,
         broker,
@@ -1406,6 +1426,7 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
         Arc::new(SystemContinuationClock::new()),
     );
 
+    let (release_owner, foreground_release) = foreground_mcp_release_fence();
     let outcome = coordinator
         .begin_arm_from_join(JoinArmRequest {
             parent_connection_id: "parent".into(),
@@ -1413,10 +1434,15 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release,
         })
         .await
         .unwrap();
-    let super::coordinator::JoinArmOutcome::Arming { mut completion, .. } = outcome else {
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        mut completion,
+    } = outcome
+    else {
         panic!("running Join must arm a continuation")
     };
     tokio::select! {
@@ -1426,6 +1452,20 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
     suspend_release.send(()).unwrap();
     completion.await.unwrap().unwrap();
 
+    let waiting = store
+        .load(&continuation_id)
+        .await
+        .unwrap()
+        .expect("persisted Waiting row");
+    assert_eq!(waiting.state, ContinuationState::Waiting);
+    assert_eq!(
+        waiting
+            .wake_at
+            .signed_duration_since(waiting.armed_at)
+            .num_milliseconds(),
+        CONTINUATION_CHECKPOINT_MS as i64
+    );
+
     tokio::time::advance(std::time::Duration::from_millis(
         CONTINUATION_CHECKPOINT_MS - 1,
     ))
@@ -1434,23 +1474,35 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
         wake_pending.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
+    assert!(matches!(
+        admission_started.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    let claimed = wake_pending.await.expect("checkpoint wake CAS won");
+    let claimed = wake_pending.await.expect("one checkpoint wake CAS winner");
     assert_eq!(
         claimed.wake_reason,
         Some(ContinuationWakeReason::Checkpoint)
     );
+    assert_eq!(store.wake_claim_wins.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        admission_started.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    release_owner.frame_flushed();
+    let request = admission_started
+        .await
+        .expect("checkpoint admission after fence");
+    assert_eq!(request.continuation_generation, waiting.generation);
     assert_eq!(
-        claimed
-            .wake_claimed_at
-            .expect("claim timestamp")
-            .signed_duration_since(claimed.armed_at)
-            .num_milliseconds(),
-        CONTINUATION_CHECKPOINT_MS as i64
+        request.origin.wake_reason(),
+        ContinuationWakeReason::Checkpoint
     );
-    let request = admission_started.await.expect("checkpoint prompt admitted");
-    assert_eq!(request.origin.continuation_id(), claimed.continuation_id);
+    let persisted = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(persisted.armed_at, waiting.armed_at);
+    assert_eq!(persisted.wake_at, waiting.wake_at);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1479,6 +1531,7 @@ async fn continuation_coordinator_event_deadline_race_claims_once_and_clears_reg
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1527,6 +1580,7 @@ async fn assert_post_ack_transition_failure_is_terminalized(target: Continuation
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1599,6 +1653,7 @@ async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() 
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1729,6 +1784,7 @@ async fn continuation_coordinator_closed_before_ack_after_suspend_requested_pres
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1842,6 +1898,7 @@ async fn continuation_coordinator_ack_ready_beats_completion_closed() {
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1951,6 +2008,7 @@ async fn continuation_coordinator_post_admission_reload_failure_retains_owner_un
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -1997,6 +2055,7 @@ async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless()
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2050,6 +2109,7 @@ async fn continuation_coordinator_post_ack_parent_identity_drift_is_not_ownerles
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2094,6 +2154,7 @@ async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCau
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2213,6 +2274,7 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2270,6 +2332,7 @@ async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuati
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: Some(transfer_rx),
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2324,6 +2387,7 @@ async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuati
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .expect("rear after transfer failure must not be blocked by orphan Arming");
@@ -2365,6 +2429,7 @@ async fn cancel_during_transfer_oneshot_await_terminalizes_arming_continuation()
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: Some(transfer_rx),
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2450,6 +2515,7 @@ async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bo
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2512,6 +2578,7 @@ async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2580,6 +2647,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2621,6 +2689,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -2678,6 +2747,7 @@ async fn continuation_coordinator_prompt_delivery_retries_exact_schedule() {
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -3088,6 +3158,7 @@ async fn continuation_coordinator_stop_cancels_worker_during_retry() {
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -3148,6 +3219,7 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -3212,6 +3284,7 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -3319,6 +3392,7 @@ async fn continuation_coordinator_state_conflict_drains_children_with_distinct_f
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -3834,6 +3908,7 @@ impl ParentContinuationPort for E2eRecordingPort {
 
 struct E2eMatrix {
     broker: Arc<DelegationBroker>,
+    spawner: Arc<MockSpawner>,
     store: Arc<InMemoryContinuationStore>,
     port: Arc<E2eRecordingPort>,
     coordinator: Arc<DelegationContinuationCoordinator>,
@@ -3842,7 +3917,8 @@ struct E2eMatrix {
 
 impl E2eMatrix {
     fn new() -> Self {
-        let broker = Arc::new(test_broker());
+        let spawner = Arc::new(MockSpawner::new());
+        let broker = Arc::new(test_broker_with_spawner(spawner.clone()));
         let store = Arc::new(InMemoryContinuationStore::default());
         let port = E2eRecordingPort::new();
         let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
@@ -3855,6 +3931,7 @@ impl E2eMatrix {
         ));
         Self {
             broker,
+            spawner,
             store,
             port,
             coordinator,
@@ -3863,7 +3940,9 @@ impl E2eMatrix {
     }
 
     fn with_attention(attention: Arc<dyn DelegationAttentionStore>) -> Self {
-        let broker = Arc::new(test_broker().with_attention_store(attention));
+        let spawner = Arc::new(MockSpawner::new());
+        let broker =
+            Arc::new(test_broker_with_spawner(spawner.clone()).with_attention_store(attention));
         let store = Arc::new(InMemoryContinuationStore::default());
         let port = E2eRecordingPort::new();
         let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
@@ -3876,6 +3955,7 @@ impl E2eMatrix {
         ));
         Self {
             broker,
+            spawner,
             store,
             port,
             coordinator,
@@ -3890,6 +3970,7 @@ impl E2eMatrix {
     async fn arm_running(
         &self,
         task_id: &str,
+        foreground_release: ForegroundMcpReleaseWaiter,
     ) -> (
         String,
         tokio::sync::oneshot::Receiver<Result<SuspensionAck, ContinuationError>>,
@@ -3902,6 +3983,7 @@ impl E2eMatrix {
                 task_ids: vec![task_id.into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release,
             })
             .await
             .expect("arm must succeed");
@@ -3973,7 +4055,9 @@ async fn delegation_continuation_e2e_capability_on_running_join_inserts_and_susp
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-arm").await;
     let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
-    let (continuation_id, mut completion) = fx.arm_running("e2e-arm").await;
+    let (continuation_id, mut completion) = fx
+        .arm_running("e2e-arm", already_released_foreground_waiter())
+        .await;
 
     let suspend = tokio::select! {
         request = suspend_entered => request.expect("SuspendForDelegation dispatched"),
@@ -4031,6 +4115,7 @@ async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
                     task_ids: vec!["e2e-peer-close".into()],
                     waiter_closed,
                     transferred_wait_rx: None,
+                    foreground_release: already_released_foreground_waiter(),
                 })
                 .await
         }
@@ -4081,7 +4166,9 @@ async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
 async fn delegation_continuation_e2e_no_prompt_while_children_merely_running() {
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-no-periodic").await;
-    let (continuation_id, completion) = fx.arm_running("e2e-no-periodic").await;
+    let (continuation_id, completion) = fx
+        .arm_running("e2e-no-periodic", already_released_foreground_waiter())
+        .await;
     completion.await.unwrap().unwrap();
     fx.await_waiting(&continuation_id).await;
 
@@ -4122,7 +4209,9 @@ async fn delegation_continuation_e2e_no_prompt_while_children_merely_running() {
 async fn delegation_continuation_e2e_wake_all_terminal_admits_once() {
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-terminal").await;
-    let (continuation_id, completion) = fx.arm_running("e2e-terminal").await;
+    let (continuation_id, completion) = fx
+        .arm_running("e2e-terminal", already_released_foreground_waiter())
+        .await;
     completion.await.unwrap().unwrap();
     fx.await_waiting(&continuation_id).await;
     assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
@@ -4142,7 +4231,9 @@ async fn delegation_continuation_e2e_wake_attention_admits_once() {
     let attention = Arc::new(MemoryDelegationAttentionStore::new());
     let fx = E2eMatrix::with_attention(attention.clone() as Arc<dyn DelegationAttentionStore>);
     fx.seed_running("e2e-attention").await;
-    let (continuation_id, completion) = fx.arm_running("e2e-attention").await;
+    let (continuation_id, completion) = fx
+        .arm_running("e2e-attention", already_released_foreground_waiter())
+        .await;
     completion.await.unwrap().unwrap();
     fx.await_waiting(&continuation_id).await;
 
@@ -4178,7 +4269,9 @@ async fn delegation_continuation_e2e_wake_attention_admits_once() {
 async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-unavailable").await;
-    let (continuation_id, completion) = fx.arm_running("e2e-unavailable").await;
+    let (continuation_id, completion) = fx
+        .arm_running("e2e-unavailable", already_released_foreground_waiter())
+        .await;
     completion.await.unwrap().unwrap();
     fx.await_waiting(&continuation_id).await;
 
@@ -4198,10 +4291,14 @@ async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
 async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-checkpoint").await;
-    let (continuation_id, completion) = fx.arm_running("e2e-checkpoint").await;
+    let (first_release_owner, first_foreground_release) = foreground_mcp_release_fence();
+    let (continuation_id, completion) = fx
+        .arm_running("e2e-checkpoint", first_foreground_release)
+        .await;
     completion.await.unwrap().unwrap();
     let waiting = fx.store.load(&continuation_id).await.unwrap().unwrap();
     assert_eq!(waiting.state, ContinuationState::Waiting);
+    first_release_owner.frame_flushed();
 
     tokio::time::advance(std::time::Duration::from_millis(
         CONTINUATION_CHECKPOINT_MS - 1,
@@ -4221,8 +4318,31 @@ async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
         CONTINUATION_CHECKPOINT_MS as i64
     );
     assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 1);
+
+    fx.port.turn_generation.store(4, Ordering::Relaxed);
+    let (second_release_owner, second_foreground_release) = foreground_mcp_release_fence();
+    let (second_id, second_completion) = fx
+        .arm_running("e2e-checkpoint", second_foreground_release)
+        .await;
+    second_completion.await.unwrap().unwrap();
+    let second = fx.store.load(&second_id).await.unwrap().unwrap();
+    assert_eq!(second.state, ContinuationState::Waiting);
+    second_release_owner.frame_flushed();
+
+    assert_eq!(second.generation, waiting.generation + 1);
+    assert_eq!(
+        second
+            .wake_at
+            .signed_duration_since(second.armed_at)
+            .num_milliseconds(),
+        CONTINUATION_CHECKPOINT_MS as i64
+    );
     assert_eq!(fx.broker.pending_count().await, 1);
+    assert_eq!(fx.spawner.cancels.lock().await.len(), 0);
+    assert_eq!(fx.spawner.disconnects.lock().await.len(), 0);
     complete_seeded_task(&fx.broker, "e2e-checkpoint").await;
+    let second_terminal = fx.await_terminal(&second_id).await;
+    assert_eq!(second_terminal.state, ContinuationState::Completed);
 }
 
 /// 6 + 7. Prompt contains latest typed snapshot and durable marker; no public
@@ -4324,6 +4444,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
             task_ids: vec!["e2e-hidden".into()],
             waiter_closed: CancellationToken::new(),
             transferred_wait_rx: None,
+            foreground_release: already_released_foreground_waiter(),
         })
         .await
         .unwrap();
@@ -4438,7 +4559,9 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
 async fn delegation_continuation_e2e_rejoin_creates_larger_generation_and_new_wake_at() {
     let fx = E2eMatrix::new();
     fx.seed_running("e2e-rejoin-1").await;
-    let (first_id, first_completion) = fx.arm_running("e2e-rejoin-1").await;
+    let (first_id, first_completion) = fx
+        .arm_running("e2e-rejoin-1", already_released_foreground_waiter())
+        .await;
     first_completion.await.unwrap().unwrap();
     let first_waiting = fx.store.load(&first_id).await.unwrap().unwrap();
     complete_seeded_task(&fx.broker, "e2e-rejoin-1").await;
@@ -4450,7 +4573,9 @@ async fn delegation_continuation_e2e_rejoin_creates_larger_generation_and_new_wa
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
     fx.port.turn_generation.store(4, Ordering::Relaxed);
     fx.seed_running("e2e-rejoin-2").await;
-    let (second_id, second_completion) = fx.arm_running("e2e-rejoin-2").await;
+    let (second_id, second_completion) = fx
+        .arm_running("e2e-rejoin-2", already_released_foreground_waiter())
+        .await;
     second_completion.await.unwrap().unwrap();
     let second = fx.store.load(&second_id).await.unwrap().unwrap();
     assert!(
@@ -4490,7 +4615,9 @@ async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan()
         let fx = E2eMatrix::new();
         fx.seed_running("e2e-stop-arming").await;
         let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
-        let (continuation_id, mut completion) = fx.arm_running("e2e-stop-arming").await;
+        let (continuation_id, mut completion) = fx
+            .arm_running("e2e-stop-arming", already_released_foreground_waiter())
+            .await;
         let _ = tokio::select! {
             request = suspend_entered => request.expect("suspend entered Arming"),
             result = &mut completion => panic!("ended early: {result:?}"),
@@ -4524,7 +4651,9 @@ async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan()
     {
         let fx = E2eMatrix::new();
         fx.seed_running("e2e-stop-waiting").await;
-        let (continuation_id, completion) = fx.arm_running("e2e-stop-waiting").await;
+        let (continuation_id, completion) = fx
+            .arm_running("e2e-stop-waiting", already_released_foreground_waiter())
+            .await;
         completion.await.unwrap().unwrap();
         fx.await_waiting(&continuation_id).await;
         assert_eq!(
@@ -4546,7 +4675,12 @@ async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan()
         let fx = E2eMatrix::new();
         fx.seed_running("e2e-stop-wake-pending").await;
         let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
-        let (continuation_id, mut completion) = fx.arm_running("e2e-stop-wake-pending").await;
+        let (continuation_id, mut completion) = fx
+            .arm_running(
+                "e2e-stop-wake-pending",
+                already_released_foreground_waiter(),
+            )
+            .await;
         let _ = tokio::select! {
             request = suspend_entered => request.expect("suspend entered"),
             result = &mut completion => panic!("ended early: {result:?}"),
@@ -4584,7 +4718,9 @@ async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan()
         let fx = E2eMatrix::new();
         fx.seed_running("e2e-stop-resuming").await;
         let (admission_entered, admission_release) = fx.port.install_admission_gate().await;
-        let (continuation_id, completion) = fx.arm_running("e2e-stop-resuming").await;
+        let (continuation_id, completion) = fx
+            .arm_running("e2e-stop-resuming", already_released_foreground_waiter())
+            .await;
         completion.await.unwrap().unwrap();
         fx.await_waiting(&continuation_id).await;
         complete_seeded_task(&fx.broker, "e2e-stop-resuming").await;
@@ -4644,6 +4780,7 @@ async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_c
                 task_ids: vec!["e2e-disconnect".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: already_released_foreground_waiter(),
             })
             .await
             .unwrap();

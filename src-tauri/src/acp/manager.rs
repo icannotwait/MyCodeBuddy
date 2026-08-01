@@ -2166,10 +2166,11 @@ impl ConnectionManager {
                     Err(ContinuationError::StateConflict)
                 };
             }
-            if state.parent_turn_generation != request.suspended_turn_generation
-                || state.turn_in_flight
-            {
+            if state.parent_turn_generation != request.suspended_turn_generation {
                 return Err(ContinuationError::StateConflict);
+            }
+            if state.turn_in_flight {
+                return Err(ContinuationError::PromptBusy);
             }
         }
 
@@ -2196,9 +2197,11 @@ impl ConnectionManager {
             || state.external_id.as_deref() != Some(request.parent_session_id.as_str())
             || state.last_suspended_turn_generation != Some(request.suspended_turn_generation)
             || state.parent_turn_generation != request.suspended_turn_generation
-            || state.turn_in_flight
         {
             return Err(ContinuationError::StateConflict);
+        }
+        if state.turn_in_flight {
+            return Err(ContinuationError::PromptBusy);
         }
         let turn_generation = state
             .parent_turn_generation
@@ -16881,6 +16884,12 @@ mod tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: {
+                    let (owner, waiter) =
+                        crate::acp::delegation::continuation::foreground_mcp_release_fence();
+                    owner.frame_flushed();
+                    waiter
+                },
             })
             .await
             .unwrap();
@@ -17328,6 +17337,12 @@ mod tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: {
+                    let (owner, waiter) =
+                        crate::acp::delegation::continuation::foreground_mcp_release_fence();
+                    owner.frame_flushed();
+                    waiter
+                },
             })
             .await
             .unwrap();

@@ -13379,6 +13379,12 @@ mod tests {
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
                 transferred_wait_rx: None,
+                foreground_release: {
+                    let (owner, waiter) =
+                        crate::acp::delegation::continuation::foreground_mcp_release_fence();
+                    owner.frame_flushed();
+                    waiter
+                },
             })
             .await
             .unwrap();

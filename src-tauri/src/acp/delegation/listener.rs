@@ -26,6 +26,9 @@ use crate::acp::delegation::broker::{
 use crate::acp::delegation::continuation::coordinator::{
     ContinuationError, DelegationContinuationCoordinator, JoinArmOutcome, JoinArmRequest,
 };
+use crate::acp::delegation::continuation::{
+    foreground_mcp_release_fence, ForegroundMcpReleaseOwner,
+};
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, RecoveryAction, RecoveryRailSnapshot, RequestedRecoveryOperation,
@@ -299,6 +302,20 @@ impl StatusErrorEnvelope {
     }
 }
 
+struct ProcessedStatus {
+    batch: DelegationStatusBatch,
+    release_owner: Option<ForegroundMcpReleaseOwner>,
+}
+
+impl ProcessedStatus {
+    fn plain(batch: DelegationStatusBatch) -> Self {
+        Self {
+            batch,
+            release_owner: None,
+        }
+    }
+}
+
 struct CancelWaiterOnDrop(CancellationToken);
 
 impl Drop for CancelWaiterOnDrop {
@@ -501,6 +518,7 @@ impl DelegationListener {
         if let BrokerMessage::Ready(req) = msg {
             return self.serve_ready_lease(conn, req.token).await;
         }
+        let mut foreground_release_owner = None;
         let resp = match msg {
             BrokerMessage::Ready(_) => unreachable!("handled above"),
             BrokerMessage::Call(req) => report_response(self.process(req).await)?,
@@ -550,7 +568,11 @@ impl DelegationListener {
                     },
                 };
                 match reports {
-                    Ok(batch) => status_response(batch)?,
+                    Ok(processed) => {
+                        let response = status_response(processed.batch)?;
+                        foreground_release_owner = processed.release_owner;
+                        response
+                    }
                     Err(_) => value_response(&StatusErrorEnvelope::continuation_arm_failed())?,
                 }
             }
@@ -709,6 +731,9 @@ impl DelegationListener {
             }
         };
         write_frame(conn, &resp).await?;
+        if let Some(owner) = foreground_release_owner.take() {
+            owner.frame_flushed();
+        }
         Ok(())
     }
 
@@ -801,27 +826,27 @@ impl DelegationListener {
     async fn process_status(
         &self,
         req: BrokerStatusRequest,
-    ) -> Result<DelegationStatusBatch, ContinuationError> {
+    ) -> Result<ProcessedStatus, ContinuationError> {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             let unknown_reports: Vec<_> =
                 req.task_ids.iter().map(|id| unknown_report(id)).collect();
-            return Ok(match req.return_when {
+            return Ok(ProcessedStatus::plain(match req.return_when {
                 None => DelegationStatusBatch::legacy(unknown_reports),
                 Some(_) => DelegationStatusBatch::joined(
                     unknown_reports,
                     DelegationWakeReason::Unavailable,
                     Vec::new(),
                 ),
-            });
+            }));
         };
         // Connection-bound capability: a legacy token must not enter Join or
         // consult Broker ownership even if raw socket JSON sends return_when.
         if req.return_when.is_some() && !entry.coordination_v1 {
-            return Ok(DelegationStatusBatch::joined(
+            return Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                 req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                 DelegationWakeReason::Unavailable,
                 Vec::new(),
-            ));
+            )));
         }
         // Identity-less hosts (Cursor) announce this MCP call as a generic
         // "MCP: tool" and never upgrade it on the wire — the companion
@@ -856,16 +881,18 @@ impl DelegationListener {
             .await;
         match req.return_when {
             // Snapshot or positive supervised waits: no indefinite arm registration.
-            None if req.wait_ms != Some(0) => Ok(DelegationStatusBatch::legacy(
-                self.broker
-                    .get_tasks_status(
-                        &entry.parent_connection_id,
-                        parent_conversation_id,
-                        &req.task_ids,
-                        legacy_wait_from(req.wait_ms),
-                    )
-                    .await,
-            )),
+            None if req.wait_ms != Some(0) => {
+                Ok(ProcessedStatus::plain(DelegationStatusBatch::legacy(
+                    self.broker
+                        .get_tasks_status(
+                            &entry.parent_connection_id,
+                            parent_conversation_id,
+                            &req.task_ids,
+                            legacy_wait_from(req.wait_ms),
+                        )
+                        .await,
+                )))
+            }
             // Indefinite legacy terminal wait (`wait_ms: 0`, no return_when).
             None => {
                 self.arm_indefinite_status_wait(
@@ -890,21 +917,22 @@ impl DelegationListener {
                         .await;
                 }
                 if req.task_ids.is_empty() {
-                    return Ok(self
-                        .broker
-                        .join_tasks_status(
-                            &entry.parent_connection_id,
-                            parent_conversation_id,
-                            &req.task_ids,
-                        )
-                        .await);
+                    return Ok(ProcessedStatus::plain(
+                        self.broker
+                            .join_tasks_status(
+                                &entry.parent_connection_id,
+                                parent_conversation_id,
+                                &req.task_ids,
+                            )
+                            .await,
+                    ));
                 }
                 let Some(parent_conversation_id) = parent_conversation_id else {
-                    return Ok(DelegationStatusBatch::joined(
+                    return Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                         req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                         DelegationWakeReason::Unavailable,
                         Vec::new(),
-                    ));
+                    )));
                 };
                 self.arm_indefinite_status_wait(
                     &entry,
@@ -915,11 +943,11 @@ impl DelegationListener {
                 )
                 .await
             }
-            Some(_) => Ok(DelegationStatusBatch::joined(
+            Some(_) => Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                 req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                 DelegationWakeReason::Unavailable,
                 Vec::new(),
-            )),
+            ))),
         }
     }
 
@@ -934,7 +962,7 @@ impl DelegationListener {
         parent_conversation_id: Option<i32>,
         rewritten_status_tool_id: Option<String>,
         kind: IndefiniteWaitKind,
-    ) -> Result<DelegationStatusBatch, ContinuationError> {
+    ) -> Result<ProcessedStatus, ContinuationError> {
         use crate::acp::tool_watchdog::{
             BindDelegationWaitResult, WaitCancelHandle, WaitOwner, WaitStamp,
         };
@@ -955,7 +983,7 @@ impl DelegationListener {
             )
             .await;
         let canonical_task_ids = match preflight {
-            StatusWaitPreflight::Ready(batch) => return Ok(batch),
+            StatusWaitPreflight::Ready(batch) => return Ok(ProcessedStatus::plain(batch)),
             StatusWaitPreflight::NeedPark { canonical_task_ids } => canonical_task_ids,
         };
 
@@ -975,11 +1003,11 @@ impl DelegationListener {
                     0
                 }
                 None => {
-                    return Ok(DelegationStatusBatch::joined(
+                    return Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                         req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                         DelegationWakeReason::Unavailable,
                         Vec::new(),
-                    ));
+                    )));
                 }
             };
 
@@ -1011,7 +1039,7 @@ impl DelegationListener {
         {
             // Fail closed: do not park without a live cancel handle.
             emit_wait_arm_reason("wait_register_failed");
-            return Ok(match kind {
+            return Ok(ProcessedStatus::plain(match kind {
                 IndefiniteWaitKind::LegacyTerminal => DelegationStatusBatch::legacy(
                     canonical_task_ids
                         .iter()
@@ -1028,7 +1056,7 @@ impl DelegationListener {
                         Vec::new(),
                     )
                 }
-            });
+            }));
         }
 
         // Install immediately after successful register so peer-close that
@@ -1077,7 +1105,7 @@ impl DelegationListener {
                     reports = &mut park => {
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         wait_guard.disarm();
-                        Ok(DelegationStatusBatch::legacy(reports))
+                        Ok(ProcessedStatus::plain(DelegationStatusBatch::legacy(reports)))
                     }
                     _ = cancel_rx.changed() => {
                         if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
@@ -1087,17 +1115,17 @@ impl DelegationListener {
                             .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            Ok(DelegationStatusBatch::legacy(
+                            Ok(ProcessedStatus::plain(DelegationStatusBatch::legacy(
                                 canonical_task_ids
                                     .iter()
                                     .map(|id| wait_cancel_report(id, cause))
                                     .collect(),
-                            ))
+                            )))
                         } else {
                             let reports = park.await;
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            Ok(DelegationStatusBatch::legacy(reports))
+                            Ok(ProcessedStatus::plain(DelegationStatusBatch::legacy(reports)))
                         }
                     }
                 }
@@ -1114,7 +1142,7 @@ impl DelegationListener {
                     batch = &mut park => {
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         wait_guard.disarm();
-                        Ok(batch)
+                        Ok(ProcessedStatus::plain(batch))
                     }
                     _ = cancel_rx.changed() => {
                         if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
@@ -1124,19 +1152,19 @@ impl DelegationListener {
                             .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            Ok(DelegationStatusBatch::joined(
+                            Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                                 canonical_task_ids
                                     .iter()
                                     .map(|id| wait_cancel_report(id, cause))
                                     .collect(),
                                 DelegationWakeReason::Unavailable,
                                 Vec::new(),
-                            ))
+                            )))
                         } else {
                             let batch = park.await;
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            Ok(batch)
+                            Ok(ProcessedStatus::plain(batch))
                         }
                     }
                 }
@@ -1152,12 +1180,14 @@ impl DelegationListener {
                 let waiter_closed_for_cancel = waiter_closed.clone();
                 let _cancel_waiter_on_drop = CancelWaiterOnDrop(waiter_closed.clone());
                 let (transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
+                let (release_owner, foreground_release) = foreground_mcp_release_fence();
                 let request = JoinArmRequest {
                     parent_connection_id: entry.parent_connection_id.clone(),
                     parent_conversation_id,
                     task_ids: canonical_task_ids.clone(),
                     waiter_closed,
                     transferred_wait_rx: Some(transfer_rx),
+                    foreground_release,
                 };
                 let wait_cancel_reg = self.wait_cancel.clone();
                 let wait_stamp_for_arm = wait_stamp.clone();
@@ -1266,7 +1296,7 @@ impl DelegationListener {
                         ArmStatus::Immediate(batch) => {
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            return Ok(batch);
+                            return Ok(ProcessedStatus::plain(batch));
                         }
                     },
                     changed = cancel_rx.changed() => {
@@ -1290,24 +1320,27 @@ impl DelegationListener {
                         let _ = arm_task.await;
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         wait_guard.disarm();
-                        Ok(DelegationStatusBatch::joined(
+                        Ok(ProcessedStatus::plain(DelegationStatusBatch::joined(
                             canonical_task_ids
                                 .iter()
                                 .map(|task_id| wait_cancel_report(task_id, cause))
                                 .collect(),
                             DelegationWakeReason::Unavailable,
                             Vec::new(),
-                        ))
+                        )))
                     }
                     StatusReleaseDecision::Suspended => {
                         wait_guard.disarm();
-                        Ok(self
-                            .continuation_release_batch(
-                                &entry.parent_connection_id,
-                                parent_conversation_id,
-                                &canonical_task_ids,
-                            )
-                            .await)
+                        Ok(ProcessedStatus {
+                            batch: self
+                                .continuation_release_batch(
+                                    &entry.parent_connection_id,
+                                    parent_conversation_id,
+                                    &canonical_task_ids,
+                                )
+                                .await,
+                            release_owner: Some(release_owner),
+                        })
                     }
                 }
             }
@@ -2828,6 +2861,7 @@ mod tests {
     };
     use crate::acp::delegation::continuation::types::{
         ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
+        ContinuationWakeReason,
     };
     use crate::acp::delegation::spawner::{
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
@@ -2836,9 +2870,12 @@ mod tests {
     use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
     use chrono::Utc;
     use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncRead, AsyncWrite, ReadBuf};
 
     struct AlwaysRootLookup;
     #[async_trait]
@@ -3139,6 +3176,7 @@ mod tests {
         snapshot_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
         suspend_entered: std::sync::Mutex<Option<oneshot::Sender<SuspendRequest>>>,
         suspend_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        admissions: std::sync::Mutex<Vec<(u64, ContinuationWakeReason)>>,
         fail_snapshot: bool,
     }
 
@@ -3150,6 +3188,7 @@ mod tests {
                 snapshot_release: tokio::sync::Mutex::new(None),
                 suspend_entered: std::sync::Mutex::new(None),
                 suspend_release: tokio::sync::Mutex::new(None),
+                admissions: std::sync::Mutex::new(Vec::new()),
                 fail_snapshot: false,
             })
         }
@@ -3200,6 +3239,7 @@ mod tests {
                 snapshot_release: tokio::sync::Mutex::new(None),
                 suspend_entered: std::sync::Mutex::new(None),
                 suspend_release: tokio::sync::Mutex::new(None),
+                admissions: std::sync::Mutex::new(Vec::new()),
                 fail_snapshot: false,
             }
         }
@@ -3264,8 +3304,15 @@ mod tests {
 
         async fn admit_continuation(
             &self,
-            _request: ContinuationPromptRequest,
+            request: ContinuationPromptRequest,
         ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admissions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((
+                    request.continuation_generation,
+                    request.origin.wake_reason(),
+                ));
             Ok(PromptAdmissionResult::Admitted)
         }
 
@@ -3540,7 +3587,8 @@ mod tests {
                             return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
                             parent_tool_use_id,
                         })
-                        .await;
+                        .await
+                        .map(|processed| processed.batch);
                     if result.is_ok() {
                         response_count.fetch_add(1, Ordering::SeqCst);
                     }
@@ -3692,6 +3740,423 @@ mod tests {
                 "the exact WaitStamp is cleaned, not merely a same-id replacement"
             );
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestFlushMode {
+        Pass,
+        GateOk,
+        GateErr,
+    }
+
+    struct FlushGateStream<S> {
+        inner: S,
+        mode: TestFlushMode,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        successful_flushes: Arc<AtomicUsize>,
+        counted: bool,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for FlushGateStream<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for FlushGateStream<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if !matches!(self.mode, TestFlushMode::Pass) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release.as_mut() {
+                    match Pin::new(release).poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(_) => self.release = None,
+                    }
+                }
+                if matches!(self.mode, TestFlushMode::GateErr) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected status response flush failure",
+                    )));
+                }
+            }
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    if !self.counted {
+                        self.successful_flushes.fetch_add(1, Ordering::SeqCst);
+                        self.counted = true;
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    struct ServeOneContinuationHarness {
+        broker: Arc<DelegationBroker>,
+        spawner: Arc<MockSpawner>,
+        store: Arc<ReleaseObservedStore>,
+        port: Arc<ContinuationTestPort>,
+        coordinator: Arc<DelegationContinuationCoordinator>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+        task_id: String,
+        client: Option<tokio::io::DuplexStream>,
+        server_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+        suspend_entered: Option<oneshot::Receiver<SuspendRequest>>,
+        suspend_release: Option<oneshot::Sender<()>>,
+        flush_entered: Option<oneshot::Receiver<()>>,
+        flush_release: Option<oneshot::Sender<()>>,
+        successful_flushes: Arc<AtomicUsize>,
+        stamp: Option<WaitStamp>,
+        continuation_id: Option<String>,
+        generation: Option<u64>,
+    }
+
+    impl ServeOneContinuationHarness {
+        async fn new(
+            label: &str,
+            mode: TestFlushMode,
+            attention: Option<Arc<dyn DelegationAttentionStore>>,
+        ) -> Self {
+            let spawner = Arc::new(MockSpawner::new());
+            let broker = match attention {
+                Some(store) => make_broker_with_attention(spawner.clone(), store).await,
+                None => make_broker(spawner.clone()).await,
+            };
+            let task_id = broker.seed_live_task_for_test("parent-conn", label).await;
+            let store = ReleaseObservedStore::new();
+            let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+            let (tokens, coordinator) = continuation_registry_with_store(
+                broker.clone(),
+                store.clone() as Arc<dyn ContinuationStore>,
+                port.clone(),
+            );
+            tokens
+                .register("tok".into(), continuation_token_entry(true))
+                .await;
+            let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+            let listener = make_listener_with_wait_cancel(
+                broker.clone(),
+                tokens,
+                Some(1),
+                wait_cancel.clone(),
+            );
+            let (client, server) = tokio::io::duplex(8 * 1024);
+            let successful_flushes = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let mut server = FlushGateStream {
+                inner: server,
+                mode,
+                entered: (!matches!(mode, TestFlushMode::Pass)).then_some(entered_tx),
+                release: (!matches!(mode, TestFlushMode::Pass)).then_some(release_rx),
+                successful_flushes: successful_flushes.clone(),
+                counted: false,
+            };
+            let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+            Self {
+                broker,
+                spawner,
+                store,
+                port,
+                coordinator,
+                wait_cancel,
+                task_id,
+                client: Some(client),
+                server_task: Some(server_task),
+                suspend_entered: Some(suspend_entered),
+                suspend_release: Some(suspend_release),
+                flush_entered: (!matches!(mode, TestFlushMode::Pass)).then_some(entered_rx),
+                flush_release: (!matches!(mode, TestFlushMode::Pass)).then_some(release_tx),
+                successful_flushes,
+                stamp: None,
+                continuation_id: None,
+                generation: None,
+            }
+        }
+
+        async fn send_join_status(&mut self) {
+            write_frame(
+                self.client.as_mut().unwrap(),
+                &BrokerMessage::Status(BrokerStatusRequest {
+                    token: "tok".into(),
+                    task_ids: vec![self.task_id.clone()],
+                    wait_ms: Some(0),
+                    return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                    parent_tool_use_id: "foreground-release-test".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            self.suspend_entered
+                .take()
+                .unwrap()
+                .await
+                .expect("suspension reached");
+            self.stamp = Some(
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(stamp) =
+                            self.wait_cancel.live_wait_stamps().await.into_iter().next()
+                        {
+                            break stamp;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("exact wait stamp"),
+            );
+            let row = self
+                .store
+                .load_active_for_conversation(1)
+                .await
+                .unwrap()
+                .unwrap();
+            self.continuation_id = Some(row.continuation_id);
+            self.generation = Some(row.generation);
+        }
+
+        fn release_suspension(&mut self) {
+            self.suspend_release.take().unwrap().send(()).unwrap();
+        }
+
+        async fn await_flush(&mut self) {
+            self.flush_entered.take().unwrap().await.unwrap();
+        }
+
+        fn release_flush(&mut self) {
+            self.flush_release.take().unwrap().send(()).unwrap();
+        }
+
+        async fn read_one_response(&mut self) -> BrokerResponse {
+            read_frame(self.client.as_mut().unwrap()).await.unwrap()
+        }
+
+        async fn join_server(&mut self) -> std::io::Result<()> {
+            self.server_task.take().unwrap().await.unwrap()
+        }
+
+        async fn await_one_admission(&self) -> (u64, ContinuationWakeReason) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(record) = self
+                        .port
+                        .admissions
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .first()
+                        .copied()
+                    {
+                        break record;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one same-generation admission")
+        }
+
+        async fn await_wake_pending(&self) -> ContinuationRecord {
+            let continuation_id = self.continuation_id.as_deref().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let row = self.store.load(continuation_id).await.unwrap().unwrap();
+                    if row.state == ContinuationState::WakePending {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one wake CAS wins while the frame is gated")
+        }
+
+        async fn assert_common(
+            &self,
+            expected_flushes: usize,
+            expected_cancels: usize,
+            expected_disconnects: usize,
+        ) {
+            let stamp = self.stamp.as_ref().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.wait_cancel.contains(&stamp.wait_id).await
+                    || self.store.ownership_wins() != 1
+                    || self.spawner.cancels.lock().await.len() != expected_cancels
+                    || self.spawner.disconnects.lock().await.len() != expected_disconnects
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("serve_one lifecycle settles");
+            assert_eq!(
+                self.successful_flushes.load(Ordering::SeqCst),
+                expected_flushes
+            );
+            assert_eq!(self.store.ownership_wins(), 1);
+            assert_eq!(self.spawner.cancels.lock().await.len(), expected_cancels);
+            assert_eq!(
+                self.spawner.disconnects.lock().await.len(),
+                expected_disconnects
+            );
+            assert_eq!(
+                self.wait_cancel
+                    .cancel(stamp, CancelCause::AutoTimeout)
+                    .await,
+                WaitCancelResult::NotFound
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_release_blocks_terminal_admission_until_frame_flush() {
+        let mut fx =
+            ServeOneContinuationHarness::new("frame-terminal", TestFlushMode::GateOk, None).await;
+        fx.send_join_status().await;
+        fx.release_suspension();
+        fx.await_flush().await;
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        let row = fx.await_wake_pending().await;
+        assert_eq!(row.state, ContinuationState::WakePending);
+        assert!(fx.port.admissions.lock().unwrap().is_empty());
+        assert_eq!(fx.spawner.disconnects.lock().await.len(), 1);
+        fx.release_flush();
+        let _response = fx.read_one_response().await;
+        fx.join_server().await.expect("one response frame flushed");
+        let (generation, reason) = fx.await_one_admission().await;
+        assert_eq!(generation, fx.generation.unwrap());
+        assert_eq!(reason, ContinuationWakeReason::AllTerminal);
+        fx.assert_common(1, 0, 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_release_blocks_attention_admission_until_frame_flush() {
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let mut fx = ServeOneContinuationHarness::new(
+            "frame-attention",
+            TestFlushMode::GateOk,
+            Some(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        )
+        .await;
+        fx.send_join_status().await;
+        fx.release_suspension();
+        fx.await_flush().await;
+        attention
+            .open_or_recover(NewAttentionRequest {
+                task_id: fx.task_id.clone(),
+                parent_conversation_id: 1,
+                child_conversation_id: 99,
+                child_tool_call_id: "child-tool".into(),
+                message: "Need a decision".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        fx.broker.notify_attention_changed_for_test();
+        let row = fx.await_wake_pending().await;
+        assert_eq!(
+            row.wake_reason,
+            Some(ContinuationWakeReason::AttentionRequired)
+        );
+        assert!(fx.port.admissions.lock().unwrap().is_empty());
+        fx.release_flush();
+        let _response = fx.read_one_response().await;
+        fx.join_server().await.expect("one response frame flushed");
+        let (generation, reason) = fx.await_one_admission().await;
+        assert_eq!(generation, fx.generation.unwrap());
+        assert_eq!(reason, ContinuationWakeReason::AttentionRequired);
+        fx.assert_common(1, 0, 0).await;
+        complete_running_task(&fx.broker, &fx.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn foreground_release_peer_eof_read_branch_opens_same_generation() {
+        let mut fx = ServeOneContinuationHarness::new("peer-eof", TestFlushMode::Pass, None).await;
+        fx.send_join_status().await;
+        drop(fx.client.take());
+        fx.join_server()
+            .await
+            .expect("EOF/read branch returns Ok(())");
+        fx.release_suspension();
+        assert_eq!(fx.spawner.disconnects.lock().await.len(), 0);
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        let (generation, reason) = fx.await_one_admission().await;
+        assert_eq!(generation, fx.generation.unwrap());
+        assert_eq!(reason, ContinuationWakeReason::AllTerminal);
+        fx.assert_common(0, 0, 1).await;
+    }
+
+    #[tokio::test]
+    async fn foreground_release_response_write_failure_opens_same_generation() {
+        let mut fx =
+            ServeOneContinuationHarness::new("peer-write-fail", TestFlushMode::GateErr, None).await;
+        fx.send_join_status().await;
+        fx.release_suspension();
+        fx.await_flush().await;
+        complete_running_task(&fx.broker, &fx.task_id).await;
+        fx.await_wake_pending().await;
+        assert!(fx.port.admissions.lock().unwrap().is_empty());
+        assert_eq!(fx.spawner.disconnects.lock().await.len(), 1);
+        fx.release_flush();
+        let error = fx.join_server().await.expect_err("injected flush fails");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let (generation, reason) = fx.await_one_admission().await;
+        assert_eq!(generation, fx.generation.unwrap());
+        assert_eq!(reason, ContinuationWakeReason::AllTerminal);
+        fx.assert_common(0, 0, 1).await;
+    }
+
+    #[tokio::test]
+    async fn foreground_release_wait_remains_user_stop_cancelable() {
+        let mut fx =
+            ServeOneContinuationHarness::new("stop-while-fenced", TestFlushMode::GateOk, None)
+                .await;
+        fx.send_join_status().await;
+        fx.release_suspension();
+        fx.await_flush().await;
+        assert_eq!(
+            fx.coordinator
+                .handle_parent_stop("parent-conn", 1)
+                .await
+                .unwrap(),
+            1
+        );
+        fx.release_flush();
+        let _response = fx.read_one_response().await;
+        fx.join_server().await.expect("one response frame flushed");
+        assert!(fx.port.admissions.lock().unwrap().is_empty());
+        let row = fx
+            .store
+            .load(fx.continuation_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        fx.assert_common(1, 1, 1).await;
     }
 
     #[tokio::test]
@@ -4689,7 +5154,7 @@ mod tests {
         );
 
         complete_running_task(&broker, "continuation-off-running").await;
-        let batch = join.await.unwrap().unwrap();
+        let batch = join.await.unwrap().unwrap().batch;
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
         assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
     }
@@ -4750,7 +5215,7 @@ mod tests {
         assert!(!join.is_finished());
 
         complete_running_task(&broker, "e2e-cap-off").await;
-        let batch = join.await.unwrap().unwrap();
+        let batch = join.await.unwrap().unwrap().batch;
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
         assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
         assert!(store.list_non_terminal().await.unwrap().is_empty());
@@ -4898,7 +5363,8 @@ mod tests {
                 parent_tool_use_id: String::new(),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .batch;
 
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
         assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
@@ -4913,7 +5379,8 @@ mod tests {
                 parent_tool_use_id: String::new(),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .batch;
         assert_eq!(
             invalid_batch.wake_reason,
             Some(DelegationWakeReason::Unavailable)
@@ -5123,7 +5590,8 @@ mod tests {
         )
         .await
         .expect("legacy-token Join rejection must not park")
-        .unwrap();
+        .unwrap()
+        .batch;
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
         assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
         assert!(batch.attention_requests.unwrap().is_empty());
@@ -5316,7 +5784,8 @@ mod tests {
             .await
             .expect("cancel must complete wait")
             .expect("join")
-            .expect("status ok");
+            .expect("status ok")
+            .batch;
         assert_eq!(batch.tasks.len(), 1);
         assert_eq!(
             batch.tasks[0].error_code.as_deref(),
@@ -5417,7 +5886,8 @@ mod tests {
             .await
             .expect("wait cancel must complete process_status")
             .expect("join")
-            .expect("status ok");
+            .expect("status ok")
+            .batch;
         assert_eq!(batch.tasks.len(), 1);
         assert_eq!(
             batch.tasks[0].error_code.as_deref(),
@@ -5604,7 +6074,8 @@ mod tests {
             .await
             .expect("cancel after Arming must complete the wait without hanging")
             .expect("join status task")
-            .expect("status ok");
+            .expect("status ok")
+            .batch;
         assert_eq!(
             batch.tasks[0].error_code.as_deref(),
             Some("tool_stalled_timeout")
@@ -5953,7 +6424,8 @@ mod tests {
             .await
             .expect("cancel completes")
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .batch;
         assert_eq!(
             batch.tasks[0].error_code.as_deref(),
             Some("tool_stalled_timeout")
