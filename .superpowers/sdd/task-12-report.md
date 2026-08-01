@@ -1,6 +1,6 @@
 # Task 12 report
 
-Status: TASK_REVIEW_APPROVED
+Status: COMPLETE
 
 ## Acceptance RED and GREEN
 
@@ -52,13 +52,13 @@ Frontend, from repository root:
 
 - `pnpm eslint .`: exit 0 with 23 existing warnings.
 - `pnpm test`: exit 0.
-- `pnpm build`: exit 0.
+- `pnpm build`: exit 0; 33 static pages generated.
 
 Desktop Rust, from `src-tauri/`:
 
 - `cargo check`: passed.
-- `cargo test --features test-utils`: 3896 passed, 1 ignored; all integration
-  binaries passed.
+- `cargo test --features test-utils`: 3906 passed, 1 ignored; all integration,
+  bin, and doc targets passed.
 - `cargo clippy --all-targets --features test-utils -- -D warnings`: passed.
 
 Server Rust:
@@ -66,7 +66,7 @@ Server Rust:
 - `cargo check --no-default-features --features server --bin codeg-server`:
   passed.
 - `cargo test --no-default-features --features server --bin codeg-server --lib`:
-  3820 passed, 1 ignored; server bin target passed with no tests.
+  3830 passed, 1 ignored; server bin target passed with no tests.
 - `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
   passed.
 
@@ -87,7 +87,9 @@ pre-existing formatting drift; Task 12 formatted only owned Rust paths.
   Important, or Minor findings. The reviewer could not verify the reported
   full matrix from the diff package, so the controller retained the direct
   command evidence above as the authoritative verification record.
-- Whole-branch review: pending.
+- Whole-branch review: approved after all seven Important findings and the
+  final scoped matrix-policy findings were fixed and re-reviewed. No Critical
+  or Important findings remain.
 
 ## Whole-branch Important fix wave (2026-08-01)
 
@@ -163,7 +165,8 @@ Additional focused GREEN verification:
 The only diagnostics were the already documented development sidecar
 placeholder warning and Cargo's upstream `proc-macro-error2`
 future-incompatibility warning. The approved Designs and implementation plan
-were not modified. Controller whole-branch review remains pending.
+were not modified. The later whole-branch review approved this fix after the
+remaining review waves were complete.
 
 ## Whole-branch Important fix wave, round 2 (2026-08-01)
 
@@ -238,7 +241,8 @@ Additional focused GREEN verification:
 The only diagnostics were the already documented development sidecar
 placeholder warning and Cargo's upstream `proc-macro-error2`
 future-incompatibility warning. The approved Designs and implementation plan
-were not modified. Controller whole-branch review remains pending.
+were not modified. The later whole-branch review approved this fix after the
+remaining review waves were complete.
 
 ## Whole-branch Important fix wave, round 3 (2026-08-01)
 
@@ -499,3 +503,54 @@ Cargo's upstream `proc-macro-error2` future-incompatibility warning, and
 PowerShell/Git's informational LF-to-CRLF working-copy warning. No full
 repository matrix was run. Approved Designs, implementation plan, Skill prose,
 frontend, production recovery policy, and stashes were not modified.
+
+## Final current-HEAD validation and review (2026-08-01)
+
+The first full desktop matrix after the whole-branch fixes exposed exactly
+three failing policy/catalog tests. Commit
+`7e2e57041a729e442005d75c4f3872c2fa13e11e` corrected those test contracts and
+the fixed tools/list wording without changing production recovery policy or
+raising the fixed 7,680-byte budget. The final review measured the catalog at
+7,672 bytes and approved all three scoped corrections.
+
+The complete matrix was then rerun at current implementation HEAD
+`2aa8cf8a7a00ca9a65de251e400931858b52d49f`:
+
+- `pnpm eslint .`: exit 0 with 23 existing warnings.
+- `pnpm test`: exit 0.
+- `pnpm build`: exit 0; 33 static pages generated.
+- `cargo check`: passed.
+- `cargo test --features test-utils`: 3906 passed, 1 ignored; all integration,
+  bin, and doc targets passed.
+- `cargo clippy --all-targets --features test-utils -- -D warnings`: passed.
+- Server check: passed.
+- Server tests: 3830 passed, 1 ignored; all requested targets passed.
+- Server strict Clippy: passed.
+- `codeg-mcp` check and strict Clippy: passed.
+
+The final whole-branch review approved the implementation. All seven initial
+Important findings were closed: typed connection-loss persistence, exact
+workflow replay after later Task admission, completed/error fail-closed
+handling, structural missing-identity classification, informed recovery-card
+rendering, fail-closed validator polarity, and the complete structured MCP
+authorization result. The last scoped review found no Critical, Important, or
+Minor regression.
+
+Three historical Minor observations remain non-blocking:
+
+- The fingerprint-exclusion test does not fully cross a production snapshot
+  builder boundary.
+- Restart coverage does not explicitly assert the distinct phase, edge, and
+  gate collections.
+- A zero-row state-only CAS can diagnose a graph-revision race as stale
+  manifest revision, although rollback behavior is correct.
+
+The approved Design hashes were reverified from normalized Git content:
+
+- Delegation: `b8b04fb31daafd275d24fd8f712ff488d9a7429e7a3b9cd6a7f38c7b4cf0401d`
+- Workflow: `632d2c74a27fcff4c01b274b8b2bfb54fed35ea767cc2c39f5d0035352c87ce9`
+- B2D: `ded3bd24a6f01c6e3af737bb5e7ec012a14871948aad7c48d39b5785243ae2f0`
+
+Known non-blocking diagnostics remain the development-only missing
+`codeg-mcp` sidecar placeholder and Cargo's upstream `proc-macro-error2`
+future-incompatibility warning.
