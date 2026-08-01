@@ -1628,7 +1628,13 @@ async fn work_unit_replacement_at_limit_txn(
 async fn validate_replacement_insert_txn(
     txn: &DatabaseTransaction,
     insert: &ReservingRunInsert,
-) -> Result<crate::acp::delegation::recovery_policy::RecoveryDecision, TaskStoreError> {
+) -> Result<
+    (
+        crate::acp::delegation::recovery_policy::RecoveryDecision,
+        Option<String>,
+    ),
+    TaskStoreError,
+> {
     let replaced_id = insert
         .replaced_task_id
         .as_deref()
@@ -1779,7 +1785,7 @@ async fn validate_replacement_insert_txn(
         external_session_identity_hash,
         source_is_latest,
         source_superseded,
-        source_recovery_authorization_id,
+        source_recovery_authorization_id.clone(),
     );
     let requested_reason = ReplacementReason::parse(reason).ok_or_else(|| {
         TaskStoreError::InvalidReplacement(format!("replacement_reason {reason} is unsupported"))
@@ -1824,7 +1830,7 @@ async fn validate_replacement_insert_txn(
             "lineage_root_task_id must inherit replaced run".into(),
         ));
     }
-    Ok(central)
+    Ok((central, source_recovery_authorization_id))
 }
 
 /// SQLite-backed store for `delegation_task_runs` + conversation projection fence.
@@ -2228,7 +2234,7 @@ impl RunStore {
                         insert.replacement_reason.is_some(),
                     ) {
                         (true, true) => {
-                            let initial_decision =
+                            let (initial_decision, inherited_authorization_id) =
                                 validate_replacement_insert_txn(txn, &insert).await?;
                             preflight_replacement(
                                 txn,
@@ -2274,6 +2280,8 @@ impl RunStore {
                             let recovery_decision = consumed_authorization_id
                                 .is_some()
                                 .then_some(authorized_decision);
+                            let persisted_authorization_id = consumed_authorization_id
+                                .or(inherited_authorization_id.as_deref());
                             ensure_workflow_child_conversation_independent(
                                 txn,
                                 insert.parent_conversation_id,
@@ -2281,7 +2289,7 @@ impl RunStore {
                                 insert.child_conversation_id,
                             )
                             .await?;
-                            insert_reserving_txn(txn, &insert, consumed_authorization_id).await?;
+                            insert_reserving_txn(txn, &insert, persisted_authorization_id).await?;
 
                             let effect = admit_workflow_run_txn(
                                 txn,
@@ -14226,7 +14234,13 @@ mod termination_audit {
                 .admit_gen1_reserving(replacement)
                 .await
                 .expect("authorization provenance inherits replacement confirmation");
-            assert!(matches!(admitted, Gen1AdmitOutcome::Created(_)));
+            let Gen1AdmitOutcome::Created(replacement) = admitted else {
+                panic!("expected inherited replacement without a second authorization decision");
+            };
+            assert_eq!(
+                replacement.recovery_authorization_id.as_deref(),
+                Some(authorization_id.as_str())
+            );
             let receipt = RecoveryAuthorizationStore::new(db.conn.clone())
                 .find_by_id(&authorization_id)
                 .await
