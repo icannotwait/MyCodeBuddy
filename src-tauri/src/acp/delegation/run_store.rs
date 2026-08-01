@@ -8015,7 +8015,7 @@ mod tests {
             "admission_unknown must not collapse into unresumable"
         );
 
-        // Full adapter has no authorization input until Task 9.
+        // The shared adapter now exposes the typed Task 9 confirmation.
         let repl_child =
             new_replacement_child(&db, parent_id, "tu-adm-unk-elig", "repl-adm-unk-elig").await;
         let mut repl = base_replacement_insert(
@@ -8030,7 +8030,10 @@ mod tests {
             .admit_gen1_reserving(repl)
             .await
             .expect_err("admission_unknown replacement must fail closed");
-        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(matches!(
+            err,
+            TaskStoreError::RecoveryConfirmationRequired(_)
+        ));
         assert!(
             store
                 .load_by_task_id("repl-adm-unk-elig")
@@ -12660,7 +12663,7 @@ mod tests {
     #[tokio::test]
     async fn promote_running_compat_maps_budget_exhausted_to_err() {
         use crate::db::entities::delegation_lineage_budget;
-        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use sea_orm::{ActiveModelTrait, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) =
@@ -12680,14 +12683,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        let row = delegation_lineage_budget::Entity::find_by_id(lineage)
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .expect("budget row");
-        let mut active = row.into_active_model();
-        active.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        active.update(&db.conn).await.unwrap();
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage.to_string()),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed exhausted lineage rail");
 
         ensure_bound(&store, "uc-cb-3", "conn-cb3").await;
         let err = store
