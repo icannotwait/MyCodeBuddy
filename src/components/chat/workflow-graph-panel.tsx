@@ -315,9 +315,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
                             className="flex items-center gap-2 px-1 text-[10px] font-medium text-muted-foreground"
                             data-testid={`workflow-task-reviewer-count-${taskIndex}`}
                           >
-                            <span>
-                              {t("taskIndex", { index: taskIndex })}
-                            </span>
+                            <span>{t("taskIndex", { index: taskIndex })}</span>
                             {row.reviewerProgress && (
                               <span className="tabular-nums">
                                 {t("gateProgress", row.reviewerProgress)}

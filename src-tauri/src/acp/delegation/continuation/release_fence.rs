@@ -75,10 +75,11 @@ mod tests {
     #[tokio::test]
     async fn foreground_mcp_release_fence_stays_pending_while_owner_is_armed() {
         let (owner, mut waiter) = foreground_mcp_release_fence();
-        assert!(matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), waiter.wait_ref()).await,
-            Err(_)
-        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), waiter.wait_ref())
+                .await
+                .is_err()
+        );
         owner.frame_flushed();
         assert_eq!(
             waiter.wait().await,

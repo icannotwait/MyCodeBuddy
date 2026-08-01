@@ -1202,7 +1202,7 @@ pub mod mock {
 
     #[derive(Debug, Clone)]
     enum SettleScript {
-        Ok(Settlement),
+        Ok(Box<Settlement>),
         Err(TaskStoreError),
     }
 
@@ -1365,7 +1365,7 @@ pub mod mock {
             self.settle_script
                 .lock()
                 .await
-                .push_back(SettleScript::Ok(settlement));
+                .push_back(SettleScript::Ok(Box::new(settlement)));
         }
 
         pub async fn queue_settle_err(&self, err: TaskStoreError) {
@@ -1558,7 +1558,7 @@ pub mod mock {
 
             if let Some(scripted) = self.settle_script.lock().await.pop_front() {
                 return match scripted {
-                    SettleScript::Ok(s) => Ok(s),
+                    SettleScript::Ok(s) => Ok(*s),
                     SettleScript::Err(e) => Err(e),
                 };
             }
