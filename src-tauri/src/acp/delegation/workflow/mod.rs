@@ -71,3 +71,6 @@ pub use store::{
 };
 pub use types::*;
 pub use validate::validate_manifest_document;
+
+#[cfg(test)]
+mod recovery_tests;
