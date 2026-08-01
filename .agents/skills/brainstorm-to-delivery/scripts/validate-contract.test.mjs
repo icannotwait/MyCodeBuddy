@@ -1208,6 +1208,76 @@ describe("authorized recovery validator contract", () => {
     })
   }
 
+  const recoveryTokenActions = [
+    ["request_recovery_authorization", "call", "called"],
+    ["recovery_authorization_id", "supply", "supplied"],
+    ["recovery_confirmation_required", "honor", "honored"],
+    ["recover_workflow", "call", "called"],
+  ]
+  const boundedNegativeConstructions = [
+    ["forbidden", ({ token }) => `${token} is forbidden during recovery.`],
+    ["prohibited", ({ token }) => `${token} is prohibited during recovery.`],
+    [
+      "under no circumstances",
+      ({ token, passive }) =>
+        `${token} must under no circumstances be ${passive} during recovery.`,
+    ],
+    [
+      "not allowed",
+      ({ token, passive }) =>
+        `${token} is not allowed to be ${passive} during recovery.`,
+    ],
+    [
+      "not permitted",
+      ({ token, passive }) =>
+        `${token} is not permitted to be ${passive} during recovery.`,
+    ],
+    [
+      "must not",
+      ({ token, passive }) =>
+        `${token} must not be ${passive} during recovery.`,
+    ],
+    [
+      "should not",
+      ({ token, passive }) =>
+        `${token} should not be ${passive} during recovery.`,
+    ],
+    [
+      "may not",
+      ({ token, passive }) => `${token} may not be ${passive} during recovery.`,
+    ],
+    [
+      "do not",
+      ({ token, active }) => `Do not ${active} ${token} during recovery.`,
+    ],
+    [
+      "not",
+      ({ token, passive }) =>
+        `${token} is not to be ${passive} during recovery.`,
+    ],
+    [
+      "never",
+      ({ token, passive }) =>
+        `${token} must never be ${passive} during recovery.`,
+    ],
+    [
+      "cannot",
+      ({ token, passive }) => `${token} cannot be ${passive} during recovery.`,
+    ],
+  ]
+  for (const [token, active, passive] of recoveryTokenActions) {
+    for (const [construction, mutation] of boundedNegativeConstructions) {
+      it(`uses B2D-R001 when ${token} is negated with ${construction}`, () => {
+        const extra = mutation({ token, active, passive })
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${extra}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+  }
+
   for (const [token, safeNegative] of [
     [
       "recovery_authorization_id",
@@ -1225,7 +1295,8 @@ describe("authorized recovery validator contract", () => {
         token
       )
       assertHasRuleId(
-        validateSkillMarkdown(`${stripped}\n${restoredSafeNegative}\n`).failures,
+        validateSkillMarkdown(`${stripped}\n${restoredSafeNegative}\n`)
+          .failures,
         "B2D-R001"
       )
     })

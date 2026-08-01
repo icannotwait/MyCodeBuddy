@@ -143,6 +143,31 @@ function isSafeNegatedRecoveryClause(clause, token) {
   return false
 }
 
+function hasRecoverySuffixNegation(afterToken) {
+  const suffix = afterToken.slice(0, 180)
+  const separator = "\\s*(?:[,():-]\\s*)?"
+  return (
+    new RegExp(
+      `^${separator}` +
+        `(?:(?:must|should|does|do|is|are|was|were|will|would|can|could|may)\\s+)?` +
+        `(?:not|never|cannot|can't)\\b`,
+      "i"
+    ).test(suffix) ||
+    new RegExp(
+      `^${separator}` +
+        `(?:is|are|was|were|be|being)\\s+` +
+        `(?:strictly\\s+)?(?:forbidden|prohibited)\\b`,
+      "i"
+    ).test(suffix) ||
+    new RegExp(
+      `^${separator}` +
+        `(?:(?:must|should|will|would|can|could|may)\\s+)?` +
+        `under\\s+no\\s+circumstances\\b`,
+      "i"
+    ).test(suffix)
+  )
+}
+
 function recoveryTokenMentions(skill, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   const exactToken = new RegExp(
@@ -152,22 +177,24 @@ function recoveryTokenMentions(skill, token) {
   const mentions = []
   const clauses = skill
     .split(/\r?\n\s*\r?\n/)
-    .flatMap((paragraph) => paragraph.replace(/\r?\n/g, " ").split(/(?<=[.!?;])/))
+    .flatMap((paragraph) =>
+      paragraph.replace(/\r?\n/g, " ").split(/(?<=[.!?;])/)
+    )
   for (const clause of clauses) {
     exactToken.lastIndex = 0
     for (const match of clause.matchAll(exactToken)) {
       const tokenStart = match.index + match[1].length
       const tokenEnd = tokenStart + token.length
       const before = clause.slice(Math.max(0, tokenStart - 180), tokenStart)
-      const after = clause.slice(tokenEnd, Math.min(clause.length, tokenEnd + 180))
+      const after = clause.slice(
+        tokenEnd,
+        Math.min(clause.length, tokenEnd + 180)
+      )
       const prefixNegated =
         /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\s+(?:[A-Za-z0-9_-]+\s+){0,12}$/i.test(
           before
         )
-      const suffixNegated =
-        /^\s*(?:[,():-]\s*)?(?:(?:must|should|does|do|is|are|was|were|will|would|can|could|may)\s+)?(?:not|never|cannot|can't)\b/i.test(
-          after
-        )
+      const suffixNegated = hasRecoverySuffixNegation(after)
       const negated = prefixNegated || suffixNegated
       const polarity =
         negated && isSafeNegatedRecoveryClause(clause, token)
