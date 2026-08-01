@@ -19,7 +19,8 @@ use codeg_lib::acp::delegation::broker::{
 use codeg_lib::acp::delegation::card_summary::{extract_card_summary, CARD_SUMMARY_MARKER};
 use codeg_lib::acp::delegation::run_store::{
     derive_task_preview, request_fingerprint, ReservingRunInsert, RunStore, REPLACEMENT_LIMIT,
-    REPLACEMENT_REASON_UNRESUMABLE, UNEXPECTED_CONTINUE_LIMIT,
+    REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE, REPLACEMENT_REASON_UNRESUMABLE,
+    UNEXPECTED_CONTINUE_LIMIT,
 };
 use codeg_lib::acp::delegation::spawner::{
     accepted, mock::MockSpawner, ConnectionSpawner, DelegationLink,
@@ -28,6 +29,10 @@ use codeg_lib::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskSto
 use codeg_lib::acp::delegation::types::{
     ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
     DelegationSuccess, TaskStatus, CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
+};
+use codeg_lib::acp::termination::{
+    AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
+    AcpTerminationSummaryV1, DelegationTerminationAuditV1,
 };
 use codeg_lib::app_state::AppState;
 use codeg_lib::commands::delegation::get_delegation_run_snapshot_core;
@@ -135,6 +140,43 @@ fn continue_req(
         correlation_id: None,
         recovery_authorization_id: None,
     }
+}
+
+fn typed_running_termination_audit(
+    source: AcpTerminationSource,
+    reason: AcpTerminationReason,
+    admission_class: AdmissionClass,
+) -> String {
+    serde_json::to_string(&DelegationTerminationAuditV1::new(
+        AcpTerminationSummaryV1::new(
+            source,
+            reason,
+            AcpTerminationClassification::Unexpected,
+            true,
+            Utc::now(),
+        ),
+        DelegationRunStatus::Running,
+        admission_class,
+        None,
+        None,
+    ))
+    .expect("serialize typed termination audit")
+}
+
+fn unexpected_host_restart_audit(admission_class: AdmissionClass) -> String {
+    typed_running_termination_audit(
+        AcpTerminationSource::HostRestart,
+        AcpTerminationReason::HostRestarted,
+        admission_class,
+    )
+}
+
+fn unexpected_session_loss_audit(admission_class: AdmissionClass) -> String {
+    typed_running_termination_audit(
+        AcpTerminationSource::Session,
+        AcpTerminationReason::SessionLost,
+        admission_class,
+    )
 }
 
 fn completed_outcome(text: &str, child_id: i32, agent: AgentType) -> DelegationOutcome {
@@ -402,9 +444,9 @@ async fn shape_832_unexpected_interrupt_new_run_same_child() {
     let mut root = root.into_active_model();
     root.status = Set(DelegationRunStatus::Canceled);
     root.error_code = Set(Some("host_restarted".into()));
-    root.termination_audit_json = Set(Some(
-        r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#.into(),
-    ));
+    root.termination_audit_json = Set(Some(unexpected_host_restart_audit(
+        root.admission_class.clone().unwrap(),
+    )));
     root.update(&db.conn).await.expect("mark interrupted");
 
     mock.queue_spawn(Ok("832-recover".into())).await;
@@ -649,7 +691,7 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 },
             ],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "Same reviewer for re-review",
+            policy_outcome: "owners of open Critical and Important findings only",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -661,7 +703,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "Same implementer for fix rounds",
+            policy_outcome:
+                "Admitted key, role, agent, and profile remain frozen through every fix round",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -673,7 +716,7 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "Independent Codex | New per Task | Same reviewer",
+            policy_outcome: "Every new implement/fix artifact invalidates both prior reviews",
             must_differ_from: &["task|3|implementer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -715,7 +758,7 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Replacement],
-            policy_outcome: "Replacement only for `unresumable`",
+            policy_outcome: "Recovery is status-first and resume-first",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -727,7 +770,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "That Final thread only",
+            policy_outcome:
+                "Prefer `continue_delegation` when the ledger shows a recoverable thread",
             must_differ_from: &["task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -751,7 +795,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
-            policy_outcome: "at most one replacement and two unexpected continues per work unit",
+            policy_outcome:
+                "only while replacement budget remains; after replacement consumption, block",
             must_differ_from: &[],
             max_unexpected_continues: 2,
             max_replacements: 1,
@@ -777,13 +822,12 @@ fn skill_forward_routing_invariants_nine_scenarios() {
         "continue_delegation",
         "work_unit_key",
         "agent_type: \"grok\"",
-        "agent_type: \"codex\"",
-        "New per Task",
+        "\"codex\"",
+        "Admitted key, role, agent, and profile remain frozen",
         "final_review",
         "unresumable",
         "budget_exhausted_continue",
-        "not_supported",
-        "Always new",
+        "Final whole-branch review remains a new Codex child",
     ] {
         assert!(
             skill.contains(marker),
@@ -2006,6 +2050,9 @@ async fn pre_admission_replacement_retry_does_not_charge_until_running() {
         let mut row = row.into_active_model();
         row.status = Set(DelegationRunStatus::Failed);
         row.error_code = Set(Some("unresumable".into()));
+        row.termination_audit_json = Set(Some(unexpected_session_loss_audit(
+            row.admission_class.clone().unwrap(),
+        )));
         row.update(&db.conn).await.unwrap();
     }
 
@@ -2040,6 +2087,20 @@ async fn pre_admission_replacement_retry_does_not_charge_until_running() {
             "pre-running failure must not charge replacement rail: {b:?}"
         );
     }
+    let projection = runs
+        .recovery_projection_for_task(&root_id)
+        .await
+        .expect("load retry projection")
+        .expect("retry projection");
+    assert_eq!(projection.disposition, "replace", "{projection:?}");
+    assert_eq!(
+        projection
+            .replacement_reason
+            .as_ref()
+            .map(|reason| reason.as_str()),
+        Some(REPLACEMENT_REASON_UNRESUMABLE),
+        "{projection:?}"
+    );
 
     // Retry with same replaces_task_id / reason / work_unit_key succeeds.
     mock.queue_spawn(Ok("pa-rep2".into())).await;
@@ -2107,10 +2168,9 @@ async fn budget_no_refund_after_running_and_cap() {
         let mut row = row.into_active_model();
         row.status = Set(DelegationRunStatus::Canceled);
         row.error_code = Set(Some("host_restarted".into()));
-        row.termination_audit_json = Set(Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
-        ));
+        row.termination_audit_json = Set(Some(unexpected_host_restart_audit(
+            row.admission_class.clone().unwrap(),
+        )));
         row.update(&db.conn).await.unwrap();
 
         mock.queue_spawn(Ok(format!("bnr-uc-{i}"))).await;
@@ -2138,22 +2198,21 @@ async fn budget_no_refund_after_running_and_cap() {
                 ),
             )
             .await;
-        // Force audit-friendly cancel if complete_call mapped differently.
+        // Model another host restart after this accepted continuation. The
+        // broker's generic canceled outcome represents an explicit cancel,
+        // which is not the scenario this budget fixture exercises.
         let settled = DelegationTaskRun::find_by_id(&cont_id)
             .one(&db.conn)
             .await
             .unwrap()
             .unwrap();
-        if settled.status == DelegationRunStatus::Completed {
-            let mut settled = settled.into_active_model();
-            settled.status = Set(DelegationRunStatus::Canceled);
-            settled.error_code = Set(Some("host_restarted".into()));
-            settled.termination_audit_json = Set(Some(
-                r#"{"source":"interrupted","reason":"interrupted","prior_status":"running"}"#
-                    .into(),
-            ));
-            settled.update(&db.conn).await.unwrap();
-        }
+        let mut settled = settled.into_active_model();
+        settled.status = Set(DelegationRunStatus::Canceled);
+        settled.error_code = Set(Some("host_restarted".into()));
+        settled.termination_audit_json = Set(Some(unexpected_host_restart_audit(
+            settled.admission_class.clone().unwrap(),
+        )));
+        settled.update(&db.conn).await.unwrap();
         target = cont_id;
     }
 
@@ -2173,7 +2232,8 @@ async fn budget_no_refund_after_running_and_cap() {
         "charges stick after terminal; no refund"
     );
 
-    // Third unexpected continue is refused.
+    // A third unexpected continue is refused and projected as the required
+    // same-key budget-exhausted replacement.
     let row = DelegationTaskRun::find_by_id(&target)
         .one(&db.conn)
         .await
@@ -2182,10 +2242,25 @@ async fn budget_no_refund_after_running_and_cap() {
     let mut row = row.into_active_model();
     row.status = Set(DelegationRunStatus::Canceled);
     row.error_code = Set(Some("host_restarted".into()));
-    row.termination_audit_json = Set(Some(
-        r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#.into(),
-    ));
+    row.termination_audit_json = Set(Some(unexpected_host_restart_audit(
+        row.admission_class.clone().unwrap(),
+    )));
     row.update(&db.conn).await.unwrap();
+
+    let projection = runs
+        .recovery_projection_for_task(&target)
+        .await
+        .expect("load exhausted projection")
+        .expect("exhausted projection");
+    assert_eq!(projection.disposition, "replace", "{projection:?}");
+    assert_eq!(
+        projection
+            .replacement_reason
+            .as_ref()
+            .map(|reason| reason.as_str()),
+        Some(REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE),
+        "{projection:?}"
+    );
 
     let over = broker
         .continue_delegation(continue_req(
@@ -2198,7 +2273,7 @@ async fn budget_no_refund_after_running_and_cap() {
         .await;
     assert_eq!(
         over.error_code.as_deref(),
-        Some("budget_exhausted"),
+        Some("not_continuable"),
         "{over:?}"
     );
 }

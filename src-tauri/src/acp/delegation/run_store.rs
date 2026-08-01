@@ -832,18 +832,45 @@ fn is_pure_pre_admission_abort_row(row: &delegation_task_run::Model) -> bool {
         && !is_admission_recovery_error_code(row.error_code.as_deref())
 }
 
-/// Whether `task_id` has any durable replacement successor (direct edge).
-async fn has_replacement_successor_txn(
-    txn: &DatabaseTransaction,
-    task_id: &str,
+/// Whether any source in `source_task_ids` has a replacement successor that
+/// durably owns the edge. Pure pre-admission aborts are ignored unless they
+/// themselves have a successor (A<-B<-C).
+async fn replacement_sources_are_superseded<C: ConnectionTrait>(
+    conn: &C,
+    source_task_ids: Vec<String>,
 ) -> Result<bool, TaskStoreError> {
-    let hit = DelegationTaskRun::find()
-        .filter(delegation_task_run::Column::ReplacedTaskId.eq(task_id))
-        .limit(1)
-        .all(txn)
+    if source_task_ids.is_empty() {
+        return Ok(false);
+    }
+    let successors = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ReplacedTaskId.is_in(source_task_ids))
+        .all(conn)
         .await
         .map_err(map_db_err)?;
-    Ok(!hit.is_empty())
+    let mut pure_abort_task_ids = Vec::new();
+    for row in successors {
+        if matches!(
+            row.status,
+            DelegationRunStatus::Reserving | DelegationRunStatus::Running
+        ) || row.reached_running_at.is_some()
+        {
+            return Ok(true);
+        }
+        if !is_pure_pre_admission_abort_row(&row) {
+            return Ok(true);
+        }
+        pure_abort_task_ids.push(row.task_id);
+    }
+    if pure_abort_task_ids.is_empty() {
+        return Ok(false);
+    }
+    let transitive_successor = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ReplacedTaskId.is_in(pure_abort_task_ids))
+        .limit(1)
+        .all(conn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(!transitive_successor.is_empty())
 }
 
 /// Source is superseded when a replacement lineage edge owns it:
@@ -860,28 +887,22 @@ async fn replacement_source_is_superseded_txn(
     txn: &DatabaseTransaction,
     source_task_id: &str,
 ) -> Result<bool, TaskStoreError> {
-    let successors = DelegationTaskRun::find()
-        .filter(delegation_task_run::Column::ReplacedTaskId.eq(source_task_id))
-        .all(txn)
+    replacement_sources_are_superseded(txn, vec![source_task_id.to_string()]).await
+}
+
+async fn child_is_superseded_conn<C: ConnectionTrait>(
+    conn: &C,
+    child_conversation_id: i32,
+) -> Result<bool, TaskStoreError> {
+    let child_task_ids = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ChildConversationId.eq(child_conversation_id))
+        .all(conn)
         .await
-        .map_err(map_db_err)?;
-    for row in successors {
-        if matches!(
-            row.status,
-            DelegationRunStatus::Reserving | DelegationRunStatus::Running
-        ) || row.reached_running_at.is_some()
-        {
-            return Ok(true);
-        }
-        if !is_pure_pre_admission_abort_row(&row) {
-            return Ok(true);
-        }
-        // Pure pre-admission abort: supersede only if it left a successor.
-        if has_replacement_successor_txn(txn, &row.task_id).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .map_err(map_db_err)?
+        .into_iter()
+        .map(|row| row.task_id)
+        .collect();
+    replacement_sources_are_superseded(conn, child_task_ids).await
 }
 
 impl PersistedRun {
@@ -1286,25 +1307,7 @@ async fn build_continue_eligibility_txn(
     let is_latest =
         is_latest_run_on_child_txn(txn, target.child_conversation_id, &target.task_id).await?;
 
-    let child_task_ids: Vec<String> = DelegationTaskRun::find()
-        .filter(delegation_task_run::Column::ChildConversationId.eq(target.child_conversation_id))
-        .all(txn)
-        .await
-        .map_err(map_db_err)?
-        .into_iter()
-        .map(|row| row.task_id)
-        .collect();
-    let child_superseded = if child_task_ids.is_empty() {
-        false
-    } else {
-        !DelegationTaskRun::find()
-            .filter(delegation_task_run::Column::ReplacedTaskId.is_in(child_task_ids))
-            .limit(1)
-            .all(txn)
-            .await
-            .map_err(map_db_err)?
-            .is_empty()
-    };
+    let child_superseded = child_is_superseded_conn(txn, target.child_conversation_id).await?;
 
     let child = conversation::Entity::find_by_id(target.child_conversation_id)
         .one(txn)
@@ -2932,25 +2935,7 @@ impl RunStore {
         &self,
         child_conversation_id: i32,
     ) -> Result<bool, TaskStoreError> {
-        // Any run with replaced_task_id pointing at a run belonging to this child.
-        let child_task_ids: Vec<String> = DelegationTaskRun::find()
-            .filter(delegation_task_run::Column::ChildConversationId.eq(child_conversation_id))
-            .all(&self.db.conn)
-            .await
-            .map_err(map_db_err)?
-            .into_iter()
-            .map(|r| r.task_id)
-            .collect();
-        if child_task_ids.is_empty() {
-            return Ok(false);
-        }
-        let hit = DelegationTaskRun::find()
-            .filter(delegation_task_run::Column::ReplacedTaskId.is_in(child_task_ids))
-            .limit(1)
-            .all(&self.db.conn)
-            .await
-            .map_err(map_db_err)?;
-        Ok(!hit.is_empty())
+        child_is_superseded_conn(&self.db.conn, child_conversation_id).await
     }
 
     async fn child_continue_facts(
@@ -10385,7 +10370,10 @@ mod tests {
             .admit_gen1_reserving(ok)
             .await
             .expect_err("dedicated admission_unknown still requires authorization");
-        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+        assert!(matches!(
+            err,
+            TaskStoreError::RecoveryConfirmationRequired(_)
+        ));
         assert!(store
             .load_by_task_id("repl-adm-unres-ok")
             .await
