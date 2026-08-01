@@ -2846,7 +2846,8 @@
         "showMore": "展開",
         "showLess": "收合",
         "responseInterrupted": "回應已中斷",
-        "waitingForSubagents": "等待子任務中…"
+        "waitingForSubagents": "等待子任務中…",
+        "loadOlderHistory": "載入更早的訊息"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

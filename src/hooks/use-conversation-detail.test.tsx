@@ -22,6 +22,7 @@ function seedSession(detail: DbConversationDetail | null) {
           detail,
           detailLoading: false,
           detailError: null,
+          detailHistoryLoadingOlder: false,
           acpLoadError: null,
           localTurns: [],
           backgroundTurns: [],

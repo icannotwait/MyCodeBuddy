@@ -42,6 +42,13 @@ interface VirtualizedMessageThreadProps<T> {
   /** Extra className on the live footer shell. */
   footerClassName?: string
   /**
+   * Optional chrome above the virtualized rows (e.g. "Load earlier messages").
+   * Outside Virtua so it does not affect item indices / nav.
+   */
+  header?: ReactNode
+  /** Extra className on the header shell. */
+  headerClassName?: string
+  /**
    * Hint for the initial height (px) of an unmeasured item.
    * Virtua auto-measures every item once mounted, so this only
    * affects the very first paint — omit it if you don't care.
@@ -85,6 +92,8 @@ function VirtualizedMessageThreadImpl<T>({
   emptyState,
   footer,
   footerClassName,
+  header,
+  headerClassName,
   itemSize,
   bufferSize = 800,
   gap = 16,
@@ -98,11 +107,28 @@ function VirtualizedMessageThreadImpl<T>({
     useStickToBottomContext()
   const virtualizerHandleRef = useRef<VirtualizerHandle>(null)
   const footerShellRef = useRef<HTMLDivElement | null>(null)
+  const committedItemKeysRef = useRef<readonly string[]>([])
   const scrollToBottomRef = useRef(scrollToBottom)
   const stopScrollRef = useRef(stopScroll)
   scrollToBottomRef.current = scrollToBottom
   stopScrollRef.current = stopScroll
   const hasFooter = footer != null
+  const itemKeys = useMemo(
+    () => items.map((item, index) => getItemKey(item, index)),
+    [items, getItemKey]
+  )
+  const shiftForPrepend = useMemo(() => {
+    const previous = committedItemKeysRef.current
+    const added = itemKeys.length - previous.length
+    return (
+      added > 0 &&
+      previous.length > 0 &&
+      previous.every((key, index) => key === itemKeys[index + added])
+    )
+  }, [itemKeys])
+  useLayoutEffect(() => {
+    committedItemKeysRef.current = itemKeys
+  }, [itemKeys])
   // Seed follow intent once when footer appears (not on every re-render).
   const initialFollowRef = useRef(true)
   if (!hasFooter) {
@@ -307,6 +333,17 @@ function VirtualizedMessageThreadImpl<T>({
           (emptyState ?? null)
         ) : (
           <>
+            {header ? (
+              <div
+                data-message-history-header
+                className={cn(
+                  "mx-auto min-h-14 w-full max-w-3xl px-4 pt-4",
+                  headerClassName
+                )}
+              >
+                {header}
+              </div>
+            ) : null}
             {items.length > 0 ? (
               <Virtualizer
                 ref={virtualizerHandleRef}
@@ -315,6 +352,8 @@ function VirtualizedMessageThreadImpl<T>({
                 }
                 itemSize={itemSize}
                 bufferSize={bufferSize}
+                shift={shiftForPrepend}
+                startMargin={header ? 56 : 0}
               >
                 {items.map((item, index) => (
                   <div

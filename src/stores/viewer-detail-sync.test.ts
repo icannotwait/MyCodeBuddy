@@ -93,6 +93,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -268,7 +269,7 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID)
+    expect(mockGet).toHaveBeenCalledWith(CID, expect.any(Object))
     const turns = session()?.detail?.turns ?? []
     expect(turns.map((t) => t.role)).toEqual(["user", "assistant"])
     // The persisted load replaces the synthesized optimistic prompt.
@@ -400,7 +401,7 @@ describe("syncViewerDetail — pure viewer refetch", () => {
 
     useConversationRuntimeStore.getState().actions.syncViewerDetail(-7)
     await vi.advanceTimersByTimeAsync(0)
-    expect(mockGet).toHaveBeenCalledWith(500)
+    expect(mockGet).toHaveBeenCalledWith(500, expect.any(Object))
   })
 
   it("routes a positive-id nudge to a draft tab keyed by a negative runtime id", async () => {
@@ -430,7 +431,7 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     useConversationRuntimeStore.getState().actions.syncViewerDetail(CID)
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(mockGet).toHaveBeenCalledWith(CID)
+    expect(mockGet).toHaveBeenCalledWith(CID, expect.any(Object))
     const turns =
       useConversationRuntimeStore.getState().byConversationId.get(-7)?.detail
         ?.turns ?? []

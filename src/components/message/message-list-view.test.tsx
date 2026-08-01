@@ -33,8 +33,9 @@ import {
   initializeStreamingPerformanceConfig,
 } from "@/lib/acp/streaming-performance-config"
 
-const { virtualizerScrollToIndex } = vi.hoisted(() => ({
+const { virtualizerScrollToIndex, virtualizerKeysSpy } = vi.hoisted(() => ({
   virtualizerScrollToIndex: vi.fn(),
+  virtualizerKeysSpy: vi.fn(),
 }))
 
 // virtua / stick-to-bottom / heavy markdown — keep list tests focused.
@@ -43,6 +44,12 @@ vi.mock("virtua", () => ({
     props: { children?: ReactNode },
     ref: Ref<{ scrollToIndex: (i: number) => void }>
   ) {
+    const children = Array.isArray(props.children) ? props.children : []
+    virtualizerKeysSpy(
+      children.map(
+        (child) => (child as { key?: string | null } | null)?.key ?? null
+      )
+    )
     useImperativeHandle(ref, () => ({
       scrollToIndex: virtualizerScrollToIndex,
     }))
@@ -630,6 +637,7 @@ function seedHistory(
           },
           detailLoading: false,
           detailError: null,
+          detailHistoryLoadingOlder: false,
           acpLoadError: null,
           localTurns: [],
           optimisticTurns: [],
@@ -881,6 +889,59 @@ describe("MessageListView initial history scroll latch", () => {
     expect(
       screen.getByTestId("finish-initial-history-scroll")
     ).toBeInTheDocument()
+  })
+})
+
+describe("MessageListView history prepend keys", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    virtualizerKeysSpy.mockClear()
+    seedHistory([
+      userTurn("u1", "first"),
+      assistantTurn("a1", "first reply"),
+      userTurn("u2", "second"),
+      assistantTurn("a2", "second reply"),
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("keeps existing virtual row keys stable when older turns are prepended", () => {
+    renderMessageList()
+    const before = virtualizerKeysSpy.mock.calls[
+      virtualizerKeysSpy.mock.calls.length - 1
+    ]?.[0] as string[]
+
+    act(() => {
+      useConversationRuntimeStore.setState((state) => {
+        const current = state.byConversationId.get(CID)!
+        const next = new Map(state.byConversationId)
+        next.set(CID, {
+          ...current,
+          detail: {
+            ...current.detail!,
+            turns: [
+              userTurn("u0", "older"),
+              assistantTurn("a0", "older reply"),
+              ...current.detail!.turns,
+            ],
+          },
+        })
+        return { byConversationId: next }
+      })
+    })
+
+    const after = virtualizerKeysSpy.mock.calls[
+      virtualizerKeysSpy.mock.calls.length - 1
+    ]?.[0] as string[]
+    expect(after.slice(-before.length)).toEqual(before)
   })
 })
 

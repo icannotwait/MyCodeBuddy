@@ -50,6 +50,15 @@ function turn(
   }
 }
 
+function userTurn(id: string, text = id): MessageTurn {
+  return {
+    id,
+    role: "user",
+    blocks: [{ type: "text", text }],
+    timestamp: "2026-07-07T03:47:00.000Z",
+  }
+}
+
 function detail(
   overrides: Partial<DbConversationDetail> = {}
 ): DbConversationDetail {
@@ -92,6 +101,17 @@ function session(conversationId: number) {
 async function flushMicrotasks() {
   await Promise.resolve()
   await Promise.resolve()
+}
+
+function deferredDetail(): {
+  promise: Promise<DbConversationDetail>
+  resolve: (detail: DbConversationDetail) => void
+} {
+  let resolve!: (detail: DbConversationDetail) => void
+  const promise = new Promise<DbConversationDetail>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
 }
 
 beforeEach(() => {
@@ -298,7 +318,10 @@ describe("refetchDetail DB-id resolution", () => {
     // 1 call: `completeTurn` no longer fires an implicit refetch (see its
     // own comment — it raced the transcript's last write and lost content).
     expect(mockGetFolderConversation).toHaveBeenCalledTimes(1)
-    expect(mockGetFolderConversation).toHaveBeenCalledWith(42)
+    expect(mockGetFolderConversation).toHaveBeenCalledWith(
+      42,
+      expect.any(Object)
+    )
     // Result lands under the runtime key; the stale live buffers are gone and
     // the persisted (terminal) copy is what the timeline renders.
     expect(session(VIRTUAL)?.detail?.turns.map((t) => t.id)).toEqual(["turn-0"])
@@ -314,7 +337,270 @@ describe("refetchDetail DB-id resolution", () => {
     mockGetFolderConversation.mockResolvedValueOnce(detail())
     actions().refetchDetail(7)
     await flushMicrotasks()
-    expect(mockGetFolderConversation).toHaveBeenCalledWith(7)
+    expect(mockGetFolderConversation).toHaveBeenCalledWith(
+      7,
+      expect.any(Object)
+    )
+  })
+})
+
+describe("history page and refetch coordination", () => {
+  it("preserves the loaded oldest turn when remote history advances", async () => {
+    const loaded = Array.from({ length: 20 }, (_, index) =>
+      userTurn(`u${index + 1}`)
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        turns: loaded,
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 40,
+          total_user_turn_count: 40,
+          user_turn_limit: 20,
+          returned_user_turn_count: 20,
+        },
+      })
+    )
+    actions().fetchDetail(7)
+    await flushMicrotasks()
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        turns: [
+          ...Array.from({ length: 19 }, (_, index) =>
+            userTurn(`u${index + 2}`)
+          ),
+          userTurn("u21"),
+        ],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 41,
+          total_user_turn_count: 41,
+          user_turn_limit: 20,
+          returned_user_turn_count: 20,
+        },
+      })
+    )
+    actions().refetchDetail(7)
+    await flushMicrotasks()
+
+    expect(session(7)?.detail?.turns.map((entry) => entry.id)).toEqual(
+      Array.from({ length: 21 }, (_, index) => `u${index + 1}`)
+    )
+    expect(session(7)?.detail?.history_window).toMatchObject({
+      returned_user_turn_count: 21,
+      user_turn_limit: 21,
+    })
+  })
+
+  it("lets a newer refetch own a pending older page without losing its depth", async () => {
+    const current = detail({
+      turns: [userTurn("u21"), turn("a21", "current")],
+      history_window: {
+        has_more_before: true,
+        total_turn_count: 80,
+        total_user_turn_count: 40,
+        user_turn_limit: 20,
+        returned_user_turn_count: 1,
+      },
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(current)
+    actions().fetchDetail(7)
+    await flushMicrotasks()
+
+    const older = deferredDetail()
+    const refetch = deferredDetail()
+    mockGetFolderConversation
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(refetch.promise)
+
+    actions().loadOlderHistory(7)
+    actions().refetchDetail(7)
+
+    expect(mockGetFolderConversation).toHaveBeenNthCalledWith(3, 7, {
+      historyUserTurnLimit: 40,
+    })
+
+    older.resolve(
+      detail({
+        turns: [userTurn("u1"), turn("a1", "older")],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 80,
+          total_user_turn_count: 40,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    await flushMicrotasks()
+    expect(session(7)?.detail?.turns.map((entry) => entry.id)).toEqual([
+      "u1",
+      "a1",
+      "u21",
+      "a21",
+    ])
+
+    refetch.resolve(
+      detail({
+        turns: [
+          userTurn("u1"),
+          turn("a1", "older"),
+          userTurn("u21"),
+          turn("a21", "current"),
+        ],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 80,
+          total_user_turn_count: 40,
+          user_turn_limit: 40,
+          returned_user_turn_count: 2,
+        },
+      })
+    )
+    await flushMicrotasks()
+    expect(session(7)?.detail?.turns.map((entry) => entry.id)).toEqual([
+      "u1",
+      "a1",
+      "u21",
+      "a21",
+    ])
+  })
+
+  it("invalidates an older viewer refetch before prepending a history page", async () => {
+    const current = detail({
+      turns: [userTurn("u21"), turn("a21", "current")],
+      history_window: {
+        has_more_before: true,
+        total_turn_count: 80,
+        total_user_turn_count: 40,
+        user_turn_limit: 20,
+        returned_user_turn_count: 1,
+      },
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(current)
+    actions().fetchDetail(7)
+    await flushMicrotasks()
+
+    const viewerRefetch = deferredDetail()
+    const older = deferredDetail()
+    mockGetFolderConversation
+      .mockReturnValueOnce(viewerRefetch.promise)
+      .mockReturnValueOnce(older.promise)
+
+    actions().syncViewerDetail(7)
+    actions().loadOlderHistory(7)
+
+    older.resolve(
+      detail({
+        turns: [userTurn("u1"), turn("a1", "older")],
+        history_window: {
+          has_more_before: false,
+          total_turn_count: 4,
+          total_user_turn_count: 2,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    await flushMicrotasks()
+
+    viewerRefetch.resolve(current)
+    await flushMicrotasks()
+
+    expect(session(7)?.detail?.turns.map((entry) => entry.id)).toEqual([
+      "u1",
+      "a1",
+      "u21",
+      "a21",
+    ])
+  })
+
+  it("does not recreate a removed session when an older page returns late", async () => {
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        turns: [userTurn("u21")],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 40,
+          total_user_turn_count: 40,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    actions().fetchDetail(7)
+    await flushMicrotasks()
+
+    const older = deferredDetail()
+    mockGetFolderConversation.mockReturnValueOnce(older.promise)
+    actions().loadOlderHistory(7)
+    actions().removeConversation(7)
+
+    older.resolve(detail({ turns: [userTurn("u1")] }))
+    await flushMicrotasks()
+
+    expect(session(7)).toBeUndefined()
+  })
+
+  it("does not let a superseded page clear a newer page loading state", async () => {
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        turns: [userTurn("u21")],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 40,
+          total_user_turn_count: 40,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    actions().fetchDetail(7)
+    await flushMicrotasks()
+
+    const firstPage = deferredDetail()
+    mockGetFolderConversation.mockReturnValueOnce(firstPage.promise)
+    actions().loadOlderHistory(7)
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        turns: [userTurn("u1"), userTurn("u21")],
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 40,
+          total_user_turn_count: 40,
+          user_turn_limit: 40,
+          returned_user_turn_count: 2,
+        },
+      })
+    )
+    actions().refetchDetail(7)
+    await flushMicrotasks()
+
+    const secondPage = deferredDetail()
+    mockGetFolderConversation.mockReturnValueOnce(secondPage.promise)
+    actions().loadOlderHistory(7)
+    expect(session(7)?.detailHistoryLoadingOlder).toBe(true)
+
+    firstPage.resolve(detail({ turns: [userTurn("stale")] }))
+    await flushMicrotasks()
+    expect(session(7)?.detailHistoryLoadingOlder).toBe(true)
+
+    secondPage.resolve(
+      detail({
+        turns: [userTurn("u0")],
+        history_window: {
+          has_more_before: false,
+          total_turn_count: 3,
+          total_user_turn_count: 3,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    await flushMicrotasks()
+    expect(session(7)?.detailHistoryLoadingOlder).toBe(false)
   })
 })
 

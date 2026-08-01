@@ -700,6 +700,20 @@ export interface ConversationsBulkChanged {
 
 export const CONVERSATIONS_BULK_CHANGED_EVENT = "conversations://bulk-changed"
 
+/** Mirrors Rust `HistoryWindowInfo` on windowed detail responses. */
+export interface HistoryWindowInfo {
+  /** Older turns exist before `turns[0]` in the full transcript. */
+  has_more_before: boolean
+  /** Total turns in the full (pre-window) transcript. */
+  total_turn_count: number
+  /** Total user-role turns in the full transcript. */
+  total_user_turn_count: number
+  /** Effective user-turn limit (`0` = unlimited). */
+  user_turn_limit: number
+  /** User turns included in the returned window. */
+  returned_user_turn_count: number
+}
+
 export interface DbConversationDetail {
   summary: DbConversationSummary
   turns: MessageTurn[]
@@ -726,6 +740,11 @@ export interface DbConversationDetail {
    * or when projection fails. Never includes `work_unit_key`.
    */
   workflow_graph?: WorkflowGraphSnapshot | null
+  /**
+   * Present when this detail was clipped to a user-turn window. Clients use
+   * `has_more_before` to offer "load older".
+   */
+  history_window?: HistoryWindowInfo | null
 }
 
 /** Mirrors Rust `WorkflowCompatibility`. */

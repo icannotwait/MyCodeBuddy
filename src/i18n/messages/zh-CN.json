@@ -2846,7 +2846,8 @@
         "showMore": "展开",
         "showLess": "收起",
         "responseInterrupted": "响应已中断",
-        "waitingForSubagents": "等待子任务中…"
+        "waitingForSubagents": "等待子任务中…",
+        "loadOlderHistory": "加载更早的消息"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

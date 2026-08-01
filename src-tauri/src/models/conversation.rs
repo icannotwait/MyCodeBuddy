@@ -127,6 +127,22 @@ pub struct ConversationDetail {
     pub transcript_watermark: Option<u64>,
 }
 
+/// Describes a user-turn window applied to [`DbConversationDetail::turns`].
+/// Absent when the client requested unlimited history (or omitted windowing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryWindowInfo {
+    /// Older turns exist before `turns[0]` in the full transcript.
+    pub has_more_before: bool,
+    /// Total turns in the full (pre-window) transcript.
+    pub total_turn_count: u32,
+    /// Total user-role turns in the full transcript.
+    pub total_user_turn_count: u32,
+    /// Effective user-turn limit applied for this response (`0` = unlimited).
+    pub user_turn_limit: u32,
+    /// Number of user turns included in the returned window.
+    pub returned_user_turn_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DbConversationDetail {
     pub summary: DbConversationSummary,
@@ -151,6 +167,10 @@ pub struct DbConversationDetail {
     /// no recognized A1 keys, or when projection fails (never fails detail load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_graph: Option<crate::acp::delegation::workflow::WorkflowGraphSnapshot>,
+    /// Present when this detail was clipped to a user-turn window. Clients use
+    /// `has_more_before` to offer "load older" and keep scrollback expandable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_window: Option<HistoryWindowInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

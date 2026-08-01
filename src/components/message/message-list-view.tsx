@@ -358,7 +358,7 @@ type AssistantTurnItem = Extract<ThreadRenderItem, { kind: "turn" }>
  * group. Valid only while every member's group reference and item key still
  * match: group identity flows through the per-turn adapter + group caches, so
  * member-group equality implies unchanged content AND sourceTurns, while the
- * keys embed phase/id/index so ordering or phase drift invalidates too. A run
+ * keys embed phase/role/id so identity or phase drift invalidates too. A run
  * containing the streaming turn misses every batch by construction (the
  * streaming turn re-adapts per batch) — that residual rebuild is the point;
  * purely historical runs hit and keep their group/parts/sourceTurns
@@ -1128,6 +1128,27 @@ export function MessageListView({
     "incremental_live_transcript"
   )
   const showThinking = useAgentThinkingVisibility(agentType)
+  const historyWindow = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.detail?.history_window ?? null,
+      [conversationId]
+    )
+  )
+  const detailHistoryLoadingOlder = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.detailHistoryLoadingOlder ??
+        false,
+      [conversationId]
+    )
+  )
+  const loadOlderHistory = useConversationRuntimeStore(
+    (s) => s.actions.loadOlderHistory
+  )
+  const onLoadOlderHistory = useCallback(() => {
+    loadOlderHistory(conversationId)
+  }, [conversationId, loadOlderHistory])
 
   // One-shot latch: initialized once from mount-time eligibility; only the
   // controller clears it. Later prop changes never re-arm this state.
@@ -1316,11 +1337,12 @@ export function MessageListView({
         }
         groupCache.set(msg, group)
       }
-      // Include phase so a turn that briefly coexists across phases (e.g.
+      // Include phase and role so a turn that briefly coexists across phases (e.g.
       // a streaming turn that has just been promoted to localTurns while the
       // liveMessage is still attached) doesn't collide with itself in the
-      // virtualized list. Index disambiguates further within a phase.
-      const key = `${phase}-${msg.id}-${i}`
+      // virtualized list. Never include the array index: older-page prepends
+      // must keep every existing Virtua key stable for scroll anchoring.
+      const key = `${phase}-${role}-${msg.id}`
       // Hoist a compaction-only turn to its own standalone divider item so it
       // renders BETWEEN turns instead of being merged into (and wedged inside)
       // the preceding assistant reply by `mergeConsecutiveAssistantTurns`.
@@ -1789,6 +1811,31 @@ export function MessageListView({
           getItemKey={getThreadItemKey}
           renderItem={renderThreadItem}
           emptyState={emptyState}
+          header={
+            historyWindow?.has_more_before ? (
+              <div className="flex justify-center pb-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={onLoadOlderHistory}
+                  disabled={detailHistoryLoadingOlder}
+                  aria-busy={detailHistoryLoadingOlder}
+                  data-testid="load-older-history"
+                >
+                  {detailHistoryLoadingOlder ? (
+                    <Loader2
+                      aria-hidden="true"
+                      className="me-1.5 h-3.5 w-3.5 animate-spin"
+                    />
+                  ) : null}
+                  {detailHistoryLoadingOlder
+                    ? t("loading")
+                    : t("loadOlderHistory")}
+                </Button>
+              </div>
+            ) : null
+          }
           footer={liveFooter}
           scrollApiRef={scrollApiRef}
         />

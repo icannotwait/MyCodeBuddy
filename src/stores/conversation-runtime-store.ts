@@ -4,6 +4,14 @@ import type {
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
 import { getFolderConversation } from "@/lib/api"
+import {
+  coldHistoryFetchOptions,
+  countUserTurns,
+  loadOlderHistoryFetchOptions,
+  prependHistoryPage,
+  preserveLoadedHistoryOnRefetch,
+  refetchHistoryFetchOptions,
+} from "@/lib/history-window"
 import { useWorkflowGraphStore } from "@/lib/workflow-graph-store"
 import {
   cacheCompletedStreamingPartition,
@@ -162,6 +170,8 @@ export interface ConversationRuntimeSession {
   detail: DbConversationDetail | null
   detailLoading: boolean
   detailError: string | null
+  /** True while a "load older history" page fetch is in flight. */
+  detailHistoryLoadingOlder: boolean
 
   // ACP `session/load` failed in a non-recoverable way (currently only when
   // the agent reports ResourceNotFound for the historical session_id). Set
@@ -395,6 +405,19 @@ type Action =
       preserveLive?: boolean
     }
   | {
+      type: "LOAD_OLDER_HISTORY_START"
+      conversationId: number
+    }
+  | {
+      type: "LOAD_OLDER_HISTORY_SUCCESS"
+      conversationId: number
+      page: DbConversationDetail
+    }
+  | {
+      type: "LOAD_OLDER_HISTORY_ERROR"
+      conversationId: number
+    }
+  | {
       type: "SET_DELEGATE_SYNC_ERROR"
       conversationId: number
       error: string | null
@@ -590,6 +613,7 @@ function createEmptySession(
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -610,6 +634,19 @@ function createEmptySession(
     softFence: false,
     ownerPreserve: false,
   }
+}
+
+function runtimeRefetchHistoryFetchOptions(
+  session: ConversationRuntimeSession | null | undefined
+) {
+  const additionalUserTurns =
+    countUserTurns(session?.localTurns) +
+    countUserTurns(session?.optimisticTurns)
+  return refetchHistoryFetchOptions(
+    session?.detail,
+    session?.detailHistoryLoadingOlder ?? false,
+    additionalUserTurns
+  )
 }
 
 /** Resolve session agent type from loaded detail (conversation summary). */
@@ -1804,7 +1841,11 @@ function reducer(
       const current =
         state.byConversationId.get(action.conversationId) ??
         createEmptySession(action.conversationId)
-      const nextExternalId = action.detail.summary.external_id ?? null
+      const detail = preserveLoadedHistoryOnRefetch(
+        current.detail,
+        action.detail
+      )
+      const nextExternalId = detail.summary.external_id ?? null
 
       // DB data is authoritative for completed turns. Normally clear all the
       // in-flight buffers (localTurns/optimisticTurns/liveMessage). Preserve
@@ -1823,7 +1864,7 @@ function reducer(
       // stale id) could then hide that completed reply. So treat it like
       // `preserveLive` and keep every live buffer; a settled (non-in-flight) load
       // replaces them authoritatively.
-      const detailIsInFlight = action.detail.in_flight_user_turn_id != null
+      const detailIsInFlight = detail.in_flight_user_turn_id != null
       const isActivelyInteracting =
         current.syncState === "awaiting_persist" ||
         action.preserveLive === true ||
@@ -1838,7 +1879,7 @@ function reducer(
       // parsed from bytes appended after this fetch read the file). A detail
       // without a watermark (non-Claude parser) retires nothing — its overlay
       // is never populated anyway.
-      const detailWatermark = action.detail.transcript_watermark ?? null
+      const detailWatermark = detail.transcript_watermark ?? null
       const retainedBackground =
         detailWatermark === null
           ? current.backgroundTurns
@@ -1850,12 +1891,13 @@ function reducer(
 
       const nextSessionBase: ConversationRuntimeSession = {
         ...current,
-        detail: action.detail,
+        detail,
         detailLoading: false,
         detailError: null,
+        detailHistoryLoadingOlder: false,
         delegateSyncError: null,
         externalId: nextExternalId ?? current.externalId,
-        sessionStats: action.detail.session_stats ?? current.sessionStats,
+        sessionStats: detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
         ...(isActivelyInteracting
           ? keepAllLiveBuffers
@@ -1866,13 +1908,10 @@ function reducer(
       // When live buffers are cleared, re-derive activities from the last
       // assistant turn in detail (+ any remaining localTurns). While live is
       // preserved, keep existing store activities (live path owns them).
-      const agentType = action.detail.summary.agent_type
+      const agentType = detail.summary.agent_type
       let delegationActivities = nextSessionBase.delegationActivities
       if (!isActivelyInteracting || !keepAllLiveBuffers) {
-        const sourceTurns = [
-          ...action.detail.turns,
-          ...nextSessionBase.localTurns,
-        ]
+        const sourceTurns = [...detail.turns, ...nextSessionBase.localTurns]
         delegationActivities = deriveActivitiesFromAssistantTurns(
           sourceTurns,
           agentType
@@ -1906,6 +1945,34 @@ function reducer(
         conversationIdByExternalId: nextExternalIndex,
       }
     }
+
+    case "LOAD_OLDER_HISTORY_START":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detailHistoryLoadingOlder: true,
+      }))
+
+    case "LOAD_OLDER_HISTORY_SUCCESS": {
+      return updateSessionInState(state, action.conversationId, (current) => {
+        if (!current.detail) {
+          return {
+            ...current,
+            detailHistoryLoadingOlder: false,
+          }
+        }
+        return {
+          ...current,
+          detail: prependHistoryPage(current.detail, action.page),
+          detailHistoryLoadingOlder: false,
+        }
+      })
+    }
+
+    case "LOAD_OLDER_HISTORY_ERROR":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detailHistoryLoadingOlder: false,
+      }))
 
     case "FETCH_DETAIL_ERROR":
       return updateSessionInState(state, action.conversationId, (current) => ({
@@ -2447,6 +2514,7 @@ function reducer(
         detail: to.detail ?? from.detail,
         detailLoading: to.detailLoading || from.detailLoading,
         detailError: to.detailError ?? from.detailError,
+        detailHistoryLoadingOlder: false,
         localTurns: [...from.localTurns, ...to.localTurns],
         optimisticTurns: [...from.optimisticTurns, ...to.optimisticTurns],
         liveMessage: mergedLiveMessage,
@@ -2722,9 +2790,13 @@ function reducer(
       }
 
       // Branch A — Authoritative replace when detail non-empty OR both empty.
-      const stamped = stampUserStopSourceOnFence(
+      const stampedIncoming = stampUserStopSourceOnFence(
         action.detail,
         action.key.providerTurnId
+      )
+      const stamped = preserveLoadedHistoryOnRefetch(
+        current.detail,
+        stampedIncoming
       )
       const detailWatermark = stamped.transcript_watermark ?? null
       const retainedBackground =
@@ -2869,6 +2941,12 @@ export interface RuntimeActions {
     options: { reason: "manual_reload" }
   ) => void
   /**
+   * Fetch the previous user-turn page and prepend it to `detail.turns`.
+   * No-op when `history_window.has_more_before` is false or a page is already
+   * loading.
+   */
+  loadOlderHistory: (conversationId: number) => void
+  /**
    * Attach interrupted `TurnOutcome` to the current-turn assistant or an
    * outcome-only turn. Idempotent by `(connectionId, completionSeq)`.
    * Returns whether this call newly recorded the outcome (`recorded`) or the
@@ -2977,6 +3055,7 @@ export interface ConversationRuntimeContextValue extends RuntimeActions {
 // and resurrection-after-remove races. Cells are kept indefinitely (small int
 // per conversation); a cleanup sweep isn't needed for the expected cardinality.
 const fetchGeneration = new Map<number, number>()
+const historyPageGeneration = new Map<number, number>()
 
 function bumpFetchGeneration(conversationId: number): number {
   const next = (fetchGeneration.get(conversationId) ?? 0) + 1
@@ -2989,6 +3068,19 @@ function isLatestGeneration(
   generation: number
 ): boolean {
   return fetchGeneration.get(conversationId) === generation
+}
+
+function bumpHistoryPageGeneration(conversationId: number): number {
+  const next = (historyPageGeneration.get(conversationId) ?? 0) + 1
+  historyPageGeneration.set(conversationId, next)
+  return next
+}
+
+function isLatestHistoryPageGeneration(
+  conversationId: number,
+  generation: number
+): boolean {
+  return historyPageGeneration.get(conversationId) === generation
 }
 
 // ─── User-stop cancel reconciliation ─────────────────────────────────────
@@ -3360,11 +3452,23 @@ function runCancelReconcileAttempt(
     .byConversationId.get(conversationId)
   // Resolve persisted fetch id at attempt start (survives runtime-key migrate).
   const fetchId = resolvePersistedConversationId(session, conversationId)
+  const pageGeneration = historyPageGeneration.get(conversationId) ?? 0
 
-  getFolderConversation(fetchId)
+  // The fence is on the just-aborted tail, but Branch A installs this detail
+  // authoritatively. Preserve any older pages the user already loaded.
+  getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(session))
     .then((detail) => {
       if (runtime.cancelled) return
       if (!cancelReconcileGatesStillHold(runtime)) return
+      if (
+        runtime.conversationId !== conversationId ||
+        (historyPageGeneration.get(conversationId) ?? 0) !== pageGeneration
+      ) {
+        // Pagination changed the retained prefix while this read was in
+        // flight. Retry with the current expanded window before reconciling.
+        runCancelReconcileAttempt(runtime, attemptIndex)
+        return
+      }
       if (!detailHasMatchingCancelFence(detail, key.providerTurnId)) {
         const next = attemptIndex + 1
         if (next < CANCEL_RECONCILE_DELAYS_MS.length) {
@@ -4203,7 +4307,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    getFolderConversation(conversationId)
+    getFolderConversation(conversationId, coldHistoryFetchOptions())
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         // Exclusive path: a cancel fence may start while this cold fetch is
@@ -4276,7 +4380,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const fetchId = session?.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    getFolderConversation(fetchId)
+    // Expand the window to cover any already-loaded older history so refetch
+    // does not drop prepended pages.
+    getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(session))
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         // Re-check fence: a cancel may have started while the fetch was in flight.
@@ -4475,7 +4581,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const fetchId = resolvePersistedConversationId(session, conversationId)
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    getFolderConversation(fetchId)
+    getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(session))
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         dispatch({
@@ -4493,6 +4599,48 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           conversationId,
           error: toErrorMessage(error),
         })
+      })
+  }
+
+  const loadOlderHistory = (conversationId: number): void => {
+    const session = get().byConversationId.get(conversationId)
+    if (!session?.detail?.turns.length) return
+    if (session.detailHistoryLoadingOlder || session.detailLoading) return
+    if (!session.detail.history_window?.has_more_before) return
+    const oldestId = session.detail.turns[0]?.id
+    if (!oldestId) return
+    const fetchId = resolvePersistedConversationId(session, conversationId)
+    // A page fetch must supersede any earlier passive/destructive detail read;
+    // otherwise that stale tail can land later and erase the prepended page.
+    bumpFetchGeneration(conversationId)
+    const pageGeneration = bumpHistoryPageGeneration(conversationId)
+    dispatch({ type: "LOAD_OLDER_HISTORY_START", conversationId })
+    getFolderConversation(fetchId, loadOlderHistoryFetchOptions(oldestId))
+      .then((page) => {
+        if (!isLatestHistoryPageGeneration(conversationId, pageGeneration)) {
+          return
+        }
+        const cur = get().byConversationId.get(conversationId)
+        // Drop the page if the session was reloaded or removed mid-flight.
+        if (!cur) return
+        if (!cur.detail || cur.detail.turns[0]?.id !== oldestId) {
+          dispatch({ type: "LOAD_OLDER_HISTORY_ERROR", conversationId })
+          return
+        }
+        dispatch({
+          type: "LOAD_OLDER_HISTORY_SUCCESS",
+          conversationId,
+          page,
+        })
+      })
+      .catch(() => {
+        if (
+          !isLatestHistoryPageGeneration(conversationId, pageGeneration) ||
+          !get().byConversationId.has(conversationId)
+        ) {
+          return
+        }
+        dispatch({ type: "LOAD_OLDER_HISTORY_ERROR", conversationId })
       })
   }
 
@@ -4551,7 +4699,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // times and the attempt cap bounds each run — but it's why this is the one
       // detail fetcher that both triggers and can re-trigger itself.
       const generation = bumpFetchGeneration(conversationId)
-      getFolderConversation(fetchId)
+      getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(cur))
         .then((detail) => {
           if (cancelled) return
           const cur2 = get().byConversationId.get(conversationId)
@@ -4685,7 +4833,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       delegateTerminalSyncCancels.set(conversationId, cancel)
       const fetchId = initial.dbConversationId ?? conversationId
       const generation = bumpFetchGeneration(conversationId)
-      getFolderConversation(fetchId)
+      getFolderConversation(fetchId, coldHistoryFetchOptions())
         .then((detail) => {
           if (cancelled) return
           if (
@@ -4782,7 +4930,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }
       const fetchId = current.dbConversationId ?? conversationId
       const generation = bumpFetchGeneration(conversationId)
-      getFolderConversation(fetchId)
+      getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(current))
         .then((detail) => {
           if (cancelled) return
           const currentAfterRead = get().byConversationId.get(conversationId)
@@ -4862,7 +5010,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         if (!session || session.localTurns.length === 0) return
         if (session.syncState === "awaiting_persist") return
 
-        getFolderConversation(dbConversationId)
+        getFolderConversation(
+          dbConversationId,
+          runtimeRefetchHistoryFetchOptions(session)
+        )
           .then((parsed) => {
             if (cancelled) return
             const cur = get().byConversationId.get(runtimeId)
@@ -4972,6 +5123,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     fetchDetail,
     refetchDetail,
     reloadDetail,
+    loadOlderHistory,
     recordTurnOutcome,
     startCancelReconcile,
     clearCancelReconcile,
@@ -5091,6 +5243,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     migrateConversation: (fromConversationId, toConversationId) => {
       if (fromConversationId === toConversationId) return
 
+      bumpHistoryPageGeneration(fromConversationId)
+      bumpHistoryPageGeneration(toConversationId)
+
       const fromSession = get().byConversationId.get(fromConversationId)
       const toSession = get().byConversationId.get(toConversationId)
       // Snapshot cancel-path state before merging sessions.
@@ -5207,6 +5362,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // late-arriving response can't resurrect the session with stale
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
+      bumpHistoryPageGeneration(conversationId)
       stopCancelReconcileTimers(conversationId)
       stopSoftFenceTimer(conversationId)
       bumpCancelGeneration(conversationId)
@@ -5227,6 +5383,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       recordedTurnOutcomeKeys.clear()
       userStopNoCoordinatorCompletions.clear()
       cancelReconcileRuntimes.clear()
+      historyPageGeneration.clear()
       dispatch({ type: "RESET" })
       liveTranscriptStore.reset()
     },
@@ -5369,6 +5526,7 @@ export function resetConversationRuntimeStore(): void {
   // have no concurrent fetches — but a real in-place backend switch would need a
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
+  historyPageGeneration.clear()
   cancelGenerationById.clear()
   recordedTurnOutcomeKeys.clear()
   userStopOwnershipById.clear()

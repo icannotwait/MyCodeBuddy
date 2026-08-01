@@ -21,6 +21,7 @@ import {
 } from "@/lib/api"
 import {
   cancelWorkspaceFileSearch as cancelWorkspaceFileSearchTauri,
+  getFolderConversation as getFolderConversationTauri,
   getFileTree as getFileTreeTauri,
   searchWorkspaceFiles as searchWorkspaceFilesTauri,
 } from "@/lib/tauri"
@@ -78,6 +79,12 @@ describe("workspace file API payloads", () => {
   })
 
   it("keeps direct Tauri wrappers in payload parity", async () => {
+    await getFolderConversationTauri(42)
+    expect(mocks.invoke).toHaveBeenLastCalledWith("get_folder_conversation", {
+      conversationId: 42,
+      historyUserTurnLimit: 20,
+    })
+
     await getFileTreeTauri("/repo", 2, true)
     expect(mocks.invoke).toHaveBeenLastCalledWith("get_file_tree", {
       path: "/repo",

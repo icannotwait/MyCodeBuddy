@@ -133,6 +133,13 @@ pub async fn get_conversation(
 #[serde(rename_all = "camelCase")]
 pub struct GetFolderConversationParams {
     pub conversation_id: i32,
+    /// `None` / omitted → full history. `Some(0)` → full.
+    /// `Some(n>0)` → last n user turns (+ intervening assistant turns).
+    #[serde(default)]
+    pub history_user_turn_limit: Option<u32>,
+    /// Exclusive upper-bound turn id for "load older" pages.
+    #[serde(default)]
+    pub history_before_turn_id: Option<String>,
 }
 
 pub async fn get_folder_conversation(
@@ -147,6 +154,10 @@ pub async fn get_folder_conversation(
         &state.emitter,
         state.internal_sessions.as_ref(),
         params.conversation_id,
+        crate::commands::history_window::HistoryLoadOpts {
+            user_turn_limit: params.history_user_turn_limit,
+            before_turn_id: params.history_before_turn_id,
+        },
     )
     .await?;
     Ok(Json(result))

@@ -120,6 +120,7 @@ function emptySession(
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -266,6 +267,143 @@ describe("FE1 complete live buffer reconciles without duplication", () => {
     // no duplicated assistant for the cancelled turn
     const assistants = s.detail?.turns.filter((t) => t.role === "assistant")
     expect(assistants?.filter((t) => t.id === "a1")).toHaveLength(1)
+  })
+})
+
+describe("cancel reconcile history window", () => {
+  it("requests enough user turns to preserve already-loaded history", async () => {
+    const loaded = Array.from({ length: 25 }, (_, index) =>
+      userTurn(`u${index}`)
+    )
+    seed({
+      detail: detail(loaded, {
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 100,
+          total_user_turn_count: 50,
+          user_turn_limit: 25,
+          returned_user_turn_count: 25,
+        },
+      }),
+      localTurns: [userTurn("u-new"), assistantTurn("local", "cancelled live")],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        ...loaded,
+        assistantTurn("fence", "persisted", interruptedOutcome()),
+      ])
+    )
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      historyUserTurnLimit: 26,
+    })
+    expect(session().detail?.turns[0]?.id).toBe("u0")
+  })
+
+  it("retries a stale cancel read after an older page lands", async () => {
+    const initialTurns = [
+      userTurn("u1"),
+      assistantTurn("a1", "first reply"),
+      userTurn("u2"),
+      assistantTurn("a2", "second reply"),
+    ]
+    seed({
+      detail: detail(initialTurns, {
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 8,
+          total_user_turn_count: 4,
+          user_turn_limit: 2,
+          returned_user_turn_count: 2,
+        },
+      }),
+      localTurns: [
+        userTurn("u3"),
+        assistantTurn("local", "cancelled live", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+
+    const firstCancelRead = deferredDetail()
+    const olderPageRead = deferredDetail()
+    const reconciled = detail(
+      [
+        userTurn("u0"),
+        assistantTurn("a0", "older reply"),
+        ...initialTurns,
+        userTurn("u3"),
+        assistantTurn("fence", "persisted", interruptedOutcome()),
+      ],
+      {
+        history_window: {
+          has_more_before: false,
+          total_turn_count: 8,
+          total_user_turn_count: 4,
+          user_turn_limit: 23,
+          returned_user_turn_count: 4,
+        },
+      }
+    )
+    mockGet
+      .mockImplementationOnce(() => firstCancelRead.promise)
+      .mockImplementationOnce(() => olderPageRead.promise)
+      .mockResolvedValueOnce(reconciled)
+
+    startCoordinator()
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    actions().loadOlderHistory(CID)
+
+    olderPageRead.resolve(
+      detail([userTurn("u0"), assistantTurn("a0", "older reply")], {
+        history_window: {
+          has_more_before: false,
+          total_turn_count: 8,
+          total_user_turn_count: 4,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      })
+    )
+    await Promise.resolve()
+    expect(session().detail?.turns[0]?.id).toBe("u0")
+
+    firstCancelRead.resolve(
+      detail(
+        [
+          ...initialTurns,
+          userTurn("u3"),
+          assistantTurn("fence", "persisted", interruptedOutcome()),
+        ],
+        {
+          history_window: {
+            has_more_before: true,
+            total_turn_count: 8,
+            total_user_turn_count: 4,
+            user_turn_limit: 21,
+            returned_user_turn_count: 3,
+          },
+        }
+      )
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(mockGet).toHaveBeenCalledTimes(3)
+    expect(session().detail?.turns.map((turn) => turn.id)).toEqual([
+      "u0",
+      "a0",
+      "u1",
+      "a1",
+      "u2",
+      "a2",
+      "u3",
+      "fence",
+    ])
   })
 })
 
@@ -1037,7 +1175,7 @@ describe("FE15 Manual Reload during pending is authoritative", () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(mockGet).toHaveBeenCalledWith(CID)
+    expect(mockGet).toHaveBeenCalledWith(CID, expect.any(Object))
     const s = useConversationRuntimeStore
       .getState()
       .byConversationId.get(runtimeId)
