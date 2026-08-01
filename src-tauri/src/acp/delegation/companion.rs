@@ -51,19 +51,21 @@ use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_feedback_round_trip, client_get_workflow_state_round_trip,
     client_parent_decision_round_trip, client_publish_workflow_round_trip,
+    client_recover_workflow_round_trip, client_recovery_authorization_round_trip,
     client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
     client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
     BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
     BrokerFeedbackRequest, BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest,
-    BrokerPublishWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionRole,
+    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
-use crate::acp::delegation::types::DelegationReturnWhen;
+use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
     WorkflowIndexOmissionStep, WorkflowStateIndexDto, WORKFLOW_CAPABILITY_VERSION,
 };
 use crate::acp::question::parse_questions;
+use crate::acp::recovery_authorization::RecoverySubjectKind;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
 /// Upper bound on one broker-side cancel round-trip. Bounds both
@@ -182,7 +184,7 @@ pub struct CompanionFeatures {
     pub ask: bool,
     pub sessions: bool,
     /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
-    /// enables all four B9 tools together (structural catalog agreement).
+    /// enables all five B9 tools together (structural catalog agreement).
     pub workflow_v2: bool,
 }
 
@@ -190,6 +192,7 @@ pub struct CompanionFeatures {
 pub const WORKFLOW_V2_TOOLS: &[&str] = &[
     "get_workflow_capabilities",
     "get_workflow_state",
+    "recover_workflow",
     "publish_workflow_manifest",
     "settle_workflow_gate",
 ];
@@ -197,9 +200,9 @@ pub const WORKFLOW_V2_TOOLS: &[&str] = &[
 /// Capability catalog classification (B9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowCapabilityMode {
-    /// None of the four workflow tools present; workflow is unavailable.
+    /// None of the five workflow tools present; workflow is unavailable.
     Unavailable,
-    /// All four present → v2 mode (capability must also report true).
+    /// All five present → v2 mode (capability must also report true).
     WorkflowManifestV2,
     /// Partial tool set → inconsistent hard-block.
     Inconsistent,
@@ -226,7 +229,7 @@ where
 
 /// Local `get_workflow_capabilities` payload from launch features/role (A15.1).
 /// Does not touch durable workflow state. When `workflow_v2` is on and role is
-/// Root, returns v2 true with the four operation names; otherwise v2 false and
+/// Root, returns v2 true with the complete operation catalog; otherwise v2 false and
 /// empty operations (tool itself is normally absent when feature is off).
 pub fn local_workflow_capabilities(features: &CompanionFeatures, role: CompanionRole) -> Value {
     let enabled = features.workflow_v2 && role == CompanionRole::Root;
@@ -332,13 +335,16 @@ impl CompanionContext {
                     && self.role == CompanionRole::DelegationChild
             }
             "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
-            // All four workflow tools require workflow_v2 + Root.
+            "request_recovery_authorization" => {
+                (self.features.delegation && self.features.coordination_v1)
+                    || (self.features.workflow_v2 && self.role == CompanionRole::Root)
+            }
+            // The complete workflow catalog requires workflow_v2 + Root.
             "get_workflow_capabilities"
             | "get_workflow_state"
             | "publish_workflow_manifest"
-            | "settle_workflow_gate" => {
-                self.features.workflow_v2 && self.role == CompanionRole::Root
-            }
+            | "settle_workflow_gate"
+            | "recover_workflow" => self.features.workflow_v2 && self.role == CompanionRole::Root,
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -846,6 +852,33 @@ async fn build_tools_call_spawn(
             )
             .await
         }
+        "request_recovery_authorization" => {
+            let req = match parse_recovery_authorization_args(&arguments, &ctx.token) {
+                Ok(request) => request,
+                Err(message) => return LineAction::Respond(err(id, -32602, message)),
+            };
+            if ctx.role == CompanionRole::DelegationChild
+                && req.subject_kind == RecoverySubjectKind::Workflow
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "delegation children cannot authorize workflow recovery",
+                ));
+            }
+            let round_trip =
+                Box::pin(
+                    async move { client_recovery_authorization_round_trip(&socket, &req).await },
+                );
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_recovery_authorization_result,
+            )
+            .await
+        }
         // A15.1: answer locally from CompanionFeatures — no UDS / no store.
         "get_workflow_capabilities" => {
             let caps = local_workflow_capabilities(&ctx.features, ctx.role);
@@ -880,6 +913,15 @@ async fn build_tools_call_spawn(
                 Box::pin(async move { client_settle_workflow_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
+        "recover_workflow" => {
+            let req = match parse_recover_workflow_args(&arguments, &ctx.token) {
+                Ok(request) => request,
+                Err(message) => return LineAction::Respond(err(id, -32602, message)),
+            };
+            let round_trip =
+                Box::pin(async move { client_recover_workflow_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
+        }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
 }
@@ -908,6 +950,117 @@ fn parse_get_workflow_state_args(
     Ok(BrokerGetWorkflowStateRequest {
         token: token.to_string(),
         workflow_id,
+    })
+}
+
+fn reject_unknown_arguments(arguments: &Value, tool: &str, allowed: &[&str]) -> Result<(), String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| format!("{tool} arguments must be an object"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{tool} does not accept `{key}`"));
+    }
+    Ok(())
+}
+
+fn parse_recovery_authorization_args(
+    arguments: &Value,
+    token: &str,
+) -> Result<BrokerRecoveryAuthorizationRequest, String> {
+    reject_unknown_arguments(
+        arguments,
+        "request_recovery_authorization",
+        &[
+            "subject_kind",
+            "subject_id",
+            "correlation_id",
+            "proposed_user_reason",
+        ],
+    )?;
+    let subject_kind =
+        match arguments.get("subject_kind").and_then(Value::as_str) {
+            Some("delegation_task") => RecoverySubjectKind::DelegationTask,
+            Some("workflow") => RecoverySubjectKind::Workflow,
+            _ => return Err(
+                "request_recovery_authorization subject_kind must be delegation_task or workflow"
+                    .into(),
+            ),
+        };
+    let subject_id = arguments
+        .get("subject_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "request_recovery_authorization requires non-empty subject_id".to_string())?
+        .to_string();
+    let correlation_id = arguments
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "request_recovery_authorization requires correlation_id".to_string())?;
+    validate_correlation_id(correlation_id).map_err(|message| {
+        format!("request_recovery_authorization invalid correlation_id: {message}")
+    })?;
+    let proposed_user_reason = match arguments.get("proposed_user_reason") {
+        None => None,
+        Some(Value::String(reason)) if !reason.trim().is_empty() && reason.len() <= 4096 => {
+            Some(reason.clone())
+        }
+        Some(Value::String(_)) => {
+            return Err("proposed_user_reason must be nonblank and at most 4096 UTF-8 bytes".into())
+        }
+        Some(_) => return Err("proposed_user_reason must be a string".into()),
+    };
+    if subject_kind == RecoverySubjectKind::DelegationTask && proposed_user_reason.is_some() {
+        return Err("proposed_user_reason is not accepted for delegation recovery".into());
+    }
+    Ok(BrokerRecoveryAuthorizationRequest {
+        token: token.to_string(),
+        subject_kind,
+        subject_id,
+        correlation_id: correlation_id.to_string(),
+        proposed_user_reason,
+    })
+}
+
+fn parse_recover_workflow_args(
+    arguments: &Value,
+    token: &str,
+) -> Result<BrokerRecoverWorkflowRequest, String> {
+    reject_unknown_arguments(
+        arguments,
+        "recover_workflow",
+        &[
+            "workflow_id",
+            "recovery_authorization_id",
+            "expected_manifest_revision",
+            "correlation_id",
+        ],
+    )?;
+    let required_string = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("recover_workflow requires non-empty {key}"))
+    };
+    let correlation_id = required_string("correlation_id")?;
+    validate_correlation_id(&correlation_id)
+        .map_err(|message| format!("recover_workflow invalid correlation_id: {message}"))?;
+    let expected_manifest_revision = match arguments.get("expected_manifest_revision") {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(value)) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+    .filter(|revision| *revision > 0)
+    .ok_or_else(|| {
+        "recover_workflow expected_manifest_revision must be a positive integer".to_string()
+    })?;
+    Ok(BrokerRecoverWorkflowRequest {
+        token: token.to_string(),
+        workflow_id: required_string("workflow_id")?,
+        recovery_authorization_id: required_string("recovery_authorization_id")?,
+        expected_manifest_revision,
+        correlation_id,
     })
 }
 
@@ -1029,6 +1182,27 @@ fn render_workflow_result(outcome: &Value) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
+        "structuredContent": outcome.clone(),
+    })
+}
+
+fn render_recovery_authorization_result(outcome: &Value) -> Value {
+    if outcome.get("error").is_some() {
+        return render_workflow_result(outcome);
+    }
+    let status = outcome
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("abandoned");
+    let text = match status {
+        "approved" => "Recovery approved",
+        "declined" => "Recovery declined",
+        "abandoned" => "Recovery authorization abandoned",
+        _ => "Recovery authorization did not resolve",
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
         "structuredContent": outcome.clone(),
     })
 }
@@ -3514,6 +3688,17 @@ mod tests {
             tool_guidance(ask_tool).contains("meaning or trade-off"),
             "ask_user_question guidance lost nested option description"
         );
+        let delegate_description = tools
+            .iter()
+            .find(|tool| tool["name"] == "delegate_to_agent")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("delegate_to_agent description");
+        assert!(
+            delegate_description.contains(
+                "For each distinct agent/profile mention, call once; pass profile_id for a profile"
+            ),
+            "delegate guidance must not imply that ordinary agent mentions require profile_id"
+        );
         let cases: [(&str, &[&str]); 8] = [
             (
                 "delegate_to_agent",
@@ -4549,7 +4734,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        // Root + coordination_v1 + workflow_v2: reply + four workflow tools.
+        // Root + coordination_v1 + workflow_v2: reply + authorization + five workflow tools.
         assert_eq!(
             names,
             vec![
@@ -4560,8 +4745,10 @@ mod tests {
                 "check_user_feedback",
                 "get_session_info",
                 "reply_to_delegation",
+                "request_recovery_authorization",
                 "get_workflow_capabilities",
                 "get_workflow_state",
+                "recover_workflow",
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
             ]
@@ -5263,5 +5450,263 @@ mod tests {
         assert_eq!(rendered["content"][0]["text"], "Reply delivered");
         let text = rendered["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("secret-reply-body"));
+    }
+
+    mod recovery_tool_contract {
+        use super::*;
+
+        #[tokio::test]
+        async fn tools_list_exposes_exact_recovery_inputs_and_removes_broad_unresumable_copy() {
+            let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid schema");
+            let tools = schema.as_array().expect("tool array");
+            let authorization = tools
+                .iter()
+                .find(|tool| tool["name"] == "request_recovery_authorization")
+                .expect("request_recovery_authorization schema");
+            assert!(authorization["description"]
+                .as_str()
+                .expect("authorization description")
+                .contains("recovery_confirmation_required"));
+            assert!(authorization["description"]
+                .as_str()
+                .expect("authorization description")
+                .contains("exact rejected call"));
+            for result_field in [
+                "subject_kind",
+                "allowed_action",
+                "cause_code",
+                "expires_at",
+                "target_state",
+                "replacement_reason",
+            ] {
+                assert!(authorization["description"]
+                    .as_str()
+                    .expect("authorization description")
+                    .contains(result_field));
+            }
+            let authorization_schema = &authorization["inputSchema"];
+            assert_eq!(authorization_schema["additionalProperties"], false);
+            assert_eq!(
+                authorization_schema["required"],
+                json!(["subject_kind", "subject_id", "correlation_id"])
+            );
+            assert_eq!(
+                authorization_schema["properties"]["subject_kind"]["enum"],
+                json!(["delegation_task", "workflow"])
+            );
+            assert_eq!(
+                authorization_schema["properties"]["correlation_id"]["pattern"],
+                "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            );
+            assert_eq!(
+                authorization_schema["properties"]["proposed_user_reason"]["maxLength"],
+                4096
+            );
+            for rejected in [
+                "action",
+                "target",
+                "warning",
+                "work_unit_key",
+                "delegation_target",
+                "recovery_authorization_id",
+            ] {
+                assert!(
+                    authorization_schema["properties"].get(rejected).is_none(),
+                    "caller must not supply {rejected}"
+                );
+            }
+
+            let recover = tools
+                .iter()
+                .find(|tool| tool["name"] == "recover_workflow")
+                .expect("recover_workflow schema");
+            assert_eq!(recover["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                recover["inputSchema"]["required"],
+                json!([
+                    "workflow_id",
+                    "recovery_authorization_id",
+                    "expected_manifest_revision",
+                    "correlation_id"
+                ])
+            );
+            assert_eq!(
+                recover["inputSchema"]["properties"]["correlation_id"]["pattern"],
+                "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            );
+
+            let replacement_description = tools
+                .iter()
+                .find(|tool| tool["name"] == "delegate_to_agent")
+                .unwrap()["inputSchema"]["properties"]["replacement_reason"]["description"]
+                .as_str()
+                .unwrap();
+            for tool_name in ["delegate_to_agent", "continue_delegation"] {
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool["name"] == tool_name)
+                    .expect("delegation replay tool schema");
+                assert_eq!(
+                    tool["inputSchema"]["properties"]["recovery_authorization_id"]["minLength"],
+                    1
+                );
+            }
+            for unsafe_source in [
+                "parent_canceled",
+                "parent_turn_failed",
+                "join_abandoned",
+                "user_cancelled",
+                "tool_stalled_timeout",
+            ] {
+                assert!(
+                    !replacement_description.contains(unsafe_source),
+                    "schema must not map {unsafe_source} to unresumable"
+                );
+            }
+
+            let advertised =
+                unwrap_respond(dispatch_with_context(coordination_root(), tools_list()).await);
+            let advertised_tools = advertised.result.as_ref().unwrap()["tools"]
+                .as_array()
+                .unwrap();
+            let advertised_authorization = advertised_tools
+                .iter()
+                .find(|tool| tool["name"] == "request_recovery_authorization")
+                .expect("advertised authorization tool");
+            assert!(advertised_authorization["description"]
+                .as_str()
+                .expect("advertised authorization description")
+                .contains("recovery_confirmation_required"));
+            let names = advertised_tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"request_recovery_authorization".to_string()));
+            let workflow_names =
+                list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
+            assert!(workflow_names.contains(&"recover_workflow".to_string()));
+
+            for bad in [
+                json!({"subject_kind":"delegation_task","subject_id":"task","correlation_id":" bad"}),
+                json!({"subject_kind":"delegation_task","subject_id":"task","correlation_id":"x".repeat(129)}),
+                json!({"subject_kind":"delegation_task","subject_id":"task","correlation_id":"ok","proposed_user_reason":"not allowed"}),
+                json!({"subject_kind":"workflow","subject_id":"wf","correlation_id":"ok","proposed_user_reason":" ","action":"replace"}),
+            ] {
+                assert!(parse_recovery_authorization_args(&bad, "token").is_err());
+            }
+            assert!(parse_recovery_authorization_args(
+                &json!({"subject_kind":"workflow","subject_id":"wf","correlation_id":"x".repeat(128),"proposed_user_reason":"x".repeat(4096)}),
+                "token"
+            )
+            .is_ok());
+            for reason in ["x".repeat(4097), "界".repeat(1366)] {
+                assert!(parse_recovery_authorization_args(
+                    &json!({"subject_kind":"workflow","subject_id":"wf","correlation_id":"ok","proposed_user_reason":reason}),
+                    "token"
+                )
+                .is_err());
+            }
+            for rejected in [
+                "action",
+                "target",
+                "warning",
+                "work_unit_key",
+                "delegation_target",
+                "recovery_authorization_id",
+            ] {
+                let mut arguments = json!({
+                    "subject_kind": "delegation_task",
+                    "subject_id": "task",
+                    "correlation_id": "valid-correlation",
+                });
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(rejected.to_string(), json!("caller-supplied"));
+                let error = parse_recovery_authorization_args(&arguments, "token")
+                    .expect_err("forbidden recovery input must fail");
+                assert!(
+                    error.contains(rejected),
+                    "unexpected error for {rejected}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn companion_preserves_structured_authorization_contract_for_terminal_statuses() {
+            for (status, reused) in [("approved", false), ("approved", true), ("declined", false)] {
+                let outcome = json!({
+                    "status": status,
+                    "recovery_authorization_id": "authorization-a",
+                    "reused": reused,
+                    "subject_kind": "workflow",
+                    "subject_id": "workflow-a",
+                    "allowed_action": "recover_workflow",
+                    "target_state": "estimated",
+                    "cause_code": "plan_gate_blocked",
+                    "expires_at": if status == "approved" { json!("2026-07-30T12:10:00Z") } else { Value::Null },
+                });
+                let rendered = render_recovery_authorization_result(&outcome);
+                assert_eq!(rendered["structuredContent"], outcome);
+                assert_eq!(rendered["isError"], false);
+            }
+        }
+
+        #[tokio::test]
+        async fn workflow_catalog_is_inconsistent_when_recover_workflow_is_missing() {
+            let complete = WORKFLOW_V2_TOOLS.to_vec();
+            assert_eq!(
+                classify_workflow_tool_catalog(complete.iter().copied()),
+                WorkflowCapabilityMode::WorkflowManifestV2
+            );
+            for omitted in WORKFLOW_V2_TOOLS {
+                let partial = complete
+                    .iter()
+                    .copied()
+                    .filter(|tool| tool != omitted)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    classify_workflow_tool_catalog(partial),
+                    WorkflowCapabilityMode::Inconsistent,
+                    "omitting {omitted} must fail closed"
+                );
+            }
+
+            for enabled in [
+                WORKFLOW_ROOT,
+                CompanionFeatures::parse(Some(
+                    "delegation,coordination_v1,feedback,ask,sessions,workflow_v2",
+                )),
+            ] {
+                let names = list_tool_names(dispatch_with_features(enabled, tools_list()).await);
+                assert_eq!(
+                    classify_workflow_tool_catalog(names.iter().map(String::as_str)),
+                    WorkflowCapabilityMode::WorkflowManifestV2
+                );
+                let without_recover = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| *name != "recover_workflow")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    classify_workflow_tool_catalog(without_recover),
+                    WorkflowCapabilityMode::Inconsistent
+                );
+                let capabilities = local_workflow_capabilities(&enabled, CompanionRole::Root);
+                assert_eq!(capabilities["workflow_manifest_v2"], true);
+                assert_eq!(capabilities["operations"], json!(WORKFLOW_V2_TOOLS));
+            }
+
+            for disabled in [COORDINATION, CompanionFeatures::parse(Some(""))] {
+                let disabled_names =
+                    list_tool_names(dispatch_with_features(disabled, tools_list()).await);
+                assert!(!disabled_names.contains(&"get_workflow_state".to_string()));
+                assert!(!disabled_names.contains(&"recover_workflow".to_string()));
+                let capabilities = local_workflow_capabilities(&disabled, CompanionRole::Root);
+                assert_eq!(capabilities["workflow_manifest_v2"], false);
+                assert_eq!(capabilities["versions"][WORKFLOW_CAPABILITY_VERSION], false);
+                assert_eq!(capabilities["operations"], json!([]));
+            }
+        }
     }
 }

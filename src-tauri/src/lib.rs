@@ -1590,7 +1590,9 @@ mod tauri_app {
                     if let Some(cm) = app.try_state::<ConnectionManager>() {
                         // Disconnect first so terminal ACP events enter the
                         // desktop queue before we drain the batcher.
-                        tauri::async_runtime::block_on(cm.disconnect_all());
+                        tauri::async_runtime::block_on(cm.disconnect_all(
+                            crate::acp::termination::AcpDisconnectOrigin::ApplicationShutdown,
+                        ));
                     }
                     if let Some(delivery) =
                         app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>()

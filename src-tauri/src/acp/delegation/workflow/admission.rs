@@ -28,6 +28,7 @@ use crate::db::entities::delegation_workflow_node_binding;
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::web::event_bridge::EventEmitter;
 
+use super::error::WorkflowAdmissionRecoveryError;
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
@@ -35,6 +36,8 @@ use super::gates::{
 };
 use super::key::parse_recognized_work_unit_key;
 use super::project::evidence_from_run_and_binding;
+use super::recovery_policy::decide_workflow_recovery;
+use super::store::load_workflow_recovery_snapshot_conn;
 use super::types::{
     DocumentGateKind, ManifestDocument, ParsedWorkUnitKey, PHASE_FINAL, PHASE_TASKS,
     WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
@@ -636,10 +639,27 @@ async fn ensure_plan_approved_for_new_tasks<C: ConnectionTrait>(
 ) -> Result<(), TaskStoreError> {
     // Blocked workflows reject new work.
     if header.workflow_state == WorkflowState::Blocked {
-        return Err(admission_err(
-            "workflow_blocked",
-            "workflow is blocked; new Task admissions rejected",
-        ));
+        let recovery = decide_workflow_recovery(
+            &load_workflow_recovery_snapshot_conn(conn, header, None)
+                .await
+                .map_err(|error| {
+                    TaskStoreError::Permanent(format!(
+                        "load blocked workflow recovery projection: {error}"
+                    ))
+                })?,
+        )
+        .projection();
+        let message = WorkflowAdmissionRecoveryError {
+            message: "workflow is blocked; new Task admissions rejected".into(),
+            recovery,
+        }
+        .encode()
+        .map_err(|error| {
+            TaskStoreError::Permanent(format!(
+                "serialize blocked workflow recovery projection: {error}"
+            ))
+        })?;
+        return Err(admission_err("workflow_blocked", message));
     }
 
     // Prefer durable Plan gate settlement over header state alone.
@@ -3723,6 +3743,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_first_dispatch_blocked_returns_typed_projection_without_authorization_id() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let doc = sample_doc("task7-blocked-admission", ManifestWorkflowState::Blocked);
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("publish blocked workflow");
+        let header = delegation_workflow::Entity::find_by_id(published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
+            .await
+            .unwrap();
+        assert!(
+            !snapshot.contradictory_durable_state,
+            "fresh blocked publication snapshot: {snapshot:#?}"
+        );
+        let state = crate::acp::delegation::workflow::store::get_workflow_state_core(
+            &db,
+            parent,
+            Some(&header.workflow_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.recovery,
+            Some(decide_workflow_recovery(&snapshot).projection())
+        );
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child_for(&db, AgentType::Grok).await,
+                "70000000-0000-4000-8000-000000000007",
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect_err("blocked workflow remains fail-closed");
+
+        let TaskStoreError::WorkflowAdmission { code, message } = err else {
+            panic!("expected workflow admission rejection");
+        };
+        assert_eq!(code, "workflow_blocked");
+        let body = crate::acp::delegation::workflow::error::WorkflowAdmissionRecoveryError::decode(
+            &message,
+        )
+        .expect("typed recovery projection");
+        assert_eq!(
+            body.message,
+            "workflow is blocked; new Task admissions rejected"
+        );
+        assert_eq!(body.recovery.disposition, "confirmation_required");
+        assert_eq!(
+            body.recovery.proposed_action.as_deref(),
+            Some("recover_workflow")
+        );
+        assert_eq!(
+            body.recovery.target_state,
+            Some(ManifestWorkflowState::Estimated)
+        );
+        assert_eq!(body.recovery.cause_code, "explicit_manifest_block");
+        assert_eq!(body.recovery.risk_class, "normal");
+        assert!(body.recovery.authorization_required);
+        assert!(body.recovery.blockers.is_empty());
+
+        let serialized = serde_json::to_string(&body).unwrap().to_ascii_lowercase();
+        assert!(!serialized.contains("authorization_id"));
+        assert!(!serialized.contains("authorizationid"));
+        assert!(!serialized.contains("receipt"));
+    }
+
+    #[tokio::test]
     async fn routed_cohort_freezes_before_reviewer_producer_readiness() {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
@@ -4198,6 +4308,7 @@ mod tests {
                         child_connection_id: Set(None),
                         replaced_task_id: Set(None),
                         replacement_reason: Set(None),
+                        recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
@@ -4477,6 +4588,7 @@ mod tests {
                         child_connection_id: Set(None),
                         replaced_task_id: Set(None),
                         replacement_reason: Set(None),
+                        recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
@@ -4579,6 +4691,7 @@ mod tests {
                         child_connection_id: Set(None),
                         replaced_task_id: Set(None),
                         replacement_reason: Set(None),
+                        recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
@@ -4678,6 +4791,7 @@ mod tests {
                         child_connection_id: Set(None),
                         replaced_task_id: Set(None),
                         replacement_reason: Set(None),
+                        recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
@@ -4920,6 +5034,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -5193,6 +5308,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };

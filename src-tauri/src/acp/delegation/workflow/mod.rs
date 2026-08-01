@@ -8,6 +8,7 @@ pub mod gates;
 pub mod key;
 pub mod plan_review;
 pub mod project;
+pub mod recovery_policy;
 pub mod state_dto;
 pub mod store;
 pub mod types;
@@ -26,8 +27,8 @@ pub use dto::{
 };
 pub use error::WorkflowStoreError;
 pub use events::{
-    emit_workflow_compatibility_nudge, emit_workflow_graph_changed, WORKFLOW_GRAPH_CHANGED_EVENT,
-    WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+    emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
+    WorkflowRecoveryEvent, WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
 };
 pub use gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
@@ -43,6 +44,14 @@ pub use project::{
     evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,
     soft_attach_workflow_graph,
 };
+pub use recovery_policy::{
+    decide_workflow_recovery, hash_displayed_reset_reason, WorkflowRecoveryActiveRun,
+    WorkflowRecoveryBindingLifecycle, WorkflowRecoveryBlocker, WorkflowRecoveryCauseCode,
+    WorkflowRecoveryConfirmation, WorkflowRecoveryDecision, WorkflowRecoveryDisposition,
+    WorkflowRecoveryDocumentIdentity, WorkflowRecoveryFrozenTaskCohort,
+    WorkflowRecoveryPlanGateEvidence, WorkflowRecoveryPlanIdentity, WorkflowRecoveryProjection,
+    WorkflowRecoveryRiskClass, WorkflowRecoverySnapshot, WorkflowRecoveryStopCode,
+};
 pub use state_dto::{
     project_workflow_state_index, ActionableTaskRouteDto, PlanFindingStubDto,
     PlanRecoverySourceDto, PlanReviewIndexDto, TaskPolicyIndexDto, WorkflowGateStateDto,
@@ -52,9 +61,16 @@ pub use state_dto::{
     INDEX_MAX_NODES,
 };
 pub use store::{
-    get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    PublishResult, PublishWorkflowRequest, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
+    append_state_only_revision_txn, append_workflow_block_revision_txn, get_workflow_state_core,
+    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, recover_workflow_core,
+    settle_workflow_gate_core, PublishResult, PublishWorkflowRequest, RecoverWorkflowRequest,
+    RecoverWorkflowResult, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
+    StateOnlyRevisionRequest, StateOnlyRevisionResult, WorkflowBlockEntryRequest,
+    WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
     WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;
 pub use validate::validate_manifest_document;
+
+#[cfg(test)]
+mod recovery_tests;

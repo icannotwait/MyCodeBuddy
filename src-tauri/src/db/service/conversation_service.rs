@@ -267,6 +267,7 @@ async fn create_inner(
         pinned_at: Set(None),
         awaiting_reply_token: Set(None),
         delegation_run_generation: Set(None),
+        last_termination_audit_json: Set(None),
     }
     .insert(&txn)
     .await?;
@@ -2257,6 +2258,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };

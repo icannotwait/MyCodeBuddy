@@ -27,6 +27,7 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
+use crate::acp::termination::{AcpTerminationSummaryV1, ParentEndContext};
 use crate::acp::types::AcpEvent;
 use crate::web::event_bridge::emit_with_state;
 
@@ -132,10 +133,24 @@ pub(crate) enum PromptAdmissionResult {
     AlreadyAdmitted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParentConnectionExitCause {
-    Disconnected,
-    SuspensionDrainTimeout,
+    Disconnected {
+        termination: AcpTerminationSummaryV1,
+    },
+    SuspensionDrainTimeout {
+        termination: AcpTerminationSummaryV1,
+    },
+}
+
+impl ParentConnectionExitCause {
+    pub(crate) fn termination(&self) -> &AcpTerminationSummaryV1 {
+        match self {
+            Self::Disconnected { termination } | Self::SuspensionDrainTimeout { termination } => {
+                termination
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -555,7 +570,13 @@ impl DelegationContinuationCoordinator {
             None => false,
         };
 
-        self.broker.cancel_by_parent(parent_connection_id).await;
+        let context = ParentEndContext {
+            reason: ParentTurnEndReason::ParentDisconnected,
+            termination: cause.termination().clone(),
+        };
+        self.broker
+            .cancel_by_parent_with_context(parent_connection_id, context)
+            .await;
         if !had_matching_active {
             return;
         }
@@ -583,10 +604,10 @@ impl DelegationContinuationCoordinator {
             }
         };
         let failure_code = match cause {
-            ParentConnectionExitCause::Disconnected => {
+            ParentConnectionExitCause::Disconnected { .. } => {
                 ContinuationFailureCode::ParentConnectionLost
             }
-            ParentConnectionExitCause::SuspensionDrainTimeout => {
+            ParentConnectionExitCause::SuspensionDrainTimeout { .. } => {
                 ContinuationFailureCode::SuspendDrainTimeout
             }
         };
@@ -1925,12 +1946,22 @@ mod cleanup_tests {
         for (index, cause, expected) in [
             (
                 0,
-                ParentConnectionExitCause::Disconnected,
+                ParentConnectionExitCause::Disconnected {
+                    termination: AcpTerminationSummaryV1::legacy_unspecified(true, Utc::now()),
+                },
                 ContinuationFailureCode::ParentConnectionLost,
             ),
             (
                 1,
-                ParentConnectionExitCause::SuspensionDrainTimeout,
+                ParentConnectionExitCause::SuspensionDrainTimeout {
+                    termination: AcpTerminationSummaryV1::new(
+                        crate::acp::termination::AcpTerminationSource::Session,
+                        crate::acp::termination::AcpTerminationReason::SuspensionDrainTimeout,
+                        crate::acp::termination::AcpTerminationClassification::AutomatedAmbiguous,
+                        true,
+                        Utc::now(),
+                    ),
+                },
                 ContinuationFailureCode::SuspendDrainTimeout,
             ),
         ] {
@@ -1966,7 +1997,9 @@ mod cleanup_tests {
             .handle_parent_connection_exit(
                 "parent",
                 Some(1),
-                ParentConnectionExitCause::Disconnected,
+                ParentConnectionExitCause::Disconnected {
+                    termination: AcpTerminationSummaryV1::legacy_unspecified(true, Utc::now()),
+                },
             )
             .await;
         assert_eq!(

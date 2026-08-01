@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
+use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
     AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
@@ -156,6 +157,7 @@ pub async fn acp_connect(
 #[serde(rename_all = "camelCase")]
 pub struct AcpDisconnectParams {
     pub connection_id: String,
+    pub origin: AcpDisconnectOrigin,
     #[serde(default)]
     pub expected_owner_window: Option<String>,
     #[serde(default)]
@@ -175,6 +177,7 @@ pub async fn acp_disconnect(
             params.expected_owner_window.as_deref(),
             params.expected_operation_id.as_deref(),
             params.expected_ownership_generation,
+            params.origin,
         )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;

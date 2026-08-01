@@ -159,6 +159,72 @@ pub enum ManifestWorkflowState {
     Blocked,
 }
 
+/// Durable kind of an immutable manifest revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestRevisionKind {
+    Publication,
+    StateOnly,
+}
+
+impl ManifestRevisionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publication => "publication",
+            Self::StateOnly => "state_only",
+        }
+    }
+
+    pub fn from_db(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("publication") => Ok(Self::Publication),
+            Some("state_only") => Ok(Self::StateOnly),
+            Some(other) => Err(format!("unknown manifest revision kind: {other}")),
+        }
+    }
+}
+
+/// Durable reason that placed the active workflow projection in `blocked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBlockCause {
+    PlanUserDecisionRequired,
+    PlanGateBlocked,
+    ExplicitManifestBlock,
+    UnresolvedTaskCohort,
+    DurableStateInconsistent,
+    LegacyUnknown,
+}
+
+impl WorkflowBlockCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanUserDecisionRequired => "plan_user_decision_required",
+            Self::PlanGateBlocked => "plan_gate_blocked",
+            Self::ExplicitManifestBlock => "explicit_manifest_block",
+            Self::UnresolvedTaskCohort => "unresolved_task_cohort",
+            Self::DurableStateInconsistent => "durable_state_inconsistent",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+
+    pub fn from_db(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None => Ok(Self::LegacyUnknown),
+            Some("plan_user_decision_required") => Ok(Self::PlanUserDecisionRequired),
+            Some("plan_gate_blocked") => Ok(Self::PlanGateBlocked),
+            Some("explicit_manifest_block") => Ok(Self::ExplicitManifestBlock),
+            Some("unresolved_task_cohort") => Ok(Self::UnresolvedTaskCohort),
+            Some("durable_state_inconsistent") => Ok(Self::DurableStateInconsistent),
+            Some(other) => Err(format!("unknown workflow block cause: {other}")),
+        }
+    }
+
+    pub fn from_transition_reason(reason: &str) -> Result<Self, String> {
+        Self::from_db(Some(reason))
+    }
+}
+
 /// Node kind on a published manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

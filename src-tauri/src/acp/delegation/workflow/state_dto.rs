@@ -14,6 +14,7 @@ use super::plan_review::{
     FindingSeverity, FindingStatus, PlanReviewNextAction, PlanReviewRoundState, PlanReviewScope,
     PlanRevisionKind,
 };
+use super::recovery_policy::WorkflowRecoveryProjection;
 use super::types::{DocumentRef, ManifestTaskPolicy, ManifestWorkflowState, TaskRiskLevel};
 
 pub const INDEX_MAX_NODES: usize = 12;
@@ -126,6 +127,8 @@ pub struct WorkflowStateIndexDto {
     pub schema_version: u64,
     pub plan_target_rel_path: String,
     pub risk_policy_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<WorkflowRecoveryProjection>,
     pub detail: WorkflowStateDetail,
     pub inline_findings: bool,
     pub payload_truncated: bool,
@@ -649,6 +652,7 @@ pub fn project_workflow_state_index(
         schema_version: state.schema_version,
         plan_target_rel_path: state.plan_target_rel_path,
         risk_policy_version: state.risk_policy_version,
+        recovery: None,
         detail: WorkflowStateDetail::Index,
         inline_findings: false,
         payload_truncated: state.evidence_truncated || findings_were_capped || nodes_were_capped,

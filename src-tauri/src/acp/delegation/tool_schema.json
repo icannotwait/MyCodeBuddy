@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start a cold local sub-agent. ASYNCHRONOUS: returns task_id. It cannot see this conversation; task must include all context. Fan out, then Join task_ids with get_delegation_status. For each distinct agent/profile, call once; pass profile_id. admission_failed/admission_unknown require explicit replacement, never continue_delegation.",
+    "description": "Cold sub-agent; ASYNCHRONOUS task_id. It cannot see this conversation: task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile. admission_failed/admission_unknown: explicit replacement.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -20,76 +20,68 @@
             "pi",
             "grok",
             "cursor"
-          ],
-          "description": "For @AgentName/codeg://agent/<agent_type>, use that exact agent_type."
+          ]
         },
-        "profile_id": {
-          "type": "string",
-          "description": "Optional immutable profile UUID; runs that profile without agent defaults."
-        },
-        "profile_label": {
-          "type": "string",
-          "description": "Display label for a profile mention; routing ignores it."
-        },
-        "task": {
-          "type": "string",
-          "description": "Complete prompt: goal, context, absolute paths, constraints, and expected output."
-        },
+        "profile_id": { "type": "string" },
+        "profile_label": { "type": "string" },
+        "task": { "type": "string" },
         "correlation_id": {
           "type": "string",
-          "description": "Fresh token for each invocation (UUID recommended); never reuse."
+          "description": "Fresh per invocation."
+        },
+        "recovery_authorization_id": {
+          "type": "string",
+          "minLength": 1
         },
         "working_dir": {
           "type": "string",
-          "description": "Absolute working directory; defaults to the parent session directory."
+          "description": "Absolute; defaults to parent."
         },
         "work_unit_key": {
           "type": "string",
           "maxLength": 200,
-          "description": "Optional orchestration key (≤200 chars) for recovery budgets and first-dispatch fencing."
+          "description": "Recovery key; max 200."
         },
         "replaces_task_id": {
           "type": "string",
-          "description": "Prior same-role terminal task_id when replacing (pair with replacement_reason)."
+          "description": "Prior task_id; pair with replacement_reason."
         },
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "With replaces_task_id. admission_failed/admission_unknown require explicit replacement, never continue. unresumable covers parent_disconnected, parent_canceled, parent_turn_failed, join_abandoned, user_cancelled, tool_stalled_timeout; prefer continue_delegation when recoverable."
+          "description": "With replaces_task_id. admission_failed/admission_unknown: explicit replacement, never continue. Established work follows central recovery; cancellation/stall never implies unresumable."
         }
       }
     }
   },
   {
     "name": "continue_delegation",
-    "description": "Continue a terminal child asynchronously. Pass prior task_id and full revision context; never creates a child. Join with get_delegation_status.",
+    "description": "Continue terminal task_id asynchronously with full context; never creates a child. Join via get_delegation_status.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "task", "correlation_id"],
       "properties": {
-        "task_id": {
-          "type": "string",
-          "description": "Prior run task_id to continue (latest eligible terminal on its child)."
-        },
-        "task": {
-          "type": "string",
-          "description": "Complete revision prompt with all context the child needs."
-        },
+        "task_id": { "type": "string" },
+        "task": { "type": "string" },
         "correlation_id": {
           "type": "string",
-          "description": "Fresh token for each invocation (UUID recommended); never reuse."
+          "description": "Fresh per invocation."
+        },
+        "recovery_authorization_id": {
+          "type": "string",
+          "minLength": 1
         },
         "work_unit_key": {
           "type": "string",
           "maxLength": 200,
-          "description": "Optional orchestration key; defaults to the prior run's key when omitted."
+          "description": "Prior key if omitted; max 200."
         }
       }
     }
   },
   {
     "name": "get_delegation_status",
-    "description": "Get task_ids status/results in input order. Omit wait_ms for an immediate snapshot. Join via return_when=all_terminal_or_attention, wait_ms=0; positive wait_ms is rejected. Join returns when all requested tasks are terminal, attention is required, or unavailable. Answer attention, then re-Join only still-running required task_ids. Includes wake_reason and attention_requests.",
+    "description": "task_ids in input order. Omit wait_ms for an immediate snapshot. Join: return_when=all_terminal_or_attention and wait_ms=0; positive wait_ms is rejected. Returns when all requested tasks are terminal, attention, or unavailable. Answer attention; re-Join only still-running required task_ids. Includes wake_reason and attention_requests.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -97,45 +89,38 @@
         "task_ids": {
           "type": "array",
           "items": { "type": "string" },
-          "minItems": 1,
-          "description": "Task IDs to inspect together."
+          "minItems": 1
         },
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 0,
-          "description": "Use 0 with return_when for Join."
+          "maximum": 0
         },
         "return_when": {
           "type": "string",
-          "enum": ["all_terminal_or_attention"],
-          "description": "Join condition; requires wait_ms=0."
+          "enum": ["all_terminal_or_attention"]
         }
       }
     }
   },
   {
     "name": "cancel_delegation",
-    "description": "Cancel a running task only when its result is no longer wanted. timeout is non-canceling and returns guidance to keep waiting. Prefer get_delegation_status with wait_ms for slow work. If already finished, return its final result.",
+    "description": "Cancel only when its result is no longer wanted. timeout is non-canceling: keep waiting with get_delegation_status wait_ms for slow work. Already finished returns final result. taskfail, usercancel, and others cancel.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "reason"],
       "properties": {
-        "task_id": {
-          "type": "string",
-          "description": "Task ID returned by delegate_to_agent."
-        },
+        "task_id": { "type": "string" },
         "reason": {
           "type": "string",
-          "enum": ["timeout", "taskfail", "usercancel", "others"],
-          "description": "Reason: timeout is non-canceling; taskfail, usercancel, and others cancel."
+          "enum": ["timeout", "taskfail", "usercancel", "others"]
         }
       }
     }
   },
   {
     "name": "check_user_feedback",
-    "description": "Read pending messages; messages are available only through this tool. Non-blocking. Call before starting implementation, a significant decision, and after a meaningful sub-task. Treat them as HIGH-PRIORITY steering; empty result means continue.",
+    "description": "Messages are available only through this tool. Non-blocking; call before starting implementation, a significant decision, and after a meaningful sub-task. HIGH-PRIORITY; empty result means continue.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -198,19 +183,15 @@
   },
   {
     "name": "get_session_info",
-    "description": "Resolve codeg://session/<number> to read-only metadata and optional recent messages. Use Codeg's internal conversation ID, not the agent session ID. Missing returns found: false, not an error.",
+    "description": "Resolve codeg://session/ to read-only metadata and optional recent messages. Use internal conversation ID, not the agent session ID. Missing is found: false, not an error.",
     "inputSchema": {
       "type": "object",
       "required": ["session_id"],
       "properties": {
-        "session_id": {
-          "type": "integer",
-          "description": "Number from codeg://session/<number>; Codeg's internal conversation ID."
-        },
+        "session_id": { "type": "integer" },
         "max_messages": {
           "type": "integer",
-          "minimum": 0,
-          "description": "Recent turns to include. Defaults to 20; 0 returns metadata only; max 200."
+          "minimum": 0
         }
       }
     }
@@ -239,15 +220,35 @@
       "additionalProperties": false,
       "required": ["request_id", "reply"],
       "properties": {
-        "request_id": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Open Join attention request id."
-        },
+        "request_id": { "type": "string", "minLength": 1 },
         "reply": {
           "type": "string",
-          "minLength": 1,
-          "description": "Decision; max 16 KiB UTF-8."
+          "minLength": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "request_recovery_authorization",
+    "description": "After typed recovery_confirmation_required, request confirmation; replay the exact rejected call with recovery_authorization_id. Server derives action, target, warning, work-unit key, and delegation target. Results include subject_kind, subject_id, allowed_action, cause_code, expires_at, and action-specific target_state or replacement_reason metadata.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_kind", "subject_id", "correlation_id"],
+      "properties": {
+        "subject_kind": {
+          "type": "string",
+          "enum": ["delegation_task", "workflow"]
+        },
+        "subject_id": { "type": "string", "minLength": 1 },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "proposed_user_reason": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "reset_plan_lineage only; otherwise rejected."
         }
       }
     }
@@ -265,6 +266,29 @@
       "properties": {
         "workflow_id": { "type": "string" },
         "detail": { "type": "string", "enum": ["index"], "default": "index" }
+      }
+    }
+  },
+  {
+    "name": "recover_workflow",
+    "description": "Root only. Call get_workflow_state, then request_recovery_authorization; use its receipt. Never creates a challenge.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_id",
+        "recovery_authorization_id",
+        "expected_manifest_revision",
+        "correlation_id"
+      ],
+      "properties": {
+        "workflow_id": { "type": "string", "minLength": 1 },
+        "recovery_authorization_id": { "type": "string", "minLength": 1 },
+        "expected_manifest_revision": { "type": "integer", "minimum": 1 },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        }
       }
     }
   },

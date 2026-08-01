@@ -24,3 +24,4 @@ pub use super::folder_command::Entity as FolderCommand;
 pub use super::model_provider::Entity as ModelProvider;
 pub use super::opened_tab::Entity as OpenedTab;
 pub use super::quick_message::Entity as QuickMessage;
+pub use super::recovery_authorization::Entity as RecoveryAuthorization;

@@ -21,8 +21,15 @@ use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::types::{cold_task_report_message, DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    cold_task_report_message, DelegationRecoveryProjection, DelegationTaskReport, TaskStatus,
+};
+use crate::acp::termination::{
+    AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
+    AcpTerminationSummaryV1, DelegationTerminationAuditV1,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
+use crate::db::entities::delegation_task_run::DelegationRunStatus;
 use crate::db::AppDatabase;
 use crate::models::AgentType;
 
@@ -111,8 +118,9 @@ pub struct TerminalTaskWrite {
     pub runtime_stats: Option<DelegationRuntimeStats>,
     /// Optional validated card summary JSON (frontend display only).
     pub card_summary_json: Option<String>,
-    /// Optional structured termination audit JSON (host_restarted provenance).
-    pub termination_audit_json: Option<String>,
+    /// Typed termination evidence. Serialization is owned by RunStore while
+    /// the terminal CAS transaction is active.
+    termination_evidence: Option<DelegationTerminationAuditV1>,
 }
 
 impl TerminalTaskWrite {
@@ -124,40 +132,77 @@ impl TerminalTaskWrite {
             conversation_status,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: None,
         }
     }
 
+    #[cfg(test)]
     pub fn failed(
         error_code: impl Into<String>,
         finished_at: DateTime<Utc>,
-        conversation_status: ConversationStatus,
+        _conversation_status: ConversationStatus,
+    ) -> Self {
+        let error_code = error_code.into();
+        let evidence = DelegationTerminationAuditV1::for_terminal_code(
+            &error_code,
+            DelegationRunStatus::Running,
+            true,
+            finished_at,
+        );
+        Self::failed_with_evidence(error_code, finished_at, evidence)
+    }
+
+    pub fn failed_with_evidence(
+        error_code: impl Into<String>,
+        finished_at: DateTime<Utc>,
+        evidence: DelegationTerminationAuditV1,
     ) -> Self {
         Self {
             status: TaskStatus::Failed,
             error_code: Some(error_code.into()),
             finished_at,
-            conversation_status,
+            conversation_status: ConversationStatus::Cancelled,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: Some(evidence),
         }
     }
 
     pub fn canceled(
         error_code: impl Into<String>,
         finished_at: DateTime<Utc>,
-        conversation_status: ConversationStatus,
+        evidence: DelegationTerminationAuditV1,
     ) -> Self {
         Self {
             status: TaskStatus::Canceled,
             error_code: Some(error_code.into()),
             finished_at,
-            conversation_status,
+            conversation_status: ConversationStatus::Cancelled,
             runtime_stats: None,
             card_summary_json: None,
-            termination_audit_json: None,
+            termination_evidence: Some(evidence),
         }
+    }
+
+    #[cfg(test)]
+    pub fn legacy_without_audit(status: TaskStatus, error_code: Option<String>) -> Self {
+        Self {
+            status,
+            error_code,
+            finished_at: Utc::now(),
+            conversation_status: if status == TaskStatus::Completed {
+                ConversationStatus::PendingReview
+            } else {
+                ConversationStatus::Cancelled
+            },
+            runtime_stats: None,
+            card_summary_json: None,
+            termination_evidence: None,
+        }
+    }
+
+    pub fn termination_evidence(&self) -> Option<&DelegationTerminationAuditV1> {
+        self.termination_evidence.as_ref()
     }
 
     pub fn with_runtime_stats(mut self, stats: DelegationRuntimeStats) -> Self {
@@ -168,22 +213,6 @@ impl TerminalTaskWrite {
     pub fn with_card_summary_json(mut self, json: impl Into<String>) -> Self {
         self.card_summary_json = Some(json.into());
         self
-    }
-
-    pub fn with_termination_audit_json(mut self, json: impl Into<String>) -> Self {
-        self.termination_audit_json = Some(json.into());
-        self
-    }
-
-    fn to_persisted_status(&self) -> Result<DelegationTaskStatus, TaskStoreError> {
-        match self.status {
-            TaskStatus::Completed => Ok(DelegationTaskStatus::Completed),
-            TaskStatus::Failed => Ok(DelegationTaskStatus::Failed),
-            TaskStatus::Canceled => Ok(DelegationTaskStatus::Canceled),
-            TaskStatus::Running | TaskStatus::Unknown => Err(TaskStoreError::Permanent(
-                "terminal write must not use running/unknown status".into(),
-            )),
-        }
     }
 }
 
@@ -224,6 +253,7 @@ impl PersistedTask {
             observation: None,
             last_agent_activity_at: None,
             stalled_since: None,
+            recovery: None,
         }
     }
 }
@@ -301,6 +331,10 @@ pub enum TaskStoreError {
     /// Continue target fails eligibility. Wire: `not_continuable`.
     #[error("not continuable: {0}")]
     NotContinuable(String),
+    #[error("recovery confirmation required")]
+    RecoveryConfirmationRequired(DelegationRecoveryProjection),
+    #[error("recovery authorization rejected: {code}")]
+    RecoveryAuthorizationRejected { code: &'static str },
     /// Workflow graph admission rejected (B2/B6/A8.3/A14/B14).
     /// Wire code is the structured `code` field (e.g. `final_early`).
     #[error("workflow admission rejected ({code}): {message}")]
@@ -334,6 +368,8 @@ impl TaskStoreError {
             Self::InvalidReplacement(_) => Some("invalid_replacement"),
             Self::StaleTaskId(_) => Some("stale_task_id"),
             Self::NotContinuable(_) => Some("not_continuable"),
+            Self::RecoveryConfirmationRequired(_) => Some("recovery_confirmation_required"),
+            Self::RecoveryAuthorizationRejected { code } => Some(code),
             Self::NotFound(_) => Some("not_found"),
             // Structured admission codes are returned via
             // [`TaskStoreError::workflow_admission_code`] / DelegationError;
@@ -343,6 +379,13 @@ impl TaskStoreError {
             // Pre-admission ownership fence — broker maps to spawn_failed.
             Self::BindOwnershipConflict(_) => Some("spawn_failed"),
             Self::Transient(_) | Self::Permanent(_) => None,
+        }
+    }
+
+    pub fn recovery_projection(&self) -> Option<&DelegationRecoveryProjection> {
+        match self {
+            Self::RecoveryConfirmationRequired(projection) => Some(projection),
+            _ => None,
         }
     }
 
@@ -552,6 +595,9 @@ pub trait DelegationTaskStore: Send + Sync {
     /// Mark the retry record frozen so workers skip settle and `put_retry`
     /// refuses re-own. No-op when no record exists.
     async fn freeze_retry(&self, task_id: &str);
+    /// Replace the retry terminal with the producer-authored permanent failure
+    /// and freeze it in the same lock acquisition.
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite);
 }
 
 /// Default store for broker unit tests that do **not** exercise durability.
@@ -622,6 +668,13 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn freeze_retry(&self, task_id: &str) {
         if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
+    }
+
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.terminal = terminal;
             retry.frozen = true;
         }
     }
@@ -783,6 +836,7 @@ fn report_from_terminal(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -862,90 +916,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         }
 
         // Legacy conversation-only CAS (gen-1 before live run inserts).
-        let persisted_status = terminal.to_persisted_status()?;
-        let mut update = conversation::Entity::update_many()
-            .col_expr(
-                conversation::Column::DelegationTaskStatus,
-                sea_orm::sea_query::Expr::value(persisted_status),
-            )
-            .col_expr(
-                conversation::Column::DelegationErrorCode,
-                sea_orm::sea_query::Expr::value(terminal.error_code.clone()),
-            )
-            .col_expr(
-                conversation::Column::DelegationFinishedAt,
-                sea_orm::sea_query::Expr::value(terminal.finished_at),
-            )
-            .col_expr(
-                conversation::Column::Status,
-                sea_orm::sea_query::Expr::value(terminal.conversation_status.clone()),
-            )
-            .col_expr(
-                conversation::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
-            );
+        let won = self
+            .runs
+            .settle_legacy_conversation_terminal(task_id, &terminal)
+            .await?;
 
-        // Optional final runtime snapshot in the same CAS update.
-        if let Some(ref stats) = terminal.runtime_stats {
-            let tool_call_count = i64::try_from(stats.tool_call_count).map_err(|_| {
-                TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into())
-            })?;
-            let edit_tool_call_count = i64::try_from(stats.edit_tool_call_count).map_err(|_| {
-                TaskStoreError::Permanent("runtime edit_tool_call_count exceeds i64".into())
-            })?;
-            let additions = stats
-                .additions
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| TaskStoreError::Permanent("runtime additions exceeds i64".into()))?;
-            let deletions = stats
-                .deletions
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| TaskStoreError::Permanent("runtime deletions exceeds i64".into()))?;
-            let touched_files_json =
-                serde_json::to_string(&stats.touched_files).map_err(|err| {
-                    TaskStoreError::Permanent(format!("serialize touched_files failed: {err}"))
-                })?;
-            update = update
-                .col_expr(
-                    conversation::Column::DelegationToolCallCount,
-                    sea_orm::sea_query::Expr::value(tool_call_count),
-                )
-                .col_expr(
-                    conversation::Column::DelegationEditToolCallCount,
-                    sea_orm::sea_query::Expr::value(edit_tool_call_count),
-                )
-                .col_expr(
-                    conversation::Column::DelegationTouchedFilesJson,
-                    sea_orm::sea_query::Expr::value(touched_files_json),
-                )
-                .col_expr(
-                    conversation::Column::DelegationTouchedFilesTruncated,
-                    sea_orm::sea_query::Expr::value(stats.touched_files_truncated),
-                )
-                .col_expr(
-                    conversation::Column::DelegationAdditions,
-                    sea_orm::sea_query::Expr::value(additions),
-                )
-                .col_expr(
-                    conversation::Column::DelegationDeletions,
-                    sea_orm::sea_query::Expr::value(deletions),
-                )
-                .col_expr(
-                    conversation::Column::DelegationLineCountsComplete,
-                    sea_orm::sea_query::Expr::value(stats.line_counts_complete),
-                );
-        }
-
-        let result = update
-            .filter(conversation::Column::DelegationCallId.eq(task_id))
-            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
-            .exec(&self.db().conn)
-            .await
-            .map_err(Self::map_db_err)?;
-
-        if result.rows_affected > 0 {
+        if won {
             let row = self
                 .load(task_id)
                 .await?
@@ -970,7 +946,6 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         use crate::db::entities::conversation::ConversationKind;
         use crate::db::entities::delegation_task_run;
         use crate::db::service::conversation_service;
-        use sea_orm::sea_query::Expr;
 
         // Authoritative: settle non-terminal run rows (+ monotonic projection).
         let from_runs = self.runs.reconcile_non_terminal(at).await?;
@@ -1041,32 +1016,45 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         // Live rows only: never rewrite soft-deleted historical orphans (e.g.
         // pre-Task-5 provisional shells still projecting `running`) to
         // `host_restarted`. Runtime compensation and Task 6 migration own those.
-        let result = conversation::Entity::update_many()
-            .col_expr(
-                conversation::Column::DelegationTaskStatus,
-                Expr::value(DelegationTaskStatus::Failed),
-            )
-            .col_expr(
-                conversation::Column::DelegationErrorCode,
-                Expr::value("host_restarted"),
-            )
-            .col_expr(conversation::Column::DelegationFinishedAt, Expr::value(at))
-            .col_expr(
-                conversation::Column::Status,
-                Expr::value(ConversationStatus::Cancelled),
-            )
-            .col_expr(conversation::Column::UpdatedAt, Expr::value(at))
+        let remaining = conversation::Entity::find()
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
             .filter(conversation::Column::DeletedAt.is_null())
-            .exec(&self.db().conn)
+            .all(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
+        let mut legacy_settled = 0u64;
+        for row in remaining {
+            let Some(task_id) = row.delegation_call_id.as_deref() else {
+                continue;
+            };
+            let audit = DelegationTerminationAuditV1::new(
+                AcpTerminationSummaryV1::new(
+                    AcpTerminationSource::HostRestart,
+                    AcpTerminationReason::HostRestarted,
+                    AcpTerminationClassification::Unexpected,
+                    true,
+                    at,
+                ),
+                DelegationRunStatus::Running,
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+                row.parent_tool_use_id.clone(),
+                None,
+            );
+            let terminal = TerminalTaskWrite::failed_with_evidence("host_restarted", at, audit);
+            if self
+                .runs
+                .settle_legacy_conversation_terminal(task_id, &terminal)
+                .await?
+            {
+                legacy_settled = legacy_settled.saturating_add(1);
+            }
+        }
 
         // Conversation fallback may re-touch rows already projected by run
         // settle; count only run settlements as authoritative increments and
         // still report conversation rows_affected + provisional cleanups.
         Ok(from_runs
-            .saturating_add(result.rows_affected)
+            .saturating_add(legacy_settled)
             .saturating_add(provisional_cleaned))
     }
 
@@ -1194,6 +1182,13 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             retry.frozen = true;
         }
     }
+
+    async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.terminal = terminal;
+            retry.frozen = true;
+        }
+    }
 }
 
 /// Scripted in-memory store for broker unit tests.
@@ -1233,6 +1228,8 @@ pub mod mock {
         /// When true, the next `write_runtime_stats` hangs until cancelled
         /// (for timeout tests with a paused Tokio clock).
         hang_next_runtime: std::sync::atomic::AtomicBool,
+        /// One queued load error for broker cold-lookup tests.
+        fail_next_load: Mutex<Option<TaskStoreError>>,
     }
 
     /// Deterministic settle delay for mid-settle observation tests.
@@ -1256,6 +1253,7 @@ pub mod mock {
                 runtime_writes: Mutex::new(Vec::new()),
                 fail_next_runtime: Mutex::new(None),
                 hang_next_runtime: std::sync::atomic::AtomicBool::new(false),
+                fail_next_load: Mutex::new(None),
             }
         }
 
@@ -1416,6 +1414,10 @@ pub mod mock {
             self.hang_next_runtime.store(true, Ordering::SeqCst);
         }
 
+        pub async fn fail_next_load(&self, error: TaskStoreError) {
+            *self.fail_next_load.lock().await = Some(error);
+        }
+
         pub async fn runtime_write_count(&self, task_id: &str) -> usize {
             self.runtime_writes
                 .lock()
@@ -1474,6 +1476,9 @@ pub mod mock {
     #[async_trait]
     impl DelegationTaskStore for MockTaskStore {
         async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError> {
+            if let Some(error) = self.fail_next_load.lock().await.take() {
+                return Err(error);
+            }
             let mut map = self.tasks.lock().await;
             if self.seed_on_load.load(Ordering::SeqCst) {
                 let child_id = self.default_child_id.load(Ordering::SeqCst);
@@ -1671,6 +1676,13 @@ pub mod mock {
 
         async fn freeze_retry(&self, task_id: &str) {
             if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.frozen = true;
+            }
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.terminal = terminal;
                 retry.frozen = true;
             }
         }
@@ -1912,10 +1924,9 @@ mod tests {
                         Utc::now(),
                         ConversationStatus::Cancelled,
                     ),
-                    DelegationTaskStatus::Canceled => TerminalTaskWrite::canceled(
-                        "usercancel",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                    DelegationTaskStatus::Canceled => TerminalTaskWrite::legacy_without_audit(
+                        TaskStatus::Canceled,
+                        Some("usercancel".into()),
                     ),
                     DelegationTaskStatus::Running => unreachable!(),
                 };
@@ -1930,8 +1941,10 @@ mod tests {
         let db = test_store_with_running_task("task-1").await;
         let store = DbDelegationTaskStore::new(db.clone());
         let completed = TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview);
-        let canceled =
-            TerminalTaskWrite::canceled("usercancel", Utc::now(), ConversationStatus::Cancelled);
+        let canceled = TerminalTaskWrite::legacy_without_audit(
+            TaskStatus::Canceled,
+            Some("usercancel".into()),
+        );
 
         let (a, b) = tokio::join!(
             store.settle("task-1", completed),

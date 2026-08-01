@@ -34,6 +34,355 @@ const RECOVERY_REQUIRED = [
   ],
 ]
 
+const RECOVERY_CONTRACT_TERMS = [
+  "request_recovery_authorization",
+  "recovery_authorization_id",
+  "recovery_confirmation_required",
+  "recover_workflow",
+]
+
+function extractHeadingSection(skill, heading) {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const start = skill.search(new RegExp(`^##\\s+${escaped}\\s*$`, "im"))
+  if (start < 0) return null
+  const from = skill.slice(start)
+  const nextRel = from.slice(1).search(/^##\s/m)
+  return nextRel < 0 ? from : from.slice(0, nextRel + 1)
+}
+
+function stableAgent(parsed) {
+  return parsed.ok ? parsed.agent : `invalid:${parsed.reason}`
+}
+
+function canonicalNumberedRoutes(taskRouteSection) {
+  const tables = parseMarkdownTablesByHeading(taskRouteSection)
+  const routes = []
+  for (const [heading, route] of [
+    ["normal", [...tables.keys()].find((key) => /^normal route\b/i.test(key))],
+    [
+      "high",
+      [...tables.keys()].find((key) => /^high(?:-risk)? route\b/i.test(key)),
+    ],
+  ]) {
+    for (const row of tables.get(route) ?? []) {
+      const role = classifyRole(roleCell(row.cells))
+      if (!role) continue
+      routes.push(
+        `${heading}|${role}|${stableAgent(parseExactAgentIdentity(agentCell(row.cells)))}`
+      )
+    }
+  }
+  return routes.sort()
+}
+
+function canonicalTopRoutes(skill) {
+  const section = extractHeadingSection(skill, "Codeg roles and tools")
+  const tables = parseMarkdownTablesByHeading(section)
+  const rows = tables.get("codeg roles and tools") ?? []
+  const routes = []
+  for (const row of rows) {
+    if ((row.cells[0] ?? "").toLowerCase() === "route") continue
+    const route = (row.cells[0] ?? "").trim().toLowerCase()
+    const role = classifyRole(row.cells[1])
+    if (!route || !role) continue
+    routes.push(
+      `${route}|${role}|${stableAgent(parseExactAgentIdentity(row.cells[2]))}`
+    )
+  }
+  return routes.sort()
+}
+
+const EXPECTED_ROUTE_MULTISET = [
+  "high|implementer|codex",
+  "high|reviewer|codex",
+  "high|reviewer|grok",
+  "normal|implementer|grok",
+  "normal|reviewer|codex",
+].sort()
+
+function sameMultiset(left, right) {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => entry === right[index])
+  )
+}
+
+function normalizedRecoveryClause(clause) {
+  return clause
+    .replace(/[’‘ʼ]/g, "'")
+    .replace(/[`*]/g, "")
+    .replace(/^\s*(?:[-+]\s+|\d+[.)]\s+)?/, "")
+    .replace(/[.!?;]+\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isAuthorizationIdPrivacyClause(normalized) {
+  const id = "(?:the\\s+)?recovery_authorization_id"
+  const target =
+    "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics)"
+  const targets = `${target}(?:\\s*,\\s*${target})*(?:\\s*,?\\s+(?:and|or)\\s+${target})?`
+  const destination = `(?:in|into|on|to)\\s+(?:the\\s+)?${targets}`
+  const activeAction = "(?:persist|store|project|expose|include|write|record)"
+  const passiveAction =
+    "(?:persisted|stored|projected|exposed|included|written|recorded)"
+  const imperativeControl =
+    "(?:never|do\\s+not|must\\s+not|should\\s+not|shall\\s+not|may\\s+not|under\\s+no\\s+circumstances|must\\s+under\\s+no\\s+circumstances)"
+  const activeSubject =
+    "(?:the\\s+)?(?:runtime|system|workflow|implementation|validator|broker|client|codeg)"
+  const subjectControl =
+    "(?:(?:must|should|shall|may|does|will|can)\\s+(?:not|never)|(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances|(?:doesn't|can't|won't|wouldn't|shouldn't|mustn't))"
+  const passiveControl =
+    `(?:` +
+    `(?:must|should|shall|may|will|can)\\s+(?:not|never)\\s+be\\s+${passiveAction}|` +
+    `(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances\\s+be\\s+${passiveAction}|` +
+    `is\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}|` +
+    `is\\s+not\\s+(?:allowed|permitted)\\s+to\\s+be\\s+${passiveAction}|` +
+    `isn't\\s+(?:allowed|permitted)\\s+to\\s+be\\s+${passiveAction}|` +
+    `(?:must|should|shall|may)\\s+be\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}` +
+    `)\\s+${destination}`
+
+  return (
+    new RegExp(
+      `^${imperativeControl}\\s+${activeAction}\\s+${id}\\s+${destination}$`,
+      "i"
+    ).test(normalized) ||
+    new RegExp(
+      `^${activeSubject}\\s+${subjectControl}\\s+${activeAction}\\s+${id}\\s+${destination}$`,
+      "i"
+    ).test(normalized) ||
+    new RegExp(
+      `^${id}\\s+${passiveControl}(?:\\s+and\\s+${passiveControl})*$`,
+      "i"
+    ).test(normalized)
+  )
+}
+
+function isSafeNeutralRecoveryClause(normalized, token) {
+  if (token === "recovery_authorization_id") {
+    return isAuthorizationIdPrivacyClause(normalized)
+  }
+  if (token === "recover_workflow") {
+    return (
+      /^(?:an?\s+)?enabled\s+catalog\s+missing\s+recover_workflow\s+hard[- ]blocks?$/i.test(
+        normalized
+      ) ||
+      /^recover_workflow\s+(?:never|(?:(?:must|should|does|do|will|would|can|could|may)\s+not))\s+(?:generates?|creates?|opens?|mints?)\s+(?:a\s+)?challenge$/i.test(
+        normalized
+      ) ||
+      /^Require the full v2 tool set \(get_workflow_capabilities, get_workflow_state, publish_workflow_manifest, settle_workflow_gate, recover_workflow\)$/i.test(
+        normalized
+      ) ||
+      /^(?:["”]\s*\|\s*)?Workflow recovery requires recover_workflow$/i.test(
+        normalized
+      )
+    )
+  }
+  return false
+}
+
+function hasExplicitNegativeRecoverySemantics(normalized) {
+  return (
+    /\bnot\b/i.test(normalized) ||
+    /\b(?:isn't|aren't|wasn't|weren't|can't|don't|doesn't|won't|wouldn't|shouldn't|mustn't)\b/i.test(
+      normalized
+    ) ||
+    /\b(?:never|cannot|forbid(?:s|den|ding)?|prohibit(?:s|ed|ing)?|disallow(?:s|ed|ing)?|avoid(?:s|ed|ing)?)\b/i.test(
+      normalized
+    ) ||
+    /\bby\s+no\s+means\b/i.test(normalized) ||
+    /\bunder\s+no\s+circumstances\b/i.test(normalized) ||
+    /\bwithout\b/i.test(normalized)
+  )
+}
+
+function isExplicitPositiveRecoveryClause(normalized, token) {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const delegationTable =
+    "^\\|\\s*Typed delegation recovery challenge\\s*\\|\\s*" +
+    "Projected call\\s*(?:->|→)\\s*recovery_confirmation_required\\s*" +
+    "(?:->|→)\\s*request_recovery_authorization\\s*(?:->|→)\\s*" +
+    "exact rejected call replay with the ID$"
+  const workflowTable =
+    "^\\|\\s*Workflow recovery\\s*\\|\\s*get_workflow_state\\s*" +
+    "(?:->|→)\\s*request_recovery_authorization\\s*(?:->|→)\\s*" +
+    "receipt-required recover_workflow$"
+
+  if (token === "recovery_confirmation_required") {
+    return (
+      new RegExp(
+        `^(?:receive(?:s|d)?|emit(?:s|ted)?|surface(?:s|d)?)\\s+` +
+          `(?:a\\s+)?typed\\s+${escaped}` +
+          `(?:\\s+from\\s+(?:the\\s+)?projected call)?$`,
+        "i"
+      ).test(normalized) || new RegExp(delegationTable, "i").test(normalized)
+    )
+  }
+  if (token === "request_recovery_authorization") {
+    return (
+      new RegExp(
+        `^(?:then\\s+)?(?:call|invoke)\\s+${escaped}` +
+          `(?:\\s+for\\s+(?:the\\s+)?rejected action)?$`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(delegationTable, "i").test(normalized) ||
+      new RegExp(workflowTable, "i").test(normalized)
+    )
+  }
+  if (token === "recovery_authorization_id") {
+    const id = `(?:the\\s+)?${escaped}`
+    const replayKind =
+      "(?:recovery|continue|replacement|recover_workflow|continue\\s+or\\s+replacement)"
+    const replayLed = new RegExp(
+      `^(?:then\\s+)?replay\\s+the\\s+exact\\s+rejected\\s+` +
+        `${replayKind}\\s+call\\s+(?:` +
+        `(?:with|using)\\s+${id}(?:\\s+and\\s+the\\s+same\\s+key,\\s*profile,\\s*and\\s*action)?|` +
+        `and\\s+(?:supply|pass|use)\\s+${id}(?:\\s+as\\s+(?:an?\\s+)?input)?` +
+        `)$`,
+      "i"
+    )
+    const inputLed = new RegExp(
+      `^(?:supply|pass|use)\\s+${id}(?:\\s+as\\s+(?:an?\\s+)?input)?\\s+` +
+        `(?:on|to|for)\\s+the\\s+exact\\s+rejected\\s+` +
+        `(?:recovery|continue|replacement|recover_workflow)\\s+replay\\s+call$`,
+      "i"
+    )
+    return replayLed.test(normalized) || inputLed.test(normalized)
+  }
+  if (token === "recover_workflow") {
+    return (
+      new RegExp(
+        `^(?:(?:then|after authorization,)\\s+)?` +
+          `(?:call|invoke)\\s+receipt-required\\s+${escaped}$`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(workflowTable, "i").test(normalized) ||
+      new RegExp(
+        `^(?:supply|pass|use)\\s+(?:the\\s+)?recovery_authorization_id` +
+          `(?:\\s+as\\s+(?:an?\\s+)?input)?\\s+(?:on|to|for)\\s+` +
+          `the\\s+exact\\s+rejected\\s+${escaped}\\s+replay\\s+call$`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(
+        `^(?:then\\s+)?replay\\s+the\\s+exact\\s+rejected\\s+${escaped}` +
+          `\\s+call\\s+(?:(?:with|using)\\s+(?:the\\s+)?` +
+          `recovery_authorization_id(?:\\s+and\\s+the\\s+same\\s+key,` +
+          `\\s*profile,\\s*and\\s*action)?|and\\s+(?:supply|pass|use)` +
+          `\\s+(?:the\\s+)?recovery_authorization_id` +
+          `(?:\\s+as\\s+(?:an?\\s+)?input)?)$`,
+        "i"
+      ).test(normalized)
+    )
+  }
+  return false
+}
+
+function recoveryClauses(skill) {
+  return skill.split(/\r?\n\s*\r?\n/).flatMap((paragraph) => {
+    const lines = paragraph.split(/\r?\n/).filter((line) => line.trim())
+    const bounded = lines.every((line) => /^\s*\|/.test(line))
+      ? lines
+      : [lines.join(" ")]
+    return bounded.flatMap((clause) => clause.split(/(?<=[.!?;])/))
+  })
+}
+
+function recoveryTokenMentions(skill, token) {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const exactToken = new RegExp(
+    `(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`,
+    "g"
+  )
+  const mentions = []
+  const clauses = recoveryClauses(skill)
+  for (const clause of clauses) {
+    exactToken.lastIndex = 0
+    if (!exactToken.test(clause)) continue
+    const normalized = normalizedRecoveryClause(clause)
+    const negative = hasExplicitNegativeRecoverySemantics(normalized)
+    const safeNeutral = isSafeNeutralRecoveryClause(normalized, token)
+    const polarity = negative
+      ? safeNeutral
+        ? "neutral"
+        : "negated"
+      : safeNeutral
+        ? "neutral"
+        : isExplicitPositiveRecoveryClause(normalized, token)
+          ? "affirmative"
+          : "invalid"
+    mentions.push({ polarity })
+  }
+  return mentions
+}
+
+function affirmativeTokenMention(skill, token) {
+  return recoveryTokenMentions(skill, token).some(
+    (mention) => mention.polarity === "affirmative"
+  )
+}
+
+function hasInvalidTokenMention(skill, token) {
+  return recoveryTokenMentions(skill, token).some(
+    (mention) =>
+      mention.polarity === "negated" || mention.polarity === "invalid"
+  )
+}
+
+function hasUnsafeCancellationMapping(skill) {
+  const causes = [
+    "parent_canceled",
+    "parent_turn_failed",
+    "join_abandoned",
+    "user_cancelled",
+    "tool_stalled_timeout",
+  ]
+  return skill.split(/[.,;\r\n]+/).some((clause) => {
+    const lower = clause.toLowerCase()
+    const matches = [...lower.matchAll(new RegExp(causes.join("|"), "g"))]
+    return matches.some((match, index) => {
+      const cause = match[0]
+      const causeIndex = match.index
+      const previousEnd =
+        index === 0
+          ? 0
+          : matches[index - 1].index + matches[index - 1][0].length
+      const nextStart = matches[index + 1]?.index ?? lower.length
+      const before = lower.slice(
+        Math.max(previousEnd, causeIndex - 48),
+        causeIndex
+      )
+      const after = lower.slice(causeIndex + cause.length, nextStart)
+      if (!/(?:unresumable|replacement(?:_reason)?|replace)/.test(after)) {
+        return false
+      }
+      if (
+        /(?:never|must not|does not|do not|cannot|can't)\s+(?:map|replace|use)\b[^,.;]*$/.test(
+          before
+        ) ||
+        /(?:never\s+maps?|must not\s+(?:map|replace|use)|does not\s+(?:map|replace|use)|do not\s+(?:map|replace|use)|cannot\s+(?:map|replace|use)|can't\s+(?:map|replace|use)|is not\s+(?:a\s+)?replacement source)\b/.test(
+          after
+        )
+      ) {
+        return false
+      }
+      return /(?:maps?|use[sd]?|becomes?|is|to|replacement_reason\s*=|replace)/.test(
+        after
+      )
+    })
+  })
+}
+
+function hasNegatedDesignTrigger(skill, trigger) {
+  const escaped = trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(
+    `${escaped}\\b[^.;\\r\\n]{0,80}\\b(?:` +
+      `(?:does|do|should|must|may|can|could|will|would)\\s+(?:not|never)\\s+trigger|` +
+      `never\\s+triggers?|cannot\\s+trigger|can't\\s+trigger` +
+      `)\\s+(?:an\\s+)?external Design review`,
+    "i"
+  ).test(skill)
+}
+
 /**
  * Isolate the numbered Task route section (`## 4. Task route` or `## Task route`).
  * Returns null when the section is missing.
@@ -381,6 +730,18 @@ const ACTION_FORMS = new Map([
   ["authors", "author"],
   ["authoring", "author"],
   ["authored", "author"],
+  ["draft", "draft"],
+  ["drafts", "draft"],
+  ["drafting", "draft"],
+  ["drafted", "draft"],
+  ["compose", "compose"],
+  ["composes", "compose"],
+  ["composing", "compose"],
+  ["composed", "compose"],
+  ["generate", "generate"],
+  ["generates", "generate"],
+  ["generating", "generate"],
+  ["generated", "generate"],
   ["rewrite", "rewrite"],
   ["rewrites", "rewrite"],
   ["rewriting", "rewrite"],
@@ -399,7 +760,15 @@ const ACTION_FORMS = new Map([
   ["invoked", "invoke"],
 ])
 
-const CONTENT_ACTIONS = new Set(["write", "author", "rewrite", "edit"])
+const CONTENT_ACTIONS = new Set([
+  "write",
+  "author",
+  "draft",
+  "compose",
+  "generate",
+  "rewrite",
+  "edit",
+])
 const CONTRAST_BOUNDARIES = new Set(["but", "however", "yet", "then"])
 const DELEGATION_CONTROL_FORMS = new Map([
   ["ask", "ask"],
@@ -753,10 +1122,20 @@ export function findParentPermissionViolations(skill) {
         "parent authorship permission present: parent instructed to invoke writing-plans itself"
       )
     }
+    // This bounded parser is defense in depth for known ownership grammar;
+    // it is not proof of arbitrary natural-language ownership semantics.
+    const chineseAction = line.match(
+      /父会话[^。；;]*?(起草|拟写|编写|撰写|创作|生成|改写|重写|编辑|修改)[^。；;]*?(Plan|Task\s*code|代码)/i
+    )
+    const chinesePrefix = chineseAction
+      ? line.slice(
+          line.indexOf("父会话"),
+          chineseAction.index + chineseAction[0].indexOf(chineseAction[1])
+        )
+      : ""
     if (
-      /父会话(?:可以|可|应当|应|必须).*(?:编写|撰写|改写|实现|修复).*(?:计划|Plan|Task|代码)/i.test(
-        line
-      )
+      chineseAction &&
+      !/(?:不得|禁止|不要|不应|不可|不能)[^。；;]*$/i.test(chinesePrefix)
     ) {
       found.push(
         "parent authorship permission present: parent Chinese permission to author Plan/Task"
@@ -840,13 +1219,13 @@ export function validateSkillMarkdown(skill) {
   const notes = []
   const lines = skill.split(/\r?\n/)
 
-  const fail = (msg) => failures.push(msg)
+  const fail = (ruleId, msg) => failures.push(`[${ruleId}] ${msg}`)
   const pass = (msg) => notes.push(`OK: ${msg}`)
 
   // --- Forbidden: reject every literal occurrence (brief raw patterns) ---
   for (const [re, label] of FORBIDDEN) {
     if (re.test(skill)) {
-      fail(label)
+      fail("B2D-001", label)
     } else {
       pass(label.replace(/^forbidden /, "absent "))
     }
@@ -854,7 +1233,7 @@ export function validateSkillMarkdown(skill) {
 
   for (const [re, label] of REQUIRED) {
     if (!re.test(skill)) {
-      fail(`missing required term: ${label}`)
+      fail("B2D-002", `missing required term: ${label}`)
     } else {
       pass(`has ${label}`)
     }
@@ -862,7 +1241,7 @@ export function validateSkillMarkdown(skill) {
 
   for (const [re, label] of RECOVERY_REQUIRED) {
     if (!re.test(skill)) {
-      fail(`missing required recovery term: ${label}`)
+      fail("B2D-003", `missing required recovery term: ${label}`)
     } else {
       pass(`has ${label}`)
     }
@@ -870,11 +1249,11 @@ export function validateSkillMarkdown(skill) {
 
   const fm = skill.match(/^---\r?\n([\s\S]*?)\r?\n---/)
   if (!fm) {
-    fail("missing YAML frontmatter")
+    fail("B2D-004", "missing YAML frontmatter")
   } else {
     const descMatch = fm[1].match(/^description:\s*(.+)$/m)
     if (!descMatch) {
-      fail("frontmatter missing description")
+      fail("B2D-004", "frontmatter missing description")
     } else {
       const desc = descMatch[1].trim()
       if (
@@ -883,25 +1262,26 @@ export function validateSkillMarkdown(skill) {
         )
       ) {
         fail(
+          "B2D-004",
           "frontmatter description must be trigger-only (leaks workflow terms)"
         )
       } else {
         pass("frontmatter description present")
       }
       if (!/^Use when\b/i.test(desc)) {
-        fail('frontmatter description should start with "Use when"')
+        fail("B2D-004", 'frontmatter description should start with "Use when"')
       }
     }
   }
 
   if (lines.length >= 500) {
-    fail(`SKILL.md has ${lines.length} lines (must be < 500)`)
+    fail("B2D-005", `SKILL.md has ${lines.length} lines (must be < 500)`)
   } else {
     pass(`line count ${lines.length} < 500`)
   }
 
   const ownership = validateParentOwnership(skill)
-  for (const f of ownership.failures) fail(f)
+  for (const f of ownership.failures) fail("B2D-006", f)
   for (const n of ownership.notes) pass(n)
 
   const taskRouteSection = extractTaskRouteSection(skill)
@@ -910,7 +1290,24 @@ export function validateSkillMarkdown(skill) {
     pass("normal route table Grok implementer + Codex reviewer")
     pass("high route table Codex implementer + two distinct reviewers")
   } else {
-    for (const f of routeFailures) fail(f)
+    for (const f of routeFailures) fail("B2D-007", f)
+  }
+
+  const topRoutes = canonicalTopRoutes(skill)
+  const numberedRoutes = canonicalNumberedRoutes(taskRouteSection)
+  if (!sameMultiset(topRoutes, EXPECTED_ROUTE_MULTISET)) {
+    fail(
+      "B2D-013",
+      `top Codeg roles and tools table is not exact: ${topRoutes.join(", ")}`
+    )
+    fail("B2D-007", "an authoritative route table is not exact")
+  } else {
+    pass("top Codeg roles and tools table is exact")
+  }
+  if (!sameMultiset(topRoutes, numberedRoutes)) {
+    fail("B2D-014", "top and numbered route surfaces differ")
+  } else {
+    pass("route surfaces are identical")
   }
 
   // High must not allow single-reviewer pass (permissive language in whole skill)
@@ -922,7 +1319,7 @@ export function validateSkillMarkdown(skill) {
     /pass high with (only\s+)?one reviewer/i.test(skill)
 
   if (highAllowsOneReviewer) {
-    fail("high route must not allow passing with a single reviewer")
+    fail("B2D-008", "high route must not allow passing with a single reviewer")
   }
 
   const coverage =
@@ -931,6 +1328,7 @@ export function validateSkillMarkdown(skill) {
     /latest/i.test(skill)
   if (!coverage) {
     fail(
+      "B2D-009",
       "missing exact latest producer coverage (reviewed_task_id + artifact_digest)"
     )
   } else {
@@ -946,7 +1344,7 @@ export function validateSkillMarkdown(skill) {
       /full[- ]group|complete cohort|complete Plan review group|restore.*complete/i,
       "full-group reset",
     ],
-    [/two (consecutive )?non-improving|stagnat/i, "stagnation"],
+    [/two (consecutive )?non-improving/i, "stagnation"],
     [
       /pre-admission|before.*cohort.*admitted/i,
       "pre-admission risk correction path",
@@ -964,16 +1362,226 @@ export function validateSkillMarkdown(skill) {
 
   for (const [re, label] of planContracts) {
     if (!re.test(skill)) {
-      fail(`missing contract: ${label}`)
+      fail("B2D-010", `missing contract: ${label}`)
     } else {
       pass(label)
     }
   }
 
   if (!/subagent-driven-development/.test(skill)) {
-    fail("must invoke subagent-driven-development by name")
+    fail("B2D-011", "must invoke subagent-driven-development by name")
   } else {
     pass("invokes subagent-driven-development")
+  }
+
+  const quickReference =
+    extractHeadingSection(skill, "Quick reference under pressure") ?? ""
+  const phaseLines = [
+    "Design Gate approved -> dispatch Plan Author automatically.",
+    "Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.",
+    "Task Gate passed -> dispatch the next eligible Task or Final review automatically.",
+    "Final review approved -> verify, commit, and report automatically.",
+  ]
+  for (const line of phaseLines) {
+    if (!quickReference.includes(line)) {
+      fail("B2D-012", `missing automatic phase transition: ${line}`)
+    }
+  }
+  for (const condition of [
+    "hard block",
+    "user_decision_required",
+    "requirements, scope, architecture, or user data handling",
+  ]) {
+    if (!quickReference.includes(condition)) {
+      fail("B2D-012", `missing exact pause condition: ${condition}`)
+    }
+  }
+  if ((skill.match(/user_decision_required/g) ?? []).length < 2) {
+    fail(
+      "B2D-012",
+      "user_decision_required must appear in both recovery and pause contracts"
+    )
+  }
+  if (
+    /pause[^.\n]{0,80}(?:user approval|approval)[^.\n]{0,80}(?:phase|next)/i.test(
+      quickReference
+    )
+  ) {
+    fail(
+      "B2D-012",
+      "adds a user-approval pause outside the exact hard conditions"
+    )
+  }
+
+  for (const token of RECOVERY_CONTRACT_TERMS) {
+    if (
+      !affirmativeTokenMention(skill, token) ||
+      hasInvalidTokenMention(skill, token)
+    ) {
+      fail("B2D-R001", `missing affirmative recovery contract term: ${token}`)
+    }
+  }
+
+  const delegationSequenceValid =
+    /projected call[\s\S]{0,160}recovery_confirmation_required[\s\S]{0,160}request_recovery_authorization[\s\S]{0,220}replay the exact rejected (?:continue or\s*)?replacement call|projected call[\s\S]{0,160}recovery_confirmation_required[\s\S]{0,160}request_recovery_authorization[\s\S]{0,220}replay the exact rejected continue or\s*replacement call/i.test(
+      skill
+    ) && /same key, profile, and\s*action/i.test(skill)
+  const unsafeDelegationSequence =
+    /request_recovery_authorization before recovery_confirmation_required/i.test(
+      skill
+    ) ||
+    /similar replacement call instead of replaying the exact rejected call/i.test(
+      skill
+    ) ||
+    /change the key and profile before replaying the action/i.test(skill)
+  if (!delegationSequenceValid || unsafeDelegationSequence) {
+    fail(
+      "B2D-R002",
+      "delegation challenge, authorization, and exact replay order is invalid"
+    )
+  }
+
+  if (hasUnsafeCancellationMapping(skill)) {
+    fail(
+      "B2D-R003",
+      "cancellation or stall evidence maps affirmatively to replacement/unresumable"
+    )
+  }
+
+  if (
+    !/tool_stalled_timeout[\s\S]{0,100}confirmed same-key continue/i.test(
+      skill
+    ) ||
+    /tool_stalled_timeout continues (?:without confirmation|automatically)/i.test(
+      skill
+    ) ||
+    /tool_stalled_timeout uses replacement before continue/i.test(skill)
+  ) {
+    fail(
+      "B2D-R004",
+      "tool_stalled_timeout must be confirmed, resume-first, and same-key"
+    )
+  }
+
+  const workflowSequenceValid =
+    /Workflow recovery follows this exact ordered recipe:[\s\S]{0,100}get_workflow_state[\s\S]{0,120}request_recovery_authorization[\s\S]{0,120}receipt-required recover_workflow/i.test(
+      skill
+    ) &&
+    /enabled catalog missing recover_workflow hard-blocks/i.test(skill) &&
+    /recover_workflow never\s+generates a challenge/i.test(skill)
+  if (
+    !workflowSequenceValid ||
+    /recover_workflow before request_recovery_authorization/i.test(skill) ||
+    /skip get_workflow_state/i.test(skill) ||
+    /missing recover_workflow may proceed/i.test(skill)
+  ) {
+    fail(
+      "B2D-R005",
+      "workflow status, authorization, recovery, or catalog contract is invalid"
+    )
+  }
+
+  if (
+    !/user_decision_required requires exact reset_plan_lineage[\s\S]{0,180}displayed reason hash/i.test(
+      skill
+    ) ||
+    !/receipt is the durable[\s\S]{0,100}reason[\s\S]{0,100}new authorized stagnation baseline/i.test(
+      skill
+    ) ||
+    /user_decision_required may reset[\s\S]{0,180}without reset_plan_lineage/i.test(
+      skill
+    )
+  ) {
+    fail(
+      "B2D-R006",
+      "user_decision_required lineage reset lacks exact receipt/reason/baseline"
+    )
+  }
+
+  if (
+    !/First admission freezes the key, role, agent, profile[\s\S]{0,120}inherited continue[\s\S]{0,80}replacement counters/i.test(
+      skill
+    ) ||
+    !/Recovery never changes key\/profile or resets inherited\s*consumption/i.test(
+      skill
+    ) ||
+    /Recovery may change the admitted key or profile/i.test(skill) ||
+    /Recovery resets inherited continue and replacement consumption/i.test(
+      skill
+    )
+  ) {
+    fail(
+      "B2D-R007",
+      "admitted identity/profile or inherited counters are mutable"
+    )
+  }
+
+  if (
+    !/platform-harvested and validated card settles/i.test(skill) ||
+    !/Failed or unavailable harvest[\s\S]{0,100}degrades the child[\s\S]{0,120}same-child continue[\s\S]{0,80}re-emit the card/i.test(
+      skill
+    ) ||
+    !/prose\s*never settles/i.test(skill) ||
+    /Reject a platform-harvested and validated card/i.test(skill) ||
+    /Prose approval settles the recovery card/i.test(skill) ||
+    /degraded child may finish without same-child card re-emission/i.test(skill)
+  ) {
+    fail(
+      "B2D-R008",
+      "harvest, prose, or degraded-child card contract is invalid"
+    )
+  }
+
+  const designTriggers = [
+    "migration",
+    "security/authorization",
+    "concurrency",
+    "persistence/state-machine",
+    "externally visible compatibility",
+    "ambiguity",
+  ]
+  if (
+    !/Normal Task review independently recomputes b2d_task_risk_v1/i.test(
+      skill
+    ) ||
+    designTriggers.some((trigger) => !skill.toLowerCase().includes(trigger)) ||
+    /Normal Task review copies b2d_task_risk_v1/i.test(skill) ||
+    designTriggers.some((trigger) => hasNegatedDesignTrigger(skill, trigger))
+  ) {
+    fail(
+      "B2D-R009",
+      "Task risk recomputation or deterministic Design trigger is invalid"
+    )
+  }
+
+  if (
+    !/Exhausted continue uses same-key budget_exhausted_continue replacement[\s\S]{0,120}replacement budget remains/i.test(
+      skill
+    ) ||
+    !/after replacement consumption, block/i.test(skill) ||
+    /continue exhaustion, mint a new key and profile/i.test(skill) ||
+    /continue exhaustion, replace with replacement_reason=unresumable/i.test(
+      skill
+    ) ||
+    /After replacement consumption, replace again/i.test(skill)
+  ) {
+    fail("B2D-R010", "continue/replacement exhaustion contract is invalid")
+  }
+
+  if (
+    !/Before every delegation or continue, write ledger intent[\s\S]{0,120}intended key,[\s\S]{0,80}role, agent, profile, and action/i.test(
+      skill
+    ) ||
+    !/Fill latest_task_id after admission/i.test(skill) ||
+    !/reconcile from platform state after recovery/i.test(skill) ||
+    /Write ledger intent after the delegation mutation/i.test(skill) ||
+    /Ledger intent may omit intended action and identity/i.test(skill) ||
+    /Skip platform-state reconciliation after recovery/i.test(skill)
+  ) {
+    fail(
+      "B2D-R011",
+      "ledger intent or post-recovery reconciliation contract is invalid"
+    )
   }
 
   return { failures, notes }

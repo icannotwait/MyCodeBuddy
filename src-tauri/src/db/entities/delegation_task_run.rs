@@ -75,6 +75,7 @@ pub struct Model {
     pub child_connection_id: Option<String>,
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
+    pub recovery_authorization_id: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

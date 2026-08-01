@@ -4664,7 +4664,13 @@ async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_c
             .handle_parent_connection_exit(
                 "parent",
                 Some(7),
-                ParentConnectionExitCause::Disconnected,
+                ParentConnectionExitCause::Disconnected {
+                    termination:
+                        crate::acp::termination::AcpTerminationSummaryV1::legacy_unspecified(
+                            true,
+                            Utc::now(),
+                        ),
+                },
             )
             .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

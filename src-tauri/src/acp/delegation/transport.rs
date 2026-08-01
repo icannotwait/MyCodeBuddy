@@ -66,6 +66,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::QuestionSpec;
+use crate::acp::recovery_authorization::RecoverySubjectKind;
 
 /// Immutable companion launch role. Root sessions may Join; forced
 /// delegation children are marked so later tasks can gate decision tools.
@@ -333,6 +334,30 @@ pub struct BrokerGetWorkflowStateRequest {
     pub workflow_id: Option<String>,
 }
 
+/// Ask the user to authorize the central recovery action derived for an owned
+/// delegation task or root workflow. Action/target/warning fields are omitted
+/// intentionally: the listener derives them from durable state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerRecoveryAuthorizationRequest {
+    pub token: String,
+    pub subject_kind: RecoverySubjectKind,
+    pub subject_id: String,
+    pub correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_user_reason: Option<String>,
+}
+
+/// Consume an approved workflow recovery receipt in the same transaction as
+/// the state-only manifest revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerRecoverWorkflowRequest {
+    pub token: String,
+    pub workflow_id: String,
+    pub recovery_authorization_id: String,
+    pub expected_manifest_revision: u64,
+    pub correlation_id: String,
+}
+
 /// Companion → listener ready-lease request. First frame of the two-frame
 /// ready handshake: listener authenticates `token`, acks, then both keep the
 /// socket open until peer EOF or revoke.
@@ -367,6 +392,8 @@ pub enum BrokerMessage {
     PublishWorkflow(BrokerPublishWorkflowRequest),
     SettleWorkflow(BrokerSettleWorkflowRequest),
     GetWorkflowState(BrokerGetWorkflowStateRequest),
+    RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest),
+    RecoverWorkflow(BrokerRecoverWorkflowRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -632,6 +659,26 @@ pub async fn client_get_workflow_state_round_trip(
     req: &BrokerGetWorkflowStateRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::GetWorkflowState(req.clone())).await
+}
+
+/// Dispatch a blocking typed recovery authorization request.
+pub async fn client_recovery_authorization_round_trip(
+    socket_path: &str,
+    req: &BrokerRecoveryAuthorizationRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::RequestRecoveryAuthorization(req.clone()),
+    )
+    .await
+}
+
+/// Dispatch `recover_workflow` and read its committed result (or error).
+pub async fn client_recover_workflow_round_trip(
+    socket_path: &str,
+    req: &BrokerRecoverWorkflowRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::RecoverWorkflow(req.clone())).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be

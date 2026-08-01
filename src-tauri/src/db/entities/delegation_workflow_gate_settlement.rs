@@ -90,6 +90,7 @@ pub struct Model {
     pub next_action: Option<PlanReviewNextAction>,
     #[sea_orm(column_type = "Text", nullable)]
     pub report_files_json: Option<String>,
+    pub lineage_reset_authorization_id: Option<String>,
     pub created_at: DateTimeUtc,
 }
 

@@ -25,6 +25,7 @@
 //!   * [`QuestionRuntimeConfig`] — the hot-swappable "is the feature on?" flag,
 //!     read at MCP injection time (mirrors [`crate::acp::feedback`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,7 +37,6 @@ use sacp::schema::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use tokio::sync::{oneshot, RwLock};
 
 /// Max questions per `ask_user_question` call. Matches Claude Code's
@@ -67,6 +67,16 @@ pub struct QuestionOption {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryQuestionPresentation {
+    pub subject: String,
+    pub action: String,
+    pub target: String,
+    pub cause: String,
+    pub risk: String,
+    pub display_reason: Option<String>,
+}
+
 /// A single multiple-choice question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionSpec {
@@ -91,6 +101,21 @@ pub struct QuestionSpec {
     /// input. Default false — absent on the wire for every non-secret source.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_secret: bool,
+    /// Recovery-specific presentation codes. Authorization receipts and other
+    /// durable metadata never ride on the question card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryQuestionPresentation>,
+}
+
+impl QuestionSpec {
+    pub fn with_recovery(mut self, recovery: RecoveryQuestionPresentation) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
+
+    pub fn recovery(&self) -> Option<RecoveryQuestionPresentation> {
+        self.recovery.clone()
+    }
 }
 
 /// The pending (awaiting-answer) question set stored on
@@ -151,6 +176,35 @@ pub struct QuestionOutcome {
 pub struct RegisteredQuestion {
     pub question_id: String,
     pub answer_rx: oneshot::Receiver<QuestionOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryQuestionRegistrationError {
+    ParentUnavailable,
+    Occupied,
+    Invalid,
+}
+
+#[cfg(test)]
+pub(crate) fn generic_test_question() -> QuestionSpec {
+    QuestionSpec {
+        id: "generic-test-question".into(),
+        question: "Generic question?".into(),
+        header: "Generic".into(),
+        multi_select: false,
+        options: vec![
+            QuestionOption {
+                label: "A".into(),
+                description: String::new(),
+            },
+            QuestionOption {
+                label: "B".into(),
+                description: String::new(),
+            },
+        ],
+        is_secret: false,
+        recovery: None,
+    }
 }
 
 /// Listener-facing access to register / cancel a pending question on a parent
@@ -292,6 +346,7 @@ pub fn parse_questions(arguments: &Value) -> Result<Vec<QuestionSpec>, String> {
             multi_select,
             options,
             is_secret: false,
+            recovery: None,
         });
     }
     Ok(out)
@@ -375,6 +430,17 @@ pub fn validate_specs(specs: &[QuestionSpec]) -> Result<(), String> {
                     "questions[{qi}].options[{oi}] `description` exceeds {MAX_QUESTION_TEXT_CHARS} characters"
                 ));
             }
+        }
+        if q.recovery().is_some()
+            && (q.multi_select
+                || q.is_secret
+                || q.options.len() != 2
+                || q.options[0].label != crate::acp::recovery_authorization::RECOVERY_APPROVE_LABEL
+                || q.options[1].label != crate::acp::recovery_authorization::RECOVERY_DECLINE_LABEL)
+        {
+            return Err(format!(
+                "questions[{qi}] has an invalid recovery authorization presentation"
+            ));
         }
     }
     Ok(())
@@ -550,6 +616,7 @@ pub fn parse_grok_ext_questions(params: &Value) -> Result<Vec<QuestionSpec>, Str
             multi_select,
             options,
             is_secret: false,
+            recovery: None,
         });
     }
     Ok(out)
@@ -1063,6 +1130,7 @@ fn parse_form_questions(
             multi_select,
             options,
             is_secret: is_secret_property(raw, id),
+            recovery: None,
         });
         fields.push(ElicitationField {
             id: id.clone(),
@@ -1738,6 +1806,7 @@ mod tests {
                 })
                 .collect(),
             is_secret: false,
+            recovery: None,
         };
 
         assert!(validate_specs(&[]).is_err(), "empty set");
@@ -1784,6 +1853,7 @@ mod tests {
                 },
             ],
             is_secret: false,
+            recovery: None,
         };
         assert!(validate_specs(&[blank_id]).is_err(), "blank id");
         // Duplicate option label within one question (parse_questions rejects it).
@@ -1803,6 +1873,7 @@ mod tests {
                 },
             ],
             is_secret: false,
+            recovery: None,
         };
         assert!(
             validate_specs(&[dup_label]).is_err(),
@@ -2233,5 +2304,101 @@ mod tests {
             output["answers"][0]["question"]
         );
         assert_eq!(output["answers"][0]["header"], "");
+    }
+
+    #[test]
+    fn question_recovery_presentation_round_trips_without_receipt_metadata() {
+        let presentation = RecoveryQuestionPresentation {
+            subject: "workflow".into(),
+            action: "recover_workflow".into(),
+            target: "workflow-a".into(),
+            cause: "stalled".into(),
+            risk: "state_change".into(),
+            display_reason: Some("workflow_stalled".into()),
+        };
+        let spec = QuestionSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            question: "recovery_authorization".into(),
+            header: "Recovery".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: crate::acp::recovery_authorization::RECOVERY_APPROVE_LABEL.into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: crate::acp::recovery_authorization::RECOVERY_DECLINE_LABEL.into(),
+                    description: String::new(),
+                },
+            ],
+            is_secret: false,
+            recovery: Some(presentation.clone()),
+        };
+
+        let wire = serde_json::to_value(&spec).unwrap();
+        let recovery = wire["recovery"].as_object().unwrap();
+        let keys: std::collections::BTreeSet<_> = recovery.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "cause",
+                "display_reason",
+                "risk",
+                "subject",
+                "target"
+            ]
+            .into_iter()
+            .collect()
+        );
+        let encoded = wire.to_string();
+        assert!(!encoded.contains("authorization_id"));
+        assert!(!encoded.contains("receipt"));
+
+        let round_trip: QuestionSpec = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.recovery(), Some(presentation));
+        assert!(validate_specs(std::slice::from_ref(&round_trip)).is_ok());
+    }
+
+    #[test]
+    fn recovery_presentation_is_owned_by_each_question_value() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let presentation = RecoveryQuestionPresentation {
+            subject: "workflow".into(),
+            action: "recover_workflow".into(),
+            target: "workflow-a".into(),
+            cause: "stalled".into(),
+            risk: "state_change".into(),
+            display_reason: None,
+        };
+        let with_recovery = QuestionSpec {
+            id: id.clone(),
+            question: "recovery_authorization".into(),
+            header: "Recovery".into(),
+            multi_select: false,
+            options: Vec::new(),
+            is_secret: false,
+            recovery: Some(presentation.clone()),
+        };
+        let reused_id = QuestionSpec {
+            id,
+            question: "ordinary question".into(),
+            header: "Ordinary".into(),
+            multi_select: false,
+            options: Vec::new(),
+            is_secret: false,
+            recovery: None,
+        };
+
+        assert_eq!(with_recovery.recovery(), Some(presentation));
+        let mut cloned = with_recovery.clone();
+        cloned.recovery = None;
+        assert!(with_recovery.recovery.is_some());
+        assert!(cloned.recovery.is_none());
+        assert_eq!(reused_id.recovery(), None);
+        assert!(serde_json::to_value(reused_id)
+            .unwrap()
+            .get("recovery")
+            .is_none());
     }
 }

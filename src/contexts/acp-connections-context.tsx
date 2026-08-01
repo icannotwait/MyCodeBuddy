@@ -49,6 +49,8 @@ import {
   acpGetEventMetrics,
   acpReplayStreamingPerfFixture,
   getSystemRenderingSettings,
+  type AcpDisconnectLease,
+  type AcpDisconnectOrigin,
 } from "@/lib/api"
 import {
   getTransferFence,
@@ -4112,7 +4114,7 @@ export interface AcpActionsValue {
     intent?: ConnectionIntent,
     retryObserverDiscovery?: boolean
   ): Promise<void>
-  disconnect(contextKey: string): Promise<void>
+  disconnect(contextKey: string, origin?: AcpDisconnectOrigin): Promise<void>
   disconnectAll(): Promise<void>
   sendPrompt(
     contextKey: string,
@@ -4211,6 +4213,13 @@ export interface AcpActionsValue {
    * subsequent settings change re-shows it. Wired to the banner's X button.
    */
   dismissConfigStale(contextKey: string): void
+}
+
+function disconnectLeaseWithOrigin(
+  lease: AcpDisconnectLease | null | undefined,
+  origin: AcpDisconnectOrigin
+): AcpDisconnectLease {
+  return { ...(lease ?? {}), origin }
 }
 
 const AcpActionsContext = createContext<AcpActionsValue | null>(null)
@@ -6235,7 +6244,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const leaseConn = storeRef.current.connections.get(contextKey)
         acpDisconnect(
           connectionId,
-          leaseConn ? leaseArgsForDisconnect(leaseConn) : null
+          disconnectLeaseWithOrigin(
+            leaseConn ? leaseArgsForDisconnect(leaseConn) : null,
+            "idle_timeout"
+          )
         ).catch(() => {})
         reverseMapRef.current.delete(connectionId)
         teardownAttachSubscription(contextKey)
@@ -6254,7 +6266,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Disconnect all on unmount
   useEffect(() => {
-    const reverseMap = reverseMapRef.current
     const attachSubs = attachSubscriptionsRef.current
     // Capture the store ref at effect-setup time so the cleanup
     // function doesn't read a moving target (`storeRef.current` is the
@@ -6263,30 +6274,32 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     // because in the general case a ref's `.current` can be replaced).
     const store = storeRef.current
     return () => {
-      for (const [connectionId, contextKey] of reverseMap) {
+      for (const conn of store.connections.values()) {
         // Delegation-child entries are not real user-facing
         // connections — the broker owns their backend lifecycle and
         // will tear them down when the parent's delegation resolves.
         // Calling acpDisconnect on them here would race the broker's
         // own one-shot teardown and emit a benign-but-noisy "unknown
         // connection" error from the backend.
-        const conn = store.connections.get(contextKey)
-        if (conn?.isDelegationChild) continue
+        if (conn.isDelegationChild) continue
         // Viewers attach to a connection another client owns — never
         // acpDisconnect it on our unmount. The attach-sub detach loop below
         // releases our read-only subscription cleanly.
-        if (conn?.isViewer) continue
+        if (conn.isViewer) continue
         // Pop-out handoff: ownership moved (or is moving) to a detached window.
         if (
-          conn?.conversationId != null &&
+          conn.conversationId != null &&
           (isTransferringOut(conn.conversationId) ||
             isFrontendDisconnectSuppressed(conn.conversationId))
         ) {
           continue
         }
         acpDisconnect(
-          connectionId,
-          conn ? leaseArgsForDisconnect(conn) : null
+          conn.connectionId,
+          disconnectLeaseWithOrigin(
+            leaseArgsForDisconnect(conn),
+            "provider_unmount"
+          )
         ).catch(() => {})
       }
       for (const [, sub] of attachSubs) {
@@ -6831,7 +6844,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               if (!suppressBare) {
                 await acpDisconnect(
                   existing.connectionId,
-                  leaseArgsForDisconnect(existing)
+                  disconnectLeaseWithOrigin(
+                    leaseArgsForDisconnect(existing),
+                    "connection_superseded"
+                  )
                 ).catch(() => {})
               }
               reverseMapRef.current.delete(existing.connectionId)
@@ -7104,14 +7120,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             isFrontendDisconnectSuppressed(conversationId))
         if (abandonedKeysRef.current.delete(contextKey)) {
           if (!suppressBareSpawn) {
-            acpDisconnect(connectionId, coldLease).catch(() => {})
+            acpDisconnect(
+              connectionId,
+              disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
+            ).catch(() => {})
           }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
           if (!suppressBareSpawn) {
-            acpDisconnect(connectionId, coldLease).catch(() => {})
+            acpDisconnect(
+              connectionId,
+              disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
+            ).catch(() => {})
           }
           return
         }
@@ -7289,7 +7311,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   connectRef.current = connect
 
   const disconnect = useCallback(
-    async (contextKey: string) => {
+    async (
+      contextKey: string,
+      origin: AcpDisconnectOrigin = "explicit_user"
+    ) => {
       pendingConnectRequestsRef.current.delete(contextKey)
       // Cancel in-flight observer discovery delays and handoff re-entry.
       cancelObserverDelay(contextKey)
@@ -7373,7 +7398,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
-      await acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn))
+      await acpDisconnect(
+        conn.connectionId,
+        disconnectLeaseWithOrigin(leaseArgsForDisconnect(conn), origin)
+      )
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -7416,7 +7444,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         delegationRouteOverride: boundRouteOverride,
         ownerOperationId: boundOwnerOperationId,
       } = conn
-      await disconnect(contextKey)
+      await disconnect(contextKey, "config_reapply")
       await connect(
         contextKey,
         agentType,
@@ -7464,7 +7492,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           promises.push(
             acpDisconnect(
               conn.connectionId,
-              leaseArgsForDisconnect(conn)
+              disconnectLeaseWithOrigin(
+                leaseArgsForDisconnect(conn),
+                "disconnect_all"
+              )
             ).catch(() => {})
           )
         }

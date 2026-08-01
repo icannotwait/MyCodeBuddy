@@ -3,7 +3,28 @@
 use thiserror::Error;
 
 use super::plan_review::PlanReviewError;
+use super::recovery_policy::WorkflowRecoveryProjection;
 pub use super::types::WorkflowError;
+
+pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
+pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
+pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowAdmissionRecoveryError {
+    pub message: String,
+    pub recovery: WorkflowRecoveryProjection,
+}
+
+impl WorkflowAdmissionRecoveryError {
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn decode(value: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(value)
+    }
+}
 
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -39,7 +60,7 @@ pub enum WorkflowStoreError {
     #[error("publication token conflict: parent already has workflow {existing_workflow_id}")]
     PublicationTokenConflict { existing_workflow_id: String },
 
-    #[error("admitted-node identity mutation rejected for node {node_id}")]
+    #[error("workflow binding immutable identity conflict for node {node_id}; use a new node id")]
     AdmittedNodeIdentityMutation { node_id: String },
 
     #[error("admitted workflow binding or Task cohort policy/complete route is immutable at {node_id} (cohort_frozen)")]
@@ -90,11 +111,34 @@ pub enum WorkflowStoreError {
     #[error("busy (retryable): {0}")]
     Busy(String),
 
+    #[error("workflow recovery is not available")]
+    WorkflowRecoveryNotAvailable,
+
+    #[error("workflow recovery request conflicts with a committed recovery")]
+    WorkflowRecoveryConflict,
+
+    #[error("recovery authorization is required for {action}")]
+    RecoveryAuthorizationRequired { action: &'static str },
+
+    #[error("recovery authorization is stale")]
+    RecoveryAuthorizationStale,
+
+    #[error("recovery authorization rejected: {code}")]
+    RecoveryAuthorizationRejected { code: &'static str },
+
     #[error("persistence failure: {0}")]
     Persistence(String),
 }
 
 impl WorkflowStoreError {
+    pub fn workflow_recovery_required() -> Self {
+        Self::GateNotReady(WORKFLOW_RECOVERY_REQUIRED.into())
+    }
+
+    pub fn is_workflow_recovery_required(&self) -> bool {
+        matches!(self, Self::GateNotReady(reason) if reason == WORKFLOW_RECOVERY_REQUIRED)
+    }
+
     /// True when the client may retry the same operation after a short delay.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Busy(_) | Self::Persistence(_))

@@ -16,6 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::attention::AttentionResolutionCode;
+use crate::acp::delegation::recovery_policy::{
+    RecoveryDecision, RecoveryDisposition, ReplacementReason,
+};
 use crate::models::AgentType;
 
 /// MCP tool name for initial delegation — field 0 of `request_fingerprint`.
@@ -156,6 +159,8 @@ pub struct DelegationRequest {
     /// invocation. Not a task/run/conversation id; not persisted on the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_authorization_id: Option<String>,
 }
 
 /// Everything the broker needs to dispatch a `continue_delegation` call.
@@ -174,6 +179,8 @@ pub struct ContinueDelegationRequest {
     /// [`DelegationRequest::correlation_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_authorization_id: Option<String>,
 }
 
 /// Max accepted length for a call `correlation_id` (inclusive).
@@ -504,6 +511,10 @@ pub enum DelegationError {
     /// Platform recovery rail refused the operation.
     #[error("budget exhausted: {0}")]
     BudgetExhausted(String),
+    #[error("recovery confirmation required")]
+    RecoveryConfirmationRequired(DelegationRecoveryProjection),
+    #[error("recovery authorization rejected: {code}")]
+    RecoveryAuthorizationRejected { code: String },
     /// Soft-delete of a provisional orphan child (fence/idempotent loser)
     /// failed after retry. Fail-closed: do not return busy/idempotent success
     /// while the no-run child may still be visible under the parent.
@@ -571,6 +582,115 @@ pub enum TaskStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegationRecoveryProjection {
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_reason: Option<ReplacementReason>,
+    pub cause_code: String,
+    pub risk_class: String,
+    pub authorization_required: bool,
+}
+
+impl<'de> Deserialize<'de> for DelegationRecoveryProjection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireProjection {
+            disposition: String,
+            proposed_action: Option<String>,
+            replacement_reason: Option<String>,
+            cause_code: String,
+            risk_class: String,
+            authorization_required: bool,
+        }
+
+        let wire = WireProjection::deserialize(deserializer)?;
+        let replacement_reason = match wire.replacement_reason.as_deref() {
+            Some(value) => Some(
+                ReplacementReason::parse(value)
+                    .ok_or_else(|| serde::de::Error::custom("invalid replacement_reason"))?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            disposition: wire.disposition,
+            proposed_action: wire.proposed_action,
+            replacement_reason,
+            cause_code: wire.cause_code,
+            risk_class: wire.risk_class,
+            authorization_required: wire.authorization_required,
+        })
+    }
+}
+
+impl From<&RecoveryDecision> for DelegationRecoveryProjection {
+    fn from(decision: &RecoveryDecision) -> Self {
+        fn stable_name<T: Serialize>(value: &T) -> String {
+            serde_json::to_value(value)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        }
+
+        let authorization_required = decision.requires_authorization();
+        let (disposition, proposed_action, replacement_reason) = match &decision.disposition {
+            RecoveryDisposition::Continue { .. } => (
+                if authorization_required {
+                    "confirmation_required"
+                } else {
+                    "continue"
+                },
+                Some("continue".to_string()),
+                None,
+            ),
+            RecoveryDisposition::FreshDispatch => (
+                if authorization_required {
+                    "confirmation_required"
+                } else {
+                    "fresh_dispatch"
+                },
+                Some("fresh_dispatch".to_string()),
+                None,
+            ),
+            RecoveryDisposition::Replace { replacement_reason } => (
+                if authorization_required {
+                    "confirmation_required"
+                } else {
+                    "replace"
+                },
+                Some("replace".to_string()),
+                Some(replacement_reason.clone()),
+            ),
+            RecoveryDisposition::Stop { code } => {
+                return Self {
+                    disposition: stable_name(code),
+                    proposed_action: None,
+                    replacement_reason: None,
+                    cause_code: stable_name(&decision.cause_code),
+                    risk_class: stable_name(&decision.risk_class),
+                    authorization_required: false,
+                };
+            }
+            RecoveryDisposition::InconsistentDurableState => {
+                ("inconsistent_durable_state", None, None)
+            }
+        };
+        Self {
+            disposition: disposition.to_string(),
+            proposed_action,
+            replacement_reason,
+            cause_code: stable_name(&decision.cause_code),
+            risk_class: stable_name(&decision.risk_class),
+            authorization_required,
+        }
+    }
+}
+
 /// Unified response the broker hands the listener for every delegation tool
 /// (`delegate_to_agent` / `get_delegation_status` / `cancel_delegation`). The
 /// listener serializes it into `BrokerResponse.outcome`; the companion renders
@@ -627,6 +747,8 @@ pub struct DelegationTaskReport {
     /// Stall start (`last_agent_activity_at + threshold`); only when stalled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_since: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<DelegationRecoveryProjection>,
 }
 
 /// Caller-facing warning when a prior prompt may already have executed
@@ -862,6 +984,13 @@ impl DelegationOutcome {
                 child_conversation_id,
             };
         }
+        if let DelegationError::RecoveryAuthorizationRejected { code } = &err {
+            return DelegationOutcome::Err {
+                code: code.clone(),
+                message: "recovery authorization rejected".to_string(),
+                child_conversation_id,
+            };
+        }
         let code = match &err {
             DelegationError::DepthLimitExceeded { .. } => "depth_limit",
             DelegationError::InvalidAgentType => "invalid_agent_type",
@@ -898,6 +1027,11 @@ impl DelegationOutcome {
             DelegationError::Unresumable(_) => "unresumable",
             DelegationError::InvalidReplacement(_) => "invalid_replacement",
             DelegationError::BudgetExhausted(_) => "budget_exhausted",
+            DelegationError::RecoveryConfirmationRequired(_) => "recovery_confirmation_required",
+            // Handled above so the validated Task 8 rejection code is retained.
+            DelegationError::RecoveryAuthorizationRejected { .. } => {
+                "recovery_authorization_rejected"
+            }
             DelegationError::ProvisionalCleanupFailed(_) => "provisional_cleanup_failed",
             DelegationError::ProvisionalTerminalizationFailed(_) => {
                 "provisional_terminalization_failed"

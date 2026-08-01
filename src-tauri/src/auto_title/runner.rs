@@ -165,7 +165,12 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
     }
 
     async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        self.manager.disconnect(conn_id).await
+        self.manager
+            .disconnect_with_origin(
+                conn_id,
+                crate::acp::termination::AcpDisconnectOrigin::InternalJobComplete,
+            )
+            .await
     }
 }
 

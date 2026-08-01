@@ -37,6 +37,8 @@ pub struct Model {
     pub design_fingerprint: String,
     /// SHA-256 hex of plan-side structure fingerprint (plan doc + plan/task/final graph).
     pub plan_fingerprint: String,
+    pub block_cause_code: Option<String>,
+    pub block_source_manifest_revision: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

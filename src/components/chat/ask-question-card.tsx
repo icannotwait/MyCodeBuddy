@@ -21,6 +21,12 @@ import type {
   PendingQuestionState,
   QuestionAnswer,
   QuestionSpec,
+  RecoveryActionCode,
+  RecoveryCauseCode,
+  RecoveryQuestionPresentation,
+  RecoveryRiskCode,
+  RecoverySubjectCode,
+  RecoveryTargetCode,
 } from "@/lib/types"
 
 interface AskQuestionCardProps {
@@ -61,6 +67,284 @@ interface QState {
   otherText: string
 }
 
+const RECOVERY_ACTIONS = [
+  "continue",
+  "fresh_dispatch",
+  "replace",
+  "recover_workflow",
+  "reset_plan_lineage",
+] as const satisfies readonly RecoveryActionCode[]
+
+const RECOVERY_CAUSES = [
+  "completed",
+  "revision_eligible_failure",
+  "unexpected_transport_loss",
+  "unexpected_process_loss",
+  "unexpected_session_loss",
+  "unexpected_host_restart",
+  "unexpected_child_connection_loss",
+  "parent_canceled",
+  "parent_turn_failed",
+  "join_abandoned",
+  "user_cancelled",
+  "tool_stalled_timeout",
+  "legacy_parent_disconnect",
+  "intentional_parent_disconnect",
+  "malformed_termination_audit",
+  "pre_admission_retry",
+  "pre_admission_abort",
+  "admission_failed",
+  "admission_unknown",
+  "missing_resume_identity",
+  "unsupported_reuse",
+  "persisted_unresumable",
+  "continue_budget_exhausted",
+  "replacement_budget_exhausted",
+  "route_rejected",
+  "stale_source",
+  "busy_source",
+  "structural_fence",
+  "contradictory_evidence",
+  "legacy_block_with_current_plan_approval",
+  "legacy_block_with_current_plan",
+  "legacy_block_without_plan",
+  "plan_user_decision_required",
+  "plan_gate_blocked",
+  "explicit_manifest_block",
+  "unresolved_task_cohort",
+  "durable_state_inconsistent",
+] as const satisfies readonly RecoveryCauseCode[]
+
+const RECOVERY_RISKS = [
+  "normal",
+  "execution_may_have_occurred",
+  "explicit_user_stop",
+  "legacy_unknown_origin",
+  "plan_lineage_reset",
+  "durable_state_risk",
+] as const satisfies readonly RecoveryRiskCode[]
+
+const RECOVERY_SUBJECTS = [
+  "delegation_task",
+  "workflow",
+] as const satisfies readonly RecoverySubjectCode[]
+
+const RECOVERY_TARGETS = [
+  "existing_session",
+  "fresh_task",
+  "replace_unresumable",
+  "replace_budget_exhausted_continue",
+  "replace_not_supported",
+  "replace_admission_failed",
+  "replace_admission_unknown",
+  "workflow_skeleton",
+  "workflow_estimated",
+  "workflow_approved",
+  "plan_lineage",
+] as const satisfies readonly RecoveryTargetCode[]
+
+function targetMatchesAction(
+  action: RecoveryActionCode,
+  target: RecoveryTargetCode
+): boolean {
+  switch (action) {
+    case "continue":
+      return target === "existing_session"
+    case "fresh_dispatch":
+      return target === "fresh_task"
+    case "replace":
+      return target.startsWith("replace_")
+    case "recover_workflow":
+      return target.startsWith("workflow_")
+    case "reset_plan_lineage":
+      return target === "plan_lineage"
+  }
+}
+
+function isOneOf<const T extends readonly string[]>(
+  values: T,
+  value: string
+): value is T[number] {
+  return values.includes(value as T[number])
+}
+
+function RecoveryQuestionCard({
+  questionId,
+  spec,
+  presentation,
+  onAnswer,
+  readOnly,
+  interactionLocked,
+}: {
+  questionId: string
+  spec: QuestionSpec
+  presentation: RecoveryQuestionPresentation
+  onAnswer: AskQuestionCardProps["onAnswer"]
+  readOnly: boolean
+  interactionLocked: boolean
+}) {
+  const t = useTranslations("Folder.chat.askQuestion")
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState(false)
+  const inFlight = useRef(false)
+
+  const action = presentation.action
+  const cause = presentation.cause
+  const risk = presentation.risk
+  const subject = presentation.subject
+  const target = presentation.target
+  if (
+    !isOneOf(RECOVERY_ACTIONS, action) ||
+    !isOneOf(RECOVERY_CAUSES, cause) ||
+    !isOneOf(RECOVERY_RISKS, risk) ||
+    !isOneOf(RECOVERY_SUBJECTS, subject) ||
+    !isOneOf(RECOVERY_TARGETS, target) ||
+    !targetMatchesAction(action, target) ||
+    (action === "reset_plan_lineage" && !presentation.display_reason)
+  ) {
+    return null
+  }
+
+  const decide = async (decision: "approve" | "decline") => {
+    if (readOnly || interactionLocked || submitting || inFlight.current) return
+    inFlight.current = true
+    setSubmitting(true)
+    setError(false)
+    try {
+      await onAnswer(questionId, {
+        answers: [{ questionId: spec.id, labels: [decision] }],
+        declined: decision === "decline",
+      })
+      inFlight.current = false
+    } catch {
+      inFlight.current = false
+      setSubmitting(false)
+      setError(true)
+    }
+  }
+
+  const locked = readOnly || interactionLocked || submitting
+  return (
+    <div
+      role="group"
+      aria-label={t("recovery.title")}
+      className="mb-2 flex max-h-[88svh] flex-col overflow-hidden rounded-lg border border-amber-500/40 bg-card shadow-lg ws-msg-card"
+    >
+      <div className="flex min-h-0 flex-col gap-3 p-3">
+        <div className="flex items-start gap-2.5">
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/10 text-amber-700 dark:text-amber-300">
+            <MessageCircleQuestionMark className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">{t("recovery.title")}</p>
+            <p className="text-xs text-muted-foreground">
+              {t("recovery.subtitle")}
+            </p>
+          </div>
+        </div>
+
+        <dl className="grid gap-2 text-sm sm:grid-cols-2">
+          <div>
+            <dt className="text-xs text-muted-foreground">
+              {t("recovery.actionLabel")}
+            </dt>
+            <dd>{t(`recovery.actions.${action}`)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">
+              {t("recovery.subjectLabel")}
+            </dt>
+            <dd>{t(`recovery.subjects.${subject}`)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">
+              {t("recovery.targetLabel")}
+            </dt>
+            <dd>{t(`recovery.targets.${target}`)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">
+              {t("recovery.causeLabel")}
+            </dt>
+            <dd>{t(`recovery.causes.${cause}`)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">
+              {t("recovery.riskLabel")}
+            </dt>
+            <dd>{t(`recovery.risks.${risk}`)}</dd>
+          </div>
+          {action === "reset_plan_lineage" && (
+            <div className="sm:col-span-2">
+              <dt className="text-xs text-muted-foreground">
+                {t("recovery.reasonLabel")}
+              </dt>
+              <dd className="whitespace-pre-wrap break-words">
+                {presentation.display_reason}
+              </dd>
+            </div>
+          )}
+        </dl>
+
+        {!readOnly && (
+          <div className="flex items-center justify-end gap-2">
+            {error && (
+              <span role="alert" className="mr-auto text-xs text-destructive">
+                {t("submitError")}
+              </span>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={locked}
+              onClick={() => void decide("decline")}
+            >
+              {t("recovery.decline")}
+            </Button>
+            <Button
+              size="sm"
+              disabled={locked}
+              onClick={() => void decide("approve")}
+            >
+              {submitting && (
+                <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+              )}
+              {t("recovery.approve")}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function AskQuestionCard(props: AskQuestionCardProps) {
+  const recoveryQuestions = props.question.questions.filter(
+    (spec) => spec.recovery !== undefined
+  )
+  if (recoveryQuestions.length === 0) {
+    return <GenericAskQuestionCard {...props} />
+  }
+  if (
+    recoveryQuestions.length !== 1 ||
+    props.question.questions.length !== 1 ||
+    !recoveryQuestions[0].recovery
+  ) {
+    return null
+  }
+  return (
+    <RecoveryQuestionCard
+      key={props.question.question_id}
+      questionId={props.question.question_id}
+      spec={recoveryQuestions[0]}
+      presentation={recoveryQuestions[0].recovery}
+      onAnswer={props.onAnswer}
+      readOnly={props.readOnly ?? false}
+      interactionLocked={props.interactionLocked ?? false}
+    />
+  )
+}
+
 function initialState(
   questions: QuestionSpec[],
   seed?: SeedSelections
@@ -86,7 +370,7 @@ function isAnswered(s: QState | undefined): boolean {
   return s.chosen.length > 0 || hasOther
 }
 
-export function AskQuestionCard({
+function GenericAskQuestionCard({
   question,
   onAnswer,
   readOnly = false,

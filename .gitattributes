@@ -2,3 +2,4 @@
 # reproducible on Windows checkouts even when core.autocrlf=true.
 *.ts text eol=lf
 *.tsx text eol=lf
+*.mjs text eol=lf

@@ -230,12 +230,13 @@ function Probe() {
 }
 
 async function mountProvider() {
-  render(
+  const view = render(
     <AcpConnectionsProvider>
       <Probe />
     </AcpConnectionsProvider>
   )
   await act(async () => {})
+  return view
 }
 
 const TAB = "conv-1-claude_code-42"
@@ -529,7 +530,62 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      origin: "explicit_user",
+    })
+  })
+
+  it("labels provider cleanup, disconnectAll, idle reap, and supersession", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+
+    const provider = await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "codex", "/repo")
+    })
+    h.acpDisconnect.mockClear()
+    provider.unmount()
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      expect.objectContaining({ origin: "provider_unmount" })
+    )
+
+    h.acpDisconnect.mockClear()
+    vi.useFakeTimers()
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "codex", "/repo")
+      await h.actions!.disconnectAll()
+    })
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      expect.objectContaining({ origin: "disconnect_all" })
+    )
+
+    h.acpDisconnect.mockClear()
+    await act(async () => {
+      await h.actions!.connect(TAB, "codex", "/repo")
+      await h.actions!.connect(TAB, "claude_code", "/other")
+    })
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      expect.objectContaining({ origin: "connection_superseded" })
+    )
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+    h.acpDisconnect.mockClear()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(121_000)
+    })
+    vi.useRealTimers()
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      expect.objectContaining({ origin: "idle_timeout" })
+    )
   })
 
   it("desktop viewer torn down DURING snapshot fetch does not seed delegations or route", async () => {
@@ -975,7 +1031,9 @@ describe("AcpConnectionsProvider route override + conflict", () => {
     })
     expect(reapplied).toBe(true)
     // Explicit disconnect of the live owner process first…
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      origin: "config_reapply",
+    })
     // …then reconnect reuses the stored conversation id + route override exactly
     // (sessionId is whatever the connection last held — typically from snapshot).
     expect(h.acpConnect).toHaveBeenCalledWith(
@@ -4153,6 +4211,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       expectedOwnerWindow: "main",
       expectedOperationId: "op-B",
       expectedOwnershipGeneration: 4,
+      origin: "explicit_user",
     })
   })
 

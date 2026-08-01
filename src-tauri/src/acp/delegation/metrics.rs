@@ -38,6 +38,209 @@ pub enum RuntimeProjectionErrorKind {
     TerminalPersistence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryMetricEventKind {
+    #[serde(rename = "recovery.decision")]
+    Decision,
+    #[serde(rename = "recovery.confirmation_requested")]
+    ConfirmationRequested,
+    #[serde(rename = "recovery.confirmation_approved")]
+    ConfirmationApproved,
+    #[serde(rename = "recovery.confirmation_declined")]
+    ConfirmationDeclined,
+    #[serde(rename = "recovery.authorization_consumed")]
+    AuthorizationConsumed,
+    #[serde(rename = "recovery.authorization_rejected")]
+    AuthorizationRejected,
+    #[serde(rename = "recovery.resume_failed")]
+    ResumeFailed,
+    #[serde(rename = "recovery.replacement_admitted")]
+    ReplacementAdmitted,
+}
+
+impl RecoveryMetricEventKind {
+    pub const ALL: [Self; 8] = [
+        Self::Decision,
+        Self::ConfirmationRequested,
+        Self::ConfirmationApproved,
+        Self::ConfirmationDeclined,
+        Self::AuthorizationConsumed,
+        Self::AuthorizationRejected,
+        Self::ResumeFailed,
+        Self::ReplacementAdmitted,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "recovery.decision",
+            Self::ConfirmationRequested => "recovery.confirmation_requested",
+            Self::ConfirmationApproved => "recovery.confirmation_approved",
+            Self::ConfirmationDeclined => "recovery.confirmation_declined",
+            Self::AuthorizationConsumed => "recovery.authorization_consumed",
+            Self::AuthorizationRejected => "recovery.authorization_rejected",
+            Self::ResumeFailed => "recovery.resume_failed",
+            Self::ReplacementAdmitted => "recovery.replacement_admitted",
+        }
+    }
+}
+
+macro_rules! stable_recovery_metric_value {
+    ($name:ident, [$($value:literal),+ $(,)?]) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(value: &str) -> Option<Self> {
+                matches!(value, $($value)|+).then(|| Self(value.to_string()))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+stable_recovery_metric_value!(
+    RecoveryMetricAction,
+    ["continue", "fresh_dispatch", "replace",]
+);
+
+stable_recovery_metric_value!(
+    RecoveryMetricCause,
+    [
+        "completed",
+        "revision_eligible_failure",
+        "unexpected_transport_loss",
+        "unexpected_process_loss",
+        "unexpected_session_loss",
+        "unexpected_host_restart",
+        "unexpected_child_connection_loss",
+        "parent_canceled",
+        "parent_turn_failed",
+        "join_abandoned",
+        "user_cancelled",
+        "tool_stalled_timeout",
+        "legacy_parent_disconnect",
+        "intentional_parent_disconnect",
+        "malformed_termination_audit",
+        "pre_admission_retry",
+        "pre_admission_abort",
+        "admission_failed",
+        "admission_unknown",
+        "missing_resume_identity",
+        "unsupported_reuse",
+        "persisted_unresumable",
+        "continue_budget_exhausted",
+        "replacement_budget_exhausted",
+        "route_rejected",
+        "stale_source",
+        "busy_source",
+        "structural_fence",
+        "contradictory_evidence",
+    ]
+);
+
+stable_recovery_metric_value!(
+    RecoveryMetricRisk,
+    [
+        "normal",
+        "execution_may_have_occurred",
+        "explicit_user_stop",
+        "legacy_unknown_origin",
+    ]
+);
+
+stable_recovery_metric_value!(
+    RecoveryMetricCode,
+    [
+        "recovery_confirmation_required",
+        "recovery_authorization_database_error",
+        "recovery_authorization_not_found",
+        "recovery_authorization_blocked",
+        "recovery_authorization_cancelled",
+        "recovery_authorization_challenge_conflict",
+        "recovery_authorization_question_binding_conflict",
+        "recovery_authorization_parent_mismatch",
+        "recovery_authorization_subject_kind_mismatch",
+        "recovery_authorization_subject_id_mismatch",
+        "recovery_authorization_fingerprint_mismatch",
+        "recovery_authorization_action_mismatch",
+        "recovery_authorization_payload_mismatch",
+        "recovery_authorization_pending",
+        "recovery_authorization_declined",
+        "recovery_authorization_expired",
+        "recovery_authorization_abandoned",
+        "recovery_authorization_consumed_conflict",
+        "unresumable",
+    ]
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegationRecoveryMetricEvent {
+    pub kind: RecoveryMetricEventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<RecoveryMetricAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<RecoveryMetricCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RecoveryMetricRisk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<RecoveryMetricCode>,
+}
+
+impl DelegationRecoveryMetricEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn validated(
+        kind: RecoveryMetricEventKind,
+        task_id: Option<&str>,
+        authorization_id: Option<&str>,
+        parent_id: Option<String>,
+        child_id: Option<String>,
+        action: Option<&str>,
+        cause: Option<&str>,
+        risk: Option<&str>,
+        code: Option<&str>,
+    ) -> Option<Self> {
+        let action = match action {
+            Some(value) => Some(RecoveryMetricAction::parse(value)?),
+            None => None,
+        };
+        let cause = match cause {
+            Some(value) => Some(RecoveryMetricCause::parse(value)?),
+            None => None,
+        };
+        let risk = match risk {
+            Some(value) => Some(RecoveryMetricRisk::parse(value)?),
+            None => None,
+        };
+        let code = match code {
+            Some(value) => Some(RecoveryMetricCode::parse(value)?),
+            None => None,
+        };
+        Some(Self {
+            kind,
+            task_id: task_id.map(str::to_string),
+            authorization_id: authorization_id.map(str::to_string),
+            parent_id,
+            child_id,
+            action,
+            cause,
+            risk,
+            code,
+        })
+    }
+}
+
 impl RuntimeProjectionErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -164,6 +367,10 @@ pub struct DelegationMetricsSnapshot {
     /// Bounded settlement loop handed durable truth to a retry owner (new or existing).
     #[serde(default)]
     pub settlement_retry_exhausted: u64,
+    #[serde(default)]
+    pub recovery_events: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub recovery_lookup_unknown: BTreeMap<String, u64>,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -215,6 +422,9 @@ pub struct DelegationMetrics {
     admission_failed_by_agent: Mutex<BTreeMap<String, u64>>,
     settlement_retry_enqueued: AtomicU64,
     settlement_retry_exhausted: AtomicU64,
+    recovery_event_counts: Mutex<BTreeMap<String, u64>>,
+    recovery_lookup_unknown: Mutex<BTreeMap<String, u64>>,
+    recovery_event_log: Mutex<Vec<DelegationRecoveryMetricEvent>>,
 }
 
 impl DelegationMetrics {
@@ -229,6 +439,55 @@ impl DelegationMetrics {
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.entry(key).or_insert(0);
         *entry = (*entry).saturating_add(n);
+    }
+
+    pub fn record_recovery_event(&self, event: DelegationRecoveryMetricEvent) {
+        Self::inc_labeled(&self.recovery_event_counts, event.kind.as_str().to_string());
+        tracing::info!(
+            target: "codeg::delegation::recovery",
+            event = event.kind.as_str(),
+            task_id = event.task_id.as_deref(),
+            authorization_id = event.authorization_id.as_deref(),
+            parent_id = event.parent_id.as_deref(),
+            child_id = event.child_id.as_deref(),
+            action = event.action.as_ref().map(RecoveryMetricAction::as_str),
+            cause = event.cause.as_ref().map(RecoveryMetricCause::as_str),
+            risk = event.risk.as_ref().map(RecoveryMetricRisk::as_str),
+            code = event.code.as_ref().map(RecoveryMetricCode::as_str),
+            "delegation recovery event"
+        );
+        self.recovery_event_log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(event);
+    }
+
+    pub fn recovery_events(&self) -> Vec<DelegationRecoveryMetricEvent> {
+        self.recovery_event_log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn record_recovery_lookup_unknown(&self, code: &'static str) {
+        if !matches!(
+            code,
+            "db_not_found"
+                | "ownership_mismatch"
+                | "token_parent_mismatch"
+                | "store_error"
+                | "prefix_ambiguous"
+        ) {
+            return;
+        }
+        Self::inc_labeled(&self.recovery_lookup_unknown, code.to_string());
+    }
+
+    pub fn recovery_lookup_unknown_codes(&self) -> BTreeMap<String, u64> {
+        self.recovery_lookup_unknown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub(crate) fn duration_ms_saturating(d: Duration) -> u64 {
@@ -630,6 +889,16 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let recovery_events = self
+            .recovery_event_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let recovery_lookup_unknown = self
+            .recovery_lookup_unknown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         DelegationMetricsSnapshot {
             route_selections,
             safe_fallbacks,
@@ -683,6 +952,8 @@ impl DelegationMetrics {
             admission_failed_by_agent,
             settlement_retry_enqueued: self.settlement_retry_enqueued.load(Ordering::Relaxed),
             settlement_retry_exhausted: self.settlement_retry_exhausted.load(Ordering::Relaxed),
+            recovery_events,
+            recovery_lookup_unknown,
         }
     }
 }

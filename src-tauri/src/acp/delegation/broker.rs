@@ -79,15 +79,16 @@ use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaSnapshot,
     DelegationMetaWriter, NoopMetaWriter,
 };
-use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
+use crate::acp::delegation::metrics::{
+    DelegationRecoveryMetricEvent, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
+};
 use crate::acp::delegation::run_identity::{
-    cold_resolve_allows, fence_allows_settlement, AdmissionWindowTerminal, LiveRunRegistration,
-    SettlementFenceDecision,
+    cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
     PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
-    PromoteRunningOutcome, ReservingRunInsert, RunStore,
+    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -99,13 +100,18 @@ use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
     AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
-    DelegationOutcome, DelegationProfile, DelegationReplyResult, DelegationRequest,
-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ObservationSnapshot,
-    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
+    DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
+    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
+    ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    DELEGATE_TO_AGENT_TOOL,
+};
+use crate::acp::termination::{
+    AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
+    AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
 };
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
-use crate::db::entities::delegation_task_run::AdmissionClass;
+use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
 use crate::models::AgentType;
 
 /// Coalesced runtime-stats write window (one worker sleep per flush cycle).
@@ -469,15 +475,11 @@ struct PendingInner {
     /// (gated by `setups`), keyed by `call_id`. Each carries the `seq` arrival
     /// stamp taken when it buffered, so the park can order it against a racing
     /// parent cancel (first-terminal-wins). Drained at park.
-    early_completes: HashMap<String, (u64, DelegationOutcome)>,
-    /// Cancel reasons captured by a child failure that beat registration (gated
-    /// by `setups`), keyed by `child_connection_id`. The value pairs the `seq`
-    /// arrival stamp (for the park's first-terminal-wins ordering against a
-    /// racing parent cancel) with the pre-computed `Canceled { reason }` text
-    /// (same wording the parked `cancel_by_child_connection` path produces);
-    /// `handle_request` rebuilds the full outcome at park with the real
-    /// `child_conversation_id` (which the resolver, finding no entry, lacked).
-    early_cancels: HashMap<String, (u64, String)>,
+    early_completes: HashMap<String, (u64, ObservedTerminal)>,
+    /// Child failures captured before registration, keyed by child connection.
+    /// The value keeps the arrival stamp and producer-authored terminal
+    /// evidence together; park fills only the wire child identity.
+    early_cancels: HashMap<String, (u64, ObservedTerminal)>,
     /// In-flight `handle_request` setups, keyed by a unique per-call id and
     /// registered at entry (BEFORE the claim poll, so the whole claim→park
     /// window is covered). This is the parent-cancel counterpart to `setups`:
@@ -537,10 +539,10 @@ struct PendingInner {
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct InflightParentEnd {
     stamp: u64,
-    reason: ParentTurnEndReason,
+    context: ParentEndContext,
 }
 
 /// One in-flight `handle_request` setup tracked for parent-cancel coverage.
@@ -562,6 +564,20 @@ struct InflightSetup {
     /// Survives single-shot pre-cancel buffer consumption so every later
     /// durable-admission / launch checkpoint still fails closed.
     external_canceled: bool,
+    /// Whether this setup has crossed the prompt-send boundary.
+    prompt_may_have_executed: bool,
+}
+
+/// A terminal event captured at its producer boundary.
+///
+/// The wire outcome remains independent from the typed durable write. Buffer
+/// and drain paths carry this value unchanged, so error-code presentation can
+/// never be used to reconstruct termination evidence or timestamps.
+#[derive(Debug, Clone)]
+struct ObservedTerminal {
+    outcome: DelegationOutcome,
+    terminal: TerminalTaskWrite,
+    result_text: Option<String>,
 }
 
 /// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
@@ -571,11 +587,12 @@ struct InflightSetup {
 /// continue path can project the real wire code while durable settle is still
 /// in flight after the handoff was unregistered.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Preserves the first-terminal payload without heap indirection.
 enum ReservingHandoffDisposition {
     /// Parent end won first-terminal-wins (or no earlier child terminal).
-    ParentEnded(ParentTurnEndReason),
+    ParentEnded(ParentEndContext),
     /// A buffered child terminal stamped earlier than the parent end.
-    ChildTerminal(DelegationOutcome),
+    ChildTerminal(ObservedTerminal),
 }
 
 /// Process-local terminal intent while durable may still be non-terminal.
@@ -602,12 +619,15 @@ impl TerminalIntent {
             completed_report(task_id, completed)
         } else {
             match &self.disposition {
-                ReservingHandoffDisposition::ParentEnded(reason) => {
-                    parent_end_setup_report(agent_type, *reason, Some(child_conversation_id))
+                ReservingHandoffDisposition::ParentEnded(context) => {
+                    parent_end_setup_report(agent_type, context, Some(child_conversation_id))
                 }
-                ReservingHandoffDisposition::ChildTerminal(outcome) => {
-                    report_from_outcome(Some(task_id.to_string()), Some(agent_type), outcome, None)
-                }
+                ReservingHandoffDisposition::ChildTerminal(observed) => report_from_outcome(
+                    Some(task_id.to_string()),
+                    Some(agent_type),
+                    &observed.outcome,
+                    None,
+                ),
             }
         };
         if report.task_id.is_none() {
@@ -703,8 +723,10 @@ pub(crate) fn sanitize_bootstrap_unresumable_message(message: &str) -> String {
 
 fn disposition_error_code(disposition: &ReservingHandoffDisposition) -> Option<String> {
     match disposition {
-        ReservingHandoffDisposition::ParentEnded(reason) => Some(reason.error_code().to_string()),
-        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
+        ReservingHandoffDisposition::ParentEnded(context) => {
+            Some(context.durable_error_code().to_string())
+        }
+        ReservingHandoffDisposition::ChildTerminal(observed) => match &observed.outcome {
             DelegationOutcome::Err { code, .. } => Some(code.clone()),
             DelegationOutcome::Ok(_) => None,
         },
@@ -732,7 +754,7 @@ struct ReservingHandoffEnd {
 /// pre-send bind fails closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionFenceReject {
-    ParentEnd(ParentTurnEndReason),
+    ParentEnd(ParentEndContext),
     ExternalCanceled,
     /// Durable bind lost to a different already-bound connection. Live state
     /// was unwound and the challenger disconnected; **do not** settle the
@@ -798,7 +820,7 @@ pub(crate) struct CoordinationIdentity {
     /// connection registration, before `promote_running`). Each entry is
     /// stamped with the pending `seq` clock at buffer time so park can order
     /// first-terminal-wins against a racing parent cancel.
-    pub(crate) admission_buffer: Vec<(u64, AdmissionWindowTerminal)>,
+    admission_buffer: Vec<(u64, ObservedTerminal)>,
     /// True after `promote_running` succeeds — buffered terminals may then
     /// be applied.
     pub(crate) admitted_running: bool,
@@ -812,6 +834,10 @@ pub(crate) struct CoordinationIdentity {
     /// handoff while the lease is held; the send path re-checks after the
     /// await and cancels any accepted prompt if the fence lost.
     pub(crate) prompt_send_lease: bool,
+    /// Sticky fact set at the send boundary and never cleared by lease release.
+    prompt_may_have_executed: bool,
+    /// Setup record whose prompt flag advances with `prompt_send_lease`.
+    pub(crate) inflight_id: Option<u64>,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -944,7 +970,7 @@ impl PendingInner {
     fn buffer_admission_window_terminal(
         &mut self,
         child_connection_id: &str,
-        terminal: AdmissionWindowTerminal,
+        terminal: ObservedTerminal,
     ) -> bool {
         // Check before tick so we do not advance the clock for non-buffering
         // paths, and avoid holding a `get_mut` borrow across `tick()`.
@@ -971,7 +997,7 @@ impl PendingInner {
     fn take_first_admission_terminal(
         &mut self,
         child_connection_id: &str,
-    ) -> Option<(u64, AdmissionWindowTerminal)> {
+    ) -> Option<(u64, ObservedTerminal)> {
         let coord = self.coordination_by_child.get_mut(child_connection_id)?;
         if coord.admission_buffer.is_empty() {
             return None;
@@ -995,38 +1021,35 @@ impl PendingInner {
     /// cancel. No-op when the `call_id` isn't reserved (already resolved by
     /// another terminal path), so the buffer only ever holds genuine
     /// pre-registration races.
-    fn buffer_early_complete(&mut self, call_id: &str, outcome: DelegationOutcome) {
+    fn buffer_early_complete(&mut self, call_id: &str, terminal: ObservedTerminal) {
         if self.setups.contains_key(call_id) {
             let stamp = self.tick();
             self.early_completes
-                .insert(call_id.to_string(), (stamp, outcome));
+                .insert(call_id.to_string(), (stamp, terminal));
         }
     }
 
     /// Buffer a child failure for a still-reserved delegation, stamped with the
     /// current arrival clock so the park can order it against a racing parent
     /// cancel. No-op when the child isn't reserved (normal post-resolution
-    /// teardown). Stores the pre-computed cancel reason so the park rebuilds the
-    /// same wording the parked `cancel_by_child_connection` path produces.
-    fn buffer_child_failure(&mut self, child_connection_id: &str, detail: Option<String>) {
+    /// teardown). Stores producer-authored evidence and its observation time.
+    fn buffer_child_failure(&mut self, child_connection_id: &str, terminal: ObservedTerminal) {
         if self.is_child_reserved(child_connection_id) {
             let stamp = self.tick();
-            self.early_cancels.insert(
-                child_connection_id.to_string(),
-                (stamp, child_canceled_reason(detail.as_deref())),
-            );
+            self.early_cancels
+                .insert(child_connection_id.to_string(), (stamp, terminal));
         }
     }
 
     /// Drain a buffered completion with its arrival stamp (by `call_id`) — used
     /// by `handle_request` at park.
-    fn take_early_complete(&mut self, call_id: &str) -> Option<(u64, DelegationOutcome)> {
+    fn take_early_complete(&mut self, call_id: &str) -> Option<(u64, ObservedTerminal)> {
         self.early_completes.remove(call_id)
     }
 
-    /// Drain a buffered cancel reason with its arrival stamp (by
+    /// Drain a buffered child terminal with its arrival stamp (by
     /// `child_connection_id`) — used by `handle_request` at park.
-    fn take_early_cancel(&mut self, child_connection_id: &str) -> Option<(u64, String)> {
+    fn take_early_cancel(&mut self, child_connection_id: &str) -> Option<(u64, ObservedTerminal)> {
         self.early_cancels.remove(child_connection_id)
     }
 
@@ -1065,6 +1088,7 @@ impl PendingInner {
                 parent_end: None,
                 external_handle,
                 external_canceled: false,
+                prompt_may_have_executed: false,
             },
         );
         id
@@ -1092,6 +1116,12 @@ impl PendingInner {
         }
     }
 
+    fn mark_inflight_prompt_may_have_executed(&mut self, id: u64) {
+        if let Some(setup) = self.inflight.get_mut(&id) {
+            setup.prompt_may_have_executed = true;
+        }
+    }
+
     /// Whether this setup was sticky-marked by external MCP cancel.
     fn inflight_external_canceled(&self, id: u64) -> bool {
         self.inflight
@@ -1110,7 +1140,7 @@ impl PendingInner {
     /// to order the parent end against a buffered child terminal and to settle
     /// with the stable root code.
     fn inflight_parent_end(&self, id: u64) -> Option<InflightParentEnd> {
-        self.inflight.get(&id).and_then(|s| s.parent_end)
+        self.inflight.get(&id).and_then(|s| s.parent_end.clone())
     }
 
     /// Flag every in-flight setup owned by `parent_connection_id` as ended,
@@ -1128,12 +1158,16 @@ impl PendingInner {
     fn mark_inflight_canceled_for_parent(
         &mut self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: impl ParentEndContextArg,
     ) -> u64 {
+        let context = context.into_parent_end_context();
         let stamp = self.tick();
         for setup in self.inflight.values_mut() {
             if setup.parent_connection_id == parent_connection_id && setup.parent_end.is_none() {
-                setup.parent_end = Some(InflightParentEnd { stamp, reason });
+                setup.parent_end = Some(InflightParentEnd {
+                    stamp,
+                    context: context.with_prompt_may_have_executed(setup.prompt_may_have_executed),
+                });
             }
         }
         stamp
@@ -1177,7 +1211,7 @@ impl PendingInner {
     fn take_reserving_handoffs_for_parent_end(
         &mut self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: &ParentEndContext,
         parent_end_stamp: u64,
     ) -> Vec<ReservingHandoffEnd> {
         let child_ids: Vec<String> = self
@@ -1195,37 +1229,20 @@ impl PendingInner {
             let Some(coord) = self.coordination_by_child.get(&child_id).cloned() else {
                 continue;
             };
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = self.take_early_complete(&coord.task_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = self.take_early_complete(&coord.task_id) {
+                consider(stamp, terminal);
+            }
+            if let Some((stamp, terminal)) = self.take_early_cancel(&child_id) {
+                consider(stamp, terminal);
             }
             let child_conversation_id = coord.run_registration.child_conversation_id;
-            if let Some((stamp, cancel_reason)) = self.take_early_cancel(&child_id) {
-                consider(
-                    stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled {
-                            reason: cancel_reason,
-                        },
-                        Some(child_conversation_id).filter(|id| *id != 0),
-                    ),
-                );
-            }
             if let Some((stamp, terminal)) = self.take_first_admission_terminal(&child_id) {
-                // Agent type is unknown on the handoff path; admission drain
-                // only needs the outcome wire code/message for durable settle.
-                consider(
-                    stamp,
-                    admission_terminal_to_outcome(
-                        terminal,
-                        child_conversation_id,
-                        AgentType::ClaudeCode,
-                    ),
-                );
+                consider(stamp, terminal);
             }
             // First-wins claim via shared non-destructive resolver: peek any
             // existing bootstrap ChildTerminal (or earlier park) before insert.
@@ -1235,10 +1252,12 @@ impl PendingInner {
                 intent.disposition
             } else {
                 let computed = match child_terminal {
-                    Some((child_stamp, outcome)) if child_stamp < parent_end_stamp => {
-                        ReservingHandoffDisposition::ChildTerminal(outcome)
+                    Some((child_stamp, terminal)) if child_stamp < parent_end_stamp => {
+                        ReservingHandoffDisposition::ChildTerminal(terminal)
                     }
-                    _ => ReservingHandoffDisposition::ParentEnded(reason),
+                    _ => ReservingHandoffDisposition::ParentEnded(
+                        context.with_prompt_may_have_executed(coord.prompt_may_have_executed),
+                    ),
                 };
                 match self
                     .closed_handoff_dispositions
@@ -1319,7 +1338,10 @@ impl PendingInner {
     fn disposition_is_persistence_error(disposition: &ReservingHandoffDisposition) -> bool {
         matches!(
             disposition,
-            ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err { code, .. })
+            ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                outcome: DelegationOutcome::Err { code, .. },
+                ..
+            })
                 if code == "persistence_error"
         )
     }
@@ -1681,11 +1703,35 @@ impl SettleContext {
 /// Setup-window terminal report for a parent turn/connection end (no durable
 /// row yet when `task_id` is absent). Uses stable parent-end codes — never
 /// generic `"canceled"`.
+trait ParentEndContextArg {
+    fn into_parent_end_context(self) -> ParentEndContext;
+}
+
+#[cfg(test)]
+impl ParentEndContextArg for ParentTurnEndReason {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        ParentEndContext::legacy(self, Utc::now(), true)
+    }
+}
+
+impl ParentEndContextArg for ParentEndContext {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        self
+    }
+}
+
+impl ParentEndContextArg for &ParentEndContext {
+    fn into_parent_end_context(self) -> ParentEndContext {
+        self.clone()
+    }
+}
+
 fn parent_end_setup_report(
     agent_type: AgentType,
-    reason: ParentTurnEndReason,
+    context: impl ParentEndContextArg,
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
+    let context = context.into_parent_end_context();
     DelegationTaskReport {
         task_id: None,
         continued_from_task_id: None,
@@ -1694,32 +1740,210 @@ fn parent_end_setup_report(
         child_conversation_id,
         agent_type: Some(agent_type),
         text: None,
-        error_code: Some(reason.error_code().to_string()),
-        message: Some(reason.message().to_string()),
+        error_code: Some(context.durable_error_code().to_string()),
+        message: Some(context.reason.message().to_string()),
         duration_ms: None,
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
-/// Map a resolved outcome onto a durable terminal write + optional result text.
-fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Option<String>) {
-    let now = Utc::now();
-    match outcome {
+fn termination_audit(
+    source: AcpTerminationSource,
+    reason: AcpTerminationReason,
+    classification: AcpTerminationClassification,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    requested_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+) -> DelegationTerminationAuditV1 {
+    let mut termination = AcpTerminationSummaryV1::new(
+        source,
+        reason,
+        classification,
+        prompt_may_have_executed,
+        observed_at,
+    );
+    termination.requested_at = requested_at;
+    if source == AcpTerminationSource::Frontend {
+        termination.frontend_origin =
+            Some(crate::acp::termination::AcpDisconnectOrigin::LegacyUnspecified);
+    }
+    DelegationTerminationAuditV1::new(
+        termination,
+        prior_status,
+        AdmissionClass::NormalRevision,
+        None,
+        None,
+    )
+}
+
+fn failed_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    source: AcpTerminationSource,
+    reason: AcpTerminationReason,
+    classification: AcpTerminationClassification,
+) -> TerminalTaskWrite {
+    let observed_at = Utc::now();
+    TerminalTaskWrite::failed_with_evidence(
+        code,
+        observed_at,
+        termination_audit(
+            source,
+            reason,
+            classification,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+    )
+}
+
+fn explicit_cancellation_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+) -> TerminalTaskWrite {
+    let observed_at = Utc::now();
+    TerminalTaskWrite::canceled(
+        code,
+        observed_at,
+        explicit_cancellation_audit(prior_status, prompt_may_have_executed, observed_at),
+    )
+}
+
+fn explicit_cancellation_audit(
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+) -> DelegationTerminationAuditV1 {
+    termination_audit(
+        AcpTerminationSource::Frontend,
+        AcpTerminationReason::UserCancelled,
+        AcpTerminationClassification::Explicit,
+        prior_status,
+        prompt_may_have_executed,
+        Some(observed_at),
+        observed_at,
+    )
+}
+
+fn observed_terminal_from_outcome(
+    outcome: DelegationOutcome,
+    evidence: DelegationTerminationAuditV1,
+    observed_at: DateTime<Utc>,
+) -> ObservedTerminal {
+    let (terminal, result_text) = match &outcome {
         DelegationOutcome::Ok(ok) => (
-            TerminalTaskWrite::completed(now, ConversationStatus::PendingReview),
+            TerminalTaskWrite::completed(observed_at, ConversationStatus::PendingReview),
             Some(ok.text.clone()),
         ),
-        DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => (
-            TerminalTaskWrite::canceled(code.clone(), now, ConversationStatus::Cancelled),
-            None,
-        ),
-        DelegationOutcome::Err { code, .. } => (
-            TerminalTaskWrite::failed(code.clone(), now, ConversationStatus::Cancelled),
-            None,
-        ),
+        DelegationOutcome::Err { code, .. } => {
+            let terminal = if is_canceled_error_code(code) {
+                TerminalTaskWrite::canceled(code.clone(), observed_at, evidence)
+            } else {
+                TerminalTaskWrite::failed_with_evidence(code.clone(), observed_at, evidence)
+            };
+            (terminal, None)
+        }
+    };
+    ObservedTerminal {
+        outcome,
+        terminal,
+        result_text,
     }
+}
+
+fn observe_child_outcome(
+    outcome: DelegationOutcome,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+) -> ObservedTerminal {
+    observed_terminal_from_outcome(
+        outcome,
+        termination_audit(
+            AcpTerminationSource::ChildConnection,
+            AcpTerminationReason::ChildTerminal,
+            AcpTerminationClassification::Unexpected,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+        observed_at,
+    )
+}
+
+fn persistence_error_observation(
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+    observed_at: DateTime<Utc>,
+    child_conversation_id: Option<i32>,
+) -> ObservedTerminal {
+    let outcome = DelegationOutcome::Err {
+        code: "persistence_error".into(),
+        message: bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError),
+        child_conversation_id,
+    };
+    observed_terminal_from_outcome(
+        outcome,
+        termination_audit(
+            AcpTerminationSource::Legacy,
+            AcpTerminationReason::LegacyUnspecified,
+            AcpTerminationClassification::LegacyUnknown,
+            prior_status,
+            prompt_may_have_executed,
+            None,
+            observed_at,
+        ),
+        observed_at,
+    )
+}
+
+impl ObservedTerminal {
+    fn with_child_identity(mut self, child_conversation_id: i32, agent_type: AgentType) -> Self {
+        match &mut self.outcome {
+            DelegationOutcome::Ok(ok) => {
+                ok.child_conversation_id = child_conversation_id;
+                ok.child_agent_type = agent_type;
+            }
+            DelegationOutcome::Err {
+                child_conversation_id: cid,
+                ..
+            } => {
+                if cid.is_none() {
+                    *cid = Some(child_conversation_id);
+                }
+            }
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+fn canceled_terminal(
+    code: impl Into<String>,
+    prior_status: DelegationRunStatus,
+    prompt_may_have_executed: bool,
+) -> TerminalTaskWrite {
+    let code = code.into();
+    let observed_at = Utc::now();
+    TerminalTaskWrite::canceled(
+        code.clone(),
+        observed_at,
+        DelegationTerminationAuditV1::for_terminal_code(
+            &code,
+            prior_status,
+            prompt_may_have_executed,
+            observed_at,
+        ),
+    )
 }
 
 /// Project a full [`TerminalTaskWrite`] payload onto a process-local outcome.
@@ -1798,19 +2022,40 @@ fn report_from_terminal_write(
 /// Map a parked/parent-end handoff disposition onto a durable terminal write.
 fn terminal_from_handoff_disposition(
     disposition: &ReservingHandoffDisposition,
+    prior_status: DelegationRunStatus,
 ) -> TerminalTaskWrite {
     match disposition {
-        ReservingHandoffDisposition::ParentEnded(reason) => TerminalTaskWrite::canceled(
-            reason.error_code(),
-            Utc::now(),
-            ConversationStatus::Cancelled,
-        ),
-        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
-            DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
-                TerminalTaskWrite::canceled(code.clone(), Utc::now(), ConversationStatus::Cancelled)
-            }
-            other => terminal_from_outcome(other).0,
+        ReservingHandoffDisposition::ParentEnded(context) => {
+            let observed_at = context.termination.observed_at;
+            TerminalTaskWrite::canceled(
+                context.durable_error_code(),
+                observed_at,
+                context.audit(prior_status, AdmissionClass::NormalRevision, None, None),
+            )
+        }
+        ReservingHandoffDisposition::ChildTerminal(observed) => observed.terminal.clone(),
+    }
+}
+
+fn observed_terminal_from_handoff_disposition(
+    disposition: &ReservingHandoffDisposition,
+    prior_status: DelegationRunStatus,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+) -> ObservedTerminal {
+    match disposition {
+        ReservingHandoffDisposition::ParentEnded(context) => ObservedTerminal {
+            outcome: DelegationOutcome::Err {
+                code: context.durable_error_code().to_string(),
+                message: context.reason.message().to_string(),
+                child_conversation_id: Some(child_conversation_id),
+            },
+            terminal: terminal_from_handoff_disposition(disposition, prior_status),
+            result_text: None,
         },
+        ReservingHandoffDisposition::ChildTerminal(observed) => observed
+            .clone()
+            .with_child_identity(child_conversation_id, agent_type),
     }
 }
 
@@ -1869,42 +2114,6 @@ fn report_harvest_context_from_runtime(
         .map(|f| std::path::PathBuf::from(f.path))
         .collect();
     (paths, workspace)
-}
-
-/// Convert an admission-window terminal into a settlement outcome.
-/// Preserves typed codes (refusal, max_tokens, unresumable, …) from
-/// [`AdmissionWindowTerminal::Outcome`]; bare disconnect maps to canceled.
-fn admission_terminal_to_outcome(
-    terminal: AdmissionWindowTerminal,
-    child_conversation_id: i32,
-    agent_type: AgentType,
-) -> DelegationOutcome {
-    match terminal {
-        AdmissionWindowTerminal::Outcome(outcome) => match outcome {
-            DelegationOutcome::Ok(mut ok) => {
-                ok.child_conversation_id = child_conversation_id;
-                if ok.child_agent_type != agent_type {
-                    ok.child_agent_type = agent_type;
-                }
-                DelegationOutcome::Ok(ok)
-            }
-            DelegationOutcome::Err {
-                code,
-                message,
-                child_conversation_id: cid,
-            } => DelegationOutcome::Err {
-                code,
-                message,
-                child_conversation_id: cid.or(Some(child_conversation_id)),
-            },
-        },
-        AdmissionWindowTerminal::Disconnect { detail } => DelegationOutcome::from_err(
-            DelegationError::Canceled {
-                reason: child_canceled_reason(detail.as_deref()),
-            },
-            Some(child_conversation_id),
-        ),
-    }
 }
 
 /// Rebuild a lightweight outcome for meta/event summary from a settled report.
@@ -2014,6 +2223,7 @@ fn report_from_outcome(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2024,8 +2234,14 @@ fn report_err(
     err: DelegationError,
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
+    let recovery = match &err {
+        DelegationError::RecoveryConfirmationRequired(projection) => Some(projection.clone()),
+        _ => None,
+    };
     let outcome = DelegationOutcome::from_err(err, child_conversation_id);
-    report_from_outcome(None, Some(agent_type), &outcome, None)
+    let mut report = report_from_outcome(None, Some(agent_type), &outcome, None);
+    report.recovery = recovery;
+    report
 }
 
 /// Build an error report after a continuation has durably reserved a run.
@@ -2062,6 +2278,14 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
         TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
+        TaskStoreError::RecoveryConfirmationRequired(projection) => {
+            DelegationError::RecoveryConfirmationRequired(projection)
+        }
+        TaskStoreError::RecoveryAuthorizationRejected { code } => {
+            DelegationError::RecoveryAuthorizationRejected {
+                code: code.to_string(),
+            }
+        }
         TaskStoreError::StaleTaskId(m) => DelegationError::StaleTaskId(m),
         TaskStoreError::NotContinuable(m) => DelegationError::NotContinuable(m),
         TaskStoreError::NotFound(m) => DelegationError::NotFound(m),
@@ -2085,6 +2309,7 @@ fn is_same_owner_intended_error_code(code: &str) -> bool {
 }
 
 /// Outcome of the shared post-accept promote helper (gen-1 + continuation).
+#[allow(clippy::large_enum_variant)] // The failure report stays by value across the shared promote path.
 enum PostAcceptPromoteResult {
     /// Promote succeeded (or already-running idempotent). Caller continues the
     /// running ack path. `already_running` must not double-count accepted metrics
@@ -2261,6 +2486,7 @@ fn running_ack(
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2495,6 +2721,7 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2514,6 +2741,7 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2538,6 +2766,7 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2566,6 +2795,7 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         observation: None,
         last_agent_activity_at: None,
         stalled_since: None,
+        recovery: None,
     }
 }
 
@@ -2580,6 +2810,10 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
 enum StatusClass {
     /// Terminal/owned-cached, or a cross-parent `unknown` — the report is final.
     Settled(DelegationTaskReport),
+    Unknown {
+        report: DelegationTaskReport,
+        reason: &'static str,
+    },
     /// Running or mid-settle (settling map) and owned — the bare running
     /// snapshot plus its child connection id, so `assemble_reports` can attach
     /// the latest live reply out of lock. Waiters treat this as not-yet-
@@ -2676,7 +2910,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
         // do not treat as cross-parent denial; fall through for DB ownership
         // and/or disposition-backed intent.
         if !c.parent_connection_id.is_empty() {
-            return StatusClass::Settled(unknown_report(task_id));
+            return StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            };
         }
     }
     // Owned terminal intent without a parent-matching completed row (e.g.
@@ -2718,7 +2955,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
                 child_connection_id: r.child_connection_id.clone(),
             }
         } else {
-            StatusClass::Settled(unknown_report(task_id))
+            StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            }
         };
     }
     // Durable CAS in flight: keep waiters parked and snapshot status Running.
@@ -2729,7 +2969,10 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
                 child_connection_id: r.child_connection_id.clone(),
             }
         } else {
-            StatusClass::Settled(unknown_report(task_id))
+            StatusClass::Unknown {
+                report: unknown_report(task_id),
+                reason: "token_parent_mismatch",
+            }
         };
     }
     StatusClass::NotInMemory
@@ -3099,6 +3342,11 @@ pub struct DelegationBroker {
     /// but before durable reserve starts, so parent-end cannot overtake it.
     #[cfg(any(test, feature = "test-utils"))]
     continue_post_note_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold continuation after its final closed-handoff check and
+    /// before the admission park lock, so a producer can park and unregister
+    /// the exact terminal disposition in that interleaving.
+    #[cfg(any(test, feature = "test-utils"))]
+    continue_pre_park_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: hold `continue_closed_handoff_report` after the first durable
     /// load (non-terminal) and before parked-disposition take, so settle can
     /// commit and clear the park between those steps.
@@ -3119,6 +3367,10 @@ pub struct DelegationBroker {
     /// race the pure reserving claim deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_post_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold gen-1 after durable admission has completed all local
+    /// cancel checks and immediately before setup checkpoint #1.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_before_spawn_checkpoint_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: hold gen-1 after durable pre-send bind succeeds and before
     /// the post-bind cancel recheck / prompt send, so parent cancel can stamp
     /// inflight during the bind→send window deterministically.
@@ -3236,6 +3488,8 @@ impl DelegationBroker {
             #[cfg(any(test, feature = "test-utils"))]
             continue_post_note_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
+            continue_pre_park_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
             continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_precheck_gate: Arc::new(Mutex::new(None)),
@@ -3243,6 +3497,8 @@ impl DelegationBroker {
             gen1_pre_admit_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_admit_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_before_spawn_checkpoint_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_bind_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -3644,6 +3900,103 @@ impl DelegationBroker {
         self.metrics.clone()
     }
 
+    #[allow(clippy::too_many_arguments)] // Stable telemetry schema mirrors the metric event fields.
+    fn record_recovery_event(
+        &self,
+        kind: RecoveryMetricEventKind,
+        task_id: Option<&str>,
+        authorization_id: Option<&str>,
+        parent_conversation_id: Option<i32>,
+        child_conversation_id: Option<i32>,
+        action: Option<&str>,
+        cause: Option<&str>,
+        risk: Option<&str>,
+        code: Option<&str>,
+    ) {
+        let Some(event) = DelegationRecoveryMetricEvent::validated(
+            kind,
+            task_id,
+            authorization_id,
+            parent_conversation_id.map(|id| id.to_string()),
+            child_conversation_id.map(|id| id.to_string()),
+            action,
+            cause,
+            risk,
+            code,
+        ) else {
+            tracing::warn!(
+                target: "codeg::delegation::recovery",
+                event = kind.as_str(),
+                "invalid stable recovery telemetry value rejected"
+            );
+            return;
+        };
+        self.metrics.record_recovery_event(event);
+    }
+
+    fn record_recovery_admission_error(
+        &self,
+        error: &TaskStoreError,
+        task_id: &str,
+        parent_conversation_id: i32,
+        child_conversation_id: Option<i32>,
+        action: &'static str,
+    ) {
+        match error {
+            TaskStoreError::RecoveryConfirmationRequired(projection) => {
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::Decision,
+                    Some(task_id),
+                    None,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    projection.proposed_action.as_deref(),
+                    Some(&projection.cause_code),
+                    Some(&projection.risk_class),
+                    Some("recovery_confirmation_required"),
+                );
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::ConfirmationRequested,
+                    Some(task_id),
+                    None,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    projection.proposed_action.as_deref(),
+                    Some(&projection.cause_code),
+                    Some(&projection.risk_class),
+                    Some("recovery_confirmation_required"),
+                );
+            }
+            TaskStoreError::RecoveryAuthorizationRejected { code } => {
+                if *code == "recovery_authorization_declined" {
+                    self.record_recovery_event(
+                        RecoveryMetricEventKind::ConfirmationDeclined,
+                        Some(task_id),
+                        None,
+                        Some(parent_conversation_id),
+                        child_conversation_id,
+                        Some(action),
+                        None,
+                        None,
+                        Some(code),
+                    );
+                }
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::AuthorizationRejected,
+                    Some(task_id),
+                    None,
+                    Some(parent_conversation_id),
+                    child_conversation_id,
+                    Some(action),
+                    None,
+                    None,
+                    Some(code),
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Record one status-wait outcome (exact-once per request return path).
     fn record_status_wait(
         &self,
@@ -3832,7 +4185,7 @@ impl DelegationBroker {
         runs: &RunStore,
         task_id: &str,
         child_conversation_id: i32,
-        reason: ParentTurnEndReason,
+        context: ParentEndContext,
         agent_type: AgentType,
         inflight_id: u64,
         abandon_context: &'static str,
@@ -3844,8 +4197,14 @@ impl DelegationBroker {
             agent_type,
             inflight_id,
             abandon_context,
-            reason.error_code(),
-            |agent, child| parent_end_setup_report(agent, reason, child),
+            context.durable_error_code(),
+            context.audit(
+                DelegationRunStatus::Reserving,
+                AdmissionClass::NormalRevision,
+                None,
+                None,
+            ),
+            |agent, child| parent_end_setup_report(agent, &context, child),
         )
         .await
     }
@@ -3861,6 +4220,7 @@ impl DelegationBroker {
         inflight_id: u64,
         abandon_context: &'static str,
     ) -> DelegationTaskReport {
+        let observed_at = Utc::now();
         self.cancel_admitted_gen1_pre_spawn_with(
             runs,
             task_id,
@@ -3869,6 +4229,7 @@ impl DelegationBroker {
             inflight_id,
             abandon_context,
             "canceled",
+            explicit_cancellation_audit(DelegationRunStatus::Reserving, false, observed_at),
             |agent, child| {
                 report_err(
                     agent,
@@ -3892,8 +4253,10 @@ impl DelegationBroker {
         inflight_id: u64,
         abandon_context: &'static str,
         settle_error_code: &str,
+        termination_audit: DelegationTerminationAuditV1,
         success_report: impl FnOnce(AgentType, Option<i32>) -> DelegationTaskReport,
     ) -> DelegationTaskReport {
+        let finished_at = termination_audit.termination.observed_at;
         match runs.abandon_reserving_claim(task_id).await {
             Ok(true) => {
                 if let Err(cleanup_err) = self
@@ -3935,8 +4298,8 @@ impl DelegationBroker {
                             task_id,
                             TerminalTaskWrite::canceled(
                                 settle_error_code,
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
+                                finished_at,
+                                termination_audit,
                             ),
                         )
                         .await
@@ -5071,13 +5434,15 @@ impl DelegationBroker {
     /// If this in-flight setup has been flagged by a parent end, deregister it
     /// and return the stable root reason. One lock acquisition; used at the
     /// pre-spawn / post-spawn checkpoints in `handle_request`.
-    async fn take_inflight_cancel(&self, inflight_id: u64) -> Option<ParentTurnEndReason> {
+    async fn take_inflight_cancel(&self, inflight_id: u64) -> Option<ParentEndContext> {
         let mut inner = self.pending.inner.lock().await;
-        let reason = inner.inflight_parent_end(inflight_id).map(|end| end.reason);
-        if reason.is_some() {
+        let context = inner
+            .inflight_parent_end(inflight_id)
+            .map(|end| end.context);
+        if context.is_some() {
             inner.deregister_inflight(inflight_id);
         }
-        reason
+        context
     }
 
     /// Drop this setup's in-flight record. Called on each `handle_request`
@@ -5810,8 +6175,75 @@ impl DelegationBroker {
                     Some(child_row.id),
                 );
             }
-            match runs.admit_gen1_reserving(insert).await {
+            let authorization = RecoveryAdmissionAuthorization {
+                authorization_id: req.recovery_authorization_id.clone(),
+                correlation_id: req
+                    .correlation_id
+                    .clone()
+                    .or_else(|| {
+                        (!req.parent_tool_use_id.is_empty()).then(|| req.parent_tool_use_id.clone())
+                    })
+                    .unwrap_or_else(|| call_id.clone()),
+            };
+            let admitted = match runs
+                .admit_gen1_reserving_authorized(insert, authorization)
+                .await
+            {
+                Ok(Gen1AdmitOutcome::AuthorizedCreated {
+                    run,
+                    recovery_decision,
+                }) => {
+                    let projection = DelegationRecoveryProjection::from(&recovery_decision);
+                    if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                        self.record_recovery_event(
+                            RecoveryMetricEventKind::Decision,
+                            Some(&run.task_id),
+                            Some(authorization_id),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            projection.proposed_action.as_deref(),
+                            Some(&projection.cause_code),
+                            Some(&projection.risk_class),
+                            None,
+                        );
+                    }
+                    Ok(Gen1AdmitOutcome::Created(run))
+                }
+                other => other,
+            };
+            match admitted {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
+                    if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                        for kind in [
+                            RecoveryMetricEventKind::ConfirmationApproved,
+                            RecoveryMetricEventKind::AuthorizationConsumed,
+                        ] {
+                            self.record_recovery_event(
+                                kind,
+                                Some(&run.task_id),
+                                Some(authorization_id),
+                                Some(run.parent_conversation_id),
+                                Some(run.child_conversation_id),
+                                Some("replace"),
+                                None,
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    if run.replaced_task_id.is_some() {
+                        self.record_recovery_event(
+                            RecoveryMetricEventKind::ReplacementAdmitted,
+                            Some(&run.task_id),
+                            run.recovery_authorization_id.as_deref(),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            Some("replace"),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                     // Post-commit / pre-spawn window: parent-end durable sweep
                     // may race the pure reserving claim here. Hold for tests.
                     #[cfg(any(test, feature = "test-utils"))]
@@ -5852,6 +6284,9 @@ impl DelegationBroker {
                     }
                     prebound_child = Some((child_row.id, folder.id));
                 }
+                Ok(Gen1AdmitOutcome::AuthorizedCreated { .. }) => {
+                    unreachable!("authorized created outcome normalized above")
+                }
                 Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
                     // Race after pre-check: matching fingerprint already reserved.
                     // Terminalize + guarded soft-delete the unused provisional
@@ -5874,6 +6309,13 @@ impl DelegationBroker {
                     return gen1_idempotent_ack(&existing);
                 }
                 Err(e) => {
+                    self.record_recovery_admission_error(
+                        &e,
+                        req.replaces_task_id.as_deref().unwrap_or(&call_id),
+                        req.parent_conversation_id,
+                        Some(child_row.id),
+                        "replace",
+                    );
                     // Loser of work-unit / unique fence — never dispatch, and
                     // terminalize + hide the provisional InProgress/Running
                     // child so the sidebar and list_children do not show an
@@ -5891,6 +6333,11 @@ impl DelegationBroker {
                     return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                 }
             }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.gen1_before_spawn_checkpoint_gate).await;
         }
 
         // Checkpoint #1 (opportunistic): if a parent end already landed
@@ -5919,9 +6366,14 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            "parent_ended",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            reason.durable_error_code(),
+                            reason.termination.observed_at,
+                            reason.audit(
+                                DelegationRunStatus::Reserving,
+                                AdmissionClass::NormalRevision,
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await;
@@ -5979,10 +6431,13 @@ impl DelegationBroker {
                     let _ = runs
                         .settle_terminal(
                             &call_id,
-                            TerminalTaskWrite::failed(
+                            failed_terminal(
                                 "spawn_failed",
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
+                                DelegationRunStatus::Reserving,
+                                false,
+                                AcpTerminationSource::Admission,
+                                AcpTerminationReason::AdmissionFailed,
+                                AcpTerminationClassification::Unexpected,
                             ),
                         )
                         .await;
@@ -6007,9 +6462,14 @@ impl DelegationBroker {
                     .settle_terminal(
                         &call_id,
                         TerminalTaskWrite::canceled(
-                            "parent_ended",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            reason.durable_error_code(),
+                            reason.termination.observed_at,
+                            reason.audit(
+                                DelegationRunStatus::Reserving,
+                                AdmissionClass::NormalRevision,
+                                Some(req.parent_tool_use_id.clone()),
+                                Some(child_connection_id.clone()),
+                            ),
                         ),
                     )
                     .await;
@@ -6047,10 +6507,10 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &call_id,
-                        TerminalTaskWrite::canceled(
+                        explicit_cancellation_terminal(
                             "canceled",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
                         ),
                     )
                     .await;
@@ -6129,6 +6589,8 @@ impl DelegationBroker {
                     // Gen-1 setup still owns an inflight record; park does FWW.
                     settle_on_parent_end: false,
                     prompt_send_lease: false,
+                    prompt_may_have_executed: false,
+                    inflight_id: Some(inflight_id),
                 },
             );
         }
@@ -6179,10 +6641,13 @@ impl DelegationBroker {
                     .settle_pre_admission_failure_if_owned(
                         &call_id,
                         &child_connection_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await
@@ -6230,20 +6695,29 @@ impl DelegationBroker {
             LiveRuntimeState::honor_gate(&self.gen1_pre_send_fence_gate).await;
         }
         enum PreSendCancel {
-            Parent(ParentTurnEndReason),
+            Parent(ParentEndContext),
             External,
         }
         let pre_send_cancel = {
             let mut inner = self.pending.inner.lock().await;
             if let Some(end) = inner.inflight_parent_end(inflight_id) {
-                Some(PreSendCancel::Parent(end.reason))
+                Some(PreSendCancel::Parent(end.context))
             } else if inner.inflight_external_canceled(inflight_id) {
                 Some(PreSendCancel::External)
             } else {
                 // Claim send lease under the same lock as the cancel observe so
                 // parent-end drain can see in-flight send ownership.
-                if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
+                let inflight_prompt_owner = if let Some(coord) =
+                    inner.coordination_by_child.get_mut(&child_connection_id)
+                {
                     coord.prompt_send_lease = true;
+                    coord.prompt_may_have_executed = true;
+                    coord.inflight_id
+                } else {
+                    None
+                };
+                if let Some(id) = inflight_prompt_owner {
+                    inner.mark_inflight_prompt_may_have_executed(id);
                 }
                 None
             }
@@ -6257,7 +6731,7 @@ impl DelegationBroker {
             }
             let _ = self.spawner.disconnect(&child_connection_id).await;
             match cancel {
-                PreSendCancel::Parent(reason) => {
+                PreSendCancel::Parent(context) => {
                     if let (Some(runs), Some((child_id, _))) =
                         (self.run_store.as_ref(), prebound_child.as_ref())
                     {
@@ -6266,7 +6740,7 @@ impl DelegationBroker {
                                 runs,
                                 &call_id,
                                 *child_id,
-                                reason,
+                                context.clone(),
                                 req.agent_type,
                                 inflight_id,
                                 "parent cancel at pre-send fence before prompt",
@@ -6278,9 +6752,14 @@ impl DelegationBroker {
                             .settle_terminal(
                                 &call_id,
                                 TerminalTaskWrite::canceled(
-                                    reason.error_code(),
-                                    Utc::now(),
-                                    ConversationStatus::Cancelled,
+                                    context.durable_error_code(),
+                                    context.termination.observed_at,
+                                    context.audit(
+                                        DelegationRunStatus::Reserving,
+                                        AdmissionClass::NormalRevision,
+                                        Some(req.parent_tool_use_id.clone()),
+                                        Some(child_connection_id.clone()),
+                                    ),
                                 ),
                             )
                             .await;
@@ -6288,7 +6767,7 @@ impl DelegationBroker {
                     self.drop_inflight(inflight_id).await;
                     return parent_end_setup_report(
                         req.agent_type,
-                        reason,
+                        &context,
                         prebound_child.map(|(cid, _)| cid),
                     );
                 }
@@ -6311,10 +6790,10 @@ impl DelegationBroker {
                         let _ = runs
                             .settle_terminal(
                                 &call_id,
-                                TerminalTaskWrite::canceled(
+                                explicit_cancellation_terminal(
                                     "canceled",
-                                    Utc::now(),
-                                    ConversationStatus::Cancelled,
+                                    DelegationRunStatus::Reserving,
+                                    false,
                                 ),
                             )
                             .await;
@@ -6378,10 +6857,13 @@ impl DelegationBroker {
                         inner.unreserve(&call_id, &child_connection_id);
                         inner.deregister_inflight(inflight_id);
                     }
-                    let terminal = TerminalTaskWrite::failed(
+                    let terminal = failed_terminal(
                         "spawn_failed",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        true,
+                        AcpTerminationSource::Transport,
+                        AcpTerminationReason::TransportDisconnected,
+                        AcpTerminationClassification::Unexpected,
                     );
                     let ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
@@ -6570,9 +7052,10 @@ impl DelegationBroker {
         // terminal/cancel DID beat us we deliberately DON'T park: resolving
         // inline (never leaving an entry for a second resolver to grab) rules
         // out a double-finalize.
+        #[allow(clippy::large_enum_variant)] // Local race resolution keeps its terminal evidence by value.
         enum Disposition {
-            ChildTerminal(DelegationOutcome),
-            ParentEnded(ParentTurnEndReason),
+            ChildTerminal(ObservedTerminal),
+            ParentEnded(ParentEndContext),
             /// Sticky external cancel observed under the park lock (setup-to-
             /// running handoff). Must not insert `running` or publish start.
             ExternalCanceled,
@@ -6586,21 +7069,18 @@ impl DelegationBroker {
             // First-terminal-wins among: early complete (call_id), early cancel
             // (child connection), and admission-window buffer (connection-scoped
             // TurnComplete / disconnect / error / cancel while reserving).
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = inner.take_early_complete(&call_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = inner.take_early_complete(&call_id) {
+                consider(stamp, terminal);
             }
-            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+            if let Some((stamp, terminal)) = inner.take_early_cancel(&child_connection_id) {
                 consider(
                     stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled { reason },
-                        Some(child_conversation_id),
-                    ),
+                    terminal.with_child_identity(child_conversation_id, req.agent_type),
                 );
             }
             if let Some((stamp, terminal)) =
@@ -6608,7 +7088,7 @@ impl DelegationBroker {
             {
                 consider(
                     stamp,
-                    admission_terminal_to_outcome(terminal, child_conversation_id, req.agent_type),
+                    terminal.with_child_identity(child_conversation_id, req.agent_type),
                 );
             }
             let parent_end = inner.inflight_parent_end(inflight_id);
@@ -6624,7 +7104,7 @@ impl DelegationBroker {
                     if child_stamp < end.stamp {
                         Disposition::ChildTerminal(outcome)
                     } else {
-                        Disposition::ParentEnded(end.reason)
+                        Disposition::ParentEnded(end.context)
                     }
                 }
                 // Only a child terminal fired.
@@ -6635,7 +7115,7 @@ impl DelegationBroker {
                 // Only a parent end fired.
                 (None, Some(end)) => {
                     inner.deregister_inflight(inflight_id);
-                    Disposition::ParentEnded(end.reason)
+                    Disposition::ParentEnded(end.context)
                 }
                 // Nothing beat us — mark admission, then re-drain any terminal
                 // that landed in the admission buffer under this same lock
@@ -6673,11 +7153,9 @@ impl DelegationBroker {
                             inner.take_first_admission_terminal(&child_connection_id)
                         {
                             inner.deregister_inflight(inflight_id);
-                            Disposition::ChildTerminal(admission_terminal_to_outcome(
-                                terminal,
-                                child_conversation_id,
-                                req.agent_type,
-                            ))
+                            Disposition::ChildTerminal(
+                                terminal.with_child_identity(child_conversation_id, req.agent_type),
+                            )
                         } else {
                             inner.running.insert(
                                 call_id.clone(),
@@ -6708,8 +7186,10 @@ impl DelegationBroker {
 
         match disposition {
             // A child terminal beat registration — durable settle then return.
-            Disposition::ChildTerminal(outcome) => {
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+            Disposition::ChildTerminal(observed) => {
+                let outcome = observed.outcome;
+                let terminal = observed.terminal;
+                let result_text = observed.result_text;
                 let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
                 let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                     terminal,
@@ -6739,11 +7219,16 @@ impl DelegationBroker {
             // A parent end reached this delegation mid-setup — after the
             // prompt was sent, before we registered. Preserve the stable root
             // code (do not collapse via DelegationError::Canceled).
-            Disposition::ParentEnded(reason) => {
+            Disposition::ParentEnded(parent_end) => {
                 let terminal = TerminalTaskWrite::canceled(
-                    reason.error_code(),
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
+                    parent_end.durable_error_code(),
+                    parent_end.termination.observed_at,
+                    parent_end.audit(
+                        DelegationRunStatus::Running,
+                        AdmissionClass::NormalRevision,
+                        Some(req.parent_tool_use_id.clone()),
+                        Some(child_connection_id.clone()),
+                    ),
                 );
                 let ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
@@ -6755,8 +7240,8 @@ impl DelegationBroker {
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
                     disconnect_on_loss: true,
-                    message: Some(reason.message().to_string()),
-                    attention_resolution: reason.attention_code(),
+                    message: Some(parent_end.reason.message().to_string()),
+                    attention_resolution: parent_end.reason.attention_code(),
                     runtime: Some(runtime),
                     card_summary: None,
                 };
@@ -6767,7 +7252,9 @@ impl DelegationBroker {
             // and never return a running acknowledgement.
             Disposition::ExternalCanceled => {
                 let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let terminal =
+                    explicit_cancellation_terminal("canceled", DelegationRunStatus::Running, true);
+                let result_text = None;
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -6862,7 +7349,12 @@ impl DelegationBroker {
                 if removed {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome = canceled_outcome(child_conversation_id, "canceled before await");
-                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let terminal = explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Running,
+                        true,
+                    );
+                    let result_text = None;
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -6924,6 +7416,12 @@ impl DelegationBroker {
         // the terminal runtime snapshot uses the exact same timestamp.
         let finished_at = terminal.finished_at;
         let conversation_status = terminal.conversation_status.clone();
+        let producer_phase = terminal.termination_evidence().map(|audit| {
+            (
+                audit.prior_status.clone(),
+                audit.termination.prompt_may_have_executed,
+            )
+        });
         // Seal projector first so runtime stats writers no-op, then snapshot,
         // then settle with those stats. Do **not** set `runtime.terminal` yet —
         // mid-settle attention/reply races still need a nonterminal window
@@ -7132,6 +7630,7 @@ impl DelegationBroker {
                     observation: None,
                     last_agent_activity_at: None,
                     stalled_since: None,
+                    recovery: None,
                 };
                 {
                     let mut inner = self.pending.inner.lock().await;
@@ -7155,11 +7654,19 @@ impl DelegationBroker {
                 self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 // Preserve captured final stats for the eventual successful settle.
-                let mut retry_terminal = TerminalTaskWrite::failed(
-                    "persistence_error",
+                // Failed/canceled producers always carry typed evidence. Reuse
+                // their actual phase and sticky prompt fact; only successful
+                // completion lacks termination evidence and therefore uses the
+                // post-prompt running completion invariant.
+                let (prior_status, prompt_may_have_executed) =
+                    producer_phase.unwrap_or((DelegationRunStatus::Running, true));
+                let mut retry_terminal = persistence_error_observation(
+                    prior_status,
+                    prompt_may_have_executed,
                     Utc::now(),
-                    ConversationStatus::Cancelled,
-                );
+                    Some(ctx.child_conversation_id),
+                )
+                .terminal;
                 if let Some(stats) = final_runtime_stats {
                     retry_terminal = retry_terminal.with_runtime_stats(stats);
                 }
@@ -7793,7 +8300,7 @@ impl DelegationBroker {
             if let Some(inflight_id) = transfer_inflight_id {
                 if let Some(end) = inner.inflight_parent_end(inflight_id) {
                     inner.deregister_inflight(inflight_id);
-                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                    return Err(AdmissionFenceReject::ParentEnd(end.context));
                 }
                 if inner.inflight_external_canceled(inflight_id) {
                     inner.deregister_inflight(inflight_id);
@@ -7820,6 +8327,8 @@ impl DelegationBroker {
                     // durable-settle the handoff directly.
                     settle_on_parent_end: true,
                     prompt_send_lease: false,
+                    prompt_may_have_executed: false,
+                    inflight_id: None,
                 },
             );
             if let Some(inflight_id) = transfer_inflight_id {
@@ -7832,7 +8341,7 @@ impl DelegationBroker {
                     inner.unreserve(&handoff.task_id, &child_connection_id);
                     inner.unregister_live_run(&child_connection_id);
                     inner.deregister_inflight(inflight_id);
-                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                    return Err(AdmissionFenceReject::ParentEnd(end.context));
                 }
                 if inner.inflight_external_canceled(inflight_id) {
                     inner.unreserve(&handoff.task_id, &child_connection_id);
@@ -8188,7 +8697,75 @@ impl DelegationBroker {
             );
         }
 
-        let admitted = runs.admit_continue_reserving(admission).await;
+        let authorization = RecoveryAdmissionAuthorization {
+            authorization_id: req.recovery_authorization_id.clone(),
+            correlation_id: req
+                .correlation_id
+                .clone()
+                .or_else(|| {
+                    (!req.parent_tool_use_id.is_empty()).then(|| req.parent_tool_use_id.clone())
+                })
+                .unwrap_or_else(|| new_task_id.clone()),
+        };
+        let admitted = match runs
+            .admit_continue_reserving_authorized(admission, authorization)
+            .await
+        {
+            Ok(ContinueAdmitOutcome::AuthorizedCreated {
+                run,
+                recovery_decision,
+            }) => {
+                let projection = DelegationRecoveryProjection::from(&recovery_decision);
+                if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                    self.record_recovery_event(
+                        RecoveryMetricEventKind::Decision,
+                        Some(&run.task_id),
+                        Some(authorization_id),
+                        Some(run.parent_conversation_id),
+                        Some(run.child_conversation_id),
+                        projection.proposed_action.as_deref(),
+                        Some(&projection.cause_code),
+                        Some(&projection.risk_class),
+                        None,
+                    );
+                }
+                Ok(ContinueAdmitOutcome::Created(run))
+            }
+            other => other,
+        };
+        match &admitted {
+            Ok(ContinueAdmitOutcome::Created(run)) => {
+                if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
+                    for kind in [
+                        RecoveryMetricEventKind::ConfirmationApproved,
+                        RecoveryMetricEventKind::AuthorizationConsumed,
+                    ] {
+                        self.record_recovery_event(
+                            kind,
+                            Some(&run.task_id),
+                            Some(authorization_id),
+                            Some(run.parent_conversation_id),
+                            Some(run.child_conversation_id),
+                            Some("continue"),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+            Ok(ContinueAdmitOutcome::AuthorizedCreated { .. }) => {
+                unreachable!("authorized created outcome normalized above")
+            }
+            Err(error) => self.record_recovery_admission_error(
+                error,
+                &req.target_task_id,
+                req.parent_conversation_id,
+                Some(target.child_conversation_id),
+                "continue",
+            ),
+            Ok(ContinueAdmitOutcome::Idempotent(_)) => {}
+        }
 
         // Test-only hold: cancel between durable reserve commit and handoff
         // registration. Production is a no-op when no gate is installed.
@@ -8200,14 +8777,22 @@ impl DelegationBroker {
         // Post-reserve cancel check (does not drop the fence on None — the
         // Created path transfers it atomically into the handoff below).
         let reserved = match (admitted, self.take_inflight_cancel(inflight_id).await) {
-            (Ok(ContinueAdmitOutcome::Created(run)), Some(reason)) => {
+            (Ok(ContinueAdmitOutcome::AuthorizedCreated { .. }), _) => {
+                unreachable!("authorized created outcome normalized above")
+            }
+            (Ok(ContinueAdmitOutcome::Created(run)), Some(parent_end)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &run.task_id,
                         TerminalTaskWrite::canceled(
-                            reason.error_code(),
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            parent_end.durable_error_code(),
+                            parent_end.termination.observed_at,
+                            parent_end.audit(
+                                DelegationRunStatus::Reserving,
+                                run.admission_class.clone(),
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await
@@ -8221,7 +8806,7 @@ impl DelegationBroker {
                 return with_continuation_run_identity(
                     parent_end_setup_report(
                         run.agent_type,
-                        reason,
+                        &parent_end,
                         Some(run.child_conversation_id),
                     ),
                     &run.task_id,
@@ -8280,14 +8865,19 @@ impl DelegationBroker {
             .await
         {
             Ok(registration) => registration,
-            Err(AdmissionFenceReject::ParentEnd(reason)) => {
+            Err(AdmissionFenceReject::ParentEnd(parent_end)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
                         TerminalTaskWrite::canceled(
-                            reason.error_code(),
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            parent_end.durable_error_code(),
+                            parent_end.termination.observed_at,
+                            parent_end.audit(
+                                DelegationRunStatus::Reserving,
+                                reserved.admission_class.clone(),
+                                Some(req.parent_tool_use_id.clone()),
+                                None,
+                            ),
                         ),
                     )
                     .await
@@ -8301,7 +8891,7 @@ impl DelegationBroker {
                 return with_continuation_run_identity(
                     parent_end_setup_report(
                         reserved.agent_type,
-                        reason,
+                        &parent_end,
                         Some(reserved.child_conversation_id),
                     ),
                     &reserved.task_id,
@@ -8312,10 +8902,10 @@ impl DelegationBroker {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::canceled(
+                        explicit_cancellation_terminal(
                             "canceled",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
                         ),
                     )
                     .await
@@ -8376,10 +8966,13 @@ impl DelegationBroker {
                     .settle_pre_admission_failure_if_owned(
                         &reserved.task_id,
                         &challenger_connection_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await
@@ -8452,10 +9045,13 @@ impl DelegationBroker {
                     let _ = runs
                         .settle_terminal(
                             &reserved.task_id,
-                            TerminalTaskWrite::failed(
+                            failed_terminal(
                                 "unresumable",
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
+                                DelegationRunStatus::Reserving,
+                                false,
+                                AcpTerminationSource::Session,
+                                AcpTerminationReason::SessionLost,
+                                AcpTerminationClassification::Unexpected,
                             ),
                         )
                         .await;
@@ -8498,6 +9094,17 @@ impl DelegationBroker {
             return report;
         }
         let Some(external_id) = external_id else {
+            self.record_recovery_event(
+                RecoveryMetricEventKind::ResumeFailed,
+                Some(&reserved.task_id),
+                reserved.recovery_authorization_id.as_deref(),
+                Some(reserved.parent_conversation_id),
+                Some(reserved.child_conversation_id),
+                Some("continue"),
+                None,
+                None,
+                Some("unresumable"),
+            );
             let settle = self
                 .settle_bootstrap_unresumable(
                     &reserved.task_id,
@@ -8558,10 +9165,10 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
+                    explicit_cancellation_terminal(
                         "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        false,
                     ),
                 )
                 .await;
@@ -8599,6 +9206,17 @@ impl DelegationBroker {
         {
             Ok(id) => id,
             Err(_e) => {
+                self.record_recovery_event(
+                    RecoveryMetricEventKind::ResumeFailed,
+                    Some(&reserved.task_id),
+                    reserved.recovery_authorization_id.as_deref(),
+                    Some(reserved.parent_conversation_id),
+                    Some(reserved.child_conversation_id),
+                    Some("continue"),
+                    None,
+                    None,
+                    Some("unresumable"),
+                );
                 if let Some(report) = self
                     .continue_abort_if_handoff_closed(ContinueHandoffGate {
                         task_id: &reserved.task_id,
@@ -8673,10 +9291,10 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
+                    explicit_cancellation_terminal(
                         "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        false,
                     ),
                 )
                 .await;
@@ -8702,14 +9320,28 @@ impl DelegationBroker {
         // The admission handoff is keyed by this exact incarnation. A spawner
         // returning another id cannot safely receive the continued prompt.
         if child_connection_id != handoff.child_connection_id {
+            self.record_recovery_event(
+                RecoveryMetricEventKind::ResumeFailed,
+                Some(&reserved.task_id),
+                reserved.recovery_authorization_id.as_deref(),
+                Some(reserved.parent_conversation_id),
+                Some(reserved.child_conversation_id),
+                Some("continue"),
+                None,
+                None,
+                Some("unresumable"),
+            );
             let _ = self.spawner.disconnect(&child_connection_id).await;
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::failed(
+                    failed_terminal(
                         "unresumable",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        false,
+                        AcpTerminationSource::Session,
+                        AcpTerminationReason::SessionLost,
+                        AcpTerminationClassification::Unexpected,
                     ),
                 )
                 .await;
@@ -8738,10 +9370,13 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            false,
+                            AcpTerminationSource::Admission,
+                            AcpTerminationReason::AdmissionFailed,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await;
@@ -8783,10 +9418,10 @@ impl DelegationBroker {
             let _ = runs
                 .settle_terminal(
                     &reserved.task_id,
-                    TerminalTaskWrite::canceled(
+                    explicit_cancellation_terminal(
                         "canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Reserving,
+                        false,
                     ),
                 )
                 .await;
@@ -8864,10 +9499,13 @@ impl DelegationBroker {
                 let _ = runs
                     .settle_terminal(
                         &reserved.task_id,
-                        TerminalTaskWrite::failed(
+                        failed_terminal(
                             "spawn_failed",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
+                            DelegationRunStatus::Reserving,
+                            true,
+                            AcpTerminationSource::Transport,
+                            AcpTerminationReason::TransportDisconnected,
+                            AcpTerminationClassification::Unexpected,
                         ),
                     )
                     .await;
@@ -8982,32 +9620,36 @@ impl DelegationBroker {
             }
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.continue_pre_park_gate).await;
+        }
+
         // Gen-1 first-terminal-wins park: early_complete / early_cancel /
         // admission_buffer, then re-drain after admitted_running. Parent-end
         // already unregisters the handoff — never insert Running after that.
+        #[allow(clippy::large_enum_variant)] // Continue handoff resolution carries the complete terminal evidence.
         enum ContinueAdmissionDisposition {
-            ChildTerminal(DelegationOutcome),
+            ChildTerminal(ObservedTerminal),
             Running,
         }
         let task_preview = reserved.task_preview.clone().unwrap_or_default();
         let started_at = Instant::now();
         let (runtime, disposition) = {
             let mut inner = self.pending.inner.lock().await;
-            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+            let mut child_terminal: Option<(u64, ObservedTerminal)> = None;
+            let mut consider = |stamp: u64, terminal: ObservedTerminal| match &child_terminal {
                 Some((s, _)) if *s <= stamp => {}
-                _ => child_terminal = Some((stamp, outcome)),
+                _ => child_terminal = Some((stamp, terminal)),
             };
-            if let Some((stamp, outcome)) = inner.take_early_complete(&reserved.task_id) {
-                consider(stamp, outcome);
+            if let Some((stamp, terminal)) = inner.take_early_complete(&reserved.task_id) {
+                consider(stamp, terminal);
             }
-            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+            if let Some((stamp, terminal)) = inner.take_early_cancel(&child_connection_id) {
                 consider(
                     stamp,
-                    DelegationOutcome::from_err(
-                        DelegationError::Canceled { reason },
-                        Some(reserved.child_conversation_id),
-                    ),
+                    terminal
+                        .with_child_identity(reserved.child_conversation_id, reserved.agent_type),
                 );
             }
             if let Some((stamp, terminal)) =
@@ -9015,11 +9657,8 @@ impl DelegationBroker {
             {
                 consider(
                     stamp,
-                    admission_terminal_to_outcome(
-                        terminal,
-                        reserved.child_conversation_id,
-                        reserved.agent_type,
-                    ),
+                    terminal
+                        .with_child_identity(reserved.child_conversation_id, reserved.agent_type),
                 );
             }
             let handoff_open = inner
@@ -9029,8 +9668,27 @@ impl DelegationBroker {
                     .coordination_by_child
                     .get(&child_connection_id)
                     .is_some_and(|c| !c.admitted_running && c.task_id == reserved.task_id);
+            let closed_disposition = inner
+                .resolve_terminal_intent(&reserved.task_id)
+                .map(|intent| intent.disposition);
 
-            if let Some((_, outcome)) = child_terminal {
+            if let Some(disposition) = closed_disposition {
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                (
+                    Arc::new(LiveRuntimeState::new(
+                        accepted.prompt_accepted_at,
+                        PathBuf::new(),
+                    )),
+                    ContinueAdmissionDisposition::ChildTerminal(
+                        observed_terminal_from_handoff_disposition(
+                            &disposition,
+                            DelegationRunStatus::Running,
+                            reserved.child_conversation_id,
+                            reserved.agent_type,
+                        ),
+                    ),
+                )
+            } else if let Some((_, terminal)) = child_terminal {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
                 (
                     inner
@@ -9043,7 +9701,7 @@ impl DelegationBroker {
                                 PathBuf::new(),
                             ))
                         }),
-                    ContinueAdmissionDisposition::ChildTerminal(outcome),
+                    ContinueAdmissionDisposition::ChildTerminal(terminal),
                 )
             } else if !handoff_open {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
@@ -9052,12 +9710,30 @@ impl DelegationBroker {
                         accepted.prompt_accepted_at,
                         PathBuf::new(),
                     )),
-                    ContinueAdmissionDisposition::ChildTerminal(DelegationOutcome::from_err(
-                        DelegationError::Canceled {
-                            reason: "parent_canceled".into(),
-                        },
-                        Some(reserved.child_conversation_id),
-                    )),
+                    {
+                        let observed_at = Utc::now();
+                        let outcome = DelegationOutcome::from_err(
+                            DelegationError::Canceled {
+                                reason: "parent_canceled".into(),
+                            },
+                            Some(reserved.child_conversation_id),
+                        );
+                        ContinueAdmissionDisposition::ChildTerminal(observed_terminal_from_outcome(
+                            outcome,
+                            ParentEndContext::legacy(
+                                ParentTurnEndReason::ParentCanceled,
+                                observed_at,
+                                true,
+                            )
+                            .audit(
+                                DelegationRunStatus::Running,
+                                AdmissionClass::NormalRevision,
+                                None,
+                                Some(child_connection_id.clone()),
+                            ),
+                            observed_at,
+                        ))
+                    },
                 )
             } else {
                 if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
@@ -9089,8 +9765,7 @@ impl DelegationBroker {
                     inner.unreserve(&reserved.task_id, &child_connection_id);
                     (
                         runtime,
-                        ContinueAdmissionDisposition::ChildTerminal(admission_terminal_to_outcome(
-                            terminal,
+                        ContinueAdmissionDisposition::ChildTerminal(terminal.with_child_identity(
                             reserved.child_conversation_id,
                             reserved.agent_type,
                         )),
@@ -9130,7 +9805,7 @@ impl DelegationBroker {
             }
         };
 
-        if let ContinueAdmissionDisposition::ChildTerminal(outcome) = disposition {
+        if let ContinueAdmissionDisposition::ChildTerminal(observed) = disposition {
             // Prefer durable parent-end settlement if it already won.
             if let Ok(Some(existing)) = runs.load_by_task_id(&reserved.task_id).await {
                 use crate::db::entities::delegation_task_run::DelegationRunStatus;
@@ -9148,7 +9823,9 @@ impl DelegationBroker {
                     return continue_idempotent_ack(&existing, req.target_task_id);
                 }
             }
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let outcome = observed.outcome;
+            let terminal = observed.terminal;
+            let result_text = observed.result_text;
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
             let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
                 terminal,
@@ -9250,7 +9927,12 @@ impl DelegationBroker {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
                     let outcome =
                         canceled_outcome(reserved.child_conversation_id, "canceled before await");
-                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let terminal = explicit_cancellation_terminal(
+                        "canceled",
+                        DelegationRunStatus::Running,
+                        true,
+                    );
+                    let result_text = None;
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
                         parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -9337,6 +10019,7 @@ impl DelegationBroker {
                             inner.coordination_by_child.get_mut(handoff_connection_id)
                         {
                             coord.prompt_send_lease = true;
+                            coord.prompt_may_have_executed = true;
                         }
                     }
                     open
@@ -9386,6 +10069,7 @@ impl DelegationBroker {
             if open && !terminal && claim_prompt_send {
                 if let Some(coord) = inner.coordination_by_child.get_mut(handoff_connection_id) {
                     coord.prompt_send_lease = true;
+                    coord.prompt_may_have_executed = true;
                 }
             }
             open
@@ -9544,7 +10228,7 @@ impl DelegationBroker {
         );
         let mut report = parent_end_setup_report(
             agent_type,
-            ParentTurnEndReason::ParentCanceled,
+            ParentEndContext::legacy(ParentTurnEndReason::ParentCanceled, Utc::now(), true),
             Some(child_conversation_id),
         );
         report.task_id = Some(task_id.to_string());
@@ -9833,7 +10517,21 @@ impl DelegationBroker {
             message: wire_message.clone(),
             child_conversation_id: Some(child_conversation_id),
         };
-        let (terminal, _) = terminal_from_outcome(&outcome);
+        let observed_at = Utc::now();
+        let observed = observed_terminal_from_outcome(
+            outcome.clone(),
+            termination_audit(
+                AcpTerminationSource::Admission,
+                AcpTerminationReason::AdmissionFailed,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Reserving,
+                true,
+                None,
+                observed_at,
+            ),
+            observed_at,
+        );
+        let terminal = observed.terminal.clone();
 
         // 1) Claim local first-terminal disposition (insert-if-absent).
         // On Occupied: report from existing TerminalIntent / durable truth —
@@ -9903,7 +10601,7 @@ impl DelegationBroker {
                     return PostAcceptPromoteResult::Failed(report);
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(observed.clone()));
                     true
                 }
             }
@@ -10027,6 +10725,11 @@ impl DelegationBroker {
                         agent_type,
                         child_conversation_id,
                     );
+                    let adopted_observed = ObservedTerminal {
+                        outcome: adopted_outcome.clone(),
+                        terminal: existing.terminal.clone(),
+                        result_text: None,
+                    };
                     // Align disposition + overlay from the **full** TerminalTaskWrite
                     // only while retry ownership is still live and finalize has not
                     // already installed a terminal overlay. Do not invent
@@ -10044,7 +10747,7 @@ impl DelegationBroker {
                         } else {
                             inner.closed_handoff_dispositions.insert(
                                 task_id.to_string(),
-                                ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
+                                ReservingHandoffDisposition::ChildTerminal(adopted_observed),
                             );
                             let completed = build_completed(
                                 parent_connection_id,
@@ -10600,18 +11303,29 @@ impl DelegationBroker {
         let stable_message = sanitize_bootstrap_unresumable_message(&raw_message);
         let outcome =
             DelegationOutcome::from_err(DelegationError::Unresumable(stable_message), None);
-        let (terminal, _) = terminal_from_outcome(&outcome);
+        let observed_at = Utc::now();
+        let observed = observed_terminal_from_outcome(
+            outcome.clone(),
+            termination_audit(
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Reserving,
+                false,
+                None,
+                observed_at,
+            ),
+            observed_at,
+        );
+        let terminal = observed.terminal.clone();
 
         // Test-only / no durable store: buffer admission-window outcome.
         if self.run_store.is_none() {
             let mut inner = self.pending.inner.lock().await;
             if let Some(conn) = child_connection_id {
-                let _ = inner.buffer_admission_window_terminal(
-                    conn,
-                    AdmissionWindowTerminal::Outcome(outcome.clone()),
-                );
+                let _ = inner.buffer_admission_window_terminal(conn, observed.clone());
             }
-            inner.buffer_early_complete(task_id, outcome);
+            inner.buffer_early_complete(task_id, observed);
             return BootstrapSettleResult::Won;
         }
 
@@ -10651,7 +11365,7 @@ impl DelegationBroker {
                         .await;
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(observed.clone()));
                     if let Some(ref id) = overlay_identity {
                         inner.insert_completed(
                             task_id,
@@ -10899,6 +11613,24 @@ impl DelegationBroker {
         }
 
         let persistence_message = bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
+        let retry_evidence = self
+            .task_store
+            .get_retry(task_id)
+            .await
+            .and_then(|retry| retry.terminal.termination_evidence().cloned());
+        let prior_status = retry_evidence
+            .as_ref()
+            .map(|audit| audit.prior_status.clone())
+            .unwrap_or(DelegationRunStatus::Running);
+        let prompt_may_have_executed = retry_evidence
+            .as_ref()
+            .is_some_and(|audit| audit.termination.prompt_may_have_executed);
+        let persistence_observed = persistence_error_observation(
+            prior_status,
+            prompt_may_have_executed,
+            Utc::now(),
+            accounting.map(|a| a.child_conversation_id),
+        );
 
         // Critical section: durable_cas free → take permanent_pe_claim, park,
         // re-read durable, (optionally test-gate), re-check durable + claim fence.
@@ -10941,19 +11673,15 @@ impl DelegationBroker {
             // payloads alongside unresumable / persistence_error.
             let is_same_owner = matches!(
                 inner.closed_handoff_dispositions.get(task_id),
-                Some(ReservingHandoffDisposition::ChildTerminal(
-                    DelegationOutcome::Err { code, .. }
-                )) if is_same_owner_intended_error_code(code)
+                Some(ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                    outcome: DelegationOutcome::Err { code, .. },
+                    ..
+                })) if is_same_owner_intended_error_code(code)
             );
             if is_same_owner {
-                let child_conversation_id = accounting.map(|a| a.child_conversation_id);
                 inner.closed_handoff_dispositions.insert(
                     task_id.to_string(),
-                    ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                        code: "persistence_error".into(),
-                        message: persistence_message.clone(),
-                        child_conversation_id,
-                    }),
+                    ReservingHandoffDisposition::ChildTerminal(persistence_observed.clone()),
                 );
             }
             // Upgrade process-local overlay when it is our business refuse or
@@ -11084,8 +11812,11 @@ impl DelegationBroker {
             should_record
         };
 
-        // Keep original retry payload ownership, freeze it (no worker spin).
-        self.task_store.freeze_retry(task_id).await;
+        // Preserve the same producer-authored persistence payload in the park
+        // and frozen retry record (no worker spin).
+        self.task_store
+            .replace_retry_and_freeze(task_id, persistence_observed.terminal.clone())
+            .await;
         if should_record {
             // Once-only: parent-end may later durable-win the parked
             // ChildTerminal(persistence_error) and must not re-count.
@@ -11163,6 +11894,7 @@ impl DelegationBroker {
         &self,
         task_id: &str,
         fallback: ReservingHandoffDisposition,
+        prior_status: DelegationRunStatus,
     ) -> (ReservingHandoffDisposition, TerminalTaskWrite) {
         loop {
             let mut inner = self.pending.inner.lock().await;
@@ -11207,11 +11939,12 @@ impl DelegationBroker {
                         .resolve_terminal_intent(task_id)
                         .map(|intent| intent.disposition)
                         .unwrap_or_else(|| fallback.clone());
-                    let terminal = terminal_from_handoff_disposition(&disposition);
+                    let terminal =
+                        terminal_from_handoff_disposition(&disposition, prior_status.clone());
                     return (disposition, terminal);
                 }
             }
-            let terminal = terminal_from_handoff_disposition(&disposition);
+            let terminal = terminal_from_handoff_disposition(&disposition, prior_status.clone());
             return (disposition, terminal);
         }
     }
@@ -11484,6 +12217,7 @@ impl DelegationBroker {
                             observation: None,
                             last_agent_activity_at: None,
                             stalled_since: None,
+                            recovery: None,
                         };
                         if report.agent_type.is_none() {
                             report.agent_type = Some(agent_type);
@@ -11534,17 +12268,20 @@ impl DelegationBroker {
         child_connection_id: &str,
         outcome: DelegationOutcome,
     ) {
+        let observed_at = Utc::now();
         // Admission-window buffer: connection registered, not yet promote_running.
         {
             let mut inner = self.pending.inner.lock().await;
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
-                    // Preserve the full outcome (refusal / max_tokens /
-                    // unresumable / Ok / canceled) so drain keeps wire codes.
-                    let _ = inner.buffer_admission_window_terminal(
-                        child_connection_id,
-                        AdmissionWindowTerminal::Outcome(outcome),
+                    let prompt_may_have_executed = coord.prompt_may_have_executed;
+                    let observed = observe_child_outcome(
+                        outcome,
+                        DelegationRunStatus::Reserving,
+                        prompt_may_have_executed,
+                        observed_at,
                     );
+                    let _ = inner.buffer_admission_window_terminal(child_connection_id, observed);
                     return;
                 }
                 // Fence: event connection must match registered incarnation.
@@ -11588,7 +12325,11 @@ impl DelegationBroker {
                 }
             }
         };
-        self.complete_call(&task_id, outcome).await;
+        self.complete_call_observed(
+            &task_id,
+            observe_child_outcome(outcome, DelegationRunStatus::Running, true, observed_at),
+        )
+        .await;
     }
 
     /// Called by the child-session lifecycle subscriber on `TurnComplete`
@@ -11610,6 +12351,15 @@ impl DelegationBroker {
     /// Prefer [`Self::complete_call_for_connection`] from lifecycle so continued
     /// runs settle by active task id rather than conversation root call id.
     pub async fn complete_call(&self, call_id: &str, outcome: DelegationOutcome) {
+        let observed_at = Utc::now();
+        self.complete_call_observed(
+            call_id,
+            observe_child_outcome(outcome, DelegationRunStatus::Running, true, observed_at),
+        )
+        .await;
+    }
+
+    async fn complete_call_observed(&self, call_id: &str, observed: ObservedTerminal) {
         let task = {
             let mut inner = self.pending.inner.lock().await;
             match inner.running.remove(call_id) {
@@ -11661,13 +12411,23 @@ impl DelegationBroker {
                         "[delegation] complete_call: not in running — buffer early complete \
                          if reserved, else no-op"
                     );
-                    inner.buffer_early_complete(call_id, outcome.clone());
+                    let observed_at = observed.terminal.finished_at;
+                    inner.buffer_early_complete(
+                        call_id,
+                        observe_child_outcome(
+                            observed.outcome.clone(),
+                            DelegationRunStatus::Reserving,
+                            true,
+                            observed_at,
+                        ),
+                    );
                     None
                 }
             }
         };
         if let Some((task, duration_ms)) = task {
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let terminal = observed.terminal;
+            let result_text = observed.result_text;
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
@@ -11858,6 +12618,10 @@ impl DelegationBroker {
     /// 2. if no setup was marked, buffer the handle in `pre_canceled_handles`
     ///    for entry-side observation (cancel before inflight registration).
     pub async fn cancel_by_external_handle(&self, external_handle: &str, reason: String) {
+        let observed_at = Utc::now();
+        let termination =
+            explicit_cancellation_audit(DelegationRunStatus::Running, true, observed_at)
+                .termination;
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             let keys: Vec<String> = inner
@@ -11882,7 +12646,8 @@ impl DelegationBroker {
             return;
         }
         // A turn is in flight, so cancel + disconnect after durable settle.
-        self.settle_drained_canceled(drained, &reason, true).await;
+        self.settle_drained_canceled(drained, &reason, true, termination)
+            .await;
     }
 
     /// Resolve the pending delegation whose child matches
@@ -11903,29 +12668,36 @@ impl DelegationBroker {
         child_connection_id: &str,
         terminal_error: Option<&str>,
     ) {
+        let observed_at = Utc::now();
         let reason = child_canceled_reason(terminal_error);
+        let outcome = DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: reason.clone(),
+            },
+            None,
+        );
+        let running_termination = AcpTerminationSummaryV1::new(
+            AcpTerminationSource::ChildConnection,
+            AcpTerminationReason::ChildTerminal,
+            AcpTerminationClassification::Unexpected,
+            true,
+            observed_at,
+        );
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             // Admission window: buffer disconnect/error while still reserving.
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
-                    let terminal = match terminal_error {
-                        Some(detail) => {
-                            AdmissionWindowTerminal::Outcome(DelegationOutcome::from_err(
-                                DelegationError::Canceled {
-                                    reason: child_canceled_reason(Some(detail)),
-                                },
-                                None,
-                            ))
-                        }
-                        None => AdmissionWindowTerminal::Disconnect { detail: None },
-                    };
-                    let _ = inner.buffer_admission_window_terminal(child_connection_id, terminal);
-                    // Also keep the classic early-cancel buffer for park drain.
-                    inner.buffer_child_failure(
-                        child_connection_id,
-                        terminal_error.map(|s| s.to_string()),
+                    let terminal = observe_child_outcome(
+                        outcome.clone(),
+                        DelegationRunStatus::Reserving,
+                        coord.prompt_may_have_executed,
+                        observed_at,
                     );
+                    let _ = inner
+                        .buffer_admission_window_terminal(child_connection_id, terminal.clone());
+                    // Also keep the classic early-cancel buffer for park drain.
+                    inner.buffer_child_failure(child_connection_id, terminal);
                     return;
                 }
                 // Fence: only settle if this connection is the registered incarnation.
@@ -11964,7 +12736,12 @@ impl DelegationBroker {
                     // registration instead of no-oping.
                     inner.buffer_child_failure(
                         child_connection_id,
-                        terminal_error.map(|s| s.to_string()),
+                        observe_child_outcome(
+                            outcome.clone(),
+                            DelegationRunStatus::Reserving,
+                            true,
+                            observed_at,
+                        ),
                     );
                 }
                 Vec::new()
@@ -11973,7 +12750,8 @@ impl DelegationBroker {
             }
         };
         // Child already disconnected/errored — disconnect-only after settle.
-        self.settle_drained_canceled(drained, &reason, false).await;
+        self.settle_drained_canceled(drained, &reason, false, running_termination)
+            .await;
         {
             let mut inner = self.pending.inner.lock().await;
             inner.unregister_live_run(child_connection_id);
@@ -11987,34 +12765,38 @@ impl DelegationBroker {
     /// since those connections are going away. Runs fully inline — the
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
+        let context =
+            ParentEndContext::legacy(ParentTurnEndReason::ParentDisconnected, Utc::now(), true);
+        self.cancel_by_parent_with_context(parent_connection_id, context)
+            .await;
+    }
+
+    pub(crate) async fn cancel_by_parent_with_context(
+        &self,
+        parent_connection_id: &str,
+        context: ParentEndContext,
+    ) {
+        debug_assert_eq!(context.reason, ParentTurnEndReason::ParentDisconnected);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(
-                parent_connection_id,
-                ParentTurnEndReason::ParentDisconnected,
-                false,
-            )
+            .drain_parent_tree(parent_connection_id, &context, false)
             .await;
         // Reserving handoffs settle inline before running teardown so a later
         // bootstrap refuse cannot relabel parent_disconnected → unresumable.
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(
-            reserving,
-            ParentTurnEndReason::ParentDisconnected,
-        )
-        .await;
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
+            .await;
         // Durable non-terminal runs (post-reserve, pre-handoff) settle even
         // when no in-memory coordination entry exists yet. Exclude task ids
         // already owned by reserving-handoff or drained-running settlement so
         // this DB-only path cannot steal their CAS win and skip side effects.
         self.settle_durable_non_terminal_for_parent_end(
             parent_conversation_ids,
-            ParentTurnEndReason::ParentDisconnected,
+            &context,
             &exclude,
         )
         .await;
-        self.settle_drained_for_parent_end(drained, ParentTurnEndReason::ParentDisconnected)
-            .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Cascade-cancel every live descendant under `parent_connection_id` for a
@@ -12046,18 +12828,19 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         // Pre-bootstrap handoffs have no running entry: settle them *inline*
         // before returning so a sequential later refuse cannot win unresumable
         // over parent_canceled. Running-task teardown stays backgrounded.
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
         if !reserving.is_empty() {
-            self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+            self.settle_reserving_handoffs_for_parent_end(reserving, &context)
                 .await;
         }
         // Durable non-terminal runs must settle even when the in-memory maps
@@ -12065,7 +12848,7 @@ impl DelegationBroker {
         if !parent_conversation_ids.is_empty() {
             self.settle_durable_non_terminal_for_parent_end(
                 parent_conversation_ids,
-                reason,
+                &context,
                 &exclude,
             )
             .await;
@@ -12077,7 +12860,9 @@ impl DelegationBroker {
         // turn); background only the slow child teardown.
         let broker = self.clone();
         tokio::spawn(async move {
-            broker.settle_drained_for_parent_end(drained, reason).await;
+            broker
+                .settle_drained_for_parent_end(drained, &context)
+                .await;
         });
     }
 
@@ -12091,16 +12876,21 @@ impl DelegationBroker {
         reason: ParentTurnEndReason,
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason, &exclude)
-            .await;
-        self.settle_drained_for_parent_end(drained, reason).await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            &context,
+            &exclude,
+        )
+        .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Fast, lock-guarded part of a parent end: BFS the full descendant tree
@@ -12129,7 +12919,7 @@ impl DelegationBroker {
     async fn drain_parent_tree(
         &self,
         parent_connection_id: &str,
-        reason: ParentTurnEndReason,
+        context: &ParentEndContext,
         keep_consumed: bool,
     ) -> (
         Vec<(String, RunningTask, u64)>,
@@ -12151,7 +12941,7 @@ impl DelegationBroker {
                 if !visited.insert(conn_id.clone()) {
                     continue;
                 }
-                let parent_end_stamp = inner.mark_inflight_canceled_for_parent(&conn_id, reason);
+                let parent_end_stamp = inner.mark_inflight_canceled_for_parent(&conn_id, context);
 
                 // Coordination identities exist before running registration, so
                 // include their child connections in the traversal even during
@@ -12177,7 +12967,7 @@ impl DelegationBroker {
                 // handoffs that have setups+live/coord but no inflight.
                 reserving_handoffs.extend(inner.take_reserving_handoffs_for_parent_end(
                     &conn_id,
-                    reason,
+                    context,
                     parent_end_stamp,
                 ));
 
@@ -12247,17 +13037,22 @@ impl DelegationBroker {
     async fn settle_drained_for_parent_end(
         &self,
         drained: Vec<(String, RunningTask, u64)>,
-        reason: ParentTurnEndReason,
+        parent_end: &ParentEndContext,
     ) {
         for (task_id, task, duration_ms) in drained {
             let terminal = TerminalTaskWrite::canceled(
-                reason.error_code(),
-                Utc::now(),
-                ConversationStatus::Cancelled,
+                parent_end.durable_error_code(),
+                parent_end.termination.observed_at,
+                parent_end.audit(
+                    DelegationRunStatus::Running,
+                    AdmissionClass::NormalRevision,
+                    Some(task.parent_tool_use_id.clone()),
+                    Some(task.child_connection_id.clone()),
+                ),
             );
             let mut context = SettleContext::from_running(&task, duration_ms, true);
-            context.message = Some(reason.message().to_string());
-            context.attention_resolution = reason.attention_code();
+            context.message = Some(parent_end.reason.message().to_string());
+            context.attention_resolution = parent_end.reason.attention_code();
             self.settle_task(&task_id, terminal, None, context).await;
         }
     }
@@ -12272,7 +13067,7 @@ impl DelegationBroker {
     async fn settle_reserving_handoffs_for_parent_end(
         &self,
         handoffs: Vec<ReservingHandoffEnd>,
-        fallback_reason: ParentTurnEndReason,
+        fallback: &ParentEndContext,
     ) {
         let Some(runs) = self.run_store.as_ref() else {
             return;
@@ -12281,7 +13076,11 @@ impl DelegationBroker {
             // Serialize claim selection with permanent PE finalize: re-read
             // disposition immediately before CAS under durable_cas_claim.
             let (disposition, terminal) = self
-                .take_parent_end_cas_selection(&handoff.task_id, handoff.disposition.clone())
+                .take_parent_end_cas_selection(
+                    &handoff.task_id,
+                    handoff.disposition.clone(),
+                    DelegationRunStatus::Reserving,
+                )
                 .await;
             match runs.settle_terminal(&handoff.task_id, terminal).await {
                 Ok(settlement) => {
@@ -12327,7 +13126,7 @@ impl DelegationBroker {
                             task_id = %handoff.task_id,
                             child_connection_id = %handoff.child_connection_id,
                             child_conversation_id = handoff.child_conversation_id,
-                            reason = fallback_reason.error_code(),
+                            reason = fallback.durable_error_code(),
                             "[delegation] reserving handoff settled on parent end"
                         );
                     } else {
@@ -12363,7 +13162,7 @@ impl DelegationBroker {
     async fn settle_durable_non_terminal_for_parent_end(
         &self,
         parent_conversation_ids: HashSet<i32>,
-        reason: ParentTurnEndReason,
+        parent_end: &ParentEndContext,
         exclude_task_ids: &HashSet<String>,
     ) {
         let Some(runs) = self.run_store.as_ref() else {
@@ -12404,7 +13203,7 @@ impl DelegationBroker {
                     tracing::info!(
                         task_id = %row.task_id,
                         parent_conversation_id,
-                        reason = reason.error_code(),
+                        reason = parent_end.durable_error_code(),
                         "[delegation] durable non-terminal skip pure gen1 reserving; inflight owns compensate"
                     );
                     continue;
@@ -12412,9 +13211,13 @@ impl DelegationBroker {
                 // Honor process-local bootstrap (or other) claim: never invent
                 // parent_canceled over an earlier ChildTerminal park. Claim
                 // selection is serialized with permanent PE finalize.
-                let fallback = ReservingHandoffDisposition::ParentEnded(reason);
+                let prior_status = row.run_status.clone();
+                let prompt_may_have_executed = matches!(prior_status, DelegationRunStatus::Running);
+                let fallback = ReservingHandoffDisposition::ParentEnded(
+                    parent_end.with_prompt_may_have_executed(prompt_may_have_executed),
+                );
                 let (claimed, terminal) = self
-                    .take_parent_end_cas_selection(&row.task_id, fallback)
+                    .take_parent_end_cas_selection(&row.task_id, fallback, prior_status)
                     .await;
                 match runs.settle_terminal(&row.task_id, terminal).await {
                     Ok(settlement) => {
@@ -12442,7 +13245,7 @@ impl DelegationBroker {
                             tracing::info!(
                                 task_id = %row.task_id,
                                 parent_conversation_id,
-                                reason = reason.error_code(),
+                                reason = parent_end.durable_error_code(),
                                 "[delegation] durable non-terminal settled on parent end"
                             );
                         } else {
@@ -12475,14 +13278,25 @@ impl DelegationBroker {
         drained: Vec<(String, RunningTask, u64)>,
         reason: &str,
         cancel_turn: bool,
+        termination: AcpTerminationSummaryV1,
     ) {
         for (task_id, task, duration_ms) in drained {
             let outcome = canceled_outcome(task.child_conversation_id, reason);
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let terminal = TerminalTaskWrite::canceled(
+                "canceled",
+                termination.observed_at,
+                DelegationTerminationAuditV1::new(
+                    termination.clone(),
+                    DelegationRunStatus::Running,
+                    AdmissionClass::NormalRevision,
+                    Some(task.parent_tool_use_id.clone()),
+                    Some(task.child_connection_id.clone()),
+                ),
+            );
             let mut ctx = SettleContext::from_running(&task, duration_ms, cancel_turn);
             let (_, _, _, message) = terminal_fields(&outcome);
             ctx.message = message;
-            self.settle_task(&task_id, terminal, result_text, ctx).await;
+            self.settle_task(&task_id, terminal, None, ctx).await;
         }
     }
 
@@ -12510,16 +13324,21 @@ impl DelegationBroker {
             self.cancel_by_parent(parent_connection_id).await;
             return;
         }
+        let context = ParentEndContext::legacy(reason, Utc::now(), true);
         self.clear_mandatory_profile_routes(parent_connection_id);
         let (drained, reserving, parent_conversation_ids, settling) = self
-            .drain_parent_tree(parent_connection_id, reason, true)
+            .drain_parent_tree(parent_connection_id, &context, true)
             .await;
         let exclude = parent_end_broker_settled_task_ids(&drained, &reserving, &settling);
-        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+        self.settle_reserving_handoffs_for_parent_end(reserving, &context)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason, &exclude)
-            .await;
-        self.settle_drained_for_parent_end(drained, reason).await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            &context,
+            &exclude,
+        )
+        .await;
+        self.settle_drained_for_parent_end(drained, &context).await;
     }
 
     /// Test-only: hold `continue_delegation` after durable reserve commit and
@@ -12560,6 +13379,19 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.continue_post_note_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold after the last closed-handoff check and before park.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_continue_pre_park_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.continue_pre_park_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -12619,6 +13451,20 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.gen1_post_admit_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold immediately before setup checkpoint #1 after durable
+    /// admission and its earlier cancel fences have completed.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_before_spawn_checkpoint_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_before_spawn_checkpoint_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -12769,7 +13615,7 @@ impl DelegationBroker {
         parent_connection_id: &str,
         parent_conversation_id: Option<i32>,
         task_ids: &[String],
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<Option<&'static str>>) {
         let matches = {
             let inner = self.pending.inner.lock().await;
             task_ids
@@ -12784,15 +13630,18 @@ impl DelegationBroker {
         };
 
         let mut resolved = Vec::with_capacity(task_ids.len());
+        let mut unknown_causes = Vec::with_capacity(task_ids.len());
         for (requested, matched) in task_ids.iter().zip(matches) {
-            let canonical = match matched {
-                StatusTaskIdMatch::Unique(canonical) => Some(canonical),
-                StatusTaskIdMatch::Exact | StatusTaskIdMatch::Ambiguous => None,
+            let (canonical, unknown_cause) = match matched {
+                StatusTaskIdMatch::Unique(canonical) => (Some(canonical), None),
+                StatusTaskIdMatch::Exact => (None, None),
+                StatusTaskIdMatch::Ambiguous => (None, Some("prefix_ambiguous")),
                 StatusTaskIdMatch::None => {
                     let (Some(parent_id), Some(prefix)) =
                         (parent_conversation_id, recovery_task_id_prefix(requested))
                     else {
                         resolved.push(requested.clone());
+                        unknown_causes.push(None);
                         continue;
                     };
                     let exact_exists = match self.task_store.load(requested).await {
@@ -12802,37 +13651,22 @@ impl DelegationBroker {
                             .find_by_call_id(requested)
                             .await
                             .is_some(),
-                        Err(error) => {
-                            tracing::warn!(
-                                parent_connection_id,
-                                parent_conversation_id = parent_id,
-                                requested_task_id = %requested,
-                                error = %error,
-                                "[delegation] exact task lookup failed; prefix recovery skipped"
-                            );
+                        Err(_) => {
                             resolved.push(requested.clone());
+                            unknown_causes.push(Some("store_error"));
                             continue;
                         }
                     };
                     if exact_exists {
-                        None
+                        (None, None)
                     } else {
                         match self
                             .task_store
                             .resolve_unique_owned_prefix(parent_id, &prefix)
                             .await
                         {
-                            Ok(canonical) => canonical,
-                            Err(error) => {
-                                tracing::warn!(
-                                    parent_connection_id,
-                                    parent_conversation_id = parent_id,
-                                    requested_task_id = %requested,
-                                    error = %error,
-                                    "[delegation] task prefix lookup failed"
-                                );
-                                None
-                            }
+                            Ok(canonical) => (canonical, None),
+                            Err(_) => (None, Some("store_error")),
                         }
                     }
                 }
@@ -12841,7 +13675,6 @@ impl DelegationBroker {
                 tracing::warn!(
                     parent_connection_id,
                     parent_conversation_id,
-                    requested_task_id = %requested,
                     canonical_task_id = %canonical,
                     "[delegation] recovered status task id from unique prefix"
                 );
@@ -12849,8 +13682,28 @@ impl DelegationBroker {
             } else {
                 resolved.push(requested.clone());
             }
+            unknown_causes.push(unknown_cause);
         }
-        resolved
+        (resolved, unknown_causes)
+    }
+
+    fn classify_status_task_ids(
+        inner: &PendingInner,
+        parent_connection_id: &str,
+        task_ids: &[String],
+        unknown_causes: &[Option<&'static str>],
+    ) -> Vec<StatusClass> {
+        task_ids
+            .iter()
+            .zip(unknown_causes)
+            .map(|(task_id, cause)| match cause {
+                Some(reason) => StatusClass::Unknown {
+                    report: unknown_report(task_id),
+                    reason,
+                },
+                None => classify_locked(inner, parent_connection_id, task_id),
+            })
+            .collect()
     }
 
     /// Backs the batch `get_delegation_status` tool. Resolves the status of one
@@ -12885,7 +13738,7 @@ impl DelegationBroker {
         if task_ids.is_empty() {
             return Vec::new();
         }
-        let resolved_task_ids = self
+        let (resolved_task_ids, unknown_causes) = self
             .resolve_status_task_ids(parent_connection_id, parent_conversation_id, task_ids)
             .await;
         let task_ids = resolved_task_ids.as_slice();
@@ -12919,10 +13772,12 @@ impl DelegationBroker {
 
             let classes: Vec<StatusClass> = {
                 let inner = self.pending.inner.lock().await;
-                task_ids
-                    .iter()
-                    .map(|id| classify_locked(&inner, parent_connection_id, id))
-                    .collect()
+                Self::classify_status_task_ids(
+                    &inner,
+                    parent_connection_id,
+                    task_ids,
+                    &unknown_causes,
+                )
             };
             // Park only on live in-memory Running (running ∪ settling). Any
             // NotInMemory/Settled id forces an immediate return of the assemble
@@ -13127,15 +13982,17 @@ impl DelegationBroker {
                 if task_ids.is_empty() {
                     return StatusWaitPreflight::Ready(DelegationStatusBatch::legacy(Vec::new()));
                 }
-                let resolved = self
+                let (resolved, unknown_causes) = self
                     .resolve_status_task_ids(parent_connection_id, parent_conversation_id, task_ids)
                     .await;
                 let classes = {
                     let inner = self.pending.inner.lock().await;
-                    resolved
-                        .iter()
-                        .map(|id| classify_locked(&inner, parent_connection_id, id))
-                        .collect::<Vec<_>>()
+                    Self::classify_status_task_ids(
+                        &inner,
+                        parent_connection_id,
+                        &resolved,
+                        &unknown_causes,
+                    )
                 };
                 let can_park = all_live_running(&classes);
                 let reports = self
@@ -13165,7 +14022,7 @@ impl DelegationBroker {
                         Vec::new(),
                     ));
                 }
-                let resolved = self
+                let (resolved, unknown_causes) = self
                     .resolve_status_task_ids(
                         parent_connection_id,
                         Some(parent_conversation_id),
@@ -13173,7 +14030,12 @@ impl DelegationBroker {
                     )
                     .await;
                 match self
-                    .evaluate_join_snapshot(parent_connection_id, parent_conversation_id, &resolved)
+                    .evaluate_join_snapshot_resolved(
+                        parent_connection_id,
+                        parent_conversation_id,
+                        &resolved,
+                        &unknown_causes,
+                    )
                     .await
                 {
                     JoinEvaluation::Ready(batch) => StatusWaitPreflight::Ready(batch),
@@ -13191,16 +14053,28 @@ impl DelegationBroker {
         parent_conversation_id: i32,
         task_ids: &[String],
     ) -> JoinEvaluation {
-        let resolved_task_ids = self
+        let (resolved_task_ids, unknown_causes) = self
             .resolve_status_task_ids(parent_connection_id, Some(parent_conversation_id), task_ids)
             .await;
-        let task_ids = resolved_task_ids.as_slice();
+        self.evaluate_join_snapshot_resolved(
+            parent_connection_id,
+            parent_conversation_id,
+            &resolved_task_ids,
+            &unknown_causes,
+        )
+        .await
+    }
+
+    async fn evaluate_join_snapshot_resolved(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+        task_ids: &[String],
+        unknown_causes: &[Option<&'static str>],
+    ) -> JoinEvaluation {
         let classes = {
             let inner = self.pending.inner.lock().await;
-            task_ids
-                .iter()
-                .map(|id| classify_locked(&inner, parent_connection_id, id))
-                .collect::<Vec<_>>()
+            Self::classify_status_task_ids(&inner, parent_connection_id, task_ids, unknown_causes)
         };
         let class_views = classes.clone();
         let tasks = self
@@ -13275,6 +14149,10 @@ impl DelegationBroker {
         for (id, class) in task_ids.iter().zip(classes) {
             let report = match class {
                 StatusClass::Settled(report) => report,
+                StatusClass::Unknown { report, reason } => {
+                    self.metrics.record_recovery_lookup_unknown(reason);
+                    report
+                }
                 StatusClass::Running {
                     mut report,
                     child_connection_id,
@@ -13293,6 +14171,15 @@ impl DelegationBroker {
                     report
                 }
             };
+            let mut report = report;
+            if report.status != TaskStatus::Unknown {
+                if let Some(run_store) = &self.run_store {
+                    match run_store.recovery_projection_for_task(id).await {
+                        Ok(projection) => report.recovery = projection,
+                        Err(_) => self.metrics.record_recovery_lookup_unknown("store_error"),
+                    }
+                }
+            }
             out.push(report);
         }
         out
@@ -13353,6 +14240,30 @@ impl DelegationBroker {
         task_id: &str,
         reason: &str,
     ) -> DelegationTaskReport {
+        let observed_at = Utc::now();
+        let termination =
+            explicit_cancellation_audit(DelegationRunStatus::Running, true, observed_at)
+                .termination;
+        self.cancel_task_by_id_with_termination(
+            parent_connection_id,
+            parent_conversation_id,
+            task_id,
+            reason,
+            termination,
+        )
+        .await
+    }
+
+    /// Internal producer-authored cancellation boundary. `reason` remains the
+    /// durable/wire error code; typed evidence is never derived from it.
+    pub async fn cancel_task_by_id_with_termination(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_id: &str,
+        reason: &str,
+        termination: AcpTerminationSummaryV1,
+    ) -> DelegationTaskReport {
         let drained = {
             let mut inner = self.pending.inner.lock().await;
             if let Some(c) = inner.completed.get(task_id) {
@@ -13380,7 +14291,22 @@ impl DelegationBroker {
         match drained {
             Some((_id, task, duration_ms)) => {
                 let outcome = canceled_outcome(task.child_conversation_id, reason);
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let terminal_code = match &outcome {
+                    DelegationOutcome::Err { code, .. } => code.clone(),
+                    DelegationOutcome::Ok(_) => unreachable!("canceled outcome must be an error"),
+                };
+                let terminal = TerminalTaskWrite::canceled(
+                    terminal_code,
+                    termination.observed_at,
+                    DelegationTerminationAuditV1::new(
+                        termination,
+                        DelegationRunStatus::Running,
+                        AdmissionClass::NormalRevision,
+                        Some(task.parent_tool_use_id.clone()),
+                        Some(task.child_connection_id.clone()),
+                    ),
+                );
+                let result_text = None;
                 let mut ctx = SettleContext::from_running(&task, duration_ms, true);
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -13430,6 +14356,7 @@ impl DelegationBroker {
                             observation: None,
                             last_agent_activity_at: None,
                             stalled_since: None,
+                            recovery: None,
                         }
                     }
                 }
@@ -13449,32 +14376,41 @@ impl DelegationBroker {
         parent_conversation_id: Option<i32>,
         task_id: &str,
     ) -> DelegationTaskReport {
-        if let Ok(Some(row)) = self.task_store.load(task_id).await {
-            if parent_conversation_id.is_some() && row.parent_id == parent_conversation_id {
-                // Ownership established via durable parent_id — may project
-                // claimed terminal intent while durable is still running.
-                if row.status == TaskStatus::Running {
-                    let intent = {
-                        let inner = self.pending.inner.lock().await;
-                        inner.resolve_terminal_intent(task_id)
-                    };
-                    if let Some(intent) = intent {
-                        let agent_type = intent
-                            .completed
-                            .as_ref()
-                            .map(|c| c.agent_type)
-                            .unwrap_or(row.agent_type);
-                        let child_id = intent
-                            .completed
-                            .as_ref()
-                            .map(|c| c.child_conversation_id)
-                            .unwrap_or(row.child_conversation_id);
-                        return intent.to_report(task_id, agent_type, child_id, None);
+        match self.task_store.load(task_id).await {
+            Ok(Some(row)) => {
+                if parent_conversation_id.is_some() && row.parent_id == parent_conversation_id {
+                    // Ownership established via durable parent_id — may project
+                    // claimed terminal intent while durable is still running.
+                    if row.status == TaskStatus::Running {
+                        let intent = {
+                            let inner = self.pending.inner.lock().await;
+                            inner.resolve_terminal_intent(task_id)
+                        };
+                        if let Some(intent) = intent {
+                            let agent_type = intent
+                                .completed
+                                .as_ref()
+                                .map(|c| c.agent_type)
+                                .unwrap_or(row.agent_type);
+                            let child_id = intent
+                                .completed
+                                .as_ref()
+                                .map(|c| c.child_conversation_id)
+                                .unwrap_or(row.child_conversation_id);
+                            return intent.to_report(task_id, agent_type, child_id, None);
+                        }
                     }
+                    return row.to_report(None);
                 }
-                return row.to_report(None);
+                if parent_conversation_id.is_some() {
+                    self.metrics
+                        .record_recovery_lookup_unknown("ownership_mismatch");
+                    return unknown_report(task_id);
+                }
             }
-            if parent_conversation_id.is_some() {
+            Ok(None) => {}
+            Err(_) => {
+                self.metrics.record_recovery_lookup_unknown("store_error");
                 return unknown_report(task_id);
             }
         }
@@ -13484,7 +14420,15 @@ impl DelegationBroker {
             {
                 db_report(task_id, &rec)
             }
-            _ => unknown_report(task_id),
+            Some(_) => {
+                self.metrics
+                    .record_recovery_lookup_unknown("ownership_mismatch");
+                unknown_report(task_id)
+            }
+            None => {
+                self.metrics.record_recovery_lookup_unknown("db_not_found");
+                unknown_report(task_id)
+            }
         }
     }
 
@@ -13874,6 +14818,784 @@ mod tests {
         Arc::new(MockDepth(vec![(1, None)])) as Arc<dyn ConversationDepthLookup>
     }
 
+    mod authorized_delegation_recovery {
+        use super::*;
+        use crate::acp::delegation::metrics::RecoveryMetricEventKind;
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, ReplacementReason,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::types::DelegationRecoveryProjection;
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        async fn assert_unknown_with_only_code(
+            broker: &DelegationBroker,
+            parent_connection_id: &str,
+            task_id: &str,
+            expected_code: &str,
+        ) {
+            let report = broker
+                .get_task_status(parent_connection_id, Some(1), task_id, StatusWait::Snapshot)
+                .await;
+            assert_eq!(report.status, TaskStatus::Unknown);
+            assert_eq!(
+                broker.metrics().recovery_lookup_unknown_codes(),
+                [(expected_code.to_string(), 1)].into_iter().collect()
+            );
+        }
+
+        #[tokio::test]
+        async fn cold_lookup_keeps_public_unknown_and_emits_stable_internal_reason() {
+            let missing = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            assert_unknown_with_only_code(
+                &missing,
+                "parent-conn",
+                "deadbeef-missing-task",
+                "db_not_found",
+            )
+            .await;
+
+            let foreign_store = Arc::new(MockTaskStore::new());
+            foreign_store
+                .seed_running("decafbad-foreign-task", 42, Some(2))
+                .await;
+            let foreign = broker_with_store(Arc::new(MockSpawner::new()), foreign_store);
+            assert_unknown_with_only_code(
+                &foreign,
+                "parent-conn",
+                "decafbad-foreign-task",
+                "ownership_mismatch",
+            )
+            .await;
+
+            let token_parent = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            token_parent
+                .seed_live_task_for_test("owner-connection", "c001d00d-live-task")
+                .await;
+            assert_unknown_with_only_code(
+                &token_parent,
+                "other-connection",
+                "c001d00d-live-task",
+                "token_parent_mismatch",
+            )
+            .await;
+
+            let failing_store = Arc::new(MockTaskStore::new());
+            failing_store
+                .fail_next_load(TaskStoreError::Permanent(
+                    "persistence detail must remain private".into(),
+                ))
+                .await;
+            let failing = broker_with_store(Arc::new(MockSpawner::new()), failing_store);
+            assert_unknown_with_only_code(
+                &failing,
+                "parent-conn",
+                "badc0ffe-store-error",
+                "store_error",
+            )
+            .await;
+
+            let ambiguous = DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            );
+            ambiguous
+                .seed_live_task_for_test("parent-conn", "abcdef01-first-task")
+                .await;
+            ambiguous
+                .seed_live_task_for_test("parent-conn", "abcdef01-second-task")
+                .await;
+            assert_unknown_with_only_code(
+                &ambiguous,
+                "parent-conn",
+                "abcdef01-ambiguous-task",
+                "prefix_ambiguous",
+            )
+            .await;
+        }
+
+        struct RecoveryTelemetryFixture {
+            db: Arc<crate::db::AppDatabase>,
+            runs: Arc<RunStore>,
+            broker: Arc<DelegationBroker>,
+            parent_id: i32,
+            source_task_id: String,
+            workspace_path: String,
+        }
+
+        impl RecoveryTelemetryFixture {
+            fn replacement_request(&self, tool_use_id: &str) -> DelegationRequest {
+                let mut request = request(self.parent_id, tool_use_id);
+                request.working_dir = Some(self.workspace_path.clone());
+                request.work_unit_key = Some("telemetry-unit".into());
+                request.replaces_task_id = Some(self.source_task_id.clone());
+                request.replacement_reason = Some("admission_unknown".into());
+                request
+            }
+
+            async fn challenge(&self) -> RecoveryChallenge {
+                let source = self
+                    .runs
+                    .load_by_task_id(&self.source_task_id)
+                    .await
+                    .expect("load telemetry source")
+                    .expect("telemetry source");
+                let eligibility = self
+                    .runs
+                    .build_continue_eligibility(&source)
+                    .await
+                    .expect("telemetry eligibility");
+                let snapshot =
+                    crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+                        &eligibility,
+                    );
+                let operation = RequestedRecoveryOperation::Replace {
+                    replacement_reason: ReplacementReason::AdmissionUnknown,
+                };
+                let decision = decide_delegation_recovery(
+                    &snapshot,
+                    &RecoveryRailSnapshot {
+                        agent_supports_reuse: eligibility.agent_supports_reuse,
+                        unexpected_continue_budget_available: eligibility
+                            .unexpected_continue_budget_available,
+                        replacement_budget_available: eligibility.replacement_budget_available,
+                    },
+                    operation.clone(),
+                );
+                let projection = DelegationRecoveryProjection::from(&decision);
+                RecoveryChallenge {
+                    parent_conversation_id: source.parent_conversation_id,
+                    subject_kind: RecoverySubjectKind::DelegationTask,
+                    subject_id: source.task_id.clone(),
+                    delegation_identity: Some(DelegationAuthorizationIdentity {
+                        source_task_id: source.task_id,
+                        child_conversation_id: Some(source.child_conversation_id),
+                        lineage_root_task_id: source.lineage_root_task_id,
+                        work_unit_key: source.work_unit_key,
+                    }),
+                    source_state_fingerprint: decision.source_state_fingerprint,
+                    allowed_action: RecoveryAllowedAction::Replace,
+                    action_payload: crate::acp::delegation::run_store::recovery_action_payload(
+                        &operation,
+                    ),
+                    cause_code: projection.cause_code,
+                    risk_class: projection.risk_class,
+                    display_reason: Some("private display prose".into()),
+                }
+            }
+        }
+
+        async fn recovery_telemetry_fixture() -> RecoveryTelemetryFixture {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-telemetry-parent").await,
+                AgentType::ClaudeCode,
+                Some("telemetry parent".into()),
+                None,
+            )
+            .await
+            .expect("telemetry parent");
+            let runs = Arc::new(RunStore::new(db.clone()));
+            let spawner = Arc::new(MockSpawner::new());
+            spawner
+                .queue_spawn(Ok("telemetry-replacement-conn".into()))
+                .await;
+            spawner.queue_send(Ok(accepted(0, Utc::now()))).await;
+            let broker = broker_with_run_store(spawner, parent.id, runs.clone()).await;
+            let source_task_id = "telemetry-source-task".to_string();
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-telemetry-source").await,
+                AgentType::ClaudeCode,
+                Some("telemetry source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "telemetry-source-tool".into(),
+                    delegation_call_id: source_task_id.clone(),
+                }),
+            )
+            .await
+            .expect("telemetry source child");
+            let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                .expect("agent type json")
+                .as_str()
+                .expect("agent type string")
+                .to_string();
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.clone(),
+                root_task_id: source_task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("telemetry-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type,
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("telemetry source preview".into()),
+                request_fingerprint: Some("telemetry-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: Some("telemetry-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve telemetry source");
+            let finished_at = Utc::now();
+            runs.settle_terminal(
+                &source_task_id,
+                TerminalTaskWrite::failed_with_evidence(
+                    "admission_unknown",
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "admission_unknown",
+                        DelegationRunStatus::Reserving,
+                        true,
+                        finished_at,
+                    ),
+                ),
+            )
+            .await
+            .expect("terminal telemetry source");
+            RecoveryTelemetryFixture {
+                db,
+                runs,
+                broker,
+                parent_id: parent.id,
+                source_task_id,
+                workspace_path,
+            }
+        }
+
+        async fn authorized_continue_resume_failure_events(
+        ) -> Vec<crate::acp::delegation::metrics::DelegationRecoveryMetricEvent> {
+            use crate::acp::delegation::types::ContinueDelegationRequest;
+            use crate::db::entities::{conversation, delegation_task_run};
+            use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+            let db = Arc::new(fresh_in_memory_db().await);
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-resume-parent").await,
+                AgentType::ClaudeCode,
+                Some("resume parent".into()),
+                None,
+            )
+            .await
+            .expect("resume parent");
+            let source_task_id = "resume-recovery-source";
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-resume-source").await,
+                AgentType::ClaudeCode,
+                Some("resume source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "resume-source-tool".into(),
+                    delegation_call_id: source_task_id.into(),
+                }),
+            )
+            .await
+            .expect("resume source child");
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let runs = Arc::new(RunStore::new(db.clone()));
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.into(),
+                root_task_id: source_task_id.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("resume-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("resume source preview".into()),
+                request_fingerprint: Some("resume-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.into(),
+                work_unit_key: Some("resume-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve resume source");
+            runs.bind_child_connection_while_reserving(source_task_id, "resume-source-conn")
+                .await
+                .expect("bind resume source");
+            runs.promote_running(source_task_id, "resume-source-conn", Utc::now())
+                .await
+                .expect("promote resume source");
+            let run = delegation_task_run::Entity::find_by_id(source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut run = run.into_active_model();
+            run.status = Set(DelegationRunStatus::Canceled);
+            run.error_code = Set(Some("parent_disconnected".into()));
+            run.termination_audit_json = Set(None);
+            run.finished_at = Set(Some(Utc::now()));
+            run.update(&db.conn).await.expect("legacy resume source");
+            let child = conversation::Entity::find_by_id(source_child.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut child = child.into_active_model();
+            child.external_id = Set(Some("private-raw-resume-session".into()));
+            child
+                .update(&db.conn)
+                .await
+                .expect("resume session identity");
+
+            let source = runs.load_by_task_id(source_task_id).await.unwrap().unwrap();
+            let eligibility = runs.build_continue_eligibility(&source).await.unwrap();
+            let snapshot =
+                crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+                    &eligibility,
+                );
+            let operation = RequestedRecoveryOperation::Continue;
+            let decision = decide_delegation_recovery(
+                &snapshot,
+                &RecoveryRailSnapshot {
+                    agent_supports_reuse: eligibility.agent_supports_reuse,
+                    unexpected_continue_budget_available: eligibility
+                        .unexpected_continue_budget_available,
+                    replacement_budget_available: eligibility.replacement_budget_available,
+                },
+                operation.clone(),
+            );
+            let projection = DelegationRecoveryProjection::from(&decision);
+            let challenge = RecoveryChallenge {
+                parent_conversation_id: parent.id,
+                subject_kind: RecoverySubjectKind::DelegationTask,
+                subject_id: source_task_id.into(),
+                delegation_identity: Some(DelegationAuthorizationIdentity {
+                    source_task_id: source_task_id.into(),
+                    child_conversation_id: Some(source_child.id),
+                    lineage_root_task_id: source_task_id.into(),
+                    work_unit_key: Some("resume-unit".into()),
+                }),
+                source_state_fingerprint: decision.source_state_fingerprint,
+                allowed_action: RecoveryAllowedAction::Continue,
+                action_payload: crate::acp::delegation::run_store::recovery_action_payload(
+                    &operation,
+                ),
+                cause_code: projection.cause_code,
+                risk_class: projection.risk_class,
+                display_reason: Some("private resume display prose".into()),
+            };
+            let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+            let now = Utc::now();
+            let approved = authorizations
+                .insert_pending(&challenge, now)
+                .await
+                .expect("insert resume authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve resume authorization");
+
+            let spawner = Arc::new(MockSpawner::new());
+            spawner
+                .queue_spawn(Err(SpawnerError::Spawn(
+                    "private resume transport prose".into(),
+                )))
+                .await;
+            let broker = broker_with_run_store(spawner.clone(), parent.id, runs.clone()).await;
+            let report = broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "resume-authorized-tool".into(),
+                    target_task_id: source_task_id.into(),
+                    task: "private resume prompt prose".into(),
+                    work_unit_key: Some("resume-unit".into()),
+                    external_handle: None,
+                    correlation_id: Some("resume-correlation".into()),
+                    recovery_authorization_id: Some(approved.authorization_id.clone()),
+                })
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+            assert_eq!(spawner.resume_args.lock().await.len(), 1);
+            assert_eq!(
+                spawner.resume_args.lock().await[0].external_session_id,
+                "private-raw-resume-session"
+            );
+            let consumed = authorizations
+                .find_by_id(&approved.authorization_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                consumed.status,
+                crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus::Consumed
+            );
+            broker.metrics().recovery_events()
+        }
+
+        #[tokio::test]
+        async fn delegation_recovery_metrics_emit_only_stable_ids_actions_causes_and_codes() {
+            let fixture = recovery_telemetry_fixture().await;
+
+            let required = fixture
+                .broker
+                .start_delegation(fixture.replacement_request("telemetry-required"))
+                .await;
+            assert_eq!(
+                required.error_code.as_deref(),
+                Some("recovery_confirmation_required")
+            );
+
+            let authorizations = RecoveryAuthorizationStore::new(fixture.db.conn.clone());
+            let now = Utc::now();
+            let declined = authorizations
+                .insert_pending(&fixture.challenge().await, now)
+                .await
+                .expect("insert declined authorization");
+            authorizations
+                .decline_pending(&declined.authorization_id)
+                .await
+                .expect("decline authorization");
+            let mut declined_request = fixture.replacement_request("telemetry-declined");
+            declined_request.recovery_authorization_id = Some(declined.authorization_id);
+            let declined_report = fixture.broker.start_delegation(declined_request).await;
+            assert_eq!(
+                declined_report.error_code.as_deref(),
+                Some("recovery_authorization_declined")
+            );
+
+            let approved = authorizations
+                .insert_pending(&fixture.challenge().await, now)
+                .await
+                .expect("insert approved authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve authorization");
+            let mut approved_request = fixture.replacement_request("telemetry-approved");
+            approved_request.recovery_authorization_id = Some(approved.authorization_id);
+            let admitted = fixture.broker.start_delegation(approved_request).await;
+            assert_eq!(admitted.status, TaskStatus::Running, "{admitted:?}");
+
+            let mut events = fixture.broker.metrics().recovery_events();
+            events.extend(authorized_continue_resume_failure_events().await);
+            let counts = events.iter().fold(BTreeMap::new(), |mut counts, event| {
+                *counts.entry(event.kind.as_str()).or_insert(0usize) += 1;
+                counts
+            });
+            assert_eq!(counts.get("recovery.decision"), Some(&3));
+            assert_eq!(counts.get("recovery.confirmation_requested"), Some(&1));
+            assert_eq!(counts.get("recovery.confirmation_approved"), Some(&2));
+            assert_eq!(counts.get("recovery.confirmation_declined"), Some(&1));
+            assert_eq!(counts.get("recovery.authorization_consumed"), Some(&2));
+            assert_eq!(counts.get("recovery.authorization_rejected"), Some(&1));
+            assert_eq!(counts.get("recovery.replacement_admitted"), Some(&1));
+            assert_eq!(counts.get("recovery.resume_failed"), Some(&1));
+            assert!(events.iter().all(|event| {
+                matches!(
+                    event.action.as_ref().map(|value| value.as_str()),
+                    Some("replace" | "continue")
+                ) && event
+                    .cause
+                    .as_ref()
+                    .map(|value| value.as_str())
+                    .is_none_or(|cause| {
+                        matches!(cause, "admission_unknown" | "legacy_parent_disconnect")
+                    })
+                    && event
+                        .risk
+                        .as_ref()
+                        .map(|value| value.as_str())
+                        .is_none_or(|risk| {
+                            matches!(
+                                risk,
+                                "execution_may_have_occurred" | "legacy_unknown_origin"
+                            )
+                        })
+            }));
+            let serialized = serde_json::to_string(&events).expect("serialize recovery events");
+            for forbidden in [
+                "private display prose",
+                "telemetry source preview",
+                "prompt",
+                "answer",
+                "display_reason",
+                "external_session",
+                "private-raw-resume-session",
+                "private resume transport prose",
+                "private resume prompt prose",
+                "private resume display prose",
+            ] {
+                assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+            }
+            assert!(events.iter().any(|event| {
+                event.kind == RecoveryMetricEventKind::AuthorizationRejected
+                    && event.code.as_ref().map(|value| value.as_str())
+                        == Some("recovery_authorization_declined")
+            }));
+        }
+
+        #[tokio::test]
+        async fn successful_recovery_decision_uses_transaction_authority_after_projection_failure()
+        {
+            let fixture = recovery_telemetry_fixture().await;
+            let challenge = fixture.challenge().await;
+            let authorizations = RecoveryAuthorizationStore::new(fixture.db.conn.clone());
+            let now = Utc::now();
+            let approved = authorizations
+                .insert_pending(&challenge, now)
+                .await
+                .expect("insert approved authorization");
+            authorizations
+                .approve_pending(
+                    &approved.authorization_id,
+                    now,
+                    now + chrono::Duration::minutes(10),
+                )
+                .await
+                .expect("approve authorization");
+
+            fixture.runs.fail_next_recovery_projection();
+            let mut request = fixture.replacement_request("transaction-authority");
+            request.recovery_authorization_id = Some(approved.authorization_id.clone());
+            let admitted = fixture.broker.start_delegation(request).await;
+            assert_eq!(admitted.status, TaskStatus::Running, "{admitted:?}");
+
+            let decisions: Vec<_> = fixture
+                .broker
+                .metrics()
+                .recovery_events()
+                .into_iter()
+                .filter(|event| event.kind == RecoveryMetricEventKind::Decision)
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "committed admission must emit one decision"
+            );
+            let event = &decisions[0];
+            assert_eq!(event.task_id.as_deref(), admitted.task_id.as_deref());
+            assert_eq!(
+                event.action.as_ref().map(|value| value.as_str()),
+                Some(challenge.allowed_action.as_str())
+            );
+            assert_eq!(
+                event.cause.as_ref().map(|value| value.as_str()),
+                Some(challenge.cause_code.as_str())
+            );
+            assert_eq!(
+                event.risk.as_ref().map(|value| value.as_str()),
+                Some(challenge.risk_class.as_str())
+            );
+            fixture
+                .runs
+                .recovery_projection_for_task(&fixture.source_task_id)
+                .await
+                .expect_err("standalone projection fault must remain unused by admission");
+        }
+
+        #[tokio::test]
+        async fn cold_and_live_status_share_recovery_projection_without_receipt_id() {
+            use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+            let data_dir = tempfile::tempdir().expect("reopen database directory");
+            let db = Arc::new(
+                crate::db::init_database(data_dir.path(), "task9-reopen")
+                    .await
+                    .expect("open live database"),
+            );
+            let parent = conversation_service::create(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-status-parent").await,
+                AgentType::ClaudeCode,
+                Some("status parent".into()),
+                None,
+            )
+            .await
+            .expect("status parent");
+            let source_task_id = "status-recovery-source";
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                seed_folder(&db, "/tmp/codeg-recovery-status-source").await,
+                AgentType::ClaudeCode,
+                Some("status source".into()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "status-source-tool".into(),
+                    delegation_call_id: source_task_id.into(),
+                }),
+            )
+            .await
+            .expect("status source child");
+            let workspace_path = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace_path,
+                None,
+                BTreeMap::new(),
+            );
+            let runs = Arc::new(RunStore::new(db.clone()));
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: source_task_id.into(),
+                root_task_id: source_task_id.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("status-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("status source preview".into()),
+                request_fingerprint: Some("status-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.into(),
+                work_unit_key: Some("status-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve status source");
+            runs.bind_child_connection_while_reserving(source_task_id, "status-source-conn")
+                .await
+                .expect("bind status source");
+            runs.promote_running(source_task_id, "status-source-conn", Utc::now())
+                .await
+                .expect("promote status source");
+            let row = crate::db::entities::delegation_task_run::Entity::find_by_id(source_task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut row = row.into_active_model();
+            row.status = Set(DelegationRunStatus::Canceled);
+            row.error_code = Set(Some("parent_disconnected".into()));
+            row.termination_audit_json = Set(None);
+            row.finished_at = Set(Some(Utc::now()));
+            row.update(&db.conn).await.expect("legacy terminal source");
+
+            let live =
+                broker_with_run_store(Arc::new(MockSpawner::new()), parent.id, runs.clone()).await;
+            live.seed_live_task_for_test("parent-conn", source_task_id)
+                .await;
+            let live_report = live
+                .get_task_status(
+                    "parent-conn",
+                    Some(parent.id),
+                    source_task_id,
+                    StatusWait::Snapshot,
+                )
+                .await;
+            let live_projection = live_report.recovery.clone().expect("live projection");
+
+            drop(live);
+            drop(runs);
+            db.conn.clone().close().await.expect("close live database");
+            drop(db);
+
+            let reopened = Arc::new(
+                crate::db::init_database(data_dir.path(), "task9-reopen")
+                    .await
+                    .expect("reopen cold database"),
+            );
+            let cold_runs = Arc::new(RunStore::new(reopened.clone()));
+            let cold =
+                broker_with_run_store(Arc::new(MockSpawner::new()), parent.id, cold_runs).await;
+            let cold_report = cold
+                .get_task_status(
+                    "parent-conn",
+                    Some(parent.id),
+                    source_task_id,
+                    StatusWait::Snapshot,
+                )
+                .await;
+            assert_eq!(cold_report.recovery.as_ref(), Some(&live_projection));
+            for serialized in [
+                serde_json::to_string(&live_report).unwrap(),
+                serde_json::to_string(&cold_report).unwrap(),
+            ] {
+                for forbidden in [
+                    "authorization_id",
+                    "question_id",
+                    "receipt_id",
+                    "recovery_authorization_id",
+                ] {
+                    assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+                }
+            }
+        }
+    }
+
     fn request(parent_conv: i32, tool_use: &str) -> DelegationRequest {
         DelegationRequest {
             parent_connection_id: "parent-conn".into(),
@@ -13889,6 +15611,7 @@ mod tests {
             replaces_task_id: None,
             replacement_reason: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         }
     }
 
@@ -13914,6 +15637,29 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
+    }
+
+    async fn assert_inflight_parent_end_is_reserving_preprompt(broker: &DelegationBroker) {
+        let inner = broker.pending.inner.lock().await;
+        let context = inner
+            .inflight
+            .values()
+            .filter_map(|setup| setup.parent_end.as_ref())
+            .next()
+            .expect("parent end must remain attached to the gated setup")
+            .context
+            .clone();
+        let audit = context.audit(
+            DelegationRunStatus::Reserving,
+            AdmissionClass::NormalRevision,
+            None,
+            None,
+        );
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "pre-prompt parent end must not claim that the prompt may have executed"
+        );
     }
 
     // -- Task 4.3 -----------------------------------------------------------
@@ -15105,6 +16851,10 @@ mod tests {
         }
         async fn freeze_retry(&self, task_id: &str) {
             self.inner.freeze_retry(task_id).await
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            self.inner.replace_retry_and_freeze(task_id, terminal).await
         }
     }
 
@@ -20948,9 +22698,8 @@ mod tests {
         }
         assert!(!broker.is_running_for_test(&call_id).await);
         assert!(!broker.has_live_run_for_test("c-unres").await);
-        // terminal_from_outcome maps non-canceled codes to
-        // TerminalTaskWrite::failed — so the returned outcome code is the
-        // durable settlement surface for this path.
+        // The producer-authored session terminal keeps the returned outcome
+        // code as the durable settlement surface for this path.
     }
 
     /// Order-sensitive: manager only returns connection id after bootstrap
@@ -21312,7 +23061,6 @@ mod tests {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
-
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-ok").await;
         let parent = conversation_service::create(
@@ -21803,7 +23551,7 @@ mod tests {
     /// Parent cancel stamped during the post-bind pre-send window must not
     /// enqueue a prompt and must disconnect the unused child.
     #[tokio::test]
-    async fn gen1_bind_parent_cancel_before_send_no_prompt_disconnects() {
+    async fn termination_evidence_wave2_post_spawn_pre_dispatch_parent_end_is_preprompt() {
         use crate::db::entities::delegation_task_run::{
             Column as RunCol, DelegationRunStatus, Entity as DelegationTaskRun,
         };
@@ -21872,6 +23620,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
         let _ = release_tx.send(());
 
         let report = driver.await.expect("join");
@@ -21899,7 +23648,7 @@ mod tests {
     /// and external buffer drain, while the pre-send fence gate holds — the
     /// atomic fence must still observe it (zero sends + disconnect).
     #[tokio::test]
-    async fn gen1_pre_send_fence_parent_cancel_inter_check_no_prompt() {
+    async fn termination_evidence_wave2_pre_send_parent_end_is_preprompt() {
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
 
@@ -21950,6 +23699,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
         let _ = release_tx.send(());
 
         let report = driver.await.expect("join");
@@ -22039,6 +23789,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -22191,6 +23942,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -22475,6 +24227,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
@@ -22606,11 +24359,7 @@ mod tests {
         };
         runs.settle_terminal(
             &task_id,
-            TerminalTaskWrite::canceled(
-                "parent_canceled",
-                Utc::now(),
-                ConversationStatus::Cancelled,
-            ),
+            canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
         )
         .await
         .expect("terminal winner");
@@ -22701,10 +24450,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -22841,9 +24590,18 @@ mod tests {
         let mut root_run = root_run.into_active_model();
         root_run.status = Set(DelegationRunStatus::Canceled);
         root_run.error_code = Set(Some("host_restarted".into()));
+        let observed_at = Utc::now();
         root_run.termination_audit_json = Set(Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
+            serde_json::to_string(&termination_audit(
+                AcpTerminationSource::HostRestart,
+                AcpTerminationReason::HostRestarted,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Running,
+                true,
+                None,
+                observed_at,
+            ))
+            .expect("typed host-restart audit"),
         ));
         root_run.update(&db.conn).await.unwrap();
 
@@ -22872,6 +24630,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -22888,14 +24647,14 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root)
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut budget = budget.into_active_model();
-        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        budget.update(&db.conn).await.unwrap();
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage_root),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
         let _ = release.send(());
         let report = driver.await.expect("join");
         assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
@@ -22958,11 +24717,7 @@ mod tests {
         };
         runs.settle_terminal(
             &task_id,
-            TerminalTaskWrite::canceled(
-                "parent_canceled",
-                Utc::now(),
-                ConversationStatus::Cancelled,
-            ),
+            canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
         )
         .await
         .expect("terminal winner");
@@ -23120,8 +24875,21 @@ mod tests {
         assert!(retry.frozen, "must freeze ownership before release");
         assert_eq!(
             retry.terminal.error_code.as_deref(),
-            Some("admission_failed"),
-            "frozen payload keeps intended admission code"
+            Some("persistence_error"),
+            "frozen payload must match the permanent persistence producer"
+        );
+        let evidence = retry
+            .terminal
+            .termination_evidence()
+            .expect("typed frozen persistence evidence");
+        assert_eq!(evidence.termination.source, AcpTerminationSource::Legacy);
+        assert_eq!(
+            evidence.termination.reason,
+            AcpTerminationReason::LegacyUnspecified
+        );
+        assert_eq!(
+            evidence.termination.classification,
+            AcpTerminationClassification::LegacyUnknown
         );
     }
 
@@ -23191,11 +24959,7 @@ mod tests {
         let owned = flaky
             .put_retry(PendingTerminalRetry {
                 task_id: task_id.clone(),
-                terminal: TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                terminal: canceled_terminal("parent_canceled", DelegationRunStatus::Running, true),
                 child_conversation_id: 0,
                 frozen: false,
             })
@@ -23404,6 +25168,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -23519,10 +25284,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -23683,10 +25448,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: 0,
                     frozen: false,
@@ -23808,7 +25573,11 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 task_id.clone(),
-                ReservingHandoffDisposition::ParentEnded(ParentTurnEndReason::ParentCanceled),
+                ReservingHandoffDisposition::ParentEnded(ParentEndContext::legacy(
+                    ParentTurnEndReason::ParentCanceled,
+                    Utc::now(),
+                    true,
+                )),
             );
         }
         let _ = send_gate.send(());
@@ -23904,6 +25673,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -23923,10 +25693,10 @@ mod tests {
             flaky
                 .put_retry(PendingTerminalRetry {
                     task_id: continued_task_id.clone(),
-                    terminal: TerminalTaskWrite::canceled(
+                    terminal: canceled_terminal(
                         "parent_canceled",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
+                        DelegationRunStatus::Running,
+                        true,
                     ),
                     child_conversation_id: child_id,
                     frozen: false,
@@ -24027,11 +25797,16 @@ mod tests {
                 let mut inner = broker.pending.inner.lock().await;
                 inner.closed_handoff_dispositions.insert(
                     task_id.clone(),
-                    ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                        code: code.to_string(),
-                        message: format!("intended {code}"),
-                        child_conversation_id: Some(child.id),
-                    }),
+                    ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                        DelegationOutcome::Err {
+                            code: code.to_string(),
+                            message: format!("intended {code}"),
+                            child_conversation_id: Some(child.id),
+                        },
+                        DelegationRunStatus::Reserving,
+                        true,
+                        Utc::now(),
+                    )),
                 );
             }
             let _ = flaky
@@ -24065,8 +25840,8 @@ mod tests {
                 inner.closed_handoff_dispositions.get(&task_id).cloned()
             };
             match disp {
-                Some(ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                    code: pe,
+                Some(ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                    outcome: DelegationOutcome::Err { code: pe, .. },
                     ..
                 })) => {
                     assert_eq!(
@@ -24078,6 +25853,21 @@ mod tests {
             }
             let retry = flaky.get_retry(&task_id).await.expect("frozen");
             assert!(retry.frozen);
+            let parked_terminal = {
+                let inner = broker.pending.inner.lock().await;
+                match inner.closed_handoff_dispositions.get(&task_id) {
+                    Some(ReservingHandoffDisposition::ChildTerminal(observed)) => {
+                        observed.terminal.clone()
+                    }
+                    other => panic!("expected typed PE park for {code}, got {other:?}"),
+                }
+            };
+            assert_eq!(
+                retry.terminal.termination_evidence(),
+                parked_terminal.termination_evidence(),
+                "frozen persistence retry must retain the producer-authored park evidence"
+            );
+            assert_eq!(retry.terminal.finished_at, parked_terminal.finished_at);
         }
     }
 
@@ -24284,6 +26074,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -24456,6 +26247,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -24885,6 +26677,10 @@ mod tests {
         }
         async fn freeze_retry(&self, task_id: &str) {
             self.inner.freeze_retry(task_id).await
+        }
+
+        async fn replace_retry_and_freeze(&self, task_id: &str, terminal: TerminalTaskWrite) {
+            self.inner.replace_retry_and_freeze(task_id, terminal).await
         }
     }
 
@@ -25864,11 +27660,16 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 task_id.clone(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
-                    code: "unresumable".into(),
-                    message: "resume failed".into(),
-                    child_conversation_id: Some(child.id),
-                }),
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::Err {
+                        code: "unresumable".into(),
+                        message: "resume failed".into(),
+                        child_conversation_id: Some(child.id),
+                    },
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
+                )),
             );
         }
 
@@ -26160,6 +27961,7 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    recovery_authorization_id: None,
                 })
                 .await
         });
@@ -26251,6 +28053,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -26890,6 +28693,7 @@ mod tests {
             observation: None,
             last_agent_activity_at: None,
             stalled_since: None,
+            recovery: None,
         };
         let accounting = PersistenceRetryAccounting {
             parent_connection_id: parent_conn.clone(),
@@ -27312,6 +29116,319 @@ mod tests {
         );
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_child_count().await, 0);
+    }
+
+    fn audited_setup_parent_loss(
+        source: AcpTerminationSource,
+        reason: AcpTerminationReason,
+        classification: AcpTerminationClassification,
+    ) -> ParentEndContext {
+        let mut termination =
+            AcpTerminationSummaryV1::new(source, reason, classification, false, Utc::now());
+        if source == AcpTerminationSource::Frontend {
+            termination.frontend_origin =
+                Some(crate::acp::termination::AcpDisconnectOrigin::ExplicitUser);
+        }
+        ParentEndContext {
+            reason: ParentTurnEndReason::ParentDisconnected,
+            termination,
+        }
+    }
+
+    async fn setup_window_fixture(
+        token: &str,
+    ) -> (
+        Arc<crate::db::AppDatabase>,
+        crate::db::entities::conversation::Model,
+        Arc<RunStore>,
+        Arc<MockSpawner>,
+        Arc<DelegationBroker>,
+    ) {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-modern-setup-{token}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("modern setup {token}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        (db, parent, runs, mock, broker)
+    }
+
+    fn assert_setup_loss_is_policy_compatible(
+        error_code: &str,
+        persisted_audit: DelegationTerminationAuditV1,
+        expect_automatic_continue: bool,
+    ) {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
+            RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::termination::ParsedDelegationTermination;
+
+        assert_eq!(persisted_audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(!persisted_audit.termination.prompt_may_have_executed);
+
+        // Pre-spawn rows remain behind the reached-running fence. Re-project
+        // only that execution phase to prove the persisted code and typed
+        // cause agree with the automatic-running-loss policy; this must not
+        // turn cold setup loss itself into a resumable continue.
+        let mut running_audit = persisted_audit;
+        running_audit.prior_status = DelegationRunStatus::Running;
+        running_audit.termination.prompt_may_have_executed = true;
+        let source = RecoverySourceSnapshot {
+            source_task_id: "policy-source".into(),
+            lineage_root_task_id: "policy-source".into(),
+            generation: 1,
+            parent_conversation_id: 1,
+            child_conversation_id: 2,
+            agent_type: "codex".into(),
+            profile_id: None,
+            workspace_path: Some("C:/workspace".into()),
+            route_fingerprint: Some("route-1".into()),
+            work_unit_key: Some("policy-work-unit".into()),
+            parent_tool_use_id: Some("parent-tool".into()),
+            child_connection_id: Some("policy-running-connection".into()),
+            history_only: false,
+            is_latest: true,
+            has_active_run: false,
+            child_superseded: false,
+            child_ownership_valid: true,
+            agent_type_matches: true,
+            run_status: DelegationRunStatus::Canceled,
+            error_code: Some(error_code.into()),
+            admission_class: AdmissionClass::NormalRevision,
+            parsed_termination: ParsedDelegationTermination::Typed(running_audit),
+            reached_running: true,
+            launch_snapshot_complete: true,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: Some("default".into()),
+            config_values_json: Some("{}".into()),
+            external_session_identity_hash: Some(hash_external_session_identity("session-1")),
+            replaced_task_id: None,
+            replacement_reason: None,
+            recovery_authorization_id: None,
+        };
+        let decision = decide_delegation_recovery(
+            &source,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: true,
+                unexpected_continue_budget_available: true,
+                replacement_budget_available: true,
+            },
+            RequestedRecoveryOperation::Inspect,
+        );
+        if expect_automatic_continue {
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue
+                }
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+        } else {
+            assert_eq!(decision.confirmation, RecoveryConfirmation::Required);
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_pre_spawn_parent_loss_before_spawn_checkpoint_uses_typed_code() {
+        let cases = [
+            (
+                "transport",
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                "transport_disconnected",
+            ),
+            (
+                "process",
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+                "process_exited",
+            ),
+            (
+                "session",
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                "session_lost",
+            ),
+            (
+                "frontend",
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                "parent_disconnected",
+            ),
+        ];
+
+        for (token, source, reason, classification, expected_code) in cases {
+            let (_db, parent, _runs, mock, broker) = setup_window_fixture(token).await;
+            mock.queue_spawn(Ok(format!("unused-{token}"))).await;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            broker
+                .install_gen1_before_spawn_checkpoint_gate(entered_tx, release_rx)
+                .await;
+
+            let driver = {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    let mut req = request(parent.id, &format!("pt-before-spawn-{token}"));
+                    req.working_dir = Some(test_working_dir());
+                    broker.start_delegation(req).await
+                })
+            };
+            entered_rx
+                .await
+                .expect("before-spawn checkpoint gate entered");
+            let context = audited_setup_parent_loss(source, reason, classification);
+            let policy_audit = context.audit(
+                DelegationRunStatus::Reserving,
+                AdmissionClass::NormalRevision,
+                Some(format!("pt-before-spawn-{token}")),
+                None,
+            );
+            broker
+                .cancel_by_parent_with_context("parent-conn", context)
+                .await;
+            release_tx.send(()).expect("release before-spawn gate");
+
+            let report = driver.await.expect("join before-spawn request");
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some(expected_code),
+                "setup checkpoint #1 must preserve {token} evidence: {report:?}"
+            );
+            assert!(
+                mock.spawn_args.lock().await.is_empty(),
+                "checkpoint #1 must return before spawn for {token}"
+            );
+            assert_setup_loss_is_policy_compatible(
+                report
+                    .error_code
+                    .as_deref()
+                    .expect("typed setup report code"),
+                policy_audit,
+                token != "frontend",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_pre_spawn_parent_loss_during_spawn_persists_typed_code() {
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let cases = [
+            (
+                "transport",
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                "transport_disconnected",
+            ),
+            (
+                "process",
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+                "process_exited",
+            ),
+            (
+                "session",
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+                "session_lost",
+            ),
+            (
+                "frontend",
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                "parent_disconnected",
+            ),
+        ];
+
+        for (token, source, reason, classification, expected_code) in cases {
+            let (db, parent, runs, mock, broker) = setup_window_fixture(token).await;
+            mock.queue_spawn(Ok(format!("spawned-{token}"))).await;
+            let release = mock.install_spawn_gate().await;
+            let driver = {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    let mut req = request(parent.id, &format!("pt-during-spawn-{token}"));
+                    req.working_dir = Some(test_working_dir());
+                    broker.start_delegation(req).await
+                })
+            };
+            while mock.spawn_args.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let run = DelegationTaskRun::find()
+                .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+                .one(&db.conn)
+                .await
+                .expect("load setup run")
+                .expect("durable setup run");
+
+            broker
+                .cancel_by_parent_with_context(
+                    "parent-conn",
+                    audited_setup_parent_loss(source, reason, classification),
+                )
+                .await;
+            release.send(()).expect("release spawn gate");
+            let report = driver.await.expect("join spawn-window request");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code));
+
+            let terminal = runs
+                .load_by_task_id(&run.task_id)
+                .await
+                .expect("load terminal setup run")
+                .expect("terminal setup run remains durable");
+            assert_eq!(terminal.error_code.as_deref(), Some(expected_code));
+            let terminal_row = DelegationTaskRun::find_by_id(&run.task_id)
+                .one(&db.conn)
+                .await
+                .expect("load terminal setup row")
+                .expect("terminal setup row");
+            let audit = serde_json::from_str::<DelegationTerminationAuditV1>(
+                terminal_row
+                    .termination_audit_json
+                    .as_deref()
+                    .expect("typed setup termination audit"),
+            )
+            .expect("parse typed setup termination audit");
+            assert_eq!(audit.termination.source, source);
+            assert_eq!(audit.termination.reason, reason);
+            assert_eq!(audit.termination.classification, classification);
+            assert_setup_loss_is_policy_compatible(
+                terminal_row
+                    .error_code
+                    .as_deref()
+                    .expect("durable setup code"),
+                audit,
+                token != "frontend",
+            );
+            assert_eq!(
+                mock.disconnects.lock().await.as_slice(),
+                &[format!("spawned-{token}")]
+            );
+        }
     }
 
     /// Finding 2 (remaining): external MCP cancel while `start_delegation` is
@@ -29040,6 +31157,7 @@ mod tests {
             runtime_stats: None,
             replaced_task_id: None,
             replacement_reason: None,
+            recovery_authorization_id: None,
         };
         let reserving_report = continue_idempotent_ack(&reserving, "run-2".into());
         assert!(
@@ -29327,6 +31445,7 @@ mod tests {
                     observation: None,
                     last_agent_activity_at: None,
                     stalled_since: None,
+                    recovery: None,
                 }
             }
         }
@@ -29415,7 +31534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_terminal_write_returns_persistence_error_and_keeps_retry() {
+    async fn termination_evidence_wave2_persistence_retry_matches_handoff_drain() {
         let store = Arc::new(MockTaskStore::fail_settle_times(4));
         let mock = Arc::new(MockSpawner::new());
         let broker =
@@ -29428,11 +31547,83 @@ mod tests {
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
         assert!(store.has_retry_record("task-1").await);
+        let retry = store.get_retry("task-1").await.expect("retry payload");
+        let retry_outcome = outcome_from_terminal_write(
+            &retry.terminal,
+            AgentType::ClaudeCode,
+            retry.child_conversation_id,
+        );
+        let drained = terminal_from_handoff_disposition(
+            &ReservingHandoffDisposition::ChildTerminal(ObservedTerminal {
+                outcome: retry_outcome,
+                terminal: retry.terminal.clone(),
+                result_text: None,
+            }),
+            DelegationRunStatus::Running,
+        );
+        assert_eq!(
+            drained.termination_evidence(),
+            retry.terminal.termination_evidence(),
+            "handoff drain must consume producer-authored persistence evidence unchanged"
+        );
+        assert_eq!(drained.finished_at, retry.terminal.finished_at);
         assert!(
             !mock.disconnects.lock().await.is_empty(),
             "child must be disconnected after persistence exhaustion"
         );
         assert!(broker.child_was_disconnected("task-1").await);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_reserving_transport_retry_preserves_phase_and_prompt() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+            .with_task_store(
+                store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+            )
+            .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)));
+        let terminal = failed_terminal(
+            "spawn_failed",
+            DelegationRunStatus::Reserving,
+            false,
+            AcpTerminationSource::Transport,
+            AcpTerminationReason::TransportDisconnected,
+            AcpTerminationClassification::Unexpected,
+        );
+        let context = SettleContext {
+            parent_connection_id: "parent-conn".into(),
+            parent_tool_use_id: "tu-wave3-retry".into(),
+            child_connection_id: "wave3-retry-child".into(),
+            child_conversation_id: 42,
+            agent_type: AgentType::ClaudeCode,
+            task_preview: "pre-prompt send failure".into(),
+            duration_ms: 0,
+            cancel_turn: false,
+            disconnect_on_loss: true,
+            message: Some("send failed before prompt dispatch".into()),
+            attention_resolution: AttentionResolutionCode::TaskTerminal,
+            runtime: None,
+            card_summary: None,
+        };
+
+        let report = broker
+            .settle_task("wave3-reserving-retry", terminal, None, context)
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        let retry = store
+            .get_retry("wave3-reserving-retry")
+            .await
+            .expect("retry payload");
+        let audit = retry
+            .terminal
+            .termination_evidence()
+            .expect("typed persistence retry evidence");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "retry must preserve the failed producer's sticky prompt fact"
+        );
     }
 
     #[tokio::test]
@@ -29680,7 +31871,7 @@ mod tests {
     /// dropped; child cancel/disconnect still runs and the task does not stay
     /// permanently Running.
     #[tokio::test]
-    async fn cancel_task_by_id_outer_timeout_still_completes_settlement() {
+    async fn termination_evidence_wave2_watchdog_cancel_is_typed_at_producer() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn-timeout".into())).await;
         spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
@@ -29704,10 +31895,24 @@ mod tests {
         let cancel = {
             let broker = broker.clone();
             let t1 = t1.clone();
+            let observed_at = Utc::now();
+            let termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Watchdog,
+                AcpTerminationReason::ToolStalledTimeout,
+                AcpTerminationClassification::AutomatedAmbiguous,
+                true,
+                observed_at,
+            );
             tokio::spawn(async move {
                 tokio::time::timeout(
                     Duration::from_millis(30),
-                    broker.cancel_task_by_id("parent-conn", Some(1), &t1, "tool_stalled_timeout"),
+                    broker.cancel_task_by_id_with_termination(
+                        "parent-conn",
+                        Some(1),
+                        &t1,
+                        "tool_stalled_timeout",
+                        termination,
+                    ),
                 )
                 .await
             })
@@ -29762,6 +31967,23 @@ mod tests {
             store.persisted(&t1).await.error_code.as_deref(),
             Some("tool_stalled_timeout")
         );
+        let settle_calls = store.settle_calls().await;
+        let audit = settle_calls
+            .last()
+            .and_then(|(_, terminal)| terminal.termination_evidence())
+            .expect("typed watchdog termination evidence");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert_eq!(audit.termination.source, AcpTerminationSource::Watchdog);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ToolStalledTimeout
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::AutomatedAmbiguous
+        );
+        assert!(audit.termination.prompt_may_have_executed);
+        assert!(audit.termination.requested_at.is_none());
         assert_eq!(
             spawner.cancels.lock().await.as_slice(),
             &["child-conn-timeout".to_string()],
@@ -30222,6 +32444,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
         let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
@@ -30454,6 +32677,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
 
@@ -30470,9 +32694,14 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 "task-exist".into(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
-                    DelegationError::Unresumable("parked".into()),
-                    None,
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::from_err(
+                        DelegationError::Unresumable("parked".into()),
+                        None,
+                    ),
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
                 )),
             );
             inner.insert_completed(
@@ -30563,6 +32792,7 @@ mod tests {
                 observation: None,
                 last_agent_activity_at: None,
                 stalled_since: None,
+                recovery: None,
             }))
             .await;
 
@@ -30579,9 +32809,14 @@ mod tests {
             let mut inner = broker.pending.inner.lock().await;
             inner.closed_handoff_dispositions.insert(
                 "task-mismatch".into(),
-                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
-                    DelegationError::Unresumable("missing external session id".into()),
-                    None,
+                ReservingHandoffDisposition::ChildTerminal(observe_child_outcome(
+                    DelegationOutcome::from_err(
+                        DelegationError::Unresumable("missing external session id".into()),
+                        None,
+                    ),
+                    DelegationRunStatus::Reserving,
+                    false,
+                    Utc::now(),
                 )),
             );
         }
@@ -30766,6 +33001,7 @@ mod tests {
             observation: Some(snap.observation),
             last_agent_activity_at: Some(snap.last_agent_activity_at),
             stalled_since: snap.stalled_since,
+            recovery: None,
         }
     }
 
@@ -31683,11 +33919,9 @@ mod tests {
                     Utc::now(),
                     ConversationStatus::Cancelled,
                 ),
-                "canceled" => TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                "canceled" => {
+                    canceled_terminal("parent_canceled", DelegationRunStatus::Running, true)
+                }
                 _ => unreachable!(),
             };
             runs.settle_terminal(&task_id, terminal)
@@ -31772,11 +34006,9 @@ mod tests {
                     Utc::now(),
                     ConversationStatus::Cancelled,
                 ),
-                "canceled" => TerminalTaskWrite::canceled(
-                    "parent_canceled",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                "canceled" => {
+                    canceled_terminal("parent_canceled", DelegationRunStatus::Running, true)
+                }
                 _ => unreachable!(),
             };
             let child_id = seed_terminal_gen1_replay_run(
@@ -32108,6 +34340,7 @@ mod tests {
             child_connection_id: Set(None),
             replaced_task_id: Set(None),
             replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -32306,7 +34539,7 @@ mod tests {
     /// canceled child. Uses the post-admit gate so durable parent-end sweep can
     /// race the committed reservation deterministically.
     #[tokio::test]
-    async fn gen1_parent_cancel_after_admit_before_spawn_compensates_despite_parent_sweep() {
+    async fn termination_evidence_wave2_pre_spawn_parent_end_is_preprompt() {
         use crate::db::entities::conversation::{self, DelegationTaskStatus};
         use crate::db::entities::delegation_task_run::{
             self, DelegationRunStatus, Entity as DelegationTaskRun,
@@ -32385,6 +34618,7 @@ mod tests {
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        assert_inflight_parent_end_is_reserving_preprompt(&broker).await;
 
         let after_sweep = runs
             .load_by_task_id(&task_id)
@@ -32734,6 +34968,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -32777,6 +35012,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -32810,6 +35046,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -32846,6 +35083,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -32884,6 +35122,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -32962,6 +35201,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(
@@ -33059,6 +35299,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
+            recovery_authorization_id: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -33235,6 +35476,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(
@@ -33357,6 +35599,7 @@ mod tests {
                     error_code: None,
                     finished_at: None,
                     conversation_status: None,
+                    last_termination_audit_json: None,
                     started_at: None,
                     tool_call_count: Some(999),
                     edit_tool_call_count: Some(999),
@@ -33471,6 +35714,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33491,6 +35735,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33512,6 +35757,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33549,6 +35795,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -33825,6 +36072,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert!(cont.error_code.is_none(), "continue: {cont:?}");
@@ -33937,6 +36185,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(corr.into()),
+                recovery_authorization_id: None,
             })
             .await;
         drop(_guard);
@@ -34040,6 +36289,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
 
@@ -34125,6 +36375,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -34207,6 +36458,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -34319,9 +36571,18 @@ mod tests {
         let mut root_run = root_run.into_active_model();
         root_run.status = Set(DelegationRunStatus::Canceled);
         root_run.error_code = Set(Some("host_restarted".into()));
+        let observed_at = Utc::now();
         root_run.termination_audit_json = Set(Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
-                .into(),
+            serde_json::to_string(&termination_audit(
+                AcpTerminationSource::HostRestart,
+                AcpTerminationReason::HostRestarted,
+                AcpTerminationClassification::Unexpected,
+                DelegationRunStatus::Running,
+                true,
+                None,
+                observed_at,
+            ))
+            .expect("typed host-restart audit"),
         ));
         root_run
             .update(&db.conn)
@@ -34353,6 +36614,7 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        recovery_authorization_id: None,
                     })
                     .await
             })
@@ -34377,17 +36639,14 @@ mod tests {
 
         // Simulate a concurrent promotion taking the final charge slot while
         // this prompt is admitted but still gated in the mock transport.
-        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root_task_id)
-            .one(&db.conn)
-            .await
-            .expect("lineage budget lookup")
-            .expect("lineage budget created by reserve");
-        let mut budget = budget.into_active_model();
-        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
-        budget
-            .update(&db.conn)
-            .await
-            .expect("exhaust lineage budget");
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage_root_task_id),
+            unexpected_continue_count: Set(UNEXPECTED_CONTINUE_LIMIT),
+            replacement_count: Set(0),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("exhaust lineage budget");
 
         let _ = release.send(());
         let report = driver.await.expect("continue join");
@@ -34478,6 +36737,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -34547,6 +36807,80 @@ mod tests {
 
     /// Idempotent parent-tool replay of a successful admission_unknown
     /// replacement must carry the same warning as the fresh running ack.
+    async fn approve_replacement_recovery(
+        db: &crate::db::AppDatabase,
+        runs: &RunStore,
+        source_task_id: &str,
+        replacement_reason: crate::acp::delegation::recovery_policy::ReplacementReason,
+    ) -> String {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, RequestedRecoveryOperation,
+        };
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+
+        let source = runs
+            .load_by_task_id(source_task_id)
+            .await
+            .expect("load recovery source")
+            .expect("recovery source");
+        let eligibility = runs
+            .build_continue_eligibility(&source)
+            .await
+            .expect("build recovery eligibility");
+        let snapshot = crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+            &eligibility,
+        );
+        let operation = RequestedRecoveryOperation::Replace { replacement_reason };
+        let decision = decide_delegation_recovery(
+            &snapshot,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: eligibility.agent_supports_reuse,
+                unexpected_continue_budget_available: eligibility
+                    .unexpected_continue_budget_available,
+                replacement_budget_available: eligibility.replacement_budget_available,
+            },
+            operation.clone(),
+        );
+        assert!(decision.requires_authorization());
+        let projection =
+            crate::acp::delegation::types::DelegationRecoveryProjection::from(&decision);
+        let challenge = RecoveryChallenge {
+            parent_conversation_id: source.parent_conversation_id,
+            subject_kind: RecoverySubjectKind::DelegationTask,
+            subject_id: source.task_id.clone(),
+            delegation_identity: Some(DelegationAuthorizationIdentity {
+                source_task_id: source.task_id.clone(),
+                child_conversation_id: Some(source.child_conversation_id),
+                lineage_root_task_id: source.lineage_root_task_id.clone(),
+                work_unit_key: source.work_unit_key.clone(),
+            }),
+            source_state_fingerprint: decision.source_state_fingerprint,
+            allowed_action: RecoveryAllowedAction::Replace,
+            action_payload: crate::acp::delegation::run_store::recovery_action_payload(&operation),
+            cause_code: projection.cause_code,
+            risk_class: projection.risk_class,
+            display_reason: None,
+        };
+        let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+        let now = Utc::now();
+        let pending = authorizations
+            .insert_pending(&challenge, now)
+            .await
+            .expect("insert replacement authorization");
+        authorizations
+            .approve_pending(
+                &pending.authorization_id,
+                now,
+                now + chrono::Duration::minutes(10),
+            )
+            .await
+            .expect("approve replacement authorization");
+        pending.authorization_id
+    }
+
     #[tokio::test]
     async fn replacement_admission_unknown_idempotent_ack_includes_duplicate_execution_warning() {
         use crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
@@ -34626,12 +36960,18 @@ mod tests {
         })
         .await
         .expect("source reserve");
+        let finished_at = Utc::now();
         runs.settle_terminal(
             source_task_id,
-            TerminalTaskWrite::failed(
+            TerminalTaskWrite::failed_with_evidence(
                 "admission_unknown",
-                Utc::now(),
-                ConversationStatus::Cancelled,
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
+                    "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
+                    finished_at,
+                ),
             ),
         )
         .await
@@ -34642,6 +36982,15 @@ mod tests {
         replacement_request.work_unit_key = Some("adm-unk-idem-unit".into());
         replacement_request.replaces_task_id = Some(source_task_id.into());
         replacement_request.replacement_reason = Some("admission_unknown".into());
+        replacement_request.recovery_authorization_id = Some(
+            approve_replacement_recovery(
+                &db,
+                &runs,
+                source_task_id,
+                crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+            )
+            .await,
+        );
         let first = broker.start_delegation(replacement_request.clone()).await;
         assert_eq!(first.status, TaskStatus::Running, "{first:?}");
         assert!(
@@ -34772,12 +37121,18 @@ mod tests {
         })
         .await
         .expect("source reserve");
+        let finished_at = Utc::now();
         runs.settle_terminal(
             source_task_id,
-            TerminalTaskWrite::failed(
+            TerminalTaskWrite::failed_with_evidence(
                 "admission_unknown",
-                Utc::now(),
-                ConversationStatus::Cancelled,
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
+                    "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
+                    finished_at,
+                ),
             ),
         )
         .await
@@ -34795,6 +37150,15 @@ mod tests {
         replacement_request.work_unit_key = Some("adm-unk-unit".into());
         replacement_request.replaces_task_id = Some(source_task_id.into());
         replacement_request.replacement_reason = Some("admission_unknown".into());
+        replacement_request.recovery_authorization_id = Some(
+            approve_replacement_recovery(
+                &db,
+                &runs,
+                source_task_id,
+                crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+            )
+            .await,
+        );
         let replacement = broker.start_delegation(replacement_request).await;
         assert_eq!(
             replacement.status,
@@ -34853,7 +37217,8 @@ mod tests {
     /// after the durable commit returns, so only durable parent-tree settle
     /// can see the run.
     #[tokio::test]
-    async fn continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns() {
+    async fn termination_evidence_wave3_continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns(
+    ) {
         use crate::acp::delegation::types::ContinueDelegationRequest;
         use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
         use crate::db::service::conversation_service;
@@ -34913,6 +37278,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -34953,6 +37319,24 @@ mod tests {
             "parent end must settle durable reserving without an in-memory handoff"
         );
         assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+        let canceled_entity =
+            crate::db::entities::delegation_task_run::Entity::find_by_id(&continued_task_id)
+                .one(&db.conn)
+                .await
+                .expect("load canceled entity")
+                .expect("canceled entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            canceled_entity
+                .termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(
+            !audit.termination.prompt_may_have_executed,
+            "post-reserve/pre-handoff parent end is pre-prompt"
+        );
 
         let _ = release_tx.send(());
         let report = driver.await.expect("continue join");
@@ -35040,6 +37424,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35180,6 +37565,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35287,6 +37673,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35388,6 +37775,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35514,6 +37902,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35628,6 +38017,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -35722,6 +38112,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -35734,9 +38125,9 @@ mod tests {
 
     /// Admission-window disconnect on continue drains after promote.
     #[tokio::test]
-    async fn continue_admission_window_disconnect_drains_after_promote() {
+    async fn termination_evidence_wave2_buffered_admission_disconnect_keeps_observation() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
-        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::entities::{conversation, delegation_task_run};
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
@@ -35787,6 +38178,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -35795,14 +38187,18 @@ mod tests {
         let (continued_task_id, child_connection_id) = loop {
             if let Ok(Some(run)) = runs.load_by_parent_tool_use(parent.id, "tu-adm-disc").await {
                 if let Some(cid) = run.child_connection_id {
-                    break (run.task_id, cid);
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
+        let observed_before = Utc::now();
         broker
             .cancel_by_child_connection(&child_connection_id, None)
             .await;
+        let observed_after = Utc::now();
         assert_eq!(
             broker
                 .admission_buffer_len_for_test(&child_connection_id)
@@ -35818,8 +38214,49 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(continued.run_status, DelegationRunStatus::Running);
-        assert_ne!(continued.run_status, DelegationRunStatus::Reserving);
+        assert_ne!(
+            continued.run_status,
+            delegation_task_run::DelegationRunStatus::Running
+        );
+        assert_ne!(
+            continued.run_status,
+            delegation_task_run::DelegationRunStatus::Reserving
+        );
+        let continued_row = delegation_task_run::Entity::find_by_id(&continued_task_id)
+            .one(&db.conn)
+            .await
+            .expect("load continued run entity")
+            .expect("continued run entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            continued_row
+                .termination_audit_json
+                .as_deref()
+                .expect("typed child-disconnect audit"),
+        )
+        .expect("valid V1 audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            audit.termination.source,
+            AcpTerminationSource::ChildConnection
+        );
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ChildTerminal
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert!(audit.termination.prompt_may_have_executed);
+        assert!(audit.termination.requested_at.is_none());
+        assert!(
+            audit.termination.observed_at >= observed_before
+                && audit.termination.observed_at <= observed_after,
+            "buffer drain replaced original observation time: {} not in [{}, {}]",
+            audit.termination.observed_at,
+            observed_before,
+            observed_after
+        );
     }
 
     /// Parent cancel of a live running task with a real RunStore must not let
@@ -35827,7 +38264,8 @@ mod tests {
     /// Broker-level settle must still emit one terminal event, close attention,
     /// and drop the live registration.
     #[tokio::test]
-    async fn parent_cancel_running_with_run_store_emits_event_and_closes_attention() {
+    async fn termination_evidence_wave3_parent_cancel_running_with_run_store_emits_event_and_closes_attention(
+    ) {
         use crate::acp::delegation::attention::{
             mock::MemoryDelegationAttentionStore, AttentionResolutionCode, DelegationAttentionStore,
         };
@@ -35837,6 +38275,7 @@ mod tests {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-parent-cancel-running-sweep").await;
@@ -35917,6 +38356,25 @@ mod tests {
             .expect("row");
         assert_eq!(row.run_status, DelegationRunStatus::Canceled);
         assert_eq!(row.error_code.as_deref(), Some("parent_canceled"));
+        let row_entity = crate::db::entities::delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("load run entity")
+            .expect("run entity");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row_entity
+                .termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            row_entity.finished_at,
+            Some(audit.termination.observed_at),
+            "parent-end drain must use the producer observation as terminal time"
+        );
 
         let completed = events.snapshot().await;
         assert_eq!(
@@ -35940,6 +38398,69 @@ mod tests {
             "broker-level settle must unregister the live run"
         );
         assert!(!broker.is_running_for_test(&task_id).await);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_db_only_running_parent_end_uses_running_prompt_phase() {
+        use crate::db::entities::delegation_task_run;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-wave3-db-only-running").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("wave3 db-only running parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let child_connection_id = "wave3-db-only-running-child";
+        mock.queue_spawn(Ok(child_connection_id.into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "tu-wave3-db-only-running");
+        req.working_dir = Some(test_working_dir());
+        let ack = broker.start_delegation(req).await;
+        let task_id = ack.task_id.expect("running task id");
+        assert_eq!(ack.status, TaskStatus::Running);
+
+        // Simulate process-local recovery loss while the durable row remains
+        // Running. Parent-end must derive phase from that row, not root defaults.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.running.remove(&task_id);
+            inner.unregister_live_run(child_connection_id);
+        }
+        broker
+            .note_parent_conversation_for_test("parent-conn", parent.id)
+            .await;
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentTurnFailed)
+            .await;
+
+        let row = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row.termination_audit_json
+                .as_deref()
+                .expect("typed parent-end audit"),
+        )
+        .expect("valid parent-end audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentTurnFailed
+        );
     }
 
     /// Parent end while a child completion is mid-CAS (`settling`) must not let
@@ -36102,6 +38623,241 @@ mod tests {
         );
     }
 
+    struct Wave3ContinuePreParkFixture {
+        db: Arc<crate::db::AppDatabase>,
+        broker: Arc<DelegationBroker>,
+        continued_task_id: String,
+        child_connection_id: String,
+        release: tokio::sync::oneshot::Sender<()>,
+        driver: tokio::task::JoinHandle<DelegationTaskReport>,
+    }
+
+    async fn wave3_continue_pre_park_fixture(label: &str) -> Wave3ContinuePreParkFixture {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-wave3-pre-park-{label}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("wave3 pre-park {label}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok(format!("root-{label}"))).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, &format!("tu-wave3-root-{label}"));
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some(format!("wave3-pre-park-session-{label}")));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok(format!("continued-{label}"))).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_pre_park_gate(entered_tx, release_rx)
+            .await;
+        let parent_tool_use_id = format!("tu-wave3-continue-{label}");
+        let continue_request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: parent_tool_use_id.clone(),
+            target_task_id: root_task_id,
+            task: "continue into pre-park race".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: None,
+            recovery_authorization_id: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(continue_request).await })
+        };
+        entered_rx.await.expect("continue must reach pre-park gate");
+        let row = runs
+            .load_by_parent_tool_use(parent.id, &parent_tool_use_id)
+            .await
+            .expect("load continuation")
+            .expect("continuation row");
+        let child_connection_id = row
+            .child_connection_id
+            .clone()
+            .expect("continued child connection");
+
+        Wave3ContinuePreParkFixture {
+            db,
+            broker,
+            continued_task_id: row.task_id,
+            child_connection_id,
+            release,
+            driver,
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_parent_turn_failed_disposition_wins_exactly() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("parent-failed").await;
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T01:02:03Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                fixture.continued_task_id.clone(),
+                ReservingHandoffDisposition::ParentEnded(ParentEndContext::legacy(
+                    ParentTurnEndReason::ParentTurnFailed,
+                    observed_at,
+                    true,
+                )),
+            );
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let report = fixture.driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("parent_turn_failed"));
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(row.termination_audit_json.as_deref().expect("typed audit"))
+                .expect("valid audit");
+        assert_eq!(audit.termination.source, AcpTerminationSource::ParentTurn);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentTurnFailed
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert_eq!(audit.termination.observed_at, observed_at);
+        assert_eq!(row.finished_at, Some(observed_at));
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_child_terminal_disposition_wins_exactly() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("child-terminal").await;
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T02:03:04Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let observed = observe_child_outcome(
+            DelegationOutcome::Err {
+                code: "unresumable".into(),
+                message: "child terminal at producer".into(),
+                child_conversation_id: None,
+            },
+            DelegationRunStatus::Reserving,
+            true,
+            observed_at,
+        );
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                fixture.continued_task_id.clone(),
+                ReservingHandoffDisposition::ChildTerminal(observed),
+            );
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let report = fixture.driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 =
+            serde_json::from_str(row.termination_audit_json.as_deref().expect("typed audit"))
+                .expect("valid audit");
+        assert_eq!(
+            audit.termination.source,
+            AcpTerminationSource::ChildConnection
+        );
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ChildTerminal
+        );
+        assert_eq!(
+            audit.termination.classification,
+            AcpTerminationClassification::Unexpected
+        );
+        assert_eq!(audit.termination.observed_at, observed_at);
+        assert_eq!(row.finished_at, Some(observed_at));
+        assert_eq!(audit.prior_status, DelegationRunStatus::Reserving);
+        assert!(audit.termination.prompt_may_have_executed);
+    }
+
+    #[tokio::test]
+    async fn termination_evidence_wave3_pre_park_missing_disposition_uses_promoted_phase() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let fixture = wave3_continue_pre_park_fixture("fallback-phase").await;
+        {
+            let mut inner = fixture.broker.pending.inner.lock().await;
+            inner.unreserve(&fixture.continued_task_id, &fixture.child_connection_id);
+            inner.unregister_live_run(&fixture.child_connection_id);
+        }
+
+        let _ = fixture.release.send(());
+        let _ = fixture.driver.await.expect("continue join");
+        let row = delegation_task_run::Entity::find_by_id(&fixture.continued_task_id)
+            .one(&fixture.db.conn)
+            .await
+            .expect("load row")
+            .expect("row");
+        let audit: DelegationTerminationAuditV1 = serde_json::from_str(
+            row.termination_audit_json
+                .as_deref()
+                .expect("typed fallback audit"),
+        )
+        .expect("valid audit");
+        assert_eq!(audit.prior_status, DelegationRunStatus::Running);
+        assert!(audit.termination.prompt_may_have_executed);
+        assert_eq!(
+            audit.termination.reason,
+            AcpTerminationReason::ParentCanceled
+        );
+    }
+
     /// Parent cancel after the final open check claims the prompt-send lease
     /// (send gated) must close the handoff; after send completes the continue
     /// path must cancel the accepted prompt and report parent_canceled.
@@ -36161,6 +38917,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36270,6 +39027,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36416,6 +39174,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36578,6 +39337,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            recovery_authorization_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -36762,6 +39522,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
+                recovery_authorization_id: None,
             })
             .await;
 
@@ -36884,6 +39645,7 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
+            recovery_authorization_id: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -36986,6 +39748,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -37076,6 +39839,7 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
+                recovery_authorization_id: None,
             })
             .await;
         assert_eq!(
@@ -37248,5 +40012,343 @@ mod tests {
             not_ws.is_none(),
             "must not bind run under whitespace parent_tool_use_id"
         );
+    }
+
+    mod termination_evidence_wave4 {
+        use super::*;
+        use crate::db::entities::{conversation, delegation_task_run};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        struct BoundReservingFixture {
+            db: Arc<crate::db::AppDatabase>,
+            runs: RunStore,
+            broker: DelegationBroker,
+            task_id: String,
+            child_conversation_id: i32,
+        }
+
+        async fn bound_reserving_fixture(suffix: &str) -> BoundReservingFixture {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let folder = seed_folder(&db, &format!("/tmp/codeg-wave4-{suffix}")).await;
+            let parent = conversation_service::create(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("wave4 {suffix} parent")),
+                None,
+            )
+            .await
+            .expect("parent");
+            let task_id = format!("wave4-{suffix}-4111-8111-111111111111");
+            let child = conversation_service::create_with_delegation(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("wave4 {suffix} child")),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: format!("wave4-{suffix}-tool"),
+                    delegation_call_id: task_id.clone(),
+                }),
+            )
+            .await
+            .expect("child");
+            let runs = RunStore::new(db.clone());
+            let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                .expect("agent type json")
+                .as_str()
+                .expect("agent type string")
+                .to_string();
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some(format!("wave4-{suffix}-tool")),
+                child_conversation_id: child.id,
+                agent_type,
+                profile_id: None,
+                workspace_path: None,
+                route_fingerprint: None,
+                launch_snapshot_version: None,
+                mode_id: None,
+                config_values_json: None,
+                task_preview: Some("wave4 timestamp fallback".into()),
+                request_fingerprint: Some(format!("wave4-{suffix}-fingerprint")),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: None,
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("reserve");
+            runs.bind_child_connection_while_reserving(
+                &task_id,
+                format!("wave4-{suffix}-child-connection"),
+            )
+            .await
+            .expect("bind child connection");
+
+            BoundReservingFixture {
+                db,
+                runs,
+                broker: DelegationBroker::new(
+                    Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                    shallow_lookup(),
+                ),
+                task_id,
+                child_conversation_id: child.id,
+            }
+        }
+
+        async fn load_terminal_projection(
+            fixture: &BoundReservingFixture,
+        ) -> (
+            delegation_task_run::Model,
+            DelegationTerminationAuditV1,
+            conversation::Model,
+            DelegationTerminationAuditV1,
+        ) {
+            let run = delegation_task_run::Entity::find_by_id(&fixture.task_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load run")
+                .expect("run");
+            let run_audit: DelegationTerminationAuditV1 = serde_json::from_str(
+                run.termination_audit_json
+                    .as_deref()
+                    .expect("typed run audit"),
+            )
+            .expect("valid run audit");
+            let child = conversation::Entity::find_by_id(fixture.child_conversation_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load child")
+                .expect("child");
+            let child_audit: DelegationTerminationAuditV1 = serde_json::from_str(
+                child
+                    .last_termination_audit_json
+                    .as_deref()
+                    .expect("typed child audit"),
+            )
+            .expect("valid child audit");
+            (run, run_audit, child, child_audit)
+        }
+
+        #[tokio::test]
+        async fn parent_end_bound_reserving_fallback_keeps_observed_timestamp() {
+            let fixture = bound_reserving_fixture("parent-end").await;
+            let observed_at = DateTime::parse_from_rfc3339("2025-02-03T04:05:06.123456Z")
+                .expect("fixed timestamp")
+                .with_timezone(&Utc);
+            let context =
+                ParentEndContext::legacy(ParentTurnEndReason::ParentTurnFailed, observed_at, false);
+
+            let report = fixture
+                .broker
+                .cancel_admitted_gen1_pre_spawn(
+                    &fixture.runs,
+                    &fixture.task_id,
+                    fixture.child_conversation_id,
+                    context,
+                    AgentType::ClaudeCode,
+                    u64::MAX,
+                    "wave4 parent-end fallback",
+                )
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("parent_turn_failed"));
+
+            let (run, run_audit, child, child_audit) = load_terminal_projection(&fixture).await;
+            assert_eq!(run_audit.termination.observed_at, observed_at);
+            assert_eq!(run.finished_at, Some(observed_at));
+            assert_eq!(child.delegation_finished_at, Some(observed_at));
+            assert_eq!(child_audit.termination.observed_at, observed_at);
+            assert_eq!(child_audit, run_audit);
+        }
+
+        #[tokio::test]
+        async fn external_cancel_bound_reserving_fallback_keeps_requested_observed_timestamp() {
+            let fixture = bound_reserving_fixture("external-cancel").await;
+
+            let report = fixture
+                .broker
+                .cancel_admitted_gen1_pre_spawn_external(
+                    &fixture.runs,
+                    &fixture.task_id,
+                    fixture.child_conversation_id,
+                    AgentType::ClaudeCode,
+                    u64::MAX,
+                    "wave4 external-cancel fallback",
+                )
+                .await;
+            assert_eq!(report.error_code.as_deref(), Some("canceled"));
+
+            let (run, run_audit, child, child_audit) = load_terminal_projection(&fixture).await;
+            let observed_at = run_audit.termination.observed_at;
+            assert_eq!(run_audit.termination.requested_at, Some(observed_at));
+            assert_eq!(run.finished_at, Some(observed_at));
+            assert_eq!(child.delegation_finished_at, Some(observed_at));
+            assert_eq!(child_audit.termination.requested_at, Some(observed_at));
+            assert_eq!(child_audit.termination.observed_at, observed_at);
+            assert_eq!(child_audit, run_audit);
+        }
+    }
+
+    mod disconnect_origin {
+        use super::*;
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
+            RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::termination::{
+            AcpDisconnectOrigin, AcpTerminationClassification, AcpTerminationReason,
+            AcpTerminationSource, ParsedDelegationTermination,
+        };
+
+        #[tokio::test]
+        async fn typed_parent_connection_exit_preserves_producer_summary_and_timestamp() {
+            let spawner = Arc::new(MockSpawner::new());
+            let store = Arc::new(MockTaskStore::accept_any_running(42));
+            let broker = broker_with_store(spawner, store.clone());
+            broker
+                .seed_live_task_for_test("parent-conn", "disconnect-origin-task")
+                .await;
+
+            let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T04:05:06Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let requested_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T04:05:01Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let mut termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Frontend,
+                AcpTerminationReason::FrontendDisconnected,
+                AcpTerminationClassification::Intentional,
+                true,
+                observed_at,
+            );
+            termination.frontend_origin = Some(AcpDisconnectOrigin::ProviderUnmount);
+            termination.requested_at = Some(requested_at);
+            let context = ParentEndContext {
+                reason: ParentTurnEndReason::ParentDisconnected,
+                termination: termination.clone(),
+            };
+
+            broker
+                .cancel_by_parent_with_context("parent-conn", context)
+                .await;
+
+            let calls = store.settle_calls().await;
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]
+                    .1
+                    .termination_evidence()
+                    .expect("typed termination evidence")
+                    .termination,
+                termination
+            );
+            assert_eq!(calls[0].1.finished_at, observed_at);
+        }
+
+        #[tokio::test]
+        async fn typed_transport_cleanup_projects_automatic_unexpected_continue() {
+            let spawner = Arc::new(MockSpawner::new());
+            let store = Arc::new(MockTaskStore::accept_any_running(42));
+            let broker = broker_with_store(spawner, store.clone());
+            broker
+                .seed_live_task_for_test("parent-conn", "transport-loss-task")
+                .await;
+
+            let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T05:06:07Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                true,
+                observed_at,
+            );
+            broker
+                .cancel_by_parent_with_context(
+                    "parent-conn",
+                    ParentEndContext {
+                        reason: ParentTurnEndReason::ParentDisconnected,
+                        termination,
+                    },
+                )
+                .await;
+
+            let calls = store.settle_calls().await;
+            assert_eq!(calls.len(), 1);
+            let terminal = &calls[0].1;
+            assert_eq!(
+                terminal.error_code.as_deref(),
+                Some("transport_disconnected")
+            );
+            let source = RecoverySourceSnapshot {
+                source_task_id: "transport-loss-task".into(),
+                lineage_root_task_id: "transport-loss-task".into(),
+                generation: 1,
+                parent_conversation_id: 10,
+                child_conversation_id: 42,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some("C:/workspace".into()),
+                route_fingerprint: Some("route-1".into()),
+                work_unit_key: Some("transport-loss".into()),
+                parent_tool_use_id: Some("parent-tool".into()),
+                child_connection_id: Some("child-connection-transport-loss-task".into()),
+                history_only: false,
+                is_latest: true,
+                has_active_run: false,
+                child_superseded: false,
+                child_ownership_valid: true,
+                agent_type_matches: true,
+                run_status: DelegationRunStatus::Canceled,
+                error_code: terminal.error_code.clone(),
+                admission_class: AdmissionClass::NormalRevision,
+                parsed_termination: ParsedDelegationTermination::Typed(
+                    terminal
+                        .termination_evidence()
+                        .expect("cleanup termination evidence")
+                        .clone(),
+                ),
+                reached_running: true,
+                launch_snapshot_complete: true,
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: Some("default".into()),
+                config_values_json: Some("{}".into()),
+                external_session_identity_hash: Some(hash_external_session_identity("session-1")),
+                replaced_task_id: None,
+                replacement_reason: None,
+                recovery_authorization_id: None,
+            };
+            let decision = decide_delegation_recovery(
+                &source,
+                &RecoveryRailSnapshot {
+                    agent_supports_reuse: true,
+                    unexpected_continue_budget_available: true,
+                    replacement_budget_available: true,
+                },
+                RequestedRecoveryOperation::Inspect,
+            );
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue
+                }
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+        }
     }
 }

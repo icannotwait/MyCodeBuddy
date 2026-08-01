@@ -453,7 +453,21 @@ export async function acpAnswerQuestion(
   })
 }
 
+export type AcpDisconnectOrigin =
+  | "explicit_user"
+  | "provider_unmount"
+  | "disconnect_all"
+  | "application_shutdown"
+  | "connection_superseded"
+  | "idle_timeout"
+  | "config_reapply"
+  | "draft_retarget"
+  | "abandoned_connect"
+  | "internal_job_complete"
+  | "legacy_unspecified"
+
 export type AcpDisconnectLease = {
+  origin?: AcpDisconnectOrigin
   expectedOwnerWindow?: string | null
   expectedOperationId?: string | null
   expectedOwnershipGeneration?: number | null
@@ -484,6 +498,7 @@ export async function acpDisconnect(
 ): Promise<void> {
   return getTransport().call("acp_disconnect", {
     connectionId,
+    origin: lease?.origin ?? "legacy_unspecified",
     expectedOwnerWindow: lease?.expectedOwnerWindow ?? null,
     expectedOperationId: lease?.expectedOperationId ?? null,
     expectedOwnershipGeneration: lease?.expectedOwnershipGeneration ?? null,

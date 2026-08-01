@@ -21,11 +21,62 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const realSkill = readFileSync(join(__dirname, "..", "SKILL.md"), "utf8")
 
+const RULE_ID_RE = /^\[([A-Z0-9-]+)\]\s/
+
+function failureRuleIds(failures) {
+  return failures.map((failure) => {
+    const match = failure.match(RULE_ID_RE)
+    assert.ok(match, `failure lacks stable rule id: ${failure}`)
+    return match[1]
+  })
+}
+
+function assertHasRuleId(failures, expected) {
+  assert.ok(
+    failureRuleIds(failures).includes(expected),
+    `expected ${expected}; got: ${failures.join("; ")}`
+  )
+}
+
 const RECOVERY_PARAGRAPH = `Recovery is index-first. Treat recovery_sources and
 actionable_task_routes as authoritative. Read each workspace report_file before
 settlement, use get_session_info for bounded child transcripts, and use
 get_delegation_status for selected run outcomes. Never depend on
 inline finding summaries.
+
+Recovery is status-first and resume-first. Cancellation-family evidence never
+maps to unresumable, and tool_stalled_timeout is not a replacement source.
+For tool_stalled_timeout, use a confirmed same-key continue; only genuine
+unexpected transport loss may continue without confirmation when central policy permits.
+
+Delegation recovery follows this exact ordered recipe: make the projected call;
+receive typed recovery_confirmation_required; call
+request_recovery_authorization; then replay the exact rejected continue or
+replacement call with recovery_authorization_id and the same key, profile, and
+action. Never persist recovery_authorization_id in status, ledger, report, or card.
+
+Workflow recovery follows this exact ordered recipe: get_workflow_state; call
+request_recovery_authorization; then call receipt-required recover_workflow.
+An enabled catalog missing recover_workflow hard-blocks. recover_workflow never
+generates a challenge. user_decision_required requires exact reset_plan_lineage
+authorization tied to the displayed reason hash; its receipt is the durable
+requirements-change reason and begins a new authorized stagnation baseline.
+
+First admission freezes the key, role, agent, profile, and inherited continue
+and replacement counters. Pre-admission profile or route correction is a
+material Plan revision. Recovery never changes key/profile or resets inherited
+consumption. Exhausted continue uses same-key budget_exhausted_continue replacement
+only while replacement budget remains; after replacement consumption, block.
+
+A platform-harvested and validated card settles. Failed or unavailable harvest
+degrades the child and requires same-child continue to re-emit the card; prose
+never settles. Normal Task review independently recomputes b2d_task_risk_v1;
+migration, security/authorization, concurrency, persistence/state-machine,
+externally visible compatibility, and ambiguity each trigger external Design review.
+
+Before every delegation or continue, write ledger intent with intended key,
+role, agent, profile, and action. Fill latest_task_id after admission and
+reconcile from platform state after recovery.
 `
 
 /** Minimal skill that satisfies all contracts (hand-maintained fixture). */
@@ -61,6 +112,16 @@ description: Use when a Codeg conversation provides a completed Brainstorm file 
 
 # Brainstorm to Delivery
 
+## Codeg roles and tools
+
+| Route | Role | Agent |
+| --- | --- | --- |
+| Normal | Implementer / fixer | Grok |
+| Normal | Independent reviewer | Codex |
+| High | Implementer / fixer | Codex |
+| High | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
+| High | Independent reviewer 2 | Grok (independent child) |
+
 A Codex Plan Author owns every Plan. Parent must not implement Task code.
 Parent must not write or rewrite the Plan. Author owns the Plan file and all
 revisions. Invoke subagent-driven-development and writing-plans by name.
@@ -75,6 +136,15 @@ Full-group reset for material changes. Two non-improving rounds trigger stagnati
 Pre-admission risk correction uses material Plan revision. Post-admission uses cohort_frozen.
 
 ${route}
+
+## Quick reference under pressure
+
+- Design Gate approved -> dispatch Plan Author automatically.
+- Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.
+- Task Gate passed -> dispatch the next eligible Task or Final review automatically.
+- Final review approved -> verify, commit, and report automatically.
+- Only pause for a hard block, user_decision_required, or an unresolved choice that changes requirements, scope, architecture, or user data handling.
+- If state is stale, call get_workflow_state and continue without extra user approval.
 
 ${overrides.extra ?? ""}
 `
@@ -119,10 +189,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex |
 | Independent reviewer 2 | Grok |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) => /normal route table must map Implementer/i.test(f)),
-      `expected normal implementer failure, got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -143,10 +212,9 @@ describe("validateRouteTables", () => {
 | Implementer / fixer | Codex |
 | Independent reviewer | Codex |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) => /two distinct Independent reviewer/i.test(f)),
-      `expected dual-reviewer failure, got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -168,13 +236,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex |
 | Independent reviewer 2 | Codex |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some(
-        (f) =>
-          /Codex AND Grok/i.test(f) || /two distinct reviewer agents/i.test(f)
-      ),
-      `expected distinct high reviewers failure, got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -201,10 +265,7 @@ describe("validateRouteTables", () => {
       extra: `## Notes\n\nRemember: high gate is strict AND somewhere else.\n`,
     })
     const { failures } = validateSkillMarkdown(skill)
-    assert.ok(
-      failures.some((f) => /high route/i.test(f) && /reviewer/i.test(f)),
-      `strict AND outside tables must not mask one-reviewer high table; got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(failures, "B2D-007")
   })
 
   it("parses role/agent rows from real skill Task route tables", () => {
@@ -235,10 +296,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
 | Independent reviewer 2 | Grok (independent child) |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) => /normal|exact|mixed|identity|implementer/i.test(f)),
-      `mixed normal implementer must fail; got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -260,12 +320,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex or Grok |
 | Independent reviewer 2 | Grok |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) =>
-        /high|exact|mixed|identity|implementer|reviewer/i.test(f)
-      ),
-      `mixed high cells must fail; got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -288,10 +345,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
 | Independent reviewer 2 | Grok (independent child) |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) => /extra|exact|unexpected|row|mapping/i.test(f)),
-      `extra normal row must fail; got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -314,10 +370,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 2 | Grok |
 | Independent reviewer 3 | Codex |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) => /high/i.test(f)),
-      `non-exact high mapping must fail; got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 
@@ -376,12 +431,9 @@ describe("validateRouteTables", () => {
 | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
 | Independent reviewer 2 | Grok (independent child) |
 `
-    const failures = validateRouteTables(section)
-    assert.ok(
-      failures.some((f) =>
-        /parenthetical|mixed|exact|identity|fallback/i.test(f)
-      ),
-      `parenthetical identity smuggling must fail; got: ${failures.join("; ")}`
+    assertHasRuleId(
+      validateSkillMarkdown(baseValidSkill({ route: section })).failures,
+      "B2D-007"
     )
   })
 })
@@ -687,11 +739,7 @@ describe("validateParentOwnership", () => {
 Parent must not implement Task code. Parent must not write or rewrite the Plan.
 Parent writes the Plan when urgency requires it.
 `
-    const { failures } = validateParentOwnership(skill)
-    assert.ok(
-      failures.some((f) => /parent|Plan|authorship|permission/i.test(f)),
-      `expected contradictory ownership failure, got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-006")
   })
 
   it("rejects parent instructed to invoke writing-plans itself", () => {
@@ -699,11 +747,7 @@ Parent writes the Plan when urgency requires it.
 Parent must not implement Task code. Parent must not write or rewrite the Plan.
 使用 \`writing-plans\` 编写任何实施计划
 `
-    const { failures } = validateParentOwnership(skill)
-    assert.ok(
-      failures.some((f) => /writing-plans|parent authorship/i.test(f)),
-      `expected parent writing-plans failure, got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-006")
   })
 
   it("rejects Parent writes Task code with urgency clause despite Author-owns", () => {
@@ -711,11 +755,7 @@ Parent must not implement Task code. Parent must not write or rewrite the Plan.
 Parent must not implement Task code. Parent must not write or rewrite the Plan.
 Parent writes Task code when urgency requires it.
 `
-    const { failures } = validateParentOwnership(skill)
-    assert.ok(
-      failures.some((f) => /Task code|parent authorship|permission/i.test(f)),
-      `expected Task code permission failure, got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-006")
   })
 
   it("rejects Parent implements Task and Parent writes Plan without modal verbs", () => {
@@ -724,15 +764,7 @@ Parent must not implement Task code. Parent must not write or rewrite the Plan.
 Parent implements Task.
 Parent writes Plan.
 `
-    const { failures } = validateParentOwnership(skill)
-    assert.ok(
-      failures.some((f) => /parent/i.test(f)),
-      `expected direct parent permission failures, got: ${failures.join("; ")}`
-    )
-    assert.ok(
-      failures.length >= 1,
-      `expected at least one ownership failure, got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-006")
   })
 
   it("preserves legitimate prohibition text without treating it as permission", () => {
@@ -764,11 +796,7 @@ Parent does not implement Task code.
 Parent must not implement Task code. Parent must not write or rewrite the Plan.
 Parent must not wait; Parent writes Task code when urgency requires it.
 `
-    const { failures } = validateParentOwnership(skill)
-    assert.ok(
-      failures.some((f) => /Task code|parent authorship|permission/i.test(f)),
-      `line-level prohibition must not mask permission; got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-006")
   })
 
   it("rejects the exact comma-but Task-writing mutation", () => {
@@ -898,20 +926,8 @@ describe("index-first recovery contract", () => {
   it("reports every recovery requirement when the paragraph is removed", () => {
     const mutated = baseValidSkill().replace(RECOVERY_PARAGRAPH, "")
     const { failures } = validateSkillMarkdown(mutated)
-
-    for (const label of [
-      "recovery_sources",
-      "actionable_task_routes",
-      "report_file",
-      "get_session_info",
-      "get_delegation_status",
-      "inline finding summaries compatibility warning",
-    ]) {
-      assert.ok(
-        failures.some((failure) => failure.includes(label)),
-        `missing mutation failure for ${label}; got: ${failures.join("; ")}`
-      )
-    }
+    const ids = failureRuleIds(failures)
+    assert.equal(ids.filter((id) => id === "B2D-003").length, 6)
   })
 })
 
@@ -921,10 +937,7 @@ describe("forbidden literals", () => {
       extra: "Do not use workflow_manifest_v1 under any circumstances.\n",
     })
     const { failures } = validateSkillMarkdown(skill)
-    assert.ok(
-      failures.some((f) => /workflow_manifest_v1/i.test(f)),
-      `negated forbidden token must still fail; got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(failures, "B2D-001")
   })
 
   it("rejects schema_version = 1 on a never-use line", () => {
@@ -932,10 +945,7 @@ describe("forbidden literals", () => {
       extra: "Never set schema_version = 1 for manifests.\n",
     })
     const { failures } = validateSkillMarkdown(skill)
-    assert.ok(
-      failures.some((f) => /schema_version/i.test(f)),
-      `got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(failures, "B2D-001")
   })
 
   it("rejects pair_frozen even when saying avoid pair_frozen", () => {
@@ -943,10 +953,7 @@ describe("forbidden literals", () => {
       extra: "Avoid pair_frozen; use cohort_frozen instead.\n",
     })
     const { failures } = validateSkillMarkdown(skill)
-    assert.ok(
-      failures.some((f) => /pair_frozen/i.test(f)),
-      `got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(failures, "B2D-001")
   })
 
   it("rejects mode=legacy on a ban line", () => {
@@ -954,10 +961,7 @@ describe("forbidden literals", () => {
       extra: "mode=legacy is forbidden.\n",
     })
     const { failures } = validateSkillMarkdown(skill)
-    assert.ok(
-      failures.some((f) => /mode=legacy|mode\s*=\s*legacy/i.test(f)),
-      `got: ${failures.join("; ")}`
-    )
+    assertHasRuleId(failures, "B2D-001")
   })
 })
 
@@ -1006,6 +1010,873 @@ describe("phase-transition pressure reference", () => {
     assert.match(
       quickReference,
       /do not request[\s\S]*?(?:extra )?user approval/i
+    )
+  })
+})
+
+describe("stable validator rule ids", () => {
+  const mutationCases = [
+    ["B2D-001", (skill) => `${skill}\nworkflow_manifest_v1\n`],
+    [
+      "B2D-002",
+      (skill) => skill.replace(/reviewer_cohort_node_ids/g, "reviewer cohort"),
+    ],
+    ["B2D-003", (skill) => skill.replace(/recovery_sources/g, "sources")],
+    [
+      "B2D-004",
+      (skill) =>
+        skill.replace(
+          /description:.*$/m,
+          "description: Use when running the high route and stagnation workflow."
+        ),
+    ],
+    ["B2D-005", (skill) => `${skill}${"padding\n".repeat(501)}`],
+    ["B2D-006", (skill) => `${skill}\nParent drafts the Plan.\n`],
+    [
+      "B2D-007",
+      (skill) =>
+        skill.replace(
+          "| Implementer / fixer | Grok |",
+          "| Implementer / fixer | Codex |"
+        ),
+    ],
+    [
+      "B2D-008",
+      (skill) => `${skill}\nHigh route may pass with one reviewer.\n`,
+    ],
+    ["B2D-009", (skill) => skill.replace(/reviewed_task_id/g, "task id")],
+    [
+      "B2D-010",
+      (skill) =>
+        skill.replace(
+          /Two non-improving rounds trigger stagnation handling\./,
+          ""
+        ),
+    ],
+    [
+      "B2D-011",
+      (skill) =>
+        skill.replace(/subagent-driven-development/g, "delegated development"),
+    ],
+  ]
+
+  for (const [ruleId, mutate] of mutationCases) {
+    it(`uses ${ruleId} for its existing fixture family`, () => {
+      const { failures } = validateSkillMarkdown(mutate(baseValidSkill()))
+      assertHasRuleId(failures, ruleId)
+    })
+  }
+
+  it("positive fixture has no failure ids", () => {
+    const { failures } = validateSkillMarkdown(baseValidSkill())
+    assert.deepEqual(failureRuleIds(failures), [])
+  })
+})
+
+describe("B2D-012 automatic phase transition contract", () => {
+  const requiredLines = [
+    "Design Gate approved -> dispatch Plan Author automatically.",
+    "Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.",
+    "Task Gate passed -> dispatch the next eligible Task or Final review automatically.",
+    "Final review approved -> verify, commit, and report automatically.",
+  ]
+
+  for (const requiredLine of requiredLines) {
+    it(`rejects removal of ${requiredLine}`, () => {
+      const { failures } = validateSkillMarkdown(
+        baseValidSkill().replace(requiredLine, "")
+      )
+      assertHasRuleId(failures, "B2D-012")
+    })
+  }
+
+  it("rejects an extra user-approval pause", () => {
+    const { failures } = validateSkillMarkdown(
+      baseValidSkill({
+        extra: "Pause for user approval before starting every next phase.\n",
+      })
+    )
+    assertHasRuleId(failures, "B2D-012")
+  })
+
+  for (const condition of [
+    "hard block",
+    "user_decision_required",
+    "requirements, scope, architecture, or user data handling",
+  ]) {
+    it(`rejects omission of hard pause condition ${condition}`, () => {
+      const { failures } = validateSkillMarkdown(
+        baseValidSkill().replace(condition, "ordinary work")
+      )
+      assertHasRuleId(failures, "B2D-012")
+    })
+  }
+})
+
+describe("authoritative route surface parity", () => {
+  it("uses B2D-013 when the top normal row is mutated", () => {
+    const skill = baseValidSkill().replace(
+      "| Normal | Implementer / fixer | Grok |",
+      "| Normal | Implementer / fixer | Codex |"
+    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-013")
+  })
+
+  it("uses B2D-013 when the top high row is removed", () => {
+    const skill = baseValidSkill().replace(
+      "| High | Independent reviewer 2 | Grok (independent child) |\n",
+      ""
+    )
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-013")
+  })
+
+  it("uses B2D-014 when only the numbered route differs", () => {
+    const firstNumbered = baseValidSkill().lastIndexOf(
+      "| Implementer / fixer | Grok |"
+    )
+    const skill = `${baseValidSkill().slice(0, firstNumbered)}| Implementer / fixer | Codex |${baseValidSkill().slice(firstNumbered + "| Implementer / fixer | Grok |".length)}`
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-014")
+  })
+})
+
+describe("authorized recovery validator contract", () => {
+  const recoveryTokenActions = [
+    [
+      "request_recovery_authorization",
+      "call",
+      "called",
+      "Call request_recovery_authorization for the rejected action.",
+    ],
+    [
+      "recovery_authorization_id",
+      "supply",
+      "supplied",
+      "Replay the exact rejected recovery call and supply recovery_authorization_id.",
+    ],
+    [
+      "recovery_confirmation_required",
+      "surface",
+      "surfaced",
+      "Surface typed recovery_confirmation_required from the projected call.",
+    ],
+    [
+      "recover_workflow",
+      "call",
+      "called",
+      "After authorization, call receipt-required recover_workflow.",
+    ],
+  ]
+
+  const operationalPositiveClauses = [
+    ["request_recovery_authorization", "call request_recovery_authorization"],
+    [
+      "recovery_authorization_id",
+      "then replay the exact rejected continue or replacement call with recovery_authorization_id and the same key, profile, and action",
+    ],
+    [
+      "recovery_authorization_id",
+      "supply recovery_authorization_id as input on the exact rejected recovery replay call",
+    ],
+    [
+      "recovery_authorization_id",
+      "pass recovery_authorization_id to the exact rejected continue replay call",
+    ],
+    [
+      "recovery_authorization_id",
+      "use recovery_authorization_id on the exact rejected recover_workflow replay call",
+    ],
+    [
+      "recovery_authorization_id",
+      "then replay the exact rejected recover_workflow call with recovery_authorization_id",
+    ],
+    [
+      "recovery_confirmation_required",
+      "receive typed recovery_confirmation_required",
+    ],
+    ["recover_workflow", "then call receipt-required recover_workflow"],
+  ]
+
+  for (const [token, , , positiveClause] of recoveryTokenActions) {
+    it(`uses B2D-R001 when ${token} is absent`, () => {
+      const { failures } = validateSkillMarkdown(
+        baseValidSkill().replaceAll(token, `missing_${token}`)
+      )
+      assertHasRuleId(failures, "B2D-R001")
+    })
+
+    it(`accepts an explicit positive recovery-use clause for ${token}`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const failures = validateSkillMarkdown(
+        `${stripped}\n${positiveClause}\n`
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    })
+
+    it(`uses B2D-R001 when ${token} appears only in a negated sentence`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const { failures } = validateSkillMarkdown(
+        `${stripped}\nNever call ${token}.\n`
+      )
+      assertHasRuleId(failures, "B2D-R001")
+    })
+
+    it(`uses B2D-R001 when ${token} has a negated call despite the positive recipe`, () => {
+      const extra =
+        token === "recovery_authorization_id"
+          ? `Do not use ${token} for the replay.\n`
+          : `Do not call ${token} during recovery.\n`
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra })).failures,
+        "B2D-R001"
+      )
+    })
+
+    it(`uses B2D-R001 when ${token} is negated after the token`, () => {
+      const extra = `${token} must never be supplied during recovery.\n`
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra })).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  for (const [token, mutation] of [
+    [
+      "request_recovery_authorization",
+      "request_recovery_authorization must never be called during recovery, even when a status report permits replay.",
+    ],
+    [
+      "recovery_authorization_id",
+      "recovery_authorization_id must never be supplied to a recovery call, even when status permits replay.",
+    ],
+    [
+      "recovery_confirmation_required",
+      "recovery_confirmation_required must never be honored during recovery, even when a report permits replay.",
+    ],
+    [
+      "recover_workflow",
+      "recover_workflow must never be called during recovery, even when the process may create a challenge.",
+    ],
+  ]) {
+    it(`uses B2D-R001 for ambiguous negation of ${token}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  const boundedNegativeConstructions = [
+    ["forbidden", ({ token }) => `${token} is forbidden during recovery.`],
+    ["prohibited", ({ token }) => `${token} is prohibited during recovery.`],
+    [
+      "under no circumstances",
+      ({ token, passive }) =>
+        `${token} must under no circumstances be ${passive} during recovery.`,
+    ],
+    [
+      "not allowed",
+      ({ token, passive }) =>
+        `${token} is not allowed to be ${passive} during recovery.`,
+    ],
+    [
+      "not permitted",
+      ({ token, passive }) =>
+        `${token} is not permitted to be ${passive} during recovery.`,
+    ],
+    [
+      "must not",
+      ({ token, passive }) =>
+        `${token} must not be ${passive} during recovery.`,
+    ],
+    [
+      "should not",
+      ({ token, passive }) =>
+        `${token} should not be ${passive} during recovery.`,
+    ],
+    [
+      "may not",
+      ({ token, passive }) => `${token} may not be ${passive} during recovery.`,
+    ],
+    [
+      "do not",
+      ({ token, active }) => `Do not ${active} ${token} during recovery.`,
+    ],
+    [
+      "not",
+      ({ token, passive }) =>
+        `${token} is not to be ${passive} during recovery.`,
+    ],
+    [
+      "never",
+      ({ token, passive }) =>
+        `${token} must never be ${passive} during recovery.`,
+    ],
+    [
+      "cannot",
+      ({ token, passive }) => `${token} cannot be ${passive} during recovery.`,
+    ],
+    [
+      "shall not",
+      ({ token, passive }) =>
+        `${token} shall not be ${passive} during recovery.`,
+    ],
+    [
+      "must be forbidden",
+      ({ token }) => `${token} must be forbidden during recovery.`,
+    ],
+    [
+      "must be prohibited",
+      ({ token }) => `${token} must be prohibited during recovery.`,
+    ],
+    [
+      "must be avoided",
+      ({ token }) => `${token} must be avoided during recovery.`,
+    ],
+    [
+      "usage is forbidden",
+      ({ token }) => `${token} usage is forbidden during recovery.`,
+    ],
+    ["is disallowed", ({ token }) => `${token} is disallowed during recovery.`],
+  ]
+  for (const [token, active, passive] of recoveryTokenActions) {
+    for (const [construction, mutation] of boundedNegativeConstructions) {
+      it(`uses B2D-R001 when ${token} is negated with ${construction}`, () => {
+        const extra = mutation({ token, active, passive })
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${extra}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+  }
+
+  for (const [token, active] of recoveryTokenActions) {
+    for (const ambiguous of [
+      `${token} is part of the recovery vocabulary.`,
+      `Document ${token} semantics for operators.`,
+      `${token} appears in the recovery contract.`,
+    ]) {
+      it(`uses B2D-R001 for ambiguous ${token} prose: ${ambiguous}`, () => {
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${ambiguous}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+
+    it(`lets negative suffix semantics dominate positive ${token} noise`, () => {
+      const mixed = `${active[0].toUpperCase()}${active.slice(1)} ${token} during recovery but its usage is forbidden after authorization.`
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mixed}\n` })).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  const reviewerRegressions = [
+    "Require full v2 tool set (never call recover_workflow).",
+    "Require full v2 tool set (recover_workflow is prohibited during recovery).",
+    "Call request_recovery_authorization for the rejected action, but not during recovery.",
+    "Use recovery_authorization_id in the exact status projection.",
+    "Use recovery_authorization_id on the exact rejected recovery replay, but it isn't allowed.",
+    "The phrase call recover_workflow appears in documentation.",
+    "The phrase call request_recovery_authorization appears in documentation.",
+    "The phrase surface recovery_confirmation_required appears in documentation.",
+    "The phrase use recovery_authorization_id in the exact rejected replay appears in documentation.",
+  ]
+  for (const sentence of reviewerRegressions) {
+    it(`uses B2D-R001 for reviewer regression: ${sentence}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${sentence}\n` }))
+          .failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  const negativeSuffixes = [
+    ", but not during recovery",
+    ", but this usage isn't allowed during recovery",
+    ", but this usage isn’t allowed during recovery",
+    ", but these calls aren't allowed during recovery",
+    ", but the action wasn't allowed during recovery",
+    ", but the actions weren't allowed during recovery",
+    ", but this can't occur during recovery",
+    ", but this cannot occur during recovery",
+    ", but don't do so during recovery",
+    ", but the runtime doesn't permit it during recovery",
+    ", but the runtime doesn’t permit it during recovery",
+    ", but the runtime won't permit it during recovery",
+    ", but the runtime wouldn't permit it during recovery",
+    ", but the runtime shouldn't permit it during recovery",
+    ", but the runtime mustn't permit it during recovery",
+    ", but it may not occur during recovery",
+    ", but it shall not occur during recovery",
+    ", but it ought not occur during recovery",
+    ", but by no means during recovery",
+    ", but under no circumstances during recovery",
+    ", but without recovery permission",
+    ", but its usage is forbidden during recovery",
+    ", but its usage is prohibited during recovery",
+    ", but its usage is disallowed during recovery",
+    ", but its usage must be avoided during recovery",
+    ", but its usage is not allowed during recovery",
+    ", but its usage is not permitted during recovery",
+  ]
+  for (const [token, , , positiveClause] of recoveryTokenActions) {
+    const positivePrefix = positiveClause.replace(/[.!?;]+$/, "")
+    for (const suffix of negativeSuffixes) {
+      it(`lets ${suffix.slice(6)} negate positive ${token} use`, () => {
+        const mixed = `${positivePrefix}${suffix}.`
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${mixed}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+  }
+
+  for (const [token, , , positiveClause] of recoveryTokenActions) {
+    for (const metaClause of [
+      `The phrase ${positiveClause.replace(/[.!?;]+$/, "")} appears in documentation.`,
+      `Operators quote "${positiveClause.replace(/[.!?;]+$/, "")}" in reports.`,
+    ]) {
+      it(`does not count meta/documentation mention of ${token} as affirmative`, () => {
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${metaClause}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+  }
+
+  for (const [token, productionClause] of operationalPositiveClauses) {
+    it(`recognizes the real Skill operational clause for ${token}`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const failures = validateSkillMarkdown(
+        `${stripped}\n${productionClause}.\n`
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    })
+  }
+
+  for (const privacyClause of [
+    "Never project recovery_authorization_id into status projections.",
+    "Do not include recovery_authorization_id in cards or reports.",
+    "The runtime shall not expose recovery_authorization_id in metrics.",
+    "recovery_authorization_id must not be persisted in ledgers.",
+    "recovery_authorization_id is prohibited from being projected into reports.",
+    "recovery_authorization_id must under no circumstances be exposed in metrics.",
+    "recovery_authorization_id is prohibited from being projected into reports and must under no circumstances be exposed in metrics.",
+  ]) {
+    it(`allows bounded authorization-ID privacy guidance: ${privacyClause}`, () => {
+      const failures = validateSkillMarkdown(
+        baseValidSkill({ extra: `${privacyClause}\n` })
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    })
+  }
+
+  for (const replayProhibition of [
+    "recovery_authorization_id is prohibited from being supplied to recovery replay.",
+    "Do not include recovery_authorization_id in the exact recovery call.",
+    "recovery_authorization_id must under no circumstances be passed to recover_workflow replay.",
+  ]) {
+    it(`does not neutralize a replay prohibition: ${replayProhibition}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `${replayProhibition}\n` })
+        ).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  it("preserves privacy, challenge, and cancellation safe controls", () => {
+    const safeControls = `Never persist recovery_authorization_id in status projections, ledgers, reports, cards, or metrics.
+recover_workflow never generates a challenge.
+Never map cancellation to unresumable.`
+    const failures = validateSkillMarkdown(
+      baseValidSkill({ extra: `${safeControls}\n` })
+    ).failures
+    const ids = failureRuleIds(failures)
+    assert.ok(!ids.includes("B2D-R001"))
+    assert.ok(!ids.includes("B2D-R003"))
+  })
+
+  it("runs production recovery polarity probes against the real Skill", () => {
+    const reviewerProhibitions = [
+      ...reviewerRegressions,
+      "recover_workflow is forbidden during recovery.",
+      "request_recovery_authorization is prohibited during recovery.",
+      "recovery_authorization_id must under no circumstances be supplied during recovery.",
+    ]
+    for (const clause of reviewerProhibitions) {
+      assertHasRuleId(
+        validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+        "B2D-R001"
+      )
+    }
+
+    for (const [
+      token,
+      active,
+      passive,
+      operationalClause,
+    ] of recoveryTokenActions) {
+      for (const [, mutation] of boundedNegativeConstructions) {
+        const clause = mutation({ token, active, passive })
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+          "B2D-R001"
+        )
+      }
+
+      for (const clause of [
+        `${token} belongs to the recovery vocabulary.`,
+        `${active[0].toUpperCase()}${active.slice(1)} ${token} during recovery but its usage is forbidden after authorization.`,
+      ]) {
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+          "B2D-R001"
+        )
+      }
+
+      const positiveClause = operationalClause.replace(/[.!?;]+$/, "")
+      for (const suffix of negativeSuffixes) {
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${positiveClause}${suffix}.\n`)
+            .failures,
+          "B2D-R001"
+        )
+      }
+
+      for (const metaClause of [
+        `The phrase ${positiveClause} appears in documentation.`,
+        `Operators quote "${positiveClause}" in reports.`,
+      ]) {
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${metaClause}\n`).failures,
+          "B2D-R001"
+        )
+      }
+    }
+
+    for (const clause of [
+      "Never project recovery_authorization_id into status projections, reports, cards, or metrics.",
+      "The runtime shall not expose recovery_authorization_id in metrics.",
+      "recovery_authorization_id is prohibited from being projected into reports and must under no circumstances be exposed in metrics.",
+    ]) {
+      const failures = validateSkillMarkdown(
+        `${realSkill}\n${clause}\n`
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    }
+  })
+
+  for (const [token, safeNegative] of [
+    [
+      "recovery_authorization_id",
+      "Never persist recovery_authorization_id in status, ledger, report, or card.",
+    ],
+    [
+      "recover_workflow",
+      "An enabled catalog missing recover_workflow hard-blocks. recover_workflow never generates a challenge.",
+    ],
+  ]) {
+    it(`does not count safe negative ${token} guidance as affirmative`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const restoredSafeNegative = safeNegative.replaceAll(
+        `missing_${token}`,
+        token
+      )
+      assertHasRuleId(
+        validateSkillMarkdown(`${stripped}\n${restoredSafeNegative}\n`)
+          .failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  const sequenceMutations = [
+    "Call request_recovery_authorization before recovery_confirmation_required.",
+    "After authorization, construct a similar replacement call instead of replaying the exact rejected call.",
+    "After rejection, change the key and profile before replaying the action.",
+  ]
+  for (const mutation of sequenceMutations) {
+    it(`uses B2D-R002 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R002"
+      )
+    })
+  }
+
+  for (const cause of [
+    "parent_canceled",
+    "parent_turn_failed",
+    "join_abandoned",
+    "user_cancelled",
+    "tool_stalled_timeout",
+  ]) {
+    it(`uses B2D-R003 when ${cause} maps affirmatively to unresumable`, () => {
+      const skill = baseValidSkill({
+        extra: `${cause} maps directly to replacement_reason=unresumable.\n`,
+      })
+      assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-R003")
+    })
+  }
+
+  it("allows a direct cancellation prohibition", () => {
+    const failures = validateSkillMarkdown(
+      baseValidSkill({ extra: "Never map cancellation to unresumable.\n" })
+    ).failures
+    assert.ok(!failureRuleIds(failures).includes("B2D-R003"))
+  })
+
+  it("allows a direct stall prohibition", () => {
+    const failures = validateSkillMarkdown(
+      baseValidSkill({
+        extra: "tool_stalled_timeout is not a replacement source.\n",
+      })
+    ).failures
+    assert.ok(!failureRuleIds(failures).includes("B2D-R003"))
+  })
+
+  it("allows an all-safe multi-cause cancellation clause", () => {
+    const failures = validateSkillMarkdown(
+      baseValidSkill({
+        extra:
+          "parent_canceled is not a replacement source and parent_turn_failed never maps to unresumable and join_abandoned is not a replacement source and user_cancelled never maps to replacement and tool_stalled_timeout is not a replacement source.\n",
+      })
+    ).failures
+    assert.ok(!failureRuleIds(failures).includes("B2D-R003"))
+  })
+
+  it("does not let unrelated negation mask an affirmative mapping", () => {
+    for (const mutation of [
+      "Never discard work; parent_canceled maps to replacement_reason=unresumable.",
+      "Never discard work, parent_canceled maps to replacement_reason=unresumable.",
+      "Never lose history, tool_stalled_timeout maps to replacement_reason=unresumable.",
+      "parent_canceled is not a replacement source but tool_stalled_timeout maps to replacement_reason=unresumable.",
+    ]) {
+      const skill = baseValidSkill({ extra: `${mutation}\n` })
+      assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-R003")
+    }
+  })
+
+  for (const mutation of [
+    "tool_stalled_timeout continues without confirmation.",
+    "tool_stalled_timeout continues automatically.",
+    "tool_stalled_timeout uses replacement before continue.",
+  ]) {
+    it(`uses B2D-R004 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R004"
+      )
+    })
+  }
+
+  for (const mutation of [
+    "Call recover_workflow before request_recovery_authorization.",
+    "Workflow recovery may skip get_workflow_state when the id is known.",
+    "An enabled catalog missing recover_workflow may proceed with a fallback.",
+  ]) {
+    it(`uses B2D-R005 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R005"
+      )
+    })
+  }
+
+  it("uses B2D-R006 for an unreceipted lineage reset", () => {
+    const skill = baseValidSkill({
+      extra:
+        "user_decision_required may reset the Plan lineage without reset_plan_lineage authorization, displayed reason hash, or a new baseline.\n",
+    })
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-R006")
+  })
+
+  for (const mutation of [
+    "Recovery may change the admitted key or profile.",
+    "Recovery resets inherited continue and replacement consumption.",
+  ]) {
+    it(`uses B2D-R007 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R007"
+      )
+    })
+  }
+
+  for (const mutation of [
+    "Reject a platform-harvested and validated card.",
+    "Prose approval settles the recovery card.",
+    "A degraded child may finish without same-child card re-emission.",
+  ]) {
+    it(`uses B2D-R008 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R008"
+      )
+    })
+  }
+
+  const designTriggers = [
+    "Migration",
+    "Security/authorization",
+    "Concurrency",
+    "Persistence/state-machine",
+    "Externally visible compatibility",
+    "Ambiguity",
+  ]
+  for (const mutation of [
+    "Normal Task review copies b2d_task_risk_v1 from the manifest.",
+    ...designTriggers.flatMap((trigger) => [
+      `${trigger} does not trigger external Design review.`,
+      `${trigger} never triggers external Design review.`,
+      `${trigger} must never trigger external Design review.`,
+      `${trigger} should not trigger external Design review.`,
+      `${trigger} never triggers an external Design review.`,
+    ]),
+  ]) {
+    it(`uses B2D-R009 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R009"
+      )
+    })
+  }
+
+  for (const control of designTriggers.flatMap((trigger) => [
+    `${trigger} must trigger an external Design review.`,
+    `${trigger} may trigger an external Design review.`,
+  ])) {
+    it(`allows positive Design-trigger modal control: ${control}`, () => {
+      const failures = validateSkillMarkdown(
+        baseValidSkill({ extra: `${control}\n` })
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R009"))
+    })
+  }
+
+  for (const mutation of [
+    "At continue exhaustion, mint a new key and profile.",
+    "At continue exhaustion, replace with replacement_reason=unresumable.",
+    "After replacement consumption, replace again.",
+  ]) {
+    it(`uses B2D-R010 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R010"
+      )
+    })
+  }
+
+  for (const mutation of [
+    "Write ledger intent after the delegation mutation.",
+    "Ledger intent may omit intended action and identity.",
+    "Skip platform-state reconciliation after recovery.",
+  ]) {
+    it(`uses B2D-R011 for ${mutation}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mutation}\n` }))
+          .failures,
+        "B2D-R011"
+      )
+    })
+  }
+})
+
+describe("expanded Parent ownership grammar", () => {
+  for (const verb of [
+    "draft",
+    "drafts",
+    "drafting",
+    "drafted",
+    "compose",
+    "composes",
+    "composing",
+    "composed",
+    "generate",
+    "generates",
+    "generating",
+    "generated",
+  ]) {
+    it(`uses B2D-006 for Parent ${verb} Plan`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `Parent ${verb} the Plan.\n` })
+        ).failures,
+        "B2D-006"
+      )
+    })
+
+    it(`uses B2D-006 for Parent ${verb} Task code`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `Parent ${verb} Task code.\n` })
+        ).failures,
+        "B2D-006"
+      )
+    })
+  }
+
+  for (const verb of [
+    "起草",
+    "拟写",
+    "编写",
+    "撰写",
+    "创作",
+    "生成",
+    "改写",
+    "重写",
+    "编辑",
+    "修改",
+  ]) {
+    it(`uses B2D-006 for 父会话${verb} Plan`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `父会话${verb} Plan。\n` })
+        ).failures,
+        "B2D-006"
+      )
+    })
+
+    it(`uses B2D-006 for 父会话${verb} Task code`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `父会话${verb} Task code。\n` })
+        ).failures,
+        "B2D-006"
+      )
+    })
+  }
+
+  it("allows action-scoped negative controls and coordination artifacts", () => {
+    const skill = baseValidSkill({
+      extra: `Parent must not draft or compose the Plan.
+父会话不得编写 Plan。
+Parent drafts the Task brief and composes review findings.
+`,
+    })
+    assert.ok(
+      !failureRuleIds(validateSkillMarkdown(skill).failures).includes("B2D-006")
     )
   })
 })

@@ -916,6 +916,7 @@ mod tests {
                         },
                     ],
                     is_secret: false,
+                    recovery: None,
                 }],
             )
             .await

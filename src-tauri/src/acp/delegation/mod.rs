@@ -45,6 +45,7 @@ pub mod live_reply;
 pub mod meta_writer;
 pub mod metrics;
 pub mod parent_watcher;
+pub mod recovery_policy;
 pub mod route;
 pub mod run_identity;
 pub mod run_store;

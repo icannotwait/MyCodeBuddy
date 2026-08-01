@@ -94,4 +94,28 @@ describe("tab-store draft delegation route override", () => {
     expect(tab?.conversationId).toBe(99)
     expect(tab?.delegationRouteOverride).toBeUndefined()
   })
+
+  it("labels draft route retarget teardown", async () => {
+    const acpDisconnect = vi.fn(async () => {})
+    useTabStore.getState().setSideEffects({
+      activateConversationPane: () => {},
+      acpDisconnect,
+    })
+    useTabStore.setState({
+      rawTabs: [draftTab({ id: "route-retarget", folderId: 0, isChat: true })],
+      activeTabId: "route-retarget",
+    })
+
+    useTabStore
+      .getState()
+      .openNewConversationTab(2, "/repo/two", { inheritFromActive: true })
+    useTabStore.getState().consumeDraftRetargets()
+
+    await vi.waitFor(() => {
+      expect(acpDisconnect).toHaveBeenCalledWith(
+        "route-retarget",
+        "draft_retarget"
+      )
+    })
+  })
 })
