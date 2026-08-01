@@ -344,3 +344,74 @@ Commands ran from the repository root.
 Only the validator library, its tests, and this report changed. Rust,
 frontend, approved Designs, implementation plan, stashes, and shipped Skill
 prose were not modified. No full repository matrix was run.
+
+## Whole-branch Important fix wave, round 5 (2026-08-01)
+
+Validator implementation commit:
+
+- `bdbb9e73d88045ed017c2ddc59da9ebcec0efdc3` `fix validator clause polarity hardening`
+
+### Design rationale
+
+Round 4 established tri-state polarity but still evaluated safe-neutral before
+negative evidence and used substring-style affirmative checks. Round 5 now
+normalizes each bounded clause once, including curly apostrophes, detects the
+complete negative grammar first, and permits a negative clause to become
+neutral only when that entire normalized clause matches an anchored
+safe-neutral grammar. Non-negative safe catalog clauses remain neutral;
+otherwise only anchored token-specific operational clauses are affirmative,
+and every unmatched clause is invalid under stable rule `B2D-R001`.
+
+The authorization-ID privacy grammar remains restricted to persistence,
+projection, or exposure actions and status projections, ledgers, reports,
+cards, or metrics. The workflow safe grammar now accepts only the exact shipped
+five-tool capability sentence, enabled-catalog hard block, catalog-requirement
+cell, and challenge-generation prohibition. Positive clauses are anchored to
+the shipped confirmation response, authorization request, receipt-required
+workflow call, quick-reference sequences, or exact rejected-call replay with
+the authorization ID bound directly as input. Documentation wrappers, quoted
+examples, arbitrary capability parentheses, status projection use, and mixed
+positive/negative clauses therefore fail closed. Skill prose was unchanged.
+
+### RED evidence
+
+Commands ran from the repository root.
+
+- Direct production-validator probe against the real Skill before test edits:
+  all 9 representative reviewer bypasses were incorrectly accepted, including
+  both arbitrary capability-parenthetical clauses, bare `not`, the status
+  projection ID use, the contracted ID prohibition, and all four meta mentions.
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED, 483 selected; 410 passed and 73 intended regressions failed. Failures
+  covered the reviewer table, missing negative constructions across all four
+  recovery terms, and quoted/documentation clauses. Existing production
+  positive and safe-control cases remained green.
+- `node --test --test-name-pattern "recognizes the real Skill operational clause for recovery_authorization_id" .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED for the added cross-token replay control, 5 selected; 4 passed and 1
+  failed because replay-led `recover_workflow` was valid for the ID grammar but
+  still invalid for the embedded workflow token.
+
+### GREEN evidence
+
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  12 suites and 499 tests passed, 0 failed.
+- `node --test --test-name-pattern "recognizes the real Skill operational clause for recovery_authorization_id" .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  5 selected tests passed, 0 failed.
+- `node --test --test-name-pattern "production recovery polarity probes" .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  1 selected test passed with 211 direct assertions against the real Skill: 12
+  reviewer regressions, 72 bounded negative constructions, 108 mixed
+  positive/negative suffix cases, 8 ambiguous/mixed legacy cases, 8
+  documentation wrappers, and 3 safe privacy controls.
+- `node .agents/skills/brainstorm-to-delivery/scripts/validate-contract.mjs`:
+  the real shipped Skill passed 36 checks with 0 failures.
+- `node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs; node --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  both files passed Node syntax checks.
+- `pnpm exec prettier --check .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  both files passed.
+- `pnpm exec eslint --no-ignore .agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  passed with no findings.
+- `git diff --check`: passed.
+
+Only the validator library, its tests, and this report changed. Rust,
+frontend, approved Designs, implementation plan, stashes, and shipped Skill
+prose were not modified. No full repository matrix was run.
