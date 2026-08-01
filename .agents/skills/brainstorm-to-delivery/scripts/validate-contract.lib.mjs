@@ -116,19 +116,50 @@ function normalizedRecoveryClause(clause) {
     .trim()
 }
 
-function isSafeNegatedRecoveryClause(clause, token) {
-  const normalized = normalizedRecoveryClause(clause)
-  if (token === "recovery_authorization_id") {
-    const target =
-      "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics)"
-    const targetList = `${target}(?:\\s*(?:,\\s*(?:and|or)?\\s*|\\s+(?:and|or)\\s+)${target})*`
-    return new RegExp(
-      `^(?:never|do not|must not|should not)\\s+` +
-        `(?:persist|store|project|expose|include|write|record)\\s+` +
-        `(?:the\\s+)?recovery_authorization_id\\s+` +
-        `(?:in|into|on|to)\\s+(?:the\\s+)?${targetList}$`,
+function isAuthorizationIdPrivacyClause(normalized) {
+  const id = "(?:the\\s+)?recovery_authorization_id"
+  const target =
+    "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics)"
+  const targets = `${target}(?:\\s*,\\s*${target})*(?:\\s*,?\\s+(?:and|or)\\s+${target})?`
+  const destination = `(?:in|into|on|to)\\s+(?:the\\s+)?${targets}`
+  const activeAction = "(?:persist|store|project|expose|include|write|record)"
+  const passiveAction =
+    "(?:persisted|stored|projected|exposed|included|written|recorded)"
+  const imperativeControl =
+    "(?:never|do\\s+not|must\\s+not|should\\s+not|shall\\s+not|may\\s+not|under\\s+no\\s+circumstances|must\\s+under\\s+no\\s+circumstances)"
+  const activeSubject =
+    "(?:the\\s+)?(?:runtime|system|workflow|implementation|validator|broker|client|codeg)"
+  const subjectControl =
+    "(?:(?:must|should|shall|may|does|will|can)\\s+(?:not|never)|(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances)"
+  const passiveControl =
+    `(?:` +
+    `(?:must|should|shall|may|will|can)\\s+(?:not|never)\\s+be\\s+${passiveAction}|` +
+    `(?:must|should|shall|may|will|can)\\s+under\\s+no\\s+circumstances\\s+be\\s+${passiveAction}|` +
+    `is\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}|` +
+    `is\\s+not\\s+(?:allowed|permitted)\\s+to\\s+be\\s+${passiveAction}|` +
+    `(?:must|should|shall|may)\\s+be\\s+(?:forbidden|prohibited|disallowed)\\s+from\\s+being\\s+${passiveAction}` +
+    `)\\s+${destination}`
+
+  return (
+    new RegExp(
+      `^${imperativeControl}\\s+${activeAction}\\s+${id}\\s+${destination}$`,
+      "i"
+    ).test(normalized) ||
+    new RegExp(
+      `^${activeSubject}\\s+${subjectControl}\\s+${activeAction}\\s+${id}\\s+${destination}$`,
+      "i"
+    ).test(normalized) ||
+    new RegExp(
+      `^${id}\\s+${passiveControl}(?:\\s+and\\s+${passiveControl})*$`,
       "i"
     ).test(normalized)
+  )
+}
+
+function isSafeNeutralRecoveryClause(clause, token) {
+  const normalized = normalizedRecoveryClause(clause)
+  if (token === "recovery_authorization_id") {
+    return isAuthorizationIdPrivacyClause(normalized)
   }
   if (token === "recover_workflow") {
     return (
@@ -137,35 +168,90 @@ function isSafeNegatedRecoveryClause(clause, token) {
       ) ||
       /^recover_workflow\s+(?:never|(?:(?:must|should|does|do|will|would|can|could|may)\s+not))\s+(?:generates?|creates?|opens?|mints?)\s+(?:a\s+)?challenge$/i.test(
         normalized
+      ) ||
+      /^Require\s+(?:the\s+)?full\s+v2\s+tool\s+set\s+\([^)]*\brecover_workflow\b[^)]*\)$/i.test(
+        normalized
+      ) ||
+      /(?:^|\|\s*)Workflow\s+recovery\s+requires\s+recover_workflow$/i.test(
+        normalized
       )
     )
   }
   return false
 }
 
-function hasRecoverySuffixNegation(afterToken) {
-  const suffix = afterToken.slice(0, 180)
-  const separator = "\\s*(?:[,():-]\\s*)?"
+function hasExplicitNegativeRecoverySemantics(clause) {
+  const normalized = normalizedRecoveryClause(clause)
   return (
-    new RegExp(
-      `^${separator}` +
-        `(?:(?:must|should|does|do|is|are|was|were|will|would|can|could|may)\\s+)?` +
-        `(?:not|never|cannot|can't)\\b`,
-      "i"
-    ).test(suffix) ||
-    new RegExp(
-      `^${separator}` +
-        `(?:is|are|was|were|be|being)\\s+` +
-        `(?:strictly\\s+)?(?:forbidden|prohibited)\\b`,
-      "i"
-    ).test(suffix) ||
-    new RegExp(
-      `^${separator}` +
-        `(?:(?:must|should|will|would|can|could|may)\\s+)?` +
-        `under\\s+no\\s+circumstances\\b`,
-      "i"
-    ).test(suffix)
+    /\b(?:never|cannot|can't|forbid(?:s|den|ding)?|prohibit(?:s|ed|ing)?|disallow(?:s|ed|ing)?|avoid(?:s|ed|ing)?)\b/i.test(
+      normalized
+    ) ||
+    /\bunder\s+no\s+circumstances\b/i.test(normalized) ||
+    /\b(?:do|does|did|must|shall|should|may|can|could|will|would|is|are|was|were|be|being)\s+(?:\w+\s+){0,2}not\b/i.test(
+      normalized
+    ) ||
+    /\bnot\s+(?:allowed|permitted)\b/i.test(normalized)
   )
+}
+
+function isExplicitPositiveRecoveryClause(clause, token) {
+  const normalized = normalizedRecoveryClause(clause)
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const arrowTransition = new RegExp(
+    `(?:->|→)\\s*(?:typed\\s+|receipt-required\\s+)?${escaped}\\s*(?:->|→)`,
+    "i"
+  )
+
+  if (token === "recovery_confirmation_required") {
+    return (
+      new RegExp(
+        `\\b(?:receive|emit|surface|return|project)(?:s|d|ed)?\\s+(?:a\\s+)?(?:typed\\s+)?${escaped}\\b`,
+        "i"
+      ).test(normalized) || arrowTransition.test(normalized)
+    )
+  }
+  if (token === "request_recovery_authorization") {
+    return (
+      new RegExp(`\\b(?:call|invoke)\\s+(?:the\\s+)?${escaped}\\b`, "i").test(
+        normalized
+      ) || arrowTransition.test(normalized)
+    )
+  }
+  if (token === "recovery_authorization_id") {
+    const exactReplay = /\b(?:exact|replay|rejected)\b/i.test(normalized)
+    const supplied = new RegExp(
+      `\\b(?:supply|pass|use)(?:es|s|ed|ing)?\\s+(?:the\\s+)?${escaped}\\b`,
+      "i"
+    ).test(normalized)
+    const replayWithId = new RegExp(
+      `\\b(?:replay|call)\\b[^.!?;]{0,140}\\b(?:with|using)\\s+(?:the\\s+)?${escaped}\\b`,
+      "i"
+    ).test(normalized)
+    return exactReplay && (supplied || replayWithId)
+  }
+  if (token === "recover_workflow") {
+    return (
+      new RegExp(
+        `\\b(?:call|invoke)\\s+(?:receipt-required\\s+)?${escaped}\\b`,
+        "i"
+      ).test(normalized) ||
+      new RegExp(
+        `\\brequest_recovery_authorization\\b\\s*(?:->|→)\\s*receipt-required\\s+${escaped}\\b`,
+        "i"
+      ).test(normalized)
+    )
+  }
+  return false
+}
+
+function recoveryClauses(skill) {
+  return skill.split(/\r?\n\s*\r?\n/).flatMap((paragraph) => {
+    const lines = paragraph.split(/\r?\n/).filter((line) => line.trim())
+    const bounded = lines.every((line) => /^\s*\|/.test(line))
+      ? lines
+      : [lines.join(" ")]
+    return bounded.flatMap((clause) => clause.split(/(?<=[.!?;])/))
+  })
 }
 
 function recoveryTokenMentions(skill, token) {
@@ -175,35 +261,18 @@ function recoveryTokenMentions(skill, token) {
     "g"
   )
   const mentions = []
-  const clauses = skill
-    .split(/\r?\n\s*\r?\n/)
-    .flatMap((paragraph) =>
-      paragraph.replace(/\r?\n/g, " ").split(/(?<=[.!?;])/)
-    )
+  const clauses = recoveryClauses(skill)
   for (const clause of clauses) {
     exactToken.lastIndex = 0
-    for (const match of clause.matchAll(exactToken)) {
-      const tokenStart = match.index + match[1].length
-      const tokenEnd = tokenStart + token.length
-      const before = clause.slice(Math.max(0, tokenStart - 180), tokenStart)
-      const after = clause.slice(
-        tokenEnd,
-        Math.min(clause.length, tokenEnd + 180)
-      )
-      const prefixNegated =
-        /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\s+(?:[A-Za-z0-9_-]+\s+){0,12}$/i.test(
-          before
-        )
-      const suffixNegated = hasRecoverySuffixNegation(after)
-      const negated = prefixNegated || suffixNegated
-      const polarity =
-        negated && isSafeNegatedRecoveryClause(clause, token)
-          ? "neutral"
-          : negated
-            ? "negated"
-            : "affirmative"
-      mentions.push({ polarity })
-    }
+    if (!exactToken.test(clause)) continue
+    const polarity = isSafeNeutralRecoveryClause(clause, token)
+      ? "neutral"
+      : hasExplicitNegativeRecoverySemantics(clause)
+        ? "negated"
+        : isExplicitPositiveRecoveryClause(clause, token)
+          ? "affirmative"
+          : "invalid"
+    mentions.push({ polarity })
   }
   return mentions
 }
@@ -214,9 +283,10 @@ function affirmativeTokenMention(skill, token) {
   )
 }
 
-function hasNegatedTokenMention(skill, token) {
+function hasInvalidTokenMention(skill, token) {
   return recoveryTokenMentions(skill, token).some(
-    (mention) => mention.polarity === "negated"
+    (mention) =>
+      mention.polarity === "negated" || mention.polarity === "invalid"
   )
 }
 
@@ -1308,7 +1378,7 @@ export function validateSkillMarkdown(skill) {
   for (const token of RECOVERY_CONTRACT_TERMS) {
     if (
       !affirmativeTokenMention(skill, token) ||
-      hasNegatedTokenMention(skill, token)
+      hasInvalidTokenMention(skill, token)
     ) {
       fail("B2D-R001", `missing affirmative recovery contract term: ${token}`)
     }

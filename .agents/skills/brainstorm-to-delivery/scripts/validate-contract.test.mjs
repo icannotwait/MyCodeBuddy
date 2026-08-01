@@ -1140,17 +1140,47 @@ describe("authoritative route surface parity", () => {
 })
 
 describe("authorized recovery validator contract", () => {
-  for (const token of [
-    "request_recovery_authorization",
-    "recovery_authorization_id",
-    "recovery_confirmation_required",
-    "recover_workflow",
-  ]) {
+  const recoveryTokenActions = [
+    [
+      "request_recovery_authorization",
+      "call",
+      "called",
+      "Call request_recovery_authorization for the rejected action.",
+    ],
+    [
+      "recovery_authorization_id",
+      "supply",
+      "supplied",
+      "Replay the exact rejected recovery call and supply recovery_authorization_id.",
+    ],
+    [
+      "recovery_confirmation_required",
+      "surface",
+      "surfaced",
+      "Surface typed recovery_confirmation_required from the projected call.",
+    ],
+    [
+      "recover_workflow",
+      "call",
+      "called",
+      "After authorization, call receipt-required recover_workflow.",
+    ],
+  ]
+
+  for (const [token, , , positiveClause] of recoveryTokenActions) {
     it(`uses B2D-R001 when ${token} is absent`, () => {
       const { failures } = validateSkillMarkdown(
         baseValidSkill().replaceAll(token, `missing_${token}`)
       )
       assertHasRuleId(failures, "B2D-R001")
+    })
+
+    it(`accepts an explicit positive recovery-use clause for ${token}`, () => {
+      const stripped = baseValidSkill().replaceAll(token, `missing_${token}`)
+      const failures = validateSkillMarkdown(
+        `${stripped}\n${positiveClause}\n`
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
     })
 
     it(`uses B2D-R001 when ${token} appears only in a negated sentence`, () => {
@@ -1208,12 +1238,6 @@ describe("authorized recovery validator contract", () => {
     })
   }
 
-  const recoveryTokenActions = [
-    ["request_recovery_authorization", "call", "called"],
-    ["recovery_authorization_id", "supply", "supplied"],
-    ["recovery_confirmation_required", "honor", "honored"],
-    ["recover_workflow", "call", "called"],
-  ]
   const boundedNegativeConstructions = [
     ["forbidden", ({ token }) => `${token} is forbidden during recovery.`],
     ["prohibited", ({ token }) => `${token} is prohibited during recovery.`],
@@ -1264,6 +1288,28 @@ describe("authorized recovery validator contract", () => {
       "cannot",
       ({ token, passive }) => `${token} cannot be ${passive} during recovery.`,
     ],
+    [
+      "shall not",
+      ({ token, passive }) =>
+        `${token} shall not be ${passive} during recovery.`,
+    ],
+    [
+      "must be forbidden",
+      ({ token }) => `${token} must be forbidden during recovery.`,
+    ],
+    [
+      "must be prohibited",
+      ({ token }) => `${token} must be prohibited during recovery.`,
+    ],
+    [
+      "must be avoided",
+      ({ token }) => `${token} must be avoided during recovery.`,
+    ],
+    [
+      "usage is forbidden",
+      ({ token }) => `${token} usage is forbidden during recovery.`,
+    ],
+    ["is disallowed", ({ token }) => `${token} is disallowed during recovery.`],
   ]
   for (const [token, active, passive] of recoveryTokenActions) {
     for (const [construction, mutation] of boundedNegativeConstructions) {
@@ -1277,6 +1323,107 @@ describe("authorized recovery validator contract", () => {
       })
     }
   }
+
+  for (const [token, active] of recoveryTokenActions) {
+    for (const ambiguous of [
+      `${token} is part of the recovery vocabulary.`,
+      `Document ${token} semantics for operators.`,
+      `${token} appears in the recovery contract.`,
+    ]) {
+      it(`uses B2D-R001 for ambiguous ${token} prose: ${ambiguous}`, () => {
+        assertHasRuleId(
+          validateSkillMarkdown(baseValidSkill({ extra: `${ambiguous}\n` }))
+            .failures,
+          "B2D-R001"
+        )
+      })
+    }
+
+    it(`lets negative suffix semantics dominate positive ${token} noise`, () => {
+      const mixed = `${active[0].toUpperCase()}${active.slice(1)} ${token} during recovery but its usage is forbidden after authorization.`
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra: `${mixed}\n` })).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  for (const privacyClause of [
+    "Never project recovery_authorization_id into status projections.",
+    "Do not include recovery_authorization_id in cards or reports.",
+    "The runtime shall not expose recovery_authorization_id in metrics.",
+    "recovery_authorization_id must not be persisted in ledgers.",
+    "recovery_authorization_id is prohibited from being projected into reports.",
+    "recovery_authorization_id must under no circumstances be exposed in metrics.",
+    "recovery_authorization_id is prohibited from being projected into reports and must under no circumstances be exposed in metrics.",
+  ]) {
+    it(`allows bounded authorization-ID privacy guidance: ${privacyClause}`, () => {
+      const failures = validateSkillMarkdown(
+        baseValidSkill({ extra: `${privacyClause}\n` })
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    })
+  }
+
+  for (const replayProhibition of [
+    "recovery_authorization_id is prohibited from being supplied to recovery replay.",
+    "Do not include recovery_authorization_id in the exact recovery call.",
+    "recovery_authorization_id must under no circumstances be passed to recover_workflow replay.",
+  ]) {
+    it(`does not neutralize a replay prohibition: ${replayProhibition}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseValidSkill({ extra: `${replayProhibition}\n` })
+        ).failures,
+        "B2D-R001"
+      )
+    })
+  }
+
+  it("runs production recovery polarity probes against the real Skill", () => {
+    const reviewerProhibitions = [
+      "recover_workflow is forbidden during recovery.",
+      "request_recovery_authorization is prohibited during recovery.",
+      "recovery_authorization_id must under no circumstances be supplied during recovery.",
+    ]
+    for (const clause of reviewerProhibitions) {
+      assertHasRuleId(
+        validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+        "B2D-R001"
+      )
+    }
+
+    for (const [token, active, passive] of recoveryTokenActions) {
+      for (const [, mutation] of boundedNegativeConstructions) {
+        const clause = mutation({ token, active, passive })
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+          "B2D-R001"
+        )
+      }
+
+      for (const clause of [
+        `${token} belongs to the recovery vocabulary.`,
+        `${active[0].toUpperCase()}${active.slice(1)} ${token} during recovery but its usage is forbidden after authorization.`,
+      ]) {
+        assertHasRuleId(
+          validateSkillMarkdown(`${realSkill}\n${clause}\n`).failures,
+          "B2D-R001"
+        )
+      }
+    }
+
+    for (const clause of [
+      "Never project recovery_authorization_id into status projections, reports, cards, or metrics.",
+      "The runtime shall not expose recovery_authorization_id in metrics.",
+      "recovery_authorization_id is prohibited from being projected into reports and must under no circumstances be exposed in metrics.",
+    ]) {
+      const failures = validateSkillMarkdown(
+        `${realSkill}\n${clause}\n`
+      ).failures
+      assert.ok(!failureRuleIds(failures).includes("B2D-R001"))
+    }
+  })
 
   for (const [token, safeNegative] of [
     [
