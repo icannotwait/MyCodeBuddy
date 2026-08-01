@@ -10213,7 +10213,7 @@ impl DelegationBroker {
         );
         let mut report = parent_end_setup_report(
             agent_type,
-            ParentTurnEndReason::ParentCanceled,
+            ParentEndContext::legacy(ParentTurnEndReason::ParentCanceled, Utc::now(), true),
             Some(child_conversation_id),
         );
         report.task_id = Some(task_id.to_string());

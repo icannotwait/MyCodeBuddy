@@ -727,6 +727,7 @@ fn is_admission_recovery_error_code(code: Option<&str>) -> bool {
     matches!(code, Some("admission_failed") | Some("admission_unknown"))
 }
 
+#[cfg(test)]
 fn replacement_reason_matches_source(
     reason: &str,
     source: &PersistedRun,
