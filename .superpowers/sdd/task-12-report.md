@@ -415,3 +415,87 @@ Commands ran from the repository root.
 Only the validator library, its tests, and this report changed. Rust,
 frontend, approved Designs, implementation plan, stashes, and shipped Skill
 prose were not modified. No full repository matrix was run.
+
+## Final desktop matrix fix wave (2026-08-01)
+
+Implementation commit:
+
+- `7e2e57041a729e442005d75c4f3872c2fa13e11e` `fix(recovery): align final matrix policy tests`
+
+### Root cause and correction
+
+- The recovery-authorization catalog retained every approved structured result
+  field and action-specific metadata contract, but the expanded prose made the
+  Grok `tools/list` JSONL line 7,683 bytes. Replacing only `Structured results
+  include` with `Results include` reduced the line to 7,672 bytes without
+  raising the fixed 7,680-byte budget.
+- The explicit-cancel admission test removed the source external session
+  identity but still requested `not_supported`. Structural resume identity
+  absence is `unresumable`; the test now submits and expects that exact derived
+  replacement while retaining confirmation-required and no-write assertions.
+- The legacy NULL-audit parent-disconnect test did not actually seed the
+  external session identity claimed by its resume-first scenario. It now seeds
+  that identity, asserts the confirmation-required `continue` projection
+  (`legacy_parent_disconnect` / `legacy_unknown_origin`), then asserts a direct
+  `unresumable` replacement returns public `invalid_replacement`, exposes no
+  recovery projection, and creates no run.
+
+### RED evidence
+
+Commands ran from `src-tauri` unless noted.
+
+- `cargo test acp::delegation::companion::tests::grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget --lib -- --exact --nocapture`:
+  RED, 1 selected; 0 passed and 1 failed. The test printed
+  `Grok tools/list JSONL bytes: 7683` and failed the fixed 7,680-byte limit.
+- `cargo test explicit_cancel_and_admission_unknown_require_authorization --lib -- --nocapture`:
+  RED, 1 selected; 0 passed and 1 failed at `replacement projection` because
+  the stale `not_supported` request did not match the derived structural
+  `unresumable` policy decision.
+- `cargo test parent_disconnected_source_rejects_unresumable_replacement_without_authorization --lib -- --nocapture`:
+  RED, 1 selected; 0 passed and 1 failed at the stale
+  `TaskStoreError::InvalidReplacement` assertion. Investigation showed the
+  fixture had no external session identity, so current policy correctly
+  projected an authorized `unresumable` replacement instead of resume-first.
+- The first post-edit
+  `cargo test grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget --lib -- --list`
+  gates failed compilation before any GREEN while the new fixture setup was
+  corrected: the service summary was not an entity active model, then the
+  entity query was missing `.one(&db.conn)`, then `IntoActiveModel` was not in
+  scope. The final identical list gate selected 1 test.
+
+### GREEN evidence
+
+- `cargo test grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget --lib -- --list`:
+  1 test listed, nonzero.
+- `cargo test grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget --lib -- --nocapture`:
+  1 passed, 0 failed; printed `Grok tools/list JSONL bytes: 7672`.
+- `cargo test explicit_cancel_and_admission_unknown_require_authorization --lib -- --list`:
+  1 test listed, nonzero.
+- `cargo test explicit_cancel_and_admission_unknown_require_authorization --lib -- --nocapture`:
+  1 passed, 0 failed.
+- `cargo test parent_disconnected_source_rejects_unresumable_replacement_without_authorization --lib -- --list`:
+  1 test listed, nonzero (repeated after the final assertion-message edit with
+  the same 1-test result).
+- `cargo test parent_disconnected_source_rejects_unresumable_replacement_without_authorization --lib -- --nocapture`:
+  1 passed, 0 failed (repeated after the final assertion-message edit with the
+  same 1/1 pass result).
+- `cargo test acp::delegation::companion::tests::recovery_tool_contract --lib -- --list`:
+  3 tests listed, nonzero.
+- `cargo test acp::delegation::companion::tests::recovery_tool_contract --lib -- --nocapture`:
+  3 passed, 0 failed.
+- `cargo test acp::delegation::run_store::termination_audit::authorized_delegation_recovery --lib -- --list`:
+  7 tests listed, nonzero.
+- `cargo test acp::delegation::run_store::termination_audit::authorized_delegation_recovery --lib -- --nocapture`:
+  7 passed, 0 failed.
+- `cargo clippy --lib --features test-utils -- -D warnings`: passed on the final
+  tree with 0 Clippy findings.
+- From the repository root,
+  `rustfmt --edition 2021 --check src-tauri/src/acp/delegation/run_store.rs`:
+  passed.
+- From the repository root, `git diff --check`: passed.
+
+The only diagnostics were the existing development sidecar placeholder warning,
+Cargo's upstream `proc-macro-error2` future-incompatibility warning, and
+PowerShell/Git's informational LF-to-CRLF working-copy warning. No full
+repository matrix was run. Approved Designs, implementation plan, Skill prose,
+frontend, production recovery policy, and stashes were not modified.
