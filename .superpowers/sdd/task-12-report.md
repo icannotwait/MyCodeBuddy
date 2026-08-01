@@ -1,80 +1,90 @@
 # Task 12 report
 
-Status: NEEDS_CONTEXT
+Status: TASK_REVIEW_APPROVED
 
-## RED attempt
+## Acceptance RED and GREEN
 
-Command, from `src-tauri/`:
+The reconstructed session-2566 fixture first failed because the blocked
+workflow had no current Plan Author run binding. After adding the exact current
+Author/reviewer evidence, `cargo test session_2566 --lib -- --nocapture`
+listed and passed 1 test. It proves direct publication cannot unblock,
+authorized state-only recovery advances revision 8 to 9 without changing Plan
+structure or retired bindings, and Task 1 admission remains available.
 
-```powershell
-cargo test session_2566 --lib -- --nocapture
-```
+The delegation fixture then failed after the authorized continue was consumed,
+the resume failed durably, and replacement was admitted: the replacement did
+not inherit the consumed recovery provenance. Commit `ca7a4c43` fixed the
+RunStore replacement path; the exact test subsequently listed and passed 1.
 
-The prior `KnownWatchForFileGuard` test-only feature-gating blocker was fixed
-outside Task 12 in commit `86708ac7`.
+Full integration testing exposed a second production inconsistency: a pure
+pre-admission replacement abort did not supersede admission transactionally,
+but public recovery projection treated any replacement edge as superseding.
+Commit `370a4689` centralized constant-query supersession semantics so retry,
+status, and authorization projection agree while preserving transitive
+supersession for an abort that itself has a successor.
 
-`cargo test session_2566 --lib -- --nocapture` is GREEN: 1 discovered,
-1 passed. The fixture verifies the fixed workflow ID, blocked header/revision
-8, fixed Plan digest, current evidence, retired bindings, ordinary direct
-publication non-unblock, approved receipt, in-place state-only revision 9,
-and Task 1 admission.
+## Task 12 commits
 
-## Delegation acceptance blocker
+- `86708ac7` `fix(test): expose office-watch fixtures to unit tests`
+- `ca7a4c43` `fix: inherit recovery provenance across replacement`
+- `34c8c1e9` `fix: restore non-test recovery compilation`
+- `4163cc03` `test: verify authorized recovery end to end`
+- `23c1da18` `fix: make lint reproducible on Windows`
+- `b2cf4320` `test: update disconnect provenance expectations`
+- `6a5c6c20` `test: update integration fixtures for recovery fields`
+- `370a4689` `fix: align recovery integration contracts`
+- `1bbadcdc` `test: update recovery matrix expectations`
+- `f610d9dd` `fix: satisfy strict recovery clippy gates`
 
-Command, from `src-tauri/`:
+## Focused verification
 
-```powershell
-cargo test legacy_parent_disconnect_authorize_continue_then_unresumable_replace --lib -- --nocapture
-```
+- Task 12 acceptance fixtures: 2/2 passed.
+- `delegation_session_reuse_integration`: 19/19 passed.
+- `replacement_admission`: 14/14 passed.
+- `authorized_delegation_recovery`: 11/11 passed.
+- `delegation_recovery`: 24/24 passed.
+- `delegate_access_api`: 6/6 passed.
+- `git diff --check`: passed.
 
-Result: 1 discovered, 0 passed, 1 failed.
+## Full validation matrix
 
-The test runs the real `DelegationBroker::continue_delegation` path: direct
-continue is rejected pending confirmation, a fixed receipt is approved and
-consumed with the reserving continuation, resume failure persists that new
-run as `failed/unresumable`, and a replacement from that latest run is
-admitted. The failure is the final immutable-provenance assertion:
+Frontend, from repository root:
 
-```text
-recovery_tests.rs:377
-left: None
-right: Some("<consumed authorization id>")
-```
+- `pnpm eslint .`: exit 0 with 23 existing warnings.
+- `pnpm test`: exit 0.
+- `pnpm build`: exit 0.
 
-The replacement's `recovery_authorization_id` is `None`; it does not inherit
-the consumed receipt provenance from the latest failed continuation. This is
-a production defect in the Task 1-11 `RunStore` replacement admission path,
-outside Task 12 ownership. No production fix, focused suite, matrix, or Task
-12 commit was run.
+Desktop Rust, from `src-tauri/`:
 
-## Pending fixture work
+- `cargo check`: passed.
+- `cargo test --features test-utils`: 3896 passed, 1 ignored; all integration
+  binaries passed.
+- `cargo clippy --all-targets --features test-utils -- -D warnings`: passed.
 
-`workflow/recovery_tests.rs` contains the reconstructed durable session and
-the real broker/store acceptance path. The initial session RED was
-`GateNotReady("active Plan Author node plan-author has no run binding")`;
-the fixture then added current durable evidence and reached GREEN.
+Server Rust:
 
-No production files outside Task 12 ownership were changed.
+- `cargo check --no-default-features --features server --bin codeg-server`:
+  passed.
+- `cargo test --no-default-features --features server --bin codeg-server --lib`:
+  3820 passed, 1 ignored; server bin target passed with no tests.
+- `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
+  passed.
 
-## Strict desktop Clippy repair
+Collaboration sidecar:
 
-Command, from `src-tauri/`:
+- `cargo check --no-default-features --bin codeg-mcp`: passed.
+- `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings`: passed.
 
-```powershell
-cargo clippy --all-targets --features test-utils --message-format short -- -D warnings
-```
+Known non-blocking diagnostics are the development-only missing codeg-mcp
+sidecar placeholder warning in desktop builds and Cargo's upstream
+`proc-macro-error2` future-incompatibility warning. Whole-tree
+`cargo fmt --check` is outside the required matrix and still reports unrelated
+pre-existing formatting drift; Task 12 formatted only owned Rust paths.
 
-Initial result: failed with 17 diagnostics. The findings were five existing
-large enum variants, two existing high-arity helper seams, one test-module
-name collision, and nine mechanical Clippy suggestions. The first repair run
-left one `unnecessary_lazy_evaluations` finding in `run_store.rs`; the final
-rerun passed with exit code 0 and no lint diagnostics.
+## Reviews
 
-Changes were limited to direct Clippy replacements plus narrow documented
-allows where boxing or an API-shape change would have widened the recovery
-surface. `rustfmt` was run explicitly only on the nine modified Rust files;
-`git diff --check` passed before the final Clippy rerun.
-
-Independent lint-diff review: no findings. The reviewer also confirmed that
-the exact strict Clippy command and a nine-file `rustfmt --check` pass; the
-unrelated whole-tree formatting drift remains outside this repair.
+- Task 12 review: spec compliant and quality approved; no Critical,
+  Important, or Minor findings. The reviewer could not verify the reported
+  full matrix from the diff package, so the controller retained the direct
+  command evidence above as the authoritative verification record.
+- Whole-branch review: pending.
