@@ -587,6 +587,7 @@ struct ObservedTerminal {
 /// continue path can project the real wire code while durable settle is still
 /// in flight after the handoff was unregistered.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Preserves the first-terminal payload without heap indirection.
 enum ReservingHandoffDisposition {
     /// Parent end won first-terminal-wins (or no earlier child terminal).
     ParentEnded(ParentEndContext),
@@ -2309,6 +2310,7 @@ fn is_same_owner_intended_error_code(code: &str) -> bool {
 }
 
 /// Outcome of the shared post-accept promote helper (gen-1 + continuation).
+#[allow(clippy::large_enum_variant)] // The failure report stays by value across the shared promote path.
 enum PostAcceptPromoteResult {
     /// Promote succeeded (or already-running idempotent). Caller continues the
     /// running ack path. `already_running` must not double-count accepted metrics
@@ -3893,6 +3895,7 @@ impl DelegationBroker {
         self.metrics.clone()
     }
 
+    #[allow(clippy::too_many_arguments)] // Stable telemetry schema mirrors the metric event fields.
     fn record_recovery_event(
         &self,
         kind: RecoveryMetricEventKind,
@@ -7039,6 +7042,7 @@ impl DelegationBroker {
         // terminal/cancel DID beat us we deliberately DON'T park: resolving
         // inline (never leaving an entry for a second resolver to grab) rules
         // out a double-finalize.
+        #[allow(clippy::large_enum_variant)] // Local race resolution keeps its terminal evidence by value.
         enum Disposition {
             ChildTerminal(ObservedTerminal),
             ParentEnded(ParentEndContext),
@@ -9614,6 +9618,7 @@ impl DelegationBroker {
         // Gen-1 first-terminal-wins park: early_complete / early_cancel /
         // admission_buffer, then re-drain after admitted_running. Parent-end
         // already unregisters the handoff — never insert Running after that.
+        #[allow(clippy::large_enum_variant)] // Continue handoff resolution carries the complete terminal evidence.
         enum ContinueAdmissionDisposition {
             ChildTerminal(ObservedTerminal),
             Running,

@@ -5542,7 +5542,7 @@ mod tests {
 
         #[tokio::test]
         async fn workflow_catalog_is_inconsistent_when_recover_workflow_is_missing() {
-            let complete = WORKFLOW_V2_TOOLS.iter().copied().collect::<Vec<_>>();
+            let complete = WORKFLOW_V2_TOOLS.to_vec();
             assert_eq!(
                 classify_workflow_tool_catalog(complete.iter().copied()),
                 WorkflowCapabilityMode::WorkflowManifestV2

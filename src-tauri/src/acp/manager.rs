@@ -5593,7 +5593,7 @@ impl ConnectionManager {
 
         let mut claim_waits = 0_u32;
         let authorization_id = loop {
-            match self.claim_question_settlement(&question_id).await {
+            match self.claim_question_settlement(question_id).await {
                 QuestionSettlementClaim::Missing => {
                     let Some(expected_authorization_id) = expected_authorization_id else {
                         return Ok(());

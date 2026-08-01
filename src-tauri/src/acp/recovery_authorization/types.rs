@@ -117,6 +117,7 @@ impl From<&recovery_authorization::Model> for RecoveryAuthorizationResult {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Pending preserves the durable row used by question resolution.
 pub enum PreparedAuthorization {
     NotRequired {
         action: RecoveryAllowedAction,

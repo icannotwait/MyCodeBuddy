@@ -1529,16 +1529,15 @@ async fn authorize_recovery_admission_txn(
     }
 
     if decision.confirmation == RecoveryConfirmation::Required {
-        let authorization_id = authorization_id.ok_or_else(|| {
-            TaskStoreError::RecoveryConfirmationRequired(DelegationRecoveryProjection::from(
-                &decision,
-            ))
-        })?;
-        let allowed_action = recovery_allowed_action(&operation).ok_or_else(|| {
+        let authorization_id =
+            authorization_id.ok_or(TaskStoreError::RecoveryConfirmationRequired(
+                DelegationRecoveryProjection::from(&decision),
+            ))?;
+        let allowed_action = recovery_allowed_action(&operation).ok_or(
             TaskStoreError::RecoveryAuthorizationRejected {
                 code: "recovery_authorization_action_mismatch",
-            }
-        })?;
+            },
+        )?;
         let action_payload = recovery_action_payload(&operation);
         let expectation = AuthorizationConsumeExpectation {
             parent_conversation_id: source.parent_conversation_id,
@@ -14108,13 +14107,10 @@ mod termination_audit {
                     public.get("detach").is_none(),
                     "busy public response must not contain a detach instruction"
                 );
-                assert_eq!(
-                    public
-                        .get("detach")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                    false
-                );
+                assert!(!public
+                    .get("detach")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false));
                 assert_eq!(run_count(&db).await, before);
                 let source_after = DelegationTaskRun::find_by_id(&source_task_id)
                     .one(&db.conn)

@@ -967,7 +967,7 @@ async fn emit_plan_lineage_reset_rejection_if_designated(
                     .one(txn)
                     .await
                     .map_err(db_err)?
-                    .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id))?;
+                    .ok_or(WorkflowStoreError::NotFound(workflow_id.clone()))?;
                 if header.parent_conversation_id != parent_conversation_id {
                     return Err(WorkflowStoreError::WorkflowRecoveryConflict);
                 }
@@ -2222,7 +2222,7 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
             latest_run_supersession_valid = false;
             continue;
         };
-        let replacement_valid = run.replaced_task_id.as_deref().map_or(true, |replaced| {
+        let replacement_valid = run.replaced_task_id.as_deref().is_none_or(|replaced| {
             bound_task_ids.contains(replaced)
                 && run_bindings.iter().any(|candidate| {
                     candidate.task_id == replaced
@@ -2311,7 +2311,7 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
                 latest_run_binding_by_node
                     .get(node_id)
                     .and_then(|run_binding| run_by_id.get(&run_binding.task_id))
-                    .map_or(true, |run| run.status == DelegationRunStatus::Canceled)
+                    .is_none_or(|run| run.status == DelegationRunStatus::Canceled)
             });
             let unresolved = !route_complete
                 || !complete_cohort_frozen
@@ -13376,6 +13376,7 @@ mod tests {
             submission
         }
 
+        #[allow(clippy::too_many_arguments)] // Test fixture maps the complete recovery request explicitly.
         async fn settle_reset(
             db: &AppDatabase,
             emitter: &EventEmitter,

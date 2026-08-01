@@ -2357,7 +2357,7 @@ mod tests {
 
         let round_trip: QuestionSpec = serde_json::from_value(wire).unwrap();
         assert_eq!(round_trip.recovery(), Some(presentation));
-        assert!(validate_specs(&[round_trip.clone()]).is_ok());
+        assert!(validate_specs(std::slice::from_ref(&round_trip)).is_ok());
     }
 
     #[test]

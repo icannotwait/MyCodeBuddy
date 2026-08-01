@@ -7,6 +7,7 @@ pub use store::*;
 pub use types::*;
 
 #[cfg(test)]
+#[allow(clippy::module_inception)] // Keeps recovery authorization integration tests beside the module exports.
 mod recovery_authorization {
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
