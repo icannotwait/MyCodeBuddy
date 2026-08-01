@@ -164,3 +164,78 @@ The only diagnostics were the already documented development sidecar
 placeholder warning and Cargo's upstream `proc-macro-error2`
 future-incompatibility warning. The approved Designs and implementation plan
 were not modified. Controller whole-branch review remains pending.
+
+## Whole-branch Important fix wave, round 2 (2026-08-01)
+
+Implementation commit:
+
+- `f8481fd18896b0cd6184354546fe8d6e3edbd71d` `fix recovery replay and validator hardening`
+
+### RED evidence
+
+Rust commands below ran from `src-tauri/`; validator commands ran from the
+repository root.
+
+- `cargo test modern_pre_spawn_parent_loss --lib -- --nocapture`: RED, 2
+  selected, 0 passed, and 2 intended failures. Checkpoint #1 returned
+  `parent_disconnected` instead of `transport_disconnected`; checkpoint #2
+  persisted `parent_disconnected` instead of `transport_disconnected`.
+- `cargo test exact_replay_survives_later_task_admission_and_active_run --lib -- --nocapture`:
+  RED, 1 selected, 0 passed, and 1 intended `WorkflowRecoveryConflict` after
+  normal Task admission advanced the graph and left a reserving run active.
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  RED, 262 selected; 258 passed and 4 intended failures. The two exact
+  adversarial status/challenge suffixes bypassed `B2D-R001`, and the two
+  safe-negative-only clauses were incorrectly counted as affirmative.
+
+### GREEN list gates and tests
+
+Every filtered Rust GREEN was preceded by the identical filter with
+`-- --list`, and each list was nonzero:
+
+- `cargo test modern_pre_spawn_parent_loss --lib -- --list`: 2 tests listed.
+- `cargo test modern_pre_spawn_parent_loss --lib -- --nocapture`: 2 passed,
+  3901 filtered out. Both real pre-spawn checkpoints cover typed transport,
+  process, and session loss plus intentional frontend disconnect.
+- `cargo test exact_replay_survives_later_task_admission_and_active_run --lib -- --list`:
+  1 test listed.
+- `cargo test exact_replay_survives_later_task_admission_and_active_run --lib -- --nocapture`:
+  1 passed, 3902 filtered out.
+- `cargo test authorized_workflow_recovery --lib -- --list`: 12 tests listed.
+- `cargo test authorized_workflow_recovery --lib -- --nocapture`: 12 passed,
+  3892 filtered out. This includes immutable receipt/revision tamper rejection
+  and nullable pre-upgrade revision-evidence replay compatibility.
+- `cargo test --test delegation_recovery_migration recovery_migration_preserves_existing_workflow_and_run_bytes -- --list`:
+  1 test listed.
+- `cargo test --test delegation_recovery_migration recovery_migration_preserves_existing_workflow_and_run_bytes -- --nocapture`:
+  1 passed, 2 filtered out.
+- `cargo test --test delegation_recovery_migration recovery_migration_adds_one_active_challenge_and_provenance_columns -- --list`:
+  1 test listed.
+- `cargo test --test delegation_recovery_migration recovery_migration_adds_one_active_challenge_and_provenance_columns -- --nocapture`:
+  1 passed, 2 filtered out.
+
+Additional focused GREEN verification:
+
+- `node --test .agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs`:
+  12 suites and 262 tests passed.
+- `node .agents/skills/brainstorm-to-delivery/scripts/validate-contract.mjs`:
+  36 checks passed, 0 failures.
+- Direct production-validator probe against the real `SKILL.md`: all 4 exact
+  adversarial clauses were rejected with `B2D-R001` (4/4).
+- `cargo check`: passed.
+- `cargo check --no-default-features --features server --bin codeg-server`:
+  passed.
+- `cargo check --no-default-features --bin codeg-mcp`: passed.
+- `cargo clippy --lib --features test-utils -- -D warnings`: passed.
+- `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
+  passed.
+- `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings`:
+  passed.
+- `rustfmt --edition 2021 --check src/acp/delegation/broker.rs src/acp/delegation/workflow/store.rs src/acp/delegation/workflow/recovery_tests.rs src/db/entities/delegation_workflow_manifest_revision.rs src/db/migration/m20260730_000001_recovery_authorizations.rs tests/delegation_recovery_migration.rs`:
+  passed.
+- `git diff --check`: passed.
+
+The only diagnostics were the already documented development sidecar
+placeholder warning and Cargo's upstream `proc-macro-error2`
+future-incompatibility warning. The approved Designs and implementation plan
+were not modified. Controller whole-branch review remains pending.
