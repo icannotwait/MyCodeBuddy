@@ -123,6 +123,7 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
                     },
                 ],
                 is_secret: false,
+                recovery: None,
             }],
         )
         .await
@@ -261,6 +262,7 @@ async fn answer_question_with_interactive_connection_id_and_locked_owner_returns
                     },
                 ],
                 is_secret: false,
+                recovery: None,
             }],
         )
         .await
