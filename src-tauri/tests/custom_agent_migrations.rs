@@ -6,6 +6,13 @@ use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use codeg_lib::db::migration::Migrator;
 
 const CUSTOM_MIGRATIONS: [&str; 4] = [
+    "m20260731_000001_custom_agent",
+    "m20260731_000002_custom_agent_skills",
+    "m20260731_000003_custom_agent_skills_dir",
+    "m20260731_000004_custom_agent_source",
+];
+
+const UPSTREAM_CUSTOM_MIGRATIONS: [&str; 4] = [
     "m20260726_000001_custom_agent",
     "m20260727_000001_custom_agent_skills",
     "m20260728_000001_custom_agent_skills_dir",
@@ -88,7 +95,7 @@ impl MigratorTrait for PreSyncForkMigrator {
 }
 
 #[tokio::test]
-async fn fresh_db_applies_original_custom_agent_migrations() {
+async fn fresh_db_applies_renumbered_custom_agent_migrations() {
     let db = open_db().await;
 
     Migrator::up(&db, None).await.unwrap();
@@ -106,6 +113,12 @@ async fn fresh_db_applies_original_custom_agent_migrations() {
 
     let versions = migration_versions(&db).await;
     assert_recorded_once(&versions, &CUSTOM_MIGRATIONS);
+    for upstream_name in UPSTREAM_CUSTOM_MIGRATIONS {
+        assert!(
+            !versions.iter().any(|version| version == upstream_name),
+            "upstream migration identity {upstream_name} must be renumbered"
+        );
+    }
 }
 
 #[tokio::test]

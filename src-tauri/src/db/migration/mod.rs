@@ -38,14 +38,14 @@ mod m20260720_000001_internal_session_translate_purpose;
 mod m20260722_000001_auto_title_job_config_gen;
 mod m20260723_000001_delegation_task_runs;
 mod m20260724_000001_provisional_orphan_repair;
-mod m20260726_000001_custom_agent;
 mod m20260726_000001_delegation_workflows;
-mod m20260727_000001_custom_agent_skills;
 mod m20260727_000001_workflow_structural_revision;
 mod m20260727_000002_workflow_gate_fingerprints;
 mod m20260727_000003_workflow_manifest_v2;
-mod m20260728_000001_custom_agent_skills_dir;
-mod m20260728_000002_custom_agent_source;
+mod m20260731_000001_custom_agent;
+mod m20260731_000002_custom_agent_skills;
+mod m20260731_000003_custom_agent_skills_dir;
+mod m20260731_000004_custom_agent_source;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -90,14 +90,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20260722_000001_auto_title_job_config_gen::Migration),
             Box::new(m20260723_000001_delegation_task_runs::Migration),
             Box::new(m20260724_000001_provisional_orphan_repair::Migration),
-            Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260726_000001_delegation_workflows::Migration),
-            Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260727_000001_workflow_structural_revision::Migration),
             Box::new(m20260727_000002_workflow_gate_fingerprints::Migration),
             Box::new(m20260727_000003_workflow_manifest_v2::Migration),
-            Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
-            Box::new(m20260728_000002_custom_agent_source::Migration),
+            Box::new(m20260731_000001_custom_agent::Migration),
+            Box::new(m20260731_000002_custom_agent_skills::Migration),
+            Box::new(m20260731_000003_custom_agent_skills_dir::Migration),
+            Box::new(m20260731_000004_custom_agent_source::Migration),
         ]
     }
 }

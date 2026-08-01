@@ -2875,6 +2875,11 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    // These tests exercise the process-wide production import guard directly.
+    // Rust runs unit tests concurrently, so serialize only this small group to
+    // prevent one test's intentional lock hold from invalidating another.
+    static IMPORT_GUARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Empty registry for pre-existing folder-conversation tests.
     async fn inert_internal_session_registry(
         db: &crate::db::AppDatabase,
@@ -5140,6 +5145,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn import_local_conversations_core_missing_folder_errors() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         let db = fresh_in_memory_db().await;
         let data_dir = TempDir::new().expect("tempdir");
         let registry =
@@ -6449,6 +6455,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn import_selected_sessions_core_rejects_concurrent_and_empty() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         let db = fresh_in_memory_db().await;
         let data_dir = TempDir::new().expect("tempdir");
         let registry = inert_internal_session_registry(&db, data_dir.path()).await;
@@ -6481,6 +6488,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn legacy_import_shares_the_guard_with_batch_import() {
+        let _test_guard = IMPORT_GUARD_TEST_LOCK.lock().await;
         // The retained legacy command must NOT bypass IMPORT_GUARD — otherwise a
         // legacy import racing a batch import could double-insert on a DB with no
         // unique index. With the guard held it is rejected BEFORE the folder

@@ -4,9 +4,28 @@
 //! and verifies ON DELETE CASCADE from header → child rows.
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigrationTrait, MigratorTrait};
 
 use codeg_lib::db::migration::Migrator;
+
+const GATE_FINGERPRINTS_MIGRATION: &str = "m20260727_000002_workflow_gate_fingerprints";
+
+struct ThroughGateFingerprintsMigrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for ThroughGateFingerprintsMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        let mut selected = Vec::new();
+        for migration in Migrator::migrations() {
+            let is_target = migration.name() == GATE_FINGERPRINTS_MIGRATION;
+            selected.push(migration);
+            if is_target {
+                return selected;
+            }
+        }
+        panic!("missing migration {GATE_FINGERPRINTS_MIGRATION}");
+    }
+}
 
 fn sql(text: impl Into<String>) -> Statement {
     Statement::from_string(DbBackend::Sqlite, text.into())
@@ -239,10 +258,8 @@ async fn delete_workflow_cascades_to_child_tables() {
 
 #[tokio::test]
 async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
-    const MIGRATIONS_THROUGH_GATE_FINGERPRINTS: u32 = 43;
-
     let db = open_db().await;
-    Migrator::up(&db, Some(MIGRATIONS_THROUGH_GATE_FINGERPRINTS))
+    ThroughGateFingerprintsMigrator::up(&db, None)
         .await
         .unwrap();
     seed_folder_and_parent(&db).await;
