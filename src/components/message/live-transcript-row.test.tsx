@@ -396,6 +396,113 @@ describe("LiveTranscriptRow", () => {
     ).toEqual([{ kind: "segment", segmentId: snapshot.segmentIds[0] }])
   })
 
+  it("folds same-turn status against a live delegate when historical index is empty", () => {
+    // Empty historical index/records: the only exact-run identity is the live
+    // delegate completed earlier in this turn. Status must fold; delegate stays.
+    seedLiveTools(2582, [
+      tool("delegate-1", {
+        title: "delegate_to_agent",
+        status: "completed",
+        raw_input: JSON.stringify({ task: "implement feature" }),
+        raw_output: JSON.stringify({
+          content: [{ type: "text", text: "Delegated run-1" }],
+          structuredContent: {
+            status: "running",
+            task_id: "run-1",
+            child_conversation_id: 3001,
+          },
+        }),
+      }),
+      tool("known-status", {
+        title: "get_delegation_status",
+        status: "completed",
+        raw_input: JSON.stringify({ task_ids: ["run-1"] }),
+        raw_output: JSON.stringify({
+          structuredContent: {
+            tasks: [
+              {
+                task_id: "run-1",
+                status: "running",
+                message: "Running.",
+              },
+            ],
+          },
+        }),
+      }),
+    ])
+    const snapshot = liveTranscriptStore.getConversation(2582)!
+    const emptyHistoricalIndex: DelegationIdentityIndex = {
+      taskToUnitKey: new Map(),
+      taskToRunKey: new Map(),
+      workUnitToUnitKey: new Map(),
+      knownTaskIds: new Set(),
+      knownWorkUnitKeys: new Set(),
+    }
+    const items = buildLiveFooterItems(
+      2582,
+      snapshot.segmentIds,
+      liveTranscriptStore.getToolGroupIds(2582),
+      true,
+      emptyHistoricalIndex,
+      []
+    )
+    // Delegate remains first-class; known status segment folds away.
+    expect(items).toEqual([
+      { kind: "segment", segmentId: snapshot.segmentIds[0] },
+    ])
+    const remaining = liveTranscriptStore.getSegment(
+      2582,
+      snapshot.segmentIds[0]
+    )
+    expect(remaining).toMatchObject({
+      type: "tool",
+      toolCallId: "delegate-1",
+    })
+
+    // Unknown / mixed status stays wholly visible alongside the live delegate.
+    seedLiveTools(2582, [
+      tool("delegate-1", {
+        title: "delegate_to_agent",
+        status: "completed",
+        raw_input: JSON.stringify({ task: "implement feature" }),
+        raw_output: JSON.stringify({
+          structuredContent: {
+            status: "running",
+            task_id: "run-1",
+            child_conversation_id: 3001,
+          },
+        }),
+      }),
+      tool("mixed-status", {
+        title: "get_delegation_status",
+        status: "completed",
+        raw_input: JSON.stringify({ task_ids: ["run-1", "unknown"] }),
+        raw_output: JSON.stringify({
+          structuredContent: {
+            tasks: [
+              { task_id: "run-1", status: "running" },
+              { task_id: "unknown", status: "running" },
+            ],
+          },
+        }),
+      }),
+    ])
+    const mixedSnap = liveTranscriptStore.getConversation(2582)!
+    expect(
+      buildLiveFooterItems(
+        2582,
+        mixedSnap.segmentIds,
+        liveTranscriptStore.getToolGroupIds(2582),
+        true,
+        emptyHistoricalIndex,
+        []
+      )
+    ).toEqual([
+      { kind: "segment", segmentId: mixedSnap.segmentIds[0] },
+      { kind: "segment", segmentId: mixedSnap.segmentIds[1] },
+    ])
+  })
+
   it("shows a typing indicator when the live snapshot has no segments yet", () => {
     liveTranscriptStore.rebuild(
       CID,

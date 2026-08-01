@@ -31,7 +31,7 @@ function walkToolCalls(
   }
 }
 
-function runRecord(
+export function delegationRunRecord(
   part: AdaptedToolCallPart,
   parentConversationId: number
 ): DelegationRunRecord<AdaptedToolCallPart> {
@@ -46,6 +46,43 @@ function runRecord(
       meta: part.meta,
     }),
   }
+}
+
+/** Collect exact-run records for delegate/continue tools in adapted messages. */
+export function collectDelegationRunRecords(
+  messages: readonly AdaptedMessage[],
+  parentConversationId: number
+): DelegationRunRecord<AdaptedToolCallPart>[] {
+  const records: DelegationRunRecord<AdaptedToolCallPart>[] = []
+  for (const message of messages) {
+    walkToolCalls(message.content, (part) => {
+      if (isDelegateToAgentToolName(part.toolName)) {
+        records.push(delegationRunRecord(part, parentConversationId))
+      }
+    })
+  }
+  return records
+}
+
+/**
+ * Identity index for live status folding: historical/local delegate runs plus
+ * current-live delegate/continue tools, through the same exact-run ambiguity
+ * rules as historical projection.
+ */
+export function buildLiveDelegationIdentityIndex(
+  historicalRecords: readonly DelegationRunRecord<AdaptedToolCallPart>[],
+  liveDelegateParts: readonly AdaptedToolCallPart[],
+  parentConversationId: number
+): DelegationIdentityIndex {
+  const records: DelegationRunRecord<AdaptedToolCallPart>[] = [
+    ...historicalRecords,
+  ]
+  for (const part of liveDelegateParts) {
+    if (isDelegateToAgentToolName(part.toolName)) {
+      records.push(delegationRunRecord(part, parentConversationId))
+    }
+  }
+  return groupDelegationRuns(records).index
 }
 
 function successfulCancellation(part: AdaptedToolCallPart): boolean {
@@ -161,15 +198,9 @@ export function projectDelegationTranscript(
 ): {
   messages: AdaptedMessage[]
   identityIndex: DelegationIdentityIndex
+  runRecords: DelegationRunRecord<AdaptedToolCallPart>[]
 } {
-  const records: DelegationRunRecord<AdaptedToolCallPart>[] = []
-  for (const message of messages) {
-    walkToolCalls(message.content, (part) => {
-      if (isDelegateToAgentToolName(part.toolName)) {
-        records.push(runRecord(part, parentConversationId))
-      }
-    })
-  }
+  const records = collectDelegationRunRecords(messages, parentConversationId)
 
   const grouped = groupDelegationRuns(records)
   // Identity grouping still folds status polls / live residual rows, but each
@@ -211,6 +242,7 @@ export function projectDelegationTranscript(
       return content === message.content ? message : { ...message, content }
     }),
     identityIndex: grouped.index,
+    runRecords: records,
   }
 }
 

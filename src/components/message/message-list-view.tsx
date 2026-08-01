@@ -1395,6 +1395,7 @@ export function MessageListView({
       threadItems: items,
       nonStreamingAdapted: nonStreaming,
       delegationIdentityIndex: projected.identityIndex,
+      delegationRunRecords: projected.runRecords,
     }
   }, [
     adapterText,
@@ -1407,8 +1408,12 @@ export function MessageListView({
     mergedRunCache,
     conversationId,
   ])
-  const { threadItems, nonStreamingAdapted, delegationIdentityIndex } =
-    adaptedThread
+  const {
+    threadItems,
+    nonStreamingAdapted,
+    delegationIdentityIndex,
+    delegationRunRecords,
+  } = adaptedThread
 
   const lastTimelinePhase =
     timelineTurns[timelineTurns.length - 1]?.phase ?? null
@@ -1425,6 +1430,7 @@ export function MessageListView({
         conversationId={conversationId}
         agentType={agentType}
         showThinking={showThinking}
+        delegationRunRecords={delegationRunRecords}
         delegationIdentityIndex={delegationIdentityIndex}
       />
     )
@@ -1433,6 +1439,7 @@ export function MessageListView({
     conversationId,
     agentType,
     showThinking,
+    delegationRunRecords,
     delegationIdentityIndex,
   ])
 

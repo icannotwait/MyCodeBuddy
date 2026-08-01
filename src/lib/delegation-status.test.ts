@@ -106,7 +106,6 @@ describe("parseDelegationStatusIdentity", () => {
           task_id: "run-b",
         }),
         output: null,
-        errorText: null,
       })
     ).toEqual({
       requestIds: ["run-a", "run-b"],
@@ -150,7 +149,6 @@ describe("parseDelegationStatusIdentity", () => {
             ],
           },
         }),
-        errorText: null,
       }).valid
     ).toBe(false)
   })
@@ -180,7 +178,6 @@ describe("parseDelegationStatusIdentity", () => {
       parseDelegationStatusIdentity({
         input: JSON.stringify({ task_ids: ["run-a"] }),
         output: JSON.stringify(output),
-        errorText: null,
       })
     ).toEqual({
       requestIds: ["run-a"],
@@ -205,9 +202,97 @@ describe("parseDelegationStatusIdentity", () => {
       parseDelegationStatusIdentity({
         input: "{task_ids:[",
         output: null,
-        errorText: null,
       }).valid
     ).toBe(false)
+  })
+
+  it("peels wrapped request envelopes for strict identity", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({
+          arguments: { task_ids: [" run-a ", "run-a"] },
+        }),
+        output: null,
+      })
+    ).toEqual({
+      requestIds: ["run-a"],
+      reportIds: [],
+      candidateIds: ["run-a"],
+      valid: true,
+    })
+  })
+
+  it("peels double-encoded request JSON for strict identity", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify(JSON.stringify({ task_id: "run-b", wait_ms: 0 })),
+        output: null,
+      })
+    ).toEqual({
+      requestIds: ["run-b"],
+      reportIds: [],
+      candidateIds: ["run-b"],
+      valid: true,
+    })
+  })
+
+  it("peels content, result, and Ok report envelopes for strict identity", () => {
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a"] }),
+        output: JSON.stringify({
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                tasks: [{ task_id: "run-a", status: "running" }],
+              }),
+            },
+          ],
+        }),
+      })
+    ).toEqual({
+      requestIds: ["run-a"],
+      reportIds: ["run-a"],
+      candidateIds: ["run-a"],
+      valid: true,
+    })
+
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a"] }),
+        output: JSON.stringify({
+          result: {
+            structuredContent: {
+              tasks: [{ task_id: "run-a", status: "completed" }],
+            },
+          },
+        }),
+      })
+    ).toEqual({
+      requestIds: ["run-a"],
+      reportIds: ["run-a"],
+      candidateIds: ["run-a"],
+      valid: true,
+    })
+
+    expect(
+      parseDelegationStatusIdentity({
+        input: JSON.stringify({ task_ids: ["run-a"] }),
+        output: JSON.stringify({
+          Ok: {
+            structuredContent: {
+              tasks: [{ task_id: "run-a", status: "running" }],
+            },
+          },
+        }),
+      })
+    ).toEqual({
+      requestIds: ["run-a"],
+      reportIds: ["run-a"],
+      candidateIds: ["run-a"],
+      valid: true,
+    })
   })
 })
 

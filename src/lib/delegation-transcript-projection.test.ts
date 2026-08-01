@@ -169,7 +169,7 @@ function statusPoll(
       reports === null
         ? null
         : JSON.stringify({ structuredContent: { tasks: reports } }),
-    errorText,
+    ...(errorText ? { errorText } : {}),
     state: errorText ? "output-error" : "output-available",
   }
 }
@@ -436,7 +436,6 @@ describe("projectDelegationTranscript", () => {
       toolName: "get_delegation_status",
       input: '{"task_ids":[',
       output: null,
-      errorText: null,
       state: "output-error",
     }
     const projected = projectDelegationTranscript(

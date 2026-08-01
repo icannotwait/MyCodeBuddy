@@ -57,8 +57,15 @@ import {
   useLiveTranscriptToolGroup,
   useLiveTranscriptToolGroupIds,
 } from "@/stores/live-transcript-store"
-import type { DelegationIdentityIndex } from "@/lib/delegation-work-unit"
-import { shouldFoldLiveDelegationTool } from "@/lib/delegation-transcript-projection"
+import type {
+  DelegationIdentityIndex,
+  DelegationRunRecord,
+} from "@/lib/delegation-work-unit"
+import {
+  buildLiveDelegationIdentityIndex,
+  shouldFoldLiveDelegationTool,
+} from "@/lib/delegation-transcript-projection"
+import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 
 export interface LiveTranscriptRowProps {
@@ -68,6 +75,15 @@ export interface LiveTranscriptRowProps {
   showThinking: boolean
   /** Test / perf hook: called once per LiveToolCard render with toolCallId. */
   onToolRender?: (toolCallId: string) => void
+  /**
+   * Historical/local exact-run records from the parent conversation. Combined
+   * with current-live delegate/continue tools before status folding.
+   */
+  delegationRunRecords?: readonly DelegationRunRecord<AdaptedToolCallPart>[]
+  /**
+   * Fallback identity index when no historical records and no live
+   * delegate/continue tools are available (tests / empty history).
+   */
   delegationIdentityIndex?: DelegationIdentityIndex | null
 }
 
@@ -474,6 +490,36 @@ export type LiveFooterItem =
   | { kind: "group"; groupId: string }
 
 /**
+ * Collect live delegate/continue tools and merge with historical exact-run
+ * records so same-turn status polls can fold against the live delegation.
+ */
+export function resolveLiveDelegationIdentityIndex(
+  conversationId: number,
+  historicalRunRecords?: readonly DelegationRunRecord<AdaptedToolCallPart>[],
+  fallbackIndex?: DelegationIdentityIndex | null
+): DelegationIdentityIndex | null {
+  const snapshot = liveTranscriptStore.getConversation(conversationId)
+  const liveDelegateParts: AdaptedToolCallPart[] = []
+  if (snapshot) {
+    for (const tool of snapshot.tools.values()) {
+      const part = adaptLiveToolPart(tool)
+      if (isDelegateToAgentToolName(part.toolName)) {
+        liveDelegateParts.push(part)
+      }
+    }
+  }
+  const historical = historicalRunRecords ?? []
+  if (historical.length > 0 || liveDelegateParts.length > 0) {
+    return buildLiveDelegationIdentityIndex(
+      historical,
+      liveDelegateParts,
+      conversationId
+    )
+  }
+  return fallbackIndex ?? null
+}
+
+/**
  * Interleave non-group segments with structural tool-group summaries so
  * consecutive groupable tools collapse into one summary chip in the footer.
  */
@@ -482,7 +528,8 @@ export function buildLiveFooterItems(
   segmentIds: readonly string[],
   groupIds: readonly string[],
   showThinking: boolean,
-  delegationIdentityIndex?: DelegationIdentityIndex | null
+  delegationIdentityIndex?: DelegationIdentityIndex | null,
+  delegationRunRecords?: readonly DelegationRunRecord<AdaptedToolCallPart>[]
 ): LiveFooterItem[] {
   // Only multi-tool runs collapse into a summary chip. Lone tools keep a
   // dedicated LiveToolCard so running command tails stay visible mid-stream.
@@ -497,6 +544,12 @@ export function buildLiveFooterItems(
       if (i === 0) firstToolOfGroup.add(toolCallId)
     }
   }
+
+  const foldIndex = resolveLiveDelegationIdentityIndex(
+    conversationId,
+    delegationRunRecords,
+    delegationIdentityIndex
+  )
 
   const items: LiveFooterItem[] = []
   for (const segmentId of segmentIds) {
@@ -516,10 +569,10 @@ export function buildLiveFooterItems(
       )
       if (
         tool &&
-        delegationIdentityIndex &&
+        foldIndex &&
         shouldFoldLiveDelegationTool(
           adaptLiveToolPart(tool),
-          delegationIdentityIndex,
+          foldIndex,
           conversationId
         )
       ) {
@@ -548,6 +601,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   agentType,
   showThinking,
   onToolRender,
+  delegationRunRecords,
   delegationIdentityIndex,
 }: LiveTranscriptRowProps) {
   const segmentIds = useLiveTranscriptSegmentIds(conversationId)
@@ -567,23 +621,27 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
     messageScroll?.footerScroll?.scheduleFollow(publicationVersion)
   }, [publicationVersion, messageScroll])
 
-  const items = useMemo(
-    () =>
-      buildLiveFooterItems(
-        conversationId,
-        segmentIds,
-        groupIds,
-        showThinking,
-        delegationIdentityIndex
-      ),
-    [
+  // publicationVersion: recompute when live tool outputs gain task identity
+  // (e.g. delegate completes mid-turn) so same-turn status can fold.
+  const items = useMemo(() => {
+    void publicationVersion
+    return buildLiveFooterItems(
       conversationId,
       segmentIds,
       groupIds,
       showThinking,
       delegationIdentityIndex,
-    ]
-  )
+      delegationRunRecords
+    )
+  }, [
+    conversationId,
+    segmentIds,
+    groupIds,
+    showThinking,
+    delegationIdentityIndex,
+    delegationRunRecords,
+    publicationVersion,
+  ])
 
   if (segmentIds.length === 0) {
     return <PendingTypingIndicator />
