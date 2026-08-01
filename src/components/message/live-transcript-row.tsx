@@ -469,7 +469,7 @@ const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
   }
 })
 
-type LiveFooterItem =
+export type LiveFooterItem =
   | { kind: "segment"; segmentId: string }
   | { kind: "group"; groupId: string }
 
@@ -477,7 +477,7 @@ type LiveFooterItem =
  * Interleave non-group segments with structural tool-group summaries so
  * consecutive groupable tools collapse into one summary chip in the footer.
  */
-function buildLiveFooterItems(
+export function buildLiveFooterItems(
   conversationId: number,
   segmentIds: readonly string[],
   groupIds: readonly string[],

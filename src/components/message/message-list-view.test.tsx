@@ -658,6 +658,15 @@ function seedHistory(
   })
 }
 
+function setLocalTurns(turns: MessageTurn[]): void {
+  const state = useConversationRuntimeStore.getState()
+  const byConversationId = new Map(state.byConversationId)
+  const session = byConversationId.get(CID)
+  if (!session) throw new Error("conversation fixture is not seeded")
+  byConversationId.set(CID, { ...session, localTurns: turns })
+  useConversationRuntimeStore.setState({ byConversationId })
+}
+
 function publishLiveText(text: string, seq: number) {
   const msg = liveMessage(text)
   liveTranscriptStore.publish(CID, frame([contentDelta(seq, text)]), msg)
@@ -1136,7 +1145,7 @@ describe("MessageListView delegation work-unit projection", () => {
     __resetStreamingPerformanceConfigForTests()
   })
 
-  it("renders one historical card per turn and one residual status row", () => {
+  it("renders one historical card per turn and a complete mixed status call", () => {
     seedHistory([
       userTurn("u1", "start"),
       workUnitRunTurn("a1", "tool-1", "run-1"),
@@ -1162,13 +1171,34 @@ describe("MessageListView delegation work-unit projection", () => {
     expect(screen.getByText("still working")).toBeInTheDocument()
     expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
       "data-visible-task-ids",
-      "unknown-run"
+      "all"
     )
     expect(
       (lastOverlayProps().delegations ?? []).map(
         (delegation) => delegation.parentToolUseId
       )
     ).toEqual(["tool-1", "tool-2"])
+  })
+
+  it("applies whole-call folding to promoted localTurns", () => {
+    seedHistory([
+      userTurn("u1", "start"),
+      workUnitRunTurn("a1", "delegate-1", "run-1"),
+    ])
+    setLocalTurns([workUnitStatusTurn("promoted-mixed", ["run-1", "unknown"])])
+    const view = renderMessageList()
+    expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
+      "data-visible-task-ids",
+      "all"
+    )
+
+    view.unmount()
+    setLocalTurns([workUnitStatusTurn("promoted-known", ["run-1"])])
+    renderMessageList()
+    expect(
+      screen.queryByTestId("delegation-status-residual")
+    ).not.toBeInTheDocument()
+    expect(screen.getByTestId("delegation-work-unit")).toBeInTheDocument()
   })
 
   it("projects a multi-turn persisted session to one card per run", () => {
@@ -1269,7 +1299,7 @@ describe("MessageListView delegation work-unit projection", () => {
     expect(screen.getAllByTestId("delegation-status-residual")).toHaveLength(1)
     expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
       "data-visible-task-ids",
-      "orphan-run"
+      "all"
     )
     for (const checkpoint of checkpoints) {
       expect(screen.getByText(checkpoint)).toBeInTheDocument()

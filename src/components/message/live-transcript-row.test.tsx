@@ -91,7 +91,11 @@ vi.mock("./content-parts-renderer", () => ({
   ),
 }))
 
-import { adaptLiveToolPart, LiveTranscriptRow } from "./live-transcript-row"
+import {
+  adaptLiveToolPart,
+  buildLiveFooterItems,
+  LiveTranscriptRow,
+} from "./live-transcript-row"
 
 const CID = 77
 
@@ -300,6 +304,7 @@ describe("LiveTranscriptRow", () => {
     ])
     const index: DelegationIdentityIndex = {
       taskToUnitKey: new Map([["run-1", "unit-a"]]),
+      taskToRunKey: new Map([["run-1", `${CID}\u0000run\u0000delegate-1`]]),
       workUnitToUnitKey: new Map(),
       knownTaskIds: new Set(["run-1"]),
       knownWorkUnitKeys: new Set(),
@@ -321,6 +326,7 @@ describe("LiveTranscriptRow", () => {
     ])
     const index: DelegationIdentityIndex = {
       taskToUnitKey: new Map([["run-1", "unit-a"]]),
+      taskToRunKey: new Map([["run-1", `${CID}\u0000run\u0000delegate-1`]]),
       workUnitToUnitKey: new Map(),
       knownTaskIds: new Set(["run-1"]),
       knownWorkUnitKeys: new Set(),
@@ -329,6 +335,65 @@ describe("LiveTranscriptRow", () => {
     renderRow(undefined, true, index)
 
     expect(screen.getByTestId("tool-part-initial")).toBeInTheDocument()
+  })
+
+  it("applies whole-call folding to complete live tool segments", () => {
+    const delegationIdentityIndex: DelegationIdentityIndex = {
+      taskToUnitKey: new Map([["run-1", "unit-a"]]),
+      taskToRunKey: new Map([["run-1", "2582\u0000run\u0000delegate-1"]]),
+      workUnitToUnitKey: new Map([["unit-a", "unit-a"]]),
+      knownTaskIds: new Set(["run-1"]),
+      knownWorkUnitKeys: new Set(["unit-a"]),
+    }
+
+    seedLiveTools(2582, [
+      tool("known-status", {
+        title: "get_delegation_status",
+        status: "completed",
+        raw_input: JSON.stringify({ task_ids: ["run-1"] }),
+        raw_output: JSON.stringify({
+          structuredContent: {
+            tasks: [{ task_id: "run-1", status: "running" }],
+          },
+        }),
+      }),
+    ])
+    let snapshot = liveTranscriptStore.getConversation(2582)!
+    expect(
+      buildLiveFooterItems(
+        2582,
+        snapshot.segmentIds,
+        liveTranscriptStore.getToolGroupIds(2582),
+        true,
+        delegationIdentityIndex
+      )
+    ).toEqual([])
+
+    seedLiveTools(2582, [
+      tool("mixed-status", {
+        title: "get_delegation_status",
+        status: "completed",
+        raw_input: JSON.stringify({ task_ids: ["run-1", "unknown"] }),
+        raw_output: JSON.stringify({
+          structuredContent: {
+            tasks: [
+              { task_id: "run-1", status: "running" },
+              { task_id: "unknown", status: "running" },
+            ],
+          },
+        }),
+      }),
+    ])
+    snapshot = liveTranscriptStore.getConversation(2582)!
+    expect(
+      buildLiveFooterItems(
+        2582,
+        snapshot.segmentIds,
+        liveTranscriptStore.getToolGroupIds(2582),
+        true,
+        delegationIdentityIndex
+      )
+    ).toEqual([{ kind: "segment", segmentId: snapshot.segmentIds[0] }])
   })
 
   it("shows a typing indicator when the live snapshot has no segments yet", () => {

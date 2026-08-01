@@ -10,7 +10,7 @@ import {
   parseDelegateRunIdentity,
 } from "@/lib/delegation-card"
 import {
-  buildDelegationTaskRows,
+  parseDelegationStatusIdentity,
   parseStatusReports,
   parseTaskIds,
 } from "@/lib/delegation-status"
@@ -78,30 +78,43 @@ function cancellationTaskIds(messages: readonly AdaptedMessage[]): Set<string> {
   return keys
 }
 
-function residualStatusPart(
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  const rightSet = new Set(right)
+  return left.every((id) => rightSet.has(id))
+}
+
+export function shouldFoldDelegationStatusCall(
+  part: AdaptedToolCallPart,
+  index: DelegationIdentityIndex
+): boolean {
+  if (normalizeToolName(part.toolName) !== "get_delegation_status") {
+    return false
+  }
+  const identity = parseDelegationStatusIdentity(part)
+  if (!identity.valid || identity.candidateIds.length === 0) return false
+  if (
+    identity.requestIds.length > 0 &&
+    identity.reportIds.length > 0 &&
+    !sameIds(identity.requestIds, identity.reportIds)
+  ) {
+    return false
+  }
+  return identity.candidateIds.every((id) => index.knownTaskIds.has(id))
+}
+
+function projectStatusPart(
   part: Extract<AdaptedContentPart, { type: "delegation-status-group" }>,
   index: DelegationIdentityIndex
 ): AdaptedContentPart | null {
-  const rows = buildDelegationTaskRows(part.polls)
-  if (
-    !rows.some(
-      (row) => row.taskId !== null && index.knownTaskIds.has(row.taskId)
-    )
-  ) {
+  const polls = part.polls.filter(
+    (poll) => !shouldFoldDelegationStatusCall(poll, index)
+  )
+  if (polls.length === part.polls.length && part.visibleTaskIds === undefined) {
     return part
   }
-  const residualRows = rows.filter(
-    (row) => row.taskId === null || !index.knownTaskIds.has(row.taskId)
-  )
-  if (residualRows.length === 0) return null
-  const visibleTaskIds = Array.from(
-    new Set(
-      residualRows
-        .map((row) => row.taskId)
-        .filter((taskId): taskId is string => taskId !== null)
-    )
-  )
-  return { ...part, visibleTaskIds }
+  if (polls.length === 0) return null
+  return { type: "delegation-status-group", polls }
 }
 
 function rewriteParts(
@@ -122,7 +135,7 @@ function rewriteParts(
       continue
     }
     if (part.type === "delegation-status-group") {
-      const replacement = residualStatusPart(part, index)
+      const replacement = projectStatusPart(part, index)
       if (replacement !== part) changed = true
       if (replacement) result.push(replacement)
       continue
@@ -206,19 +219,5 @@ export function shouldFoldLiveDelegationTool(
   index: DelegationIdentityIndex,
   _parentConversationId: number
 ): boolean {
-  const toolName = normalizeToolName(part.toolName)
-  if (toolName === "get_delegation_status") {
-    const taskIds = new Set(parseTaskIds(part.input))
-    for (const report of parseStatusReports(part.output, part.errorText)) {
-      if (report.taskId) taskIds.add(report.taskId)
-    }
-    return (
-      taskIds.size > 0 &&
-      [...taskIds].every((taskId) => index.knownTaskIds.has(taskId))
-    )
-  }
-
-  // Each delegate / continue turn is a first-class card. Only status polls
-  // above fold into residual rows; never hide a live re-entry tool call.
-  return false
+  return shouldFoldDelegationStatusCall(part, index)
 }

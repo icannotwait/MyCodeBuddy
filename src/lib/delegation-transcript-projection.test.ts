@@ -91,6 +91,93 @@ function status(
   }
 }
 
+const statusCases = [
+  {
+    name: "input-only timeout",
+    input: { task_ids: ["run-1"] },
+    reports: null,
+    error: "timed out awaiting tools/call after 300s",
+    fold: true,
+  },
+  {
+    name: "output-only structured",
+    input: null,
+    reports: [{ task_id: "run-1", status: "running" }],
+    error: null,
+    fold: true,
+  },
+  {
+    name: "agreed known",
+    input: { task_ids: ["run-1"] },
+    reports: [{ task_id: "run-1", status: "running" }],
+    error: null,
+    fold: true,
+  },
+  {
+    name: "legacy known",
+    input: { task_id: "run-1" },
+    reports: null,
+    error: null,
+    fold: true,
+  },
+  {
+    name: "mixed known unknown",
+    input: { task_ids: ["run-1", "unknown"] },
+    reports: [
+      { task_id: "run-1", status: "running" },
+      { task_id: "unknown", status: "running" },
+    ],
+    error: null,
+    fold: false,
+  },
+  {
+    name: "unknown",
+    input: { task_ids: ["unknown"] },
+    reports: null,
+    error: null,
+    fold: false,
+  },
+  {
+    name: "known mismatch",
+    input: { task_ids: ["run-1"] },
+    reports: [{ task_id: "run-2", status: "running" }],
+    error: null,
+    fold: false,
+  },
+  {
+    name: "invalid structured report",
+    input: { task_ids: ["run-1"] },
+    reports: [{ status: "running" }],
+    error: null,
+    fold: false,
+  },
+  { name: "empty union", input: {}, reports: null, error: null, fold: false },
+] as const
+
+function statusPoll(
+  toolCallId: string,
+  input: Record<string, unknown> | null,
+  reports: readonly Record<string, unknown>[] | null,
+  errorText: string | null
+): AdaptedToolCallPart {
+  return {
+    type: "tool-call",
+    toolCallId,
+    toolName: "get_delegation_status",
+    input: input === null ? null : JSON.stringify(input),
+    output:
+      reports === null
+        ? null
+        : JSON.stringify({ structuredContent: { tasks: reports } }),
+    errorText,
+    state: errorText ? "output-error" : "output-available",
+  }
+}
+
+function statusGroup(poll: AdaptedToolCallPart): AdaptedContentPart {
+  return { type: "delegation-status-group", polls: [poll] }
+}
+
 function text(value: string): AdaptedContentPart {
   return { type: "text", text: value }
 }
@@ -120,8 +207,70 @@ function visibleStatusTaskIds(messages: readonly AdaptedMessage[]): string[] {
   })
 }
 
+function projectedStatusPollIds(messages: readonly AdaptedMessage[]): string[] {
+  return allParts(messages).flatMap((part) =>
+    part.type === "delegation-status-group"
+      ? part.polls.map((poll) => poll.toolCallId)
+      : []
+  )
+}
+
+function assistantText(messages: readonly AdaptedMessage[]): string {
+  return allParts(messages)
+    .filter(
+      (part): part is Extract<AdaptedContentPart, { type: "text" }> =>
+        part.type === "text"
+    )
+    .map((part) => part.text)
+    .join("\n")
+}
+
+function conversation2582Messages(): AdaptedMessage[] {
+  const taskId = "81cb187d-1473-43bf-be66-43072f554407"
+  return [
+    assistant(
+      "1",
+      delegate("delegate-call-1", taskId, "conversation-2582-run")
+    ),
+    assistant(
+      "2",
+      statusGroup(
+        statusPoll(
+          "status-timeout-1",
+          { task_ids: [taskId], wait_ms: 0 },
+          null,
+          "timed out awaiting tools/call after 300s"
+        )
+      )
+    ),
+    assistant("3", text("continuation checkpoint")),
+    assistant(
+      "4",
+      statusGroup(
+        statusPoll(
+          "status-timeout-2",
+          { task_ids: [taskId], wait_ms: 0 },
+          null,
+          "timed out awaiting tools/call after 300s"
+        )
+      )
+    ),
+    assistant(
+      "5",
+      statusGroup(
+        statusPoll(
+          "status-running-3",
+          { task_ids: [taskId], wait_ms: 0 },
+          [{ task_id: taskId, status: "running" }],
+          null
+        )
+      )
+    ),
+  ]
+}
+
 describe("projectDelegationTranscript", () => {
-  it("projects a multi-turn history to one card per run and one residual row", () => {
+  it("projects a multi-turn history while keeping an indivisible mixed call", () => {
     const messages = [
       assistant("1", delegate("tool-1", "run-1", "unit-a")),
       assistant(
@@ -143,7 +292,11 @@ describe("projectDelegationTranscript", () => {
       assistant("6", text("still working")),
       assistant(
         "7",
-        status("poll-3", [
+        status("poll-3", [{ taskId: "run-2", status: "completed" }])
+      ),
+      assistant(
+        "8",
+        status("poll-4", [
           { taskId: "run-2", status: "completed" },
           { taskId: "unknown-run", status: "completed" },
         ])
@@ -177,7 +330,10 @@ describe("projectDelegationTranscript", () => {
         .filter((part) => part.type === "text")
         .map((part) => part.text)
     ).toEqual(["checkpoint explanation", "still working"])
-    expect(visibleStatusTaskIds(projected.messages)).toEqual(["unknown-run"])
+    expect(visibleStatusTaskIds(projected.messages)).toEqual([
+      "run-2",
+      "unknown-run",
+    ])
     expect(projected.messages[2]).toBe(messages[2])
     expect(projected.messages[5]).toBe(messages[5])
     expect(originalParts).toEqual(allParts(messages))
@@ -253,6 +409,109 @@ describe("projectDelegationTranscript", () => {
 
     expect(projected.messages[1]).toBe(statusMessage)
     expect(projected.messages[1].content[0]).toBe(statusPart)
+  })
+
+  it.each(statusCases)("applies whole-call identity rule to $name", (entry) => {
+    const poll = statusPoll(entry.name, entry.input, entry.reports, entry.error)
+    const historical = projectDelegationTranscript(
+      [
+        assistant("1", delegate("delegate-1", "run-1", "unit-a")),
+        assistant("2", delegate("delegate-2", "run-2", "unit-b")),
+        assistant("3", statusGroup(poll)),
+      ],
+      2582
+    )
+    expect(
+      projectedStatusPollIds(historical.messages).includes(entry.name)
+    ).toBe(!entry.fold)
+    expect(
+      shouldFoldLiveDelegationTool(poll, historical.identityIndex, 2582)
+    ).toBe(entry.fold)
+  })
+
+  it("fails open on malformed identity-bearing input", () => {
+    const poll: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "malformed-input",
+      toolName: "get_delegation_status",
+      input: '{"task_ids":[',
+      output: null,
+      errorText: null,
+      state: "output-error",
+    }
+    const projected = projectDelegationTranscript(
+      [
+        assistant("1", delegate("delegate-1", "run-1", "unit-a")),
+        assistant("2", statusGroup(poll)),
+      ],
+      2582
+    )
+    expect(projectedStatusPollIds(projected.messages)).toEqual([
+      "malformed-input",
+    ])
+    expect(
+      shouldFoldLiveDelegationTool(poll, projected.identityIndex, 2582)
+    ).toBe(false)
+  })
+
+  it("fails open when an exact id belongs to two distinct runs", () => {
+    const poll = statusPoll(
+      "ambiguous-run",
+      { task_ids: ["duplicate"] },
+      [{ task_id: "duplicate", status: "running" }],
+      null
+    )
+    const projected = projectDelegationTranscript(
+      [
+        assistant("1", delegate("delegate-1", "duplicate", "unit-a")),
+        assistant("2", delegate("delegate-2", "duplicate", "unit-a")),
+        assistant("3", statusGroup(poll)),
+      ],
+      2582
+    )
+    expect(projectedStatusPollIds(projected.messages)).toEqual([
+      "ambiguous-run",
+    ])
+    expect(
+      shouldFoldLiveDelegationTool(poll, projected.identityIndex, 2582)
+    ).toBe(false)
+  })
+
+  it("keeps every row from an indivisible mixed known-unknown call", () => {
+    const mixed = statusPoll(
+      "mixed",
+      { task_ids: ["run-1", "unknown"] },
+      [
+        { task_id: "run-1", status: "running" },
+        { task_id: "unknown", status: "running" },
+      ],
+      null
+    )
+    const projected = projectDelegationTranscript(
+      [
+        assistant("1", delegate("delegate", "run-1", "unit-a")),
+        assistant("2", statusGroup(mixed)),
+      ],
+      2582
+    )
+    expect(visibleStatusTaskIds(projected.messages)).toEqual([
+      "run-1",
+      "unknown",
+    ])
+  })
+
+  it("folds conversation 2582 polls independently of call id and checkpoints", () => {
+    const projected = projectDelegationTranscript(
+      conversation2582Messages(),
+      2582
+    )
+
+    expect(workUnits(projected.messages)).toHaveLength(1)
+    expect(workUnits(projected.messages)[0].sources).toHaveLength(1)
+    expect(visibleStatusTaskIds(projected.messages)).toEqual([])
+    expect(assistantText(projected.messages)).toContain(
+      "continuation checkpoint"
+    )
   })
 
   it("marks mapped successful cancellation without removing its audit card", () => {
