@@ -307,35 +307,6 @@ export function DelegationSettingsSection() {
               })}
             </ButtonGroup>
           </div>
-
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1 min-w-0">
-              <label
-                htmlFor="delegation-stalled-after"
-                className="text-sm font-medium"
-              >
-                {t("softWatchdog")}
-              </label>
-              <p className="text-xs text-muted-foreground">
-                {t("softWatchdogHint", {
-                  min: STALLED_MIN,
-                  max: STALLED_MAX,
-                })}
-              </p>
-            </div>
-            <Input
-              id="delegation-stalled-after"
-              type="number"
-              min={STALLED_MIN}
-              max={STALLED_MAX}
-              step={1}
-              aria-label={t("softWatchdog")}
-              value={stalledAfterSeconds}
-              onChange={(e) => setStalledAfterSeconds(Number(e.target.value))}
-              disabled={loading || !enabled}
-              className="w-28 shrink-0"
-            />
-          </div>
         </TabsContent>
 
         <TabsContent value="agentDefaults" className="pt-2">

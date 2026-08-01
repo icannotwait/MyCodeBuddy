@@ -30,7 +30,6 @@ import { usePlatform } from "@/hooks/use-platform"
 import { relaunchApp } from "@/lib/updater"
 import { toErrorMessage } from "@/lib/app-error"
 import { ConversationExperienceSettingsSection } from "@/components/settings/conversation-experience-settings"
-import { ToolWatchdogSettingsSection } from "@/components/settings/tool-watchdog-settings"
 import { DelegationSettingsSection } from "@/components/settings/delegation-settings"
 import { SessionFeedbackSettingsSection } from "@/components/settings/session-feedback-settings"
 import { AskQuestionSettingsSection } from "@/components/settings/ask-question-settings"
@@ -391,10 +390,6 @@ export function GeneralSettings() {
         )}
 
         <ConversationExperienceSettingsSection />
-
-        {/* Separate from Delegation: host tool-execution watchdog (600+600),
-            not the delegation soft-watchdog (300s observation-only). */}
-        <ToolWatchdogSettingsSection />
 
         <DelegationSettingsSection />
 

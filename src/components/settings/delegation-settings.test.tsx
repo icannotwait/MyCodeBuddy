@@ -170,7 +170,7 @@ describe("DelegationSettingsSection", () => {
     })
   })
 
-  it("disables route choice with delegation off and clamps watchdog on save", async () => {
+  it("disables route choice with delegation off", async () => {
     mockGetDelegationSettings.mockResolvedValue({
       enabled: false,
       depth_limit: 1,
@@ -181,21 +181,8 @@ describe("DelegationSettingsSection", () => {
     renderWithIntl()
     expect(await screen.findByRole("button", { name: "Codeg" })).toBeDisabled()
     expect(screen.getByText(/effective.*Native/i)).toBeInTheDocument()
-
-    // Enable to edit watchdog, then save an out-of-range high value (clamps to max).
-    // 0 is legal (disables stall observation); under-floor clamp no longer applies.
-    const enableSwitch = screen.getByLabelText("Enable delegation")
-    fireEvent.click(enableSwitch)
-    const watchdog = screen.getByLabelText(/soft watchdog/i)
-    fireEvent.change(watchdog, { target: { value: "9999" } })
-    fireEvent.click(screen.getByRole("button", { name: /save/i }))
-    await waitFor(() => {
-      expect(mockSetDelegationBundle).toHaveBeenCalledWith(
-        expect.objectContaining({
-          settings: expect.objectContaining({ stalled_after_seconds: 3600 }),
-        })
-      )
-    })
+    // Soft watchdog is hidden from settings; value still pass-through on save.
+    expect(screen.queryByLabelText(/soft watchdog/i)).not.toBeInTheDocument()
   })
 
   it("highlights the active default route (aria-pressed) and toggles on click", async () => {
