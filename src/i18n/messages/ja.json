@@ -3028,6 +3028,8 @@
           "causeLabel": "原因",
           "riskLabel": "リスク",
           "subjectLabel": "対象",
+          "targetLabel": "復旧先",
+          "reasonLabel": "承認済みのリセット理由",
           "approve": "承認",
           "decline": "拒否",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "委任タスク",
             "workflow": "ワークフロー"
+          },
+          "targets": {
+            "existing_session": "既存のタスクセッション",
+            "fresh_task": "新しいタスク",
+            "replace_unresumable": "置換タスク：セッションを再開できません",
+            "replace_budget_exhausted_continue": "置換タスク：継続予算を使い切りました",
+            "replace_not_supported": "置換タスク：セッション再利用は未対応です",
+            "replace_admission_failed": "置換タスク：受け入れに失敗しました",
+            "replace_admission_unknown": "置換タスク：受け入れ状態が不明です",
+            "workflow_skeleton": "ワークフロー状態：スケルトン",
+            "workflow_estimated": "ワークフロー状態：見積済み",
+            "workflow_approved": "ワークフロー状態：承認済み",
+            "plan_lineage": "Plan レビューの系譜"
           },
           "risks": {
             "normal": "通常の復旧リスク",

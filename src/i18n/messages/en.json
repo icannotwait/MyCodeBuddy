@@ -3028,6 +3028,8 @@
           "causeLabel": "Cause",
           "riskLabel": "Risk",
           "subjectLabel": "Target",
+          "targetLabel": "Recovery target",
+          "reasonLabel": "Approved reset reason",
           "approve": "Approve",
           "decline": "Decline",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "Delegated task",
             "workflow": "Workflow"
+          },
+          "targets": {
+            "existing_session": "Existing task session",
+            "fresh_task": "New task",
+            "replace_unresumable": "Replacement task: session cannot resume",
+            "replace_budget_exhausted_continue": "Replacement task: continuation budget exhausted",
+            "replace_not_supported": "Replacement task: session reuse unsupported",
+            "replace_admission_failed": "Replacement task: admission failed",
+            "replace_admission_unknown": "Replacement task: admission unknown",
+            "workflow_skeleton": "Workflow state: skeleton",
+            "workflow_estimated": "Workflow state: estimated",
+            "workflow_approved": "Workflow state: approved",
+            "plan_lineage": "Plan review lineage"
           },
           "risks": {
             "normal": "Normal recovery risk",

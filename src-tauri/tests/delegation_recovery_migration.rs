@@ -12,7 +12,9 @@ fn sql(text: impl Into<String>) -> Statement {
 }
 
 async fn open_db() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.expect("database");
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("database");
     db.execute(sql("PRAGMA foreign_keys=ON;"))
         .await
         .expect("enable foreign keys");
@@ -32,17 +34,14 @@ async fn apply_recovery_migration(db: &DatabaseConnection) {
 }
 
 async fn seed_historical_state(db: &DatabaseConnection) {
-    db.execute(sql(
-        "INSERT INTO folder \
+    db.execute(sql("INSERT INTO folder \
          (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
          VALUES (1,'repo','C:/recovery-fixture','2026-07-29','2026-07-29',\
-                 '2026-07-29',1,1,'inherit','regular')",
-    ))
-    .await
-    .expect("seed folder");
+                 '2026-07-29',1,1,'inherit','regular')"))
+        .await
+        .expect("seed folder");
 
-    db.execute(sql(
-        "INSERT INTO conversation \
+    db.execute(sql("INSERT INTO conversation \
          (id,folder_id,agent_type,status,kind,message_count,title_locked,auto_title_finalized,\
           parent_id,delegation_call_id,delegation_task_status,delegation_error_code,\
           delegation_started_at,delegation_finished_at,delegation_run_generation,\
@@ -60,10 +59,9 @@ async fn seed_historical_state(db: &DatabaseConnection) {
           '2026-07-29T00:05:00Z','2026-07-29T00:06:00Z'),\
          (5,1,'codex','completed','delegate',2,0,0,1,'call-replacement','completed',\
           NULL,'2026-07-29T00:07:00Z','2026-07-29T00:10:00Z',2,\
-          '2026-07-29T00:07:00Z','2026-07-29T00:10:00Z')",
-    ))
-    .await
-    .expect("seed parent and delegation children");
+          '2026-07-29T00:07:00Z','2026-07-29T00:10:00Z')"))
+        .await
+        .expect("seed parent and delegation children");
 
     for statement in [
         r#"INSERT INTO delegation_task_runs (
@@ -335,11 +333,33 @@ async fn recovery_migration_preserves_existing_workflow_and_run_bytes() {
         .expect("task run columns");
     assert!(
         run_columns.iter().any(|row| {
-            row.try_get::<String>("", "name").expect("column name")
-                == "recovery_authorization_id"
+            row.try_get::<String>("", "name").expect("column name") == "recovery_authorization_id"
         }),
         "migration 43 must add delegation_task_runs.recovery_authorization_id"
     );
+    let manifest_columns = db
+        .query_all(sql(
+            "PRAGMA table_info(delegation_workflow_manifest_revisions)",
+        ))
+        .await
+        .expect("manifest revision columns");
+    assert!(
+        manifest_columns.iter().any(|row| {
+            row.try_get::<String>("", "name").expect("column name") == "graph_revision"
+        }),
+        "migration 43 must add immutable manifest graph_revision evidence"
+    );
+    let historical_graph_revision = db
+        .query_one(sql(
+            "SELECT graph_revision FROM delegation_workflow_manifest_revisions \
+             WHERE workflow_id='workflow-recovery' AND manifest_revision=8",
+        ))
+        .await
+        .expect("historical manifest graph revision")
+        .expect("historical manifest row")
+        .try_get::<Option<i64>>("", "graph_revision")
+        .expect("nullable graph revision");
+    assert_eq!(historical_graph_revision, None);
     assert_eq!(selected_historical_bytes(&db).await, before);
 }
 
@@ -402,11 +422,9 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
     .expect("consumed history may share a fingerprint");
 
     let indexes = db
-        .query_all(sql(
-            "SELECT name FROM sqlite_master \
+        .query_all(sql("SELECT name FROM sqlite_master \
              WHERE type='index' AND tbl_name='recovery_authorizations' \
-               AND name LIKE 'idx_ra_%' ORDER BY name",
-        ))
+               AND name LIKE 'idx_ra_%' ORDER BY name"))
         .await
         .expect("authorization indexes")
         .into_iter()
@@ -424,10 +442,8 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
     );
 
     let index_sql = db
-        .query_one(sql(
-            "SELECT sql FROM sqlite_master \
-             WHERE type='index' AND name='idx_ra_one_active_challenge'",
-        ))
+        .query_one(sql("SELECT sql FROM sqlite_master \
+             WHERE type='index' AND name='idx_ra_one_active_challenge'"))
         .await
         .expect("active index query")
         .expect("active index row")
@@ -438,9 +454,8 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
     assert!(
-        normalized_index_sql.contains(
-            "(parent_conversation_id,subject_kind,subject_id,source_state_fingerprint)"
-        ),
+        normalized_index_sql
+            .contains("(parent_conversation_id,subject_kind,subject_id,source_state_fingerprint)"),
         "wrong active index columns: {normalized_index_sql}"
     );
     assert!(
@@ -542,7 +557,10 @@ async fn recovery_migration_adds_one_active_challenge_and_provenance_columns() {
         "transition_reason_code",
         "consumer_correlation_id",
     ] {
-        assert_eq!(revision.try_get::<Option<String>>("", column).unwrap(), None);
+        assert_eq!(
+            revision.try_get::<Option<String>>("", column).unwrap(),
+            None
+        );
     }
     assert_eq!(
         revision
@@ -601,9 +619,7 @@ async fn deleting_parent_conversation_removes_recovery_authorizations() {
         .await
         .expect("delete parent conversation");
     let count = db
-        .query_one(sql(
-            "SELECT COUNT(*) AS count FROM recovery_authorizations",
-        ))
+        .query_one(sql("SELECT COUNT(*) AS count FROM recovery_authorizations"))
         .await
         .expect("authorization count")
         .expect("count row")

@@ -1259,6 +1259,19 @@ export type RecoveryActionCode =
   | "recover_workflow"
   | "reset_plan_lineage"
 
+export type RecoveryTargetCode =
+  | "existing_session"
+  | "fresh_task"
+  | "replace_unresumable"
+  | "replace_budget_exhausted_continue"
+  | "replace_not_supported"
+  | "replace_admission_failed"
+  | "replace_admission_unknown"
+  | "workflow_skeleton"
+  | "workflow_estimated"
+  | "workflow_approved"
+  | "plan_lineage"
+
 export type RecoveryRiskCode =
   | "normal"
   | "execution_may_have_occurred"
@@ -1309,7 +1322,7 @@ export type RecoveryCauseCode =
 export interface RecoveryQuestionPresentation {
   subject: string
   action: string
-  target: string
+  target: RecoveryTargetCode
   cause: string
   risk: string
   display_reason?: string | null

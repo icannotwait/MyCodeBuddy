@@ -15,9 +15,9 @@ use crate::acp::question::{
 use crate::db::entities::recovery_authorization::{self, RecoveryAuthorizationStatus};
 
 use super::{
-    canonical_json, PreparedAuthorization, RecoveryAuthorizationError, RecoveryAuthorizationResult,
-    RecoveryAuthorizationStore, RecoveryChallenge, APPROVAL_TTL, RECOVERY_APPROVE_LABEL,
-    RECOVERY_DECLINE_LABEL,
+    canonical_json, derive_recovery_action_metadata, PreparedAuthorization,
+    RecoveryAuthorizationError, RecoveryAuthorizationResult, RecoveryAuthorizationStore,
+    RecoveryChallenge, APPROVAL_TTL, RECOVERY_APPROVE_LABEL, RECOVERY_DECLINE_LABEL,
 };
 
 const PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -229,10 +229,15 @@ impl RecoveryAuthorizationService {
         cancelled: CancellationToken,
     ) -> Result<RecoveryAuthorizationResult, RecoveryAuthorizationError> {
         let parent_conversation_id = challenge.parent_conversation_id;
+        let target =
+            derive_recovery_action_metadata(challenge.allowed_action, &challenge.action_payload)
+                .ok_or(RecoveryAuthorizationError::PayloadMismatch)?
+                .target_code
+                .to_string();
         let presentation = RecoveryQuestionPresentation {
             subject: challenge.subject_kind.as_str().to_string(),
             action: challenge.allowed_action.as_str().to_string(),
-            target: challenge.subject_id.clone(),
+            target,
             cause: challenge.cause_code.clone(),
             risk: challenge.risk_class.clone(),
             display_reason: challenge.display_reason.clone(),

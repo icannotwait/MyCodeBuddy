@@ -3028,6 +3028,8 @@
           "causeLabel": "原因",
           "riskLabel": "风险",
           "subjectLabel": "目标",
+          "targetLabel": "恢复目标",
+          "reasonLabel": "已批准的重置原因",
           "approve": "批准",
           "decline": "拒绝",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "已委托任务",
             "workflow": "工作流"
+          },
+          "targets": {
+            "existing_session": "现有任务会话",
+            "fresh_task": "新任务",
+            "replace_unresumable": "替换任务：会话无法恢复",
+            "replace_budget_exhausted_continue": "替换任务：继续预算已耗尽",
+            "replace_not_supported": "替换任务：不支持会话复用",
+            "replace_admission_failed": "替换任务：准入失败",
+            "replace_admission_unknown": "替换任务：准入状态未知",
+            "workflow_skeleton": "工作流状态：骨架",
+            "workflow_estimated": "工作流状态：已估算",
+            "workflow_approved": "工作流状态：已批准",
+            "plan_lineage": "计划评审继承链"
           },
           "risks": {
             "normal": "常规恢复风险",

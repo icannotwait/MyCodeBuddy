@@ -3028,6 +3028,8 @@
           "causeLabel": "Causa",
           "riskLabel": "Riesgo",
           "subjectLabel": "Objetivo",
+          "targetLabel": "Objetivo de recuperación",
+          "reasonLabel": "Motivo de restablecimiento aprobado",
           "approve": "Aprobar",
           "decline": "Rechazar",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "Tarea delegada",
             "workflow": "Flujo de trabajo"
+          },
+          "targets": {
+            "existing_session": "Sesión de tarea existente",
+            "fresh_task": "Tarea nueva",
+            "replace_unresumable": "Tarea de reemplazo: la sesión no puede reanudarse",
+            "replace_budget_exhausted_continue": "Tarea de reemplazo: presupuesto de continuación agotado",
+            "replace_not_supported": "Tarea de reemplazo: reutilización de sesión no compatible",
+            "replace_admission_failed": "Tarea de reemplazo: admisión fallida",
+            "replace_admission_unknown": "Tarea de reemplazo: admisión desconocida",
+            "workflow_skeleton": "Estado del flujo: esqueleto",
+            "workflow_estimated": "Estado del flujo: estimado",
+            "workflow_approved": "Estado del flujo: aprobado",
+            "plan_lineage": "Linaje de revisión del Plan"
           },
           "risks": {
             "normal": "Riesgo normal de recuperación",

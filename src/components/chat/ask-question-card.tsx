@@ -26,6 +26,7 @@ import type {
   RecoveryQuestionPresentation,
   RecoveryRiskCode,
   RecoverySubjectCode,
+  RecoveryTargetCode,
 } from "@/lib/types"
 
 interface AskQuestionCardProps {
@@ -128,6 +129,38 @@ const RECOVERY_SUBJECTS = [
   "workflow",
 ] as const satisfies readonly RecoverySubjectCode[]
 
+const RECOVERY_TARGETS = [
+  "existing_session",
+  "fresh_task",
+  "replace_unresumable",
+  "replace_budget_exhausted_continue",
+  "replace_not_supported",
+  "replace_admission_failed",
+  "replace_admission_unknown",
+  "workflow_skeleton",
+  "workflow_estimated",
+  "workflow_approved",
+  "plan_lineage",
+] as const satisfies readonly RecoveryTargetCode[]
+
+function targetMatchesAction(
+  action: RecoveryActionCode,
+  target: RecoveryTargetCode
+): boolean {
+  switch (action) {
+    case "continue":
+      return target === "existing_session"
+    case "fresh_dispatch":
+      return target === "fresh_task"
+    case "replace":
+      return target.startsWith("replace_")
+    case "recover_workflow":
+      return target.startsWith("workflow_")
+    case "reset_plan_lineage":
+      return target === "plan_lineage"
+  }
+}
+
 function isOneOf<const T extends readonly string[]>(
   values: T,
   value: string
@@ -159,11 +192,15 @@ function RecoveryQuestionCard({
   const cause = presentation.cause
   const risk = presentation.risk
   const subject = presentation.subject
+  const target = presentation.target
   if (
     !isOneOf(RECOVERY_ACTIONS, action) ||
     !isOneOf(RECOVERY_CAUSES, cause) ||
     !isOneOf(RECOVERY_RISKS, risk) ||
-    !isOneOf(RECOVERY_SUBJECTS, subject)
+    !isOneOf(RECOVERY_SUBJECTS, subject) ||
+    !isOneOf(RECOVERY_TARGETS, target) ||
+    !targetMatchesAction(action, target) ||
+    (action === "reset_plan_lineage" && !presentation.display_reason)
   ) {
     return null
   }
@@ -221,6 +258,12 @@ function RecoveryQuestionCard({
           </div>
           <div>
             <dt className="text-xs text-muted-foreground">
+              {t("recovery.targetLabel")}
+            </dt>
+            <dd>{t(`recovery.targets.${target}`)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">
               {t("recovery.causeLabel")}
             </dt>
             <dd>{t(`recovery.causes.${cause}`)}</dd>
@@ -231,6 +274,16 @@ function RecoveryQuestionCard({
             </dt>
             <dd>{t(`recovery.risks.${risk}`)}</dd>
           </div>
+          {action === "reset_plan_lineage" && (
+            <div className="sm:col-span-2">
+              <dt className="text-xs text-muted-foreground">
+                {t("recovery.reasonLabel")}
+              </dt>
+              <dd className="whitespace-pre-wrap break-words">
+                {presentation.display_reason}
+              </dd>
+            </div>
+          )}
         </dl>
 
         {!readOnly && (

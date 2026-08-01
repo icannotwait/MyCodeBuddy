@@ -91,6 +91,8 @@ mod recovery_authorization {
             source_state_fingerprint: "fingerprint-a".into(),
             allowed_action: RecoveryAllowedAction::Replace,
             action_payload: json!({
+                "action": "replace",
+                "replacement_reason": "unresumable",
                 "agent": "codex",
                 "nested": {"z": 2, "a": 1},
                 "reset_reason_hash": "reason-a"

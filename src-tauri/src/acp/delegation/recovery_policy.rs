@@ -363,6 +363,9 @@ pub fn decide_delegation_recovery(
 }
 
 fn inconsistent_durable_state(source: &RecoverySourceSnapshot) -> bool {
+    if source.run_status == DelegationRunStatus::Completed && source.error_code.is_some() {
+        return true;
+    }
     if matches!(
         source.error_code.as_deref(),
         Some("admission_failed") | Some("admission_unknown")
@@ -774,7 +777,7 @@ fn apply_rails(
             if !source.launch_snapshot_complete || source.external_session_identity_hash.is_none() {
                 return replacement_or_exhausted(
                     rails,
-                    ReplacementReason::NotSupported,
+                    ReplacementReason::Unresumable,
                     assessment.cause_code.clone().then_missing_resume(),
                 );
             }
@@ -1415,7 +1418,7 @@ mod delegation_recovery_policy {
             missing_resume,
             normal_rail.clone(),
             RecoveryDisposition::Replace {
-                replacement_reason: ReplacementReason::NotSupported,
+                replacement_reason: ReplacementReason::Unresumable,
             },
             RecoveryConfirmation::NotRequired,
             RecoveryCauseCode::MissingResumeIdentity,
@@ -1546,6 +1549,80 @@ mod delegation_recovery_policy {
             RecoveryConfirmation::NotRequired,
             RecoveryCauseCode::ContradictoryEvidence,
             RecoveryRiskClass::LegacyUnknownOrigin,
+        );
+    }
+
+    #[test]
+    fn completed_rows_with_any_error_code_are_inconsistent() {
+        for error_code in ["unresumable", "subagent_error", "process_exited"] {
+            let mut completed = source();
+            completed.error_code = Some(error_code.to_string());
+
+            let decision = decide_delegation_recovery(
+                &completed,
+                &rails(),
+                RequestedRecoveryOperation::Inspect,
+            );
+
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::InconsistentDurableState,
+                "completed/{error_code} must fail closed"
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
+            assert_eq!(
+                decision.cause_code,
+                RecoveryCauseCode::ContradictoryEvidence
+            );
+            assert_eq!(decision.proposed_action(), None);
+        }
+
+        let normal =
+            decide_delegation_recovery(&source(), &rails(), RequestedRecoveryOperation::Inspect);
+        assert_eq!(
+            normal.disposition,
+            RecoveryDisposition::Continue {
+                admission_class: AdmissionClass::NormalRevision
+            }
+        );
+    }
+
+    #[test]
+    fn structural_resume_identity_absence_is_unresumable_but_disabled_reuse_is_not_supported() {
+        let mut missing_identity = source();
+        missing_identity.external_session_identity_hash = None;
+        let missing_identity_decision = decide_delegation_recovery(
+            &missing_identity,
+            &rails(),
+            RequestedRecoveryOperation::Inspect,
+        );
+        assert_eq!(
+            missing_identity_decision.disposition,
+            RecoveryDisposition::Replace {
+                replacement_reason: ReplacementReason::Unresumable
+            }
+        );
+        assert_eq!(
+            missing_identity_decision.cause_code,
+            RecoveryCauseCode::MissingResumeIdentity
+        );
+
+        let mut unsupported_rails = rails();
+        unsupported_rails.agent_supports_reuse = false;
+        let unsupported_decision = decide_delegation_recovery(
+            &source(),
+            &unsupported_rails,
+            RequestedRecoveryOperation::Inspect,
+        );
+        assert_eq!(
+            unsupported_decision.disposition,
+            RecoveryDisposition::Replace {
+                replacement_reason: ReplacementReason::NotSupported
+            }
+        );
+        assert_eq!(
+            unsupported_decision.cause_code,
+            RecoveryCauseCode::UnsupportedReuse
         );
     }
 
@@ -1695,7 +1772,7 @@ mod delegation_recovery_policy {
         assert_eq!(
             decision.disposition,
             RecoveryDisposition::Replace {
-                replacement_reason: ReplacementReason::NotSupported
+                replacement_reason: ReplacementReason::Unresumable
             },
             "established lineage must never fall back to generation-1 fresh dispatch"
         );
@@ -1780,7 +1857,7 @@ mod delegation_recovery_policy {
         assert_eq!(
             decision.disposition,
             RecoveryDisposition::Replace {
-                replacement_reason: ReplacementReason::NotSupported
+                replacement_reason: ReplacementReason::Unresumable
             }
         );
         assert_eq!(decision.confirmation, RecoveryConfirmation::Required);

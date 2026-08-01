@@ -1171,6 +1171,14 @@ describe("authorized recovery validator contract", () => {
         "B2D-R001"
       )
     })
+
+    it(`uses B2D-R001 when ${token} is negated after the token`, () => {
+      const extra = `${token} must never be supplied during recovery.\n`
+      assertHasRuleId(
+        validateSkillMarkdown(baseValidSkill({ extra })).failures,
+        "B2D-R001"
+      )
+    })
   }
 
   const sequenceMutations = [

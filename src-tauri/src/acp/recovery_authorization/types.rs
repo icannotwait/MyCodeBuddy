@@ -45,6 +45,75 @@ impl RecoveryAllowedAction {
             Self::ResetPlanLineage => "reset_plan_lineage",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "continue" => Self::Continue,
+            "fresh_dispatch" => Self::FreshDispatch,
+            "replace" => Self::Replace,
+            "recover_workflow" => Self::RecoverWorkflow,
+            "reset_plan_lineage" => Self::ResetPlanLineage,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryActionMetadata<'a> {
+    pub target_code: &'static str,
+    pub replacement_reason: Option<&'a str>,
+    pub target_state: Option<&'a str>,
+}
+
+pub fn derive_recovery_action_metadata<'a>(
+    action: RecoveryAllowedAction,
+    payload: &'a Value,
+) -> Option<RecoveryActionMetadata<'a>> {
+    let payload_action = payload.get("action").and_then(Value::as_str);
+    let (target_code, replacement_reason, target_state) = match action {
+        RecoveryAllowedAction::Continue if payload_action == Some("continue") => {
+            ("existing_session", None, None)
+        }
+        RecoveryAllowedAction::FreshDispatch if payload_action == Some("fresh_dispatch") => {
+            ("fresh_task", None, None)
+        }
+        RecoveryAllowedAction::Replace if payload_action == Some("replace") => {
+            let reason = payload.get("replacement_reason")?.as_str()?;
+            let target = match reason {
+                "unresumable" => "replace_unresumable",
+                "budget_exhausted_continue" => "replace_budget_exhausted_continue",
+                "not_supported" => "replace_not_supported",
+                "admission_failed" => "replace_admission_failed",
+                "admission_unknown" => "replace_admission_unknown",
+                _ => return None,
+            };
+            (target, Some(reason), None)
+        }
+        RecoveryAllowedAction::RecoverWorkflow => {
+            let state = payload.get("target_state")?.as_str()?;
+            let target = match state {
+                "skeleton" => "workflow_skeleton",
+                "estimated" => "workflow_estimated",
+                "approved" => "workflow_approved",
+                _ => return None,
+            };
+            (target, None, Some(state))
+        }
+        RecoveryAllowedAction::ResetPlanLineage
+            if payload
+                .get("displayed_reason_sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| !hash.is_empty()) =>
+        {
+            ("plan_lineage", None, None)
+        }
+        _ => return None,
+    };
+    Some(RecoveryActionMetadata {
+        target_code,
+        replacement_reason,
+        target_state,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +170,12 @@ pub struct AuthorizationConsumeExpectation<'a> {
 pub struct RecoveryAuthorizationResult {
     pub authorization_id: String,
     pub status: RecoveryAuthorizationStatus,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub allowed_action: String,
+    pub action_payload: Value,
+    pub cause_code: String,
+    pub display_reason: Option<String>,
     pub approved_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -110,6 +185,12 @@ impl From<&recovery_authorization::Model> for RecoveryAuthorizationResult {
         Self {
             authorization_id: row.authorization_id.clone(),
             status: row.status.clone(),
+            subject_kind: row.subject_kind.clone(),
+            subject_id: row.subject_id.clone(),
+            allowed_action: row.allowed_action.clone(),
+            action_payload: serde_json::from_str(&row.action_payload_json).unwrap_or(Value::Null),
+            cause_code: row.cause_code.clone(),
+            display_reason: row.display_reason.clone(),
             approved_at: row.approved_at,
             expires_at: row.expires_at,
         }

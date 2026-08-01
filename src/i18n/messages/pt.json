@@ -3028,6 +3028,8 @@
           "causeLabel": "Causa",
           "riskLabel": "Risco",
           "subjectLabel": "Alvo",
+          "targetLabel": "Alvo da recuperação",
+          "reasonLabel": "Motivo de redefinição aprovado",
           "approve": "Aprovar",
           "decline": "Recusar",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "Tarefa delegada",
             "workflow": "Fluxo de trabalho"
+          },
+          "targets": {
+            "existing_session": "Sessão de tarefa existente",
+            "fresh_task": "Nova tarefa",
+            "replace_unresumable": "Tarefa substituta: a sessão não pode continuar",
+            "replace_budget_exhausted_continue": "Tarefa substituta: orçamento de continuação esgotado",
+            "replace_not_supported": "Tarefa substituta: reutilização de sessão não suportada",
+            "replace_admission_failed": "Tarefa substituta: admissão falhou",
+            "replace_admission_unknown": "Tarefa substituta: admissão desconhecida",
+            "workflow_skeleton": "Estado do fluxo: esqueleto",
+            "workflow_estimated": "Estado do fluxo: estimado",
+            "workflow_approved": "Estado do fluxo: aprovado",
+            "plan_lineage": "Linhagem de revisão do Plan"
           },
           "risks": {
             "normal": "Risco normal de recuperação",

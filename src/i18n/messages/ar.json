@@ -3028,6 +3028,8 @@
           "causeLabel": "السبب",
           "riskLabel": "المخاطر",
           "subjectLabel": "الهدف",
+          "targetLabel": "هدف الاسترداد",
+          "reasonLabel": "سبب إعادة التعيين المعتمد",
           "approve": "موافقة",
           "decline": "رفض",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "مهمة مفوضة",
             "workflow": "سير العمل"
+          },
+          "targets": {
+            "existing_session": "جلسة المهمة الحالية",
+            "fresh_task": "مهمة جديدة",
+            "replace_unresumable": "مهمة بديلة: لا يمكن استئناف الجلسة",
+            "replace_budget_exhausted_continue": "مهمة بديلة: استُنفدت ميزانية المتابعة",
+            "replace_not_supported": "مهمة بديلة: إعادة استخدام الجلسة غير مدعومة",
+            "replace_admission_failed": "مهمة بديلة: فشل القبول",
+            "replace_admission_unknown": "مهمة بديلة: حالة القبول غير معروفة",
+            "workflow_skeleton": "حالة سير العمل: هيكل أولي",
+            "workflow_estimated": "حالة سير العمل: مقدّر",
+            "workflow_approved": "حالة سير العمل: معتمد",
+            "plan_lineage": "نسب مراجعة الخطة"
           },
           "risks": {
             "normal": "مخاطر استرداد عادية",

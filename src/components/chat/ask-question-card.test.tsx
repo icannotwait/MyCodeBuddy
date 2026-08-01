@@ -13,7 +13,12 @@ import koMessages from "@/i18n/messages/ko.json"
 import ptMessages from "@/i18n/messages/pt.json"
 import zhCNMessages from "@/i18n/messages/zh-CN.json"
 import zhTWMessages from "@/i18n/messages/zh-TW.json"
-import type { PendingQuestionState, QuestionAnswer } from "@/lib/types"
+import type {
+  PendingQuestionState,
+  QuestionAnswer,
+  RecoveryActionCode,
+  RecoveryTargetCode,
+} from "@/lib/types"
 
 function renderCard(
   question: PendingQuestionState,
@@ -151,13 +156,6 @@ const twoMultiFirst: PendingQuestionState = {
 
 describe("AskQuestionCard", () => {
   it("localizes a recovery card from codes and submits raw approve or decline", async () => {
-    const actions = [
-      "continue",
-      "fresh_dispatch",
-      "replace",
-      "recover_workflow",
-      "reset_plan_lineage",
-    ] as const
     const causes = [
       "completed",
       "revision_eligible_failure",
@@ -206,6 +204,19 @@ describe("AskQuestionCard", () => {
       "durable_state_risk",
     ] as const
     const subjects = ["delegation_task", "workflow"] as const
+    const targetCases = [
+      ["continue", "existing_session"],
+      ["fresh_dispatch", "fresh_task"],
+      ["replace", "replace_unresumable"],
+      ["replace", "replace_budget_exhausted_continue"],
+      ["replace", "replace_not_supported"],
+      ["replace", "replace_admission_failed"],
+      ["replace", "replace_admission_unknown"],
+      ["recover_workflow", "workflow_skeleton"],
+      ["recover_workflow", "workflow_estimated"],
+      ["recover_workflow", "workflow_approved"],
+      ["reset_plan_lineage", "plan_lineage"],
+    ] as const
     const locales = [
       ["en", enMessages],
       ["ar", arMessages],
@@ -220,10 +231,20 @@ describe("AskQuestionCard", () => {
     ] as const
 
     const recoveryQuestion = (
-      action: (typeof actions)[number],
+      action: RecoveryActionCode,
       cause: (typeof causes)[number],
       risk: (typeof risks)[number],
-      subject: (typeof subjects)[number]
+      subject: (typeof subjects)[number],
+      target: RecoveryTargetCode = action === "continue"
+        ? "existing_session"
+        : action === "fresh_dispatch"
+          ? "fresh_task"
+          : action === "replace"
+            ? "replace_unresumable"
+            : action === "recover_workflow"
+              ? "workflow_estimated"
+              : "plan_lineage",
+      displayReason = "MODEL REASON MUST NOT RENDER"
     ): PendingQuestionState => ({
       question_id: `recovery-${action}-${cause}-${risk}-${subject}`,
       created_at: "2026-01-01T00:00:00Z",
@@ -246,10 +267,10 @@ describe("AskQuestionCard", () => {
           recovery: {
             subject,
             action,
-            target: "MODEL TARGET MUST NOT RENDER",
+            target,
             cause,
             risk,
-            display_reason: "MODEL REASON MUST NOT RENDER",
+            display_reason: displayReason,
           },
         },
       ],
@@ -257,14 +278,25 @@ describe("AskQuestionCard", () => {
 
     for (const [locale, messages] of locales) {
       for (let index = 0; index < causes.length; index += 1) {
-        const action = actions[index % actions.length]
+        const [action, target] = targetCases[index % targetCases.length]
         const risk = risks[index % risks.length]
         const subject = subjects[index % subjects.length]
+        const displayReason =
+          action === "reset_plan_lineage"
+            ? `Exact reset reason ${locale} ${index}`
+            : "MODEL REASON MUST NOT RENDER"
         const onAnswer = vi.fn().mockResolvedValue(undefined)
         render(
           <NextIntlClientProvider locale={locale} messages={messages}>
             <AskQuestionCard
-              question={recoveryQuestion(action, causes[index], risk, subject)}
+              question={recoveryQuestion(
+                action,
+                causes[index],
+                risk,
+                subject,
+                target,
+                displayReason
+              )}
               onAnswer={onAnswer}
             />
           </NextIntlClientProvider>
@@ -303,13 +335,21 @@ describe("AskQuestionCard", () => {
             messages.Folder.chat.askQuestion.recovery.subjects[subject]
           )
         ).toBeInTheDocument()
+        expect(
+          screen.getByText(
+            messages.Folder.chat.askQuestion.recovery.targets[target]
+          )
+        ).toBeInTheDocument()
+        if (action === "reset_plan_lineage") {
+          expect(screen.getByText(displayReason)).toBeInTheDocument()
+        } else {
+          expect(screen.queryByText(displayReason)).not.toBeInTheDocument()
+        }
         for (const modelCopy of [
           "MODEL-PROVIDED QUESTION MUST NOT RENDER",
           "MODEL HEADER",
           "MODEL APPROVE COPY MUST NOT RENDER",
           "MODEL DECLINE COPY MUST NOT RENDER",
-          "MODEL TARGET MUST NOT RENDER",
-          "MODEL REASON MUST NOT RENDER",
         ]) {
           expect(screen.queryByText(modelCopy)).not.toBeInTheDocument()
         }
@@ -405,6 +445,7 @@ describe("AskQuestionCard", () => {
       { cause: "unknown_cause" },
       { risk: "unknown_risk" },
       { subject: "unknown_subject" },
+      { target: "unknown_target" },
     ]) {
       const unknown = recoveryQuestion(
         "continue",

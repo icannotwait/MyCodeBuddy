@@ -3028,6 +3028,8 @@
           "causeLabel": "Ursache",
           "riskLabel": "Risiko",
           "subjectLabel": "Ziel",
+          "targetLabel": "Wiederherstellungsziel",
+          "reasonLabel": "Genehmigter Rücksetzgrund",
           "approve": "Genehmigen",
           "decline": "Ablehnen",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "Delegierte Aufgabe",
             "workflow": "Workflow"
+          },
+          "targets": {
+            "existing_session": "Bestehende Aufgabensitzung",
+            "fresh_task": "Neue Aufgabe",
+            "replace_unresumable": "Ersatzaufgabe: Sitzung nicht fortsetzbar",
+            "replace_budget_exhausted_continue": "Ersatzaufgabe: Fortsetzungsbudget erschöpft",
+            "replace_not_supported": "Ersatzaufgabe: Sitzungswiederverwendung nicht unterstützt",
+            "replace_admission_failed": "Ersatzaufgabe: Aufnahme fehlgeschlagen",
+            "replace_admission_unknown": "Ersatzaufgabe: Aufnahmestatus unbekannt",
+            "workflow_skeleton": "Workflow-Status: Grundgerüst",
+            "workflow_estimated": "Workflow-Status: geschätzt",
+            "workflow_approved": "Workflow-Status: genehmigt",
+            "plan_lineage": "Plan-Prüflinie"
           },
           "risks": {
             "normal": "Normales Wiederherstellungsrisiko",

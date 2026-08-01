@@ -3028,6 +3028,8 @@
           "causeLabel": "원인",
           "riskLabel": "위험",
           "subjectLabel": "대상",
+          "targetLabel": "복구 대상",
+          "reasonLabel": "승인된 재설정 사유",
           "approve": "승인",
           "decline": "거부",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "위임된 작업",
             "workflow": "워크플로"
+          },
+          "targets": {
+            "existing_session": "기존 작업 세션",
+            "fresh_task": "새 작업",
+            "replace_unresumable": "교체 작업: 세션을 재개할 수 없음",
+            "replace_budget_exhausted_continue": "교체 작업: 계속 예산 소진",
+            "replace_not_supported": "교체 작업: 세션 재사용 미지원",
+            "replace_admission_failed": "교체 작업: 승인 실패",
+            "replace_admission_unknown": "교체 작업: 승인 상태 알 수 없음",
+            "workflow_skeleton": "워크플로 상태: 골격",
+            "workflow_estimated": "워크플로 상태: 추정됨",
+            "workflow_approved": "워크플로 상태: 승인됨",
+            "plan_lineage": "Plan 검토 계보"
           },
           "risks": {
             "normal": "일반 복구 위험",

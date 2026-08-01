@@ -724,7 +724,7 @@ pub(crate) fn sanitize_bootstrap_unresumable_message(message: &str) -> String {
 fn disposition_error_code(disposition: &ReservingHandoffDisposition) -> Option<String> {
     match disposition {
         ReservingHandoffDisposition::ParentEnded(context) => {
-            Some(context.reason.error_code().to_string())
+            Some(context.durable_error_code().to_string())
         }
         ReservingHandoffDisposition::ChildTerminal(observed) => match &observed.outcome {
             DelegationOutcome::Err { code, .. } => Some(code.clone()),
@@ -2029,7 +2029,7 @@ fn terminal_from_handoff_disposition(
         ReservingHandoffDisposition::ParentEnded(context) => {
             let observed_at = context.termination.observed_at;
             TerminalTaskWrite::canceled(
-                context.reason.error_code(),
+                context.durable_error_code(),
                 observed_at,
                 context.audit(prior_status, AdmissionClass::NormalRevision, None, None),
             )
@@ -2047,7 +2047,7 @@ fn observed_terminal_from_handoff_disposition(
     match disposition {
         ReservingHandoffDisposition::ParentEnded(context) => ObservedTerminal {
             outcome: DelegationOutcome::Err {
-                code: context.reason.error_code().to_string(),
+                code: context.durable_error_code().to_string(),
                 message: context.reason.message().to_string(),
                 child_conversation_id: Some(child_conversation_id),
             },
@@ -4192,7 +4192,7 @@ impl DelegationBroker {
             agent_type,
             inflight_id,
             abandon_context,
-            context.reason.error_code(),
+            context.durable_error_code(),
             context.audit(
                 DelegationRunStatus::Reserving,
                 AdmissionClass::NormalRevision,
@@ -6742,7 +6742,7 @@ impl DelegationBroker {
                             .settle_terminal(
                                 &call_id,
                                 TerminalTaskWrite::canceled(
-                                    context.reason.error_code(),
+                                    context.durable_error_code(),
                                     context.termination.observed_at,
                                     context.audit(
                                         DelegationRunStatus::Reserving,
@@ -7211,7 +7211,7 @@ impl DelegationBroker {
             // code (do not collapse via DelegationError::Canceled).
             Disposition::ParentEnded(parent_end) => {
                 let terminal = TerminalTaskWrite::canceled(
-                    parent_end.reason.error_code(),
+                    parent_end.durable_error_code(),
                     parent_end.termination.observed_at,
                     parent_end.audit(
                         DelegationRunStatus::Running,
@@ -8775,7 +8775,7 @@ impl DelegationBroker {
                     .settle_terminal(
                         &run.task_id,
                         TerminalTaskWrite::canceled(
-                            parent_end.reason.error_code(),
+                            parent_end.durable_error_code(),
                             parent_end.termination.observed_at,
                             parent_end.audit(
                                 DelegationRunStatus::Reserving,
@@ -8860,7 +8860,7 @@ impl DelegationBroker {
                     .settle_terminal(
                         &reserved.task_id,
                         TerminalTaskWrite::canceled(
-                            parent_end.reason.error_code(),
+                            parent_end.durable_error_code(),
                             parent_end.termination.observed_at,
                             parent_end.audit(
                                 DelegationRunStatus::Reserving,
@@ -13031,7 +13031,7 @@ impl DelegationBroker {
     ) {
         for (task_id, task, duration_ms) in drained {
             let terminal = TerminalTaskWrite::canceled(
-                parent_end.reason.error_code(),
+                parent_end.durable_error_code(),
                 parent_end.termination.observed_at,
                 parent_end.audit(
                     DelegationRunStatus::Running,
@@ -13116,7 +13116,7 @@ impl DelegationBroker {
                             task_id = %handoff.task_id,
                             child_connection_id = %handoff.child_connection_id,
                             child_conversation_id = handoff.child_conversation_id,
-                            reason = fallback.reason.error_code(),
+                            reason = fallback.durable_error_code(),
                             "[delegation] reserving handoff settled on parent end"
                         );
                     } else {
@@ -13193,7 +13193,7 @@ impl DelegationBroker {
                     tracing::info!(
                         task_id = %row.task_id,
                         parent_conversation_id,
-                        reason = parent_end.reason.error_code(),
+                        reason = parent_end.durable_error_code(),
                         "[delegation] durable non-terminal skip pure gen1 reserving; inflight owns compensate"
                     );
                     continue;
@@ -13235,7 +13235,7 @@ impl DelegationBroker {
                             tracing::info!(
                                 task_id = %row.task_id,
                                 parent_conversation_id,
-                                reason = parent_end.reason.error_code(),
+                                reason = parent_end.durable_error_code(),
                                 "[delegation] durable non-terminal settled on parent end"
                             );
                         } else {
@@ -39866,9 +39866,14 @@ mod tests {
 
     mod disconnect_origin {
         use super::*;
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
+            RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot,
+            RequestedRecoveryOperation,
+        };
         use crate::acp::termination::{
             AcpDisconnectOrigin, AcpTerminationClassification, AcpTerminationReason,
-            AcpTerminationSource,
+            AcpTerminationSource, ParsedDelegationTermination,
         };
 
         #[tokio::test]
@@ -39915,6 +39920,98 @@ mod tests {
                 termination
             );
             assert_eq!(calls[0].1.finished_at, observed_at);
+        }
+
+        #[tokio::test]
+        async fn typed_transport_cleanup_projects_automatic_unexpected_continue() {
+            let spawner = Arc::new(MockSpawner::new());
+            let store = Arc::new(MockTaskStore::accept_any_running(42));
+            let broker = broker_with_store(spawner, store.clone());
+            broker
+                .seed_live_task_for_test("parent-conn", "transport-loss-task")
+                .await;
+
+            let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T05:06:07Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let termination = AcpTerminationSummaryV1::new(
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+                true,
+                observed_at,
+            );
+            broker
+                .cancel_by_parent_with_context(
+                    "parent-conn",
+                    ParentEndContext {
+                        reason: ParentTurnEndReason::ParentDisconnected,
+                        termination,
+                    },
+                )
+                .await;
+
+            let calls = store.settle_calls().await;
+            assert_eq!(calls.len(), 1);
+            let terminal = &calls[0].1;
+            assert_eq!(
+                terminal.error_code.as_deref(),
+                Some("transport_disconnected")
+            );
+            let source = RecoverySourceSnapshot {
+                source_task_id: "transport-loss-task".into(),
+                lineage_root_task_id: "transport-loss-task".into(),
+                generation: 1,
+                parent_conversation_id: 10,
+                child_conversation_id: 42,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some("C:/workspace".into()),
+                route_fingerprint: Some("route-1".into()),
+                work_unit_key: Some("transport-loss".into()),
+                parent_tool_use_id: Some("parent-tool".into()),
+                child_connection_id: Some("child-connection-transport-loss-task".into()),
+                history_only: false,
+                is_latest: true,
+                has_active_run: false,
+                child_superseded: false,
+                child_ownership_valid: true,
+                agent_type_matches: true,
+                run_status: DelegationRunStatus::Canceled,
+                error_code: terminal.error_code.clone(),
+                admission_class: AdmissionClass::NormalRevision,
+                parsed_termination: ParsedDelegationTermination::Typed(
+                    terminal
+                        .termination_evidence()
+                        .expect("cleanup termination evidence")
+                        .clone(),
+                ),
+                reached_running: true,
+                launch_snapshot_complete: true,
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: Some("default".into()),
+                config_values_json: Some("{}".into()),
+                external_session_identity_hash: Some(hash_external_session_identity("session-1")),
+                replaced_task_id: None,
+                replacement_reason: None,
+                recovery_authorization_id: None,
+            };
+            let decision = decide_delegation_recovery(
+                &source,
+                &RecoveryRailSnapshot {
+                    agent_supports_reuse: true,
+                    unexpected_continue_budget_available: true,
+                    replacement_budget_available: true,
+                },
+                RequestedRecoveryOperation::Inspect,
+            );
+            assert_eq!(
+                decision.disposition,
+                RecoveryDisposition::Continue {
+                    admission_class: AdmissionClass::UnexpectedContinue
+                }
+            );
+            assert_eq!(decision.confirmation, RecoveryConfirmation::NotRequired);
         }
     }
 }

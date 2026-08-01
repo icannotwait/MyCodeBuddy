@@ -56,6 +56,7 @@ impl MigrationTrait for Migration {
             "ALTER TABLE delegation_workflow_manifest_revisions ADD COLUMN recovery_authorization_id TEXT NULL",
             "ALTER TABLE delegation_workflow_manifest_revisions ADD COLUMN transition_reason_code TEXT NULL",
             "ALTER TABLE delegation_workflow_manifest_revisions ADD COLUMN consumer_correlation_id TEXT NULL",
+            "ALTER TABLE delegation_workflow_manifest_revisions ADD COLUMN graph_revision INTEGER NULL",
             "ALTER TABLE delegation_workflows ADD COLUMN block_cause_code TEXT NULL",
             "ALTER TABLE delegation_workflows ADD COLUMN block_source_manifest_revision INTEGER NULL",
             "ALTER TABLE delegation_workflow_gate_settlements ADD COLUMN lineage_reset_authorization_id TEXT NULL",

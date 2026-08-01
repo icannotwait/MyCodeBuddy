@@ -230,7 +230,7 @@
   },
   {
     "name": "request_recovery_authorization",
-    "description": "After typed recovery_confirmation_required, request confirmation; replay the exact rejected call with recovery_authorization_id. Server derives action, target, warning, work-unit key, and delegation target.",
+    "description": "After typed recovery_confirmation_required, request confirmation; replay the exact rejected call with recovery_authorization_id. Server derives action, target, warning, work-unit key, and delegation target. Structured results include subject_kind, subject_id, allowed_action, cause_code, expires_at, and action-specific target_state or replacement_reason metadata.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,

@@ -5392,6 +5392,19 @@ mod tests {
                 .as_str()
                 .expect("authorization description")
                 .contains("exact rejected call"));
+            for result_field in [
+                "subject_kind",
+                "allowed_action",
+                "cause_code",
+                "expires_at",
+                "target_state",
+                "replacement_reason",
+            ] {
+                assert!(authorization["description"]
+                    .as_str()
+                    .expect("authorization description")
+                    .contains(result_field));
+            }
             let authorization_schema = &authorization["inputSchema"];
             assert_eq!(authorization_schema["additionalProperties"], false);
             assert_eq!(
@@ -5537,6 +5550,26 @@ mod tests {
                     error.contains(rejected),
                     "unexpected error for {rejected}: {error}"
                 );
+            }
+        }
+
+        #[test]
+        fn companion_preserves_structured_authorization_contract_for_terminal_statuses() {
+            for (status, reused) in [("approved", false), ("approved", true), ("declined", false)] {
+                let outcome = json!({
+                    "status": status,
+                    "recovery_authorization_id": "authorization-a",
+                    "reused": reused,
+                    "subject_kind": "workflow",
+                    "subject_id": "workflow-a",
+                    "allowed_action": "recover_workflow",
+                    "target_state": "estimated",
+                    "cause_code": "plan_gate_blocked",
+                    "expires_at": if status == "approved" { json!("2026-07-30T12:10:00Z") } else { Value::Null },
+                });
+                let rendered = render_recovery_authorization_result(&outcome);
+                assert_eq!(rendered["structuredContent"], outcome);
+                assert_eq!(rendered["isError"], false);
             }
         }
 

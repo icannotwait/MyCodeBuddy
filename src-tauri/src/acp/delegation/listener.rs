@@ -57,9 +57,10 @@ use crate::acp::question::{
     SessionQuestionAccess,
 };
 use crate::acp::recovery_authorization::{
-    DelegationAuthorizationIdentity, PreparedAuthorization, RecoveryAllowedAction,
-    RecoveryAuthorizationError, RecoveryAuthorizationResult, RecoveryAuthorizationService,
-    RecoveryChallenge, RecoverySubjectKind, RECOVERY_APPROVE_LABEL, RECOVERY_DECLINE_LABEL,
+    derive_recovery_action_metadata, DelegationAuthorizationIdentity, PreparedAuthorization,
+    RecoveryAllowedAction, RecoveryAuthorizationError, RecoveryAuthorizationResult,
+    RecoveryAuthorizationService, RecoveryChallenge, RecoverySubjectKind, RECOVERY_APPROVE_LABEL,
+    RECOVERY_DECLINE_LABEL,
 };
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
@@ -1897,6 +1898,14 @@ impl DelegationListener {
         authorization_id: String,
         cancelled: CancellationToken,
     ) -> Value {
+        let Some(metadata) =
+            derive_recovery_action_metadata(challenge.allowed_action, &challenge.action_payload)
+        else {
+            return recovery_wire_error(
+                "recovery_authorization_contract_invalid",
+                "derived recovery action payload is invalid",
+            );
+        };
         let questions = vec![QuestionSpec {
             id: uuid::Uuid::new_v4().to_string(),
             question: "recovery_authorization".to_string(),
@@ -1916,7 +1925,7 @@ impl DelegationListener {
             recovery: Some(RecoveryQuestionPresentation {
                 subject: challenge.subject_kind.as_str().to_string(),
                 action: challenge.allowed_action.as_str().to_string(),
-                target: challenge.subject_id.clone(),
+                target: metadata.target_code.to_string(),
                 cause: challenge.cause_code.clone(),
                 risk: challenge.risk_class.clone(),
                 display_reason: challenge.display_reason.clone(),
@@ -2346,19 +2355,69 @@ fn recovery_authorization_result_value(
     result: &RecoveryAuthorizationResult,
     reused: bool,
 ) -> Value {
-    serde_json::json!({
+    let Some(action) = RecoveryAllowedAction::parse(&result.allowed_action) else {
+        return recovery_wire_error(
+            "recovery_authorization_contract_invalid",
+            "persisted recovery action is invalid",
+        );
+    };
+    let Some(metadata) = derive_recovery_action_metadata(action, &result.action_payload) else {
+        return recovery_wire_error(
+            "recovery_authorization_contract_invalid",
+            "persisted recovery action payload is invalid",
+        );
+    };
+    let mut value = serde_json::json!({
         "status": serialized_recovery_code(&result.status),
         "recovery_authorization_id": result.authorization_id,
         "reused": reused,
-    })
+        "subject_kind": result.subject_kind,
+        "subject_id": result.subject_id,
+        "allowed_action": result.allowed_action,
+        "cause_code": result.cause_code,
+        "expires_at": result.expires_at,
+    });
+    let object = value
+        .as_object_mut()
+        .expect("recovery authorization result is an object");
+    match action {
+        RecoveryAllowedAction::Continue
+        | RecoveryAllowedAction::FreshDispatch
+        | RecoveryAllowedAction::Replace => {
+            object.insert(
+                "replacement_reason".into(),
+                metadata
+                    .replacement_reason
+                    .map_or(Value::Null, |reason| Value::String(reason.into())),
+            );
+        }
+        RecoveryAllowedAction::RecoverWorkflow => {
+            object.insert(
+                "target_state".into(),
+                Value::String(
+                    metadata
+                        .target_state
+                        .expect("workflow recovery metadata has target state")
+                        .into(),
+                ),
+            );
+        }
+        RecoveryAllowedAction::ResetPlanLineage => {
+            let Some(reason) = result.display_reason.as_ref() else {
+                return recovery_wire_error(
+                    "recovery_authorization_contract_invalid",
+                    "Plan lineage reset authorization has no display reason",
+                );
+            };
+            object.insert("display_reason".into(), Value::String(reason.clone()));
+        }
+    }
+    value
 }
 
 fn recovery_authorization_row_value(row: &recovery_authorization::Model, reused: bool) -> Value {
-    serde_json::json!({
-        "status": serialized_recovery_code(&row.status),
-        "recovery_authorization_id": row.authorization_id,
-        "reused": reused,
-    })
+    let result = RecoveryAuthorizationResult::from(row);
+    recovery_authorization_result_value(&result, reused)
 }
 
 fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, String> {
@@ -8126,6 +8185,56 @@ mod tests {
                 .expect("count recovery authorization rows")
         }
 
+        #[test]
+        fn authorization_result_projects_workflow_target_and_reset_metadata() {
+            let base = RecoveryAuthorizationResult {
+                authorization_id: "workflow-authorization".into(),
+                status: RecoveryAuthorizationStatus::Approved,
+                subject_kind: "workflow".into(),
+                subject_id: "workflow-a".into(),
+                allowed_action: "recover_workflow".into(),
+                action_payload: json!({ "target_state": "approved" }),
+                cause_code: "legacy_block_with_current_plan_approval".into(),
+                display_reason: None,
+                approved_at: Some(Utc::now()),
+                expires_at: Some(Utc::now()),
+            };
+            let recovered = recovery_authorization_result_value(&base, false);
+            assert_eq!(recovered["subject_kind"], "workflow");
+            assert_eq!(recovered["subject_id"], "workflow-a");
+            assert_eq!(recovered["allowed_action"], "recover_workflow");
+            assert_eq!(recovered["target_state"], "approved");
+            assert_eq!(
+                recovered["cause_code"],
+                "legacy_block_with_current_plan_approval"
+            );
+            assert!(recovered["expires_at"].as_str().is_some());
+            assert!(recovered.get("replacement_reason").is_none());
+
+            let reason = "Reset the exact approved Plan review lineage.";
+            let reset = RecoveryAuthorizationResult {
+                allowed_action: "reset_plan_lineage".into(),
+                action_payload: json!({ "displayed_reason_sha256": "abc123" }),
+                cause_code: "plan_user_decision_required".into(),
+                display_reason: Some(reason.into()),
+                ..base
+            };
+            let reset_value = recovery_authorization_result_value(&reset, true);
+            assert_eq!(reset_value["allowed_action"], "reset_plan_lineage");
+            assert_eq!(reset_value["display_reason"], reason);
+            assert_eq!(reset_value["reused"], true);
+            assert!(reset_value.get("target_state").is_none());
+
+            let invalid = RecoveryAuthorizationResult {
+                action_payload: json!({ "target_state": "unknown" }),
+                ..reset
+            };
+            assert_eq!(
+                recovery_authorization_result_value(&invalid, false)["error"]["code"],
+                "recovery_authorization_contract_invalid"
+            );
+        }
+
         #[tokio::test]
         async fn listener_forwards_recovery_receipt_into_continue_admission() {
             let fixture = recovery_fixture().await;
@@ -8154,6 +8263,12 @@ mod tests {
                 .await;
             let authorization = finish_call(client, server).await;
             assert_eq!(authorization["status"], "approved");
+            assert_eq!(authorization["subject_kind"], "delegation_task");
+            assert_eq!(authorization["subject_id"], source_task_id);
+            assert_eq!(authorization["allowed_action"], "continue");
+            assert_eq!(authorization["cause_code"], "parent_turn_failed");
+            assert_eq!(authorization["replacement_reason"], Value::Null);
+            assert!(authorization["expires_at"].as_str().is_some());
             let authorization_id = authorization["recovery_authorization_id"]
                 .as_str()
                 .expect("approved recovery receipt")
@@ -8264,6 +8379,12 @@ mod tests {
                 .await;
             let authorization = finish_call(client, server).await;
             assert_eq!(authorization["status"], "approved");
+            assert_eq!(authorization["subject_kind"], "delegation_task");
+            assert_eq!(authorization["subject_id"], source_task_id);
+            assert_eq!(authorization["allowed_action"], "replace");
+            assert_eq!(authorization["cause_code"], "admission_unknown");
+            assert_eq!(authorization["replacement_reason"], "admission_unknown");
+            assert!(authorization["expires_at"].as_str().is_some());
             let authorization_id = authorization["recovery_authorization_id"]
                 .as_str()
                 .expect("approved replacement receipt")
@@ -8358,14 +8479,13 @@ mod tests {
             assert_eq!(registered[0].0, "recovery-parent-conn");
             assert_eq!(registered[0].1.len(), 1);
             assert_eq!(registered[0].1[0].question, "recovery_authorization");
-            assert_eq!(
-                registered[0].1[0]
-                    .recovery
-                    .as_ref()
-                    .expect("fixed recovery presentation")
-                    .subject,
-                "delegation_task"
-            );
+            let presentation = registered[0].1[0]
+                .recovery
+                .as_ref()
+                .expect("fixed recovery presentation");
+            assert_eq!(presentation.subject, "delegation_task");
+            assert_eq!(presentation.target, "existing_session");
+            assert_eq!(presentation.display_reason, None);
             drop(registered);
             fixture
                 .questions
@@ -8412,6 +8532,12 @@ mod tests {
                 .await;
             let approved_outcome = finish_call(client, server).await;
             assert_eq!(approved_outcome["status"], "approved");
+            assert_eq!(approved_outcome["subject_kind"], "delegation_task");
+            assert_eq!(approved_outcome["subject_id"], approved);
+            assert_eq!(approved_outcome["allowed_action"], "continue");
+            assert_eq!(approved_outcome["cause_code"], "parent_turn_failed");
+            assert_eq!(approved_outcome["replacement_reason"], Value::Null);
+            assert!(approved_outcome["expires_at"].as_str().is_some());
             let approved_id = approved_outcome["recovery_authorization_id"]
                 .as_str()
                 .expect("approved authorization id")
@@ -8439,6 +8565,12 @@ mod tests {
             assert_eq!(reconnected["status"], "approved");
             assert_eq!(reconnected["reused"], true);
             assert_eq!(reconnected["recovery_authorization_id"], approved_id);
+            assert_eq!(reconnected["subject_kind"], "delegation_task");
+            assert_eq!(reconnected["subject_id"], approved);
+            assert_eq!(reconnected["allowed_action"], "continue");
+            assert_eq!(reconnected["cause_code"], "parent_turn_failed");
+            assert_eq!(reconnected["replacement_reason"], Value::Null);
+            assert_eq!(reconnected["expires_at"], approved_outcome["expires_at"]);
             assert_eq!(fixture.questions.registered.lock().await.len(), 1);
 
             let (client, server) = start_call(
@@ -8451,7 +8583,14 @@ mod tests {
                 .questions
                 .answer("q-2", question_outcome(Some(RECOVERY_DECLINE_LABEL), false))
                 .await;
-            assert_eq!(finish_call(client, server).await["status"], "declined");
+            let declined_outcome = finish_call(client, server).await;
+            assert_eq!(declined_outcome["status"], "declined");
+            assert_eq!(declined_outcome["subject_kind"], "delegation_task");
+            assert_eq!(declined_outcome["subject_id"], declined);
+            assert_eq!(declined_outcome["allowed_action"], "continue");
+            assert_eq!(declined_outcome["cause_code"], "parent_turn_failed");
+            assert_eq!(declined_outcome["replacement_reason"], Value::Null);
+            assert_eq!(declined_outcome["expires_at"], Value::Null);
 
             let (client, server) = start_call(
                 Arc::clone(&fixture.listener),

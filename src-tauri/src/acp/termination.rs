@@ -381,6 +381,35 @@ impl ParentEndContext {
         context
     }
 
+    pub fn durable_error_code(&self) -> &'static str {
+        match (
+            self.reason,
+            self.termination.source,
+            self.termination.reason,
+            self.termination.classification,
+        ) {
+            (
+                ParentTurnEndReason::ParentDisconnected,
+                AcpTerminationSource::Transport,
+                AcpTerminationReason::TransportDisconnected,
+                AcpTerminationClassification::Unexpected,
+            ) => "transport_disconnected",
+            (
+                ParentTurnEndReason::ParentDisconnected,
+                AcpTerminationSource::Process,
+                AcpTerminationReason::ProcessExited,
+                AcpTerminationClassification::Unexpected,
+            ) => "process_exited",
+            (
+                ParentTurnEndReason::ParentDisconnected,
+                AcpTerminationSource::Session,
+                AcpTerminationReason::SessionLost,
+                AcpTerminationClassification::Unexpected,
+            ) => "session_lost",
+            _ => self.reason.error_code(),
+        }
+    }
+
     pub fn audit(
         &self,
         prior_status: DelegationRunStatus,

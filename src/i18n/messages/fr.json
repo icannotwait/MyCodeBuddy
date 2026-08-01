@@ -3028,6 +3028,8 @@
           "causeLabel": "Cause",
           "riskLabel": "Risque",
           "subjectLabel": "Cible",
+          "targetLabel": "Cible de récupération",
+          "reasonLabel": "Motif de réinitialisation approuvé",
           "approve": "Approuver",
           "decline": "Refuser",
           "actions": {
@@ -3040,6 +3042,19 @@
           "subjects": {
             "delegation_task": "Tâche déléguée",
             "workflow": "Workflow"
+          },
+          "targets": {
+            "existing_session": "Session de tâche existante",
+            "fresh_task": "Nouvelle tâche",
+            "replace_unresumable": "Tâche de remplacement : session non reprenable",
+            "replace_budget_exhausted_continue": "Tâche de remplacement : budget de continuation épuisé",
+            "replace_not_supported": "Tâche de remplacement : réutilisation de session non prise en charge",
+            "replace_admission_failed": "Tâche de remplacement : admission échouée",
+            "replace_admission_unknown": "Tâche de remplacement : admission inconnue",
+            "workflow_skeleton": "État du workflow : squelette",
+            "workflow_estimated": "État du workflow : estimé",
+            "workflow_approved": "État du workflow : approuvé",
+            "plan_lineage": "Lignée de revue du Plan"
           },
           "risks": {
             "normal": "Risque normal de récupération",

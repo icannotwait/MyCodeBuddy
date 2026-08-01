@@ -107,48 +107,60 @@ function sameMultiset(left, right) {
   )
 }
 
-function affirmativeTokenMention(skill, token) {
+function recoveryTokenMentions(skill, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const exactToken = new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`)
-  return skill.split(/(?<=[.!?;])|\r?\n/).some((clause) => {
-    const match = exactToken.exec(clause)
-    if (!match) return false
-    const before = clause.slice(0, match.index + match[1].length).toLowerCase()
-    return !/(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?)\s+(?:\w+\s+){0,12}$/.test(
-      before
-    )
-  })
+  const exactToken = new RegExp(
+    `(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`,
+    "g"
+  )
+  const mentions = []
+  const clauses = skill
+    .split(/\r?\n\s*\r?\n/)
+    .flatMap((paragraph) => paragraph.replace(/\r?\n/g, " ").split(/(?<=[.!?;])/))
+  for (const clause of clauses) {
+    exactToken.lastIndex = 0
+    for (const match of clause.matchAll(exactToken)) {
+      const tokenStart = match.index + match[1].length
+      const tokenEnd = tokenStart + token.length
+      const before = clause.slice(Math.max(0, tokenStart - 180), tokenStart)
+      const after = clause.slice(tokenEnd, Math.min(clause.length, tokenEnd + 180))
+      const prefixNegated =
+        /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\s+(?:[A-Za-z0-9_-]+\s+){0,12}$/i.test(
+          before
+        )
+      const suffixNegated =
+        /^\s*(?:[,():-]\s*)?(?:(?:must|should|does|do|is|are|was|were|will|would|can|could|may)\s+)?(?:not|never|cannot|can't)\b/i.test(
+          after
+        )
+      let negated = prefixNegated || suffixNegated
+
+      if (negated && token === "recovery_authorization_id") {
+        const bounded = `${before} ${after}`
+        if (/\b(?:persist|status|ledger|report|card)\b/i.test(bounded)) {
+          negated = false
+        }
+      }
+      if (negated && token === "recover_workflow") {
+        const missingHardBlock =
+          /\bmissing\s*$/i.test(before) && /\bhard[- ]blocks?\b/i.test(after)
+        const challengeBoundary =
+          /\b(?:generate|create|open|mint)s?\s+(?:a\s+)?challenge\b/i.test(
+            `${before} ${after}`
+          )
+        if (missingHardBlock || challengeBoundary) negated = false
+      }
+      mentions.push({ negated })
+    }
+  }
+  return mentions
+}
+
+function affirmativeTokenMention(skill, token) {
+  return recoveryTokenMentions(skill, token).some((mention) => !mention.negated)
 }
 
 function hasNegatedTokenMention(skill, token) {
-  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const exactToken = new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`)
-  return skill.split(/(?<=[.!?;])|\r?\n/).some((clause) => {
-    const match = exactToken.exec(clause)
-    if (!match) return false
-    const before = clause
-      .slice(
-        Math.max(0, match.index + match[1].length - 180),
-        match.index + match[1].length
-      )
-      .toLowerCase()
-    if (
-      token === "recovery_authorization_id" &&
-      /\b(?:persist|status|ledger|report|card)\b[^.!?;\r\n]{0,80}$/.test(before)
-    ) {
-      return false
-    }
-    if (
-      token === "recover_workflow" &&
-      /\bmissing\s*$/.test(before) &&
-      /\bhard[- ]blocks?\b/i.test(clause.slice(match.index + match[0].length))
-    ) {
-      return false
-    }
-    return /\b(?:never|not|without|omit(?:ted)?|missing|disabled|forbid(?:den)?|prohibit(?:ed)?|do\s+not|must\s+not|does\s+not|should\s+not)\b/.test(
-      before
-    )
-  })
+  return recoveryTokenMentions(skill, token).some((mention) => mention.negated)
 }
 
 function hasUnsafeCancellationMapping(skill) {
