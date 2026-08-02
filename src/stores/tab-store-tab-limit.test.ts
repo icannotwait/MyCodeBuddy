@@ -256,6 +256,62 @@ describe("local open paths under limit", () => {
     expect(st.activeTabId).toBe("conv-1-claude_code-100")
   })
 
+  it("openTab forces pin for workspace root parent even when pin=false", async () => {
+    // Presence in workspace.conversations marks a root parent session.
+    useAppWorkspaceStore.setState({
+      conversations: [
+        {
+          id: 100,
+          folder_id: 1,
+          agent_type: "claude_code",
+          title: "Parent",
+          status: "idle",
+          mode: null,
+          model: null,
+          git_branch: null,
+          external_id: null,
+          message_count: 0,
+          child_count: 0,
+          created_at: "2026-01-01T00:00:00.000Z",
+          updated_at: "2026-01-01T00:00:00.000Z",
+          pinned_at: null,
+          parent_id: null,
+          parent_tool_use_id: null,
+          delegation_call_id: null,
+        },
+      ],
+    })
+
+    // One unpinned preview slot that must NOT be replaced by the root open.
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "conv-1-codex-99",
+          kind: "conversation",
+          folderId: 1,
+          conversationId: 99,
+          agentType: "codex",
+          title: "Child preview",
+          isPinned: false,
+          activationSeq: 1,
+        },
+      ],
+      activeTabId: "conv-1-codex-99",
+      tabsHydrated: true,
+    })
+
+    await useTabStore
+      .getState()
+      .openTab(1, 100, "claude_code", false, "Parent")
+
+    const st = useTabStore.getState()
+    const parent = st.rawTabs.find((t) => t.conversationId === 100)
+    expect(parent?.isPinned).toBe(true)
+    // Preview child survives; root appends instead of replacing.
+    expect(st.rawTabs.find((t) => t.conversationId === 99)).toBeTruthy()
+    expect(st.rawTabs).toHaveLength(2)
+  })
+
   it("openNewConversationTab at capacity creates stamped draft and length ≤10", () => {
     seedConversationTabs(10)
     useTabStore.getState().openNewConversationTab(1, "/tmp/proj")

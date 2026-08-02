@@ -1686,13 +1686,15 @@ export function SidebarConversationList({
   // for the card `memo` actually bailing out (see Phase 1 of the perf plan).
   const handleSelect = useCallback(
     (id: number, agentType: string, folderId: number) => {
+      // Root (parent) sessions always open pinned — single-click must not use
+      // the preview slot, or opening a child/subagent can replace the parent.
       // openTab awaits detached focus first; only force the conversation
       // workspace when a main tab was actually opened/activated.
       void openTab(
         folderId,
         id,
         agentType as Parameters<typeof openTab>[2],
-        false
+        true
       ).then((openedMain) => {
         if (openedMain) openConversations()
       })

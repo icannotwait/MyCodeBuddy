@@ -1226,6 +1226,20 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
   ...initialTabState(),
 
   openTab: async (folderId, conversationId, agentType, pin = false, title) => {
+    // Workspace `conversations` is root-only (delegation children never land
+    // there). Root/parent sessions always open pinned so a later preview open
+    // (e.g. subagent child via openDelegatedChildSession) cannot replace them.
+    // Callers may still pass pin=false for unknown ids / children / tests.
+    if (
+      !pin &&
+      conversationId > 0 &&
+      useAppWorkspaceStore
+        .getState()
+        .conversations.some((c) => c.id === conversationId)
+    ) {
+      pin = true
+    }
+
     // No-mirror: on local desktop, await focus of an existing detached window
     // before adding/activating a main tab. Dynamic import avoids a circular
     // dependency with conversation-popout (which imports this store).

@@ -1155,7 +1155,7 @@ describe("SidebarConversationList — openTab focus short-circuit gestures", () 
     vi.useRealTimers()
   })
 
-  it("single-click routes through openTab and skips openConversations when focus short-circuits", async () => {
+  it("single-click routes through openTab (pin) and skips openConversations when focus short-circuits", async () => {
     stableTabFns.openTab.mockResolvedValue(false)
     const { getByText } = render(tree())
 
@@ -1167,7 +1167,7 @@ describe("SidebarConversationList — openTab focus short-circuit gestures", () 
       1,
       42,
       "claude_code",
-      false
+      true
     )
     expect(stableWorkbench.openConversations).not.toHaveBeenCalled()
   })
