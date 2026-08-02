@@ -1857,6 +1857,11 @@ pub async fn get_folder_conversation_with_live_core(
     Ok(detail)
 }
 
+/// Load a folder conversation with optional history windowing.
+///
+/// - `history_user_turn_limit`: `None` / omitted → full history (compat).
+///   `Some(0)` → full. `Some(n>0)` → last n user turns (+ intervening assistant turns).
+/// - `history_before_turn_id`: exclusive upper-bound turn id for "load older" pages.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_folder_conversation(
@@ -1866,10 +1871,7 @@ pub async fn get_folder_conversation(
     registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
     chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
-    /// `None` / omitted → full history (compat). `Some(0)` → full.
-    /// `Some(n>0)` → last n user turns (+ intervening assistant turns).
     history_user_turn_limit: Option<u32>,
-    /// Exclusive upper-bound turn id for "load older" pages.
     history_before_turn_id: Option<String>,
 ) -> Result<DbConversationDetail, AppCommandError> {
     get_folder_conversation_with_live_core(
