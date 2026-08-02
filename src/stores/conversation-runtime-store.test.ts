@@ -115,6 +115,7 @@ function seedRuntimeSession(input: SeedInput = {}) {
           detail: input.detail ?? null,
           detailLoading: false,
           detailError: null,
+          detailHistoryLoadingOlder: false,
           acpLoadError: null,
           localTurns: input.localTurns ?? [],
           backgroundTurns: input.backgroundTurns ?? [],
@@ -454,6 +455,7 @@ describe("selectHistoricalTimelineTurns edge-case semantics", () => {
         detail: otherDetail,
         detailLoading: false,
         detailError: null,
+        detailHistoryLoadingOlder: false,
         acpLoadError: null,
         localTurns: [],
         backgroundTurns: [],
@@ -553,6 +555,25 @@ describe("selectHistoricalTimelineTurns edge-case semantics", () => {
     expect(migrated).not.toBe(before)
     expect(migrated.map((e) => e.turn.id)).toEqual(before.map((e) => e.turn.id))
     expect(migrated[0].key).toContain(String(OTHER_CID))
+  })
+
+  it("clears an invalidated load-older spinner when the runtime id migrates", () => {
+    seedRuntimeSession(baseSeed())
+    useConversationRuntimeStore.setState((state) => {
+      const current = state.byConversationId.get(CID)!
+      const next = new Map(state.byConversationId)
+      next.set(CID, { ...current, detailHistoryLoadingOlder: true })
+      return { byConversationId: next }
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.migrateConversation(CID, OTHER_CID)
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(OTHER_CID)
+        ?.detailHistoryLoadingOlder
+    ).toBe(false)
   })
 })
 

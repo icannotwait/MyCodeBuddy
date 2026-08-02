@@ -21,14 +21,19 @@ import {
 } from "./message-scroll-context"
 import { MessageThreadScrollButton } from "@/components/ai-elements/message-thread"
 
+const { virtualizerPropsSpy } = vi.hoisted(() => ({
+  virtualizerPropsSpy: vi.fn(),
+}))
+
 // virtua needs layout; render children directly and tag them as virtua items
 // so tests can assert the live footer is outside the item array.
 const scrollToIndexMock = vi.fn()
 vi.mock("virtua", () => ({
   Virtualizer: forwardRef(function VirtualizerMock(
-    props: { children?: ReactNode },
+    props: { children?: ReactNode; shift?: boolean },
     ref: Ref<{ scrollToIndex: (i: number) => void }>
   ) {
+    virtualizerPropsSpy(props)
     useImperativeHandle(ref, () => ({
       scrollToIndex: (...args: unknown[]) => scrollToIndexMock(...args),
     }))
@@ -232,6 +237,7 @@ describe("VirtualizedMessageThread footer slot", () => {
     scrollToBottom.mockClear()
     stopScroll.mockClear()
     scrollToIndexMock.mockClear()
+    virtualizerPropsSpy.mockClear()
     scrollTopValue = 600
     mockIsAtBottom = true
     pendingFrames.length = 0
@@ -287,6 +293,36 @@ describe("VirtualizedMessageThread footer slot", () => {
     expect(
       document.querySelector("[data-message-live-footer]")
     ).toBeInTheDocument()
+  })
+
+  it("enables shift only when stable-keyed rows are prepended", () => {
+    const renderThread = (items: string[]) => (
+      <VirtualizedMessageThread
+        items={items}
+        getItemKey={(item) => item}
+        renderItem={(item) => <div>{item}</div>}
+      />
+    )
+    const { rerender } = render(renderThread(["current"]))
+    expect(
+      virtualizerPropsSpy.mock.calls[
+        virtualizerPropsSpy.mock.calls.length - 1
+      ]?.[0].shift
+    ).toBe(false)
+
+    rerender(renderThread(["older", "current"]))
+    expect(
+      virtualizerPropsSpy.mock.calls[
+        virtualizerPropsSpy.mock.calls.length - 1
+      ]?.[0].shift
+    ).toBe(true)
+
+    rerender(renderThread(["older", "current", "newer"]))
+    expect(
+      virtualizerPropsSpy.mock.calls[
+        virtualizerPropsSpy.mock.calls.length - 1
+      ]?.[0].shift
+    ).toBe(false)
   })
 
   it("renders the footer when history is empty without using the empty state", () => {

@@ -342,6 +342,7 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       detail: null,
       detailLoading: false,
       detailError: null,
+      detailHistoryLoadingOlder: false,
       acpLoadError: null,
       localTurns: [],
       backgroundTurns: [],

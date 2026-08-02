@@ -97,6 +97,7 @@ function emptySession(
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],

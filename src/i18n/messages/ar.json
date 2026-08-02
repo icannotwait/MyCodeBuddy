@@ -2846,7 +2846,8 @@
         "showMore": "عرض المزيد",
         "showLess": "طي",
         "responseInterrupted": "تمت مقاطعة الاستجابة",
-        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…"
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين…",
+        "loadOlderHistory": "تحميل الرسائل الأقدم"
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",

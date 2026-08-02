@@ -20,6 +20,7 @@ import {
   resolveContextWindowPercent,
 } from "@/lib/context-window"
 import { getFolderConversation } from "@/lib/api"
+import { coldHistoryFetchOptions } from "@/lib/history-window"
 import { useCopiedFlag } from "@/hooks/use-copied-flag"
 import { pickModelFromTurns } from "./active-session-details"
 import { AgentIcon } from "@/components/agent-icon"
@@ -214,7 +215,7 @@ export function SessionDetailsContent({
     // fill in token usage.
     const id = summaryProp.id
     let cancelled = false
-    getFolderConversation(id)
+    getFolderConversation(id, coldHistoryFetchOptions())
       .then((detail) => {
         if (!cancelled)
           setFetchResult({

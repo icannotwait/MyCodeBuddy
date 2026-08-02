@@ -2846,7 +2846,8 @@
         "showMore": "もっと見る",
         "showLess": "折りたたむ",
         "responseInterrupted": "応答が中断されました",
-        "waitingForSubagents": "サブエージェントを待機中…"
+        "waitingForSubagents": "サブエージェントを待機中…",
+        "loadOlderHistory": "以前のメッセージを読み込む"
       },
       "liveTurnStats": {
         "thinking": "考え中...",

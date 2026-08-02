@@ -1616,6 +1616,7 @@ pub async fn get_folder_conversation_core(
             in_flight_user_turn_id: None,
             continuation_failure,
             workflow_graph,
+            history_window: None,
         },
         parsed_title,
     ))
@@ -1778,6 +1779,11 @@ fn apply_in_flight_message_id(
 /// as `in_flight_user_turn_id` so the frontend can hide the partial assistant
 /// reply persisted after it mid-stream. A no-op (one cheap lock pass) when no turn
 /// is in flight. Shared by the Tauri command and the web handler.
+///
+/// `history` optionally clips `detail.turns` to a user-turn window so long
+/// transcripts (multi‑MB JSONL → thousands of fine-grained turns) do not all
+/// ship over IPC / into the frontend store on cold open. See
+/// [`crate::commands::history_window`].
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
@@ -1785,6 +1791,7 @@ pub async fn get_folder_conversation_with_live_core(
     emitter: &EventEmitter,
     registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
+    history: crate::commands::history_window::HistoryLoadOpts,
 ) -> Result<DbConversationDetail, AppCommandError> {
     let (mut detail, parsed_title) =
         get_folder_conversation_core(conn, registry, conversation_id).await?;
@@ -1828,6 +1835,25 @@ pub async fn get_folder_conversation_with_live_core(
         detail.in_flight_user_turn_id =
             apply_in_flight_message_id(&mut detail.turns, &pending, started_at);
     }
+
+    // Keep summary.message_count as the full transcript size (set in core).
+    // Window only the turns payload when the client opts in.
+    let wants_window =
+        history.user_turn_limit.is_some_and(|n| n > 0) || history.before_turn_id.is_some();
+    if wants_window {
+        let full_count = detail.turns.len() as u32;
+        // Preserve full count even if core left message_count stale.
+        if detail.summary.message_count < full_count {
+            detail.summary.message_count = full_count;
+        }
+        let windowed =
+            crate::commands::history_window::window_message_turns(detail.turns, &history);
+        detail.turns = windowed.turns;
+        detail.history_window = Some(windowed.window);
+    } else {
+        detail.history_window = None;
+    }
+
     Ok(detail)
 }
 
@@ -1840,6 +1866,11 @@ pub async fn get_folder_conversation(
     registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
     chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
+    /// `None` / omitted → full history (compat). `Some(0)` → full.
+    /// `Some(n>0)` → last n user turns (+ intervening assistant turns).
+    history_user_turn_limit: Option<u32>,
+    /// Exclusive upper-bound turn id for "load older" pages.
+    history_before_turn_id: Option<String>,
 ) -> Result<DbConversationDetail, AppCommandError> {
     get_folder_conversation_with_live_core(
         &db.conn,
@@ -1848,6 +1879,10 @@ pub async fn get_folder_conversation(
         &EventEmitter::Tauri(app),
         registry.inner().as_ref(),
         conversation_id,
+        crate::commands::history_window::HistoryLoadOpts {
+            user_turn_limit: history_user_turn_limit,
+            before_turn_id: history_before_turn_id,
+        },
     )
     .await
 }

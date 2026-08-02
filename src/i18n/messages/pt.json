@@ -2846,7 +2846,8 @@
         "showMore": "Mostrar mais",
         "showLess": "Mostrar menos",
         "responseInterrupted": "Resposta interrompida",
-        "waitingForSubagents": "Aguardando subagentes…"
+        "waitingForSubagents": "Aguardando subagentes…",
+        "loadOlderHistory": "Carregar mensagens anteriores"
       },
       "liveTurnStats": {
         "thinking": "Pensando...",

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 import { getCurrentEffectiveAppLocale } from "./i18n"
+import { DEFAULT_HISTORY_USER_TURN_LIMIT } from "./history-window"
 import type {
   WorkspaceFileSearchIdentity,
   WorkspaceFileSearchResult,
@@ -645,7 +646,10 @@ export async function importLocalConversations(
 export async function getFolderConversation(
   conversationId: number
 ): Promise<DbConversationDetail> {
-  return invoke("get_folder_conversation", { conversationId })
+  return invoke("get_folder_conversation", {
+    conversationId,
+    historyUserTurnLimit: DEFAULT_HISTORY_USER_TURN_LIMIT,
+  })
 }
 
 export async function removeFolderFromHistory(path: string): Promise<void> {

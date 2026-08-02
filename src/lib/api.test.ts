@@ -17,6 +17,7 @@ import {
   cancelToolWatchdogLease,
   closeFolderIfEmpty,
   extendToolWatchdogLease,
+  getFolderConversation,
   getToolWatchdogSettings,
   setToolWatchdogSettings,
   matchReferenceRegex,
@@ -26,6 +27,31 @@ import {
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
+
+describe("getFolderConversation history window payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({})
+  })
+
+  it("opts frontend callers into the default history window", async () => {
+    await getFolderConversation(42)
+    expect(mockTransport.call).toHaveBeenCalledWith("get_folder_conversation", {
+      conversationId: 42,
+      historyUserTurnLimit: 20,
+      historyBeforeTurnId: undefined,
+    })
+  })
+
+  it("keeps explicit unlimited history available", async () => {
+    await getFolderConversation(42, { historyUserTurnLimit: 0 })
+    expect(mockTransport.call).toHaveBeenCalledWith("get_folder_conversation", {
+      conversationId: 42,
+      historyUserTurnLimit: 0,
+      historyBeforeTurnId: undefined,
+    })
+  })
+})
 
 describe("tool-watchdog lease control transport payloads", () => {
   beforeEach(() => {

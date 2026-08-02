@@ -273,7 +273,7 @@ describe("SessionDetailsDialog", () => {
     )
     expect(getByText(/Loading token usage/)).toBeTruthy()
     expect(await findByText("50K / 200K (25.0%)")).toBeTruthy()
-    expect(mockGet).toHaveBeenCalledWith(7)
+    expect(mockGet).toHaveBeenCalledWith(7, expect.any(Object))
   })
 
   it("derives the model from the fetched turns when the summary has none", async () => {

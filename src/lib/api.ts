@@ -15,6 +15,7 @@ import {
   isContinuationWaitingRejection,
 } from "./continuation-waiting"
 import { filterSessionConfigOptions } from "./session-config-filter"
+import { DEFAULT_HISTORY_USER_TURN_LIMIT } from "./history-window"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
@@ -1891,10 +1892,30 @@ export async function importSelectedSessions(
   return getTransport().call("import_selected_sessions", { selections })
 }
 
+export { DEFAULT_HISTORY_USER_TURN_LIMIT }
+
+export interface GetFolderConversationOptions {
+  /**
+   * Max user turns to return from the eligible range.
+   * - omit / `undefined` → frontend default window (20 user turns)
+   * - `0` → full history
+   * - `n > 0` → last n user turns (+ intervening assistant turns)
+   */
+  historyUserTurnLimit?: number
+  /** Exclusive upper-bound turn id for "load older" pages. */
+  historyBeforeTurnId?: string
+}
+
 export async function getFolderConversation(
-  conversationId: number
+  conversationId: number,
+  options?: GetFolderConversationOptions
 ): Promise<DbConversationDetail> {
-  return getTransport().call("get_folder_conversation", { conversationId })
+  return getTransport().call("get_folder_conversation", {
+    conversationId,
+    historyUserTurnLimit:
+      options?.historyUserTurnLimit ?? DEFAULT_HISTORY_USER_TURN_LIMIT,
+    historyBeforeTurnId: options?.historyBeforeTurnId,
+  })
 }
 
 /** Read-only redacted workflow graph snapshot (same DTO as detail.workflow_graph). */

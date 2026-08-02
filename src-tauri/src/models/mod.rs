@@ -22,8 +22,8 @@ pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLog
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDetail, ConversationStatePatch,
     ConversationSummary, DbConversationDetail, DbConversationSummary, FolderInfo,
-    ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder, ScanResult, ScanSession,
-    ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
+    HistoryWindowInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder,
+    ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use delegate_access::{DelegateAccessMode, DelegateAccessReason, DelegateAccessState};
 pub use folder::{
