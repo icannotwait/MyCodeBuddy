@@ -404,13 +404,10 @@ function ConfigOptionRow({
   const t = useTranslations("AcpAgentSettings.multiAgent")
   if (option.kind.type !== "select") return null
 
-  const allOptions =
-    option.kind.groups.length > 0
-      ? option.kind.groups.flatMap((g) => g.options)
-      : option.kind.options
-  const agentDefault = option.kind.current_value
-  const agentDefaultLabel =
-    allOptions.find((o) => o.value === agentDefault)?.name ?? agentDefault
+  // Prefer `value` over `name` for labels. Cursor (and similar agents) put
+  // compound parameters in value — e.g. `claude-opus-4-6[…,effort=high]` —
+  // while name is only a short base label; showing name hides that detail.
+  const agentDefaultLabel = option.kind.current_value
   // When no override exists, the trigger shows the Default sentinel item
   // so the user can tell "I'm inheriting" apart from "I picked the
   // agent's current default explicitly" — the latter would stick to that
@@ -421,7 +418,7 @@ function ConfigOptionRow({
     <div className="flex items-start justify-between gap-3">
       <div className="space-y-0.5 min-w-0">
         <label className="text-sm font-medium">{option.name}</label>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-xs text-muted-foreground break-all">
           {t("agentDefaultHint", { value: agentDefaultLabel })}
         </p>
       </div>
@@ -430,10 +427,10 @@ function ConfigOptionRow({
         onValueChange={(v) => onChange(v === DEFAULT_SENTINEL ? null : v)}
         disabled={disabled}
       >
-        <SelectTrigger size="sm" className="w-56">
+        <SelectTrigger size="sm" className="w-72 max-w-[min(24rem,50vw)]">
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent className="max-w-[min(36rem,90vw)]">
           <SelectItem value={DEFAULT_SENTINEL}>
             {t("defaultOptionLabel", { value: agentDefaultLabel })}
           </SelectItem>
@@ -445,15 +442,24 @@ function ConfigOptionRow({
                     <SelectItem
                       key={`${group.group}-${item.value}`}
                       value={item.value}
+                      title={item.name !== item.value ? item.name : undefined}
                     >
-                      {item.name}
+                      <span className="break-all font-mono text-xs">
+                        {item.value}
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectGroup>
               ))
             : option.kind.options.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  {item.name}
+                <SelectItem
+                  key={item.value}
+                  value={item.value}
+                  title={item.name !== item.value ? item.name : undefined}
+                >
+                  <span className="break-all font-mono text-xs">
+                    {item.value}
+                  </span>
                 </SelectItem>
               ))}
         </SelectContent>

@@ -6,10 +6,13 @@ vi.mock("@/hooks/use-acp-agents", () => ({
   useAcpAgents: vi.fn(),
 }))
 
-import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
+import {
+  DelegationAgentDefaultsPanel,
+  DelegationOptionEditor,
+} from "./delegation-agent-defaults"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import enMessages from "@/i18n/messages/en.json"
-import type { AcpAgentInfo, AgentType } from "@/lib/types"
+import type { AcpAgentInfo, AgentOptionsSnapshot, AgentType } from "@/lib/types"
 
 const mockUseAcpAgents = vi.mocked(useAcpAgents)
 
@@ -77,6 +80,64 @@ describe("DelegationAgentDefaultsPanel", () => {
     ).toBeInTheDocument()
     expect(
       screen.queryByRole("tab", { name: "Disabled Agent" })
+    ).not.toBeInTheDocument()
+  })
+
+  it("labels config options with value (compound ids), not short name", () => {
+    mockUseAcpAgents.mockReturnValue({
+      agents: [],
+      fresh: true,
+      refresh: async () => {},
+    })
+
+    const compound =
+      "claude-opus-4-6[thinking=true,context=200k,effort=high,fast=false]"
+    const snapshot: AgentOptionsSnapshot = {
+      modes: null,
+      config_options: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          kind: {
+            type: "select",
+            current_value: compound,
+            options: [
+              {
+                value: compound,
+                name: "claude-opus-4-6",
+                description: null,
+              },
+            ],
+            groups: [],
+          },
+        },
+      ],
+      available_commands: [],
+    }
+
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <DelegationOptionEditor
+          snapshot={snapshot}
+          overrideModeId={null}
+          overrideConfigValues={{}}
+          onModeChange={() => {}}
+          onConfigChange={() => {}}
+        />
+      </NextIntlClientProvider>
+    )
+
+    // Default hint uses the full wire value so compound params stay visible.
+    expect(
+      screen.getByText(`Agent default: ${compound}`)
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(`Default (${compound})`)
+    ).toBeInTheDocument()
+    // Short display name must not be used as the sole label on a text node.
+    expect(
+      screen.queryByText("claude-opus-4-6", { exact: true })
     ).not.toBeInTheDocument()
   })
 })
