@@ -144,6 +144,7 @@ import {
   MODEL_LIST_VIRTUALIZE_THRESHOLD,
   type ModelOptionGroup,
 } from "@/lib/model-config-groups"
+import { configOptionDisplayLabel } from "@/lib/session-config-display"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
 import { useAgentSkills } from "@/hooks/use-agent-skills"
 import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
@@ -3036,13 +3037,15 @@ export function MessageInput({
         // Model values that carry a `provider/` prefix group by provider; every
         // other option keeps its server groups or stays flat (`null` derived).
         const derived = deriveModelGroups(option)
+        // Prefer wire value when it extends a short name (Cursor compound ids),
+        // matching Multi-Agent agent defaults and the inline selectors.
         const groups: SessionSelectorGroup[] = derived
           ? derived.map((group) => ({
               key: group.key,
               name: group.name,
               options: group.options.map((item) => ({
                 value: item.value,
-                name: item.name,
+                name: configOptionDisplayLabel(item),
                 description: item.description,
               })),
             }))
@@ -3052,7 +3055,7 @@ export function MessageInput({
                 name: group.name,
                 options: group.options.map((item) => ({
                   value: item.value,
-                  name: item.name,
+                  name: configOptionDisplayLabel(item),
                   description: item.description,
                 })),
               }))
@@ -3062,7 +3065,7 @@ export function MessageInput({
                   name: null,
                   options: kind.options.map((item) => ({
                     value: item.value,
-                    name: item.name,
+                    name: configOptionDisplayLabel(item),
                     description: item.description,
                   })),
                 },

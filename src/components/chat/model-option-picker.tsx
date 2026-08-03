@@ -12,6 +12,7 @@ import {
 import { ModelOptionList } from "@/components/chat/model-option-list"
 import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import type { ModelOptionGroup } from "@/lib/model-config-groups"
+import { configOptionDisplayLabel } from "@/lib/session-config-display"
 import type { SessionConfigOptionInfo } from "@/lib/types"
 
 interface ModelOptionPickerProps {
@@ -54,7 +55,7 @@ export function ModelOptionPicker({
   const currentLabel = useMemo(() => {
     for (const group of groups) {
       for (const opt of group.options) {
-        if (opt.value === currentValue) return opt.name
+        if (opt.value === currentValue) return configOptionDisplayLabel(opt)
       }
     }
     return currentValue
@@ -78,13 +79,17 @@ export function ModelOptionPicker({
           variant="ghost"
           size="xs"
           disabled={disabled}
-          title={option.name}
+          title={
+            currentLabel ? `${option.name}: ${currentLabel}` : option.name
+          }
           aria-label={
             currentLabel ? `${option.name}: ${currentLabel}` : option.name
           }
           className="min-w-0 gap-0.5 px-1 text-muted-foreground"
         >
-          <span className="max-w-[10rem] truncate">{currentLabel}</span>
+          <span className="max-w-[14rem] truncate font-mono text-[11px]">
+            {currentLabel}
+          </span>
           <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
         </Button>
       </PopoverTrigger>

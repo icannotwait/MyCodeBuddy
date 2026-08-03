@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
 import type { ModelOptionGroup } from "@/lib/model-config-groups"
+import { configOptionDisplayLabel } from "@/lib/session-config-display"
 import type { SessionConfigOptionInfo } from "@/lib/types"
 
 interface SessionConfigSelectorProps {
@@ -68,7 +69,10 @@ export function InlineSessionConfigSelector({
   const selected = renderedOptions.find(
     (item) => item.value === option.kind.current_value
   )
-  const currentLabel = selected?.name ?? option.kind.current_value
+  // Prefer wire value when it extends a short name (Cursor compound model ids).
+  const currentLabel = selected
+    ? configOptionDisplayLabel(selected)
+    : option.kind.current_value
 
   return (
     <DropdownMenu
@@ -86,13 +90,15 @@ export function InlineSessionConfigSelector({
           variant="ghost"
           size="xs"
           disabled={disabled}
-          title={option.name}
+          title={currentLabel ? `${option.name}: ${currentLabel}` : option.name}
           aria-label={
             currentLabel ? `${option.name}: ${currentLabel}` : option.name
           }
           className="min-w-0 gap-0.5 px-1 text-muted-foreground"
         >
-          <span className="max-w-[10rem] truncate">{currentLabel}</span>
+          <span className="max-w-[14rem] truncate font-mono text-[11px]">
+            {currentLabel}
+          </span>
           <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
         </Button>
       </DropdownMenuTrigger>
@@ -101,7 +107,7 @@ export function InlineSessionConfigSelector({
         align="start"
         className="min-w-72 overflow-y-auto"
         style={{
-          maxWidth: "min(20rem, calc(100vw - 1rem))",
+          maxWidth: "min(28rem, calc(100vw - 1rem))",
           maxHeight:
             "min(60vh, var(--radix-dropdown-menu-content-available-height))",
         }}
@@ -117,32 +123,40 @@ export function InlineSessionConfigSelector({
                   {group.name !== null && (
                     <DropdownMenuLabel>{group.name}</DropdownMenuLabel>
                   )}
-                  {group.options.map((item) => (
-                    <DropdownMenuRadioItem
-                      key={`${group.key}-${item.value}`}
-                      value={item.value}
-                      title={item.name}
-                    >
-                      <DropdownRadioItemContent
-                        label={item.name}
-                        description={item.description}
-                      />
-                    </DropdownMenuRadioItem>
-                  ))}
+                  {group.options.map((item) => {
+                    const label = configOptionDisplayLabel(item)
+                    return (
+                      <DropdownMenuRadioItem
+                        key={`${group.key}-${item.value}`}
+                        value={item.value}
+                        title={
+                          item.name !== label ? item.name : undefined
+                        }
+                      >
+                        <DropdownRadioItemContent
+                          label={label}
+                          description={item.description}
+                        />
+                      </DropdownMenuRadioItem>
+                    )
+                  })}
                 </Fragment>
               ))
-            : option.kind.options.map((item) => (
-                <DropdownMenuRadioItem
-                  key={item.value}
-                  value={item.value}
-                  title={item.name}
-                >
-                  <DropdownRadioItemContent
-                    label={item.name}
-                    description={item.description}
-                  />
-                </DropdownMenuRadioItem>
-              ))}
+            : option.kind.options.map((item) => {
+                const label = configOptionDisplayLabel(item)
+                return (
+                  <DropdownMenuRadioItem
+                    key={item.value}
+                    value={item.value}
+                    title={item.name !== label ? item.name : undefined}
+                  >
+                    <DropdownRadioItemContent
+                      label={label}
+                      description={item.description}
+                    />
+                  </DropdownMenuRadioItem>
+                )
+              })}
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>

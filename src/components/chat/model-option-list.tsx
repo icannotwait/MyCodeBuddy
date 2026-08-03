@@ -11,6 +11,7 @@ import {
   flattenModelGroups,
   type ModelOptionGroup,
 } from "@/lib/model-config-groups"
+import { configOptionDisplayLabel } from "@/lib/session-config-display"
 
 interface ModelOptionListProps {
   groups: ModelOptionGroup[]
@@ -231,6 +232,7 @@ export function ModelOptionList({
                     const optionIndex = optionIndexByRow.get(flatIndex) ?? 0
                     const selected = row.option.value === currentValue
                     const active = optionIndex === activeIndexClamped
+                    const label = configOptionDisplayLabel(row.option)
                     return (
                       <button
                         key={row.key}
@@ -238,7 +240,11 @@ export function ModelOptionList({
                         role="option"
                         id={optionId(optionIndex)}
                         aria-selected={selected}
-                        title={row.option.name}
+                        title={
+                          row.option.name !== label
+                            ? row.option.name
+                            : label
+                        }
                         onMouseMove={() => setActiveIndex(optionIndex)}
                         onClick={() => onSelect(row.option.value)}
                         className={cn(
@@ -251,7 +257,7 @@ export function ModelOptionList({
                           {selected ? <Check className="size-4" /> : null}
                         </span>
                         <DropdownRadioItemContent
-                          label={row.option.name}
+                          label={label}
                           description={row.option.description}
                         />
                       </button>

@@ -192,4 +192,41 @@ describe("InlineSessionConfigSelector — model grouping", () => {
     // No provider headers for an ungroupable flat list.
     expect(screen.queryByText("anthropic")).toBeNull()
   })
+
+  it("shows Cursor compound wire values instead of short base names", async () => {
+    const user = userEvent.setup()
+    const compoundHigh =
+      "claude-opus-4-6[thinking=true,context=200k,effort=high,fast=false]"
+    const compoundLow =
+      "claude-opus-4-6[thinking=true,context=200k,effort=low,fast=false]"
+    const option = modelOption(
+      [
+        { value: compoundHigh, name: "claude-opus-4-6" },
+        { value: compoundLow, name: "claude-opus-4-6" },
+      ],
+      compoundHigh
+    )
+    const onSelect = vi.fn()
+    render(
+      <InlineSessionConfigSelector option={option} onSelect={onSelect} />
+    )
+
+    // Trigger and menu rows expose the full wire id so effort etc. stay visible.
+    const trigger = screen.getByRole("button", { name: /effort=high/ })
+    expect(trigger).toHaveTextContent(compoundHigh)
+    expect(trigger).not.toHaveTextContent(/^Model: claude-opus-4-6$/)
+    await user.click(trigger)
+
+    const low = await screen.findByRole("menuitemradio", {
+      name: /effort=low/,
+    })
+    expect(low).toHaveTextContent(compoundLow)
+    // Short base name alone must not be the only visible label.
+    expect(
+      screen.queryByText("claude-opus-4-6", { exact: true })
+    ).not.toBeInTheDocument()
+
+    await user.click(low)
+    expect(onSelect).toHaveBeenCalledWith("model", compoundLow)
+  })
 })
