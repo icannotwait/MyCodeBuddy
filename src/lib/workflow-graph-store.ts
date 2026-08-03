@@ -20,6 +20,7 @@ import {
 } from "@/lib/api"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
+  DelegationRuntimeStats,
   WorkflowGateSnapshot,
   WorkflowGraphSnapshot,
   WorkflowNodeSnapshot,
@@ -112,6 +113,8 @@ type WorkflowGraphState = {
     conversationId: number,
     graph: WorkflowGraphSnapshot | null | undefined
   ) => void
+  /** Project latest delegation runtime fields onto matching cached nodes. */
+  applyRuntimeStats: (taskId: string, stats: DelegationRuntimeStats) => void
   /** Apply a fetched snapshot with optional request-generation gate. */
   applyFetchedSnapshot: (
     conversationId: number,
@@ -499,6 +502,44 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
         error: null,
       }),
     }))
+  },
+
+  applyRuntimeStats: (taskId, stats) => {
+    if (!taskId) return
+    set((state) => {
+      let changed = false
+      const byConversationId = new Map(state.byConversationId)
+
+      for (const [conversationId, entry] of state.byConversationId) {
+        const snapshot = entry.snapshot
+        if (!snapshot) continue
+
+        let nodesChanged = false
+        const nodes = snapshot.nodes.map((item) => {
+          if (item.latest_task_id !== taskId) return item
+          nodesChanged = true
+          return {
+            ...item,
+            tool_call_count: stats.tool_call_count,
+            edit_tool_call_count: stats.edit_tool_call_count,
+            touched_file_count: stats.touched_files.length,
+            touched_files_truncated: stats.touched_files_truncated,
+            additions: stats.additions ?? null,
+            deletions: stats.deletions ?? null,
+            line_counts_complete: stats.line_counts_complete,
+          }
+        })
+
+        if (!nodesChanged) continue
+        changed = true
+        byConversationId.set(conversationId, {
+          ...entry,
+          snapshot: { ...snapshot, nodes },
+        })
+      }
+
+      return changed ? { byConversationId } : state
+    })
   },
 
   applyFetchedSnapshot: (conversationId, snapshot, requestGeneration) => {

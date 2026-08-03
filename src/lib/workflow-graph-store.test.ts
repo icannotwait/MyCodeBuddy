@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
+import type {
+  DelegationRuntimeStats,
+  WorkflowGraphSnapshot,
+  WorkflowNodeSnapshot,
+} from "@/lib/types"
 
 const {
   getWorkflowGraphSnapshot,
@@ -182,6 +186,65 @@ describe("workflow-graph-store revision gate", () => {
     expect(
       useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision
     ).toBe(5)
+  })
+
+  it("replaces runtime fields only on nodes for the exact latest task", () => {
+    const snapshot = baseSnapshot({
+      graph_revision: 12,
+      nodes: [
+        node({ node_id: "current", latest_task_id: "task-current" }),
+        node({ node_id: "stale", latest_task_id: "task-newer" }),
+      ],
+    })
+    useWorkflowGraphStore.getState().applyFromDetail(120, snapshot)
+    const before = useWorkflowGraphStore.getState().getEntry(120)
+    const stats: DelegationRuntimeStats = {
+      started_at: "2026-08-03T00:00:00.000Z",
+      finished_at: null,
+      tool_call_count: 9,
+      edit_tool_call_count: 4,
+      touched_files: [
+        {
+          path: "src/a.ts",
+          outside_workspace: false,
+          additions: 7,
+          deletions: 2,
+        },
+        { path: "src/b.ts", outside_workspace: false },
+      ],
+      touched_files_truncated: true,
+      additions: 7,
+      deletions: 2,
+      line_counts_complete: true,
+    }
+
+    useWorkflowGraphStore.getState().applyRuntimeStats("task-current", stats)
+
+    const after = useWorkflowGraphStore.getState().getEntry(120)
+    const current = after?.snapshot?.nodes.find(
+      (item) => item.node_id === "current"
+    )
+    const stale = after?.snapshot?.nodes.find(
+      (item) => item.node_id === "stale"
+    )
+    expect(current).toMatchObject({
+      tool_call_count: 9,
+      edit_tool_call_count: 4,
+      touched_file_count: 2,
+      touched_files_truncated: true,
+      additions: 7,
+      deletions: 2,
+      line_counts_complete: true,
+    })
+    expect(stale?.tool_call_count).toBeNull()
+    expect(after?.snapshot?.graph_revision).toBe(12)
+    expect(after?.requestGeneration).toBe(before?.requestGeneration)
+
+    const retained = after?.snapshot
+    useWorkflowGraphStore
+      .getState()
+      .applyRuntimeStats("task-old", { ...stats, tool_call_count: 99 })
+    expect(useWorkflowGraphStore.getState().getSnapshot(120)).toBe(retained)
   })
 
   it("discards fetched snapshot when request generation is stale", async () => {
