@@ -3185,10 +3185,64 @@ fn merge_grok_codeg_route_agent_profile(
     meta
 }
 
+/// Grok-only timeout policy for the injected `codeg-mcp` server.
+///
+/// Grok defaults MCP tool calls to 6,000s; without an explicit
+/// `_meta.mcpConfig.codeg-mcp` map, a hung/partial stdio response can pin a
+/// tool card for the entire window. Values match the approved design
+/// (`docs/superpowers/specs/2026-07-30-grok-codeg-mcp-response-budget-timeouts-design.md`).
+/// Wire keys are camelCase (`startupTimeoutMs`, …) as required by Grok's
+/// `McpServerMetaConfig` deserializer.
+fn grok_codeg_mcp_timeout_config() -> serde_json::Value {
+    serde_json::json!({
+        "startupTimeoutMs": 30_000_u64,
+        "toolTimeoutMs": 30_000_u64,
+        "toolTimeoutsMs": {
+            "get_workflow_capabilities": 5_000_u64,
+            "check_user_feedback": 10_000_u64,
+            "get_session_info": 15_000_u64,
+            "get_workflow_state": 15_000_u64,
+            "cancel_delegation": 15_000_u64,
+            "reply_to_delegation": 15_000_u64,
+            "publish_workflow_manifest": 30_000_u64,
+            "settle_workflow_gate": 30_000_u64,
+            "delegate_to_agent": 180_000_u64,
+            "continue_delegation": 300_000_u64,
+            "ask_user_question": 1_800_000_u64,
+            "request_parent_decision": 1_800_000_u64,
+            "get_delegation_status": 5_400_000_u64,
+        }
+    })
+}
+
+/// Merge Grok `_meta.mcpConfig.codeg-mcp` timeout policy. No-op for other
+/// agents. Preserves any pre-existing `mcpConfig` entries for other servers
+/// and only sets/replaces the `codeg-mcp` key (we own that companion).
+fn merge_grok_codeg_mcp_timeout_config(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    agent_type: AgentType,
+) -> serde_json::Map<String, serde_json::Value> {
+    if agent_type != AgentType::Grok {
+        return meta;
+    }
+    let codeg_cfg = grok_codeg_mcp_timeout_config();
+    match meta.get_mut("mcpConfig") {
+        Some(serde_json::Value::Object(map)) => {
+            map.insert("codeg-mcp".to_string(), codeg_cfg);
+        }
+        Some(_) | None => {
+            let mut map = serde_json::Map::new();
+            map.insert("codeg-mcp".to_string(), codeg_cfg);
+            meta.insert("mcpConfig".to_string(), serde_json::Value::Object(map));
+        }
+    }
+    meta
+}
+
 /// Merge Claude raw-SDK meta, optional hidden-generation / Codeg-route agent
-/// profiles, Claude route suppression, terminal snapshot, and adapter
-/// contributions. Consumes `route_plan.native_suppression` for Claude deny list
-/// and Grok Codeg-route `agentProfile`.
+/// profiles, Grok codeg-mcp timeout policy, Claude route suppression, terminal
+/// snapshot, and adapter contributions. Consumes `route_plan.native_suppression`
+/// for Claude deny list and Grok Codeg-route `agentProfile`.
 fn session_request_meta(
     agent_type: AgentType,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -3200,7 +3254,8 @@ fn session_request_meta(
     let with_hidden = merge_grok_hidden_generation_agent_profile(existing, agent_type, purpose);
     let with_grok_route =
         merge_grok_codeg_route_agent_profile(with_hidden, agent_type, route_plan, purpose);
-    let with_route = merge_claude_route_meta(with_grok_route, route_plan)?;
+    let with_timeouts = merge_grok_codeg_mcp_timeout_config(with_grok_route, agent_type);
+    let with_route = merge_claude_route_meta(with_timeouts, route_plan)?;
     terminal_metadata(with_route, spec, adapter)
 }
 
@@ -15701,6 +15756,137 @@ mod tests {
                 "{label} terminal meta"
             );
         }
+    }
+
+    /// Grok session/new|load|resume must stamp `_meta.mcpConfig.codeg-mcp`
+    /// with the classified timeout map (design 2026-07-30).
+    #[test]
+    fn session_request_meta_grok_codeg_mcp_timeouts_on_new_load_resume() {
+        let plan = codeg_plan(AgentType::Grok);
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::Grok);
+
+        let new_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+        let load_req = build_load_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-load".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+        let resume_req = build_resume_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-resume".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+
+        let expected_timeouts = grok_codeg_mcp_timeout_config();
+        for (label, meta) in [
+            ("new", new_req.meta.as_ref()),
+            ("load", load_req.meta.as_ref()),
+            ("resume", resume_req.meta.as_ref()),
+        ] {
+            let meta = meta.expect(label);
+            let codeg = meta
+                .get("mcpConfig")
+                .and_then(|c| c.get("codeg-mcp"))
+                .cloned()
+                .unwrap_or_else(|| panic!("{label}: missing mcpConfig.codeg-mcp"));
+            assert_eq!(codeg, expected_timeouts, "{label} timeout config");
+            assert_eq!(codeg["startupTimeoutMs"], 30_000);
+            assert_eq!(codeg["toolTimeoutMs"], 30_000);
+            let map = codeg["toolTimeoutsMs"].as_object().expect("toolTimeoutsMs");
+            assert_eq!(map["get_workflow_capabilities"], 5_000);
+            assert_eq!(map["check_user_feedback"], 10_000);
+            assert_eq!(map["get_session_info"], 15_000);
+            assert_eq!(map["get_workflow_state"], 15_000);
+            assert_eq!(map["cancel_delegation"], 15_000);
+            assert_eq!(map["reply_to_delegation"], 15_000);
+            assert_eq!(map["publish_workflow_manifest"], 30_000);
+            assert_eq!(map["settle_workflow_gate"], 30_000);
+            assert_eq!(map["delegate_to_agent"], 180_000); // 3 min
+            assert_eq!(map["continue_delegation"], 300_000); // 5 min
+            assert_eq!(map["ask_user_question"], 1_800_000); // 30 min
+            assert_eq!(map["request_parent_decision"], 1_800_000); // 30 min
+            assert_eq!(map["get_delegation_status"], 5_400_000); // 90 min
+            // Terminal + route profiles must survive the merge.
+            assert!(
+                meta.contains_key("codeg.dev/terminal"),
+                "{label} terminal meta preserved"
+            );
+            assert!(
+                meta.get("agentProfile").is_some(),
+                "{label} Grok Codeg route agentProfile preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn session_request_meta_non_grok_omits_codeg_mcp_timeouts() {
+        let spec = test_posix_spec();
+        for agent in [AgentType::ClaudeCode, AgentType::Codex, AgentType::CodeBuddy] {
+            let meta = session_request_meta(
+                agent,
+                &codeg_plan(agent),
+                &spec,
+                adapter_for(agent),
+                ConnectionPurpose::User,
+            )
+            .unwrap();
+            assert!(
+                meta.get("mcpConfig").is_none(),
+                "{agent:?} must not emit Grok-only mcpConfig timeouts"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_grok_codeg_mcp_timeout_preserves_other_server_entries() {
+        let mut existing = serde_json::Map::new();
+        existing.insert(
+            "mcpConfig".to_string(),
+            serde_json::json!({
+                "github": { "toolTimeoutMs": 60_000 },
+                "codeg-mcp": { "toolTimeoutMs": 1 } // should be replaced
+            }),
+        );
+        existing.insert("agentProfile".to_string(), serde_json::json!({"name": "keep-me"}));
+        let merged = merge_grok_codeg_mcp_timeout_config(existing, AgentType::Grok);
+        assert_eq!(merged["agentProfile"]["name"], "keep-me");
+        assert_eq!(merged["mcpConfig"]["github"]["toolTimeoutMs"], 60_000);
+        assert_eq!(
+            merged["mcpConfig"]["codeg-mcp"],
+            grok_codeg_mcp_timeout_config()
+        );
+    }
+
+    #[test]
+    fn merge_grok_codeg_mcp_timeout_is_noop_for_non_grok() {
+        let mut existing = serde_json::Map::new();
+        existing.insert("keep".to_string(), serde_json::json!(true));
+        let merged = merge_grok_codeg_mcp_timeout_config(existing, AgentType::Codex);
+        assert_eq!(merged.get("mcpConfig"), None);
+        assert_eq!(merged["keep"], true);
     }
 
     /// Complete base argv (as production builds before `AcpAgent::from_args`)

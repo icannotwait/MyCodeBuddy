@@ -96,6 +96,18 @@ pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 pub const GET_WORKFLOW_STATE_MAX_RESULT_BYTES: usize = 7_680;
 pub const GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES: usize = 256;
 
+/// Grok stdio host splits JSONL at 8,192 bytes without reassembly. Keep the
+/// same 512-byte headroom used by `tools/list` / `get_workflow_state`.
+pub const GET_SESSION_INFO_MAX_RESULT_BYTES: usize = 7_680;
+/// Same ceiling as workflow: oversized request ids are rejected pre-inflight
+/// so they cannot consume the entire response budget.
+pub const GET_SESSION_INFO_MAX_REQUEST_ID_BYTES: usize = 256;
+
+const SESSION_INFO_TRANSPORT_NOTE: &str =
+    "Session content was omitted to satisfy the 7680-byte stdio transport budget.";
+const SESSION_INFO_METADATA_NOTE: &str =
+    "Session metadata was omitted to satisfy the 7680-byte stdio transport budget.";
+
 /// Pre-coordination `delegate_to_agent` description restored when
 /// `coordination_v1` is off so old connections never see Join instructions.
 pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out work before collecting results. For each distinct codeg://delegation-profile/<uuid>, call once with its UUID as profile_id. Recover admission_failed or admission_unknown via explicit replacement (replaces_task_id + replacement_reason) only — never continue_delegation.";
@@ -610,15 +622,24 @@ async fn build_tools_call_spawn(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if name == "get_workflow_state"
+    if matches!(name.as_str(), "get_workflow_state" | "get_session_info")
         && serde_json::to_vec(&id)
-            .map(|serialized| serialized.len() > GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES)
+            .map(|serialized| {
+                serialized.len()
+                    > if name == "get_session_info" {
+                        GET_SESSION_INFO_MAX_REQUEST_ID_BYTES
+                    } else {
+                        GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES
+                    }
+            })
             .unwrap_or(true)
     {
         return LineAction::Respond(err(
             Value::Null,
             -32600,
-            "Invalid Request: get_workflow_state request id exceeds 256 serialized bytes",
+            format!(
+                "Invalid Request: {name} request id exceeds 256 serialized bytes"
+            ),
         ));
     }
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -796,7 +817,7 @@ async fn build_tools_call_spawn(
             // broker-side — canceling only suppresses the response.
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+            register_and_spawn_session_info(inflight, id, round_trip).await
         }
         "request_parent_decision" => {
             let args = match parse_parent_decision_args(&arguments) {
@@ -1520,6 +1541,87 @@ async fn register_and_spawn_workflow_state(
     })
 }
 
+async fn register_and_spawn_session_info(
+    inflight: Arc<InflightCalls>,
+    id: Value,
+    round_trip: futures_util::future::BoxFuture<'static, std::io::Result<BrokerResponse>>,
+) -> LineAction {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let id_key = request_id_key(&id);
+    inflight
+        .register(
+            id_key.clone(),
+            InflightEntry {
+                external_handle: None,
+                cancel_tx,
+            },
+        )
+        .await;
+
+    let id_for_response = id.clone();
+    let id_key_for_task = id_key.clone();
+    let inflight_for_task = inflight.clone();
+    let future = Box::pin(async move {
+        let response = tokio::select! {
+            biased;
+            _ = cancel_rx => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                None
+            }
+            rt = round_trip => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                match rt {
+                    Ok(response) => {
+                        let rendered = render_session_outcome_with_budget(
+                            id_for_response.clone(),
+                            response.outcome,
+                            GET_SESSION_INFO_MAX_RESULT_BYTES,
+                        )
+                        .unwrap_or_else(|_| {
+                            let internal_error = err(
+                                id_for_response.clone(),
+                                -32603,
+                                "get_session_info response serialization failed",
+                            );
+                            let internal_error_bytes = serialize_jsonrpc_line(&internal_error)
+                                .expect("fixed JSON-RPC error is serializable")
+                                .len();
+                            assert!(
+                                internal_error_bytes <= GET_SESSION_INFO_MAX_RESULT_BYTES,
+                                "bounded request id keeps fixed session-info error within budget"
+                            );
+                            internal_error
+                        });
+                        let rendered_bytes = serialize_jsonrpc_line(&rendered)
+                            .expect("session-info response was already serialized")
+                            .len();
+                        assert!(
+                            rendered_bytes <= GET_SESSION_INFO_MAX_RESULT_BYTES,
+                            "accepted session-info response must fit the line budget"
+                        );
+                        Some(rendered)
+                    }
+                    Err(e) => Some(err(
+                        id_for_response,
+                        -32603,
+                        format!("broker round-trip failed: {e}"),
+                    )),
+                }
+            }
+        };
+        SpawnResult {
+            response,
+            after_relay: None,
+        }
+    });
+
+    LineAction::Spawn(SpawnedCall {
+        request_id: id,
+        request_id_key: id_key,
+        future,
+    })
+}
+
 /// `check_user_feedback`-specific spawn. Like [`register_and_spawn`], but it
 /// carries an `after_relay` commit — a `CommitFeedback` round-trip marking the
 /// pulled notes `Delivered` — that the binary runs ONLY after it successfully
@@ -2171,6 +2273,244 @@ pub fn render_session_result(outcome: &Value) -> Value {
         "isError": false,
         "structuredContent": outcome.clone(),
     })
+}
+
+/// Build a complete JSON-RPC response for `get_session_info` that fits
+/// `max_bytes` (including the trailing newline). Progressive omission:
+/// drop oldest messages → shorten newest text on UTF-8 char boundaries →
+/// drop tools → drop messages → strip metadata to a bounded envelope.
+pub fn render_session_outcome_with_budget(
+    id: Value,
+    mut outcome: Value,
+    max_bytes: usize,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    let preferred = ok(id.clone(), render_session_result(&outcome));
+    let preferred_bytes = serialize_jsonrpc_line(&preferred)?.len();
+    if preferred_bytes <= max_bytes {
+        return Ok(preferred);
+    }
+
+    // 1) Drop oldest message items until only the newest remains.
+    while session_message_items(&outcome).map(|items| items.len() > 1).unwrap_or(false) {
+        drop_oldest_session_message(&mut outcome);
+        let candidate = ok(id.clone(), render_session_result(&outcome));
+        if serialize_jsonrpc_line(&candidate)?.len() <= max_bytes {
+            tracing::debug!(
+                preferred_bytes,
+                final_bytes = serialize_jsonrpc_line(&candidate)?.len(),
+                "rendered get_session_info by dropping oldest messages"
+            );
+            return Ok(candidate);
+        }
+    }
+
+    // 2) UTF-8-safe progressive shortening of the remaining newest text.
+    if let Some(best) = shrink_newest_session_text_to_fit(id.clone(), &mut outcome, max_bytes)? {
+        return Ok(best);
+    }
+
+    // 3) Remove tool names from the remaining item (existing order).
+    while session_message_items(&outcome)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("tools"))
+        .and_then(Value::as_array)
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false)
+    {
+        if let Some(tools) = outcome
+            .pointer_mut("/messages/items")
+            .and_then(Value::as_array_mut)
+            .and_then(|items| items.last_mut())
+            .and_then(|item| item.get_mut("tools"))
+            .and_then(Value::as_array_mut)
+        {
+            tools.remove(0);
+        }
+        mark_session_messages_truncated(&mut outcome);
+        let candidate = ok(id.clone(), render_session_result(&outcome));
+        if serialize_jsonrpc_line(&candidate)?.len() <= max_bytes {
+            return Ok(candidate);
+        }
+    }
+
+    // 4) Drop the messages envelope; keep full session metadata + transport note.
+    if outcome.get("messages").is_some() {
+        if let Some(obj) = outcome.as_object_mut() {
+            obj.remove("messages");
+            obj.insert("note".into(), json!(SESSION_INFO_TRANSPORT_NOTE));
+        }
+        let candidate = ok(id.clone(), render_session_result(&outcome));
+        if serialize_jsonrpc_line(&candidate)?.len() <= max_bytes {
+            return Ok(candidate);
+        }
+    }
+
+    // 5) Bounded metadata-only fallback (found + session_id + counts + note).
+    let fallback_outcome = bounded_session_info_fallback(&outcome);
+    let fallback = ok(id, render_session_result(&fallback_outcome));
+    let fallback_bytes = serialize_jsonrpc_line(&fallback)?.len();
+    if fallback_bytes <= max_bytes {
+        tracing::debug!(
+            preferred_bytes,
+            final_bytes = fallback_bytes,
+            "rendered get_session_info with bounded metadata fallback"
+        );
+        return Ok(fallback);
+    }
+
+    // Pathological: even the fallback exceeds budget (should not happen with a
+    // bounded request id). Return a fixed tiny soft result rather than hang.
+    Ok(ok(
+        fallback.id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": SESSION_INFO_METADATA_NOTE
+            }],
+            "isError": false,
+            "structuredContent": {
+                "found": false,
+                "session_id": 0,
+                "note": SESSION_INFO_METADATA_NOTE
+            }
+        }),
+    ))
+}
+
+fn session_message_items(outcome: &Value) -> Option<&Vec<Value>> {
+    outcome
+        .pointer("/messages/items")
+        .and_then(Value::as_array)
+}
+
+fn mark_session_messages_truncated(outcome: &mut Value) {
+    let Some(messages) = outcome.get_mut("messages") else {
+        return;
+    };
+    let included = messages
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or(0);
+    if let Some(obj) = messages.as_object_mut() {
+        obj.insert("included".into(), json!(included));
+        obj.insert("truncated".into(), json!(true));
+    }
+}
+
+fn drop_oldest_session_message(outcome: &mut Value) {
+    if let Some(items) = outcome
+        .pointer_mut("/messages/items")
+        .and_then(Value::as_array_mut)
+    {
+        if !items.is_empty() {
+            items.remove(0);
+        }
+    }
+    mark_session_messages_truncated(outcome);
+}
+
+/// Binary-search the maximum character prefix of the newest message text that
+/// still fits `max_bytes` when fully serialized. Returns `Some` when a fit is
+/// found (including empty text with tools still present).
+fn shrink_newest_session_text_to_fit(
+    id: Value,
+    outcome: &mut Value,
+    max_bytes: usize,
+) -> Result<Option<JsonRpcResponse>, serde_json::Error> {
+    let original = outcome
+        .pointer("/messages/items")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if original.is_empty() {
+        return Ok(None);
+    }
+
+    let char_len = original.chars().count();
+    let mut lo = 0usize;
+    let mut hi = char_len;
+    let mut best: Option<(usize, JsonRpcResponse)> = None;
+
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let candidate_text = if mid >= char_len {
+            original.clone()
+        } else if mid == 0 {
+            String::new()
+        } else {
+            let mut s: String = original.chars().take(mid).collect();
+            s.push('…');
+            s
+        };
+        set_newest_session_text(outcome, &candidate_text);
+        mark_session_messages_truncated(outcome);
+        let response = ok(id.clone(), render_session_result(outcome));
+        let bytes = serialize_jsonrpc_line(&response)?.len();
+        if bytes <= max_bytes {
+            best = Some((mid, response));
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if let Some((chars, _response)) = best {
+        // Restore the winning text into outcome so structuredContent matches.
+        let winning = if chars >= char_len {
+            original
+        } else if chars == 0 {
+            String::new()
+        } else {
+            let mut s: String = original.chars().take(chars).collect();
+            s.push('…');
+            s
+        };
+        set_newest_session_text(outcome, &winning);
+        mark_session_messages_truncated(outcome);
+        return Ok(Some(ok(id, render_session_result(outcome))));
+    }
+
+    // Empty text still oversized (tools / metadata) — leave text empty for
+    // subsequent tool-stripping steps.
+    set_newest_session_text(outcome, "");
+    mark_session_messages_truncated(outcome);
+    Ok(None)
+}
+
+fn set_newest_session_text(outcome: &mut Value, text: &str) {
+    if let Some(item) = outcome
+        .pointer_mut("/messages/items")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.last_mut())
+    {
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("text".into(), json!(text));
+        }
+    }
+}
+
+fn bounded_session_info_fallback(outcome: &Value) -> Value {
+    let mut out = json!({
+        "found": outcome.get("found").cloned().unwrap_or(json!(false)),
+        "session_id": outcome.get("session_id").cloned().unwrap_or(json!(0)),
+        "note": SESSION_INFO_METADATA_NOTE,
+    });
+    if let Some(count) = outcome.get("message_count").cloned() {
+        out["message_count"] = count;
+    }
+    // Keep a small stable agent_type when present so the soft text remains useful.
+    if let Some(agent) = outcome.get("agent_type").and_then(Value::as_str) {
+        if agent.len() <= 64 {
+            out["agent_type"] = json!(agent);
+        }
+    }
+    out
 }
 
 /// Build the human-readable summary block for a found session: a metadata header
@@ -5122,6 +5462,314 @@ mod tests {
         assert!(text.contains("- [assistant] done (tools: Read, Edit)"));
         // Full structured envelope preserved for hosts that keep it.
         assert_eq!(rendered["structuredContent"]["session_id"], 214);
+    }
+
+    fn large_session_outcome(message_count: usize, text_chars: usize) -> Value {
+        let items: Vec<Value> = (0..message_count)
+            .map(|i| {
+                let body = format!(
+                    "turn-{i}-{}",
+                    "中文内容with\"quotes\"and\\slash\n".repeat((text_chars / 20).max(1))
+                );
+                // Keep each item near `text_chars` chars.
+                let text: String = body.chars().take(text_chars).collect();
+                json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "text": text,
+                    "tools": ["Read", "Edit", "Bash", "grep"]
+                })
+            })
+            .collect();
+        json!({
+            "found": true,
+            "session_id": 2868,
+            "agent_type": "codex",
+            "title": "Grok MCP 8KB budget regression fixture",
+            "status": "pending_review",
+            "git_branch": "main",
+            "model": "test-model",
+            "workspace_path": "D:\\MyCodeBuddy",
+            "message_count": message_count * 2,
+            "is_delegation_child": false,
+            "stats": { "total_tokens": 16_734_889 },
+            "messages": {
+                "total": message_count * 2,
+                "included": message_count,
+                "truncated": true,
+                "items": items
+            }
+        })
+    }
+
+    #[test]
+    fn get_session_info_50_messages_jsonrpc_line_under_7680_bytes() {
+        let outcome = large_session_outcome(50, 1_200);
+        let preferred = ok(json!(1), render_session_result(&outcome));
+        let preferred_bytes = serialize_jsonrpc_line(&preferred).unwrap().len();
+        assert!(
+            preferred_bytes > 8_192,
+            "fixture must exceed the Grok split boundary; got {preferred_bytes}"
+        );
+
+        for id in [
+            json!(1),
+            json!("quote\"slash\\界"),
+            ascii_string_id_with_serialized_len(GET_SESSION_INFO_MAX_REQUEST_ID_BYTES),
+        ] {
+            let response = render_session_outcome_with_budget(
+                id.clone(),
+                outcome.clone(),
+                GET_SESSION_INFO_MAX_RESULT_BYTES,
+            )
+            .unwrap();
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(
+                line.len() <= GET_SESSION_INFO_MAX_RESULT_BYTES,
+                "id={id:?} line is {} bytes",
+                line.len()
+            );
+            let result = response.result.as_ref().unwrap();
+            assert_eq!(result["isError"], false);
+            assert_eq!(result["structuredContent"]["session_id"], 2868);
+            // Oversized preferred input must report truncation once omitted.
+            if result["structuredContent"].get("messages").is_some() {
+                assert_eq!(result["structuredContent"]["messages"]["truncated"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn get_session_info_200_messages_keeps_newest_fitting_context() {
+        let outcome = large_session_outcome(200, 800);
+        let response = render_session_outcome_with_budget(
+            json!(42),
+            outcome,
+            GET_SESSION_INFO_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_SESSION_INFO_MAX_RESULT_BYTES);
+
+        let structured = &response.result.as_ref().unwrap()["structuredContent"];
+        assert_eq!(structured["found"], true);
+        assert_eq!(structured["session_id"], 2868);
+        if let Some(items) = structured.pointer("/messages/items").and_then(Value::as_array)
+        {
+            // Newest turns are at the end (chronological order).
+            let last = items.last().unwrap();
+            let text = last["text"].as_str().unwrap_or("");
+            assert!(
+                text.contains("turn-199") || text.is_empty() || text.ends_with('…'),
+                "should prefer newest turn context, got {text:?}"
+            );
+            assert_eq!(structured["messages"]["truncated"], true);
+        } else {
+            // Metadata-only fallback is acceptable when even one message overflows.
+            assert!(
+                structured["note"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("7680-byte")
+            );
+        }
+    }
+
+    #[test]
+    fn get_session_info_single_long_chinese_message_truncates_on_utf8_boundary() {
+        let chinese = "中".repeat(6_000);
+        let outcome = json!({
+            "found": true,
+            "session_id": 7,
+            "agent_type": "grok",
+            "title": "utf8",
+            "message_count": 1,
+            "is_delegation_child": false,
+            "messages": {
+                "total": 1,
+                "included": 1,
+                "truncated": false,
+                "items": [{
+                    "role": "assistant",
+                    "text": chinese,
+                    "tools": []
+                }]
+            }
+        });
+        let response = render_session_outcome_with_budget(
+            json!("id"),
+            outcome,
+            GET_SESSION_INFO_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_SESSION_INFO_MAX_RESULT_BYTES);
+        // Entire JSONL must be valid UTF-8 (serialize_jsonrpc_line already is).
+        assert!(std::str::from_utf8(&line).is_ok());
+        let structured = &response.result.as_ref().unwrap()["structuredContent"];
+        if let Some(text) = structured
+            .pointer("/messages/items/0/text")
+            .and_then(Value::as_str)
+        {
+            assert!(text.chars().count() < 6_000);
+            assert!(text.ends_with('…') || text.is_empty());
+            // Truncation must not split a multi-byte codepoint — String is always valid UTF-8.
+            assert!(text.is_char_boundary(text.len()));
+        }
+    }
+
+    #[test]
+    fn get_session_info_json_escaping_measured_not_estimated() {
+        // Quotes/backslashes expand under JSON escaping; budget must measure the
+        // serialized form, not the raw character count.
+        let messy = "\"\\\n\t".repeat(2_000);
+        let outcome = json!({
+            "found": true,
+            "session_id": 3,
+            "agent_type": "codex",
+            "message_count": 1,
+            "is_delegation_child": false,
+            "messages": {
+                "total": 1, "included": 1, "truncated": false,
+                "items": [{ "role": "user", "text": messy, "tools": [] }]
+            }
+        });
+        let response = render_session_outcome_with_budget(
+            json!(1),
+            outcome,
+            GET_SESSION_INFO_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_SESSION_INFO_MAX_RESULT_BYTES);
+        assert_eq!(response.result.as_ref().unwrap()["isError"], false);
+    }
+
+    #[test]
+    fn get_session_info_small_response_preserves_shape() {
+        let outcome = json!({
+            "found": true,
+            "session_id": 214,
+            "agent_type": "claude_code",
+            "title": "Fix auth flow",
+            "status": "completed",
+            "message_count": 2,
+            "is_delegation_child": false,
+            "messages": {
+                "total": 2, "included": 2, "truncated": false,
+                "items": [
+                    { "role": "user", "text": "fix login", "tools": [] },
+                    { "role": "assistant", "text": "done", "tools": ["Edit"] }
+                ]
+            }
+        });
+        let response = render_session_outcome_with_budget(
+            json!(9),
+            outcome.clone(),
+            GET_SESSION_INFO_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let preferred = ok(json!(9), render_session_result(&outcome));
+        assert_eq!(
+            serialize_jsonrpc_line(&response).unwrap(),
+            serialize_jsonrpc_line(&preferred).unwrap()
+        );
+        assert_eq!(
+            response.result.as_ref().unwrap()["structuredContent"]["messages"]["included"],
+            2
+        );
+        assert_eq!(
+            response.result.as_ref().unwrap()["structuredContent"]["messages"]["truncated"],
+            false
+        );
+    }
+
+    #[test]
+    fn get_session_info_pathological_metadata_uses_bounded_fallback() {
+        let outcome = json!({
+            "found": true,
+            "session_id": 99,
+            "agent_type": "codex",
+            "title": "T".repeat(20_000),
+            "status": "S".repeat(20_000),
+            "git_branch": "B".repeat(20_000),
+            "model": "M".repeat(20_000),
+            "workspace_path": format!("D:\\\\{}", "P".repeat(20_000)),
+            "message_count": 1,
+            "is_delegation_child": false,
+            "stats": { "total_tokens": 1 },
+            "messages": {
+                "total": 1, "included": 1, "truncated": false,
+                "items": [{
+                    "role": "user",
+                    "text": "x".repeat(20_000),
+                    "tools": ["tool".repeat(200)]
+                }]
+            }
+        });
+        let response = render_session_outcome_with_budget(
+            ascii_string_id_with_serialized_len(GET_SESSION_INFO_MAX_REQUEST_ID_BYTES),
+            outcome,
+            GET_SESSION_INFO_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(
+            line.len() <= GET_SESSION_INFO_MAX_RESULT_BYTES,
+            "{} bytes",
+            line.len()
+        );
+        let structured = &response.result.as_ref().unwrap()["structuredContent"];
+        assert!(structured.get("messages").is_none());
+        assert!(
+            structured["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("7680-byte")
+        );
+        assert_eq!(structured["session_id"], 99);
+    }
+
+    #[tokio::test]
+    async fn get_session_info_request_id_limit_is_pre_inflight_and_bounded() {
+        let accepted = ascii_string_id_with_serialized_len(GET_SESSION_INFO_MAX_REQUEST_ID_BYTES);
+        let accepted_line = json!({
+            "jsonrpc": "2.0", "id": accepted, "method": "tools/call",
+            "params": { "name": "get_session_info", "arguments": { "session_id": 1 } }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(SESSIONS_ONLY, &accepted_line).await,
+            LineAction::Spawn(_)
+        ));
+
+        for rejected in [
+            ascii_string_id_with_serialized_len(GET_SESSION_INFO_MAX_REQUEST_ID_BYTES + 1),
+            Value::String("\\".repeat(128)),
+            Value::String("界".repeat(85)),
+        ] {
+            let inflight = Arc::new(InflightCalls::new());
+            let line = json!({
+                "jsonrpc": "2.0", "id": rejected, "method": "tools/call",
+                "params": { "name": "get_session_info", "arguments": { "session_id": 1 } }
+            })
+            .to_string();
+            let response = unwrap_respond(
+                dispatch_line(&ctx_with(SESSIONS_ONLY), inflight.clone(), &line).await,
+            );
+            assert_eq!(response.id, Value::Null);
+            assert_eq!(response.error.as_ref().unwrap().code, -32600);
+            assert!(response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("get_session_info"));
+            assert!(inflight.drain_all().await.is_empty());
+            assert!(
+                serialize_jsonrpc_line(&response).unwrap().len()
+                    <= GET_SESSION_INFO_MAX_RESULT_BYTES
+            );
+        }
     }
 
     #[test]
