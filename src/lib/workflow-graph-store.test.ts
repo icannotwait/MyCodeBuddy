@@ -149,7 +149,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 async function flushMicrotasks(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 16; index += 1) {
     await Promise.resolve()
   }
 }
@@ -330,7 +330,7 @@ describe("workflow activation lifecycle", () => {
     vi.useRealTimers()
   })
 
-  it("first-seeds overlay interest after readiness only without a numbered graph", async () => {
+  it("reconciles overlay interest after readiness even with a numbered cache", async () => {
     const changed = deferred<() => void>()
     const nudge = deferred<() => void>()
     subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
@@ -352,13 +352,30 @@ describe("workflow activation lifecycle", () => {
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(91, baseSnapshot({ graph_revision: 7 }))
-    getWorkflowGraphSnapshot.mockClear()
-    const seededRelease = useWorkflowGraphStore
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 7 })
+    )
+
+    const firstRelease = useWorkflowGraphStore
       .getState()
       .activateOverlayInterest(91)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
-    seededRelease()
+    firstRelease()
+
+    getWorkflowGraphSnapshot.mockClear()
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 8 })
+    )
+    const reactivatedRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(91)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(91)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(91)?.graph_revision
+    ).toBe(8)
+    reactivatedRelease()
   })
 
   it("refreshes overlay interest when only an unnumbered snapshot is cached", async () => {
@@ -657,7 +674,7 @@ describe("active workflow refresh scheduling", () => {
     )
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(92)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
     useWorkflowGraphStore.getState().handleGraphChanged({
       parent_conversation_id: 92,
@@ -765,31 +782,31 @@ describe("active workflow refresh scheduling", () => {
       .getState()
       .activateOverlayInterest(93)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
     const releaseExpanded = useWorkflowGraphStore
       .getState()
       .activateConversation(93)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     releaseExpanded()
 
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 93,
     })
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
 
     releaseOverlay()
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 93,
     })
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
   it("late expanded completion updates cache but cannot arm an overlay timer", async () => {
@@ -813,7 +830,7 @@ describe("active workflow refresh scheduling", () => {
       useWorkflowGraphStore.getState().getSnapshot(97)?.graph_revision
     ).toBe(2)
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     releaseOverlay()
   })
 

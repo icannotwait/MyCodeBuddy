@@ -361,11 +361,7 @@ function activateInterest(
       const currentActive = activeConversations.get(conversationId)
       if (!currentActive || currentActive.epoch !== epoch) return
       currentActive.readinessSettled = true
-      const appliedRevision =
-        get().getEntry(conversationId)?.appliedGraphRevision
-      if (currentActive.expandedCount > 0 || appliedRevision == null) {
-        void get().refresh(conversationId)
-      }
+      void get().refresh(conversationId)
     })
   } else if (mode === "expanded" && !wasExpanded && active.readinessSettled) {
     void get().refresh(conversationId)
