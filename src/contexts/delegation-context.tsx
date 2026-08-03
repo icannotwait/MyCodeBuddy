@@ -41,6 +41,7 @@ import {
   type DelegationBinding,
   type DelegationStatus,
 } from "@/lib/delegation-binding-reduce"
+import { useWorkflowGraphStore } from "@/lib/workflow-graph-store"
 import { useAcpActions, useAcpEvent } from "@/contexts/acp-connections-context"
 
 export type { DelegationBinding, DelegationStatus }
@@ -141,6 +142,12 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
       )
       mapRef.current = next
       setByToolUseId(next)
+
+      if (envelope.type === "delegation_runtime_stats_changed") {
+        useWorkflowGraphStore
+          .getState()
+          .applyRuntimeStats(envelope.task_id, envelope.runtime_stats)
+      }
 
       if (envelope.type === "delegation_started") {
         // Cancel any pending detach for this parent_tool_use_id —

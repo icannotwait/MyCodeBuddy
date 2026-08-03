@@ -821,6 +821,13 @@ export interface WorkflowNodeSnapshot {
   latest_task_id?: string | null
   latest_child_conversation_id?: number | null
   latest_run_status?: string | null
+  tool_call_count?: number | null
+  edit_tool_call_count?: number | null
+  touched_file_count?: number | null
+  touched_files_truncated?: boolean
+  additions?: number | null
+  deletions?: number | null
+  line_counts_complete?: boolean | null
   summary?: string | null
   is_observed: boolean
   retained_observed: boolean

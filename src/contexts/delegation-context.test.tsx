@@ -11,6 +11,16 @@ import { emptyRuntimeStats, type EventEnvelope } from "@/lib/types"
 
 const STARTED_AT = "2026-07-19T00:00:00.000Z"
 
+const { mockApplyWorkflowRuntimeStats } = vi.hoisted(() => ({
+  mockApplyWorkflowRuntimeStats: vi.fn(),
+}))
+
+vi.mock("@/lib/workflow-graph-store", () => ({
+  useWorkflowGraphStore: {
+    getState: () => ({ applyRuntimeStats: mockApplyWorkflowRuntimeStats }),
+  },
+}))
+
 /** Honest wire-shaped `delegation_started` for provider tests. */
 function startedEvent(
   overrides: Partial<{
@@ -189,6 +199,7 @@ describe("DelegationProvider", () => {
     capturedHandler = null
     mockAttach.mockReset()
     mockDetach.mockReset()
+    mockApplyWorkflowRuntimeStats.mockReset()
   })
 
   afterEach(() => {
@@ -436,6 +447,33 @@ describe("DelegationProvider", () => {
     expect(screen.getByTestId("task-id")).toHaveTextContent("task-xyz")
     expect(screen.getByTestId("started-at")).toHaveTextContent(STARTED_AT)
     expect(screen.getByTestId("tool-count")).toHaveTextContent("0")
+  })
+
+  it("forwards runtime snapshots to the workflow store and still updates the binding", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch(startedEvent())
+    const runtimeStats = {
+      ...emptyRuntimeStats(STARTED_AT),
+      tool_call_count: 5,
+      edit_tool_call_count: 2,
+    }
+
+    dispatch({
+      seq: 2,
+      connection_id: "p1",
+      type: "delegation_runtime_stats_changed",
+      parent_tool_use_id: "pt-1",
+      task_id: "task-1",
+      runtime_stats: runtimeStats,
+    })
+
+    expect(screen.getByTestId("tool-count")).toHaveTextContent("5")
+    expect(mockApplyWorkflowRuntimeStats).toHaveBeenCalledTimes(1)
+    expect(mockApplyWorkflowRuntimeStats).toHaveBeenCalledWith(
+      "task-1",
+      runtimeStats
+    )
   })
 
   it("does not schedule detach when completion task_id mismatches binding", async () => {

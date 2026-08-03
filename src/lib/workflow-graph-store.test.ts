@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
+import type {
+  DelegationRuntimeStats,
+  WorkflowGraphSnapshot,
+  WorkflowNodeSnapshot,
+} from "@/lib/types"
 
 const {
   getWorkflowGraphSnapshot,
@@ -149,7 +153,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 async function flushMicrotasks(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 16; index += 1) {
     await Promise.resolve()
   }
 }
@@ -182,6 +186,65 @@ describe("workflow-graph-store revision gate", () => {
     expect(
       useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision
     ).toBe(5)
+  })
+
+  it("replaces runtime fields only on nodes for the exact latest task", () => {
+    const snapshot = baseSnapshot({
+      graph_revision: 12,
+      nodes: [
+        node({ node_id: "current", latest_task_id: "task-current" }),
+        node({ node_id: "stale", latest_task_id: "task-newer" }),
+      ],
+    })
+    useWorkflowGraphStore.getState().applyFromDetail(120, snapshot)
+    const before = useWorkflowGraphStore.getState().getEntry(120)
+    const stats: DelegationRuntimeStats = {
+      started_at: "2026-08-03T00:00:00.000Z",
+      finished_at: null,
+      tool_call_count: 9,
+      edit_tool_call_count: 4,
+      touched_files: [
+        {
+          path: "src/a.ts",
+          outside_workspace: false,
+          additions: 7,
+          deletions: 2,
+        },
+        { path: "src/b.ts", outside_workspace: false },
+      ],
+      touched_files_truncated: true,
+      additions: 7,
+      deletions: 2,
+      line_counts_complete: true,
+    }
+
+    useWorkflowGraphStore.getState().applyRuntimeStats("task-current", stats)
+
+    const after = useWorkflowGraphStore.getState().getEntry(120)
+    const current = after?.snapshot?.nodes.find(
+      (item) => item.node_id === "current"
+    )
+    const stale = after?.snapshot?.nodes.find(
+      (item) => item.node_id === "stale"
+    )
+    expect(current).toMatchObject({
+      tool_call_count: 9,
+      edit_tool_call_count: 4,
+      touched_file_count: 2,
+      touched_files_truncated: true,
+      additions: 7,
+      deletions: 2,
+      line_counts_complete: true,
+    })
+    expect(stale?.tool_call_count).toBeNull()
+    expect(after?.snapshot?.graph_revision).toBe(12)
+    expect(after?.requestGeneration).toBe(before?.requestGeneration)
+
+    const retained = after?.snapshot
+    useWorkflowGraphStore
+      .getState()
+      .applyRuntimeStats("task-old", { ...stats, tool_call_count: 99 })
+    expect(useWorkflowGraphStore.getState().getSnapshot(120)).toBe(retained)
   })
 
   it("discards fetched snapshot when request generation is stale", async () => {
@@ -330,7 +393,7 @@ describe("workflow activation lifecycle", () => {
     vi.useRealTimers()
   })
 
-  it("first-seeds overlay interest after readiness only without a numbered graph", async () => {
+  it("reconciles overlay interest after readiness even with a numbered cache", async () => {
     const changed = deferred<() => void>()
     const nudge = deferred<() => void>()
     subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
@@ -352,13 +415,30 @@ describe("workflow activation lifecycle", () => {
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(91, baseSnapshot({ graph_revision: 7 }))
-    getWorkflowGraphSnapshot.mockClear()
-    const seededRelease = useWorkflowGraphStore
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 7 })
+    )
+
+    const firstRelease = useWorkflowGraphStore
       .getState()
       .activateOverlayInterest(91)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
-    seededRelease()
+    firstRelease()
+
+    getWorkflowGraphSnapshot.mockClear()
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 8 })
+    )
+    const reactivatedRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(91)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(91)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(91)?.graph_revision
+    ).toBe(8)
+    reactivatedRelease()
   })
 
   it("refreshes overlay interest when only an unnumbered snapshot is cached", async () => {
@@ -657,7 +737,7 @@ describe("active workflow refresh scheduling", () => {
     )
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(92)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
     useWorkflowGraphStore.getState().handleGraphChanged({
       parent_conversation_id: 92,
@@ -765,31 +845,31 @@ describe("active workflow refresh scheduling", () => {
       .getState()
       .activateOverlayInterest(93)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
     const releaseExpanded = useWorkflowGraphStore
       .getState()
       .activateConversation(93)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     releaseExpanded()
 
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 93,
     })
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
 
     releaseOverlay()
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 93,
     })
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
   it("late expanded completion updates cache but cannot arm an overlay timer", async () => {
@@ -813,7 +893,7 @@ describe("active workflow refresh scheduling", () => {
       useWorkflowGraphStore.getState().getSnapshot(97)?.graph_revision
     ).toBe(2)
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     releaseOverlay()
   })
 
