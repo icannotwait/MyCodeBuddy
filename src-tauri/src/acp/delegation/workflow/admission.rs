@@ -183,17 +183,136 @@ const COMPLETE_WORK_TXN_MAX_ATTEMPTS: u8 = 10;
 
 enum CompleteWorkAttemptError {
     Contract(CompleteWorkError),
-    Database(sea_orm::DbErr),
+    Database {
+        error: sea_orm::DbErr,
+        retry_safe: bool,
+    },
+}
+
+fn completion_constraint_race_codes(primary: i32, extended: i32) -> bool {
+    const SQLITE_CONSTRAINT: i32 = 19;
+    const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 1555;
+    const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
+
+    primary == SQLITE_CONSTRAINT
+        && matches!(
+            extended,
+            SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE
+        )
 }
 
 fn completion_write_race(error: &sea_orm::DbErr) -> bool {
-    const SQLITE_CONSTRAINT: i32 = 19;
     classify_sqlite_transient(error).is_some()
-        || extract_sqlite_codes(error).is_some_and(|codes| codes.primary == SQLITE_CONSTRAINT)
+        || extract_sqlite_codes(error)
+            .is_some_and(|codes| completion_constraint_race_codes(codes.primary, codes.extended))
 }
 
 fn completion_retry_delay(attempt: u8) -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(attempt) * 2)
+}
+
+#[cfg(test)]
+pub(crate) struct CompleteWorkTestControl {
+    snapshot_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    transient_body_failures: std::sync::atomic::AtomicUsize,
+    commit_failures: std::sync::atomic::AtomicUsize,
+    attempts: std::sync::atomic::AtomicUsize,
+    rollbacks: std::sync::atomic::AtomicUsize,
+    retries: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(not(test))]
+struct CompleteWorkTestControl;
+
+struct CompleteWorkAttemptContext<'a> {
+    _attempt: u8,
+    control: Option<&'a CompleteWorkTestControl>,
+}
+
+#[cfg(test)]
+impl CompleteWorkTestControl {
+    pub(crate) fn snapshot_race(parties: usize) -> Self {
+        Self {
+            snapshot_barrier: Some(std::sync::Arc::new(tokio::sync::Barrier::new(parties))),
+            transient_body_failures: std::sync::atomic::AtomicUsize::new(0),
+            commit_failures: std::sync::atomic::AtomicUsize::new(0),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            rollbacks: std::sync::atomic::AtomicUsize::new(0),
+            retries: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn transient_body_failures(count: usize) -> Self {
+        Self::with_failures(count, 0)
+    }
+
+    pub(crate) fn commit_failures(count: usize) -> Self {
+        Self::with_failures(0, count)
+    }
+
+    fn with_failures(transient_body_failures: usize, commit_failures: usize) -> Self {
+        Self {
+            snapshot_barrier: None,
+            transient_body_failures: std::sync::atomic::AtomicUsize::new(transient_body_failures),
+            commit_failures: std::sync::atomic::AtomicUsize::new(commit_failures),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            rollbacks: std::sync::atomic::AtomicUsize::new(0),
+            retries: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn consume(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        counter
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| (remaining > 0).then(|| remaining - 1),
+            )
+            .is_ok()
+    }
+
+    fn begin_attempt(&self) {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_body(&self) -> bool {
+        Self::consume(&self.transient_body_failures)
+    }
+
+    fn fail_commit(&self) -> bool {
+        Self::consume(&self.commit_failures)
+    }
+
+    async fn wait_after_snapshot(&self, attempt: u8) {
+        if attempt == 1 {
+            if let Some(barrier) = self.snapshot_barrier.as_ref() {
+                barrier.wait().await;
+            }
+        }
+    }
+
+    fn record_rollback(&self) {
+        self.rollbacks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_retry(&self) {
+        self.retries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn rollbacks(&self) -> usize {
+        self.rollbacks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn retries(&self) -> usize {
+        self.retries.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Load the immutable workflow binding after run admission commits and before
@@ -237,6 +356,45 @@ pub async fn accept_complete_work_txn(
     child_tool_call_id: &str,
     request: &CompleteWorkRequest,
 ) -> Result<AcceptedToolIntent, CompleteWorkError> {
+    accept_complete_work_txn_inner(
+        db,
+        task_id,
+        child_connection_id,
+        child_tool_call_id,
+        request,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn accept_complete_work_txn_with_test_control(
+    db: &AppDatabase,
+    task_id: &str,
+    child_connection_id: &str,
+    child_tool_call_id: &str,
+    request: &CompleteWorkRequest,
+    control: std::sync::Arc<CompleteWorkTestControl>,
+) -> Result<AcceptedToolIntent, CompleteWorkError> {
+    accept_complete_work_txn_inner(
+        db,
+        task_id,
+        child_connection_id,
+        child_tool_call_id,
+        request,
+        Some(control.as_ref()),
+    )
+    .await
+}
+
+async fn accept_complete_work_txn_inner(
+    db: &AppDatabase,
+    task_id: &str,
+    child_connection_id: &str,
+    child_tool_call_id: &str,
+    request: &CompleteWorkRequest,
+    control: Option<&CompleteWorkTestControl>,
+) -> Result<AcceptedToolIntent, CompleteWorkError> {
     if child_tool_call_id.is_empty() {
         return Err(CompleteWorkError::InvalidArguments(
             "child tool call identity is empty".into(),
@@ -260,6 +418,10 @@ pub async fn accept_complete_work_txn(
     let request_digest = format!("{:x}", Sha256::digest(canonical));
 
     for attempt in 1..=COMPLETE_WORK_TXN_MAX_ATTEMPTS {
+        #[cfg(test)]
+        if let Some(control) = control {
+            control.begin_attempt();
+        }
         match accept_complete_work_once(
             db,
             task_id,
@@ -267,17 +429,26 @@ pub async fn accept_complete_work_txn(
             child_tool_call_id,
             request,
             &request_digest,
+            CompleteWorkAttemptContext {
+                _attempt: attempt,
+                control,
+            },
         )
         .await
         {
             Ok(intent) => return Ok(intent),
             Err(CompleteWorkAttemptError::Contract(error)) => return Err(error),
-            Err(CompleteWorkAttemptError::Database(error))
-                if completion_write_race(&error) && attempt < COMPLETE_WORK_TXN_MAX_ATTEMPTS =>
-            {
+            Err(CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            }) if completion_write_race(&error) && attempt < COMPLETE_WORK_TXN_MAX_ATTEMPTS => {
+                #[cfg(test)]
+                if let Some(control) = control {
+                    control.record_retry();
+                }
                 tokio::time::sleep(completion_retry_delay(attempt)).await;
             }
-            Err(CompleteWorkAttemptError::Database(error)) => {
+            Err(CompleteWorkAttemptError::Database { error, .. }) => {
                 return Err(CompleteWorkError::Persistence(error.to_string()));
             }
         }
@@ -293,18 +464,33 @@ async fn accept_complete_work_once(
     child_tool_call_id: &str,
     request: &CompleteWorkRequest,
     request_digest: &str,
+    attempt_context: CompleteWorkAttemptContext<'_>,
 ) -> Result<AcceptedToolIntent, CompleteWorkAttemptError> {
+    let control = attempt_context.control;
     let txn = db
         .conn
         .begin()
         .await
-        .map_err(CompleteWorkAttemptError::Database)?;
+        .map_err(|error| CompleteWorkAttemptError::Database {
+            error,
+            retry_safe: true,
+        })?;
 
     let result = async {
+        #[cfg(test)]
+        if control.is_some_and(CompleteWorkTestControl::fail_body) {
+            return Err(CompleteWorkAttemptError::Database {
+                error: sea_orm::DbErr::Custom("database is locked".into()),
+                retry_safe: true,
+            });
+        }
         let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
             .one(&txn)
             .await
-            .map_err(CompleteWorkAttemptError::Database)?
+            .map_err(|error| CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            })?
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
@@ -318,14 +504,20 @@ async fn accept_complete_work_once(
         let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
             .one(&txn)
             .await
-            .map_err(CompleteWorkAttemptError::Database)?
+            .map_err(|error| CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            })?
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
         let workflow = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
             .one(&txn)
             .await
-            .map_err(CompleteWorkAttemptError::Database)?
+            .map_err(|error| CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            })?
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
@@ -340,7 +532,10 @@ async fn accept_complete_work_once(
         ))
         .one(&txn)
         .await
-        .map_err(CompleteWorkAttemptError::Database)?
+        .map_err(|error| CompleteWorkAttemptError::Database {
+            error,
+            retry_safe: true,
+        })?
         .ok_or(CompleteWorkAttemptError::Contract(
             CompleteWorkError::Unauthorized,
         ))?;
@@ -361,7 +556,10 @@ async fn accept_complete_work_once(
             )
             .one(&txn)
             .await
-            .map_err(CompleteWorkAttemptError::Database)?
+            .map_err(|error| CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            })?
         {
             if existing.request_digest != request_digest {
                 return Err(CompleteWorkAttemptError::Contract(
@@ -376,8 +574,15 @@ async fn accept_complete_work_once(
             .order_by_desc(delegation_completion_tool_intent::Column::AcceptedOrdinal)
             .one(&txn)
             .await
-            .map_err(CompleteWorkAttemptError::Database)?
+            .map_err(|error| CompleteWorkAttemptError::Database {
+                error,
+                retry_safe: true,
+            })?
             .map_or(1, |row| row.accepted_ordinal + 1);
+        #[cfg(test)]
+        if let Some(control) = control {
+            control.wait_after_snapshot(attempt_context._attempt).await;
+        }
         let model = delegation_completion_tool_intent::ActiveModel {
             intent_id: Set(format!("platform:{task_id}:{accepted_ordinal}")),
             task_id: Set(task_id.to_string()),
@@ -391,22 +596,57 @@ async fn accept_complete_work_once(
         }
         .insert(&txn)
         .await
-        .map_err(CompleteWorkAttemptError::Database)?;
+        .map_err(|error| CompleteWorkAttemptError::Database {
+            error,
+            retry_safe: true,
+        })?;
         accepted_tool_intent(model).map_err(CompleteWorkAttemptError::Contract)
     }
     .await;
 
     match result {
         Ok(intent) => {
+            #[cfg(test)]
+            if control.is_some_and(CompleteWorkTestControl::fail_commit) {
+                return rollback_complete_work_attempt(
+                    txn,
+                    CompleteWorkAttemptError::Database {
+                        error: sea_orm::DbErr::Custom("forced commit failure".into()),
+                        retry_safe: false,
+                    },
+                    control,
+                )
+                .await;
+            }
             txn.commit()
                 .await
-                .map_err(CompleteWorkAttemptError::Database)?;
+                .map_err(|error| CompleteWorkAttemptError::Database {
+                    error,
+                    retry_safe: false,
+                })?;
             Ok(intent)
         }
-        Err(error) => {
-            let _ = txn.rollback().await;
+        Err(error) => rollback_complete_work_attempt(txn, error, control).await,
+    }
+}
+
+async fn rollback_complete_work_attempt(
+    txn: sea_orm::DatabaseTransaction,
+    error: CompleteWorkAttemptError,
+    _control: Option<&CompleteWorkTestControl>,
+) -> Result<AcceptedToolIntent, CompleteWorkAttemptError> {
+    match txn.rollback().await {
+        Ok(()) => {
+            #[cfg(test)]
+            if let Some(control) = _control {
+                control.record_rollback();
+            }
             Err(error)
         }
+        Err(rollback_error) => Err(CompleteWorkAttemptError::Database {
+            error: rollback_error,
+            retry_safe: false,
+        }),
     }
 }
 
@@ -1980,6 +2220,15 @@ pub fn emit_workflow_side_effect(emitter: &EventEmitter, effect: &WorkflowTxnSid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_work_retries_only_expected_unique_constraint_codes() {
+        assert!(completion_constraint_race_codes(19, 1555));
+        assert!(completion_constraint_race_codes(19, 2067));
+        assert!(!completion_constraint_race_codes(19, 787));
+        assert!(!completion_constraint_race_codes(19, 1299));
+        assert!(!completion_constraint_race_codes(19, 275));
+    }
     use crate::acp::delegation::run_store::{Gen1AdmitOutcome, ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::TerminalTaskWrite;
     use crate::acp::delegation::workflow::events::{

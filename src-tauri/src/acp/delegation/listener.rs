@@ -7968,8 +7968,9 @@ mod tests {
         use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
         use crate::acp::delegation::transport::BrokerCompleteWorkRequest;
         use crate::acp::delegation::workflow::{
-            load_workflow_child_mcp_binding, AcceptedToolIntent, CompleteWorkError,
-            CompleteWorkRequest, CompletionOutcome,
+            accept_complete_work_txn_with_test_control, load_workflow_child_mcp_binding,
+            AcceptedToolIntent, CompleteWorkError, CompleteWorkRequest, CompleteWorkTestControl,
+            CompletionOutcome,
         };
         use crate::db::entities::delegation_completion_tool_intent;
         use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
@@ -8342,16 +8343,30 @@ mod tests {
                     .unwrap(),
             ))
             .await;
-            let responses = futures_util::future::join_all(
-                (0..8).map(|_| fixture.complete(fixture.v2_child_token(), "same-call", approve())),
-            )
+            let control = Arc::new(CompleteWorkTestControl::snapshot_race(5));
+            let request = approve();
+            let responses = futures_util::future::join_all((0..5).map(|_| {
+                accept_complete_work_txn_with_test_control(
+                    fixture.db.as_ref(),
+                    TASK_ID,
+                    CHILD_CONNECTION_ID,
+                    "same-call",
+                    &request,
+                    Arc::clone(&control),
+                )
+            }))
             .await;
 
-            let accepted: Vec<AcceptedToolIntent> = responses.into_iter().map(accepted).collect();
+            let accepted: Vec<AcceptedToolIntent> =
+                responses.into_iter().map(Result::unwrap).collect();
             assert!(accepted
                 .iter()
                 .all(|intent| intent.intent_id == accepted[0].intent_id));
             assert!(accepted.iter().all(|intent| intent.accepted_ordinal == 1));
+            assert!(
+                control.retries() > 0,
+                "the synchronized stale-snapshot race must exercise retry"
+            );
         }
 
         #[tokio::test]
@@ -8363,21 +8378,86 @@ mod tests {
                     .unwrap(),
             ))
             .await;
-            let call_ids: Vec<String> = (0..8).map(|index| format!("call-{index}")).collect();
-            let responses = futures_util::future::join_all(
-                call_ids
-                    .iter()
-                    .map(|call_id| fixture.complete(fixture.v2_child_token(), call_id, approve())),
-            )
+            let call_ids: Vec<String> = (0..5).map(|index| format!("call-{index}")).collect();
+            let control = Arc::new(CompleteWorkTestControl::snapshot_race(5));
+            let request = approve();
+            let responses = futures_util::future::join_all(call_ids.iter().map(|call_id| {
+                accept_complete_work_txn_with_test_control(
+                    fixture.db.as_ref(),
+                    TASK_ID,
+                    CHILD_CONNECTION_ID,
+                    call_id,
+                    &request,
+                    Arc::clone(&control),
+                )
+            }))
             .await;
 
             let mut ordinals: Vec<i64> = responses
                 .into_iter()
-                .map(accepted)
+                .map(Result::unwrap)
                 .map(|intent| intent.accepted_ordinal)
                 .collect();
             ordinals.sort_unstable();
-            assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+            assert_eq!(ordinals, (1..=5).collect::<Vec<_>>());
+            assert!(
+                control.retries() > 0,
+                "the synchronized ordinal race must exercise retry"
+            );
+        }
+
+        #[tokio::test]
+        async fn complete_work_rolls_back_each_retry_and_exhausts_at_the_bound() {
+            let fixture = completion_tool_fixture().await;
+            let control = Arc::new(CompleteWorkTestControl::transient_body_failures(usize::MAX));
+
+            let error = accept_complete_work_txn_with_test_control(
+                fixture.db.as_ref(),
+                TASK_ID,
+                CHILD_CONNECTION_ID,
+                "retry-exhaustion",
+                &approve(),
+                Arc::clone(&control),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(error, CompleteWorkError::Persistence(_)));
+            assert_eq!(control.attempts(), 10);
+            assert_eq!(control.rollbacks(), 10);
+            assert_eq!(control.retries(), 9);
+            assert!(delegation_completion_tool_intent::Entity::find()
+                .one(&fixture.db.conn)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn complete_work_commit_failure_rolls_back_without_retry() {
+            let fixture = completion_tool_fixture().await;
+            let control = Arc::new(CompleteWorkTestControl::commit_failures(1));
+
+            let error = accept_complete_work_txn_with_test_control(
+                fixture.db.as_ref(),
+                TASK_ID,
+                CHILD_CONNECTION_ID,
+                "commit-failure",
+                &approve(),
+                Arc::clone(&control),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(error, CompleteWorkError::Persistence(_)));
+            assert_eq!(control.attempts(), 1);
+            assert_eq!(control.rollbacks(), 1);
+            assert_eq!(control.retries(), 0);
+            assert!(delegation_completion_tool_intent::Entity::find()
+                .one(&fixture.db.conn)
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]

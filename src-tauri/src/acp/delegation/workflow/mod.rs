@@ -21,6 +21,8 @@ pub use admission::{
     on_terminal_settle_txn, AdmissionDispatchKind, CompleteWorkError, WorkflowAdmitInput,
     WorkflowTxnSideEffect,
 };
+#[cfg(test)]
+pub(crate) use admission::{accept_complete_work_txn_with_test_control, CompleteWorkTestControl};
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
     CompletionDiagnosticCode, CompletionIntent, CompletionIntentReason, CompletionIntentSource,

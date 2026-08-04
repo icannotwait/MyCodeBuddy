@@ -2113,6 +2113,24 @@ impl RunStore {
     ///
     /// Returns `true` when a matching claim row was removed.
     pub async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
+        self.abandon_pre_spawn_claim(task_id, true).await
+    }
+
+    /// Abandon only an unbound, never-running `Reserving` claim. Unlike
+    /// [`Self::abandon_reserving_claim`], this never reclaims a terminal row,
+    /// so a concurrent first-terminal winner remains authoritative.
+    pub async fn abandon_unbound_reserving_claim(
+        &self,
+        task_id: &str,
+    ) -> Result<bool, TaskStoreError> {
+        self.abandon_pre_spawn_claim(task_id, false).await
+    }
+
+    async fn abandon_pre_spawn_claim(
+        &self,
+        task_id: &str,
+        include_canceled: bool,
+    ) -> Result<bool, TaskStoreError> {
         // Prefer a single transaction so run delete + run_binding cleanup +
         // graph_revision bump stay atomic (A10/B5 provisional abandon clock).
         let task_id_owned = task_id.to_string();
@@ -2135,7 +2153,8 @@ impl RunStore {
                         && row.reached_running_at.is_none()
                         && row.child_connection_id.is_none();
 
-                    let pure_canceled = row.status == DelegationRunStatus::Canceled
+                    let pure_canceled = include_canceled
+                        && row.status == DelegationRunStatus::Canceled
                         && row.reached_running_at.is_none()
                         && row.child_connection_id.is_none();
 
@@ -2160,17 +2179,21 @@ impl RunStore {
                         }
                     }
 
-                    let deleted = DelegationTaskRun::delete_many()
+                    let mut delete = DelegationTaskRun::delete_many()
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
                         .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
-                        .filter(delegation_task_run::Column::ChildConnectionId.is_null())
-                        .filter(delegation_task_run::Column::Status.is_in([
+                        .filter(delegation_task_run::Column::ChildConnectionId.is_null());
+                    delete = if include_canceled {
+                        delete.filter(delegation_task_run::Column::Status.is_in([
                             DelegationRunStatus::Reserving,
                             DelegationRunStatus::Canceled,
                         ]))
-                        .exec(txn)
-                        .await
-                        .map_err(map_db_err)?;
+                    } else {
+                        delete.filter(
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving),
+                        )
+                    };
+                    let deleted = delete.exec(txn).await.map_err(map_db_err)?;
                     if deleted.rows_affected == 0 {
                         return Ok((false, WorkflowTxnSideEffect::None));
                     }
