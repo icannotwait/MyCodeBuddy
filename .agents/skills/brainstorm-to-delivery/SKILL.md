@@ -13,6 +13,16 @@ at explicit hard gates.
 file and revision. Risk-routed Task cohorts implement and review. The parent
 must not implement Task code and must not write or rewrite the Plan.
 
+**Human acceptance is post-coding, not mid-pipeline:** Every step that needs a
+human to look, click, approve UX, or UAT belongs **after all implementation
+logic is written and automated gates pass**. Human acceptance is a
+**post-delivery checklist item**; it must not gate Task order, block commit/
+report, or sit between coding Tasks. Encode it in the final report as
+follow-up for the user—not as an in-Plan Task gate that stalls delivery.
+(Hard gates that change requirements, scope, architecture, user data handling,
+or true `user_decision_required` still pause; those are not “acceptance of
+finished work.”)
+
 **REQUIRED SUB-SKILL:** Invoke and fully follow `subagent-driven-development`
 for workspace gates, Task briefs, reports, review packages, fix loops, ledgers,
 and final whole-branch review. **REQUIRED SUB-SKILL for Plans:** the Codex Plan
@@ -159,6 +169,11 @@ requirements, scope, architecture, or user data handling.
    `b2d_task_risk_v1`, and Task Routing Matrix format. **Author owns the Plan
    file and all revisions. Parent must not write or rewrite the Plan**; parent
    may only reject invalid output and adjudicate evidence.
+   **Plan shape rule:** Task sequence is implement → automated verify →
+   (next Task) … → Final review → commit/report. Do **not** insert
+   human-only acceptance, manual QA walkthrough, or “wait for user sign-off”
+   Tasks between logic Tasks. List human UAT/acceptance only in the Plan’s
+   post-delivery / residual work section (or final report follow-ups).
 3. Publish estimated: Plan digest, Task Routing Matrix, task policies/routes,
    complete Plan `reviewer_cohort_node_ids`, and full initial
    `required_reviewer_node_ids`. Author records `task_id`, digest, and report
@@ -270,6 +285,12 @@ fixes. Stage only owned changes; local commits only—no merge/push/PR. Final
 report: results, diffs, commands, reviews, retained Minors/risks, commits,
 worktree, blockers.
 
+**Delivery is code-complete when automated gates and Final review pass**—not
+when a human has manually accepted the feature. Put remaining human acceptance
+(UAT scripts, visual checks, product sign-off) in the final report as
+**post-delivery items**. Do not leave the workflow open waiting for that
+acceptance, and do not treat missing human UAT as a delivery blocker.
+
 ## Quick reference under pressure
 
 | Pressure | Required action |
@@ -294,6 +315,8 @@ worktree, blockers.
 | Workflow recovery | `get_workflow_state` -> `request_recovery_authorization` -> receipt-required `recover_workflow`; a missing enabled tool hard-blocks. |
 | Continue budget exhausted | Same-key `budget_exhausted_continue` replacement if its budget remains; otherwise block. |
 | Any phase could continue | Only pause for a hard block, `user_decision_required`, or an unresolved choice that changes requirements, scope, architecture, or user data handling. |
+| Plan wants “user accepts UI” between Tasks | Reject that shape: finish all logic + automated gates first; human acceptance is post-delivery only. |
+| “Stop for manual QA before coding the rest” | Forbidden as a delivery gate. Complete implementation; list manual QA in the final report. |
 | Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
 | Context compacted / recovery resumed | One index read for gates, counts, reviewer sets, and current/next routes; read referenced reports and bounded secondary detail before settle |
 
@@ -318,6 +341,8 @@ worktree, blockers.
 | “The old four-tool catalog is close enough.” | Workflow recovery requires `recover_workflow`; its absence from an enabled catalog hard-blocks. |
 | “The user approved in prose, so the workflow can reset.” | Prose never settles. `user_decision_required` needs the exact reason-hash-bound `reset_plan_lineage` receipt. |
 | “Final said request_changes in prose / report; start fixer.” | Need a platform-validated card. Harvest it or continue the same child to re-emit before Final fixer. |
+| “User must accept this screen before Task 4.” | Human acceptance is post-coding. Deliver all logic first; acceptance is a report follow-up, not a Task gate. |
+| “Delivery isn’t done until someone clicks through UAT.” | Delivery = implementation + automated verify + Final. Human UAT is post-delivery residual work. |
 
 ## Red flags — stop
 
@@ -331,6 +356,8 @@ worktree, blockers.
 - Cancellation or stall treated as proof of `unresumable`
 - Recovery changes key/profile, resets consumption, or skips the typed challenge
 - Prose approval, missing recovery receipt, or an incomplete enabled tool catalog
+- Human-only acceptance / manual UAT inserted as a Task gate mid-implementation
+- Workflow left open waiting for product sign-off after code + automated gates pass
 
 ## End-to-end example
 
