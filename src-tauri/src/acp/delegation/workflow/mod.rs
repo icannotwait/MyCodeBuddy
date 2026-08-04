@@ -1,6 +1,7 @@
 //! Brainstorm-to-delivery workflow graph: keys, validation, store, gates, projection.
 
 pub mod admission;
+pub mod artifact_resolver;
 pub mod completion_intent;
 pub mod dto;
 pub mod error;
@@ -23,6 +24,11 @@ pub use admission::{
 };
 #[cfg(test)]
 pub(crate) use admission::{accept_complete_work_txn_with_test_control, CompleteWorkTestControl};
+pub use artifact_resolver::{
+    resolve_document, resolve_final_delivery, resolve_git_head_clean, resolve_producer_completion,
+    resolve_reviewer_completion, ArtifactError, ArtifactFailure, ArtifactKind,
+    DocumentSha256Artifact, GitHeadV1Artifact, ResolvedArtifact,
+};
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
     CompletionDiagnosticCode, CompletionIntent, CompletionIntentReason, CompletionIntentSource,
@@ -72,11 +78,12 @@ pub use state_dto::{
 };
 pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn, get_workflow_state_core,
-    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, recover_workflow_core,
-    settle_workflow_gate_core, PublishResult, PublishWorkflowRequest, RecoverWorkflowRequest,
-    RecoverWorkflowResult, SettleGateEvidence, SettleResult, SettleWorkflowRequest,
-    StateOnlyRevisionRequest, StateOnlyRevisionResult, WorkflowBlockEntryRequest,
-    WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
+    guard_final_delivery_core, load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
+    recover_workflow_core, settle_workflow_gate_core, FinalDeliveryGuardRequest,
+    FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
+    RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence, SettleResult,
+    SettleWorkflowRequest, StateOnlyRevisionRequest, StateOnlyRevisionResult,
+    WorkflowBlockEntryRequest, WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
     WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;

@@ -36,11 +36,13 @@ use crate::acp::delegation::store::{
     SqliteTransientClass, TaskStoreError, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{DelegationRecoveryProjection, TaskStatus};
-use crate::acp::delegation::workflow::admission::ensure_workflow_child_conversation_independent;
+use crate::acp::delegation::workflow::admission::{
+    ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
+};
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
-    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
-    WorkflowChildMcpBinding, WorkflowTxnSideEffect,
+    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, CompletionOutcome,
+    ResolvedArtifact, WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -1934,6 +1936,32 @@ impl RunStore {
             .workflow_emitter
             .write()
             .unwrap_or_else(|e| e.into_inner()) = emitter;
+    }
+
+    /// Resolve the Task 7 code-artifact contract and stamp the run binding in
+    /// one transaction. Task 10 supplies the platform-normalized outcome and
+    /// writes the complete v2 evidence in that same transaction boundary.
+    pub async fn resolve_and_stamp_workflow_terminal_artifact(
+        &self,
+        task_id: &str,
+        outcome: CompletionOutcome,
+    ) -> Result<Option<ResolvedArtifact>, TaskStoreError> {
+        let task_id = task_id.to_string();
+        let result = self
+            .db
+            .conn
+            .transaction::<_, Option<ResolvedArtifact>, TaskStoreError>(move |txn| {
+                let task_id = task_id.clone();
+                Box::pin(async move {
+                    resolve_and_stamp_terminal_artifact_txn(txn, &task_id, outcome).await
+                })
+            })
+            .await;
+        match result {
+            Ok(artifact) => Ok(artifact),
+            Err(sea_orm::TransactionError::Connection(error)) => Err(map_db_err(error)),
+            Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
+        }
     }
 
     fn workflow_emitter(&self) -> EventEmitter {

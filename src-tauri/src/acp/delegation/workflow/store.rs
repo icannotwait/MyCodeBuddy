@@ -4,11 +4,12 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::db::entities::conversation;
 use crate::db::entities::delegation_task_run::{self, DelegationRunStatus};
@@ -17,8 +18,10 @@ use crate::db::entities::delegation_workflow_gate_settlement::{
     self, GateSettlementOutcome, PlanReviewNextAction as DbPlanReviewNextAction,
     PlanReviewScope as DbPlanReviewScope, PlanRevisionKind as DbPlanRevisionKind,
 };
+use crate::db::entities::delegation_workflow_gate_state;
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
+use crate::db::entities::delegation_workflow_outbox_event;
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::entities::recovery_authorization;
 use crate::db::AppDatabase;
@@ -32,6 +35,7 @@ use crate::acp::recovery_authorization::{
 use super::super::card_summary::{
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
+use super::artifact_resolver::{resolve_final_delivery, ArtifactError, ResolvedArtifact};
 use super::error::WorkflowStoreError;
 use super::events::{
     emit_workflow_graph_changed, emit_workflow_recovery_event, WorkflowRecoveryEvent,
@@ -281,6 +285,52 @@ pub struct SettleWorkflowRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct FinalDeliveryGuardRequest {
+    pub workflow_id: String,
+    pub gate_id: String,
+    pub workspace_path: PathBuf,
+    pub final_reviewer_task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalReviewReopened {
+    pub workflow_id: String,
+    pub gate_id: String,
+    pub gate_lineage: String,
+    pub review_round: i64,
+    pub required_reviewer_node_ids: Vec<String>,
+    pub graph_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalDeliveryGuardResult {
+    Ready(ResolvedArtifact),
+    Rejected(ArtifactError),
+    Reopened {
+        diagnostic: ArtifactError,
+        state: FinalReviewReopened,
+    },
+}
+
+impl FinalDeliveryGuardResult {
+    pub fn diagnostic_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Rejected(diagnostic) | Self::Reopened { diagnostic, .. } => {
+                Some(diagnostic.code())
+            }
+        }
+    }
+
+    pub fn reopened(&self) -> Option<&FinalReviewReopened> {
+        match self {
+            Self::Reopened { state, .. } => Some(state),
+            Self::Ready(_) | Self::Rejected(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RecoverWorkflowRequest {
     pub workflow_id: String,
     pub recovery_authorization_id: String,
@@ -410,6 +460,249 @@ pub async fn publish_workflow_manifest_core(
     }
 
     Ok(result)
+}
+
+/// Freeze delivery to the exact platform-bound passing Final artifact. A
+/// commit-id mismatch rotates the Final lineage and full reviewer cohort in
+/// the same transaction; callers emit delivery success only for `Ready`.
+pub async fn guard_final_delivery_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    request: FinalDeliveryGuardRequest,
+) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+    let parent_conversation_id =
+        delegation_workflow::Entity::find_by_id(request.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| WorkflowStoreError::NotFound(request.workflow_id.clone()))?
+            .parent_conversation_id;
+    let result = db
+        .conn
+        .transaction::<_, FinalDeliveryGuardResult, WorkflowStoreError>(|txn| {
+            Box::pin(guard_final_delivery_txn(txn, request))
+        })
+        .await
+        .map_err(|error| match error {
+            sea_orm::TransactionError::Connection(error) => db_err(error),
+            sea_orm::TransactionError::Transaction(error) => error,
+        })?;
+    if let Some(reopened) = result.reopened() {
+        emit_workflow_graph_changed(
+            emitter,
+            parent_conversation_id,
+            &reopened.workflow_id,
+            reopened.graph_revision,
+        );
+    }
+    Ok(result)
+}
+
+async fn guard_final_delivery_txn(
+    txn: &DatabaseTransaction,
+    request: FinalDeliveryGuardRequest,
+) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+    let header = delegation_workflow::Entity::find_by_id(request.workflow_id.clone())
+        .one(txn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(request.workflow_id.clone()))?;
+    if header.completion_protocol_version != 2 {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final delivery artifact guard requires completion protocol v2".into(),
+        ));
+    }
+    let binding =
+        delegation_workflow_run_binding::Entity::find_by_id(request.final_reviewer_task_id.clone())
+            .one(txn)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| WorkflowStoreError::NotFound(request.final_reviewer_task_id.clone()))?;
+    if binding.workflow_id != request.workflow_id {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final delivery evidence belongs to another workflow".into(),
+        ));
+    }
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        binding.workflow_id.clone(),
+        binding.node_id.clone(),
+    ))
+    .one(txn)
+    .await
+    .map_err(db_err)?
+    .ok_or_else(|| WorkflowStoreError::GateNotReady("Final reviewer node is missing".into()))?;
+    if node.phase_id != super::types::PHASE_FINAL || node.role != "reviewer" {
+        return Err(WorkflowStoreError::GateNotReady(
+            "delivery evidence is not a Final reviewer artifact".into(),
+        ));
+    }
+    let run = delegation_task_run::Entity::find_by_id(binding.task_id.clone())
+        .one(txn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(binding.task_id.clone()))?;
+    if run.status != DelegationRunStatus::Completed {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final reviewer evidence is not terminally completed".into(),
+        ));
+    }
+    let expected_final_head = binding
+        .artifact_digest
+        .as_deref()
+        .map(str::trim)
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| {
+            WorkflowStoreError::GateNotReady("Final reviewer artifact is missing".into())
+        })?;
+    let resolved = resolve_final_delivery(&request.workspace_path, expected_final_head).await;
+    let diagnostic = match resolved {
+        Ok(artifact) => return Ok(FinalDeliveryGuardResult::Ready(artifact)),
+        Err(diagnostic @ ArtifactError::FinalArtifactDrift { .. }) => diagnostic,
+        Err(diagnostic) => return Ok(FinalDeliveryGuardResult::Rejected(diagnostic)),
+    };
+
+    let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
+        request.workflow_id.clone(),
+        request.gate_id.clone(),
+    ))
+    .one(txn)
+    .await
+    .map_err(db_err)?
+    .ok_or_else(|| {
+        WorkflowStoreError::GateNotReady("current Final gate state is missing".into())
+    })?;
+    if binding
+        .gate_lineage
+        .as_deref()
+        .is_some_and(|lineage| lineage != gate_state.gate_lineage)
+    {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final reviewer evidence is from a stale lineage".into(),
+        ));
+    }
+
+    let reviewer_nodes = delegation_workflow_node_binding::Entity::find()
+        .filter(
+            delegation_workflow_node_binding::Column::WorkflowId.eq(request.workflow_id.clone()),
+        )
+        .filter(delegation_workflow_node_binding::Column::PhaseId.eq(super::types::PHASE_FINAL))
+        .filter(delegation_workflow_node_binding::Column::Role.eq("reviewer"))
+        .filter(
+            delegation_workflow_node_binding::Column::IntroducedRevision
+                .lte(header.active_manifest_revision),
+        )
+        .filter(
+            Condition::any()
+                .add(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+                .add(
+                    delegation_workflow_node_binding::Column::RetiredRevision
+                        .gt(header.active_manifest_revision),
+                ),
+        )
+        .order_by_asc(delegation_workflow_node_binding::Column::NodeId)
+        .all(txn)
+        .await
+        .map_err(db_err)?;
+    let required_reviewer_node_ids = reviewer_nodes
+        .into_iter()
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    if required_reviewer_node_ids.is_empty() {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final delivery drift cannot reopen an empty reviewer cohort".into(),
+        ));
+    }
+
+    let review_round = gate_state
+        .current_review_round
+        .checked_add(1)
+        .ok_or_else(|| WorkflowStoreError::Persistence("Final review round overflow".into()))?;
+    let graph_revision = header.graph_revision.checked_add(1).ok_or_else(|| {
+        WorkflowStoreError::Persistence("workflow graph revision overflow".into())
+    })?;
+    let gate_lineage = mint_final_drift_lineage(
+        &request.workflow_id,
+        &request.gate_id,
+        &gate_state.gate_lineage,
+        review_round,
+        &diagnostic,
+    );
+    let selected_node_ids_json = serde_json::to_string(&required_reviewer_node_ids)
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    let now = Utc::now();
+    let diagnostic_payload = serde_json::json!({
+        "diagnostic": diagnostic.code(),
+        "workflow_id": request.workflow_id.clone(),
+        "gate_id": request.gate_id.clone(),
+        "prior_gate_lineage": gate_state.gate_lineage.clone(),
+        "gate_lineage": gate_lineage.clone(),
+        "review_round": review_round,
+        "required_reviewer_node_ids": required_reviewer_node_ids.clone(),
+        "final_reviewer_task_id": request.final_reviewer_task_id.clone(),
+        "graph_revision": graph_revision,
+    });
+    let diagnostic_payload_json = serde_json::to_string(&diagnostic_payload)
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    let event_key = format!(
+        "codeg.final-artifact-drift.v1\0{}\0{}\0{}",
+        request.workflow_id, request.gate_id, graph_revision
+    );
+    let event_id = format!("sha256:{}", sha256_hex(event_key.as_bytes()));
+
+    let mut state_active: delegation_workflow_gate_state::ActiveModel = gate_state.into();
+    state_active.gate_lineage = Set(gate_lineage.clone());
+    state_active.current_review_round = Set(review_round);
+    state_active.selected_node_ids_json = Set(selected_node_ids_json);
+    state_active.update(txn).await.map_err(db_err)?;
+    let mut header_active: delegation_workflow::ActiveModel = header.into();
+    header_active.graph_revision = Set(graph_revision);
+    header_active.updated_at = Set(now);
+    header_active.update(txn).await.map_err(db_err)?;
+    delegation_workflow_outbox_event::ActiveModel {
+        event_id: Set(event_id),
+        workflow_id: Set(request.workflow_id.clone()),
+        graph_revision: Set(graph_revision),
+        event_kind: Set("final_artifact_drift".into()),
+        subject_key: Set(request.gate_id.clone()),
+        payload_json: Set(diagnostic_payload_json),
+        dispatch_attempts: Set(0),
+        created_at: Set(now),
+        delivered_at: Set(None),
+    }
+    .insert(txn)
+    .await
+    .map_err(db_err)?;
+
+    Ok(FinalDeliveryGuardResult::Reopened {
+        diagnostic,
+        state: FinalReviewReopened {
+            workflow_id: request.workflow_id,
+            gate_id: request.gate_id,
+            gate_lineage,
+            review_round,
+            required_reviewer_node_ids,
+            graph_revision: graph_revision as u64,
+        },
+    })
+}
+
+fn mint_final_drift_lineage(
+    workflow_id: &str,
+    gate_id: &str,
+    prior_lineage: &str,
+    review_round: i64,
+    diagnostic: &ArtifactError,
+) -> String {
+    let (expected, actual) = match diagnostic {
+        ArtifactError::FinalArtifactDrift { expected, actual } => {
+            (expected.as_str(), actual.as_str())
+        }
+        _ => ("", ""),
+    };
+    let material = format!(
+        "codeg.final-drift-lineage.v1\0{workflow_id}\0{gate_id}\0{prior_lineage}\0{review_round}\0{expected}\0{actual}"
+    );
+    format!("sha256:{}", sha256_hex(material.as_bytes()))
 }
 
 /// Recover a blocked workflow in place. The authorization is validated and
@@ -5141,6 +5434,7 @@ mod tests {
                     implementer_node_id: "task-1-impl".into(),
                     reviewer_node_ids: vec!["task-1-rev".into()],
                 },
+                allow_noop_verification: false,
             }],
         }
     }
@@ -5389,6 +5683,202 @@ mod tests {
             .expect("persisted header");
         assert_eq!(header.capability_version, "workflow_manifest_v2");
         assert_eq!(WORKFLOW_CAPABILITY_VERSION, "workflow_manifest_v2");
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_final_delivery_drift_reopens_full_final_review() {
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+        use crate::db::entities::delegation_workflow_gate_state;
+        use crate::db::entities::delegation_workflow_outbox_event;
+        use std::path::Path;
+        use std::process::Command;
+
+        fn git(repo: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run final delivery git fixture command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output is UTF-8")
+                .trim()
+                .to_string()
+        }
+
+        let repo = tempfile::tempdir().expect("temp final delivery repo");
+        git(repo.path(), &["init", "--quiet"]);
+        std::fs::write(repo.path().join("owned.txt"), b"reviewed\n")
+            .expect("write reviewed commit");
+        git(repo.path(), &["add", "owned.txt"]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Codeg Test",
+                "-c",
+                "user.email=codeg@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "reviewed",
+            ],
+        );
+        let reviewed_head = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let (db, parent) = seed_parent().await;
+        let (emitter, mut rx) = emitter_with_rx();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("tok-task7-final-delivery"),
+            },
+        )
+        .await
+        .expect("publish final delivery fixture");
+        while rx.try_recv().is_ok() {}
+        let header = delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header_am: delegation_workflow::ActiveModel = header.into();
+        header_am.completion_protocol_version = Set(2);
+        header_am.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+        header_am.update(&db.conn).await.unwrap();
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set("sha256:passing-final-lineage".into()),
+            current_review_round: Set(3),
+            selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed passing Final gate state");
+        let final_task_id = "task7-passing-final-review";
+        insert_terminal_reviewer_run(
+            &db,
+            parent,
+            &published.workflow_id,
+            "final-reviewer",
+            "final",
+            3,
+            final_task_id,
+            true,
+            1,
+            &reviewed_head,
+            DelegationRunStatus::Completed,
+            published.manifest_revision as i64,
+        )
+        .await;
+        let final_binding = delegation_workflow_run_binding::Entity::find_by_id(final_task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut final_binding_am: delegation_workflow_run_binding::ActiveModel =
+            final_binding.into();
+        final_binding_am.gate_lineage = Set(Some("sha256:passing-final-lineage".into()));
+        final_binding_am.review_round = Set(Some(3));
+        final_binding_am.update(&db.conn).await.unwrap();
+
+        let ready = guard_final_delivery_core(
+            &db,
+            &emitter,
+            FinalDeliveryGuardRequest {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "final".into(),
+                workspace_path: repo.path().to_path_buf(),
+                final_reviewer_task_id: final_task_id.into(),
+            },
+        )
+        .await
+        .expect("clean reviewed commit is deliverable");
+        assert!(matches!(ready, FinalDeliveryGuardResult::Ready(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "ready delivery does not reopen Final"
+        );
+
+        std::fs::write(repo.path().join("owned.txt"), b"post-final drift\n")
+            .expect("write post-Final drift");
+        git(repo.path(), &["add", "owned.txt"]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Codeg Test",
+                "-c",
+                "user.email=codeg@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "post-final drift",
+            ],
+        );
+
+        let guarded = guard_final_delivery_core(
+            &db,
+            &emitter,
+            FinalDeliveryGuardRequest {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "final".into(),
+                workspace_path: repo.path().to_path_buf(),
+                final_reviewer_task_id: final_task_id.into(),
+            },
+        )
+        .await
+        .expect("delivery guard commits reopen state");
+        assert_eq!(guarded.diagnostic_code(), Some("final_artifact_drift"));
+        let reopened = guarded.reopened().expect("Final review reopened");
+        assert_eq!(reopened.required_reviewer_node_ids, vec!["final-reviewer"]);
+        assert_eq!(reopened.review_round, 4);
+        assert_ne!(
+            reopened.gate_lineage, "sha256:passing-final-lineage",
+            "drift must mint a new Final lineage"
+        );
+
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "final".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.gate_lineage, reopened.gate_lineage);
+        assert_eq!(state.current_review_round, 4);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json).unwrap(),
+            vec!["final-reviewer"]
+        );
+        let outbox = delegation_workflow_outbox_event::Entity::find()
+            .filter(
+                delegation_workflow_outbox_event::Column::WorkflowId
+                    .eq(published.workflow_id.clone()),
+            )
+            .filter(delegation_workflow_outbox_event::Column::EventKind.eq("final_artifact_drift"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("durable Final drift diagnostic");
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert_eq!(payload["diagnostic"], "final_artifact_drift");
+        assert_eq!(payload["gate_lineage"], reopened.gate_lineage);
+        assert_eq!(outbox.graph_revision as u64, reopened.graph_revision);
+        let event = rx.try_recv().expect("reopen graph event after commit");
+        assert_eq!(event.channel, CHANGED);
+        assert_eq!(
+            event.payload["graph_revision"].as_u64(),
+            Some(reopened.graph_revision)
+        );
     }
 
     #[tokio::test]
@@ -5907,6 +6397,7 @@ mod tests {
                 implementer_node_id: "task-1-impl".into(),
                 reviewer_node_ids: vec!["task-1-review-codex".into(), "task-1-review-grok".into()],
             },
+            allow_noop_verification: false,
         };
 
         let task_2_impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
@@ -5966,6 +6457,7 @@ mod tests {
                 implementer_node_id: "task-2-impl".into(),
                 reviewer_node_ids: vec!["task-2-review-codex".into(), "task-2-review-grok".into()],
             },
+            allow_noop_verification: false,
         });
         doc
     }

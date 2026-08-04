@@ -259,6 +259,7 @@ mod tests {
                     implementer_node_id: "task-1-impl".into(),
                     reviewer_node_ids: vec!["task-1-rev".into()],
                 },
+                allow_noop_verification: false,
             }],
         }
     }

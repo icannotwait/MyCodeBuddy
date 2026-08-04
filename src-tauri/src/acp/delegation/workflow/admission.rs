@@ -14,6 +14,7 @@ use sea_orm::{
     QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
+use std::path::Path as FsPath;
 
 use crate::acp::delegation::card_summary::{
     card_summary_to_json, extract_card_summary_with_report_fallback,
@@ -33,6 +34,10 @@ use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
+use super::artifact_resolver::{
+    resolve_git_head_clean, resolve_producer_completion, resolve_reviewer_completion,
+    ArtifactError, ArtifactFailure, ResolvedArtifact,
+};
 use super::error::WorkflowAdmissionRecoveryError;
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::gates::{
@@ -661,6 +666,43 @@ fn admission_err(code: &str, msg: impl Into<String>) -> TaskStoreError {
     }
 }
 
+fn artifact_admission_err(error: ArtifactError) -> TaskStoreError {
+    admission_err(error.code(), error.to_string())
+}
+
+async fn resolve_v2_admission_head(workspace_path: Option<&str>) -> Result<String, TaskStoreError> {
+    let workspace_path = workspace_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            artifact_admission_err(ArtifactError::Unavailable(
+                ArtifactFailure::WorkspaceUnavailable,
+            ))
+        })?;
+    resolve_git_head_clean(FsPath::new(workspace_path))
+        .await
+        .map(|artifact| artifact.head)
+        .map_err(artifact_admission_err)
+}
+
+async fn revalidate_v2_reviewer_head(
+    workspace_path: Option<&str>,
+    expected_head: &str,
+) -> Result<(), TaskStoreError> {
+    let workspace_path = workspace_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            artifact_admission_err(ArtifactError::Unavailable(
+                ArtifactFailure::WorkspaceUnavailable,
+            ))
+        })?;
+    resolve_reviewer_completion(FsPath::new(workspace_path), expected_head)
+        .await
+        .map(|_| ())
+        .map_err(artifact_admission_err)
+}
+
 fn map_db(e: sea_orm::DbErr) -> TaskStoreError {
     TaskStoreError::Permanent(format!("workflow admission db: {e}"))
 }
@@ -774,8 +816,14 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     let lineage_ordinal =
         next_lineage_ordinal(conn, &header.workflow_id, input.lineage_root_task_id).await?;
 
-    let (gate_id, gate_cycle, artifact_digest, reviewed_task_id, reviewed_impl_gen) =
-        stamp_admission_fields(conn, &header, &binding, &parsed, input.workspace_path).await?;
+    let (
+        gate_id,
+        gate_cycle,
+        artifact_digest,
+        reviewed_task_id,
+        reviewed_impl_gen,
+        producer_baseline_head,
+    ) = stamp_admission_fields(conn, &header, &binding, &parsed, input.workspace_path).await?;
 
     let content_fingerprint = document_gate_content_fingerprint(&header, &parsed);
     let rb = delegation_workflow_run_binding::ActiveModel {
@@ -786,6 +834,7 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         gate_cycle: Set(gate_cycle),
         manifest_revision: Set(header.active_manifest_revision),
         content_fingerprint: Set(content_fingerprint),
+        producer_baseline_head: Set(producer_baseline_head),
         artifact_digest: Set(artifact_digest),
         reviewed_task_id: Set(reviewed_task_id),
         reviewed_implementer_generation: Set(reviewed_impl_gen),
@@ -915,6 +964,148 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
         workflow_id: rb.workflow_id,
         graph_revision: next_rev,
     })
+}
+
+/// Resolve and stamp the code artifact selected by an already-normalized v2
+/// completion outcome. Task 10 calls this inside its evidence transaction;
+/// semantic intent selection deliberately remains outside this Task 7 seam.
+pub async fn resolve_and_stamp_terminal_artifact_txn<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+    outcome: CompletionOutcome,
+) -> Result<Option<ResolvedArtifact>, TaskStoreError> {
+    let Some(binding) = load_run_binding(conn, task_id).await? else {
+        return Ok(None);
+    };
+    let header = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            TaskStoreError::Permanent(format!(
+                "workflow {} referenced by task {task_id} is missing",
+                binding.workflow_id
+            ))
+        })?;
+    if header.completion_protocol_version != 2 {
+        return Ok(None);
+    }
+    let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| TaskStoreError::NotFound(task_id.to_string()))?;
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        binding.workflow_id.clone(),
+        binding.node_id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(map_db)?
+    .ok_or_else(|| {
+        TaskStoreError::Permanent(format!(
+            "workflow node {} referenced by task {task_id} is missing",
+            binding.node_id
+        ))
+    })?;
+    if (node.role == "implementer" && node.phase_id == PHASE_TASKS)
+        || (node.role == "fixer" && node.phase_id == PHASE_FINAL)
+    {
+        if !matches!(
+            outcome,
+            CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns
+        ) {
+            let mut active: delegation_workflow_run_binding::ActiveModel = binding.into();
+            active.artifact_digest = Set(None);
+            active.updated_at = Set(Utc::now());
+            active.update(conn).await.map_err(map_db)?;
+            return Ok(None);
+        }
+        let workspace = required_artifact_workspace(&run)?;
+        let baseline = binding
+            .producer_baseline_head
+            .as_deref()
+            .map(str::trim)
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| {
+                artifact_admission_err(ArtifactError::Unavailable(
+                    ArtifactFailure::ExpectedArtifactInvalid,
+                ))
+            })?;
+        let allow_noop_verification = if node.role == "implementer" {
+            durable_task_allows_noop(conn, &header, node.task_index).await?
+        } else {
+            false
+        };
+        let artifact = resolve_producer_completion(
+            FsPath::new(workspace),
+            outcome,
+            baseline,
+            allow_noop_verification,
+        )
+        .await
+        .map_err(artifact_admission_err)?;
+        let mut active: delegation_workflow_run_binding::ActiveModel = binding.into();
+        active.artifact_digest = Set(artifact
+            .as_ref()
+            .map(|resolved| resolved.digest().to_string()));
+        active.updated_at = Set(Utc::now());
+        active.update(conn).await.map_err(map_db)?;
+        return Ok(artifact);
+    }
+
+    if node.role == "reviewer" && (node.phase_id == PHASE_TASKS || node.phase_id == PHASE_FINAL) {
+        let workspace = required_artifact_workspace(&run)?;
+        let expected = binding
+            .artifact_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| {
+                artifact_admission_err(ArtifactError::Unavailable(
+                    ArtifactFailure::ExpectedArtifactInvalid,
+                ))
+            })?;
+        return resolve_reviewer_completion(FsPath::new(workspace), expected)
+            .await
+            .map(Some)
+            .map_err(artifact_admission_err);
+    }
+
+    Ok(None)
+}
+
+fn required_artifact_workspace(run: &delegation_task_run::Model) -> Result<&str, TaskStoreError> {
+    run.workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            artifact_admission_err(ArtifactError::Unavailable(
+                ArtifactFailure::WorkspaceUnavailable,
+            ))
+        })
+}
+
+async fn durable_task_allows_noop<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    task_index: Option<i64>,
+) -> Result<bool, TaskStoreError> {
+    let Some(task_index) = task_index.and_then(|index| u32::try_from(index).ok()) else {
+        return Ok(false);
+    };
+    let Some(document) = load_active_manifest_doc(conn, header).await? else {
+        return Ok(false);
+    };
+    let Ok(normalized) = validate_manifest_document(&document) else {
+        return Ok(false);
+    };
+    Ok(normalized
+        .task_policies
+        .iter()
+        .find(|policy| policy.task_index == task_index)
+        .is_some_and(|policy| policy.allow_noop_verification))
 }
 
 /// Read `git rev-parse HEAD` from a workspace path. Returns `None` on any failure
@@ -1714,15 +1905,16 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<String>,
     ),
     TaskStoreError,
 > {
     match parsed {
-        ParsedWorkUnitKey::PlanAuthor { .. } => Ok((None, None, None, None, None)),
+        ParsedWorkUnitKey::PlanAuthor { .. } => Ok((None, None, None, None, None, None)),
         ParsedWorkUnitKey::Design { .. } => {
             let (gate_id, cycle, digest) =
                 document_gate_stamp(conn, header, binding, parsed).await?;
-            Ok((gate_id, cycle, digest, None, None))
+            Ok((gate_id, cycle, digest, None, None, None))
         }
         ParsedWorkUnitKey::PlanReviewer { .. } => {
             let (gate_id, cycle, digest) =
@@ -1771,12 +1963,18 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                 Some(plan_digest.to_string()),
                 Some(author_run.task_id),
                 None,
+                None,
             ))
         }
         ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
             let impl_pair =
                 load_latest_implementer_binding(conn, header, *task_index as i64).await?;
             let Some((run, rb)) = impl_pair else {
+                if header.completion_protocol_version == 2 {
+                    return Err(artifact_admission_err(ArtifactError::Unavailable(
+                        ArtifactFailure::ExpectedArtifactInvalid,
+                    )));
+                }
                 return Err(admission_err(
                     "producer_artifact_missing",
                     format!("Task {task_index} has no implementer run to review"),
@@ -1787,16 +1985,24 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                 .as_deref()
                 .map(str::trim)
                 .filter(|digest| !digest.is_empty());
-            let implementation_summary = run
-                .card_summary_json
-                .as_deref()
-                .and_then(parse_and_validate_summary_json)
-                .is_some_and(|summary| matches!(summary, CardSummary::Implementation { .. }));
+            let legacy_summary_valid = header.completion_protocol_version == 2
+                || (rb.summary_validated
+                    && run
+                        .card_summary_json
+                        .as_deref()
+                        .and_then(parse_and_validate_summary_json)
+                        .is_some_and(|summary| {
+                            matches!(summary, CardSummary::Implementation { .. })
+                        }));
             if run.status != DelegationRunStatus::Completed
-                || !rb.summary_validated
                 || digest.is_none()
-                || !implementation_summary
+                || !legacy_summary_valid
             {
+                if header.completion_protocol_version == 2 {
+                    return Err(artifact_admission_err(ArtifactError::Unavailable(
+                        ArtifactFailure::ExpectedArtifactInvalid,
+                    )));
+                }
                 return Err(admission_err(
                     "producer_artifact_missing",
                     format!(
@@ -1804,34 +2010,75 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                     ),
                 ));
             }
+            if header.completion_protocol_version == 2 {
+                revalidate_v2_reviewer_head(
+                    workspace_path,
+                    digest.expect("validated non-empty producer digest"),
+                )
+                .await?;
+            }
             Ok((
                 None,
                 None,
                 digest.map(str::to_string),
                 Some(run.task_id),
                 Some(run.generation),
+                None,
             ))
         }
         ParsedWorkUnitKey::FinalReviewer { .. } => {
             // Prefer covering latest fixer if present; else first-pass:
             // stamp branch tip digest (same digest Final gate needs) or workspace HEAD.
             if let Some((run, rb)) = load_latest_fixer_binding(conn, header).await? {
+                if header.completion_protocol_version == 2 {
+                    if run.status != DelegationRunStatus::Completed {
+                        return Err(artifact_admission_err(ArtifactError::Unavailable(
+                            ArtifactFailure::ExpectedArtifactInvalid,
+                        )));
+                    }
+                    let digest = rb
+                        .artifact_digest
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|digest| !digest.is_empty())
+                        .ok_or_else(|| {
+                            artifact_admission_err(ArtifactError::Unavailable(
+                                ArtifactFailure::ExpectedArtifactInvalid,
+                            ))
+                        })?;
+                    revalidate_v2_reviewer_head(workspace_path, digest).await?;
+                }
                 Ok((
                     None,
                     None,
                     rb.artifact_digest,
                     Some(run.task_id),
                     Some(run.generation),
+                    None,
                 ))
             } else {
-                let tip = derive_admission_branch_tip_digest(conn, header)
-                    .await?
-                    .or_else(|| workspace_head_commit(workspace_path));
-                Ok((None, None, tip, None, None))
+                let durable_tip = derive_admission_branch_tip_digest(conn, header).await?;
+                let tip = if header.completion_protocol_version == 2 {
+                    let tip = durable_tip.ok_or_else(|| {
+                        artifact_admission_err(ArtifactError::Unavailable(
+                            ArtifactFailure::ExpectedArtifactInvalid,
+                        ))
+                    })?;
+                    revalidate_v2_reviewer_head(workspace_path, &tip).await?;
+                    Some(tip)
+                } else {
+                    durable_tip.or_else(|| workspace_head_commit(workspace_path))
+                };
+                Ok((None, None, tip, None, None, None))
             }
         }
         ParsedWorkUnitKey::TaskImplementer { .. } | ParsedWorkUnitKey::FinalFixer { .. } => {
-            Ok((None, None, None, None, None))
+            let baseline = if header.completion_protocol_version == 2 {
+                Some(resolve_v2_admission_head(workspace_path).await?)
+            } else {
+                None
+            };
+            Ok((None, None, None, None, None, baseline))
         }
     }
 }
@@ -2248,11 +2495,14 @@ mod tests {
     use crate::acp::delegation::workflow::WorkflowStoreError;
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
+    use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
     use sea_orm::{QueryOrder, Set, TransactionTrait};
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::Arc;
 
     fn emitter_with_rx() -> (
@@ -2472,6 +2722,7 @@ mod tests {
                     implementer_node_id: "task-1-impl".into(),
                     reviewer_node_ids: vec!["task-1-rev".into()],
                 },
+                allow_noop_verification: false,
             }],
         }
     }
@@ -2565,6 +2816,7 @@ mod tests {
                 implementer_node_id: "task-1-impl".into(),
                 reviewer_node_ids: vec!["task-1-rev".into(), "task-1-rev-grok".into()],
             },
+            allow_noop_verification: false,
         };
         doc
     }
@@ -2614,6 +2866,7 @@ mod tests {
                 implementer_node_id: "task-2-impl".into(),
                 reviewer_node_ids: vec!["task-2-rev".into()],
             },
+            allow_noop_verification: false,
         });
         doc
     }
@@ -2907,6 +3160,516 @@ mod tests {
             static C: AtomicU64 = AtomicU64::new(1);
             format!("{:x}", C.fetch_add(1, Ordering::SeqCst))
         }
+    }
+
+    struct AdmissionGitFixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl AdmissionGitFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp admission repo");
+            git_fixture_command(dir.path(), &["init", "--quiet"]);
+            std::fs::write(dir.path().join("owned.txt"), b"baseline\n")
+                .expect("write admission baseline");
+            git_fixture_command(dir.path(), &["add", "owned.txt"]);
+            git_fixture_command(
+                dir.path(),
+                &[
+                    "-c",
+                    "user.name=Codeg Test",
+                    "-c",
+                    "user.email=codeg@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "baseline",
+                ],
+            );
+            Self { dir }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn head(&self) -> String {
+            git_fixture_command(self.path(), &["rev-parse", "HEAD"])
+        }
+
+        fn commit_change(&self) {
+            std::fs::write(self.path().join("owned.txt"), b"changed\n")
+                .expect("write admission change");
+            git_fixture_command(self.path(), &["add", "owned.txt"]);
+            git_fixture_command(
+                self.path(),
+                &[
+                    "-c",
+                    "user.name=Codeg Test",
+                    "-c",
+                    "user.email=codeg@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "change",
+                ],
+            );
+        }
+
+        fn reset_hard(&self, head: &str) {
+            git_fixture_command(self.path(), &["reset", "--hard", "--quiet", head]);
+        }
+    }
+
+    fn git_fixture_command(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run admission git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git fixture output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    async fn enable_completion_v2(db: &AppDatabase, workflow_id: &str) {
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .expect("load workflow")
+            .expect("workflow exists");
+        let mut active: delegation_workflow::ActiveModel = header.into();
+        active.completion_protocol_version = Set(2);
+        active.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+        active.update(&db.conn).await.expect("enable completion v2");
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_producer_admission_is_clean_and_persists_baseline() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task7-producer-baseline").await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+
+        std::fs::write(repo.path().join("untracked.txt"), b"dirty\n")
+            .expect("dirty producer workspace");
+        let dirty_task = "70000000-0000-4000-8000-000000000001";
+        let mut dirty = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            dirty_task,
+            "grok",
+            Some(&key),
+            None,
+        );
+        dirty.workspace_path = Some(repo.path().display().to_string());
+        let error = store
+            .admit_gen1_reserving(dirty)
+            .await
+            .expect_err("dirty v2 producer admission must fail");
+        assert_eq!(
+            error.workflow_admission_code(),
+            Some("completion_artifact_unavailable")
+        );
+        assert!(
+            delegation_task_run::Entity::find_by_id(dirty_task)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed admission must roll back the reserving row"
+        );
+
+        std::fs::remove_file(repo.path().join("untracked.txt")).expect("restore clean repo");
+        let clean_task = "70000000-0000-4000-8000-000000000002";
+        let mut clean = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            clean_task,
+            "grok",
+            Some(&key),
+            None,
+        );
+        clean.workspace_path = Some(repo.path().display().to_string());
+        store
+            .admit_gen1_reserving(clean)
+            .await
+            .expect("clean producer admission");
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(clean_task)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_head = repo.head();
+        assert_eq!(
+            binding.producer_baseline_head.as_deref(),
+            Some(expected_head.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_task_reviewer_rejects_commit_drift_before_binding() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task7-reviewer-drift").await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let producer_head = repo.head();
+        let implementer_task = "70000000-0000-4000-8000-000000000003";
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some(&producer_head),
+            None,
+            None,
+        )
+        .await;
+        repo.commit_change();
+
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let reviewer_task = "70000000-0000-4000-8000-000000000004";
+        let mut reviewer = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            reviewer_task,
+            "codex",
+            Some(&reviewer_key),
+            None,
+        );
+        reviewer.workspace_path = Some(repo.path().display().to_string());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let error = store
+            .admit_gen1_reserving(reviewer)
+            .await
+            .expect_err("reviewer must reject a different clean commit");
+        assert_eq!(
+            error.workflow_admission_code(),
+            Some("completion_scope_changed")
+        );
+        assert!(
+            delegation_workflow_run_binding::Entity::find_by_id(reviewer_task)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_final_reviewer_binds_only_delivered_head() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task7-final-drift").await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let producer_head = repo.head();
+        let implementer_task = "70000000-0000-4000-8000-000000000005";
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some(&producer_head),
+            None,
+            None,
+        )
+        .await;
+        let task_reviewer = "70000000-0000-4000-8000-000000000006";
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            &workflow_id,
+            "task-1-rev",
+            task_reviewer,
+            &reviewer_key,
+            "codex",
+            2,
+            review_summary(),
+            Some(&producer_head),
+            Some(implementer_task),
+            Some(1),
+        )
+        .await;
+        repo.commit_change();
+
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let mut final_reviewer = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            "70000000-0000-4000-8000-000000000007",
+            "codex",
+            Some(&final_key),
+            None,
+        );
+        final_reviewer.workspace_path = Some(repo.path().display().to_string());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let error = store
+            .admit_gen1_reserving(final_reviewer)
+            .await
+            .expect_err("Final reviewer must reject a post-tidy commit mismatch");
+        assert_eq!(
+            error.workflow_admission_code(),
+            Some("completion_scope_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_terminal_producer_uses_durable_noop_policy() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = sample_doc(
+            "tok-task7-terminal-producer",
+            ManifestWorkflowState::Estimated,
+        );
+        document.task_policies[0].allow_noop_verification = true;
+        let workflow_id = publish_document_approved(&db, &emitter, parent, document).await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let task_id = "70000000-0000-4000-8000-000000000010";
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let mut producer = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            task_id,
+            "grok",
+            Some(&key),
+            None,
+        );
+        producer.workspace_path = Some(repo.path().display().to_string());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        store
+            .admit_gen1_reserving(producer)
+            .await
+            .expect("admit no-op producer");
+
+        let artifact = store
+            .resolve_and_stamp_workflow_terminal_artifact(task_id, CompletionOutcome::Done)
+            .await
+            .expect("durable Task policy authorizes no-op")
+            .expect("passing producer has artifact");
+        assert_eq!(artifact.digest(), repo.head());
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.artifact_digest.as_deref(),
+            Some(repo.head().as_str())
+        );
+
+        std::fs::write(repo.path().join("untracked.txt"), b"non-pass dirt\n")
+            .expect("dirty non-pass workspace");
+        let producer_run = delegation_task_run::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut producer_run_am: delegation_task_run::ActiveModel = producer_run.into();
+        producer_run_am.workspace_path = Set(None);
+        producer_run_am.update(&db.conn).await.unwrap();
+        assert_eq!(
+            store
+                .resolve_and_stamp_workflow_terminal_artifact(task_id, CompletionOutcome::Blocked,)
+                .await
+                .expect("non-pass bypasses artifact resolution"),
+            None
+        );
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.artifact_digest, None);
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_contract_terminal_reviewer_revalidates_clean_bound_head() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "tok-task7-terminal-reviewer").await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let producer_head = repo.head();
+        let implementer_task = "70000000-0000-4000-8000-000000000011";
+        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        seed_completed_bound_run(
+            &db,
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            &workflow_id,
+            "task-1-impl",
+            implementer_task,
+            &implementer_key,
+            "grok",
+            1,
+            implementation_summary(),
+            Some(&producer_head),
+            None,
+            None,
+        )
+        .await;
+        let producer_run = delegation_task_run::Entity::find_by_id(implementer_task)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut producer_run_am: delegation_task_run::ActiveModel = producer_run.into();
+        producer_run_am.card_summary_json = Set(None);
+        producer_run_am.update(&db.conn).await.unwrap();
+        let producer_binding =
+            delegation_workflow_run_binding::Entity::find_by_id(implementer_task)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut producer_binding_am: delegation_workflow_run_binding::ActiveModel =
+            producer_binding.into();
+        producer_binding_am.summary_validated = Set(false);
+        producer_binding_am.update(&db.conn).await.unwrap();
+
+        let reviewer_task = "70000000-0000-4000-8000-000000000012";
+        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let mut reviewer = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Codex).await,
+            reviewer_task,
+            "codex",
+            Some(&reviewer_key),
+            None,
+        );
+        reviewer.workspace_path = Some(repo.path().display().to_string());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        store
+            .admit_gen1_reserving(reviewer)
+            .await
+            .expect("reviewer admits on producer commit");
+
+        repo.commit_change();
+        let drift = store
+            .resolve_and_stamp_workflow_terminal_artifact(reviewer_task, CompletionOutcome::Approve)
+            .await
+            .expect_err("terminal commit drift must fail");
+        assert_eq!(
+            drift.workflow_admission_code(),
+            Some("completion_scope_changed")
+        );
+
+        repo.reset_hard(&producer_head);
+        std::fs::write(repo.path().join("untracked.txt"), b"dirty\n")
+            .expect("dirty reviewer workspace");
+        let dirty = store
+            .resolve_and_stamp_workflow_terminal_artifact(
+                reviewer_task,
+                CompletionOutcome::RequestChanges,
+            )
+            .await
+            .expect_err("terminal dirt must fail");
+        assert_eq!(
+            dirty.workflow_admission_code(),
+            Some("completion_artifact_unavailable")
+        );
+
+        std::fs::remove_file(repo.path().join("untracked.txt")).expect("restore clean repo");
+        let artifact = store
+            .resolve_and_stamp_workflow_terminal_artifact(
+                reviewer_task,
+                CompletionOutcome::ApproveWithMinors,
+            )
+            .await
+            .expect("clean terminal reviewer revalidation")
+            .expect("code reviewer returns bound artifact");
+        assert_eq!(artifact.digest(), producer_head);
     }
 
     #[tokio::test]

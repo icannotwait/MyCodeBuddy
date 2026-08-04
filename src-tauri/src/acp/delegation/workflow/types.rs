@@ -348,6 +348,8 @@ pub struct ManifestTaskPolicy {
     pub task_index: u32,
     pub risk: ManifestTaskRisk,
     pub route: ManifestTaskRoute,
+    #[serde(default)]
+    pub allow_noop_verification: bool,
 }
 
 /// Optional durable node outcome (B14.3 cancel).

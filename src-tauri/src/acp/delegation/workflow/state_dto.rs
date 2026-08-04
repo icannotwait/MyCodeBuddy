@@ -1009,6 +1009,7 @@ mod tests {
                 implementer_node_id: implementer.to_string(),
                 reviewer_node_ids: vec![reviewer.to_string()],
             },
+            allow_noop_verification: false,
         }
     }
 

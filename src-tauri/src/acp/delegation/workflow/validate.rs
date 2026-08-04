@@ -552,6 +552,7 @@ fn normalize_task_policies(
             task_index: policy.task_index,
             risk,
             route: policy.route.clone(),
+            allow_noop_verification: policy.allow_noop_verification,
         });
     }
 
@@ -1500,6 +1501,7 @@ mod tests {
                     implementer_node_id: "task-1-impl".into(),
                     reviewer_node_ids: vec!["task-1-rev".into()],
                 },
+                allow_noop_verification: false,
             }],
         }
     }
@@ -1511,6 +1513,30 @@ mod tests {
         assert_eq!(normalized.task_count, 1);
         assert_eq!(normalized.nodes.len(), 7);
         assert_eq!(normalized.gates.len(), 2);
+    }
+
+    #[test]
+    fn task_policy_allow_noop_verification_defaults_false_and_normalizes_true() {
+        let defaulted: ManifestDocument =
+            serde_json::from_value(normal_estimated_wire()).expect("defaulted manifest");
+        assert!(!defaulted.task_policies[0].allow_noop_verification);
+        assert!(
+            !validate_manifest_document(&defaulted)
+                .expect("defaulted manifest valid")
+                .task_policies[0]
+                .allow_noop_verification
+        );
+
+        let mut explicit = normal_estimated_wire();
+        explicit["task_policies"][0]["allow_noop_verification"] = serde_json::json!(true);
+        let explicit: ManifestDocument =
+            serde_json::from_value(explicit).expect("explicit no-op manifest");
+        assert!(
+            validate_manifest_document(&explicit)
+                .expect("explicit manifest valid")
+                .task_policies[0]
+                .allow_noop_verification
+        );
     }
 
     #[test]
