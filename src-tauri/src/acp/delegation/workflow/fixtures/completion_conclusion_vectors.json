@@ -1,0 +1,75 @@
+{
+  "schema": "CompletionConclusionVectorsV1",
+  "terminal": [
+    {"role":"reviewer","input":"Conclusion: approve","expected":"approve"},
+    {"role":"reviewer","input":"- **结论：有轻微问题通过。**","expected":"approve_with_minors"},
+    {"role":"author","input":"## Final conclusion - done with concerns!","expected":"done_with_concerns"},
+    {"role":"implementer","input":"1) 结论：已完成","expected":"done"},
+    {"role":"fixer","input":"Verdict: blocked！","expected":"blocked"},
+    {"role":"reviewer","input":"Status: approved","expected":null},
+    {"role":"reviewer","input":"状态：通过","expected":null},
+    {"role":"reviewer","input":"  - Conclusion: approve","expected":null},
+    {"role":"reviewer","input":"# - Conclusion: approve","expected":null},
+    {"role":"reviewer","input":"- # Conclusion: approve","expected":null},
+    {"role":"reviewer","input":"## **# Conclusion: approve**","expected":null},
+    {"role":"reviewer","input":"Conclusion: approve?","expected":null},
+    {"role":"reviewer","input":"Conclusion: approve!!","expected":null},
+    {"role":"reviewer","input":"`Conclusion: approve`","expected":null},
+    {"role":"author","input":"Conclusion: approve","expected":"role_mismatch"}
+  ],
+  "report": [
+    {"role":"reviewer","input":"# Conclusion\n\napprove with minor issues\n","expected":"approve_with_minors"},
+    {"role":"author","input":"## 结论\n\n完成但有顾虑\n","expected":"done_with_concerns"},
+    {"role":"reviewer","input":"# Verdict\n\n通过\n","expected":"approve"},
+    {"role":"reviewer","input":"Conclusion: request changes\n","expected":"request_changes"},
+    {"role":"reviewer","input":"> Conclusion: approve\n","expected":null},
+    {"role":"reviewer","input":"```text\nConclusion: approve\n```\n","expected":null},
+    {"role":"reviewer","input":"<!-- Conclusion: approve -->\n","expected":null},
+    {"role":"reviewer","input":"| Conclusion | approve |\n| --- | --- |\n","expected":null},
+    {"role":"reviewer","input":"- # Conclusion\n\napprove\n","expected":null},
+    {"role":"reviewer","input":"### Conclusion\n\napprove\n","expected":null},
+    {"role":"reviewer","input":"# Conclusion\n\n**approve**\n","expected":null}
+  ],
+  "grammar_matrix": {
+    "labels": ["Conclusion", "Final conclusion", "Verdict", "结论", "最终结论", "审核结论"],
+    "separators": [":", "：", "-"],
+    "terminal_punctuation": ["", ".", "!", "。", "！"],
+    "heading_prefixes": ["", "# ", "## ", "### ", "#### ", "##### ", "###### "],
+    "list_prefixes": ["", "- ", "* ", "+ ", "1. ", "12. ", "123. ", "1) ", "12) ", "123) "],
+    "bold_pairs": [["", ""], ["**", "**"], ["__", "__"]],
+    "reviewer_aliases": {
+      "approve": ["approve", "approved", "pass", "通过", "认可"],
+      "approve_with_minors": ["approve with minors", "approve with minor issues", "pass with minor issues", "有小问题通过", "有轻微问题通过"],
+      "request_changes": ["request changes", "changes requested", "needs changes", "需修改", "需要修改"],
+      "block": ["block", "blocked", "阻塞", "无法通过"]
+    },
+    "producer_aliases": {
+      "done": ["done", "complete", "completed", "完成", "已完成"],
+      "done_with_concerns": ["done with concerns", "completed with concerns", "有顾虑完成", "完成但有顾虑"],
+      "blocked": ["blocked", "无法完成", "阻塞"]
+    },
+    "report_section_headings": ["# Conclusion", "## Conclusion", "# Verdict", "## Verdict", "# 结论", "## 结论"],
+    "rejected_lines": [
+      "Status: approved",
+      "状态：通过",
+      "  - Conclusion: approve",
+      "# - Conclusion: approve",
+      "- # Conclusion: approve",
+      "## **# Conclusion: approve**",
+      "**Conclusion: approve",
+      "Conclusion: **approve**",
+      "`Conclusion: approve`",
+      "Conclusion: approve?",
+      "Conclusion: approve!!",
+      "> Conclusion: approve",
+      "| Conclusion | approve |",
+      "<!-- Conclusion: approve -->"
+    ],
+    "report_hint_adjacency": {
+      "accepted_before": "Report: reports/review.md\nConclusion: approve",
+      "accepted_after": "Conclusion: approve\nReport: reports/review.md",
+      "rejected_non_adjacent": "Report: reports/review.md\nDetails follow.\nConclusion: approve",
+      "rejected_non_markdown": "Conclusion: approve\nReport: reports/review.txt"
+    }
+  }
+}

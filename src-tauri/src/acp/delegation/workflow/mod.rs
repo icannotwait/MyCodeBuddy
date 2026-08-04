@@ -1,6 +1,7 @@
 //! Brainstorm-to-delivery workflow graph: keys, validation, store, gates, projection.
 
 pub mod admission;
+pub mod completion_intent;
 pub mod dto;
 pub mod error;
 pub mod events;
@@ -18,6 +19,12 @@ pub use admission::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
     WorkflowTxnSideEffect,
+};
+pub use completion_intent::{
+    build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
+    CompletionDiagnosticCode, CompletionIntent, CompletionIntentReason, CompletionIntentSource,
+    CompletionOutcome, CompletionReportCandidate, CompletionResolution, CompletionResolverInput,
+    CompletionRole, CompletionToolIntent,
 };
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
