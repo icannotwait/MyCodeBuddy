@@ -2,8 +2,9 @@
 
 ## Status and Relationship to Existing Designs
 
-Approved in the 2026-08-04 design discussion and consolidated here for final
-written review.
+Approved in the 2026-08-04 design discussion, then revised after a
+code-grounded review of the gate, Plan-round, freshness, and attention
+subsystems. This version incorporates the approved review decisions.
 
 This design is authoritative wherever completion Card handling or completion
 evidence freshness conflicts with these earlier designs:
@@ -18,7 +19,8 @@ superseded:
 
 - a child must emit `<!-- codeg-card-summary-v1 ... -->`;
 - a missing or malformed Card requires a same-child continuation;
-- a model-authored digest is trusted as artifact identity; and
+- a Plan Author's model-authored `plan_digest` is trusted as document
+  identity; and
 - current `manifest_revision` equality is required for otherwise unchanged
   completion evidence.
 
@@ -47,6 +49,10 @@ The selected semantic intent is combined with platform-generated evidence and
 persisted as `completion_evidence_json`. Workflow admission and gate settlement
 read that evidence. A Card is generated from the evidence for display only.
 
+Document gates are reduced from the platform-bound Reviewer outcomes. Finding
+counts and structured finding ledgers may be shown as untrusted report content,
+but they are never gate inputs in protocol v2.
+
 Malformed Card-like text never triggers `continue_delegation`. A completed run
 whose meaning cannot be resolved becomes `needs_decision`, opens durable
 attention, and waits for the user without creating another child run.
@@ -65,7 +71,10 @@ That coupling created the failure seen in `codeg://session/2889`. The Parent
 repeatedly instructed a Plan Author to emit an implementation-shaped Card with
 `kind: implementation`, `verdict`, and `artifact_digest`. The platform actually
 required an Author-shaped Card with `kind: author`, `status`, `plan_digest`, and
-`report_file`.
+`report_file`. The instructed combination does not exist in any v1 Card kind:
+`verdict` belongs to the `review` wire kind, while `artifact_digest` is a run
+binding column and is not a Card field at all. This was an invalid Parent
+instruction, not an alternative platform schema.
 
 The failure then amplified through this deterministic path:
 
@@ -102,6 +111,8 @@ unrelated completed reviews and cause more work to rerun.
   attention without spawning another child run.
 - Make Cards deterministic UI projections that never participate in admission
   or settlement.
+- Derive Design and Plan gate decisions from platform-bound Reviewer outcomes,
+  without trusting finding counts or ledgers from a child or Parent.
 - Preserve valid sibling review evidence across unrelated manifest changes and
   reviewer-only amendments.
 - Invalidate evidence when its artifact, producer, node identity, gate cycle,
@@ -117,8 +128,9 @@ unrelated completed reviews and cause more work to rerun.
 - Using another model to judge a child's completion prose.
 - Trusting commit SHAs, counts, digests, task IDs, roles, or gate data emitted
   by a child or Parent.
+- Preserving structured Plan findings as a protocol-v2 state-machine input.
 - Reusing any v1 Card or settlement as v2 evidence.
-- Automatically approving a parent-adjudicated gate without its normal
+- Automatically approving a user-adjudicated gate without its normal
   settlement operation.
 - Replacing continuation for genuine transport, cancellation, stall, or
   infrastructure recovery.
@@ -142,9 +154,10 @@ separate resolution with either trusted evidence or `needs_decision`.
 ### Syntax Tolerant, Semantics Fail Closed
 
 Whitespace, case, Markdown wrappers, and common punctuation may vary. The
-platform never infers a verdict from keywords embedded in ordinary prose. Two
-different explicit outcomes at the same precedence level are a conflict, not a
-guessing opportunity.
+platform never infers a verdict from keywords embedded in ordinary prose.
+Within an ordered source, the last valid explicit statement supersedes earlier
+statements and all statements remain auditable. Conflicting conclusions from
+different report files have no reliable ordering and require user adjudication.
 
 ### No Format-Recovery Delegation
 
@@ -162,15 +175,22 @@ but it is not a semantic freshness key.
 
 Add `completion_protocol_version` to the durable workflow header.
 
-- Every newly created workflow is written by the server with value `2`.
+- The server owns a creation mode: `v1`, `v2_shadow`, or `v2_enforce`.
+- `v1` and `v2_shadow` create version-1 workflows; shadow mode additionally
+  runs the v2 resolver for metrics only and cannot write evidence or affect a
+  gate.
+- `v2_enforce` creates version-2 workflows. The selected protocol is frozen at
+  creation and an existing v2 workflow is never downgraded.
 - Existing rows are classified as version `1`; migration does not inspect or
-  transform their Cards.
+  transform their Cards and records their creation mode as `v1`.
 - Every run bound to a workflow inherits the workflow version at admission.
 - A v2 run never invokes the `codeg-card-summary-v1` parser.
 - `card_summary_json` remains untouched and readable only as legacy display
   data for v1 sessions.
 - `summary_validated`, model-authored `plan_digest`, and v1 Card kind checks are
   not consulted by any v2 admission or settlement path.
+- `manifest_revision` and `content_fingerprint` remain v1 audit fields; neither
+  is a v2 semantic eligibility key.
 
 The version is server-owned. It is not a manifest field that a model may choose
 or echo.
@@ -178,28 +198,22 @@ or echo.
 ## Architecture
 
 ```text
-                      optional structured channel
-child complete_work ----------------------------------+
-                                                      |
-child final assistant text -> terminal conclusion ----+--> completion_intent
-                                                      |        resolver
-linked/touched report -> top-level conclusion --------+           |
-                                                                  +-- ambiguous
-                                                                  |      |
-                                                                  |      v
-                                                                  |  durable attention
-                                                                  |  + user adjudication
-                                                                  v
-                                                       artifact_resolver
-                                                                  |
-                                                       evidence_scope
-                                                                  |
-                                                                  v
-                                                   completion_evidence_json
-                                                      /                    \
-                                                     v                      v
-                                            workflow safety          completion_projection
-                                            admission/gates          UI + parent status
+complete_work --------+
+terminal conclusion --+--> completion_intent resolver -- resolved --+
+report conclusion ----+             |                               |
+                                    +--> needs_decision --> attention
+                                                            |
+                                                   user adjudication
+                                                            |
+resolved intent <-------------------------------------------+
+       |
+       v
+artifact_resolver --> evidence_scope --> completion_evidence_json
+                                               |
+                              +----------------+----------------+
+                              v                                 v
+                    workflow safety                 completion_projection
+                    admission/gates                 UI + parent status
 ```
 
 The units are intentionally separate:
@@ -227,6 +241,10 @@ The canonical outcome enum is deliberately small.
 Role compatibility comes from the durable node binding. A model never submits
 `kind`, `role`, or `phase`.
 
+The workflow node role is named `reviewer`. The legacy Card wire discriminator
+is `kind: review`, not `kind: reviewer`; protocol v2 requires neither value from
+the model.
+
 `approve_with_minors` and `done_with_concerns` pass but retain their concern
 signal in UI and settlement audit. `request_changes`, `block`, and `blocked`
 are valid terminal meanings, not parse failures.
@@ -250,16 +268,18 @@ display inputs. The request has no task ID, workflow ID, role, kind, phase,
 digest, producer ID, gate ID, gate cycle, revision, counts, commits, or tests.
 
 The Broker resolves the caller through its live delegated-child connection and
-stores the intent against that run. Calls from a root, an unrelated child, or a
-terminal run are rejected. The role-specific outcome set is checked against
-the durable binding.
+stores the intent against that run. The tool is exposed only when the caller is
+a `DelegationChild`, is bound to a workflow run, and that workflow uses
+completion protocol v2. Calls from a root, a standalone delegated child, an
+unrelated child, or a terminal run are rejected. The role-specific outcome set
+is checked against the durable binding.
 
-Repeated calls with the same normalized semantic content are idempotent.
-Multiple accepted calls with different outcomes produce
-`completion_intent_conflict`; the terminal resolver does not use a lower
-precedence channel to guess which call was intended. Invalid tool requests are
-rejected immediately and do not become candidates, so a child may correct one
-with a later valid call.
+Repeated delivery of one tool call is idempotent by tool-call ID and canonical
+request digest. Across distinct valid calls for the same run, the last accepted
+call supersedes earlier calls, including a changed outcome. Every accepted call
+remains in the audit log. Invalid requests are rejected immediately and do not
+supersede the last valid call, so a child may correct one with a later valid
+call.
 
 Calling `complete_work` records intent but does not itself terminate the child
 or settle a gate. Evidence is materialized only when the run reaches its normal
@@ -295,9 +315,10 @@ must match the whole-line form:
 <label> <separator> <outcome> <optional terminal punctuation>
 ```
 
-Supported labels include `Conclusion`, `Final conclusion`, `Verdict`,
-`Status`, `结论`, `最终结论`, `审核结论`, and `状态`. Supported separators are
-`:`, `：`, and `-`.
+Supported labels are `Conclusion`, `Final conclusion`, `Verdict`, `结论`,
+`最终结论`, and `审核结论`. Broad labels such as `Status` and `状态` are not
+eligible because they commonly introduce per-item status lists. Supported
+separators are `:`, `：`, and `-`.
 
 The initial bounded outcome lexicon is:
 
@@ -315,9 +336,10 @@ The role disambiguates `blocked`/`阻塞` into reviewer `block` or worker
 `blocked`. Aliases live in one versioned parser table and the platform-injected
 prompt uses only aliases from that table.
 
-Repeated explicit lines with the same normalized outcome are harmless.
-Different outcomes, or an explicit outcome incompatible with the durable role,
-produce `needs_decision`. Words such as "approved" or "done" inside ordinary
+The last eligible top-level conclusion line is authoritative within the final
+assistant response; earlier eligible lines remain diagnostic audit material.
+If that final explicit outcome is incompatible with the durable role, the run
+enters `needs_decision`. Words such as "approved" or "done" inside ordinary
 prose never count.
 
 If this channel resolves one intent, report conclusions are not interpreted as
@@ -343,10 +365,12 @@ A Markdown parser, rather than raw substring search, identifies either:
 - a level-one or level-two `Conclusion`/`Verdict`/`结论` section whose first
   plain paragraph is exactly one accepted outcome alias.
 
-Content inside code, quotes, tables, nested lists, or examples is ignored. All
-eligible report candidates are evaluated. Equivalent outcomes coalesce;
-different outcomes produce `needs_decision`. Report IO failure is recorded as
-a diagnostic and cannot turn prose into a pass.
+Content inside code, quotes, tables, nested lists, or examples is ignored. The
+last eligible conclusion within one report is authoritative. All eligible
+report candidates are then evaluated. Equivalent outcomes coalesce; different
+outcomes across files produce `needs_decision` because file ordering is not
+treated as authorial supersession. Report IO failure is recorded as a
+diagnostic and cannot turn prose into a pass.
 
 The report path is a convenience and audit link. Report content never supplies
 task identity, role, artifact digest, producer identity, gate data, or revision
@@ -385,18 +409,16 @@ The resolver processes channels strictly in order.
 
 ```text
 valid complete_work candidates?
-  yes, one outcome   -> resolved
-  yes, conflict      -> needs_decision
+  yes                -> latest valid call resolves
   no                 -> inspect terminal conclusion
 
 valid terminal conclusion candidates?
-  yes, one outcome   -> resolved
-  yes, conflict      -> needs_decision
+  yes                -> last eligible line resolves or role-mismatches
   no                 -> inspect reports
 
 valid report conclusion candidates?
   yes, one outcome   -> resolved
-  yes, conflict      -> needs_decision
+  yes, cross-file conflict -> needs_decision
   no                 -> needs_decision
 ```
 
@@ -468,6 +490,9 @@ Add or extend these durable fields:
 ```text
 delegation_workflows
   completion_protocol_version        INTEGER NOT NULL
+  completion_protocol_mode           TEXT NOT NULL
+  legacy_source_workflow_id          TEXT NULL
+  UNIQUE(legacy_source_workflow_id) WHERE legacy_source_workflow_id IS NOT NULL
 
 delegation_task_runs
   completion_state                   TEXT NULL
@@ -477,36 +502,78 @@ delegation_task_runs
 delegation_workflow_run_bindings
   evidence_scope_digest              TEXT NULL
 
-delegation_completion_intents
+delegation_workflow_gate_settlements
+  evidence_scope_digest              TEXT NULL
+  required_evidence_task_ids_json    TEXT NULL
+  plan_round_state_v2_json           TEXT NULL
+  critical_count                     INTEGER NULL
+  important_count                    INTEGER NULL
+  minor_count                        INTEGER NULL
+
+delegation_completion_tool_intents
   intent_id                          TEXT PRIMARY KEY
   task_id                            TEXT NOT NULL
   child_tool_call_id                 TEXT NOT NULL
+  accepted_ordinal                   INTEGER NOT NULL
   outcome                            TEXT NOT NULL
   summary                            TEXT NULL
   report_hint                        TEXT NULL
   request_digest                     TEXT NOT NULL
   created_at                         TEXT NOT NULL
   UNIQUE(task_id, child_tool_call_id)
+  UNIQUE(task_id, accepted_ordinal)
+
+delegation_attention_requests
+  kind                               TEXT NOT NULL DEFAULT 'child_question'
+  child_tool_call_id                 TEXT NULL
+  payload_json                       TEXT NULL
+  resolution_json                    TEXT NULL
+  captured_scope_digest              TEXT NULL
+  UNIQUE(task_id, kind) WHERE status = 'open'
+  UNIQUE(task_id, child_tool_call_id)
+    WHERE child_tool_call_id IS NOT NULL
 ```
 
-Extend `delegation_attention_requests` with a typed kind and bounded JSON
-payload/resolution fields. Existing rows default to `child_question`; v1
-behavior is unchanged for that kind.
+`delegation_completion_tool_intents` intentionally stores only tool-channel
+intents, so its tool-call ID remains non-null. Text, report, and user intents
+are resolved directly into evidence or attention state. Existing attention
+rows become `child_question`; SQLite migration rebuilds the table to change
+nullability and replaces the old open-row index rather than layering a second
+incompatible constraint on top of it.
+
+Settlement finding-count columns remain v1 audit fields and are null for v2.
+They are made nullable as part of the settlement migration; null never means
+zero findings and no v2 reducer reads these columns.
+
+Persistence is split and registered in `src-tauri/src/db/migration/mod.rs` in
+this order:
+
+1. `m20260804_000001_completion_protocol_and_run_evidence`;
+2. `m20260804_000002_completion_scope_and_gate_settlement`;
+3. `m20260804_000003_completion_tool_intents_and_restart_link`; and
+4. `m20260804_000004_typed_completion_attention`.
 
 All v2 completion columns are written in one terminal-settlement transaction:
 
 1. verify the current durable run and workflow binding;
-2. apply the precomputed intent-resolution candidate;
+2. select the latest accepted tool intent or apply the precomputed lower
+   channel candidate;
 3. re-resolve platform identity and artifact inputs;
-4. compute the evidence scope;
-5. write either evidence or one open completion attention request;
-6. update run-binding projections and graph revision; and
-7. commit before emitting completion, attention, or workflow events.
+4. for Design and Plan documents, re-read the bytes and recompute their digest
+   inside the settlement transaction's critical section;
+5. compute the evidence scope;
+6. write either evidence or one open completion attention request;
+7. update run-binding projections and graph revision; and
+8. commit before emitting completion, attention, or workflow events.
 
-Report reads and Git/file hashing occur before the transaction. Their captured
-inputs are revalidated against current database identity inside the
-transaction. A retry for the same terminal run is idempotent and cannot create
-two evidence records or two open completion decisions.
+Report reads and the first bounded Git/file resolution may occur before the
+transaction. Database identity alone is not sufficient revalidation: required
+Design and Plan bytes are hashed a second time in the transaction, and Git
+`HEAD` is re-resolved immediately before the evidence write. A filesystem
+change after that read cannot be made atomic with SQLite, but the next
+admission or settlement scope recomputation detects it and invalidates the
+evidence. A retry for the same terminal run is idempotent and cannot create two
+evidence records or two open completion decisions.
 
 ## Artifact Resolution
 
@@ -537,15 +604,19 @@ read.
 
 ### Code-Producing Roles
 
-For Task Implementers and Final Fixers, the initial resolver is the current
-Git `HEAD` object ID read by Codeg from the admitted workspace. The value is
-stored with an explicit resolver kind such as `git_head_v1`; it is never copied
-from model-reported commits or Card content.
+Task Implementers and Final Fixers already use the platform-read Git `HEAD` in
+`workflow/admission.rs::on_terminal_settle_txn`; when `HEAD` is unavailable the
+existing code leaves `workspace_head_commit` empty and does not fall back to a
+Card commit. Protocol v2 reuses that behavior, stores an explicit resolver kind
+such as `git_head_v1`, and makes the unavailable case typed. This is not a new
+replacement for model-authored code identity; the model-authored digest defect
+applies primarily to the Plan Author's `plan_digest`.
 
 If the workspace is not a Git worktree or `HEAD` cannot be resolved, the
-artifact is unavailable. The run may still have a semantic intent, but it
-cannot satisfy a producer dependency. Codeg opens typed recovery attention or
-blocks the workflow with `completion_artifact_unavailable`; it does not ask the
+artifact is unavailable. A non-passing semantic outcome remains valid without
+an artifact because it cannot unlock a dependency. A passing producer outcome
+requires the artifact; Codeg opens `completion_artifact_recovery` attention and
+blocks the dependency with `completion_artifact_unavailable`. It never asks the
 child to re-emit metadata.
 
 Dirty-worktree snapshot identity and per-file task ownership are outside this
@@ -573,6 +644,14 @@ materialized.
 completion validity. It is SHA-256 over canonical JSON with sorted keys,
 explicit nulls, versioned field names, and normalized path strings.
 
+For Design and Plan phases, the canonical scope includes the complete material
+input set currently represented by the workflow header's
+`design_fingerprint` or `plan_fingerprint`, respectively. The implementation
+may reuse a domain-separated digest of those canonical inputs, but it must not
+silently reuse or reinterpret the legacy `content_fingerprint` column. Tests
+must prove that every material input which changes the current fingerprint also
+changes the v2 scope digest.
+
 The canonical input contains only:
 
 - completion protocol and scope-schema versions;
@@ -588,9 +667,9 @@ The canonical input contains only:
 
 | Role | Review-scope material |
 | --- | --- |
-| Design Reviewer | workflow kind, approved requirements identity, Design target path |
+| Design Reviewer | workflow kind, approved requirements identity, Design target path, and effective Design-review policy |
 | Plan Author | Plan target path and current Design identity |
-| Plan Reviewer | Design identity, Plan target, risk-policy version, task policies, task routes, and material Plan inputs |
+| Plan Reviewer | Design identity, Plan target, risk-policy version, effective review policy, task policies, task routes, and material Plan inputs |
 | Task Implementer | task index, task specification/dependencies, and admitted Plan identity |
 | Task Reviewer | implementer task specification, risk classification, review requirements, and admitted Plan identity |
 | Final Fixer | active Final findings identity and current branch-tip input |
@@ -602,7 +681,7 @@ The following values are deliberately excluded:
 - `graph_revision`;
 - reviewer cohort and required-reviewer sets;
 - sibling reviewer node identities or outcomes;
-- reviewer-policy revision;
+- roster-only revision counters whose effective policy content is unchanged;
 - display titles, summaries, counts, and report paths; and
 - unrelated future task or UI metadata.
 
@@ -630,6 +709,13 @@ Gate settlement stores the exact required-node set, evidence task IDs, and
 scope digests used for the decision so historical adjudication remains
 reproducible.
 
+Legacy run-binding and settlement `content_fingerprint` values retain their
+existing v1 meaning and remain available for historical display. A v2
+settlement writes and validates its independent `evidence_scope_digest`;
+`project.rs` display filtering and `admission.rs` Plan-gate reopening branch by
+protocol rather than overloading the old column. Evidence used for a new round
+must also be newer than the prior settlement it replaces.
+
 ## Workflow Safety Rules
 
 Infrastructure success and semantic pass are checked independently.
@@ -656,15 +742,99 @@ Consequences:
   concern status.
 
 For v2, `settle_workflow_gate` derives the current evidence set from the store.
-The caller may state the desired settlement outcome and summary, but it does
-not submit reviewer task IDs, digests, gate cycle, or manifest binding as
-evidence. Existing revision CAS may remain for concurrency, but a caller-echoed
-revision is never proof of freshness.
+The caller may state an expected settlement outcome and summary, but it does
+not submit Reviewer task IDs, counts, findings, covered Author task/digest,
+required Reviewer IDs, gate cycle, or manifest binding as evidence. The
+platform derives those values from the active workflow and rejects an expected
+outcome that disagrees with the reducer. Existing revision CAS may remain for
+concurrency, but a caller-echoed revision is never proof of freshness.
+
+The v2 request surface therefore contains only workflow/gate identity,
+`expected_graph_revision`, an optional expected outcome, a bounded display
+summary, and an existing recovery-authorization ID where that operation
+requires one. It has no `SettleGateEvidence`, finding counts/updates, covered
+task/digest, required-node set, or model-produced scope fields.
 
 An `approved` settlement succeeds only when every current required Reviewer
 has passing evidence for the current scope. A `changes_requested` or `blocked`
-settlement must be supported by current non-passing evidence or the existing
-explicit self-review/parent-adjudication rules.
+settlement must be the canonical result of current non-passing evidence or the
+existing explicit self-review/user-adjudication rules.
+
+All v2 consumers call the same bounded evidence validator. In particular:
+
+- `workflow/admission.rs` uses it for producer and Reviewer admission;
+- `workflow/store.rs` uses it for document settlement and Plan rounds;
+- `workflow/gates.rs` uses it instead of `summary_validated`, Card
+  `work_status`, and Card `review_verdict` for Task/Final pass;
+- `workflow/project.rs` uses it for node state, missing-evidence display,
+  settlement filtering, and gate reopening; and
+- `workflow/recovery_policy.rs` uses it for recovery eligibility.
+
+`broker.rs` materializes and projects the evidence but is not an independent
+gate authority. A protocol-v2 code path in any of these modules must not infer
+semantic state from `card_summary_json` or `summary_validated`.
+
+## Outcome-Based Document Gate Reduction
+
+### Design Gate
+
+The platform reads the latest fresh evidence for every required Design
+Reviewer. All `approve`/`approve_with_minors` outcomes derive `Approved`; any
+`request_changes` derives `ChangesRequested`; otherwise a current `block`
+derives `Blocked`. Legacy Critical/Important/Minor count fields are null for v2
+and `ApprovalWithOpenFindings` is a v1-only rule.
+
+### Plan Review Rounds
+
+Protocol v2 replaces `PlanReviewRoundSubmission.finding_updates` with a
+platform-derived `PlanReviewRoundStateV2`. For each current Reviewer it stores
+the Reviewer node ID, canonical outcome, evidence task ID, and evidence scope
+digest. The platform also derives the covered Author task/generation, Plan
+artifact digest, and required Reviewer set; the Parent cannot submit or amend
+them.
+
+Review scope, revision kind, and requirements-lineage reset come from the
+existing trusted workflow transition and recovery-authorization state. They
+are not inferred from completion prose and are not evidence fields supplied by
+the Parent settlement request.
+
+Reviewer outcomes have these ranks:
+
+| Outcome | Rank | Effect |
+| --- | ---: | --- |
+| `approve`, `approve_with_minors` | 0 | Pass; no routine re-review required |
+| `request_changes` | 1 | Blocking for this round |
+| `block` | 2 | Stronger blocking result |
+
+A round approves only when every currently required Reviewer is rank 0. The
+next localized corrective round requires exactly the current non-passing
+Reviewer IDs. Initial, materially revised, and holistic-rewrite Plans require
+the full current cohort. A roster-only amendment evaluates only newly added
+Reviewers, preserves fresh sibling evidence, and does not increment
+stagnation. Removing a Reviewer removes it from the required set without
+rewriting sibling state.
+
+For two completed corrective rounds in one requirements lineage, the current
+round is a strict improvement only when all three conditions hold:
+
+1. every current non-passing Reviewer was also non-passing previously;
+2. no surviving Reviewer's rank increased; and
+3. at least one prior blocker became passing or decreased rank.
+
+An initial/lineage-reset round establishes the baseline. Strict improvement
+resets `stagnation_count`; any completed non-improving corrective round
+increments it. Infrastructure failures and roster-only amendments do not
+advance it. Two stagnant rounds derive `HolisticRewriteRequired`. The holistic
+rewrite is allowed once per lineage and resets the counter; two further
+stagnant rounds derive `UserDecisionRequired`. The corresponding settlement is
+`Approved` for an all-pass state, `ChangesRequested` for continued review or a
+required rewrite, and `Blocked` while awaiting the required user decision.
+
+Reviewer reports may still display findings, severity labels, and counts, but
+the platform neither merges them into a trusted ledger nor reads them for
+eligibility, improvement, next action, or settlement. Existing v1
+`finding_ledger_json` and count columns remain historical audit data;
+`plan_round_state_v2_json` is the only v2 Plan reducer state.
 
 ## Completion Projection
 
@@ -731,6 +901,51 @@ The validator contains negative fixtures for Card templates, digest requests,
 and format-only continuation guidance so the old loop cannot re-enter through
 prompt drift.
 
+### Durable Attention Lifecycle
+
+Attention lookup and resolution APIs take both `task_id` and `kind`; a generic
+`resolve_task(task_id, ...)` is not allowed to select an arbitrary open row.
+`child_question`, `completion_decision`, and
+`completion_artifact_recovery` have separate payload validators and resolution
+operations. Only authenticated typed UI adjudication can resolve a
+`completion_decision`; a Parent free-form reply remains valid only for
+`child_question`.
+
+An open `completion_decision` may close only because:
+
+- the user commits a role-valid outcome through its CAS operation;
+- the captured run, node, or evidence scope is superseded;
+- the user explicitly terminates/abandons the workflow, or a competing CAS
+  completes it through another valid path; or
+- the workflow or owning conversation is explicitly deleted.
+
+The recoverable workflow state `Blocked` used for
+`UserDecisionRequired` is not such a terminal command and does not close the
+decision it is waiting for.
+
+Task terminal cleanup, host restart, Parent turn failure/cancellation, Parent
+disconnect, and join teardown or `join_abandoned` are not workflow-terminal
+events and must not close it. Broker tree teardown therefore filters by
+attention kind before applying `parent_canceled`, `parent_disconnected`, or
+`join_abandoned` cleanup.
+
+Startup `reconcile_open()` retains its current recovery behavior only for
+`child_question`. For `completion_decision`, it reloads the workflow, latest
+run, node binding, and captured scope: a current request remains open; a stale
+request is resolved as `superseded`, and the latest unresolved run may open one
+replacement through the normal idempotent path. Application restart alone
+never resolves it as `host_restarted` or `task_terminal`.
+
+`completion_artifact_recovery` follows the same restart and Parent-teardown
+durability. It resolves only when a typed retry materializes current evidence,
+its captured scope is superseded, or the workflow is explicitly terminated or
+deleted.
+
+An active workflow's completion decision has no automatic timeout. Cleanup is
+limited to the explicit terminal/deletion cases above. Operations expose the
+open count and oldest unresolved age so abandoned decisions are observable
+without silently discarding them.
+
 ## Legacy Workflow Restart
 
 No v1 evidence is converted, backfilled, or reused.
@@ -739,8 +954,16 @@ Migration marks existing workflows as `completion_protocol_version = 1` and
 leaves all transcripts, runs, Cards, reports, manifests, and settlements
 unchanged. They remain available for read-only inspection.
 
-When a user attempts to resume or send a new turn to a v1 workflow session,
-Codeg performs an idempotent restart operation:
+An in-place forward upgrade is intentionally rejected. A settled v1 Design or
+Plan gate has no v2 evidence scope, no platform-derived Reviewer outcome state,
+and may have been approved from Card/count semantics that v2 explicitly does
+not trust. Letting only new runs use v2 while retaining those settlements would
+create a workflow whose gates are proven by incompatible rules. Reconstructing
+them would be evidence conversion, which is outside the trust boundary.
+
+Under the normal `v2_enforce` mode, when a user attempts to resume or send a
+new turn to a v1 workflow session, Codeg performs an idempotent restart
+operation:
 
 1. keep the source conversation and workflow read-only;
 2. find an existing restart successor and open it, if one already exists;
@@ -767,6 +990,38 @@ If restart creation fails, the old session remains unchanged and the user gets
 a typed retryable error. Codeg never falls back to mutating or upgrading the
 legacy workflow.
 
+The normal post-rollout mode is `v2_enforce`, so a legacy resume follows this
+restart path by default. The explicit operational `v1` and `v2_shadow` modes
+are temporary rollout exceptions: workflows created or resumed while those
+modes are selected use the existing v1 authority. Once the server returns to
+`v2_enforce`, any later resume of such a workflow follows the same full-restart
+rule; no v1 evidence is imported.
+
+## Rollout and Rollback
+
+`completion_protocol_mode` is selected from server configuration, may be
+overridden by an agent/profile rollout allowlist, is recorded on the workflow
+header, and has three values:
+
+| Mode | New workflow authority | v2 side effects |
+| --- | --- | --- |
+| `v1` | Existing v1 completion path | None |
+| `v2_shadow` | Existing v1 completion path | Parser/reducer metrics only |
+| `v2_enforce` | v2 evidence and gates | Full |
+
+Changing the setting affects only workflows created afterward. Existing v2
+workflows continue with v2 even if the operator rolls future creation back to
+v1; no workflow changes protocol in place. Shadow computation uses bounded
+copies of the same terminal inputs but cannot persist v2 evidence, create v2
+attention, change a gate, or trigger continuation.
+
+Rollout expands by agent/profile only after at least 100 terminal samples for
+that profile. Expansion stops when `completion_outcome_role_mismatch` exceeds
+1% or the total `needs_decision` rate exceeds 5% in the evaluation window. The
+operator may then return future creation to `v2_shadow` or `v1` while active v2
+workflows remain intact. Semantic strictness is not configurable: no rollout
+mode may turn an ambiguous result into a pass.
+
 ## Error Contract
 
 New stable reason codes distinguish the recovery path:
@@ -774,14 +1029,15 @@ New stable reason codes distinguish the recovery path:
 | Code | Meaning | Workflow response |
 | --- | --- | --- |
 | `completion_intent_missing` | No eligible tool, terminal, or report conclusion | Open completion decision |
-| `completion_intent_conflict` | One precedence tier contains different explicit outcomes | Open completion decision |
+| `completion_intent_conflict` | Different report files contain incompatible top-level outcomes | Open completion decision |
 | `completion_outcome_role_mismatch` | Explicit outcome is illegal for the durable role | Open completion decision |
 | `completion_report_unavailable` | A report candidate could not be safely read | Inspect remaining local candidates; if none resolve, open completion decision |
-| `completion_artifact_unavailable` | Platform cannot resolve required document/code identity | Block or typed recovery attention; never format retry |
+| `completion_artifact_unavailable` | Platform cannot resolve identity required by a passing producer outcome | Open artifact-recovery attention and block the dependency; never format retry |
 | `completion_scope_changed` | Identity/artifact/scope changed before evidence commit or user resolution | Supersede decision and require current work evaluation |
+| `completion_decision_superseded` | An open decision no longer covers the latest run/node/scope | Close stale attention and re-evaluate the current run |
 | `completion_evidence_corrupt` | Persisted v2 evidence fails bounded schema validation | Fail closed and surface repair diagnostic |
 | `completion_decision_required` | Terminal run awaits direct user adjudication | Stop Parent orchestration |
-| `legacy_completion_protocol_restart_required` | A v1 workflow received a mutation/resume attempt | Create/open linked v2 successor |
+| `legacy_completion_protocol_restart_required` | A v1 workflow received a mutation/resume attempt under `v2_enforce` | Create/open linked v2 successor |
 
 Parser diagnostics must say which channel and semantic reason failed without
 logging full child output, report contents, user text, absolute paths, or
@@ -790,7 +1046,9 @@ profile configuration.
 ## Concurrency and Idempotency
 
 - `complete_work` uses `(task_id, child_tool_call_id)` as its idempotency key
-  and stores a canonical request digest.
+  and stores a canonical request digest. Distinct valid calls receive a durable
+  per-task ordinal; the highest ordinal is authoritative and earlier calls
+  remain auditable.
 - Terminal evidence materialization is unique per task. An identical retry
   returns the existing evidence or attention state.
 - A terminal writer and user-decision writer compare the latest run, node,
@@ -801,11 +1059,16 @@ profile configuration.
 - Reviewer amendment and user decision race through the same workflow
   transaction/CAS boundary. Removal or replacement can supersede attention but
   cannot transfer evidence to another node.
+- Startup reconciliation and Broker teardown apply kind-specific closure
+  rules; generic task/Parent cleanup cannot win a CAS against a current
+  completion decision.
 - Events are emitted only after commit and carry the committed graph revision.
 
 ## Security and Bounds
 
-- Tool caller identity comes from the Broker connection, never request fields.
+- Tool caller identity comes from the Broker connection, never request fields;
+  `complete_work` additionally requires a workflow-bound v2
+  `DelegationChild` run.
 - Completion text, summary, and report hints retain existing payload limits;
   summaries are bounded to 4 KiB in evidence and more tightly in Card display.
 - Report candidates remain limited to eight files and 512 KiB each.
@@ -829,12 +1092,17 @@ Backend modules:
   workflow package;
 - replace the v2 branch of `prepare_terminal_with_card_summary` in
   `broker.rs` with completion resolution/materialization;
-- update `workflow/admission.rs` and `workflow/store.rs` to consume v2 evidence
-  and scoped freshness;
+- update `workflow/admission.rs`, `workflow/store.rs`, `workflow/gates.rs`,
+  `workflow/project.rs`, and `workflow/recovery_policy.rs` to consume the same
+  v2 evidence validator and scoped freshness;
+- replace the v2 branch of `workflow/plan_review.rs` with the outcome-based
+  round reducer while retaining its v1 ledger decoder for historical rows;
 - add the child-only `complete_work` operation to companion schema/dispatch;
-- extend typed attention for post-terminal completion decisions;
+- extend typed attention with kind-specific query, resolution, startup
+  reconciliation, and Broker teardown behavior;
 - add SeaORM entities/migrations for protocol version, intents, evidence,
-  scope, attention kind, and restart linkage; and
+  settlement scope/Plan state, attention kind, and restart linkage using the
+  four ordered `m20260804_...` migrations above; and
 - expose completion projection consistently through Tauri, Axum, WebSocket,
   ACP history, and `codeg-mcp` status results.
 
@@ -843,6 +1111,8 @@ Frontend and Skill surfaces:
 - mirror `CompletionCardV2` and typed completion attention in TypeScript;
 - render resolved, needs-decision, blocked, and legacy-restart states;
 - add a direct role-bounded adjudication control with desktop/server parity;
+- expose the server-owned creation mode and shadow/enforce telemetry to the
+  existing operational configuration surface;
 - update all locale files for new states and actions;
 - replace v1 Card instructions in
   `.agents/skills/brainstorm-to-delivery/SKILL.md`; and
@@ -858,24 +1128,32 @@ and workflow overlay layout are outside this implementation boundary.
 
 - Accept each canonical Reviewer and worker outcome through `complete_work`.
 - Reject tool outcomes incompatible with the durable role.
-- Coalesce identical tool retries and route differing accepted calls to
-  `needs_decision`.
+- Coalesce delivery retries by tool-call ID and make the latest distinct valid
+  call authoritative, including outcome changes.
 - Accept casing, spacing, punctuation, Markdown wrapper, English, and Chinese
   terminal-line variants.
+- Reject `Status` and `状态` as conclusion labels.
 - Ignore outcome words in prose, code fences, HTML comments, quotes, tables,
   and examples.
-- Coalesce equivalent explicit lines and reject conflicting lines.
+- Make the last eligible terminal line authoritative and retain earlier lines
+  only for diagnostics.
 - Verify strict source precedence: a resolved higher channel prevents lower
   report interpretation.
 - Parse only top-level report conclusions through a Markdown AST.
+- Make the last conclusion in one report authoritative and route incompatible
+  conclusions across report files to `needs_decision`.
 - Enforce candidate count, file size, workspace containment, and symlink rules.
 
 ### Evidence and Artifact Resolution
 
 - Ignore false child/Parent task IDs, roles, kinds, revisions, and digests.
 - Compute Plan and Design digests from exact file bytes.
+- Change a Design/Plan file between the pre-read and settlement write and prove
+  the in-transaction second hash prevents stale evidence from committing.
 - Compute code artifact identity from platform Git `HEAD`; never use a
   model-authored commit list.
+- Reuse existing `workspace_head_commit` behavior and persist a typed resolver
+  kind/unavailable state.
 - Persist the selected producer task and generation from admission state.
 - Atomically write terminal status, evidence/binding projection, graph
   revision, and events.
@@ -887,11 +1165,15 @@ and workflow overlay layout are outside this implementation boundary.
 - Preserve completed sibling reviews after removing an unavailable Reviewer.
 - Preserve siblings and require only the new node after replacement.
 - Preserve evidence across title-only, graph-only, unrelated-task, and
-  reviewer-policy manifest revisions.
+  roster/revision-counter-only manifest changes whose effective review policy
+  is unchanged.
 - Invalidate on document/code digest, producer task/generation, node identity,
   material review scope, gate cycle, or workflow change.
 - Prove required-reviewer sets and `manifest_revision` are absent from scope
   canonicalization.
+- Prove every material input represented by legacy Design/Plan fingerprints is
+  represented by the v2 scope, while `content_fingerprint` keeps its v1
+  storage meaning.
 - Reject a digest built with another domain/schema version.
 
 ### Gate Safety
@@ -904,15 +1186,43 @@ and workflow overlay layout are outside this implementation boundary.
 - Never count unresolved attention as terminal gate evidence.
 - Derive gate evidence from the store rather than caller-submitted IDs or
   digests.
+- Exercise `admission.rs`, `store.rs`, `gates.rs`, `project.rs`, and
+  `recovery_policy.rs` with v2 evidence and prove none requires
+  `summary_validated` or a Card status/verdict.
+- Derive Design approval/changes/blocked solely from required Reviewer
+  outcomes; counts remain null/non-authoritative.
 - Keep failed/canceled recovery and reviewer-amendment behavior intact.
+
+### Plan Outcome Reducer
+
+- Approve only when all current required Reviewers are rank 0.
+- Re-review only current non-pass Reviewers after a localized correction.
+- Require the full cohort for initial, material, and holistic revisions.
+- Preserve siblings and avoid stagnation advancement for roster-only
+  add/remove amendments.
+- Treat blocker-set shrink or rank decrease as improvement only when no new
+  blocker appears and no surviving blocker worsens.
+- Trigger holistic rewrite after two stagnant rounds and user decision after
+  two post-rewrite stagnant rounds.
+- Prove findings, severity counts, Parent-supplied coverage, and v1
+  `finding_ledger_json` cannot change a v2 next action.
 
 ### Attention and No-Re-Emit Behavior
 
 - A completed child with no explicit conclusion opens one completion decision.
-- Conflicting or role-incompatible conclusions open one decision with bounded
-  candidate excerpts.
+- Incompatible report files or a role-incompatible authoritative conclusion
+  open one decision with bounded candidate excerpts.
 - Terminal cleanup leaves completion decisions open while still closing live
   child-question attention.
+- Host restart, Parent turn failure/cancellation/disconnect, and
+  `join_abandoned` leave current completion decisions open.
+- Startup reconcile retains current decisions, supersedes stale scopes, and
+  opens at most one current replacement.
+- Active completion decisions do not expire; explicit workflow termination or
+  deletion closes them deterministically.
+- Artifact-recovery attention also survives restart and Parent teardown, then
+  resolves on a successful typed retry, scope supersession, explicit workflow
+  termination, or deletion.
 - A direct user choice creates evidence without waking, continuing, or
   replacing the child.
 - Concurrent amendment, superseding run, or scope change prevents stale user
@@ -925,12 +1235,23 @@ and workflow overlay layout are outside this implementation boundary.
 
 - Migration labels all existing workflows v1 without changing their data.
 - v2 logic never reads legacy `card_summary_json` as evidence.
-- A v1 resume creates exactly one linked v2 root and opens its Design gate.
+- Under `v2_enforce`, a v1 resume creates exactly one linked v2 root and opens
+  its Design gate.
 - Repeated resume requests return the same successor.
 - No old run, evidence, settlement, gate cycle, or task ID appears in the new
   workflow.
 - Old and new sessions expose reciprocal links and the old session stays
   read-only.
+- An old settled gate cannot be carried into a workflow containing v2 runs.
+
+### Rollout Modes
+
+- `v1` and `v2_shadow` keep v1 authoritative; shadow writes metrics only.
+- `v2_enforce` writes v2 evidence and never calls the v1 Card parser.
+- A mode change affects new workflows only and cannot downgrade an active v2
+  workflow.
+- Rollout thresholds stop expansion at greater than 1% role mismatch or 5%
+  `needs_decision` after the 100-sample minimum.
 
 ### End-to-End Capability Matrix
 
@@ -974,11 +1295,16 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 Add bounded counters and structured events for:
 
 - completion resolution by source and role;
+- accepted and superseded `complete_work` calls;
 - missing, conflicting, and role-mismatched intent;
 - completion decisions opened, resolved, and superseded;
+- open completion decisions and oldest unresolved age;
 - artifact-resolution failure by resolver kind;
 - evidence invalidation by changed scope dimension;
-- v1-to-v2 restart creation/reuse/failure; and
+- Plan reducer outcome, strict improvement, stagnation, rewrite, and next
+  action;
+- v1-to-v2 restart creation/reuse/failure;
+- protocol creation mode and shadow/enforce result differences; and
 - continuation reason, with a dedicated invariant counter proving that
   format-only completion repair remains zero.
 
@@ -987,10 +1313,14 @@ The primary rollout indicators are:
 - percentage resolved by natural-language fallback;
 - completion-decision rate by agent/profile;
 - median time from terminal run to user adjudication;
+- oldest unresolved completion-decision age;
+- role-mismatch rate per agent/profile after the 100-sample minimum;
 - number of new child runs whose prompt contains `CARD RE-EMIT ONLY`; and
 - number of sibling reviews rerun after reviewer-only amendment.
 
-The last two metrics must remain zero under protocol v2.
+Rollout expansion stops above the approved 1% role-mismatch or 5%
+completion-decision thresholds. The last two metrics must remain zero under
+protocol v2.
 
 ## Acceptance Criteria
 
@@ -1008,15 +1338,30 @@ The last two metrics must remain zero under protocol v2.
    decision and creates no continuation or replacement run.
 8. Reviewer pass is limited to `approve`/`approve_with_minors`; producer pass
    is limited to `done`/`done_with_concerns`.
-9. Removing or replacing an unavailable Reviewer preserves unchanged sibling
+9. Design and Plan gates are derived from platform-bound Reviewer outcomes;
+   child/Parent findings and counts cannot approve, block, or advance a round.
+10. Plan corrective rounds use the approved strict-improvement relation,
+    selective re-review, two-round rewrite threshold, and post-rewrite user
+    decision threshold.
+11. Removing or replacing an unavailable Reviewer preserves unchanged sibling
    evidence, while artifact, producer, node, review-scope, gate-cycle, and
    workflow changes invalidate it.
-10. Session-2889-style wrong Card templates cannot block Plan Reviewer
+12. `evidence_scope_digest` replaces both `manifest_revision` and
+    `content_fingerprint` for v2 eligibility without changing either legacy
+    field's stored meaning.
+13. A current `completion_decision` survives task terminal cleanup, process
+    restart, Parent teardown, disconnect, and join abandonment; only its typed
+    lifecycle closure rules may resolve it.
+14. Session-2889-style wrong Card templates cannot block Plan Reviewer
     admission when a valid semantic conclusion and platform-resolved Plan
     artifact exist.
-11. New v2 sessions never contain format-only `CARD RE-EMIT ONLY` child runs.
-12. Existing v1 sessions remain readable but immutable; resume creates or
-    reopens exactly one linked v2 session and reruns the workflow from Design
-    through Final with no reused evidence.
-13. Desktop, server, and `codeg-mcp` paths expose the same completion truth and
+15. New v2 sessions never contain format-only `CARD RE-EMIT ONLY` child runs.
+16. Existing v1 sessions remain readable but immutable under normal
+    `v2_enforce`; resume creates or reopens exactly one linked v2 session and
+    reruns the workflow from Design through Final with no reused evidence.
+17. Rollout mode is frozen per workflow; shadow has no semantic side effects,
+    and rollback affects future creation without downgrading active v2 work.
+18. `admission.rs`, `store.rs`, `gates.rs`, `project.rs`, and
+    `recovery_policy.rs` all consume the same v2 validator.
+19. Desktop, server, and `codeg-mcp` paths expose the same completion truth and
     pass the required verification suites.
