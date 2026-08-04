@@ -10,6 +10,7 @@ use codeg_lib::db::migration::Migrator;
 const MIGRATION_1: &str = "m20260804_000001_completion_protocol_and_run_evidence";
 const MIGRATION_2: &str = "m20260804_000002_completion_scope_and_gate_settlement";
 const MIGRATION_3: &str = "m20260804_000003_completion_tool_intents_and_restart_link";
+const MIGRATION_4: &str = "m20260804_000004_typed_completion_attention";
 const PREVIOUS_MIGRATION: &str = "m20260731_000004_custom_agent_source";
 const PRE_MANIFEST_V2_MIGRATION: &str = "m20260727_000002_workflow_gate_fingerprints";
 
@@ -152,6 +153,21 @@ struct SettlementV1Projection {
     created_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildQuestionProjection {
+    request_id: String,
+    task_id: String,
+    parent_conversation_id: i32,
+    child_conversation_id: i32,
+    child_tool_call_id: String,
+    status: String,
+    message: String,
+    reply: Option<String>,
+    resolution_code: Option<String>,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
 async fn open_through(last_migration: &str) -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let manager = SchemaManager::new(&db);
@@ -255,6 +271,15 @@ async fn table_sql(db: &DatabaseConnection, table: &str) -> String {
     .unwrap()
     .try_get("", "sql")
     .unwrap()
+}
+
+async fn table_exists(db: &DatabaseConnection, table: &str) -> bool {
+    db.query_one(sql(format!(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+    )))
+    .await
+    .unwrap()
+    .is_some()
 }
 
 fn optional_column_expression(name: &str, columns: &[TableColumn]) -> String {
@@ -409,6 +434,24 @@ async fn run_settlement_rebuild_with_failpoint(
     db.execute(sql(format!("PRAGMA application_id = {value}")))
         .await?;
     let result = apply_named(db, MIGRATION_2).await;
+    db.execute(sql("PRAGMA application_id = 0")).await?;
+    result
+}
+
+async fn run_attention_rebuild_with_failpoint(
+    db: &DatabaseConnection,
+    failpoint: &str,
+) -> Result<(), DbErr> {
+    let value = match failpoint {
+        "copy" => FAILPOINT_COPY,
+        "schema" => FAILPOINT_SCHEMA,
+        "index" => FAILPOINT_INDEX,
+        "foreign_key_check" => FAILPOINT_FOREIGN_KEY_CHECK,
+        other => panic!("unknown failpoint {other}"),
+    };
+    db.execute(sql(format!("PRAGMA application_id = {value}")))
+        .await?;
+    let result = apply_named(db, MIGRATION_4).await;
     db.execute(sql("PRAGMA application_id = 0")).await?;
     result
 }
@@ -656,6 +699,157 @@ async fn insert_tool_intent(
          ) VALUES (\
            '{intent_id}','{task_id}','{child_tool_call_id}',{accepted_ordinal},\
            'done',NULL,NULL,'{request_digest}','2026-08-04T00:00:00Z'\
+         )"
+    )))
+    .await?;
+    Ok(())
+}
+
+async fn seed_open_child_question(
+    db: &DatabaseConnection,
+    request_id: &str,
+    task_id: &str,
+    parent_conversation_id: i32,
+    child_conversation_id: i32,
+    child_tool_call_id: &str,
+    message: &str,
+) {
+    db.execute(sql("INSERT OR IGNORE INTO folder \
+         (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
+         VALUES (1,'repo','C:/completion-protocol-fixture','2026-08-04','2026-08-04',\
+                 '2026-08-04',1,1,'inherit','regular')"))
+        .await
+        .unwrap();
+    db.execute(sql(format!(
+        "INSERT INTO conversation (\
+           id,folder_id,agent_type,status,kind,message_count,title_locked,\
+           auto_title_finalized,parent_id,created_at,updated_at\
+         ) VALUES (\
+           {parent_conversation_id},1,'codex','completed','regular',0,0,0,NULL,\
+           '2026-08-04T00:00:00Z','2026-08-04T00:00:00Z'\
+         ), (\
+           {child_conversation_id},1,'codex','in_progress','delegate',0,0,0,\
+           {parent_conversation_id},'2026-08-04T00:01:00Z','2026-08-04T00:01:00Z'\
+         )"
+    )))
+    .await
+    .unwrap();
+    db.execute(sql(format!(
+        "INSERT INTO delegation_attention_requests (\
+           request_id,task_id,parent_conversation_id,child_conversation_id,\
+           child_tool_call_id,status,message,reply,resolution_code,created_at,resolved_at\
+         ) VALUES (\
+           '{request_id}','{task_id}',{parent_conversation_id},{child_conversation_id},\
+           '{child_tool_call_id}','open','{message}',NULL,NULL,\
+           '2026-08-04T00:02:03.456Z',NULL\
+         )"
+    )))
+    .await
+    .unwrap();
+}
+
+async fn seed_resolved_child_question(
+    db: &DatabaseConnection,
+    request_id: &str,
+    task_id: &str,
+    parent_conversation_id: i32,
+    child_conversation_id: i32,
+    child_tool_call_id: &str,
+) {
+    db.execute(sql(format!(
+        "INSERT INTO delegation_attention_requests (\
+           request_id,task_id,parent_conversation_id,child_conversation_id,\
+           child_tool_call_id,status,message,reply,resolution_code,created_at,resolved_at\
+         ) VALUES (\
+           '{request_id}','{task_id}',{parent_conversation_id},{child_conversation_id},\
+           '{child_tool_call_id}','resolved','Historical question','Historical reply',\
+           'parent_reply','2026-08-04T00:03:04.567Z','2026-08-04T00:04:05.678Z'\
+         )"
+    )))
+    .await
+    .unwrap();
+}
+
+async fn child_question_projection(
+    db: &DatabaseConnection,
+    request_id: &str,
+) -> ChildQuestionProjection {
+    let row = db
+        .query_one(sql(format!(
+            "SELECT request_id,task_id,parent_conversation_id,child_conversation_id,\
+                    child_tool_call_id,status,message,reply,resolution_code,created_at,resolved_at \
+             FROM delegation_attention_requests WHERE request_id = '{request_id}'"
+        )))
+        .await
+        .unwrap()
+        .unwrap();
+    ChildQuestionProjection {
+        request_id: row.try_get("", "request_id").unwrap(),
+        task_id: row.try_get("", "task_id").unwrap(),
+        parent_conversation_id: row.try_get("", "parent_conversation_id").unwrap(),
+        child_conversation_id: row.try_get("", "child_conversation_id").unwrap(),
+        child_tool_call_id: row.try_get("", "child_tool_call_id").unwrap(),
+        status: row.try_get("", "status").unwrap(),
+        message: row.try_get("", "message").unwrap(),
+        reply: row.try_get("", "reply").unwrap(),
+        resolution_code: row.try_get("", "resolution_code").unwrap(),
+        created_at: row.try_get("", "created_at").unwrap(),
+        resolved_at: row.try_get("", "resolved_at").unwrap(),
+    }
+}
+
+async fn attention_kind(db: &DatabaseConnection, request_id: &str) -> String {
+    db.query_one(sql(format!(
+        "SELECT kind FROM delegation_attention_requests WHERE request_id = '{request_id}'"
+    )))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "kind")
+    .unwrap()
+}
+
+async fn insert_completion_attention(
+    db: &DatabaseConnection,
+    request_id: &str,
+    task_id: &str,
+    kind: &str,
+    child_conversation_id: Option<i32>,
+    child_tool_call_id: Option<&str>,
+) -> Result<(), DbErr> {
+    let child_conversation_id = child_conversation_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NULL".to_owned());
+    let child_tool_call_id = child_tool_call_id
+        .map(|value| format!("'{value}'"))
+        .unwrap_or_else(|| "NULL".to_owned());
+    db.execute(sql(format!(
+        "INSERT INTO delegation_attention_requests (\
+           request_id,task_id,parent_conversation_id,child_conversation_id,\
+           child_tool_call_id,status,message,kind,created_at\
+         ) VALUES (\
+           '{request_id}','{task_id}',10,{child_conversation_id},{child_tool_call_id},\
+           'open','typed attention','{kind}','2026-08-04T01:00:00Z'\
+         )"
+    )))
+    .await?;
+    Ok(())
+}
+
+async fn insert_outbox_event(
+    db: &DatabaseConnection,
+    event_id: &str,
+    workflow_id: &str,
+    graph_revision: i64,
+    event_kind: &str,
+    subject_key: &str,
+) -> Result<(), DbErr> {
+    db.execute(sql(format!(
+        "INSERT INTO delegation_workflow_outbox_events (\
+           event_id,workflow_id,graph_revision,event_kind,subject_key,payload_json,created_at\
+         ) VALUES (\
+           '{event_id}','{workflow_id}',{graph_revision},'{event_kind}','{subject_key}',\
+           '{{\"version\":1}}','2026-08-04T01:00:00Z'\
          )"
     )))
     .await?;
@@ -992,4 +1186,269 @@ fn migration_3_is_registered_immediately_after_migration_2() {
     let second = names.iter().position(|name| name == MIGRATION_2).unwrap();
     let third = names.iter().position(|name| name == MIGRATION_3).unwrap();
     assert_eq!(third, second + 1);
+}
+
+#[tokio::test]
+async fn migration_4_preserves_child_questions_and_permits_typed_terminal_rows() {
+    assert!(
+        Migrator::migrations()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION_4),
+        "missing migration {MIGRATION_4}"
+    );
+
+    let db = open_through(MIGRATION_3).await;
+    seed_open_child_question(&db, "request-1", "task-1", 10, 11, "tool-1", "Choose A").await;
+    seed_resolved_child_question(&db, "request-history", "task-history", 10, 11, "tool-2").await;
+    seed_workflow(&db, "wf-outbox", 2, "v2_enforce").await;
+    let before_open = child_question_projection(&db, "request-1").await;
+    let before_resolved = child_question_projection(&db, "request-history").await;
+
+    apply_named(&db, MIGRATION_4).await.unwrap();
+
+    assert_eq!(
+        child_question_projection(&db, "request-1").await,
+        before_open
+    );
+    assert_eq!(
+        child_question_projection(&db, "request-history").await,
+        before_resolved
+    );
+    assert_eq!(attention_kind(&db, "request-1").await, "child_question");
+    assert_eq!(
+        attention_kind(&db, "request-history").await,
+        "child_question"
+    );
+
+    insert_completion_attention(
+        &db,
+        "request-2",
+        "task-1",
+        "completion_decision",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(insert_completion_attention(
+        &db,
+        "request-3",
+        "task-1",
+        "completion_decision",
+        None,
+        None,
+    )
+    .await
+    .is_err());
+    insert_completion_attention(
+        &db,
+        "request-4",
+        "task-1",
+        "completion_artifact_recovery",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(insert_completion_attention(
+        &db,
+        "request-invalid-design",
+        "task-design-invalid",
+        "design_self_review_decision",
+        Some(11),
+        None,
+    )
+    .await
+    .is_err());
+    insert_completion_attention(
+        &db,
+        "request-design",
+        "task-1",
+        "design_self_review_decision",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(insert_completion_attention(
+        &db,
+        "request-invalid-child",
+        "task-child-invalid",
+        "child_question",
+        None,
+        None,
+    )
+    .await
+    .is_err());
+    assert!(insert_completion_attention(
+        &db,
+        "request-invalid-kind",
+        "task-kind-invalid",
+        "free_form",
+        None,
+        None,
+    )
+    .await
+    .is_err());
+    insert_completion_attention(
+        &db,
+        "request-tool-a",
+        "task-tool",
+        "completion_decision",
+        Some(11),
+        Some("typed-tool"),
+    )
+    .await
+    .unwrap();
+    assert!(insert_completion_attention(
+        &db,
+        "request-tool-b",
+        "task-tool",
+        "completion_artifact_recovery",
+        Some(11),
+        Some("typed-tool"),
+    )
+    .await
+    .is_err());
+
+    let attention_table_sql = table_sql(&db, "delegation_attention_requests").await;
+    for kind in [
+        "'child_question'",
+        "'completion_decision'",
+        "'completion_artifact_recovery'",
+        "'design_self_review_decision'",
+    ] {
+        assert!(
+            attention_table_sql.contains(kind),
+            "missing attention kind {kind}"
+        );
+    }
+    let attention_indexes = table_index_sql(&db, "delegation_attention_requests").await;
+    assert!(!attention_indexes.contains_key("idx_attention_one_open_per_task"));
+    assert!(attention_indexes.values().any(|definition| {
+        definition.as_deref().is_some_and(|sql| {
+            sql.contains("task_id, kind") && sql.contains("WHERE status = 'open'")
+        })
+    }));
+    assert!(attention_indexes.values().any(|definition| {
+        definition.as_deref().is_some_and(|sql| {
+            sql.contains("task_id, child_tool_call_id")
+                && sql.contains("WHERE child_tool_call_id IS NOT NULL")
+        })
+    }));
+
+    assert!(table_exists(&db, "delegation_workflow_outbox_events").await);
+    let outbox_columns = table_columns(&db, "delegation_workflow_outbox_events").await;
+    assert_eq!(
+        outbox_columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.not_null))
+            .collect::<Vec<_>>(),
+        vec![
+            ("event_id", true),
+            ("workflow_id", true),
+            ("graph_revision", true),
+            ("event_kind", true),
+            ("subject_key", true),
+            ("payload_json", true),
+            ("dispatch_attempts", true),
+            ("created_at", true),
+            ("delivered_at", false),
+        ]
+    );
+    insert_outbox_event(&db, "event-1", "wf-outbox", 7, "attention_opened", "task-1")
+        .await
+        .unwrap();
+    assert!(
+        insert_outbox_event(&db, "event-2", "wf-outbox", 7, "attention_opened", "task-1",)
+            .await
+            .is_err()
+    );
+    insert_outbox_event(&db, "event-3", "wf-outbox", 8, "attention_opened", "task-1")
+        .await
+        .unwrap();
+    let attempts = db
+        .query_one(sql(
+            "SELECT dispatch_attempts FROM delegation_workflow_outbox_events \
+             WHERE event_id = 'event-1'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "dispatch_attempts")
+        .unwrap();
+    assert_eq!(attempts, 0);
+    assert_foreign_key_check_clean(&db).await;
+}
+
+#[tokio::test]
+async fn migration_4_rolls_back_attention_rebuild_failures() {
+    assert!(
+        Migrator::migrations()
+            .iter()
+            .any(|migration| migration.name() == MIGRATION_4),
+        "missing migration {MIGRATION_4}"
+    );
+
+    for failpoint in ["copy", "schema", "index", "foreign_key_check"] {
+        let db = open_through(MIGRATION_3).await;
+        seed_open_child_question(&db, "request-1", "task-1", 10, 11, "tool-1", "Choose A").await;
+        let before_row = child_question_projection(&db, "request-1").await;
+        let before_table_sql = table_sql(&db, "delegation_attention_requests").await;
+        let before_columns = table_columns(&db, "delegation_attention_requests").await;
+        let before_foreign_keys = table_foreign_keys(&db, "delegation_attention_requests").await;
+        let before_indexes = table_indexes(&db, "delegation_attention_requests").await;
+        let before_index_sql = table_index_sql(&db, "delegation_attention_requests").await;
+
+        assert!(
+            run_attention_rebuild_with_failpoint(&db, failpoint)
+                .await
+                .is_err(),
+            "{failpoint} did not fail"
+        );
+        assert_eq!(
+            child_question_projection(&db, "request-1").await,
+            before_row,
+            "{failpoint} changed row bytes"
+        );
+        assert_eq!(
+            table_sql(&db, "delegation_attention_requests").await,
+            before_table_sql,
+            "{failpoint} changed table SQL"
+        );
+        assert_eq!(
+            table_columns(&db, "delegation_attention_requests").await,
+            before_columns,
+            "{failpoint} changed table_info"
+        );
+        assert_eq!(
+            table_foreign_keys(&db, "delegation_attention_requests").await,
+            before_foreign_keys,
+            "{failpoint} changed foreign keys"
+        );
+        assert_eq!(
+            table_indexes(&db, "delegation_attention_requests").await,
+            before_indexes,
+            "{failpoint} changed indexes"
+        );
+        assert_eq!(
+            table_index_sql(&db, "delegation_attention_requests").await,
+            before_index_sql,
+            "{failpoint} changed index SQL"
+        );
+        assert!(!table_exists(&db, "delegation_attention_requests_v2").await);
+        assert!(!table_exists(&db, "delegation_workflow_outbox_events").await);
+        assert_foreign_key_check_clean(&db).await;
+    }
+}
+
+#[test]
+fn migration_4_is_registered_immediately_after_migration_3() {
+    let names: Vec<String> = Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    let third = names.iter().position(|name| name == MIGRATION_3).unwrap();
+    let fourth = names.iter().position(|name| name == MIGRATION_4).unwrap();
+    assert_eq!(fourth, third + 1);
 }

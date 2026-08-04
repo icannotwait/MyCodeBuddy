@@ -1396,7 +1396,7 @@ mod tests {
         let t0 = chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        // One open row per task (schema UNIQUE on open task_id).
+        // One open row per task and attention kind.
         for (req_id, task_id, p, c) in [
             ("req-a", "call-1", parent_a, child_a),
             ("req-b", "call-2", parent_b.id, child_b.id),
@@ -1405,14 +1405,20 @@ mod tests {
                 request_id: Set(req_id.into()),
                 task_id: Set(task_id.into()),
                 parent_conversation_id: Set(p),
-                child_conversation_id: Set(c),
-                child_tool_call_id: Set(format!("tc-{req_id}")),
+                child_conversation_id: Set(Some(c)),
+                child_tool_call_id: Set(Some(format!("tc-{req_id}"))),
                 status: Set("open".into()),
                 message: Set(format!("msg-{req_id}")),
                 reply: Set(None),
                 resolution_code: Set(None),
                 created_at: Set(t0),
                 resolved_at: Set(None),
+                kind: Set(delegation_attention_request::AttentionKind::ChildQuestion),
+                latest_run_id: Set(None),
+                node_id: Set(None),
+                payload_json: Set(None),
+                resolution_json: Set(None),
+                captured_scope_digest: Set(None),
             };
             row.insert(&db.conn).await.expect("insert attention");
         }

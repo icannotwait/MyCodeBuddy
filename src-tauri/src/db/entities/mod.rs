@@ -22,6 +22,7 @@ pub mod delegation_workflow_gate_settlement;
 pub mod delegation_workflow_gate_state;
 pub mod delegation_workflow_manifest_revision;
 pub mod delegation_workflow_node_binding;
+pub mod delegation_workflow_outbox_event;
 pub mod delegation_workflow_run_binding;
 pub mod folder;
 pub mod folder_command;

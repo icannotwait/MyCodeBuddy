@@ -203,6 +203,15 @@ const INVARIANT_VIOLATION: &str = "attention row violates its persisted invarian
 fn model_to_record(
     row: delegation_attention_request::Model,
 ) -> Result<AttentionRecord, AttentionStoreError> {
+    if row.kind != delegation_attention_request::AttentionKind::ChildQuestion {
+        return Err(AttentionStoreError::Database(INVARIANT_VIOLATION.into()));
+    }
+    let Some(child_conversation_id) = row.child_conversation_id else {
+        return Err(AttentionStoreError::Database(INVARIANT_VIOLATION.into()));
+    };
+    let Some(child_tool_call_id) = row.child_tool_call_id else {
+        return Err(AttentionStoreError::Database(INVARIANT_VIOLATION.into()));
+    };
     let status = row.status.as_str();
     let resolution = match row.resolution_code.as_deref() {
         None => None,
@@ -245,8 +254,8 @@ fn model_to_record(
             created_at: row.created_at,
         },
         parent_conversation_id: row.parent_conversation_id,
-        child_conversation_id: row.child_conversation_id,
-        child_tool_call_id: row.child_tool_call_id,
+        child_conversation_id,
+        child_tool_call_id,
         reply: row.reply,
         resolution_code: resolution,
         resolved_at: row.resolved_at,
@@ -1334,14 +1343,20 @@ mod tests {
             request_id: "corrupt".into(),
             task_id: "task-1".into(),
             parent_conversation_id: 1,
-            child_conversation_id: 2,
-            child_tool_call_id: "tc".into(),
+            child_conversation_id: Some(2),
+            child_tool_call_id: Some("tc".into()),
             status: status.into(),
             message: "payload-secret".into(),
             reply: reply.map(str::to_string),
             resolution_code: resolution_code.map(str::to_string),
             created_at: Utc::now(),
             resolved_at,
+            kind: delegation_attention_request::AttentionKind::ChildQuestion,
+            latest_run_id: None,
+            node_id: None,
+            payload_json: None,
+            resolution_json: None,
+            captured_scope_digest: None,
         }
     }
 

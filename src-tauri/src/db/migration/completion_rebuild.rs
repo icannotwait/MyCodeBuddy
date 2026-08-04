@@ -46,6 +46,23 @@ const V2_SETTLEMENT_COLUMNS: &[&str] = &[
 const SOURCE_TABLE: &str = "delegation_workflow_gate_settlements";
 const REPLACEMENT_TABLE: &str = "delegation_workflow_gate_settlements_v2";
 
+const V1_ATTENTION_COLUMNS: &[&str] = &[
+    "request_id",
+    "task_id",
+    "parent_conversation_id",
+    "child_conversation_id",
+    "child_tool_call_id",
+    "status",
+    "message",
+    "reply",
+    "resolution_code",
+    "created_at",
+    "resolved_at",
+];
+
+const ATTENTION_SOURCE_TABLE: &str = "delegation_attention_requests";
+const ATTENTION_REPLACEMENT_TABLE: &str = "delegation_attention_requests_v2";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RebuildFailpoint {
     None,
@@ -215,6 +232,153 @@ pub(super) async fn rebuild_gate_settlements<C: ConnectionTrait>(
     Ok(())
 }
 
+pub(super) async fn rebuild_attention_requests_and_outbox<C: ConnectionTrait>(
+    conn: &C,
+    failpoint: RebuildFailpoint,
+) -> Result<(), DbErr> {
+    let source_table_sql = load_table_sql(conn, ATTENTION_SOURCE_TABLE).await?;
+    let source_indexes = load_index_sql(conn, ATTENTION_SOURCE_TABLE).await?;
+
+    conn.execute_unprepared(
+        r#"CREATE TABLE delegation_attention_requests_v2 (
+           request_id TEXT PRIMARY KEY NOT NULL,
+           task_id TEXT NOT NULL,
+           parent_conversation_id INTEGER NOT NULL,
+           child_conversation_id INTEGER NULL,
+           child_tool_call_id TEXT NULL,
+           status TEXT NOT NULL CHECK (status IN ('open','resolved')),
+           message TEXT NOT NULL,
+           reply TEXT NULL,
+           resolution_code TEXT NULL,
+           created_at TEXT NOT NULL,
+           resolved_at TEXT NULL,
+           kind TEXT NOT NULL DEFAULT 'child_question' CHECK(kind IN (
+             'child_question',
+             'completion_decision',
+             'completion_artifact_recovery',
+             'design_self_review_decision'
+           )),
+           latest_run_id TEXT NULL,
+           node_id TEXT NULL,
+           payload_json TEXT NULL,
+           resolution_json TEXT NULL,
+           captured_scope_digest TEXT NULL,
+           CHECK(kind != 'child_question' OR
+             (child_conversation_id IS NOT NULL AND child_tool_call_id IS NOT NULL)),
+           CHECK(kind != 'design_self_review_decision' OR child_conversation_id IS NULL),
+           FOREIGN KEY(parent_conversation_id)
+             REFERENCES conversation(id) ON DELETE CASCADE,
+           FOREIGN KEY(child_conversation_id)
+             REFERENCES conversation(id) ON DELETE CASCADE
+         )"#,
+    )
+    .await?;
+
+    let destination_columns = V1_ATTENTION_COLUMNS
+        .iter()
+        .copied()
+        .chain([
+            "kind",
+            "latest_run_id",
+            "node_id",
+            "payload_json",
+            "resolution_json",
+            "captured_scope_digest",
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source_values = V1_ATTENTION_COLUMNS
+        .iter()
+        .copied()
+        .chain(["'child_question'", "NULL", "NULL", "NULL", "NULL", "NULL"])
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute_unprepared(&format!(
+        "INSERT INTO {ATTENTION_REPLACEMENT_TABLE} ({destination_columns}) \
+         SELECT {source_values} FROM {ATTENTION_SOURCE_TABLE}"
+    ))
+    .await?;
+    fail_attention_at(
+        failpoint,
+        RebuildFailpoint::Copy,
+        "copy",
+        &source_table_sql,
+        &source_indexes,
+    )?;
+
+    verify_attention_projection(conn, &source_table_sql, &source_indexes).await?;
+
+    conn.execute_unprepared(&format!("DROP TABLE {ATTENTION_SOURCE_TABLE}"))
+        .await?;
+    conn.execute_unprepared(&format!(
+        "ALTER TABLE {ATTENTION_REPLACEMENT_TABLE} RENAME TO {ATTENTION_SOURCE_TABLE}"
+    ))
+    .await?;
+    fail_attention_at(
+        failpoint,
+        RebuildFailpoint::Schema,
+        "schema",
+        &source_table_sql,
+        &source_indexes,
+    )?;
+
+    for (name, definition) in &source_indexes {
+        if matches!(
+            name.as_str(),
+            "idx_attention_task_tool_call" | "idx_attention_one_open_per_task"
+        ) {
+            continue;
+        }
+        conn.execute_unprepared(definition).await?;
+    }
+    for statement in [
+        r#"CREATE UNIQUE INDEX idx_attention_task_tool_call
+           ON delegation_attention_requests(task_id, child_tool_call_id)
+           WHERE child_tool_call_id IS NOT NULL"#,
+        r#"CREATE UNIQUE INDEX idx_attention_one_open_per_task_kind
+           ON delegation_attention_requests(task_id, kind)
+           WHERE status = 'open'"#,
+    ] {
+        conn.execute_unprepared(statement).await?;
+    }
+    fail_attention_at(
+        failpoint,
+        RebuildFailpoint::Index,
+        "index",
+        &source_table_sql,
+        &source_indexes,
+    )?;
+
+    conn.execute_unprepared(
+        r#"CREATE TABLE delegation_workflow_outbox_events (
+           event_id TEXT PRIMARY KEY NOT NULL,
+           workflow_id TEXT NOT NULL,
+           graph_revision INTEGER NOT NULL,
+           event_kind TEXT NOT NULL,
+           subject_key TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+           created_at TEXT NOT NULL,
+           delivered_at TEXT NULL,
+           UNIQUE(workflow_id, graph_revision, event_kind, subject_key),
+           FOREIGN KEY(workflow_id)
+             REFERENCES delegation_workflows(workflow_id) ON DELETE CASCADE
+         )"#,
+    )
+    .await?;
+
+    verify_foreign_keys(conn).await?;
+    fail_attention_at(
+        failpoint,
+        RebuildFailpoint::ForeignKeyCheck,
+        "foreign_key_check",
+        &source_table_sql,
+        &source_indexes,
+    )?;
+
+    Ok(())
+}
+
 pub(super) async fn verify_foreign_keys<C: ConnectionTrait>(conn: &C) -> Result<(), DbErr> {
     let violations = conn
         .query_all(Statement::from_string(
@@ -341,6 +505,55 @@ async fn verify_projection<C: ConnectionTrait>(
     Ok(())
 }
 
+async fn verify_attention_projection<C: ConnectionTrait>(
+    conn: &C,
+    source_table_sql: &str,
+    source_indexes: &[(String, String)],
+) -> Result<(), DbErr> {
+    let source_count = row_count(conn, ATTENTION_SOURCE_TABLE).await?;
+    let destination_count = row_count(conn, ATTENTION_REPLACEMENT_TABLE).await?;
+    if source_count != destination_count {
+        return Err(attention_rebuild_error(
+            "row_count",
+            source_table_sql,
+            source_indexes,
+            format!("source={source_count}, destination={destination_count}"),
+        ));
+    }
+
+    let projection = V1_ATTENTION_COLUMNS
+        .iter()
+        .map(|column| encoded_value(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source_only = difference_count(
+        conn,
+        ATTENTION_SOURCE_TABLE,
+        &projection,
+        ATTENTION_REPLACEMENT_TABLE,
+        &projection,
+    )
+    .await?;
+    let destination_only = difference_count(
+        conn,
+        ATTENTION_REPLACEMENT_TABLE,
+        &projection,
+        ATTENTION_SOURCE_TABLE,
+        &projection,
+    )
+    .await?;
+    if source_only != 0 || destination_only != 0 {
+        return Err(attention_rebuild_error(
+            "byte_projection",
+            source_table_sql,
+            source_indexes,
+            format!("source_only={source_only}, destination_only={destination_only}"),
+        ));
+    }
+
+    Ok(())
+}
+
 fn encoded_value(expression: &str) -> String {
     format!(
         "CASE WHEN ({expression}) IS NULL THEN 'null' \
@@ -397,6 +610,24 @@ fn fail_at(
     Ok(())
 }
 
+fn fail_attention_at(
+    actual: RebuildFailpoint,
+    expected: RebuildFailpoint,
+    stage: &str,
+    source_table_sql: &str,
+    source_indexes: &[(String, String)],
+) -> Result<(), DbErr> {
+    if actual == expected {
+        return Err(attention_rebuild_error(
+            stage,
+            source_table_sql,
+            source_indexes,
+            "injected failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn rebuild_error(
     stage: &str,
     source_table_sql: &str,
@@ -410,6 +641,23 @@ fn rebuild_error(
         .join(",");
     DbErr::Custom(format!(
         "settlement rebuild failed at {stage}: {detail}; \
+         source_table_sql={source_table_sql}; source_indexes={index_names}"
+    ))
+}
+
+fn attention_rebuild_error(
+    stage: &str,
+    source_table_sql: &str,
+    source_indexes: &[(String, String)],
+    detail: String,
+) -> DbErr {
+    let index_names = source_indexes
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    DbErr::Custom(format!(
+        "attention rebuild failed at {stage}: {detail}; \
          source_table_sql={source_table_sql}; source_indexes={index_names}"
     ))
 }
