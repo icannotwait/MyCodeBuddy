@@ -32,6 +32,18 @@ pub enum AdmissionClass {
     Replacement,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionState {
+    #[sea_orm(string_value = "resolved")]
+    Resolved,
+    #[sea_orm(string_value = "needs_decision")]
+    NeedsDecision,
+    #[sea_orm(string_value = "artifact_recovery")]
+    ArtifactRecovery,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation_task_runs")]
 pub struct Model {
@@ -76,6 +88,9 @@ pub struct Model {
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
     pub recovery_authorization_id: Option<String>,
+    pub completion_state: Option<CompletionState>,
+    pub completion_outcome: Option<String>,
+    pub completion_evidence_json: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

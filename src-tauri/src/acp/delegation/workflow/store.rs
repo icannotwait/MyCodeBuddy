@@ -3377,6 +3377,7 @@ async fn insert_header_create_or_reclassify(
         ),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     };
 
     match header.insert(txn).await {
@@ -5628,6 +5629,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         run.insert(&db.conn).await.expect("insert run");
 
@@ -6041,6 +6043,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&db.conn)
         .await
@@ -6898,6 +6901,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(old),
             updated_at: Set(old),
+            ..Default::default()
         };
         run.insert(&db.conn).await.unwrap();
         rb.insert(&db.conn).await.unwrap();
@@ -14228,6 +14232,7 @@ mod tests {
                 recovery_authorization_id: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
+                ..Default::default()
             }
             .insert(&db.conn)
             .await

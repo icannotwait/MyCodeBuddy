@@ -1211,6 +1211,7 @@ async fn insert_reserving_txn(
         recovery_authorization_id: Set(recovery_authorization_id.map(str::to_string)),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     };
     model.insert(txn).await.map_err(map_gen1_insert_err)?;
     Ok(())
@@ -5375,6 +5376,7 @@ mod tests {
             block_source_manifest_revision: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&db.conn)
         .await

@@ -2251,6 +2251,9 @@ mod tests {
             replaced_task_id: None,
             replacement_reason: None,
             recovery_authorization_id: None,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_json: None,
             created_at: t0,
             updated_at: t1,
         };
@@ -2725,6 +2728,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         run.insert(&db.conn).await.expect("insert run");
         child

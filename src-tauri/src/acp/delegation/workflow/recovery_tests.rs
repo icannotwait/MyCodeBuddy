@@ -636,6 +636,7 @@ async fn insert_unbound_run(
         recovery_authorization_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     }
     .insert(&db.conn)
     .await

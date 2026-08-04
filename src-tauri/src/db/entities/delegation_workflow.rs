@@ -16,6 +16,18 @@ pub enum WorkflowState {
     Blocked,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionProtocolMode {
+    #[sea_orm(string_value = "v1")]
+    V1,
+    #[sea_orm(string_value = "v2_shadow")]
+    V2Shadow,
+    #[sea_orm(string_value = "v2_enforce")]
+    V2Enforce,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation_workflows")]
 pub struct Model {
@@ -39,6 +51,8 @@ pub struct Model {
     pub plan_fingerprint: String,
     pub block_cause_code: Option<String>,
     pub block_source_manifest_revision: Option<i64>,
+    pub completion_protocol_version: i64,
+    pub completion_protocol_mode: CompletionProtocolMode,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

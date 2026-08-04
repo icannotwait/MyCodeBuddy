@@ -4311,6 +4311,7 @@ mod tests {
                         recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
+                        ..Default::default()
                     };
                     model.insert(txn).await.map_err(map_db)?;
                     admit_workflow_run_txn(
@@ -4591,6 +4592,7 @@ mod tests {
                         recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
+                        ..Default::default()
                     };
                     model.insert(txn).await.map_err(map_db)?;
                     admit_workflow_run_txn(
@@ -4694,6 +4696,7 @@ mod tests {
                         recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
+                        ..Default::default()
                     };
                     model.insert(txn).await.map_err(map_db)?;
                     admit_workflow_run_txn(
@@ -4794,6 +4797,7 @@ mod tests {
                         recovery_authorization_id: Set(None),
                         created_at: Set(now),
                         updated_at: Set(now),
+                        ..Default::default()
                     };
                     model.insert(txn).await.map_err(map_db)?;
                     admit_workflow_run_txn(
@@ -5037,6 +5041,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         run.insert(&db.conn).await.unwrap();
         let max = delegation_workflow_run_binding::Entity::find()
@@ -5311,6 +5316,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         run.insert(&db.conn).await.expect("run");
 

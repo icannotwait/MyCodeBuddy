@@ -2261,6 +2261,7 @@ mod tests {
             recovery_authorization_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         row.insert(conn).await.expect("insert run");
     }
