@@ -62,6 +62,8 @@ struct Args {
     features: Option<String>,
     /// Launch role. Omitted by older launchers → Root.
     role: CompanionRole,
+    /// Immutable ACP connection incarnation used in fallback tool-call ids.
+    connection_incarnation_id: String,
     /// Built-in slugs removed from the closed delegate target enum.
     disabled_agents: Option<String>,
 }
@@ -83,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
     let mut parent_pid = None;
     let mut features = None;
     let mut role = None;
+    let mut connection_incarnation_id = None;
     let mut disabled_agents = None;
 
     let mut iter = std::env::args().skip(1);
@@ -127,6 +130,12 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--role requires a value".to_string())?;
                 role = Some(parse_role(&raw)?);
             }
+            "--connection-incarnation-id" => {
+                connection_incarnation_id =
+                    Some(iter.next().ok_or_else(|| {
+                        "--connection-incarnation-id requires a value".to_string()
+                    })?);
+            }
             "--disabled-agents" => {
                 disabled_agents = Some(
                     iter.next()
@@ -147,9 +156,12 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown arg: {other}")),
         }
     }
+    let parent_connection_id =
+        parent_connection_id.ok_or_else(|| "missing --parent-connection-id".to_string())?;
     Ok(Args {
-        parent_connection_id: parent_connection_id
-            .ok_or_else(|| "missing --parent-connection-id".to_string())?,
+        connection_incarnation_id: connection_incarnation_id
+            .unwrap_or_else(|| parent_connection_id.clone()),
+        parent_connection_id,
         socket_path: socket_path.ok_or_else(|| "missing --socket-path".to_string())?,
         token: token.ok_or_else(|| "missing --token".to_string())?,
         parent_pid,
@@ -206,6 +218,7 @@ async fn main() -> ExitCode {
         token: args.token.clone(),
         features,
         role: args.role,
+        connection_incarnation_id: args.connection_incarnation_id,
         disabled_agents: parse_csv(args.disabled_agents.as_deref()),
     };
 
@@ -441,6 +454,7 @@ mod tests {
             token: "token".into(),
             features: CompanionFeatures::parse(Some("workflow_v2")),
             role: CompanionRole::Root,
+            connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };
         let line = json!({

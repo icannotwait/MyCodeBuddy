@@ -93,7 +93,7 @@ use crate::acp::delegation::run_store::{
     PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
-use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink, SpawnerError};
 use crate::acp::delegation::store::{
     DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
     TaskStoreError, TerminalTaskWrite,
@@ -6436,17 +6436,38 @@ impl DelegationBroker {
                 prebound_child.map(|(cid, _)| cid),
             );
         }
-        let child_connection_id = match self
-            .spawner
-            .spawn(
-                &req.parent_connection_id,
-                req.agent_type,
-                req.working_dir.clone(),
-                live_launch.preferred_mode_id.clone(),
-                live_launch.preferred_config_values.clone(),
-            )
-            .await
-        {
+        let spawn_result = match self.run_store.as_ref() {
+            Some(runs) => match runs.workflow_child_mcp_binding(&call_id).await {
+                Ok(workflow_binding) => {
+                    self.spawner
+                        .spawn_with_workflow_binding(
+                            &req.parent_connection_id,
+                            req.agent_type,
+                            req.working_dir.clone(),
+                            live_launch.preferred_mode_id.clone(),
+                            live_launch.preferred_config_values.clone(),
+                            workflow_binding,
+                        )
+                        .await
+                }
+                Err(error) => Err(SpawnerError::Spawn(format!(
+                    "workflow binding load failed: {error}"
+                ))),
+            },
+            None => {
+                self.spawner
+                    .spawn_with_workflow_binding(
+                        &req.parent_connection_id,
+                        req.agent_type,
+                        req.working_dir.clone(),
+                        live_launch.preferred_mode_id.clone(),
+                        live_launch.preferred_config_values.clone(),
+                        None,
+                    )
+                    .await
+            }
+        };
+        let child_connection_id = match spawn_result {
             Ok(id) => id,
             Err(e) => {
                 self.drop_inflight(inflight_id).await;
@@ -9214,19 +9235,26 @@ impl DelegationBroker {
             );
         }
 
-        let child_connection_id = match self
-            .spawner
-            .spawn_resume_existing(
-                &req.parent_connection_id,
-                reserved.agent_type,
-                reserved.workspace_path.clone(),
-                preferred_mode,
-                preferred_config,
-                external_id,
-                Some(handoff.child_connection_id.clone()),
-            )
-            .await
-        {
+        let spawn_result = match runs.workflow_child_mcp_binding(&reserved.task_id).await {
+            Ok(workflow_binding) => {
+                self.spawner
+                    .spawn_resume_existing_with_workflow_binding(
+                        &req.parent_connection_id,
+                        reserved.agent_type,
+                        reserved.workspace_path.clone(),
+                        preferred_mode,
+                        preferred_config,
+                        external_id,
+                        Some(handoff.child_connection_id.clone()),
+                        workflow_binding,
+                    )
+                    .await
+            }
+            Err(error) => Err(SpawnerError::Spawn(format!(
+                "workflow binding load failed: {error}"
+            ))),
+        };
+        let child_connection_id = match spawn_result {
             Ok(id) => id,
             Err(_e) => {
                 self.record_recovery_event(
@@ -33613,6 +33641,141 @@ mod tests {
         );
         enable_delegation(&broker).await;
         broker
+    }
+
+    async fn seed_v2_plan_author_workflow(db: &crate::db::AppDatabase, parent_id: i32) {
+        use crate::db::entities::delegation_workflow::{
+            self, CompletionProtocolMode, WorkflowState,
+        };
+        use crate::db::entities::delegation_workflow_node_binding;
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let now = Utc::now();
+        delegation_workflow::ActiveModel {
+            workflow_id: Set("launch-binding-workflow".into()),
+            parent_conversation_id: Set(parent_id),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(WorkflowState::Estimated),
+            capability_version: Set("workflow_manifest_v2".into()),
+            publication_token: Set("launch-binding-publication".into()),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design".into()),
+            plan_fingerprint: Set("plan".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+            legacy_source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set("launch-binding-workflow".into()),
+            node_id: Set("launch-binding-author".into()),
+            work_unit_key: Set("plan|docs/plan.md|author|codex|none".into()),
+            role: Set("author".into()),
+            agent_type: Set("codex".into()),
+            profile_id: Set(None),
+            phase_id: Set("plan".into()),
+            task_index: Set(None),
+            introduced_revision: Set(1),
+            retired_revision: Set(None),
+            is_observed: Set(false),
+            retained_observed: Set(false),
+            cohort_frozen: Set(false),
+            node_outcome: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    async fn v2_plan_author_launch_fixture() -> (
+        Arc<crate::db::AppDatabase>,
+        Arc<RunStore>,
+        Arc<MockSpawner>,
+        Arc<DelegationBroker>,
+        i32,
+    ) {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-launch-binding").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("launch binding parent".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        seed_v2_plan_author_workflow(&db, parent.id).await;
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("launch-binding-child".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        (db, runs, mock, broker, parent.id)
+    }
+
+    fn v2_plan_author_request(parent_id: i32, tool_use_id: &str) -> DelegationRequest {
+        let mut request = request(parent_id, tool_use_id);
+        request.agent_type = AgentType::Codex;
+        request.working_dir = Some(test_working_dir());
+        request.work_unit_key = Some("plan|docs/plan.md|author|codex|none".into());
+        request
+    }
+
+    #[tokio::test]
+    async fn complete_work_launch_carries_committed_v2_workflow_binding() {
+        let (_db, _runs, mock, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let report = broker
+            .start_delegation(v2_plan_author_request(parent_id, "launch-binding-ok"))
+            .await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+
+        let spawn_args = mock.spawn_args.lock().await;
+        assert_eq!(spawn_args.len(), 1);
+        assert_eq!(
+            spawn_args[0].workflow_binding,
+            Some(crate::acp::delegation::workflow::WorkflowChildMcpBinding {
+                task_id: report.task_id.unwrap(),
+                workflow_id: "launch-binding-workflow".into(),
+                protocol_version: 2,
+                node_id: "launch-binding-author".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_work_binding_load_failure_aborts_before_child_spawn() {
+        let (_db, runs, mock, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        runs.fail_next_workflow_binding_load();
+        let report = broker
+            .start_delegation(v2_plan_author_request(parent_id, "launch-binding-fail"))
+            .await;
+
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert!(mock.spawn_args.lock().await.is_empty());
+        let persisted = runs
+            .load_by_parent_tool_use(parent_id, "launch-binding-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.run_status, DelegationRunStatus::Failed);
+        assert_eq!(persisted.error_code.as_deref(), Some("spawn_failed"));
     }
 
     async fn seed_terminal_gen1_replay_run(

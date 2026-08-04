@@ -49,20 +49,23 @@ use tokio::sync::{oneshot, Mutex};
 use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_feedback_round_trip, client_get_workflow_state_round_trip,
-    client_parent_decision_round_trip, client_publish_workflow_round_trip,
-    client_recover_workflow_round_trip, client_recovery_authorization_round_trip,
-    client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
-    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerFeedbackRequest, BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest,
-    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_complete_work_round_trip, client_feedback_round_trip,
+    client_get_workflow_state_round_trip, client_parent_decision_round_trip,
+    client_publish_workflow_round_trip, client_recover_workflow_round_trip,
+    client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
+    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
+    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
+    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
-    WorkflowIndexOmissionStep, WorkflowStateIndexDto, WORKFLOW_CAPABILITY_VERSION,
+    CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
+    COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES,
+    WORKFLOW_CAPABILITY_VERSION,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
@@ -198,6 +201,8 @@ pub struct CompanionFeatures {
     /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
     /// enables all five B9 tools together (structural catalog agreement).
     pub workflow_v2: bool,
+    /// Child-only workflow completion-intent transport.
+    pub completion_v2: bool,
 }
 
 /// Canonical root tool set for `workflow_manifest_v2`.
@@ -274,6 +279,7 @@ impl CompanionFeatures {
                 ask: false,
                 sessions: false,
                 workflow_v2: false,
+                completion_v2: false,
             };
         };
         let mut f = Self {
@@ -283,6 +289,7 @@ impl CompanionFeatures {
             ask: false,
             sessions: false,
             workflow_v2: false,
+            completion_v2: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -292,6 +299,7 @@ impl CompanionFeatures {
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
                 "workflow_v2" => f.workflow_v2 = true,
+                "completion_v2" => f.completion_v2 = true,
                 _ => {}
             }
         }
@@ -330,6 +338,8 @@ pub struct CompanionContext {
     pub features: CompanionFeatures,
     /// Immutable launch role (`--role root|delegation_child`).
     pub role: CompanionRole,
+    /// Immutable ACP connection incarnation supplied by the launcher.
+    pub connection_incarnation_id: String,
     /// Built-in agent slugs disabled in settings. These may only narrow the
     /// embedded closed enum; launch inputs never add new delegate targets.
     pub disabled_agents: Vec<String>,
@@ -345,6 +355,9 @@ impl CompanionContext {
                 self.features.delegation
                     && self.features.coordination_v1
                     && self.role == CompanionRole::DelegationChild
+            }
+            "complete_work" => {
+                self.features.completion_v2 && self.role == CompanionRole::DelegationChild
             }
             "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
             "request_recovery_authorization" => {
@@ -759,6 +772,50 @@ async fn build_tools_call_spawn(
                 Box::pin(async move { client_cancel_task_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_task_report).await
         }
+        "complete_work" => {
+            let request: CompleteWorkRequest = match serde_json::from_value(arguments) {
+                Ok(request) => request,
+                Err(error) => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        format!("invalid complete_work arguments: {error}"),
+                    ));
+                }
+            };
+            if request
+                .summary
+                .as_ref()
+                .is_some_and(|value| value.len() > COMPLETE_WORK_SUMMARY_MAX_BYTES)
+                || request
+                    .report_file
+                    .as_ref()
+                    .is_some_and(|value| value.len() > COMPLETE_WORK_REPORT_FILE_MAX_BYTES)
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "complete_work string exceeds its schema bound",
+                ));
+            }
+            let tool_use_id = params
+                .get("_meta")
+                .and_then(|meta| meta.get("tool_use_id"))
+                .and_then(Value::as_str);
+            let child_tool_call_id =
+                match derive_child_tool_call_id(tool_use_id, &ctx.connection_incarnation_id, &id) {
+                    Ok(identity) => identity,
+                    Err(message) => return LineAction::Respond(err(id, -32602, message)),
+                };
+            let req = BrokerCompleteWorkRequest {
+                token: ctx.token.clone(),
+                child_tool_call_id,
+                request,
+            };
+            let round_trip =
+                Box::pin(async move { client_complete_work_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
+        }
         "check_user_feedback" => {
             let req = BrokerFeedbackRequest {
                 token: ctx.token.clone(),
@@ -945,6 +1002,23 @@ async fn build_tools_call_spawn(
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn derive_child_tool_call_id(
+    tool_use_id: Option<&str>,
+    connection_incarnation_id: &str,
+    json_rpc_request_id: &Value,
+) -> Result<String, String> {
+    if let Some(tool_use_id) = tool_use_id.filter(|value| !value.is_empty()) {
+        return Ok(tool_use_id.to_string());
+    }
+    if json_rpc_request_id.is_null() || connection_incarnation_id.is_empty() {
+        return Err("complete_work requires a stable request identity".into());
+    }
+    Ok(format!(
+        "rpc:{connection_incarnation_id}:{}",
+        request_id_key(json_rpc_request_id)
+    ))
 }
 
 fn parse_get_workflow_state_args(
@@ -2649,6 +2723,7 @@ mod tests {
             ask: false,
             sessions: false,
             workflow_v2: false,
+            completion_v2: false,
         })
     }
 
@@ -2659,6 +2734,7 @@ mod tests {
             token: "tok".into(),
             features,
             role: CompanionRole::Root,
+            connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         }
     }
@@ -3865,6 +3941,7 @@ mod tests {
         ask: false,
         sessions: false,
         workflow_v2: false,
+        completion_v2: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -3873,6 +3950,7 @@ mod tests {
         ask: false,
         sessions: false,
         workflow_v2: false,
+        completion_v2: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -3881,6 +3959,7 @@ mod tests {
         ask: true,
         sessions: false,
         workflow_v2: false,
+        completion_v2: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -3889,6 +3968,7 @@ mod tests {
         ask: false,
         sessions: true,
         workflow_v2: false,
+        completion_v2: false,
     };
     const GROK_FEATURES: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -3897,6 +3977,7 @@ mod tests {
         ask: false,
         sessions: true,
         workflow_v2: true,
+        completion_v2: false,
     };
     const COORDINATION: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -3905,6 +3986,7 @@ mod tests {
         ask: false,
         sessions: false,
         workflow_v2: false,
+        completion_v2: false,
     };
     const WORKFLOW_ROOT: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -3913,6 +3995,7 @@ mod tests {
         ask: false,
         sessions: false,
         workflow_v2: true,
+        completion_v2: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -3933,6 +4016,7 @@ mod tests {
             ask: false,
             sessions: false,
             workflow_v2: false,
+            completion_v2: false,
         })
     }
 
@@ -4220,6 +4304,114 @@ mod tests {
         assert!(
             !v1.workflow_tools_enabled(),
             "workflow_v1 must be ignored as an unknown token"
+        );
+    }
+
+    #[test]
+    fn completion_v2_catalog_is_child_only_and_literal() {
+        let feature = CompanionFeatures::parse(Some("completion_v2"));
+        let mut child = ctx_with(feature);
+        child.role = CompanionRole::DelegationChild;
+        assert!(child.allows_tool("complete_work"));
+
+        let mut root = ctx_with(feature);
+        root.role = CompanionRole::Root;
+        assert!(!root.allows_tool("complete_work"));
+
+        let mut misspelled = ctx_with(CompanionFeatures::parse(Some("completion_v1")));
+        misspelled.role = CompanionRole::DelegationChild;
+        assert!(!misspelled.allows_tool("complete_work"));
+    }
+
+    #[test]
+    fn complete_work_identity_prefers_tool_use_id_then_rpc_identity() {
+        assert_eq!(
+            derive_child_tool_call_id(Some("tool-77"), "inc-4", &json!(9)).unwrap(),
+            "tool-77"
+        );
+        assert_eq!(
+            derive_child_tool_call_id(None, "inc-4", &json!(9)).unwrap(),
+            "rpc:inc-4:9"
+        );
+        assert_eq!(
+            derive_child_tool_call_id(None, "inc-4", &json!("9")).unwrap(),
+            "rpc:inc-4:\"9\""
+        );
+        assert!(derive_child_tool_call_id(None, "inc-4", &Value::Null).is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_work_rejects_unknown_arguments_before_broker_dispatch() {
+        let mut child = ctx_with(CompanionFeatures::parse(Some("completion_v2")));
+        child.role = CompanionRole::DelegationChild;
+        let response = unwrap_respond(
+            dispatch_with_context(
+                child,
+                &call(
+                    7,
+                    "complete_work",
+                    json!({
+                        "outcome": "approve",
+                        "task_id": "model-supplied-identity"
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn complete_work_rejects_multibyte_strings_over_byte_bounds_before_dispatch() {
+        let mut child = ctx_with(CompanionFeatures::parse(Some("completion_v2")));
+        child.role = CompanionRole::DelegationChild;
+        for arguments in [
+            json!({"outcome": "approve", "summary": "界".repeat(1366)}),
+            json!({"outcome": "approve", "report_file": "界".repeat(342)}),
+        ] {
+            let response = unwrap_respond(
+                dispatch_with_context(child.clone(), &call(7, "complete_work", arguments)).await,
+            );
+            assert_eq!(response.error.unwrap().code, -32602);
+        }
+    }
+
+    #[test]
+    fn complete_work_schema_is_semantic_only_and_exact() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let tool = schema
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "complete_work")
+            .expect("complete_work schema");
+        assert_eq!(
+            tool,
+            &json!({
+                "name": "complete_work",
+                "description": "Record the workflow child's semantic conclusion. This does not terminate the child.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["outcome"],
+                    "properties": {
+                        "outcome": {
+                            "type": "string",
+                            "enum": [
+                                "approve",
+                                "approve_with_minors",
+                                "request_changes",
+                                "block",
+                                "done",
+                                "done_with_concerns",
+                                "blocked"
+                            ]
+                        },
+                        "summary": {"type": "string", "maxLength": 4096},
+                        "report_file": {"type": "string", "maxLength": 1024}
+                    }
+                }
+            })
         );
     }
 
@@ -5939,6 +6131,7 @@ mod tests {
             token: "tok".into(),
             features: FEEDBACK_ONLY,
             role: CompanionRole::Root,
+            connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };
         let inflight = Arc::new(InflightCalls::new());

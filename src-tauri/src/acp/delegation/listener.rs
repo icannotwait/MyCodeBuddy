@@ -38,11 +38,12 @@ use crate::acp::delegation::run_store::{
 };
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
-    BrokerMessage, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
-    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
-    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
+    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
+    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
+    CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -51,10 +52,10 @@ use crate::acp::delegation::types::{
     TaskStatus,
 };
 use crate::acp::delegation::workflow::{
-    decide_workflow_recovery, get_workflow_state_core, publish_workflow_manifest_core,
-    recover_workflow_core, settle_workflow_gate_core, ManifestDocument, PlanReviewError,
-    PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowRequest, WorkflowError,
-    WorkflowRecoveryDisposition, WorkflowStoreError,
+    accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
+    publish_workflow_manifest_core, recover_workflow_core, settle_workflow_gate_core,
+    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
+    SettleWorkflowRequest, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -147,6 +148,10 @@ pub struct TokenEntry {
     pub role: CompanionRole,
     /// Whether this launch advertised `workflow_v2` (Root-only mutation tools).
     pub workflow_v2: bool,
+    /// Child-only completion protocol capability for this immutable launch.
+    pub completion_v2: bool,
+    /// Durable task identity stamped by workflow admission, never by the model.
+    pub bound_task_id: Option<String>,
 }
 
 impl TokenEntry {
@@ -159,6 +164,8 @@ impl TokenEntry {
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
             workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
         }
     }
 }
@@ -698,6 +705,9 @@ impl DelegationListener {
             }
             BrokerMessage::SettleWorkflow(req) => {
                 value_response(&self.process_settle_workflow(req).await)?
+            }
+            BrokerMessage::CompleteWork(req) => {
+                value_response(&self.process_complete_work(req).await)?
             }
             BrokerMessage::GetWorkflowState(req) => {
                 value_response(&self.process_get_workflow_state(req).await)?
@@ -1655,6 +1665,47 @@ impl DelegationListener {
         }
     }
 
+    async fn process_complete_work(&self, req: BrokerCompleteWorkRequest) -> Value {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return completion_work_error_value(
+                "completion_tool_unauthorized",
+                "completion tool is not authorized for this live child",
+            );
+        };
+        if !entry.completion_v2 || entry.role != CompanionRole::DelegationChild {
+            return completion_work_error_value(
+                "completion_tool_unauthorized",
+                "completion tool is not authorized for this live child",
+            );
+        }
+        let Some(task_id) = entry.bound_task_id.as_deref() else {
+            return completion_work_error_value(
+                "completion_tool_unauthorized",
+                "completion tool is not authorized for this live child",
+            );
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return completion_work_error_value(
+                "completion_tool_unauthorized",
+                "completion tool is not authorized for this live child",
+            );
+        };
+        match accept_complete_work_txn(
+            runs.db(),
+            task_id,
+            &entry.parent_connection_id,
+            &req.child_tool_call_id,
+            &req.request,
+        )
+        .await
+        {
+            Ok(intent) => serde_json::to_value(intent).unwrap_or_else(|error| {
+                completion_work_error_value("persistence", &error.to_string())
+            }),
+            Err(error) => completion_work_error_value(error.code(), &error.to_string()),
+        }
+    }
+
     async fn process_get_workflow_state(&self, req: BrokerGetWorkflowStateRequest) -> Value {
         let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
             Ok((_, id)) => id,
@@ -2563,6 +2614,15 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         "error": {
             "code": code,
             "message": err.to_string(),
+        }
+    })
+}
+
+fn completion_work_error_value(code: &str, message: &str) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
         }
     })
 }
@@ -3521,6 +3581,8 @@ mod tests {
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
             workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
         }
     }
 
@@ -7869,6 +7931,8 @@ mod tests {
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
             workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
         }
     }
 
@@ -7880,6 +7944,8 @@ mod tests {
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
             workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
         }
     }
 
@@ -7892,6 +7958,446 @@ mod tests {
             role: CompanionRole::DelegationChild,
             // Feature bit set but role is child — must still hard-deny.
             workflow_v2: true,
+            completion_v2: false,
+            bound_task_id: None,
+        }
+    }
+
+    mod complete_work_contract {
+        use super::*;
+        use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::transport::BrokerCompleteWorkRequest;
+        use crate::acp::delegation::workflow::{
+            load_workflow_child_mcp_binding, AcceptedToolIntent, CompleteWorkError,
+            CompleteWorkRequest, CompletionOutcome,
+        };
+        use crate::db::entities::delegation_completion_tool_intent;
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::entities::delegation_workflow::{
+            self, CompletionProtocolMode, WorkflowState,
+        };
+        use crate::db::entities::delegation_workflow_node_binding;
+        use crate::db::entities::delegation_workflow_run_binding;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, QueryOrder, Set};
+
+        const TASK_ID: &str = "completion-tool-task";
+        const WORKFLOW_ID: &str = "completion-tool-workflow";
+        const NODE_ID: &str = "completion-tool-reviewer";
+        const CHILD_CONNECTION_ID: &str = "completion-tool-child-connection";
+
+        struct CompletionToolFixture {
+            db: Arc<crate::db::AppDatabase>,
+            listener: Arc<DelegationListener>,
+        }
+
+        impl CompletionToolFixture {
+            fn root_token(&self) -> &'static str {
+                "completion-root"
+            }
+
+            fn v1_child_token(&self) -> &'static str {
+                "completion-v1-child"
+            }
+
+            fn unbound_child_token(&self) -> &'static str {
+                "completion-unbound-child"
+            }
+
+            fn v2_child_token(&self) -> &'static str {
+                "completion-v2-child"
+            }
+
+            async fn complete(
+                &self,
+                token: &str,
+                child_tool_call_id: &str,
+                request: CompleteWorkRequest,
+            ) -> Value {
+                self.listener
+                    .process_complete_work(BrokerCompleteWorkRequest {
+                        token: token.to_string(),
+                        child_tool_call_id: child_tool_call_id.to_string(),
+                        request,
+                    })
+                    .await
+            }
+
+            async fn run(&self) -> crate::db::entities::delegation_task_run::Model {
+                crate::db::entities::delegation_task_run::Entity::find_by_id(TASK_ID)
+                    .one(&self.db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+
+            async fn latest_tool_intent(&self) -> delegation_completion_tool_intent::Model {
+                delegation_completion_tool_intent::Entity::find()
+                    .order_by_desc(delegation_completion_tool_intent::Column::AcceptedOrdinal)
+                    .one(&self.db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        }
+
+        fn approve() -> CompleteWorkRequest {
+            CompleteWorkRequest {
+                outcome: CompletionOutcome::Approve,
+                summary: Some("ready".into()),
+                report_file: Some("reports/review.md".into()),
+            }
+        }
+
+        fn request_changes() -> CompleteWorkRequest {
+            CompleteWorkRequest {
+                outcome: CompletionOutcome::RequestChanges,
+                summary: Some("one blocking issue".into()),
+                report_file: None,
+            }
+        }
+
+        fn response_code(response: &Value) -> Option<&str> {
+            response.pointer("/error/code").and_then(Value::as_str)
+        }
+
+        fn accepted(response: Value) -> AcceptedToolIntent {
+            serde_json::from_value(response).expect("accepted completion intent")
+        }
+
+        async fn completion_tool_fixture_with_db(
+            db: Arc<crate::db::AppDatabase>,
+        ) -> CompletionToolFixture {
+            let folder = seed_folder(&db, "/tmp/completion-tool-contract").await;
+            let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+            let child = seed_conversation(&db, folder, AgentType::Codex).await;
+            let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: TASK_ID.into(),
+                root_task_id: TASK_ID.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent,
+                parent_tool_use_id: Some("parent-tool".into()),
+                child_conversation_id: child,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some("/tmp/completion-tool-contract".into()),
+                route_fingerprint: Some("aabbccdd".into()),
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: None,
+                config_values_json: Some("{}".into()),
+                task_preview: Some("review the task".into()),
+                request_fingerprint: Some("a".repeat(64)),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: TASK_ID.into(),
+                work_unit_key: None,
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+            runs.bind_child_connection_while_reserving(TASK_ID, CHILD_CONNECTION_ID)
+                .await
+                .unwrap();
+            runs.promote_running(TASK_ID, CHILD_CONNECTION_ID, Utc::now())
+                .await
+                .unwrap();
+
+            let now = Utc::now();
+            delegation_workflow::ActiveModel {
+                workflow_id: Set(WORKFLOW_ID.into()),
+                parent_conversation_id: Set(parent),
+                workflow_kind: Set("brainstorm_to_delivery".into()),
+                schema_version: Set(2),
+                active_manifest_revision: Set(1),
+                graph_revision: Set(1),
+                workflow_state: Set(WorkflowState::Estimated),
+                capability_version: Set("workflow_manifest_v2".into()),
+                publication_token: Set("completion-tool-publication".into()),
+                supersedes_approved_revision: Set(None),
+                structural_revision: Set(1),
+                design_fingerprint: Set("design".into()),
+                plan_fingerprint: Set("plan".into()),
+                block_cause_code: Set(None),
+                block_source_manifest_revision: Set(None),
+                completion_protocol_version: Set(2),
+                completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+                legacy_source_workflow_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_node_binding::ActiveModel {
+                workflow_id: Set(WORKFLOW_ID.into()),
+                node_id: Set(NODE_ID.into()),
+                work_unit_key: Set("task|6|reviewer|codex|none".into()),
+                role: Set("reviewer".into()),
+                agent_type: Set("codex".into()),
+                profile_id: Set(None),
+                phase_id: Set("tasks".into()),
+                task_index: Set(Some(6)),
+                introduced_revision: Set(1),
+                retired_revision: Set(None),
+                is_observed: Set(false),
+                retained_observed: Set(false),
+                cohort_frozen: Set(false),
+                node_outcome: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_run_binding::ActiveModel {
+                task_id: Set(TASK_ID.into()),
+                workflow_id: Set(WORKFLOW_ID.into()),
+                node_id: Set(NODE_ID.into()),
+                gate_id: Set(None),
+                gate_cycle: Set(None),
+                manifest_revision: Set(1),
+                content_fingerprint: Set(None),
+                evidence_scope_digest: Set(None),
+                gate_lineage: Set(None),
+                review_round: Set(None),
+                instruction_block_digest: Set(None),
+                material_selector_digest: Set(None),
+                subject_material_digest: Set(None),
+                requirements_identity: Set(None),
+                task_specification_identity: Set(None),
+                final_findings_identity: Set(None),
+                producer_baseline_head: Set(None),
+                artifact_digest: Set(None),
+                reviewed_task_id: Set(None),
+                reviewed_implementer_generation: Set(None),
+                lineage_ordinal: Set(1),
+                summary_validated: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+
+            let broker = Arc::new(
+                DelegationBroker::new(
+                    Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                    Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+                )
+                .with_run_store(Arc::clone(&runs)),
+            );
+            let tokens = Arc::new(TokenRegistry::default());
+            for (token, role, completion_v2, bound_task_id, connection_id) in [
+                (
+                    "completion-root",
+                    CompanionRole::Root,
+                    true,
+                    Some(TASK_ID),
+                    CHILD_CONNECTION_ID,
+                ),
+                (
+                    "completion-v1-child",
+                    CompanionRole::DelegationChild,
+                    false,
+                    Some(TASK_ID),
+                    CHILD_CONNECTION_ID,
+                ),
+                (
+                    "completion-unbound-child",
+                    CompanionRole::DelegationChild,
+                    true,
+                    None,
+                    CHILD_CONNECTION_ID,
+                ),
+                (
+                    "completion-v2-child",
+                    CompanionRole::DelegationChild,
+                    true,
+                    Some(TASK_ID),
+                    CHILD_CONNECTION_ID,
+                ),
+            ] {
+                tokens
+                    .register(
+                        token.into(),
+                        TokenEntry {
+                            parent_connection_id: connection_id.into(),
+                            working_dir: PathBuf::from("/tmp/completion-tool-contract"),
+                            coordination_v1: true,
+                            delegation_continuation_v1: false,
+                            role,
+                            workflow_v2: false,
+                            completion_v2,
+                            bound_task_id: bound_task_id.map(str::to_string),
+                        },
+                    )
+                    .await;
+            }
+            let listener = make_listener(broker, tokens, Some(parent));
+            CompletionToolFixture { db, listener }
+        }
+
+        async fn completion_tool_fixture() -> CompletionToolFixture {
+            completion_tool_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
+        }
+
+        #[tokio::test]
+        async fn broker_accepts_only_live_bound_v2_child_and_orders_distinct_calls() {
+            let fixture = completion_tool_fixture().await;
+            for caller in [
+                fixture.root_token(),
+                fixture.v1_child_token(),
+                fixture.unbound_child_token(),
+            ] {
+                let response = fixture.complete(caller, "call-1", approve()).await;
+                assert_eq!(
+                    response_code(&response),
+                    Some("completion_tool_unauthorized")
+                );
+            }
+
+            let first = accepted(
+                fixture
+                    .complete(fixture.v2_child_token(), "call-1", approve())
+                    .await,
+            );
+            let replay = accepted(
+                fixture
+                    .complete(fixture.v2_child_token(), "call-1", approve())
+                    .await,
+            );
+            assert_eq!(first.intent_id, replay.intent_id);
+            assert_eq!(first.accepted_ordinal, 1);
+
+            let conflict = fixture
+                .complete(fixture.v2_child_token(), "call-1", request_changes())
+                .await;
+            assert_eq!(
+                response_code(&conflict),
+                Some("completion_tool_call_conflict")
+            );
+            let second = accepted(
+                fixture
+                    .complete(fixture.v2_child_token(), "call-2", request_changes())
+                    .await,
+            );
+            assert_eq!(second.accepted_ordinal, 2);
+            assert_eq!(
+                fixture.latest_tool_intent().await.outcome,
+                CompletionOutcome::RequestChanges.as_str()
+            );
+        }
+
+        #[tokio::test]
+        async fn complete_work_records_intent_without_terminating_the_run() {
+            let fixture = completion_tool_fixture().await;
+            accepted(
+                fixture
+                    .complete(fixture.v2_child_token(), "call-1", approve())
+                    .await,
+            );
+            let run = fixture.run().await;
+            assert_eq!(run.status, DelegationRunStatus::Running);
+            assert_eq!(run.completion_evidence_json, None);
+        }
+
+        #[tokio::test]
+        async fn complete_work_rejects_over_byte_payload_without_superseding() {
+            let fixture = completion_tool_fixture().await;
+            let first = accepted(
+                fixture
+                    .complete(fixture.v2_child_token(), "call-1", approve())
+                    .await,
+            );
+
+            let invalid = fixture
+                .complete(
+                    fixture.v2_child_token(),
+                    "call-2",
+                    CompleteWorkRequest {
+                        outcome: CompletionOutcome::RequestChanges,
+                        summary: Some("界".repeat(1366)),
+                        report_file: None,
+                    },
+                )
+                .await;
+            assert_eq!(response_code(&invalid), Some("invalid_arguments"));
+
+            let latest = fixture.latest_tool_intent().await;
+            assert_eq!(latest.intent_id, first.intent_id);
+            assert_eq!(latest.accepted_ordinal, 1);
+            assert_eq!(latest.outcome, CompletionOutcome::Approve.as_str());
+        }
+
+        #[tokio::test]
+        async fn complete_work_concurrent_redelivery_is_idempotent() {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = completion_tool_fixture_with_db(Arc::new(
+                crate::db::init_database(dir.path(), "completion-concurrency-test")
+                    .await
+                    .unwrap(),
+            ))
+            .await;
+            let responses = futures_util::future::join_all(
+                (0..8).map(|_| fixture.complete(fixture.v2_child_token(), "same-call", approve())),
+            )
+            .await;
+
+            let accepted: Vec<AcceptedToolIntent> = responses.into_iter().map(accepted).collect();
+            assert!(accepted
+                .iter()
+                .all(|intent| intent.intent_id == accepted[0].intent_id));
+            assert!(accepted.iter().all(|intent| intent.accepted_ordinal == 1));
+        }
+
+        #[tokio::test]
+        async fn complete_work_concurrent_distinct_calls_receive_contiguous_ordinals() {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = completion_tool_fixture_with_db(Arc::new(
+                crate::db::init_database(dir.path(), "completion-concurrency-test")
+                    .await
+                    .unwrap(),
+            ))
+            .await;
+            let call_ids: Vec<String> = (0..8).map(|index| format!("call-{index}")).collect();
+            let responses = futures_util::future::join_all(
+                call_ids
+                    .iter()
+                    .map(|call_id| fixture.complete(fixture.v2_child_token(), call_id, approve())),
+            )
+            .await;
+
+            let mut ordinals: Vec<i64> = responses
+                .into_iter()
+                .map(accepted)
+                .map(|intent| intent.accepted_ordinal)
+                .collect();
+            ordinals.sort_unstable();
+            assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+        }
+
+        #[tokio::test]
+        async fn complete_work_dangling_committed_binding_fails_closed() {
+            let fixture = completion_tool_fixture().await;
+            fixture
+                .db
+                .conn
+                .execute_unprepared("PRAGMA foreign_keys=OFF")
+                .await
+                .unwrap();
+            delegation_workflow::Entity::delete_by_id(WORKFLOW_ID)
+                .exec(&fixture.db.conn)
+                .await
+                .unwrap();
+
+            let error = load_workflow_child_mcp_binding(&fixture.db, TASK_ID)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, CompleteWorkError::Persistence(_)));
         }
     }
 
@@ -7977,6 +8483,8 @@ mod tests {
                     delegation_continuation_v1: false,
                     role: CompanionRole::Root,
                     workflow_v2: true,
+                    completion_v2: false,
+                    bound_task_id: None,
                 },
             )
             .await;
@@ -8003,6 +8511,7 @@ mod tests {
             token: "workflow-v2-token".into(),
             features: CompanionFeatures::parse(Some("workflow_v2")),
             role: CompanionRole::Root,
+            connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };
         let inflight = Arc::new(InflightCalls::new());
@@ -8971,6 +9480,8 @@ mod tests {
                         delegation_continuation_v1: false,
                         role: CompanionRole::DelegationChild,
                         workflow_v2: true,
+                        completion_v2: false,
+                        bound_task_id: None,
                     },
                 )
                 .await;
@@ -9533,6 +10044,8 @@ mod tests {
                         delegation_continuation_v1: true,
                         role: CompanionRole::DelegationChild,
                         workflow_v2: false,
+                        completion_v2: false,
+                        bound_task_id: None,
                     },
                 )
                 .await;

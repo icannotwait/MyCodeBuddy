@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::completion_intent::CompletionOutcome;
+
 /// Max length of a canonical `work_unit_key` after normalization (MCP + A1).
 /// Counted as Unicode scalar values (`str::chars`), not UTF-8 bytes.
 pub const MAX_WORK_UNIT_KEY_LEN: usize = 200;
@@ -20,6 +22,42 @@ pub const MAX_EDGES: usize = 800;
 pub const MAX_GATES: usize = 50;
 pub const MAX_ADJUDICATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_JSON_BYTES: usize = 512 * 1024;
+pub const COMPLETE_WORK_SUMMARY_MAX_BYTES: usize = 4 * 1024;
+pub const COMPLETE_WORK_REPORT_FILE_MAX_BYTES: usize = 1024;
+
+/// Semantic payload accepted from the workflow child. Identity and workflow
+/// routing are always supplied by the platform transport/token binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteWorkRequest {
+    pub outcome: CompletionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_file: Option<String>,
+}
+
+/// Durable acknowledgement returned after a completion tool call is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedToolIntent {
+    pub intent_id: String,
+    pub task_id: String,
+    pub child_tool_call_id: String,
+    pub accepted_ordinal: i64,
+    pub outcome: CompletionOutcome,
+    pub summary: Option<String>,
+    pub report_file: Option<String>,
+}
+
+/// Immutable workflow identity passed from committed run admission to the
+/// forced-child MCP launch. It is never populated from model arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowChildMcpBinding {
+    pub task_id: String,
+    pub workflow_id: String,
+    pub protocol_version: i64,
+    pub node_id: String,
+}
 
 /// Fixed workflow kind for this feature.
 pub const WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY: &str = "brainstorm_to_delivery";

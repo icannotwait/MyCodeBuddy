@@ -973,6 +973,45 @@ impl ConnectionManager {
         session_attach_mode: crate::acp::session_attach::SessionAttachMode,
         preallocated_connection_id: Option<String>,
     ) -> Result<String, AcpError> {
+        self.spawn_agent_with_attach_mode_and_workflow_binding(
+            agent_type,
+            working_dir,
+            session_id,
+            launch_inputs,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+            launch_context,
+            owner_operation_id,
+            parent_connection_id,
+            session_attach_mode,
+            preallocated_connection_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_with_attach_mode_and_workflow_binding(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        launch_inputs: AcpLaunchInputs,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        launch_context: ConnectionLaunchContext,
+        owner_operation_id: Option<String>,
+        parent_connection_id: Option<String>,
+        session_attach_mode: crate::acp::session_attach::SessionAttachMode,
+        preallocated_connection_id: Option<String>,
+        workflow_child_mcp_binding: Option<
+            crate::acp::delegation::workflow::WorkflowChildMcpBinding,
+        >,
+    ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
         // the same external session in the same working_dir for the same
@@ -1215,6 +1254,7 @@ impl ConnectionManager {
                 preferred_mode_id.clone(),
                 preferred_config_values.clone(),
                 injection,
+                workflow_child_mcp_binding.clone(),
                 launch_context.clone(),
                 session_attach_mode,
                 self.tool_lease_registry.clone(),
@@ -6238,6 +6278,53 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
     }
 
+    async fn spawn_with_workflow_binding(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        workflow_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
+    ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
+        let runtime = self.runtime.snapshot();
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+            &self.db,
+            agent_type,
+            None,
+            self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
+        )
+        .await
+        .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+
+        self.manager
+            .spawn_agent_with_attach_mode_and_workflow_binding(
+                agent_type,
+                effective_working_dir,
+                None,
+                launch_inputs,
+                parent.owner_window_label,
+                parent.emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                parent.launch_context,
+                parent.owner_operation_id,
+                Some(parent_connection_id.to_string()),
+                crate::acp::session_attach::SessionAttachMode::Default,
+                None,
+                workflow_binding,
+            )
+            .await
+            .map_err(|e| SpawnerError::Spawn(e.to_string()))
+    }
+
     async fn spawn_resume_existing(
         &self,
         parent_connection_id: &str,
@@ -6281,6 +6368,55 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 Some(parent_connection_id.to_string()),
                 SessionAttachMode::ResumeExistingOnly,
                 preallocated_connection_id,
+            )
+            .await
+            .map_err(|e| SpawnerError::Spawn(e.to_string()))
+    }
+
+    async fn spawn_resume_existing_with_workflow_binding(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        external_session_id: String,
+        preallocated_connection_id: Option<String>,
+        workflow_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
+    ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
+        let runtime = self.runtime.snapshot();
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+            &self.db,
+            agent_type,
+            None,
+            self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
+        )
+        .await
+        .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+
+        self.manager
+            .spawn_agent_with_attach_mode_and_workflow_binding(
+                agent_type,
+                effective_working_dir,
+                Some(external_session_id),
+                launch_inputs,
+                parent.owner_window_label,
+                parent.emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                parent.launch_context,
+                parent.owner_operation_id,
+                Some(parent_connection_id.to_string()),
+                crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                preallocated_connection_id,
+                workflow_binding,
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))

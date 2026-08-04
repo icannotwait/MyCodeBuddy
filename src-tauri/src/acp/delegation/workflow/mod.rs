@@ -16,8 +16,9 @@ pub mod types;
 pub mod validate;
 
 pub use admission::{
-    admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
-    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
+    accept_complete_work_txn, admit_workflow_run_txn, emit_workflow_side_effect,
+    load_workflow_child_mcp_binding, on_mapped_run_transition_txn, on_provisional_abandon_txn,
+    on_terminal_settle_txn, AdmissionDispatchKind, CompleteWorkError, WorkflowAdmitInput,
     WorkflowTxnSideEffect,
 };
 pub use completion_intent::{

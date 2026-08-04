@@ -1,5 +1,22 @@
 [
   {
+    "name": "complete_work",
+    "description": "Record the workflow child's semantic conclusion. This does not terminate the child.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome"],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": ["approve", "approve_with_minors", "request_changes", "block", "done", "done_with_concerns", "blocked"]
+        },
+        "summary": {"type": "string", "maxLength": 4096},
+        "report_file": {"type": "string", "maxLength": 1024}
+      }
+    }
+  },
+  {
     "name": "delegate_to_agent",
     "description": "Cold sub-agent; ASYNCHRONOUS task_id. It cannot see this conversation: task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile. admission_failed/admission_unknown: explicit replacement.",
     "inputSchema": {

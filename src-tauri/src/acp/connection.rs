@@ -1664,6 +1664,7 @@ pub async fn spawn_agent_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    workflow_child_mcp_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
     launch_context: ConnectionLaunchContext,
     // Continue-delegation path: resume/load only, never session/new, with
     // external-id verify before SessionStarted identity rewrite.
@@ -1860,7 +1861,7 @@ pub async fn spawn_agent_connection(
     let cleanup_guard = ConnectionCleanupGuard {
         connections: cleanup_connections,
         connection_id: cleanup_connection_id,
-        connection_incarnation,
+        connection_incarnation: connection_incarnation.clone(),
         tool_lease_registry,
     };
 
@@ -1901,6 +1902,8 @@ pub async fn spawn_agent_connection(
                     preferred_mode_id,
                     preferred_config_values,
                     delegation_injection,
+                    workflow_child_mcp_binding,
+                    connection_incarnation,
                     route_plan,
                     route_bootstrap_tx,
                     session_attach_mode,
@@ -4118,6 +4121,7 @@ struct CompanionInjection {
     delegation_lease: Option<crate::acp::delegation::lease::CompanionLeaseWaiter>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn inject_codeg_mcp(
     servers: &mut Vec<McpServer>,
     injection: &DelegationInjection,
@@ -4125,6 +4129,8 @@ async fn inject_codeg_mcp(
     working_dir: &Path,
     agent_type: AgentType,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    connection_incarnation_id: &str,
+    binding: Option<&crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
 ) -> Option<CompanionInjection> {
     // Feature list follows the immutable launch plan for Codeg delegation —
     // never the live Broker settings toggle. Feedback/ask/sessions remain
@@ -4146,11 +4152,13 @@ async fn inject_codeg_mcp(
     // are available (delegation stack + run store). Children never get the bit.
     let workflow_v2 = matches!(role, crate::acp::delegation::transport::CompanionRole::Root)
         && delegation_enabled;
+    let completion_v2 = role == crate::acp::delegation::transport::CompanionRole::DelegationChild
+        && binding.is_some_and(|binding| binding.protocol_version == 2);
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
     // `None` (no feature enabled) short-circuits the whole injection.
-    let features_arg = companion_features_arg_for_agent(
+    let mut features_arg = companion_features_arg_for_agent(
         agent_type,
         delegation_enabled,
         coordination_v1,
@@ -4159,6 +4167,9 @@ async fn inject_codeg_mcp(
         sessions_enabled,
         workflow_v2,
     )?;
+    if completion_v2 {
+        features_arg.push_str(",completion_v2");
+    }
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
             "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
@@ -4179,6 +4190,8 @@ async fn inject_codeg_mcp(
                 delegation_continuation_v1,
                 role,
                 workflow_v2,
+                completion_v2,
+                bound_task_id: binding.map(|binding| binding.task_id.clone()),
             },
         )
         .await;
@@ -4213,6 +4226,8 @@ async fn inject_codeg_mcp(
         features_arg,
         "--role".to_string(),
         role_arg.to_string(),
+        "--connection-incarnation-id".to_string(),
+        connection_incarnation_id.to_string(),
     ];
     // Advertised built-in delegate targets track the user's enable toggles,
     // read fresh at injection time. Custom agents remain outside the closed
@@ -4502,6 +4517,8 @@ async fn run_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    workflow_child_mcp_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
+    connection_incarnation_id: String,
     route_plan: crate::acp::delegation::route::DelegationRoutePlan,
     route_bootstrap_tx: tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
@@ -4983,6 +5000,8 @@ async fn run_connection(
                             &cwd,
                             agent_type,
                             &route_plan,
+                            &connection_incarnation_id,
+                            workflow_child_mcp_binding.as_ref(),
                         )
                         .await
                     } else {
@@ -21094,7 +21113,7 @@ mod tests {
     // codeg-mcp stdio MCP out of every ACP session until the user
     // opts in via the settings panel.
     #[tokio::test]
-    async fn inject_codeg_delegate_skipped_when_broker_disabled() {
+    async fn complete_work_injection_skips_disabled_root_and_binds_v2_child() {
         use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
         use crate::acp::delegation::listener::TokenRegistry;
         use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
@@ -21179,6 +21198,8 @@ mod tests {
             std::path::Path::new("/tmp"),
             AgentType::Codex,
             &plan,
+            "test-incarnation",
+            None,
         )
         .await;
 
@@ -21193,6 +21214,61 @@ mod tests {
             injection.tokens.lookup("any-token").await.is_none(),
             "disabled broker must not register a delegate token"
         );
+
+        let prior_binary = std::env::var_os("CODEG_MCP_BIN");
+        unsafe {
+            std::env::set_var("CODEG_MCP_BIN", std::env::current_exe().unwrap());
+        }
+        let mut forced_child_plan = codeg_plan(AgentType::Codex);
+        forced_child_plan.source = DelegationRouteSource::ForcedChild;
+        let binding = crate::acp::delegation::workflow::WorkflowChildMcpBinding {
+            task_id: "bound-task".into(),
+            workflow_id: "bound-workflow".into(),
+            protocol_version: 2,
+            node_id: "bound-node".into(),
+        };
+        let injected = inject_codeg_mcp(
+            &mut servers,
+            &injection,
+            "child-connection",
+            std::path::Path::new("/tmp"),
+            AgentType::Codex,
+            &forced_child_plan,
+            "child-incarnation",
+            Some(&binding),
+        )
+        .await;
+        unsafe {
+            match prior_binary {
+                Some(path) => std::env::set_var("CODEG_MCP_BIN", path),
+                None => std::env::remove_var("CODEG_MCP_BIN"),
+            }
+        }
+        let injected = injected.expect("forced v2 child injection");
+
+        let McpServer::Stdio(server) = &servers[0] else {
+            panic!("expected stdio companion");
+        };
+        let argument_after = |name: &str| {
+            let index = server.args.iter().position(|value| value == name).unwrap();
+            server.args[index + 1].as_str()
+        };
+        assert!(argument_after("--features")
+            .split(',')
+            .any(|feature| feature == "completion_v2"));
+        assert_eq!(argument_after("--role"), "delegation_child");
+        assert_eq!(
+            argument_after("--connection-incarnation-id"),
+            "child-incarnation"
+        );
+        let token = injection.tokens.lookup(&injected.token).await.unwrap();
+        assert_eq!(token.parent_connection_id, "child-connection");
+        assert_eq!(
+            token.role,
+            crate::acp::delegation::transport::CompanionRole::DelegationChild
+        );
+        assert!(token.completion_v2);
+        assert_eq!(token.bound_task_id.as_deref(), Some("bound-task"));
     }
 
     // Disabled custom slugs never become companion arguments. Disabled

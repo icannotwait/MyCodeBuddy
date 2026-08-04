@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use crate::acp::delegation::workflow::WorkflowChildMcpBinding;
 use crate::models::agent::AgentType;
 
 /// Result of a successful linked prompt enqueue for a delegation child.
@@ -128,6 +129,27 @@ pub trait ConnectionSpawner: Send + Sync {
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, SpawnerError>;
 
+    /// Task-6 forced-child launch carrying a binding read from committed
+    /// workflow admission. Non-production test spawners may ignore it.
+    async fn spawn_with_workflow_binding(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        _workflow_binding: Option<WorkflowChildMcpBinding>,
+    ) -> Result<String, SpawnerError> {
+        self.spawn(
+            parent_connection_id,
+            agent_type,
+            working_dir,
+            preferred_mode_id,
+            preferred_config_values,
+        )
+        .await
+    }
+
     /// Resume an existing external session for `continue_delegation`
     /// (`ResumeExistingOnly`). Never falls through to `session/new`.
     ///
@@ -144,6 +166,30 @@ pub trait ConnectionSpawner: Send + Sync {
         external_session_id: String,
         preallocated_connection_id: Option<String>,
     ) -> Result<String, SpawnerError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_resume_existing_with_workflow_binding(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        external_session_id: String,
+        preallocated_connection_id: Option<String>,
+        _workflow_binding: Option<WorkflowChildMcpBinding>,
+    ) -> Result<String, SpawnerError> {
+        self.spawn_resume_existing(
+            parent_connection_id,
+            agent_type,
+            working_dir,
+            preferred_mode_id,
+            preferred_config_values,
+            external_session_id,
+            preallocated_connection_id,
+        )
+        .await
+    }
 
     /// Send the delegation task as the child's first prompt. The
     /// `DelegationLink` is persisted onto the new conversation row so the
@@ -226,6 +272,7 @@ pub mod mock {
         pub working_dir: Option<String>,
         pub preferred_mode_id: Option<String>,
         pub preferred_config_values: BTreeMap<String, String>,
+        pub workflow_binding: Option<WorkflowChildMcpBinding>,
     }
 
     /// Recorded `spawn_resume_existing` call (ResumeExistingOnly; never session/new).
@@ -236,6 +283,7 @@ pub mod mock {
         pub working_dir: Option<String>,
         pub external_session_id: String,
         pub preallocated_connection_id: Option<String>,
+        pub workflow_binding: Option<WorkflowChildMcpBinding>,
     }
 
     impl MockSpawner {
@@ -295,10 +343,39 @@ pub mod mock {
                 working_dir,
                 preferred_mode_id,
                 preferred_config_values,
+                workflow_binding: None,
             });
             // Honor a test-installed gate: block here (after recording the call,
             // before returning the child id) so a test can pin `handle_request`
             // in the spawn window — before it reserves the child or sends.
+            let gate = self.spawn_gate.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.spawn_results
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(SpawnerError::Spawn("no queued spawn result".into())))
+        }
+
+        async fn spawn_with_workflow_binding(
+            &self,
+            parent_connection_id: &str,
+            agent_type: AgentType,
+            working_dir: Option<String>,
+            preferred_mode_id: Option<String>,
+            preferred_config_values: BTreeMap<String, String>,
+            workflow_binding: Option<WorkflowChildMcpBinding>,
+        ) -> Result<String, SpawnerError> {
+            self.spawn_args.lock().await.push(SpawnCallArgs {
+                parent_connection_id: parent_connection_id.to_string(),
+                agent_type,
+                working_dir,
+                preferred_mode_id,
+                preferred_config_values,
+                workflow_binding,
+            });
             let gate = self.spawn_gate.lock().await.take();
             if let Some(gate) = gate {
                 let _ = gate.await;
@@ -326,6 +403,7 @@ pub mod mock {
                 working_dir: working_dir.clone(),
                 external_session_id,
                 preallocated_connection_id: preallocated_connection_id.clone(),
+                workflow_binding: None,
             });
             // Reuse spawn queue; when preallocated, prefer returning that id
             // on success so handoff settlement keys match.
@@ -336,6 +414,46 @@ pub mod mock {
                     working_dir,
                     preferred_mode_id,
                     preferred_config_values,
+                )
+                .await;
+            match result {
+                Err(error) => Err(error),
+                Ok(spawned_id) => self
+                    .resume_results
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(preallocated_connection_id.unwrap_or(spawned_id))),
+            }
+        }
+
+        async fn spawn_resume_existing_with_workflow_binding(
+            &self,
+            parent_connection_id: &str,
+            agent_type: AgentType,
+            working_dir: Option<String>,
+            preferred_mode_id: Option<String>,
+            preferred_config_values: BTreeMap<String, String>,
+            external_session_id: String,
+            preallocated_connection_id: Option<String>,
+            workflow_binding: Option<WorkflowChildMcpBinding>,
+        ) -> Result<String, SpawnerError> {
+            self.resume_args.lock().await.push(ResumeCallArgs {
+                parent_connection_id: parent_connection_id.to_string(),
+                agent_type,
+                working_dir: working_dir.clone(),
+                external_session_id,
+                preallocated_connection_id: preallocated_connection_id.clone(),
+                workflow_binding: workflow_binding.clone(),
+            });
+            let result = self
+                .spawn_with_workflow_binding(
+                    parent_connection_id,
+                    agent_type,
+                    working_dir,
+                    preferred_mode_id,
+                    preferred_config_values,
+                    workflow_binding,
                 )
                 .await;
             match result {

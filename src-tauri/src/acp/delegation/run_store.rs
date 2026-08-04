@@ -40,7 +40,7 @@ use crate::acp::delegation::workflow::admission::ensure_workflow_child_conversat
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
-    WorkflowTxnSideEffect,
+    WorkflowChildMcpBinding, WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -1865,6 +1865,9 @@ pub struct RunStore {
     /// BUSY). Observability only — does **not** gate promote admission.
     #[cfg(any(test, feature = "test-utils"))]
     identity_load_fail: std::sync::atomic::AtomicBool,
+    /// Test-only: fail the next committed workflow-binding read before spawn.
+    #[cfg(any(test, feature = "test-utils"))]
+    workflow_binding_load_fail: std::sync::atomic::AtomicBool,
     /// Test-only: fail after the run CAS write and before child projection.
     #[cfg(any(test, feature = "test-utils"))]
     terminal_transaction_fail: std::sync::atomic::AtomicBool,
@@ -1908,6 +1911,8 @@ impl RunStore {
             #[cfg(any(test, feature = "test-utils"))]
             identity_load_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
+            workflow_binding_load_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
             terminal_transaction_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             recovery_projection_fail: std::sync::atomic::AtomicBool::new(false),
@@ -1944,6 +1949,30 @@ impl RunStore {
 
     pub fn db(&self) -> &Arc<AppDatabase> {
         &self.db
+    }
+
+    /// Read the workflow identity committed alongside a reserving run before
+    /// the forced-child connection (and its MCP token) is launched.
+    pub async fn workflow_child_mcp_binding(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkflowChildMcpBinding>, String> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .workflow_binding_load_fail
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("injected workflow binding load failure".into());
+        }
+        crate::acp::delegation::workflow::load_workflow_child_mcp_binding(&self.db, task_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_workflow_binding_load(&self) {
+        self.workflow_binding_load_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-utils"))]

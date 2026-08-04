@@ -11,21 +11,26 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, JoinType, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    QuerySelect, Set, TransactionTrait,
 };
+use sha2::{Digest, Sha256};
 
 use crate::acp::delegation::card_summary::{
     card_summary_to_json, extract_card_summary_with_report_fallback,
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
 use crate::acp::delegation::runtime_stats::DelegationTouchedFile;
-use crate::acp::delegation::store::TaskStoreError;
+use crate::acp::delegation::store::{
+    classify_sqlite_transient, extract_sqlite_codes, TaskStoreError,
+};
+use crate::db::entities::delegation_completion_tool_intent;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
 use crate::db::entities::delegation_workflow_gate_settlement::{self, GateSettlementOutcome};
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding;
 use crate::db::entities::delegation_workflow_run_binding;
+use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
 use super::error::WorkflowAdmissionRecoveryError;
@@ -39,10 +44,12 @@ use super::project::evidence_from_run_and_binding;
 use super::recovery_policy::decide_workflow_recovery;
 use super::store::load_workflow_recovery_snapshot_conn;
 use super::types::{
-    DocumentGateKind, ManifestDocument, ParsedWorkUnitKey, PHASE_FINAL, PHASE_TASKS,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    AcceptedToolIntent, CompleteWorkRequest, DocumentGateKind, ManifestDocument, ParsedWorkUnitKey,
+    WorkflowChildMcpBinding, COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES,
+    PHASE_FINAL, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
+use super::{CompletionOutcome, CompletionRole};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -113,6 +120,294 @@ pub struct WorkflowAdmitInput<'a> {
     pub admission_class: AdmissionClass,
     /// Workspace path of the admitting run (for Final first-pass tip fallback).
     pub workspace_path: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompleteWorkError {
+    #[error("completion tool is not authorized for this live child")]
+    Unauthorized,
+    #[error("completion tool call id was reused with different arguments")]
+    CallConflict,
+    #[error("completion outcome is incompatible with the workflow node role")]
+    RoleMismatch,
+    #[error("invalid complete_work arguments: {0}")]
+    InvalidArguments(String),
+    #[error("completion intent persistence failed: {0}")]
+    Persistence(String),
+}
+
+impl CompleteWorkError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "completion_tool_unauthorized",
+            Self::CallConflict => "completion_tool_call_conflict",
+            Self::RoleMismatch => "completion_outcome_role_mismatch",
+            Self::InvalidArguments(_) => "invalid_arguments",
+            Self::Persistence(_) => "persistence",
+        }
+    }
+}
+
+fn completion_role(value: &str) -> Option<CompletionRole> {
+    match value {
+        "reviewer" => Some(CompletionRole::Reviewer),
+        "author" => Some(CompletionRole::Author),
+        "implementer" => Some(CompletionRole::Implementer),
+        "fixer" => Some(CompletionRole::Fixer),
+        _ => None,
+    }
+}
+
+fn completion_outcome(value: &str) -> Option<CompletionOutcome> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+}
+
+fn accepted_tool_intent(
+    model: delegation_completion_tool_intent::Model,
+) -> Result<AcceptedToolIntent, CompleteWorkError> {
+    let outcome = completion_outcome(&model.outcome).ok_or_else(|| {
+        CompleteWorkError::Persistence("stored completion outcome is invalid".into())
+    })?;
+    Ok(AcceptedToolIntent {
+        intent_id: model.intent_id,
+        task_id: model.task_id,
+        child_tool_call_id: model.child_tool_call_id,
+        accepted_ordinal: model.accepted_ordinal,
+        outcome,
+        summary: model.summary,
+        report_file: model.report_hint,
+    })
+}
+
+const COMPLETE_WORK_TXN_MAX_ATTEMPTS: u8 = 10;
+
+enum CompleteWorkAttemptError {
+    Contract(CompleteWorkError),
+    Database(sea_orm::DbErr),
+}
+
+fn completion_write_race(error: &sea_orm::DbErr) -> bool {
+    const SQLITE_CONSTRAINT: i32 = 19;
+    classify_sqlite_transient(error).is_some()
+        || extract_sqlite_codes(error).is_some_and(|codes| codes.primary == SQLITE_CONSTRAINT)
+}
+
+fn completion_retry_delay(attempt: u8) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(attempt) * 2)
+}
+
+/// Load the immutable workflow binding after run admission commits and before
+/// a forced child is launched. A missing run binding means a non-workflow
+/// child; a dangling committed workflow reference is corruption and fails closed.
+pub async fn load_workflow_child_mcp_binding(
+    db: &AppDatabase,
+    task_id: &str,
+) -> Result<Option<WorkflowChildMcpBinding>, CompleteWorkError> {
+    let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(&db.conn)
+        .await
+        .map_err(|error| CompleteWorkError::Persistence(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let Some(workflow) = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
+        .one(&db.conn)
+        .await
+        .map_err(|error| CompleteWorkError::Persistence(error.to_string()))?
+    else {
+        return Err(CompleteWorkError::Persistence(format!(
+            "workflow {} referenced by task {task_id} is missing",
+            binding.workflow_id
+        )));
+    };
+    Ok(Some(WorkflowChildMcpBinding {
+        task_id: task_id.to_string(),
+        workflow_id: binding.workflow_id,
+        protocol_version: workflow.completion_protocol_version,
+        node_id: binding.node_id,
+    }))
+}
+
+/// Re-authorize and persist one child completion call in a single write
+/// transaction. The request digest excludes all platform-owned identity.
+pub async fn accept_complete_work_txn(
+    db: &AppDatabase,
+    task_id: &str,
+    child_connection_id: &str,
+    child_tool_call_id: &str,
+    request: &CompleteWorkRequest,
+) -> Result<AcceptedToolIntent, CompleteWorkError> {
+    if child_tool_call_id.is_empty() {
+        return Err(CompleteWorkError::InvalidArguments(
+            "child tool call identity is empty".into(),
+        ));
+    }
+    if request
+        .summary
+        .as_ref()
+        .is_some_and(|value| value.len() > COMPLETE_WORK_SUMMARY_MAX_BYTES)
+        || request
+            .report_file
+            .as_ref()
+            .is_some_and(|value| value.len() > COMPLETE_WORK_REPORT_FILE_MAX_BYTES)
+    {
+        return Err(CompleteWorkError::InvalidArguments(
+            "complete_work string exceeds its schema bound".into(),
+        ));
+    }
+    let canonical = serde_json::to_vec(request)
+        .map_err(|error| CompleteWorkError::InvalidArguments(error.to_string()))?;
+    let request_digest = format!("{:x}", Sha256::digest(canonical));
+
+    for attempt in 1..=COMPLETE_WORK_TXN_MAX_ATTEMPTS {
+        match accept_complete_work_once(
+            db,
+            task_id,
+            child_connection_id,
+            child_tool_call_id,
+            request,
+            &request_digest,
+        )
+        .await
+        {
+            Ok(intent) => return Ok(intent),
+            Err(CompleteWorkAttemptError::Contract(error)) => return Err(error),
+            Err(CompleteWorkAttemptError::Database(error))
+                if completion_write_race(&error) && attempt < COMPLETE_WORK_TXN_MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(completion_retry_delay(attempt)).await;
+            }
+            Err(CompleteWorkAttemptError::Database(error)) => {
+                return Err(CompleteWorkError::Persistence(error.to_string()));
+            }
+        }
+    }
+
+    unreachable!("bounded complete_work retry loop always returns")
+}
+
+async fn accept_complete_work_once(
+    db: &AppDatabase,
+    task_id: &str,
+    child_connection_id: &str,
+    child_tool_call_id: &str,
+    request: &CompleteWorkRequest,
+    request_digest: &str,
+) -> Result<AcceptedToolIntent, CompleteWorkAttemptError> {
+    let txn = db
+        .conn
+        .begin()
+        .await
+        .map_err(CompleteWorkAttemptError::Database)?;
+
+    let result = async {
+        let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+            .one(&txn)
+            .await
+            .map_err(CompleteWorkAttemptError::Database)?
+            .ok_or(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::Unauthorized,
+            ))?;
+        if run.status != DelegationRunStatus::Running
+            || run.child_connection_id.as_deref() != Some(child_connection_id)
+        {
+            return Err(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::Unauthorized,
+            ));
+        }
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&txn)
+            .await
+            .map_err(CompleteWorkAttemptError::Database)?
+            .ok_or(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::Unauthorized,
+            ))?;
+        let workflow = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
+            .one(&txn)
+            .await
+            .map_err(CompleteWorkAttemptError::Database)?
+            .ok_or(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::Unauthorized,
+            ))?;
+        if workflow.completion_protocol_version != 2 {
+            return Err(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::Unauthorized,
+            ));
+        }
+        let node = delegation_workflow_node_binding::Entity::find_by_id((
+            binding.workflow_id.clone(),
+            binding.node_id.clone(),
+        ))
+        .one(&txn)
+        .await
+        .map_err(CompleteWorkAttemptError::Database)?
+        .ok_or(CompleteWorkAttemptError::Contract(
+            CompleteWorkError::Unauthorized,
+        ))?;
+        let role = completion_role(&node.role).ok_or(CompleteWorkAttemptError::Contract(
+            CompleteWorkError::Unauthorized,
+        ))?;
+        if !role.accepts(request.outcome) {
+            return Err(CompleteWorkAttemptError::Contract(
+                CompleteWorkError::RoleMismatch,
+            ));
+        }
+
+        if let Some(existing) = delegation_completion_tool_intent::Entity::find()
+            .filter(delegation_completion_tool_intent::Column::TaskId.eq(task_id.to_string()))
+            .filter(
+                delegation_completion_tool_intent::Column::ChildToolCallId
+                    .eq(child_tool_call_id.to_string()),
+            )
+            .one(&txn)
+            .await
+            .map_err(CompleteWorkAttemptError::Database)?
+        {
+            if existing.request_digest != request_digest {
+                return Err(CompleteWorkAttemptError::Contract(
+                    CompleteWorkError::CallConflict,
+                ));
+            }
+            return accepted_tool_intent(existing).map_err(CompleteWorkAttemptError::Contract);
+        }
+
+        let accepted_ordinal = delegation_completion_tool_intent::Entity::find()
+            .filter(delegation_completion_tool_intent::Column::TaskId.eq(task_id.to_string()))
+            .order_by_desc(delegation_completion_tool_intent::Column::AcceptedOrdinal)
+            .one(&txn)
+            .await
+            .map_err(CompleteWorkAttemptError::Database)?
+            .map_or(1, |row| row.accepted_ordinal + 1);
+        let model = delegation_completion_tool_intent::ActiveModel {
+            intent_id: Set(format!("platform:{task_id}:{accepted_ordinal}")),
+            task_id: Set(task_id.to_string()),
+            child_tool_call_id: Set(child_tool_call_id.to_string()),
+            accepted_ordinal: Set(accepted_ordinal),
+            outcome: Set(request.outcome.as_str().to_string()),
+            summary: Set(request.summary.clone()),
+            report_hint: Set(request.report_file.clone()),
+            request_digest: Set(request_digest.to_string()),
+            created_at: Set(Utc::now()),
+        }
+        .insert(&txn)
+        .await
+        .map_err(CompleteWorkAttemptError::Database)?;
+        accepted_tool_intent(model).map_err(CompleteWorkAttemptError::Contract)
+    }
+    .await;
+
+    match result {
+        Ok(intent) => {
+            txn.commit()
+                .await
+                .map_err(CompleteWorkAttemptError::Database)?;
+            Ok(intent)
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

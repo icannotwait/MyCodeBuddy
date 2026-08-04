@@ -62,6 +62,8 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::workflow::CompleteWorkRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acp::delegation::types::DelegationReturnWhen;
@@ -290,7 +292,8 @@ pub struct BrokerSettleWorkflowRequest {
 
 #[cfg(test)]
 mod workflow_v2_tests {
-    use super::BrokerSettleWorkflowRequest;
+    use super::{BrokerCompleteWorkRequest, BrokerSettleWorkflowRequest};
+    use crate::acp::delegation::workflow::{CompleteWorkRequest, CompletionOutcome};
     use serde_json::json;
 
     #[test]
@@ -324,6 +327,49 @@ mod workflow_v2_tests {
         assert!(round_trip.get("important_count").is_none());
         assert!(round_trip.get("minor_count").is_none());
     }
+
+    #[test]
+    fn complete_work_transport_contains_only_semantic_request_and_internal_identity() {
+        let request: BrokerCompleteWorkRequest = serde_json::from_value(json!({
+            "token": "secret",
+            "child_tool_call_id": "rpc:inc-4:9",
+            "request": {
+                "outcome": "approve",
+                "summary": "ready",
+                "report_file": "reports/review.md"
+            }
+        }))
+        .expect("semantic request decodes");
+        assert_eq!(request.request.outcome, CompletionOutcome::Approve);
+        let encoded = serde_json::to_value(request).expect("encode complete_work request");
+        for forbidden in [
+            "task_id",
+            "workflow_id",
+            "role",
+            "phase",
+            "gate",
+            "round",
+            "revision",
+            "digest",
+            "commit",
+            "tests",
+        ] {
+            assert!(encoded["request"].get(forbidden).is_none(), "{forbidden}");
+        }
+
+        assert!(serde_json::from_value::<CompleteWorkRequest>(json!({
+            "outcome": "approve",
+            "task_id": "forged"
+        }))
+        .is_err());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerCompleteWorkRequest {
+    pub token: String,
+    pub child_tool_call_id: String,
+    pub request: CompleteWorkRequest,
 }
 
 /// Load durable workflow recovery state. Backs `get_workflow_state`.
@@ -391,6 +437,7 @@ pub enum BrokerMessage {
     ReplyDelegation(BrokerReplyDelegationRequest),
     PublishWorkflow(BrokerPublishWorkflowRequest),
     SettleWorkflow(BrokerSettleWorkflowRequest),
+    CompleteWork(BrokerCompleteWorkRequest),
     GetWorkflowState(BrokerGetWorkflowStateRequest),
     RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest),
     RecoverWorkflow(BrokerRecoverWorkflowRequest),
@@ -572,6 +619,13 @@ pub async fn client_cancel_task_round_trip(
     req: &BrokerCancelTaskRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::CancelTask(req.clone())).await
+}
+
+pub async fn client_complete_work_round_trip(
+    socket_path: &str,
+    req: &BrokerCompleteWorkRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::CompleteWork(req.clone())).await
 }
 
 /// Dispatch a `check_user_feedback` query and read back the
