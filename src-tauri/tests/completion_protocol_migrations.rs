@@ -5,6 +5,7 @@ use codeg_lib::db::migration::Migrator;
 
 const MIGRATION_1: &str = "m20260804_000001_completion_protocol_and_run_evidence";
 const MIGRATION_2: &str = "m20260804_000002_completion_scope_and_gate_settlement";
+const PREVIOUS_MIGRATION: &str = "m20260731_000004_custom_agent_source";
 
 fn sql(text: impl Into<String>) -> Statement {
     Statement::from_string(DbBackend::Sqlite, text.into())
@@ -141,6 +142,8 @@ fn migration_1_is_registered_before_the_other_completion_migrations() {
         .map(|migration| migration.name())
         .collect();
     let first = names.iter().position(|name| *name == MIGRATION_1).unwrap();
+    let previous = first.checked_sub(1).and_then(|index| names.get(index));
+    assert_eq!(previous.copied(), Some(PREVIOUS_MIGRATION));
 
     // Task 1 ships before migration 2; once appended, it must be the successor.
     if let Some(next) = names.get(first + 1) {
