@@ -67,10 +67,22 @@ pub struct Model {
     pub structural_revision: i64,
     /// Design or plan fingerprint covered by this settlement (gate-kind-specific).
     pub content_fingerprint: String,
+    pub evidence_scope_digest: Option<String>,
+    pub gate_lineage: Option<String>,
+    pub review_round: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub required_node_set_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub required_evidence_task_ids_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub evidence_scope_digests_json: Option<String>,
+    pub localized_change_digest: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub plan_round_state_v2_json: Option<String>,
     pub outcome: GateSettlementOutcome,
-    pub critical_count: i64,
-    pub important_count: i64,
-    pub minor_count: i64,
+    pub critical_count: Option<i64>,
+    pub important_count: Option<i64>,
+    pub minor_count: Option<i64>,
     #[sea_orm(column_type = "Text")]
     pub summary: String,
     pub graph_revision_at_settle: i64,

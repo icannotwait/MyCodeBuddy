@@ -2761,6 +2761,7 @@ mod tests {
             summary_validated: Set(summary_validated),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.expect("insert rb");
     }
@@ -4055,9 +4056,9 @@ mod tests {
             structural_revision: Set(h1.structural_revision),
             content_fingerprint: Set(old_plan_fp.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
-            critical_count: Set(0),
-            important_count: Set(0),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(0)),
+            minor_count: Set(Some(0)),
             summary: Set("old approve".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
@@ -4101,6 +4102,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.unwrap();
 
@@ -4173,9 +4175,9 @@ mod tests {
             structural_revision: Set(h1.structural_revision),
             content_fingerprint: Set(plan_fp.clone()),
             outcome: Set(GateSettlementOutcome::ChangesRequested),
-            critical_count: Set(0),
-            important_count: Set(1),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(1)),
+            minor_count: Set(Some(0)),
             summary: Set("need changes".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
@@ -4218,6 +4220,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.unwrap();
 
@@ -4305,6 +4308,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.unwrap();
 
@@ -4317,9 +4321,9 @@ mod tests {
             structural_revision: Set(1),
             content_fingerprint: Set(design_fp.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
-            critical_count: Set(0),
-            important_count: Set(0),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(0)),
+            minor_count: Set(Some(0)),
             summary: Set("design ok".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
@@ -4380,6 +4384,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb2.insert(&db.conn).await.unwrap();
 

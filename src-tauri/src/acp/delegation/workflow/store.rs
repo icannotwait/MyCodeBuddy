@@ -1441,9 +1441,9 @@ pub async fn settle_workflow_gate_core(
                         structural_revision: Set(header.structural_revision),
                         content_fingerprint: Set(content_fp),
                         outcome: Set(req.outcome.clone()),
-                        critical_count: Set(critical_count),
-                        important_count: Set(important_count),
-                        minor_count: Set(minor_count),
+                        critical_count: Set(Some(critical_count)),
+                        important_count: Set(Some(important_count)),
+                        minor_count: Set(Some(minor_count)),
                         summary: Set(req.summary.clone()),
                         graph_revision_at_settle: Set(header.graph_revision),
                         review_scope: Set(plan_state.map(|state| plan_scope_to_db(state.scope))),
@@ -1475,6 +1475,7 @@ pub async fn settle_workflow_gate_core(
                         report_files_json: Set(report_files_json),
                         lineage_reset_authorization_id: Set(req.recovery_authorization_id.clone()),
                         created_at: Set(now),
+                        ..Default::default()
                     };
                     row.insert(txn).await.map_err(db_err)?;
 
@@ -2418,9 +2419,9 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
             gate_cycle: settlement.gate_cycle,
             outcome: settlement.outcome.clone(),
             content_fingerprint: settlement.content_fingerprint.clone(),
-            critical_count: settlement.critical_count,
-            important_count: settlement.important_count,
-            minor_count: settlement.minor_count,
+            critical_count: settlement.critical_count.unwrap_or(-1),
+            important_count: settlement.important_count.unwrap_or(-1),
+            minor_count: settlement.minor_count.unwrap_or(-1),
             next_action: settlement
                 .next_action
                 .as_ref()
@@ -2433,9 +2434,9 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
                 validate_plan_outcome(&settlement.outcome, &evidence.state).is_ok()
             }) && parsed_reviewers.is_some()
                 && ledger_valid
-                && settlement.critical_count >= 0
-                && settlement.important_count >= 0
-                && settlement.minor_count >= 0
+                && settlement.critical_count.is_some_and(|count| count >= 0)
+                && settlement.important_count.is_some_and(|count| count >= 0)
+                && settlement.minor_count.is_some_and(|count| count >= 0)
                 && settlement.next_action.is_some()
                 && settlement.covered_author_task_id.is_some()
                 && settlement.covered_plan_digest.is_some(),
@@ -4283,9 +4284,9 @@ fn settlement_payload_matches(
             important_count,
             minor_count,
         } => Ok(existing.review_scope.is_none()
-            && existing.critical_count == *critical_count
-            && existing.important_count == *important_count
-            && existing.minor_count == *minor_count),
+            && existing.critical_count == Some(*critical_count)
+            && existing.important_count == Some(*important_count)
+            && existing.minor_count == Some(*minor_count)),
         SettleGateEvidence::Plan(submission) => Ok(existing.review_scope.is_some()
             && load_persisted_plan_evidence(existing)?.submission == *submission),
     }
@@ -4303,6 +4304,15 @@ fn settle_result_from_row(
         .map(|_| load_persisted_plan_evidence(row))
         .transpose()?
         .map(|evidence| evidence.state);
+    let critical_count = row.critical_count.ok_or_else(|| {
+        WorkflowStoreError::Persistence("settlement is missing critical count".into())
+    })?;
+    let important_count = row.important_count.ok_or_else(|| {
+        WorkflowStoreError::Persistence("settlement is missing important count".into())
+    })?;
+    let minor_count = row.minor_count.ok_or_else(|| {
+        WorkflowStoreError::Persistence("settlement is missing minor count".into())
+    })?;
     Ok(SettleResult {
         workflow_id: row.workflow_id.clone(),
         gate_id: row.gate_id.clone(),
@@ -4312,9 +4322,9 @@ fn settle_result_from_row(
         outcome: row.outcome.clone(),
         idempotent_replay,
         plan_next_action: plan_state.as_ref().map(|state| state.next_action),
-        critical_count: row.critical_count,
-        important_count: row.important_count,
-        minor_count: row.minor_count,
+        critical_count,
+        important_count,
+        minor_count,
         stagnation_count: u32::try_from(row.stagnation_count).map_err(|_| {
             WorkflowStoreError::Persistence("invalid persisted Plan stagnation count".into())
         })?,
@@ -4342,9 +4352,9 @@ fn load_persisted_plan_evidence(
             WorkflowStoreError::Persistence(format!("serialize Plan reviewer set: {error}"))
         })?;
     let report_files_json = serialize_plan_report_files(&state.findings)?;
-    if row.critical_count != i64::from(state.critical_count)
-        || row.important_count != i64::from(state.important_count)
-        || row.minor_count != i64::from(state.minor_count)
+    if row.critical_count != Some(i64::from(state.critical_count))
+        || row.important_count != Some(i64::from(state.important_count))
+        || row.minor_count != Some(i64::from(state.minor_count))
         || row.stagnation_count != i64::from(state.stagnation_count)
         || row.rewrite_used != state.rewrite_used
         || row.next_action.as_ref().map(plan_next_action_from_db) != Some(state.next_action)
@@ -5659,6 +5669,7 @@ mod tests {
             summary_validated: Set(summary_validated),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.expect("insert run binding");
     }
@@ -6063,6 +6074,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&db.conn)
         .await
@@ -6854,6 +6866,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(old),
             updated_at: Set(old),
+            ..Default::default()
         };
         // Need a run row for terminal check.
         let child =
@@ -7759,9 +7772,9 @@ mod tests {
             structural_revision: Set(h1.structural_revision),
             content_fingerprint: Set(h1.plan_fingerprint.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
-            critical_count: Set(0),
-            important_count: Set(0),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(0)),
+            minor_count: Set(Some(0)),
             summary: Set("plan ok".into()),
             graph_revision_at_settle: Set(r1.graph_revision as i64),
             created_at: Set(now),
@@ -7899,9 +7912,9 @@ mod tests {
                 structural_revision: Set(h1.structural_revision),
                 content_fingerprint: Set(fp.into()),
                 outcome: Set(GateSettlementOutcome::Approved),
-                critical_count: Set(0),
-                important_count: Set(0),
-                minor_count: Set(0),
+                critical_count: Set(Some(0)),
+                important_count: Set(Some(0)),
+                minor_count: Set(Some(0)),
                 summary: Set(format!("{gate_id} ok")),
                 graph_revision_at_settle: Set(1),
                 created_at: Set(now),
@@ -8000,9 +8013,9 @@ mod tests {
                 structural_revision: Set(h1.structural_revision),
                 content_fingerprint: Set(fp.into()),
                 outcome: Set(GateSettlementOutcome::Approved),
-                critical_count: Set(0),
-                important_count: Set(0),
-                minor_count: Set(0),
+                critical_count: Set(Some(0)),
+                important_count: Set(Some(0)),
+                minor_count: Set(Some(0)),
                 summary: Set(format!("{gate_id} ok")),
                 graph_revision_at_settle: Set(1),
                 created_at: Set(now),
@@ -8091,9 +8104,9 @@ mod tests {
             structural_revision: Set(h1.structural_revision),
             content_fingerprint: Set(h1.plan_fingerprint.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
-            critical_count: Set(0),
-            important_count: Set(0),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(0)),
+            minor_count: Set(Some(0)),
             summary: Set("plan ok".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),

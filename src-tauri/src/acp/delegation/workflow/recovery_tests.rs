@@ -567,6 +567,7 @@ async fn insert_plan_run(
         summary_validated: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     }
     .insert(&db.conn)
     .await

@@ -1,5 +1,6 @@
 use sea_orm_migration::prelude::*;
 
+mod completion_rebuild;
 mod m20260211_000001_init;
 mod m20260219_000001_folder_command;
 mod m20260221_000001_folder_is_open;
@@ -48,6 +49,7 @@ mod m20260731_000002_custom_agent_skills;
 mod m20260731_000003_custom_agent_skills_dir;
 mod m20260731_000004_custom_agent_source;
 mod m20260804_000001_completion_protocol_and_run_evidence;
+mod m20260804_000002_completion_scope_and_gate_settlement;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -102,6 +104,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260731_000003_custom_agent_skills_dir::Migration),
             Box::new(m20260731_000004_custom_agent_source::Migration),
             Box::new(m20260804_000001_completion_protocol_and_run_evidence::Migration),
+            Box::new(m20260804_000002_completion_scope_and_gate_settlement::Migration),
         ]
     }
 }

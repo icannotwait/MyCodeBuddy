@@ -258,6 +258,7 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         summary_validated: Set(false),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     };
     rb.insert(conn).await.map_err(map_db)?;
 
@@ -2212,9 +2213,9 @@ mod tests {
             structural_revision: Set(header.structural_revision),
             content_fingerprint: Set(content_fp),
             outcome: Set(outcome.clone()),
-            critical_count: Set(0),
-            important_count: Set(0),
-            minor_count: Set(0),
+            critical_count: Set(Some(0)),
+            important_count: Set(Some(0)),
+            minor_count: Set(Some(0)),
             summary: Set("ok".into()),
             graph_revision_at_settle: Set(header.graph_revision),
             created_at: Set(now),
@@ -2333,6 +2334,7 @@ mod tests {
             summary_validated: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&db.conn)
         .await
@@ -5067,6 +5069,7 @@ mod tests {
             summary_validated: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.unwrap();
 
@@ -5345,6 +5348,7 @@ mod tests {
             summary_validated: Set(summary_validated),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         };
         rb.insert(&db.conn).await.expect("rb");
 

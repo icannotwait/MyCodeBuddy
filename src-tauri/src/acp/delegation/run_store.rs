@@ -5417,6 +5417,7 @@ mod tests {
             summary_validated: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&db.conn)
         .await
