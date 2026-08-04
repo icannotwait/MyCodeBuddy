@@ -122,6 +122,9 @@ pub async fn resolve_document(
     rel_path: &str,
     max_bytes: usize,
 ) -> Result<DocumentSha256Artifact, ArtifactError> {
+    if has_uri_scheme(rel_path) {
+        return Err(ArtifactError::Unavailable(ArtifactFailure::InvalidPath));
+    }
     let rel_path = normalize_rel_path(rel_path)
         .map_err(|_| ArtifactError::Unavailable(ArtifactFailure::InvalidPath))?;
     let workspace = workspace.to_path_buf();
@@ -133,6 +136,15 @@ pub async fn resolve_document(
     .map_err(|_| ArtifactError::Unavailable(ArtifactFailure::ReadFailed))??;
     let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     Ok(DocumentSha256Artifact { rel_path, digest })
+}
+
+fn has_uri_scheme(path: &str) -> bool {
+    let Some((scheme, _)) = path.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
 fn read_bounded_workspace_file(
@@ -184,7 +196,11 @@ fn read_bounded_workspace_file(
 pub async fn resolve_git_head_clean(workspace: &Path) -> Result<GitHeadV1Artifact, ArtifactError> {
     let head_output = run_git(workspace, &["rev-parse", "HEAD"]).await?;
     let head = normalize_git_head(&head_output)?;
-    let porcelain = run_git(workspace, &["status", "--porcelain"]).await?;
+    let porcelain = run_git(
+        workspace,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .await?;
     if !porcelain.is_empty() {
         return Err(ArtifactError::Unavailable(ArtifactFailure::DirtyWorktree));
     }
@@ -303,7 +319,8 @@ mod tests {
 
     use super::{
         resolve_document, resolve_final_delivery, resolve_git_head_clean,
-        resolve_producer_completion, resolve_reviewer_completion, ResolvedArtifact,
+        resolve_producer_completion, resolve_reviewer_completion, ArtifactFailure,
+        ResolvedArtifact,
     };
     use crate::acp::delegation::workflow::CompletionOutcome;
 
@@ -412,6 +429,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_resolver_rejects_uri_scheme_as_invalid_path() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(workspace.path().join("https:"))
+                .expect("create scheme-shaped directory");
+            fs::write(workspace.path().join("https:/artifact"), b"must not hash\n")
+                .expect("write scheme-shaped artifact");
+        }
+
+        assert_eq!(
+            resolve_document(workspace.path(), "https://artifact", 1024)
+                .await
+                .expect_err("URI scheme must fail before filesystem resolution")
+                .failure(),
+            Some(ArtifactFailure::InvalidPath)
+        );
+    }
+
+    #[tokio::test]
     async fn git_resolver_requires_head_and_completely_empty_porcelain() {
         let clean = GitFixture::new();
         assert_eq!(
@@ -460,6 +497,25 @@ mod tests {
                 .expect_err("missing HEAD must fail")
                 .code(),
             "completion_artifact_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_resolver_forces_untracked_visibility_over_repo_config() {
+        let repo = GitFixture::new();
+        git(
+            repo.path(),
+            &["config", "--local", "status.showUntrackedFiles", "no"],
+        );
+        fs::write(repo.path().join("hidden-untracked.txt"), b"still dirty\n")
+            .expect("write hidden untracked dirt");
+
+        assert_eq!(
+            resolve_git_head_clean(repo.path())
+                .await
+                .expect_err("repository config must not hide untracked dirt")
+                .failure(),
+            Some(ArtifactFailure::DirtyWorktree)
         );
     }
 
