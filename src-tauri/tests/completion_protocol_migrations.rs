@@ -9,6 +9,7 @@ use codeg_lib::db::migration::Migrator;
 
 const MIGRATION_1: &str = "m20260804_000001_completion_protocol_and_run_evidence";
 const MIGRATION_2: &str = "m20260804_000002_completion_scope_and_gate_settlement";
+const MIGRATION_3: &str = "m20260804_000003_completion_tool_intents_and_restart_link";
 const PREVIOUS_MIGRATION: &str = "m20260731_000004_custom_agent_source";
 const PRE_MANIFEST_V2_MIGRATION: &str = "m20260727_000002_workflow_gate_fingerprints";
 
@@ -564,6 +565,103 @@ async fn seed_legacy_workflow_and_run(
     .unwrap();
 }
 
+async fn seed_workflow(
+    db: &DatabaseConnection,
+    workflow_id: &str,
+    completion_protocol_version: i64,
+    completion_protocol_mode: &str,
+) {
+    db.execute(sql("INSERT OR IGNORE INTO folder \
+         (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
+         VALUES (1,'repo','C:/completion-protocol-fixture','2026-08-04','2026-08-04',\
+                 '2026-08-04',1,1,'inherit','regular')"))
+        .await
+        .unwrap();
+    let parent_conversation_id = db
+        .query_one(sql(
+            "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM conversation",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i32>("", "next_id")
+        .unwrap();
+    db.execute(sql(format!(
+        "INSERT INTO conversation (\
+           id,folder_id,agent_type,status,kind,message_count,title_locked,\
+           auto_title_finalized,parent_id,created_at,updated_at\
+         ) VALUES (\
+           {parent_conversation_id},1,'codex','completed','regular',0,0,0,NULL,\
+           '2026-08-04T00:00:00Z','2026-08-04T00:00:00Z'\
+         )"
+    )))
+    .await
+    .unwrap();
+    db.execute(sql(format!(
+        "INSERT INTO delegation_workflows (\
+           workflow_id,parent_conversation_id,workflow_kind,schema_version,\
+           active_manifest_revision,graph_revision,workflow_state,capability_version,\
+           publication_token,structural_revision,design_fingerprint,plan_fingerprint,\
+           completion_protocol_version,completion_protocol_mode,created_at,updated_at\
+         ) VALUES (\
+           '{workflow_id}',{parent_conversation_id},'brainstorm_to_delivery',1,1,1,\
+           'approved','workflow_manifest_v1','publication-{workflow_id}',1,\
+           'design-v1','plan-v1',{completion_protocol_version},\
+           '{completion_protocol_mode}','2026-08-04T00:00:00Z',\
+           '2026-08-04T00:00:00Z'\
+         )"
+    )))
+    .await
+    .unwrap();
+}
+
+async fn set_legacy_source(
+    db: &DatabaseConnection,
+    workflow_id: &str,
+    legacy_source_workflow_id: &str,
+) -> Result<(), DbErr> {
+    db.execute(sql(format!(
+        "UPDATE delegation_workflows \
+         SET legacy_source_workflow_id = '{legacy_source_workflow_id}' \
+         WHERE workflow_id = '{workflow_id}'"
+    )))
+    .await?;
+    Ok(())
+}
+
+async fn legacy_source(db: &DatabaseConnection, workflow_id: &str) -> Option<String> {
+    db.query_one(sql(format!(
+        "SELECT legacy_source_workflow_id FROM delegation_workflows \
+         WHERE workflow_id = '{workflow_id}'"
+    )))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "legacy_source_workflow_id")
+    .unwrap()
+}
+
+async fn insert_tool_intent(
+    db: &DatabaseConnection,
+    intent_id: &str,
+    task_id: &str,
+    child_tool_call_id: &str,
+    accepted_ordinal: i64,
+    request_digest: &str,
+) -> Result<(), DbErr> {
+    db.execute(sql(format!(
+        "INSERT INTO delegation_completion_tool_intents (\
+           intent_id,task_id,child_tool_call_id,accepted_ordinal,outcome,summary,\
+           report_hint,request_digest,created_at\
+         ) VALUES (\
+           '{intent_id}','{task_id}','{child_tool_call_id}',{accepted_ordinal},\
+           'done',NULL,NULL,'{request_digest}','2026-08-04T00:00:00Z'\
+         )"
+    )))
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn migration_1_labels_history_v1_without_touching_card_bytes() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -815,4 +913,83 @@ async fn migration_2_rolls_back_copy_schema_index_and_fk_failures() {
         );
         assert_foreign_key_check_clean(&db).await;
     }
+}
+
+#[tokio::test]
+async fn migration_3_enforces_tool_redelivery_and_one_restart_successor() {
+    let db = open_through(MIGRATION_2).await;
+    seed_workflow(&db, "legacy", 1, "v1").await;
+    seed_workflow(&db, "successor-a", 2, "v2_enforce").await;
+    seed_workflow(&db, "successor-b", 2, "v2_enforce").await;
+
+    apply_named(&db, MIGRATION_3).await.unwrap();
+
+    let intent_columns = table_columns(&db, "delegation_completion_tool_intents").await;
+    assert_eq!(
+        intent_columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.not_null))
+            .collect::<Vec<_>>(),
+        vec![
+            ("intent_id", true),
+            ("task_id", true),
+            ("child_tool_call_id", true),
+            ("accepted_ordinal", true),
+            ("outcome", true),
+            ("summary", false),
+            ("report_hint", false),
+            ("request_digest", true),
+            ("created_at", true),
+        ]
+    );
+    let intent_indexes = table_index_sql(&db, "delegation_completion_tool_intents").await;
+    assert!(intent_indexes
+        .get("idx_dcti_task_latest")
+        .and_then(Option::as_deref)
+        .is_some_and(|definition| definition.contains("accepted_ordinal DESC")));
+
+    set_legacy_source(&db, "successor-a", "legacy")
+        .await
+        .unwrap();
+    assert!(set_legacy_source(&db, "successor-b", "legacy")
+        .await
+        .is_err());
+
+    insert_tool_intent(&db, "intent-1", "task-1", "rpc:inc:7", 1, "sha256:a")
+        .await
+        .unwrap();
+    assert!(
+        insert_tool_intent(&db, "intent-2", "task-1", "rpc:inc:7", 2, "sha256:a")
+            .await
+            .is_err()
+    );
+    assert!(
+        insert_tool_intent(&db, "intent-3", "task-1", "rpc:inc:8", 1, "sha256:b")
+            .await
+            .is_err()
+    );
+    insert_tool_intent(&db, "intent-4", "task-1", "rpc:inc:8", 2, "sha256:b")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn migration_3_leaves_existing_workflows_without_restart_links() {
+    let db = open_through(MIGRATION_2).await;
+    seed_workflow(&db, "existing", 1, "v1").await;
+
+    apply_named(&db, MIGRATION_3).await.unwrap();
+
+    assert_eq!(legacy_source(&db, "existing").await, None);
+}
+
+#[test]
+fn migration_3_is_registered_immediately_after_migration_2() {
+    let names: Vec<String> = Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    let second = names.iter().position(|name| name == MIGRATION_2).unwrap();
+    let third = names.iter().position(|name| name == MIGRATION_3).unwrap();
+    assert_eq!(third, second + 1);
 }

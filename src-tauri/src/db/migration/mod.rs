@@ -50,6 +50,7 @@ mod m20260731_000003_custom_agent_skills_dir;
 mod m20260731_000004_custom_agent_source;
 mod m20260804_000001_completion_protocol_and_run_evidence;
 mod m20260804_000002_completion_scope_and_gate_settlement;
+mod m20260804_000003_completion_tool_intents_and_restart_link;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -105,6 +106,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260731_000004_custom_agent_source::Migration),
             Box::new(m20260804_000001_completion_protocol_and_run_evidence::Migration),
             Box::new(m20260804_000002_completion_scope_and_gate_settlement::Migration),
+            Box::new(m20260804_000003_completion_tool_intents_and_restart_link::Migration),
         ]
     }
 }

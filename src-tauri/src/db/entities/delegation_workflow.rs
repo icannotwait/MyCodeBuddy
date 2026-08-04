@@ -53,6 +53,7 @@ pub struct Model {
     pub block_source_manifest_revision: Option<i64>,
     pub completion_protocol_version: i64,
     pub completion_protocol_mode: CompletionProtocolMode,
+    pub legacy_source_workflow_id: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

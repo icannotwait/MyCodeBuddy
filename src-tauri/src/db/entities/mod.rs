@@ -10,6 +10,7 @@ pub mod chat_channel_thread_binding;
 pub mod conversation;
 pub mod custom_agent;
 pub mod delegation_attention_request;
+pub mod delegation_completion_tool_intent;
 pub mod delegation_continuation;
 pub mod delegation_final_findings_package;
 pub mod delegation_lineage_budget;

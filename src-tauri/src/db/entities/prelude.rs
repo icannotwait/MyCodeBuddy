@@ -10,6 +10,7 @@ pub use super::chat_channel_sender_context::Entity as ChatChannelSenderContext;
 pub use super::chat_channel_thread_binding::Entity as ChatChannelThreadBinding;
 pub use super::conversation::Entity as Conversation;
 pub use super::custom_agent::Entity as CustomAgent;
+pub use super::delegation_completion_tool_intent::Entity as DelegationCompletionToolIntent;
 pub use super::delegation_continuation::Entity as DelegationContinuation;
 pub use super::delegation_final_findings_package::Entity as DelegationFinalFindingsPackage;
 pub use super::delegation_lineage_budget::Entity as DelegationLineageBudget;
