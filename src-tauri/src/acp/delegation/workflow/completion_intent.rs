@@ -162,6 +162,8 @@ pub enum CompletionDiagnosticCode {
     CandidateLimitExceeded,
     ReportTooLarge,
     UnsafeReportPath,
+    #[serde(rename = "completion_report_unavailable")]
+    ReportUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,12 +209,18 @@ pub struct CompletionReportCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionReportReadFailure {
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionResolverInput {
     pub role: CompletionRole,
     pub tool_intents: Vec<CompletionToolIntent>,
     pub final_assistant_text: String,
     pub report_candidates: Vec<CompletionReportCandidate>,
     pub touched_report_candidates: Vec<CompletionReportCandidate>,
+    pub report_read_failures: Vec<CompletionReportReadFailure>,
 }
 
 pub fn build_conclusion_suffix(role: CompletionRole) -> &'static str {
@@ -236,7 +244,7 @@ pub fn resolve_completion_intent(input: &CompletionResolverInput) -> CompletionR
             report_file: selected
                 .report_file
                 .as_deref()
-                .and_then(|path| normalize_report_path(path, false)),
+                .and_then(|path| normalize_report_path(path, true)),
             excerpt: selected.outcome.as_str().to_string(),
             role_compatible: input.role.accepts(selected.outcome),
         };
@@ -306,7 +314,9 @@ pub fn resolve_completion_intent(input: &CompletionResolverInput) -> CompletionR
 }
 
 fn resolve_reports(input: &CompletionResolverInput) -> CompletionResolution {
-    let supplied_count = input.report_candidates.len() + input.touched_report_candidates.len();
+    let supplied_count = input.report_candidates.len()
+        + input.touched_report_candidates.len()
+        + input.report_read_failures.len();
     if supplied_count > MAX_REPORT_CANDIDATES {
         return needs_decision(
             CompletionIntentReason::Missing,
@@ -323,6 +333,20 @@ fn resolve_reports(input: &CompletionResolverInput) -> CompletionResolution {
     let mut seen = HashSet::new();
     let mut matches = Vec::new();
     let mut diagnostics = Vec::new();
+    for failure in &input.report_read_failures {
+        push_diagnostic(
+            &mut diagnostics,
+            CompletionDiagnostic {
+                channel: CompletionIntentSource::Report,
+                code: CompletionDiagnosticCode::ReportUnavailable,
+                report_file: failure
+                    .path
+                    .as_deref()
+                    .and_then(|path| normalize_report_path(path, true)),
+                excerpt: None,
+            },
+        );
+    }
     for report in input
         .report_candidates
         .iter()
@@ -1203,6 +1227,7 @@ mod tests {
             final_assistant_text: text.into(),
             report_candidates: Vec::new(),
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         }
     }
 
@@ -1378,6 +1403,7 @@ mod tests {
             final_assistant_text: "Conclusion: block\nConclusion: request changes".into(),
             report_candidates: vec![report("a.md", "Conclusion: block")],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         let intent = resolved(&input);
         assert_eq!(intent.outcome, CompletionOutcome::Approve);
@@ -1392,6 +1418,7 @@ mod tests {
             final_assistant_text: "Conclusion: done".into(),
             report_candidates: Vec::new(),
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         let CompletionResolution::NeedsDecision { reason_code, .. } =
             resolve_completion_intent(&input)
@@ -1412,6 +1439,7 @@ mod tests {
                 report("b.md", "Conclusion: request changes"),
             ],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         let CompletionResolution::NeedsDecision {
             reason_code,
@@ -1448,6 +1476,7 @@ mod tests {
                 report("b.md", "Conclusion: block"),
             ],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         let CompletionResolution::NeedsDecision {
             reason_code,
@@ -1461,6 +1490,62 @@ mod tests {
         assert_eq!(bounded_candidates.len(), 2);
         assert_eq!(bounded_candidates[0].outcome, CompletionOutcome::Approve);
         assert_eq!(bounded_candidates[1].outcome, CompletionOutcome::Block);
+    }
+
+    #[test]
+    fn unavailable_report_candidate_produces_a_typed_bounded_diagnostic() {
+        let input = CompletionResolverInput {
+            role: CompletionRole::Reviewer,
+            tool_intents: Vec::new(),
+            final_assistant_text: String::new(),
+            report_candidates: Vec::new(),
+            touched_report_candidates: Vec::new(),
+            report_read_failures: vec![CompletionReportReadFailure {
+                path: Some("reports/unavailable.md".into()),
+            }],
+        };
+
+        let CompletionResolution::NeedsDecision {
+            reason_code,
+            diagnostics,
+            ..
+        } = resolve_completion_intent(&input)
+        else {
+            panic!("an unavailable-only report set must need a decision");
+        };
+        assert_eq!(reason_code, CompletionIntentReason::Missing);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            CompletionDiagnosticCode::ReportUnavailable
+        );
+        assert_eq!(
+            serde_json::to_value(diagnostics[0].code).unwrap(),
+            serde_json::json!("completion_report_unavailable")
+        );
+        assert_eq!(
+            diagnostics[0].report_file.as_deref(),
+            Some("reports/unavailable.md")
+        );
+        assert_eq!(diagnostics[0].excerpt, None);
+    }
+
+    #[test]
+    fn unavailable_report_does_not_block_a_valid_report_conclusion() {
+        let result = resolved(&CompletionResolverInput {
+            role: CompletionRole::Reviewer,
+            tool_intents: Vec::new(),
+            final_assistant_text: String::new(),
+            report_candidates: vec![report("reports/valid.md", "Conclusion: approve")],
+            touched_report_candidates: Vec::new(),
+            report_read_failures: vec![CompletionReportReadFailure {
+                path: Some("reports/unavailable.markdown".into()),
+            }],
+        });
+
+        assert_eq!(result.outcome, CompletionOutcome::Approve);
+        assert_eq!(result.report_file.as_deref(), Some("reports/valid.md"));
+        assert_eq!(result.source, CompletionIntentSource::Report);
     }
 
     #[test]
@@ -1522,6 +1607,7 @@ mod tests {
             final_assistant_text: "terminal summary\nConclusion: blocked".into(),
             report_candidates: vec![report("reports/tool.md", "Conclusion: blocked")],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         let tool_result = resolved(&tool_input);
         assert_eq!(tool_result.summary.as_deref(), Some("tool summary"));
@@ -1544,6 +1630,7 @@ mod tests {
             final_assistant_text: String::new(),
             report_candidates: vec![report_candidate],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         });
         assert_eq!(report_result.summary.as_deref(), Some("report summary"));
 
@@ -1566,10 +1653,31 @@ mod tests {
             final_assistant_text: "terminal summary\nConclusion: blocked".into(),
             report_candidates: vec![report_candidate],
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         });
 
         assert_eq!(result.outcome, CompletionOutcome::Done);
         assert_eq!(result.summary.as_deref(), Some("terminal summary"));
+    }
+
+    #[test]
+    fn selected_tool_preserves_markdown_report_path_and_summary() {
+        let mut tool_intent = tool(1, CompletionOutcome::Done);
+        tool_intent.report_file = Some("reports/tool.markdown".into());
+        let mut report_candidate = report("reports/tool.markdown", "Conclusion: blocked");
+        report_candidate.summary = Some("markdown report summary".into());
+        let result = resolved(&CompletionResolverInput {
+            role: CompletionRole::Implementer,
+            tool_intents: vec![tool_intent],
+            final_assistant_text: String::new(),
+            report_candidates: vec![report_candidate],
+            touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
+        });
+
+        assert_eq!(result.outcome, CompletionOutcome::Done);
+        assert_eq!(result.report_file.as_deref(), Some("reports/tool.markdown"));
+        assert_eq!(result.summary.as_deref(), Some("markdown report summary"));
     }
 
     #[test]
@@ -1590,6 +1698,7 @@ mod tests {
             final_assistant_text: String::new(),
             report_candidates: Vec::new(),
             touched_report_candidates: Vec::new(),
+            report_read_failures: Vec::new(),
         };
         for candidate in [
             report("../outside.md", "Conclusion: approve"),

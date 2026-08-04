@@ -23,8 +23,8 @@ pub use admission::{
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
     CompletionDiagnosticCode, CompletionIntent, CompletionIntentReason, CompletionIntentSource,
-    CompletionOutcome, CompletionReportCandidate, CompletionResolution, CompletionResolverInput,
-    CompletionRole, CompletionToolIntent,
+    CompletionOutcome, CompletionReportCandidate, CompletionReportReadFailure,
+    CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
