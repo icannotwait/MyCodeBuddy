@@ -1,6 +1,6 @@
 //! Manifest document validation (A1/A12/A15 + graph integrity).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::key::{build_work_unit_key, normalize_rel_path, validate_agent_type};
 use super::types::{
@@ -230,6 +230,27 @@ pub fn validate_manifest_document(
         task_policies,
         task_count: task_indices.len(),
     })
+}
+
+/// Return the unique active Task-policy indices used to bind Plan material.
+pub fn active_plan_material_task_indices(
+    manifest: &NormalizedManifest,
+) -> Result<BTreeSet<u32>, WorkflowError> {
+    let mut indices = BTreeSet::new();
+    for policy in &manifest.task_policies {
+        if policy.task_index == 0 {
+            return Err(WorkflowError::InvalidTaskIndex(
+                "Plan material Task indices are 1-based".into(),
+            ));
+        }
+        if !indices.insert(policy.task_index) {
+            return Err(WorkflowError::DuplicateId(format!(
+                "task_policy:{}",
+                policy.task_index
+            )));
+        }
+    }
+    Ok(indices)
 }
 
 fn normalize_document_ref(doc: Option<&DocumentRef>) -> Result<Option<DocumentRef>, WorkflowError> {

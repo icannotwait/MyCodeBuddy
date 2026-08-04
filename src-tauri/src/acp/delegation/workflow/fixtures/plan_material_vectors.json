@@ -1,0 +1,147 @@
+{
+  "schema": "PlanMaterialVectorsV1",
+  "cases": [
+    {
+      "file": "basic.md",
+      "referenced_tasks": [1, 2],
+      "keys": [
+        "plan.front_matter",
+        "plan.global_constraints",
+        "plan.global_preamble",
+        "plan.policies_fingerprint",
+        "task.1",
+        "task.2"
+      ],
+      "selector": {
+        "kind": "keys",
+        "keys": [
+          "plan.front_matter",
+          "plan.global_*",
+          "plan.policies_fingerprint",
+          "task.1"
+        ]
+      },
+      "selected_keys": [
+        "plan.front_matter",
+        "plan.global_constraints",
+        "plan.global_preamble",
+        "plan.policies_fingerprint",
+        "task.1"
+      ],
+      "expected_projection": {
+        "schema": "PlanMaterialSchemaV1",
+        "materials": {
+          "plan.front_matter": {
+            "normalized_body": "---\ntitle: Material Plan\nowner: team\n---\n",
+            "body_sha256": "sha256:25f73bf820a90aed5df1ad9e0e2920fd961bbf2781a238c9bf222555deba5a0a"
+          },
+          "plan.global_constraints": {
+            "normalized_body": "- Keep APIs stable.\n- Run tests.\n",
+            "body_sha256": "sha256:25dcd7c263226d10672c6599ab168c7f491329b9d2de3bcca31ca1c9e6b329c6"
+          },
+          "plan.global_preamble": {
+            "normalized_body": "---\ntitle: Material Plan\nowner: team\n---\n\nShared preamble.\n- applies everywhere\n\n### Global Constraints\n- Keep APIs stable.\n- Run tests.\n",
+            "body_sha256": "sha256:b9b987d4f47d722dc8768397dd6fe9a39ddbdccc69a3cf05bcc32420433e8ace"
+          },
+          "plan.policies_fingerprint": {
+            "normalized_body": "{\"referenced_task_indices\":[1,2]}\n",
+            "body_sha256": "sha256:2f563201b206f8c18a46d98d3c3c0e29106f3ce38e64cc4b4ccca59535066066"
+          },
+          "task.1": {
+            "normalized_body": "Task one intro.\n#### Details\n```rust\nfn sample() {\n    println!(\"ok\");\n}\n```\n",
+            "body_sha256": "sha256:2a2e3196ca86bcbed15fa7b8660558ac7b1bd65f579f699714280d82c6af2cc5"
+          },
+          "task.2": {
+            "normalized_body": "Task two body.\n### Checklist\n- one\n- two\n\n| Key | Owner |\n| --- | --- |\n| selector | platform |\n",
+            "body_sha256": "sha256:0dc2afbd6b0d8fba535c9640b67fee2ebef20e5a578fe11b1eb38c37d3183276"
+          }
+        },
+        "task_identities": {
+          "1": {
+            "identity": {
+              "schema": "PlanMaterialSchemaV1",
+              "task_index": 1,
+              "body_sha256": "sha256:2a2e3196ca86bcbed15fa7b8660558ac7b1bd65f579f699714280d82c6af2cc5"
+            },
+            "identity_sha256": "sha256:8360c5c74765825e3a0dd2cbfecaa0c49467abf656b35e91bcc875cced49703c"
+          },
+          "2": {
+            "identity": {
+              "schema": "PlanMaterialSchemaV1",
+              "task_index": 2,
+              "body_sha256": "sha256:0dc2afbd6b0d8fba535c9640b67fee2ebef20e5a578fe11b1eb38c37d3183276"
+            },
+            "identity_sha256": "sha256:ca608be67f8662912236a94529af4916f002365de5f7fa4d1bfc9123e8d758f9"
+          }
+        }
+      },
+      "expected_error": null
+    },
+    {
+      "file": "duplicate-task.md",
+      "referenced_tasks": [1],
+      "keys": [],
+      "selector": null,
+      "selected_keys": [],
+      "expected_projection": null,
+      "expected_error": "duplicate_task"
+    },
+    {
+      "file": "normalization.md",
+      "referenced_tasks": [1],
+      "keys": [
+        "plan.front_matter",
+        "plan.global_constraints",
+        "plan.global_preamble",
+        "plan.policies_fingerprint",
+        "task.1"
+      ],
+      "selector": {
+        "kind": "all"
+      },
+      "selected_keys": [
+        "plan.front_matter",
+        "plan.global_constraints",
+        "plan.global_preamble",
+        "plan.policies_fingerprint",
+        "task.1"
+      ],
+      "expected_projection": {
+        "schema": "PlanMaterialSchemaV1",
+        "materials": {
+          "plan.front_matter": {
+            "normalized_body": "---\ntitle: Caf\u00e9\n---\n",
+            "body_sha256": "sha256:cb114d18f328e503ea7de1569bcfde42661a735d7ffebbf2835fba42230c570c"
+          },
+          "plan.global_constraints": {
+            "normalized_body": "Caf\u00e9 policy.\n",
+            "body_sha256": "sha256:9ed36e9d8f3fb5b2641f29f16823ad790ac7467de6f444155ba8122a1b8cdf25"
+          },
+          "plan.global_preamble": {
+            "normalized_body": "---\ntitle: Caf\u00e9\n---\n\nPreamble Caf\u00e9.\n\n## global constraints\nCaf\u00e9 policy.\n",
+            "body_sha256": "sha256:e1dd1a3c397196a0c2001cef8ad9f7843dc0d6bb3dcf57e1b0259e678ff7595b"
+          },
+          "plan.policies_fingerprint": {
+            "normalized_body": "{\"referenced_task_indices\":[1]}\n",
+            "body_sha256": "sha256:50ff055cd4b18a7b49f36900eacd2188ec07bfd6d8ae0fcfd8bd7879e5bda04a"
+          },
+          "task.1": {
+            "normalized_body": "Caf\u00e9 line.\nlast\n",
+            "body_sha256": "sha256:56176893992a0fd9fd151627ce371999657d40f1cf3b916323dc549bbadb4428"
+          }
+        },
+        "task_identities": {
+          "1": {
+            "identity": {
+              "schema": "PlanMaterialSchemaV1",
+              "task_index": 1,
+              "body_sha256": "sha256:56176893992a0fd9fd151627ce371999657d40f1cf3b916323dc549bbadb4428"
+            },
+            "identity_sha256": "sha256:84b8162f66b92c9f81a7a3007ef2dac5f5fc79e596faafe74b946d5acc5d8cbc"
+          }
+        }
+      },
+      "expected_error": null
+    }
+  ]
+}

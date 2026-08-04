@@ -1,5 +1,7 @@
 //! Shared types for workflow key derivation and manifest validation.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -396,6 +398,61 @@ impl DocumentGateKind {
 pub struct DocumentRef {
     pub rel_path: String,
     pub digest: String,
+}
+
+/// Exact canonical Task specification identity payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpecificationIdentityV1 {
+    pub schema: String,
+    pub task_index: u32,
+    pub body_sha256: String,
+}
+
+/// Freshness identity for one Plan Reviewer's selected material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSubjectIdentityV2 {
+    pub plan_rel_path: String,
+    pub gate_lineage: String,
+    pub material_selector_digest: String,
+    pub selected_material_digest: String,
+}
+
+/// Platform-authored proof for a same-lineage localized Plan correction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanLocalizedChangeV2 {
+    pub schema: String,
+    pub prior_plan_digest: String,
+    pub current_plan_digest: String,
+    pub changed_keys: BTreeSet<String>,
+    pub classifier_version: String,
+    pub authorization_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanLineageResetReason {
+    UnparseableMaterial,
+    AmbiguousKeySet,
+    SharedMaterialChanged,
+    PolicyOrRouteChanged,
+    MissingAuthorization,
+    SelectorMismatch,
+    UncoveredChange,
+}
+
+/// Conservative result of comparing two complete Plan material snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanChangeClassification {
+    Localized {
+        change: PlanLocalizedChangeV2,
+        corrective_reviewer_node_ids: BTreeSet<String>,
+    },
+    NewLineage {
+        changed_keys: BTreeSet<String>,
+        reason: PlanLineageResetReason,
+        reviewer_cohort_node_ids: BTreeSet<String>,
+    },
 }
 
 /// Phase entry in a manifest document.

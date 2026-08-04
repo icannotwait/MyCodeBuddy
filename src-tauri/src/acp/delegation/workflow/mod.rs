@@ -8,6 +8,7 @@ pub mod error;
 pub mod events;
 pub mod gates;
 pub mod key;
+pub mod plan_material;
 pub mod plan_review;
 pub mod project;
 pub mod recovery_policy;
@@ -51,6 +52,15 @@ pub use gates::{
     ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
+pub use plan_material::{
+    authorize_localized_plan_change, bind_plan_material, classify_plan_change,
+    derive_holistic_full_cohort_selector, derive_plan_reviewer_selector,
+    localized_plan_change_context, parse_plan_material, plan_publication_material_decision,
+    plan_publication_requires_new_lineage, select_corrective_reviewers, BoundPlanMaterialMap,
+    MaterialSelectorV1, PlanLocalizedChangeAuthorizationV1, PlanMaterialChangeInputV1,
+    PlanMaterialEntryV1, PlanMaterialError, PlanMaterialErrorKind, PlanMaterialMap,
+    PlanMaterialSchemaV1, PlanPublicationMaterialDecisionV1,
+};
 pub use plan_review::{
     derive_plan_review_round, FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewError,
     PlanReviewNextAction, PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope,
@@ -77,7 +87,8 @@ pub use state_dto::{
     INDEX_MAX_NODES,
 };
 pub use store::{
-    append_state_only_revision_txn, append_workflow_block_revision_txn, get_workflow_state_core,
+    append_state_only_revision_txn, append_workflow_block_revision_txn,
+    estimated_plan_publication_material_decision, get_workflow_state_core,
     guard_final_delivery_core, load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
     recover_workflow_core, settle_workflow_gate_core, FinalDeliveryGuardRequest,
     FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,

@@ -43,6 +43,10 @@ use super::events::{
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, RequiredReviewerEvidence,
 };
+use super::plan_material::{
+    plan_publication_material_decision, PlanMaterialError, PlanMaterialMap,
+    PlanPublicationMaterialDecisionV1,
+};
 use super::plan_review::{
     derive_plan_review_round, PlanFindingUpdate, PlanReviewError, PlanReviewNextAction,
     PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
@@ -68,6 +72,155 @@ use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
 pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v2";
+
+/// Store-facing validated input for a future durable Plan publication transition.
+pub fn estimated_plan_publication_material_decision(
+    prior_manifest: &NormalizedManifest,
+    prior: &PlanMaterialMap,
+    current_manifest: &NormalizedManifest,
+    current: &PlanMaterialMap,
+) -> Result<PlanPublicationMaterialDecisionV1, PlanMaterialError> {
+    plan_publication_material_decision(prior_manifest, prior, current_manifest, current)
+}
+
+#[cfg(test)]
+mod plan_material_publication_tests {
+    use super::super::plan_material::parse_plan_material;
+    use super::super::types::{
+        DocumentGateKind, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy, ManifestTaskRisk,
+        ManifestTaskRoute, ManifestWorkflowState, NormalizedGate, NormalizedManifest,
+        NormalizedNode, ResolutionMode, TaskRiskLevel, MANIFEST_SCHEMA_VERSION,
+        TASK_RISK_POLICY_VERSION, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    };
+    use super::estimated_plan_publication_material_decision;
+
+    #[test]
+    fn estimated_plan_publication_resets_for_derived_selector_set_changes() {
+        let prior_manifest = manifest(false);
+        let current_manifest = manifest(true);
+        let plan = parse_plan_material(b"## Task 1\nbody\n", &[1]).unwrap();
+
+        let unchanged = estimated_plan_publication_material_decision(
+            &prior_manifest,
+            &plan,
+            &prior_manifest,
+            &plan,
+        )
+        .unwrap();
+        assert!(!unchanged.requires_new_lineage());
+        assert!(!unchanged.selector_sets_changed());
+
+        let changed = estimated_plan_publication_material_decision(
+            &prior_manifest,
+            &plan,
+            &current_manifest,
+            &plan,
+        )
+        .unwrap();
+        assert!(changed.requires_new_lineage());
+        assert!(changed.selector_sets_changed());
+        assert_eq!(changed.prior_material().body("task.1"), Some("body\n"));
+        assert_eq!(changed.current_material().body("task.1"), Some("body\n"));
+    }
+
+    fn manifest(add_second_plan_reviewer: bool) -> NormalizedManifest {
+        let mut nodes = vec![
+            node(
+                "plan-reviewer-codex",
+                "plan",
+                ManifestNodeRole::Reviewer,
+                "codex",
+                None,
+            ),
+            node(
+                "task-1-implementer",
+                "tasks",
+                ManifestNodeRole::Implementer,
+                "codex",
+                Some(1),
+            ),
+            node(
+                "task-1-codex",
+                "tasks",
+                ManifestNodeRole::Reviewer,
+                "codex",
+                Some(1),
+            ),
+        ];
+        let mut cohort = vec!["plan-reviewer-codex".to_string()];
+        if add_second_plan_reviewer {
+            nodes.push(node(
+                "plan-reviewer-grok",
+                "plan",
+                ManifestNodeRole::Reviewer,
+                "grok",
+                None,
+            ));
+            cohort.push("plan-reviewer-grok".into());
+        }
+        NormalizedManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.into(),
+            plan_target_rel_path: "docs/plan.md".into(),
+            risk_policy_version: TASK_RISK_POLICY_VERSION.into(),
+            workflow_id: Some("workflow-1".into()),
+            expected_manifest_revision: Some(1),
+            publication_token: "publication-1".into(),
+            workflow_state: ManifestWorkflowState::Estimated,
+            design: None,
+            plan: None,
+            phases: Vec::new(),
+            nodes,
+            edges: Vec::new(),
+            gates: vec![NormalizedGate {
+                id: "plan-gate".into(),
+                reviewer_cohort_node_ids: cohort.clone(),
+                required_reviewer_node_ids: cohort,
+                resolution_mode: ResolutionMode::ParentAdjudication,
+                gate_kind: DocumentGateKind::Plan,
+            }],
+            task_policies: vec![ManifestTaskPolicy {
+                task_index: 1,
+                risk: ManifestTaskRisk {
+                    level: TaskRiskLevel::High,
+                    hard_triggers: Vec::new(),
+                    soft_signals: Vec::new(),
+                    score: 0,
+                    reason: "fixture".into(),
+                },
+                route: ManifestTaskRoute {
+                    implementer_node_id: "task-1-implementer".into(),
+                    reviewer_node_ids: vec!["task-1-codex".into()],
+                },
+                allow_noop_verification: false,
+            }],
+            task_count: 1,
+        }
+    }
+
+    fn node(
+        id: &str,
+        phase_id: &str,
+        role: ManifestNodeRole,
+        agent_type: &str,
+        task_index: Option<u32>,
+    ) -> NormalizedNode {
+        NormalizedNode {
+            id: id.into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(phase_id.into()),
+            role: Some(role),
+            agent_type: Some(agent_type.into()),
+            profile_id: None,
+            task_index,
+            work_unit_key: Some(format!("test|{id}")),
+            deps: Vec::new(),
+            required: true,
+            node_outcome: None,
+            title: None,
+        }
+    }
+}
 
 const MAX_PERSISTED_PLAN_EVIDENCE_BYTES: usize = 1024 * 1024;
 
