@@ -361,6 +361,22 @@ struct SummaryMeta {
     updated_at: Option<DateTime<Utc>>,
 }
 
+/// Cheap archive peek for workflow cards: `(model, reasoning_effort)` from
+/// `summary.json` only (no updates.jsonl parse). `session_id` is the Grok
+/// session uuid stored as the child conversation's `external_id`.
+pub fn peek_session_model_and_effort(session_id: &str) -> (Option<String>, Option<String>) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return (None, None);
+    }
+    let parser = GrokParser::new();
+    let Some(session_dir) = parser.find_session_dir(session_id) else {
+        return (None, None);
+    };
+    let meta = read_summary_json(&session_dir);
+    (meta.model, meta.reasoning_effort)
+}
+
 fn read_summary_json(session_dir: &Path) -> SummaryMeta {
     let Ok(raw) = fs::read_to_string(session_dir.join("summary.json")) else {
         return SummaryMeta::default();

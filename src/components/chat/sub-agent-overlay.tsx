@@ -365,6 +365,8 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const [graphExpanded, setGraphExpanded] = useState(false)
   const listRef = useRef<HTMLDivElement | null>(null)
   const sizeRef = useRef(size)
+  /** One graphless discovery refresh per open cycle (see effect below). */
+  const graphlessVisibleRefreshRef = useRef<number | null>(null)
 
   const storeSnapshot = useWorkflowGraphStore((s) =>
     conversationId != null && conversationId > 0
@@ -523,6 +525,32 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     (showDelegationRows ? delegationGroups.length : 0) +
     (showCodegActivityRows ? codegActivities.length : 0) +
     nativeActivities.length
+
+  // Force one discovery refresh when the panel is actually visible (sessions /
+  // activities) but the workflow segment has not appeared yet.
+  //
+  // Why: SubAgentOverlay always mounts with defaultExpanded and acquires
+  // overlay interest even while `return null` (zero sessions + no graph). That
+  // first activation may fetch null before the workflow is published. When
+  // sub-agents later appear the interest lease is already held, so activation
+  // reconciliation does not re-run — leave the sessions-only chip stuck until
+  // a missed event or the 10-minute fallback. Re-pull once on first visible
+  // graphless open so a durable workflow (manifest / observed graph) shows up.
+  useEffect(() => {
+    if (
+      !overlayInterestActive ||
+      conversationId == null ||
+      conversationId <= 0
+    ) {
+      graphlessVisibleRefreshRef.current = null
+      return
+    }
+    if (hasGraph) return
+    if (count === 0) return
+    if (graphlessVisibleRefreshRef.current === conversationId) return
+    graphlessVisibleRefreshRef.current = conversationId
+    void useWorkflowGraphStore.getState().refresh(conversationId)
+  }, [conversationId, overlayInterestActive, hasGraph, count])
 
   const phaseRail = useMemo(() => (graph ? buildPhaseRail(graph) : []), [graph])
   const currentNodes = useMemo(
@@ -739,7 +767,10 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                 >
                   {currentNodes.slice(0, 2).map((node) => {
                     const openable = canOpenWorkflowNode(node)
-                    const title = node.title?.trim() || node.node_id
+                    const title =
+                      node.title?.trim() ||
+                      node.summary?.trim() ||
+                      node.node_id
                     const content = (
                       <>
                         <WorkflowStatusIcon visualStatus={node.status} />

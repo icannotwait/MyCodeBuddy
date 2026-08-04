@@ -45,6 +45,10 @@ const ALLOWLISTED_CONFIG_KEYS: &[&str] = &[
     "modelId",
     "thinking",
     "reasoning",
+    // Grok ACP config-option id (see connection::GROK_EFFORT_OPTION_ID).
+    // Without this, live `preferred_config_values["reasoning_effort"]` is
+    // stripped from the durable snapshot and workflow cards never see effort.
+    "reasoning_effort",
     "effort",
     "approval_policy",
     "sandbox_mode",
@@ -270,6 +274,36 @@ mod tests {
             LAUNCH_SNAPSHOT_VERSION
         );
         assert!(!built.snapshot.route_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn allowlist_keeps_grok_reasoning_effort() {
+        let mut raw = BTreeMap::new();
+        raw.insert("model".into(), "grok-4.5".into());
+        raw.insert("reasoning_effort".into(), "high".into());
+        raw.insert("api_key".into(), "sk-secret".into());
+        let filtered = allowlist_config_values(&raw);
+        assert_eq!(
+            filtered.get("reasoning_effort").map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(filtered.get("model").map(String::as_str), Some("grok-4.5"));
+        assert!(!filtered.contains_key("api_key"));
+
+        let built = build_live_launch_config(
+            AgentType::Grok,
+            None,
+            "/tmp/ws",
+            None,
+            raw,
+        );
+        assert!(
+            built.snapshot.config_values_json.contains("reasoning_effort"),
+            "durable snapshot must keep Grok effort key: {}",
+            built.snapshot.config_values_json
+        );
+        assert!(built.snapshot.config_values_json.contains("high"));
+        assert!(!built.snapshot.config_values_json.contains("sk-secret"));
     }
 
     #[test]

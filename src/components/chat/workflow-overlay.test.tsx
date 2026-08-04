@@ -20,7 +20,12 @@ import {
 } from "@/lib/workflow-graph-store"
 
 vi.mock("@/hooks/use-delegated-sub-session", () => ({
-  useDelegatedSubSession: vi.fn(() => null),
+  useDelegatedSubSession: vi.fn(() => ({
+    binding: undefined,
+    detail: null,
+    loading: false,
+    error: null,
+  })),
 }))
 
 vi.mock("@/contexts/acp-connections-context", async () => {
@@ -60,6 +65,8 @@ function node(
     phase_id: null,
     role: null,
     agent_type: null,
+    model: null,
+    effort: null,
     profile_id: null,
     task_index: null,
     task_risk_level: null,
@@ -77,6 +84,16 @@ function node(
     latest_task_id: null,
     latest_child_conversation_id: null,
     latest_run_status: null,
+    started_at: null,
+    finished_at: null,
+    elapsed_completed_ms: null,
+    tool_call_count: null,
+    edit_tool_call_count: null,
+    touched_file_count: null,
+    touched_files_truncated: false,
+    additions: null,
+    deletions: null,
+    line_counts_complete: null,
     summary: null,
     is_observed: false,
     retained_observed: false,
@@ -169,6 +186,8 @@ function fullVocabularyGraph(): WorkflowGraphSnapshot {
         phase_id: "tasks",
         role: "implementer",
         agent_type: "codex",
+        model: "gpt-5.2",
+        effort: "high",
         task_index: 1,
         status: "completed",
         title: "Full vocab implementer",
@@ -179,6 +198,17 @@ function fullVocabularyGraph(): WorkflowGraphSnapshot {
         round_count: 3,
         active_child_generation: 1,
         gate_cycle: 2,
+        started_at: "2026-07-19T00:00:00.000Z",
+        finished_at: "2026-07-19T00:05:30.000Z",
+        // Two finished generations: 5m30s + 2m = 7m30s total.
+        elapsed_completed_ms: 7 * 60_000 + 30_000,
+        tool_call_count: 12,
+        edit_tool_call_count: 3,
+        touched_file_count: 4,
+        touched_files_truncated: false,
+        additions: 10,
+        deletions: 2,
+        line_counts_complete: true,
         task_risk_level: "high",
         task_risk_reason_codes: ["security_trust_boundary", "shared_interface"],
         required_reviewer_count: 1,
@@ -377,6 +407,63 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(
       screen.getByRole("button", { name: "Expand workflow graph" })
     ).toBeInTheDocument()
+  })
+
+  it("force-refreshes once when sessions appear while still graphless", async () => {
+    // Simulate the empty-mount path: interest spent a null discovery fetch
+    // before any sub-agent rows exist. When sessions later open the panel,
+    // force one more snapshot pull so a published workflow is not stuck behind
+    // the 10-minute overlay-only fallback.
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={95}
+        workflowGraph={null}
+        defaultExpanded
+      />
+    )
+
+    await waitFor(() => expect(getWorkflowGraphSnapshot).toHaveBeenCalled())
+    const callsAfterEmptyMount = vi.mocked(getWorkflowGraphSnapshot).mock.calls
+      .length
+    expect(screen.queryByTestId("sub-agent-overlay")).not.toBeInTheDocument()
+
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(skeletonGraph())
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[
+            {
+              origin: "native",
+              authoritative: false,
+              platform: "codex",
+              operation: "spawn",
+              observed_status: "running",
+              task_id: "agent-native-1",
+              started_at: "2026-08-04T00:00:00.000Z",
+              updated_at: "2026-08-04T00:00:00.000Z",
+            },
+          ]}
+          conversationId={95}
+          workflowGraph={null}
+          defaultExpanded
+        />
+      </NextIntlClientProvider>
+    )
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sub-agent-overlay")).toHaveAttribute(
+        "data-has-workflow",
+        "true"
+      )
+    )
+    expect(
+      vi.mocked(getWorkflowGraphSnapshot).mock.calls.length
+    ).toBeGreaterThan(callsAfterEmptyMount)
+    expect(screen.getByTestId("workflow-phase-rail")).toBeInTheDocument()
   })
 
   it("mounts with graph even when session/activity count is zero", () => {
@@ -654,14 +741,18 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     const estimated = screen.getByTestId("workflow-graph-node-n-est")
     expect(estimated).toHaveAttribute("data-estimated", "true")
     expect(estimated).toHaveAttribute("data-openable", "false")
-    expect(estimated).toBeDisabled()
     expect(estimated).toHaveAttribute("aria-disabled", "true")
     expect(estimated).toHaveAttribute("title", "Estimated — no session yet")
+    expect(
+      screen.queryByTestId("workflow-graph-node-open-n-est")
+    ).not.toBeInTheDocument()
 
     const observed = screen.getByTestId("workflow-graph-node-n-req")
     expect(observed).toHaveAttribute("data-estimated", "false")
     expect(observed).toHaveAttribute("data-openable", "true")
-    expect(observed).not.toBeDisabled()
+    expect(
+      screen.getByTestId("workflow-graph-node-open-n-req")
+    ).toBeInTheDocument()
   })
 
   it("defaults empty lanes collapsed and non-empty plan expanded with toggle", () => {
@@ -883,7 +974,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
   })
 
-  it("exposes B12 fields in node detail", () => {
+  it("shows run counts on the node card without expanding a detail panel", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
@@ -894,19 +985,11 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       />
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    fireEvent.click(screen.getByTestId("workflow-graph-node-n-req"))
 
     const nodeEl = screen.getByTestId("workflow-graph-node-n-req")
-    const wrapper = nodeEl.parentElement
-    expect(wrapper).not.toBeNull()
-    expect(
-      within(wrapper!).getByTestId("workflow-node-detail")
-    ).toBeInTheDocument()
-    expect(screen.getByTestId("workflow-node-b12")).toBeInTheDocument()
-    expect(screen.getByTestId("workflow-node-run-count")).toHaveTextContent("1")
-    expect(
-      screen.getByTestId("workflow-node-replacement-count")
-    ).toHaveTextContent("0")
+    expect(nodeEl).toHaveTextContent("Runs 1")
+    expect(nodeEl).toHaveTextContent("Role: reviewer")
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
   })
 
   it("covers the full graph vocabulary in one acceptance fixture", () => {
@@ -939,11 +1022,32 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(implementer).toHaveTextContent("Completed")
     expect(implementer).toHaveTextContent("Role: implementer")
     expect(implementer).toHaveTextContent("Agent: codex")
+    expect(implementer).toHaveTextContent("Model: gpt-5.2")
+    expect(implementer).toHaveTextContent("Effort: high")
     expect(implementer).toHaveTextContent("Runs 2")
     expect(implementer).toHaveTextContent("Replacements 1")
     expect(implementer.querySelector("[data-node-title]")).toHaveClass(
       "line-clamp-2"
     )
+    expect(implementer.querySelector("[data-node-title]")).toHaveTextContent(
+      "Full vocab implementer"
+    )
+    // Line 2 is the title row (not role / agent chrome).
+    const titleEl = implementer.querySelector("[data-node-title]")
+    expect(titleEl).toBeTruthy()
+    expect(titleEl?.textContent?.trim().length).toBeGreaterThan(0)
+    const ops = screen.getByTestId("workflow-graph-node-ops-task-impl")
+    // Lineage sum (elapsed_completed_ms), not only the latest run window.
+    expect(ops).toHaveTextContent("7m 30s")
+    expect(ops).toHaveTextContent("12 tool uses")
+    expect(ops).toHaveTextContent("4 files")
+    expect(ops).toHaveTextContent("+10 -2")
+    expect(ops.textContent).toMatch(/\|/)
+    expect(implementer).toHaveClass("rounded-lg", "border")
+    expect(
+      screen.getByTestId("workflow-graph-node-open-task-impl")
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
 
     expect(
       within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
@@ -961,33 +1065,11 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
     expect(optionalReviewer).toHaveTextContent("Optional")
     expect(optionalReviewer).toHaveTextContent("Estimated")
+    expect(
+      screen.queryByTestId("workflow-graph-node-open-task-review-opt")
+    ).not.toBeInTheDocument()
 
-    fireEvent.click(implementer)
-    const detail = screen.getByTestId("workflow-node-detail")
-    expect(detail.parentElement?.contains(implementer)).toBe(true)
-    expect(screen.getByTestId("workflow-node-b12")).toBeInTheDocument()
-    expect(screen.getByTestId("workflow-node-run-count")).toHaveTextContent("2")
-    expect(
-      screen.getByTestId("workflow-node-active-generation")
-    ).toHaveTextContent("1")
-    expect(
-      screen.getByTestId("workflow-node-replacement-count")
-    ).toHaveTextContent("1")
-    expect(screen.getByTestId("workflow-node-gate-cycle")).toHaveTextContent(
-      "2"
-    )
-    expect(screen.getByTestId("workflow-node-round-count")).toHaveTextContent(
-      "3"
-    )
-    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
-      "High risk"
-    )
-    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
-      "Security or trust boundary"
-    )
-    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
-      "Shared interface"
-    )
+    // Free-form risk evidence stays off the card surface.
     expect(screen.queryByText(/security-boundary\.ts/i)).not.toBeInTheDocument()
     expect(
       screen.queryByText(/Touches D:\/private\/project/i)
@@ -1036,7 +1118,8 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       within(tasksLane).getByTestId("workflow-task-reviewer-count-1")
     ).toHaveTextContent("1 / 1")
     expect(screen.getByTestId("workflow-graph-node-task-impl")).toHaveClass(
-      "h-auto"
+      "h-auto",
+      "rounded-lg"
     )
     expect(
       screen
@@ -1047,10 +1130,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       "ms-6",
       "border-s"
     )
-    fireEvent.click(screen.getByTestId("workflow-graph-node-task-impl"))
-    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
-      "Normal risk"
-    )
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
   })
 
   it("renders a high-risk reviewer fan-out and updates returned count", () => {
@@ -1105,7 +1185,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     ).toHaveTextContent("2 / 2")
   })
 
-  it("shows localized risk metadata without free-form evidence paths", () => {
+  it("does not surface free-form risk evidence paths on node cards", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
@@ -1116,17 +1196,8 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       />
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    fireEvent.click(screen.getByTestId("workflow-graph-node-task-impl"))
 
-    expect(screen.getByTestId("workflow-node-risk-level")).toHaveTextContent(
-      "High risk"
-    )
-    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
-      "Security or trust boundary"
-    )
-    expect(screen.getByTestId("workflow-node-risk-reasons")).toHaveTextContent(
-      "Shared interface"
-    )
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
     expect(screen.queryByText(/security-boundary\.ts/i)).not.toBeInTheDocument()
     expect(
       screen.queryByText(/Touches D:\/private\/project/i)
@@ -1164,8 +1235,10 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       within(tasksLane).getByTestId("workflow-task-reviewers-1")
     ).toHaveClass("ms-6", "border-s")
 
-    const reviewer = screen.getByTestId("workflow-graph-node-task-review-codex")
-    reviewer.focus()
+    const openReviewer = screen.getByTestId(
+      "workflow-graph-node-open-task-review-codex"
+    )
+    openReviewer.focus()
     await user.keyboard("{Enter}")
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
       expect.objectContaining({ childConversationId: 93 })
@@ -1222,7 +1295,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     }
   })
 
-  it("renders node detail inline under the selected row and hides with lane collapse", () => {
+  it("opens observed sessions from the eye control and never mounts node detail", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[]}
@@ -1233,22 +1306,18 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       />
     )
     fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
-    fireEvent.click(screen.getByTestId("workflow-graph-node-n-req"))
 
-    const detail = screen.getByTestId("workflow-node-detail")
-    const panel = screen.getByTestId("workflow-graph-panel")
-    const nodeButton = screen.getByTestId("workflow-graph-node-n-req")
-    expect(detail).toBeInTheDocument()
-    expect(panel.contains(detail)).toBe(true)
-    expect(detail.parentElement?.contains(nodeButton)).toBe(true)
-    // Detail must not be a direct child of the panel (footer placement).
-    expect(detail.parentElement).not.toBe(panel)
-
-    fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
+    expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId("workflow-graph-node-open-n-req"))
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({ childConversationId: 77 })
+    )
     expect(screen.queryByTestId("workflow-node-detail")).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId("workflow-lane-toggle-plan"))
-    expect(screen.getByTestId("workflow-node-detail")).toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-graph-node-n-req")
+    ).not.toBeInTheDocument()
   })
 
   it("holds overlay interest while open and expanded interest only for the full graph", () => {

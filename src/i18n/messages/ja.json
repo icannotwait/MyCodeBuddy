@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "役割: {role}",
         "agentLabel": "エージェント: {agent}",
+        "modelLabel": "モデル: {model}",
+        "effortLabel": "エフォート: {effort}",
         "currentWork": "現在: {title}",
         "noSessions": "サブエージェントのセッションはまだありません",
         "graphTitle": "ワークフローグラフ",

@@ -3,16 +3,30 @@
 /**
  * Expanded workflow graph: collapsible phase lanes with adaptive node rows.
  * Observed nodes open via child-tab path; estimated nodes are non-actionable.
+ * Node rows mirror SubAgentOverlayRow card chrome (no per-node detail expand).
  */
 
-import { memo, useCallback, useMemo, useState } from "react"
-import { ArrowRightIcon, ChevronDownIcon } from "lucide-react"
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react"
+import { ArrowRightIcon, ChevronDownIcon, Eye } from "lucide-react"
 import { useTranslations } from "next-intl"
 
-import { WorkflowNodeDetail } from "@/components/chat/workflow-node-detail"
+import { AgentIcon } from "@/components/agent-icon"
 import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
 import { phaseProgressFragments } from "@/components/chat/workflow-phase-rail"
 import { Badge } from "@/components/ui/badge"
+import { getAgentLabel } from "@/lib/custom-agents"
+import {
+  computeDelegationElapsedMs,
+  type EditRollupViewModel,
+} from "@/lib/delegation-card"
+import { formatElapsedLabel } from "@/lib/format-elapsed"
+import { formatConversationTitle } from "@/lib/conversation-title"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import {
   buildPhaseRail,
@@ -27,6 +41,15 @@ import type {
   WorkflowNodeSnapshot,
 } from "@/lib/types"
 import { cn } from "@/lib/utils"
+
+/** Line-2 title: session/task text first; never leave blank when summary exists. */
+function nodeDisplayTitle(node: WorkflowNodeSnapshot): string {
+  const fromTitle = formatConversationTitle(node.title).trim()
+  if (fromTitle) return fromTitle
+  const fromSummary = formatConversationTitle(node.summary).trim()
+  if (fromSummary) return fromSummary
+  return node.node_id
+}
 
 const PHASE_ORDER: PhaseRailKind[] = ["design", "plan", "tasks", "final"]
 
@@ -43,15 +66,194 @@ function laneDefaults(phases: readonly PhaseRailItem[]): LaneBooleanMap {
   ) as LaneBooleanMap
 }
 
+function isAgentType(value: string | null | undefined): value is AgentType {
+  return typeof value === "string" && value.length > 0
+}
+
+function isLiveNodeStatus(status: WorkflowNodeSnapshot["status"]): boolean {
+  return status === "running" || status === "reserving"
+}
+
+/**
+ * 1s tick while any live node needs a live elapsed clock.
+ * Snapshot value must only change on interval fire — never return Date.now()
+ * from getSnapshot (that would re-render every read).
+ */
+let liveClockMs = 0
+const liveClockListeners = new Set<() => void>()
+let liveClockInterval: number | null = null
+
+function ensureLiveClock() {
+  if (liveClockInterval != null) return
+  liveClockMs = Date.now()
+  liveClockInterval = window.setInterval(() => {
+    liveClockMs = Date.now()
+    for (const listener of liveClockListeners) listener()
+  }, 1000)
+}
+
+function releaseLiveClock() {
+  if (liveClockListeners.size > 0) return
+  if (liveClockInterval != null) {
+    window.clearInterval(liveClockInterval)
+    liveClockInterval = null
+  }
+}
+
+function subscribeLiveClock(onStoreChange: () => void): () => void {
+  liveClockListeners.add(onStoreChange)
+  ensureLiveClock()
+  return () => {
+    liveClockListeners.delete(onStoreChange)
+    releaseLiveClock()
+  }
+}
+
+function useNowMs(active: boolean): number {
+  return useSyncExternalStore(
+    active ? subscribeLiveClock : () => () => {},
+    // Terminal-only views never need a wall clock (finished − started).
+    // Live views read the interval-backed snapshot (updated once per second).
+    () => (active ? liveClockMs : 0),
+    () => 0
+  )
+}
+
+type EditSegmentTranslator = {
+  (
+    key: "editFilesCount" | "editCallsDetected",
+    values: { count: number }
+  ): string
+  (key: "editFilesTruncated", values: { count: number }): string
+  (key: "lineTotals", values: { additions: number; deletions: number }): string
+}
+
+function editRollupFromNode(node: WorkflowNodeSnapshot): EditRollupViewModel {
+  const fileCount = node.touched_file_count
+  if (fileCount != null && fileCount > 0) {
+    const additions = node.additions ?? null
+    const deletions = node.deletions ?? null
+    const showLineTotals =
+      node.line_counts_complete === true &&
+      additions != null &&
+      deletions != null
+    return {
+      mode: "files",
+      fileCount,
+      fileCountTruncated: node.touched_files_truncated === true,
+      additions,
+      deletions,
+      showLineTotals,
+    }
+  }
+  const editCalls = node.edit_tool_call_count
+  if (editCalls != null && editCalls > 0) {
+    return { mode: "editCalls", editCallCount: editCalls }
+  }
+  return { mode: "omit" }
+}
+
+function buildEditSegment(
+  editRollup: EditRollupViewModel,
+  t: EditSegmentTranslator
+): string | null {
+  if (editRollup.mode === "files") {
+    const countLabel = editRollup.fileCountTruncated
+      ? t("editFilesTruncated", { count: editRollup.fileCount })
+      : t("editFilesCount", { count: editRollup.fileCount })
+    if (
+      editRollup.showLineTotals &&
+      editRollup.additions != null &&
+      editRollup.deletions != null
+    ) {
+      return `${countLabel} ${t("lineTotals", {
+        additions: editRollup.additions,
+        deletions: editRollup.deletions,
+      })}`
+    }
+    return countLabel
+  }
+  if (editRollup.mode === "editCalls") {
+    return t("editCallsDetected", { count: editRollup.editCallCount })
+  }
+  return null
+}
+
+type LiveStatsTranslator = {
+  (key: "toolUseCount", values: { count: number }): string
+} & Parameters<typeof formatElapsedLabel>[1]
+
+function totalElapsedMs(
+  node: WorkflowNodeSnapshot,
+  nowMs: number
+): number | null {
+  const completed =
+    typeof node.elapsed_completed_ms === "number" &&
+    Number.isFinite(node.elapsed_completed_ms) &&
+    node.elapsed_completed_ms >= 0
+      ? node.elapsed_completed_ms
+      : 0
+
+  // Live latest run: add wall-clock since its start. Prior finished generations
+  // are already in `elapsed_completed_ms`.
+  if (isLiveNodeStatus(node.status)) {
+    const live = computeDelegationElapsedMs({
+      lifecycleStatus: "running",
+      startedAt: node.started_at ?? null,
+      finishedAt: null,
+      completedDurationMs: null,
+      nowMs,
+    })
+    if (live == null && completed === 0) return null
+    return completed + (live ?? 0)
+  }
+
+  // Terminal: prefer the lineage sum (includes latest when finished).
+  if (completed > 0) return completed
+
+  // Single-run / legacy snapshots without elapsed_completed_ms.
+  return computeDelegationElapsedMs({
+    lifecycleStatus: "ok",
+    startedAt: node.started_at ?? null,
+    finishedAt: node.finished_at ?? null,
+    completedDurationMs: null,
+    nowMs,
+  })
+}
+
+function buildOperationalLine(
+  node: WorkflowNodeSnapshot,
+  nowMs: number,
+  tLive: LiveStatsTranslator,
+  tEdit: EditSegmentTranslator
+): string | null {
+  const segments: string[] = []
+  const elapsedMs = totalElapsedMs(node, nowMs)
+  if (elapsedMs != null) {
+    segments.push(formatElapsedLabel(elapsedMs, tLive))
+  }
+  if (node.tool_call_count != null) {
+    segments.push(tLive("toolUseCount", { count: node.tool_call_count }))
+  }
+  const editSegment = buildEditSegment(editRollupFromNode(node), tEdit)
+  if (editSegment) segments.push(editSegment)
+  return segments.length > 0 ? segments.join(" | ") : null
+}
+
 export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   snapshot,
   className,
 }: WorkflowGraphPanelProps) {
   const t = useTranslations("Folder.chat.workflowGraph")
-  const [selectedId, setSelectedId] = useState<string | null>(
-    snapshot.current_node_ids[0] ?? snapshot.nodes[0]?.node_id ?? null
-  )
+  const tLive = useTranslations("Folder.chat.liveTurnStats")
+  const tDel = useTranslations("Folder.chat.delegation")
   const [dependenciesExpanded, setDependenciesExpanded] = useState(false)
+
+  const needsLiveClock = useMemo(
+    () => snapshot.nodes.some((node) => isLiveNodeStatus(node.status)),
+    [snapshot.nodes]
+  )
+  const nowMs = useNowMs(needsLiveClock)
 
   const lanes = useMemo(() => {
     const byKind = new Map(
@@ -88,10 +290,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   const nodeTitles = useMemo(
     () =>
       new Map(
-        snapshot.nodes.map((node) => [
-          node.node_id,
-          node.title?.trim() || node.node_id,
-        ])
+        snapshot.nodes.map((node) => [node.node_id, nodeDisplayTitle(node)])
       ),
     [snapshot.nodes]
   )
@@ -105,23 +304,24 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
     })
   }, [])
 
-  const onActivateNode = useCallback(
-    (node: WorkflowNodeSnapshot) => {
-      setSelectedId(node.node_id)
-      if (canOpenWorkflowNode(node)) {
-        void onOpenSession(node)
-      }
-    },
-    [onOpenSession]
-  )
-
-  const renderNodeControl = (
+  const renderNodeRow = (
     node: WorkflowNodeSnapshot,
-    laneKind: PhaseRailKind
+    laneKind: PhaseRailKind,
+    reviewerWrapperTestId?: string
   ) => {
     const estimated = isEstimatedNode(node)
     const openable = canOpenWorkflowNode(node)
-    const selectedNode = node.node_id === selectedId
+    // Prefer real task/session title; never leave line 2 blank when summary exists.
+    const title = nodeDisplayTitle(node)
+    const agentType = isAgentType(node.agent_type) ? node.agent_type : null
+    const model = node.model?.trim() || null
+    const effort = node.effort?.trim() || null
+    const operationalLine = buildOperationalLine(
+      node,
+      nowMs,
+      tLive as unknown as LiveStatsTranslator,
+      tDel as unknown as EditSegmentTranslator
+    )
     const accessibleName = [
       t(`phase.${laneKind}`),
       node.task_index != null
@@ -129,111 +329,132 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
         : null,
       node.role,
       node.agent_type,
+      model,
+      effort,
+      operationalLine,
       t(`nodeStatus.${node.status}`),
       node.title,
     ]
       .filter(Boolean)
       .join(", ")
 
+    // Role is the card identity (workflow "角色卡片"); fall back to agent/title.
+    const primaryLabel = node.role
+      ? t("roleLabel", { role: node.role })
+      : agentType
+        ? (getAgentLabel(agentType) ?? agentType)
+        : title
+
+    // Line 3: agent type / model / effort (not the title — title is line 2).
+    const agentBits = [
+      agentType ? t("agentLabel", { agent: agentType }) : null,
+      model ? t("modelLabel", { model }) : null,
+      effort ? t("effortLabel", { effort }) : null,
+      !node.required ? t("optionalReviewer") : null,
+    ].filter(Boolean) as string[]
+
     return (
-      <button
-        type="button"
-        data-testid={`workflow-graph-node-${node.node_id}`}
-        data-status={node.status}
-        data-estimated={estimated ? "true" : "false"}
-        data-openable={openable ? "true" : "false"}
-        aria-label={accessibleName}
-        aria-current={selectedNode ? "true" : undefined}
-        aria-disabled={estimated ? "true" : undefined}
-        disabled={estimated}
-        title={
-          estimated
-            ? t("estimatedNonActionable")
-            : openable
-              ? t("openSession")
-              : undefined
-        }
-        onClick={() => {
-          if (estimated) return
-          onActivateNode(node)
-        }}
-        className={cn(
-          "flex h-auto w-full min-w-0 flex-col justify-center gap-0.5 rounded border px-1.5 py-1.5 text-start text-[11px] transition-colors",
-          selectedNode
-            ? "border-primary bg-primary/10"
-            : "border-border/70 bg-background/60 hover:bg-muted/50",
-          estimated &&
-            "cursor-default border-dashed text-muted-foreground opacity-80"
-        )}
+      <div
+        key={node.node_id}
+        data-testid={reviewerWrapperTestId}
+        className="min-w-0"
       >
-        <span className="flex w-full min-w-0 items-start gap-1.5">
-          <WorkflowStatusIcon
-            visualStatus={node.status}
-            className="mt-0.5 size-3.5"
-          />
-          <span
-            data-node-title
-            className="min-w-0 flex-1 line-clamp-2 font-medium"
-          >
-            {node.title?.trim() || node.node_id}
-          </span>
-          <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9px]">
-            {t(`nodeStatus.${node.status}`)}
-          </Badge>
-        </span>
-        <span className="flex w-full min-w-0 flex-wrap items-center gap-1 ps-5">
-          {node.role && (
-            <Badge variant="outline" className="h-4 px-1 text-[9px]">
-              {t("roleLabel", { role: node.role })}
-            </Badge>
+        <div
+          data-testid={`workflow-graph-node-${node.node_id}`}
+          data-status={node.status}
+          data-estimated={estimated ? "true" : "false"}
+          data-openable={openable ? "true" : "false"}
+          aria-label={accessibleName}
+          aria-disabled={estimated ? "true" : undefined}
+          title={estimated ? t("estimatedNonActionable") : undefined}
+          className={cn(
+            "flex h-auto w-full min-w-0 items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5",
+            estimated &&
+              "cursor-default border-dashed text-muted-foreground opacity-80"
           )}
-          {node.agent_type && (
-            <Badge variant="outline" className="h-4 px-1 text-[9px]">
-              {t("agentLabel", { agent: node.agent_type })}
-            </Badge>
+        >
+          <div className="min-w-0 flex-1 space-y-1">
+            {/* Line 1: identity + status */}
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
+                {agentType ? (
+                  <AgentIcon agentType={agentType} className="h-3.5 w-3.5" />
+                ) : (
+                  <WorkflowStatusIcon
+                    visualStatus={node.status}
+                    className="size-3.5"
+                  />
+                )}
+              </span>
+              <span className="min-w-0 break-words text-xs font-semibold text-foreground">
+                {primaryLabel}
+              </span>
+              <Badge
+                variant="secondary"
+                className="h-4 shrink-0 px-1 text-[10px]"
+              >
+                {t(`nodeStatus.${node.status}`)}
+              </Badge>
+              {node.run_count > 0 && (
+                <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground">
+                  {t("runCount", { count: node.run_count })}
+                </span>
+              )}
+              {node.replacement_count > 0 && (
+                <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground">
+                  {t("replacementCount", {
+                    count: node.replacement_count,
+                  })}
+                </span>
+              )}
+            </div>
+            {/* Line 2: title */}
+            <div
+              data-node-title
+              className="min-w-0 text-xs text-muted-foreground line-clamp-2"
+              title={title}
+            >
+              {title}
+            </div>
+            {/* Line 3: agent / model / effort */}
+            {agentBits.length > 0 && (
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+                {agentBits.map((bit) => (
+                  <span key={bit} className="min-w-0 break-words">
+                    {bit}
+                  </span>
+                ))}
+              </div>
+            )}
+            {/* Line 4: elapsed | tools | file edits (same segments as sub-agent cards) */}
+            {operationalLine && (
+              <div
+                data-testid={`workflow-graph-node-ops-${node.node_id}`}
+                className="min-w-0 truncate text-[11px] leading-snug text-muted-foreground"
+                title={operationalLine}
+              >
+                {operationalLine}
+              </div>
+            )}
+          </div>
+          {openable && (
+            <button
+              type="button"
+              data-testid={`workflow-graph-node-open-${node.node_id}`}
+              onClick={() => {
+                void onOpenSession(node)
+              }}
+              className="inline-flex shrink-0 items-center gap-1 self-center rounded-md px-1.5 py-1 text-[11px] font-medium text-foreground/80 transition-colors hover:bg-muted/60 hover:text-foreground"
+              title={t("openSession")}
+              aria-label={t("openSession")}
+            >
+              <Eye className="h-3.5 w-3.5" />
+            </button>
           )}
-          {!node.required && (
-            <span className="text-muted-foreground">
-              {t("optionalReviewer")}
-            </span>
-          )}
-          {node.run_count > 0 && (
-            <span className="tabular-nums text-muted-foreground">
-              {t("runCount", { count: node.run_count })}
-            </span>
-          )}
-          {node.replacement_count > 0 && (
-            <span className="tabular-nums text-muted-foreground">
-              {t("replacementCount", {
-                count: node.replacement_count,
-              })}
-            </span>
-          )}
-        </span>
-      </button>
+        </div>
+      </div>
     )
   }
-
-  const renderNodeWithDetail = (
-    node: WorkflowNodeSnapshot,
-    laneKind: PhaseRailKind,
-    reviewerWrapperTestId?: string
-  ) => (
-    <div
-      key={node.node_id}
-      data-testid={reviewerWrapperTestId}
-      className="min-w-0"
-    >
-      {renderNodeControl(node, laneKind)}
-      {selectedId === node.node_id && expandedByLane[laneKind] && (
-        <WorkflowNodeDetail
-          node={node}
-          onOpenSession={onOpenSession}
-          className="mt-1"
-        />
-      )}
-    </div>
-  )
 
   return (
     <div
@@ -326,7 +547,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
 
                         <div className="space-y-1">
                           {primary.map((node) =>
-                            renderNodeWithDetail(node, lane.kind)
+                            renderNodeRow(node, lane.kind)
                           )}
                         </div>
 
@@ -341,7 +562,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
                             aria-label={t("reviewerCohort")}
                           >
                             {reviewers.map((node) =>
-                              renderNodeWithDetail(
+                              renderNodeRow(
                                 node,
                                 lane.kind,
                                 taskRow

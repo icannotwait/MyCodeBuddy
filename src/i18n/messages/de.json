@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "Rolle: {role}",
         "agentLabel": "Agent: {agent}",
+        "modelLabel": "Modell: {model}",
+        "effortLabel": "Aufwand: {effort}",
         "currentWork": "Aktuell: {title}",
         "noSessions": "Noch keine Subagenten-Sitzungen",
         "graphTitle": "Workflow-Graph",

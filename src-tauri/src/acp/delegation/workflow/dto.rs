@@ -95,6 +95,14 @@ pub struct WorkflowNodeSnapshot {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Launch model id from the latest run's allowlisted `config_values_json`
+    /// (`model` / `model_id` / `modelId`). Absent when no run or unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning / thinking effort from the latest run's
+    /// `config_values_json` (`effort` / `reasoning` / `thinking`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +139,34 @@ pub struct WorkflowNodeSnapshot {
     pub latest_child_conversation_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_run_status: Option<String>,
+    /// Latest-run start time (RFC3339) for the live portion of elapsed display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Latest-run finish time (RFC3339); absent while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// Sum of **finished** run durations (ms) across the work-unit lineage.
+    /// Excludes an in-flight latest run so the UI can add `now - started_at`.
+    /// When the latest run is terminal this includes its full duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_completed_ms: Option<u64>,
+    /// Latest-run tool call count (delegation runtime stats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_count: Option<u64>,
+    /// Latest-run edit-tool call count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_tool_call_count: Option<u64>,
+    /// Count of touched files from latest-run runtime stats (paths not exposed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touched_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub touched_files_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_counts_complete: Option<bool>,
     /// Bounded, redacted card-summary text when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -572,6 +608,8 @@ mod tests {
                 phase_id: Some("tasks".into()),
                 role: Some("implementer".into()),
                 agent_type: Some("grok".into()),
+                model: None,
+                effort: None,
                 profile_id: None,
                 task_index: Some(1),
                 task_risk_level: None,
@@ -589,6 +627,16 @@ mod tests {
                 latest_task_id: None,
                 latest_child_conversation_id: None,
                 latest_run_status: None,
+                started_at: None,
+                finished_at: None,
+                elapsed_completed_ms: None,
+                tool_call_count: None,
+                edit_tool_call_count: None,
+                touched_file_count: None,
+                touched_files_truncated: false,
+                additions: None,
+                deletions: None,
+                line_counts_complete: None,
                 summary: None,
                 is_observed: false,
                 retained_observed: false,

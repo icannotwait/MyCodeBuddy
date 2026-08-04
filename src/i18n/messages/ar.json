@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "الدور: {role}",
         "agentLabel": "الوكيل: {agent}",
+        "modelLabel": "النموذج: {model}",
+        "effortLabel": "الجهد: {effort}",
         "currentWork": "الحالي: {title}",
         "noSessions": "لا توجد جلسات وكلاء فرعيين بعد",
         "graphTitle": "مخطط سير العمل",

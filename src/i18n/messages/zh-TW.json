@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "角色：{role}",
         "agentLabel": "代理：{agent}",
+        "modelLabel": "模型：{model}",
+        "effortLabel": "力度：{effort}",
         "currentWork": "目前：{title}",
         "noSessions": "尚無子代理工作階段",
         "graphTitle": "工作流程圖",

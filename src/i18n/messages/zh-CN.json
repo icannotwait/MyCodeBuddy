@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "角色：{role}",
         "agentLabel": "智能体：{agent}",
+        "modelLabel": "模型：{model}",
+        "effortLabel": "力度：{effort}",
         "currentWork": "当前：{title}",
         "noSessions": "尚无子智能体会话",
         "graphTitle": "工作流图",

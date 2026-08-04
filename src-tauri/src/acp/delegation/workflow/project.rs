@@ -38,6 +38,274 @@ use super::types::{
 };
 use super::validate::validate_manifest_document;
 
+/// Pull display-safe model / effort from a run's allowlisted launch snapshot.
+///
+/// Keys match `launch_snapshot::ALLOWLISTED_CONFIG_KEYS`. Values are short
+/// opaque ids (no secrets); empty / missing JSON yields `None`.
+fn model_and_effort_from_config_json(
+    config_values_json: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(raw) = config_values_json.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(raw) else {
+        return (None, None);
+    };
+    let lookup = |keys: &[&str]| -> Option<String> {
+        for key in keys {
+            if let Some(value) = map
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+        None
+    };
+    (
+        lookup(&["model", "model_id", "modelId"]),
+        // Prefer Grok's ACP id first; then Codex-style / generic keys.
+        lookup(&[
+            "reasoning_effort",
+            "effort",
+            "reasoning",
+            "thinking",
+        ]),
+    )
+}
+
+/// Card operational rollup from a durable run (elapsed / tools / edits).
+/// Paths are never projected — only counts + line totals.
+#[derive(Debug, Clone, Default)]
+struct RunCardRuntime {
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    tool_call_count: Option<u64>,
+    edit_tool_call_count: Option<u64>,
+    touched_file_count: Option<u64>,
+    touched_files_truncated: bool,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    line_counts_complete: Option<bool>,
+}
+
+fn run_card_runtime(run: &delegation_task_run::Model) -> RunCardRuntime {
+    let touched_file_count = run
+        .touched_files_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+        .map(|files| files.len() as u64);
+    RunCardRuntime {
+        started_at: run.started_at.map(|t| t.to_rfc3339()),
+        finished_at: run.finished_at.map(|t| t.to_rfc3339()),
+        tool_call_count: run.tool_call_count.and_then(|c| u64::try_from(c).ok()),
+        edit_tool_call_count: run
+            .edit_tool_call_count
+            .and_then(|c| u64::try_from(c).ok()),
+        touched_file_count,
+        touched_files_truncated: run.touched_files_truncated.unwrap_or(false),
+        additions: run.additions,
+        deletions: run.deletions,
+        line_counts_complete: run.line_counts_complete,
+    }
+}
+
+fn empty_run_card_runtime() -> RunCardRuntime {
+    RunCardRuntime::default()
+}
+
+/// Duration of one finished run in ms. Unfinished / incomplete timestamps → None.
+fn finished_run_duration_ms(run: &delegation_task_run::Model) -> Option<u64> {
+    let started = run.started_at?;
+    let finished = run.finished_at?;
+    if finished < started {
+        return None;
+    }
+    let ms = (finished - started).num_milliseconds();
+    if ms < 0 {
+        None
+    } else {
+        Some(ms as u64)
+    }
+}
+
+/// Sum finished-run durations for a work unit. When `latest` is still in flight
+/// it is excluded so the card can add live `now - latest.started_at`.
+fn sum_elapsed_completed_ms(
+    runs: &[&delegation_task_run::Model],
+    latest: Option<&delegation_task_run::Model>,
+) -> Option<u64> {
+    let latest_id = latest.map(|r| r.task_id.as_str());
+    let latest_open = latest.is_some_and(|r| r.finished_at.is_none());
+    let mut total: u64 = 0;
+    let mut any = false;
+    for run in runs {
+        if latest_open && latest_id == Some(run.task_id.as_str()) {
+            continue;
+        }
+        if let Some(ms) = finished_run_duration_ms(run) {
+            total = total.saturating_add(ms);
+            any = true;
+        }
+    }
+    any.then_some(total)
+}
+
+fn non_empty_trimmed(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn title_missing(title: &Option<String>) -> bool {
+    title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+}
+
+/// First non-empty display-safe title from ordered candidates.
+///
+/// Trims each candidate, then uses [`redact_optional_display`] so path/fence
+/// scrubbing that yields an empty string falls through to the next source
+/// (instead of locking in `Some("")`). Pure `[redacted]` placeholders also fall
+/// through so a path-only preview does not block a usable summary / child title.
+fn first_display_title<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let mut last_redacted: Option<String> = None;
+    for candidate in candidates {
+        let trimmed = candidate.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(t) = redact_optional_display(trimmed) {
+            if t.trim() == "[redacted]" {
+                last_redacted = Some(t);
+                continue;
+            }
+            return Some(t);
+        }
+    }
+    last_redacted
+}
+
+/// Card line-2 title for a bound/observed run lineage.
+///
+/// Manifest titles are often unset; prefer the durable launch `task_preview`,
+/// then the validated card-summary text. Child conversation title is applied
+/// later by [`enrich_nodes_display_from_children`] (and preferred when present).
+fn project_run_title(
+    manifest_title: Option<&str>,
+    task_preview: Option<&str>,
+    summary: Option<&str>,
+) -> Option<String> {
+    first_display_title([manifest_title, task_preview, summary])
+}
+
+/// Fill gaps in node `title` / `model` / `effort` from the child conversation
+/// and, for Grok, a cheap `summary.json` peek (same source the turn footer uses).
+///
+/// Manifest titles are often empty; the card's second line needs the child
+/// conversation title (or summary/task preview) to match what users see when
+/// they open the session. When a child has a real session title, it wins over
+/// a long task_preview (same title-first rule as sub-agent cards).
+async fn enrich_nodes_display_from_children(
+    conn: &sea_orm::DatabaseConnection,
+    nodes: &mut [WorkflowNodeSnapshot],
+) {
+    let child_ids: Vec<i32> = nodes
+        .iter()
+        .filter_map(|n| n.latest_child_conversation_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if child_ids.is_empty() {
+        return;
+    }
+
+    let rows = match crate::db::entities::conversation::Entity::find()
+        .filter(crate::db::entities::conversation::Column::Id.is_in(child_ids.clone()))
+        .all(conn)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(error = %e, "enrich display: conversation lookup failed");
+            return;
+        }
+    };
+    let by_id: HashMap<i32, crate::db::entities::conversation::Model> =
+        rows.into_iter().map(|r| (r.id, r)).collect();
+
+    // Optional first-user text while auto-title has not finalized yet.
+    let job_rows = match crate::db::entities::auto_title_job::Entity::find()
+        .filter(crate::db::entities::auto_title_job::Column::ConversationId.is_in(child_ids))
+        .all(conn)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(error = %e, "enrich display: auto_title_job lookup failed");
+            Vec::new()
+        }
+    };
+    let first_user_by_cid: HashMap<i32, String> = job_rows
+        .into_iter()
+        .filter_map(|j| {
+            non_empty_trimmed(j.first_user_text.as_deref()).map(|t| (j.conversation_id, t))
+        })
+        .collect();
+
+    for node in nodes.iter_mut() {
+        let needs_model = node.model.is_none();
+        let Some(cid) = node.latest_child_conversation_id else {
+            continue;
+        };
+        let Some(child) = by_id.get(&cid) else {
+            continue;
+        };
+
+        // Prefer child session title when present (title-first, like sub-agent cards).
+        if let Some(child_title) = first_display_title([child.title.as_deref()]) {
+            node.title = Some(child_title);
+        } else if title_missing(&node.title) {
+            // Kickoff text captured for auto-title before conversation.title is set.
+            if let Some(first_user) = first_user_by_cid.get(&cid) {
+                // Cap so a multi-paragraph prompt does not flood the card line.
+                let clipped: String = first_user.chars().take(200).collect();
+                if let Some(t) = first_display_title([Some(clipped.as_str())]) {
+                    node.title = Some(t);
+                }
+            }
+        }
+
+        if needs_model {
+            node.model = non_empty_trimmed(child.model.as_deref());
+        }
+
+        let agent = child.agent_type.as_str();
+        let needs_archive = title_missing(&node.title)
+            || node.model.is_none()
+            || node.effort.is_none();
+        if needs_archive && agent.eq_ignore_ascii_case("grok") {
+            if let Some(ext) = child
+                .external_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let (arch_model, arch_effort) =
+                    crate::parsers::grok::peek_session_model_and_effort(ext);
+                if node.model.is_none() {
+                    node.model = arch_model;
+                }
+                if node.effort.is_none() {
+                    node.effort = arch_effort;
+                }
+            }
+        }
+    }
+}
+
 /// Project a redacted `WorkflowGraphSnapshot` for `parent_conversation_id`.
 ///
 /// Returns `None` when there is no graph (no manifest and no recognized A1
@@ -366,6 +634,8 @@ async fn project_manifest_mode(
         })
         .collect();
 
+    enrich_nodes_display_from_children(conn, &mut nodes).await;
+
     let (current_node_ids, current_phase_id) =
         select_current_nodes(&nodes, &gate_snaps, &settlements);
     let overall_state = derive_overall_state(&header.workflow_state, &nodes, &gate_summary);
@@ -488,10 +758,34 @@ fn project_node_from_binding(
     let deps = mn
         .map(|n| n.deps.iter().map(|d| id_map.map_id(d)).collect())
         .unwrap_or_default();
-    let title = mn
-        .and_then(|n| n.title.as_deref())
-        .map(redact_display_string);
+    // Manifest title is often empty; fall back to the launch task preview, then
+    // the validated card-summary text. Child session title may still upgrade this
+    // in enrich_nodes_display_from_children.
+    let title = project_run_title(
+        mn.and_then(|n| n.title.as_deref()),
+        latest_run.and_then(|r| r.task_preview.as_deref()),
+        summary.as_deref(),
+    );
     let required = mn.map(|n| n.required).unwrap_or(true);
+    let (model, effort) =
+        model_and_effort_from_config_json(latest_run.and_then(|r| r.config_values_json.as_deref()));
+    let runtime = latest_run
+        .map(run_card_runtime)
+        .unwrap_or_else(empty_run_card_runtime);
+    // All runs for this work unit (bound + A9 key-matched) for elapsed sum.
+    let mut all_runs: Vec<&delegation_task_run::Model> = Vec::new();
+    for rb in rbs {
+        if let Some(run) = run_by_id.get(&rb.task_id).copied() {
+            all_runs.push(run);
+        }
+    }
+    for r in &unbound_key_runs {
+        all_runs.push(*r);
+    }
+    // De-dupe by task_id (bound ∩ unbound should be empty but be safe).
+    all_runs.sort_by_key(|r| r.task_id.as_str());
+    all_runs.dedup_by_key(|r| r.task_id.as_str());
+    let elapsed_completed_ms = sum_elapsed_completed_ms(&all_runs, latest_run);
 
     WorkflowNodeSnapshot {
         node_id: id_map.map_id(&b.node_id),
@@ -499,6 +793,8 @@ fn project_node_from_binding(
         phase_id: Some(id_map.map_id(&b.phase_id)),
         role: Some(id_map.map_id(&b.role)),
         agent_type: Some(id_map.map_id(&b.agent_type)),
+        model,
+        effort,
         profile_id: b.profile_id.as_deref().map(|p| id_map.map_id(p)),
         task_index: b.task_index.map(|i| i as u32),
         task_risk_level: None,
@@ -516,6 +812,16 @@ fn project_node_from_binding(
         latest_task_id: latest_run.map(|r| id_map.map_id(&r.task_id)),
         latest_child_conversation_id: latest_run.map(|r| r.child_conversation_id),
         latest_run_status: latest_run.map(|r| run_status_str(&r.status).to_string()),
+        started_at: runtime.started_at,
+        finished_at: runtime.finished_at,
+        elapsed_completed_ms,
+        tool_call_count: runtime.tool_call_count,
+        edit_tool_call_count: runtime.edit_tool_call_count,
+        touched_file_count: runtime.touched_file_count,
+        touched_files_truncated: runtime.touched_files_truncated,
+        additions: runtime.additions,
+        deletions: runtime.deletions,
+        line_counts_complete: runtime.line_counts_complete,
         summary,
         is_observed: b.is_observed || latest_run.is_some(),
         retained_observed: b.retained_observed,
@@ -537,13 +843,15 @@ fn project_node_from_manifest_only(
         phase_id: mn.phase_id.as_deref().map(|p| id_map.map_id(p)),
         role: mn.role.map(role_str).map(|s| id_map.map_id(s)),
         agent_type: mn.agent_type.as_deref().map(|s| id_map.map_id(s)),
+        model: None,
+        effort: None,
         profile_id: mn.profile_id.as_deref().map(|s| id_map.map_id(s)),
         task_index: mn.task_index,
         task_risk_level: None,
         task_risk_reason_codes: vec![],
         required_reviewer_count: None,
         returned_reviewer_count: None,
-        title: mn.title.as_deref().map(redact_display_string),
+        title: first_display_title([mn.title.as_deref()]),
         status: ProjectedNodeStatus::Estimated,
         status_reason: None,
         run_count: 0,
@@ -554,6 +862,16 @@ fn project_node_from_manifest_only(
         latest_task_id: None,
         latest_child_conversation_id: None,
         latest_run_status: None,
+        started_at: None,
+        finished_at: None,
+        elapsed_completed_ms: None,
+        tool_call_count: None,
+        edit_tool_call_count: None,
+        touched_file_count: None,
+        touched_files_truncated: false,
+        additions: None,
+        deletions: None,
+        line_counts_complete: None,
         summary: None,
         is_observed: false,
         retained_observed: false,
@@ -1283,19 +1601,26 @@ fn append_orphan_observed_nodes(
             .and_then(|c| summary_text_from_card(&c))
             .map(|s| redact_display_string(&s));
         let raw_node_id = format!("orphan-{}", synthetic_node_id(&parsed, &key));
+        let (model, effort) =
+            model_and_effort_from_config_json(latest.config_values_json.as_deref());
+        let runtime = run_card_runtime(latest);
+        let orphan_title =
+            project_run_title(None, latest.task_preview.as_deref(), summary.as_deref());
         nodes.push(WorkflowNodeSnapshot {
             node_id: id_map.map_id(&raw_node_id),
             kind: "work_unit".into(),
             phase_id: Some(id_map.map_id(&phase_id)),
             role: Some(id_map.map_id(&role)),
             agent_type: Some(id_map.map_id(&latest.agent_type)),
+            model,
+            effort,
             profile_id: latest.profile_id.as_deref().map(|p| id_map.map_id(p)),
             task_index,
             task_risk_level: None,
             task_risk_reason_codes: vec![],
             required_reviewer_count: None,
             returned_reviewer_count: None,
-            title: None,
+            title: orphan_title,
             status,
             status_reason: Some("orphan_observed".into()),
             run_count: key_runs.len() as u64,
@@ -1313,6 +1638,16 @@ fn append_orphan_observed_nodes(
             latest_task_id: Some(id_map.map_id(&latest.task_id)),
             latest_child_conversation_id: Some(latest.child_conversation_id),
             latest_run_status: Some(run_status_str(&latest.status).to_string()),
+            started_at: runtime.started_at,
+            finished_at: runtime.finished_at,
+            elapsed_completed_ms: sum_elapsed_completed_ms(&key_runs, Some(latest)),
+            tool_call_count: runtime.tool_call_count,
+            edit_tool_call_count: runtime.edit_tool_call_count,
+            touched_file_count: runtime.touched_file_count,
+            touched_files_truncated: runtime.touched_files_truncated,
+            additions: runtime.additions,
+            deletions: runtime.deletions,
+            line_counts_complete: runtime.line_counts_complete,
             summary,
             is_observed: true,
             retained_observed: true,
@@ -1536,19 +1871,27 @@ async fn project_observed_only(
         // Synthetic node_id from stable key content — never expose raw key,
         // never use HashMap order or nodes.len() ordinals for Design/Plan/Final.
         let raw_node_id = synthetic_node_id(&parsed, &key);
+        let (model, effort) =
+            model_and_effort_from_config_json(latest.config_values_json.as_deref());
+        let runtime = run_card_runtime(latest);
+        let run_refs: Vec<&delegation_task_run::Model> = key_runs.iter().collect();
+        let observed_title =
+            project_run_title(None, latest.task_preview.as_deref(), summary.as_deref());
         nodes.push(WorkflowNodeSnapshot {
             node_id: id_map.map_id(&raw_node_id),
             kind: "work_unit".into(),
             phase_id: Some(id_map.map_id(&phase_id)),
             role: Some(id_map.map_id(&role)),
             agent_type: Some(id_map.map_id(&latest.agent_type)),
+            model,
+            effort,
             profile_id: latest.profile_id.as_deref().map(|p| id_map.map_id(p)),
             task_index,
             task_risk_level: None,
             task_risk_reason_codes: vec![],
             required_reviewer_count: None,
             returned_reviewer_count: None,
-            title: None,
+            title: observed_title,
             status,
             status_reason: None,
             run_count,
@@ -1563,6 +1906,16 @@ async fn project_observed_only(
             latest_task_id: Some(id_map.map_id(&latest.task_id)),
             latest_child_conversation_id: Some(latest.child_conversation_id),
             latest_run_status: Some(run_status_str(&latest.status).to_string()),
+            started_at: runtime.started_at,
+            finished_at: runtime.finished_at,
+            elapsed_completed_ms: sum_elapsed_completed_ms(&run_refs, Some(latest)),
+            tool_call_count: runtime.tool_call_count,
+            edit_tool_call_count: runtime.edit_tool_call_count,
+            touched_file_count: runtime.touched_file_count,
+            touched_files_truncated: runtime.touched_files_truncated,
+            additions: runtime.additions,
+            deletions: runtime.deletions,
+            line_counts_complete: runtime.line_counts_complete,
             summary,
             is_observed: true,
             retained_observed: false,
@@ -1589,6 +1942,8 @@ async fn project_observed_only(
         })
         .collect();
     phases.sort_by(|a, b| a.id.cmp(&b.id));
+
+    enrich_nodes_display_from_children(conn, &mut nodes).await;
 
     let (current_node_ids, current_phase_id) = select_current_nodes(&nodes, &[], &[]);
 
@@ -1846,6 +2201,157 @@ fn _manifest_state_wire(s: ManifestWorkflowState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sum_elapsed_completed_ms_skips_open_latest_and_adds_finished() {
+        use chrono::{TimeZone, Utc};
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 5, 0).unwrap(); // 5m
+        let t2 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 10, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 12, 0).unwrap(); // 2m
+
+        let finished_a = delegation_task_run::Model {
+            task_id: "a".into(),
+            root_task_id: "a".into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: 1,
+            parent_tool_use_id: None,
+            child_conversation_id: 10,
+            agent_type: "grok".into(),
+            profile_id: None,
+            workspace_path: None,
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: None,
+            request_fingerprint: None,
+            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            reached_running_at: None,
+            lineage_root_task_id: "a".into(),
+            work_unit_key: None,
+            legacy_parent_tool_use_id: None,
+            history_only: false,
+            status: DelegationRunStatus::Completed,
+            error_code: None,
+            termination_audit_json: None,
+            started_at: Some(t0),
+            finished_at: Some(t1),
+            tool_call_count: None,
+            edit_tool_call_count: None,
+            touched_files_json: None,
+            touched_files_truncated: None,
+            additions: None,
+            deletions: None,
+            line_counts_complete: None,
+            card_summary_json: None,
+            child_turn_anchor: None,
+            child_connection_id: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+            recovery_authorization_id: None,
+            created_at: t0,
+            updated_at: t1,
+        };
+        let finished_b = delegation_task_run::Model {
+            task_id: "b".into(),
+            generation: 2,
+            started_at: Some(t2),
+            finished_at: Some(t3),
+            status: DelegationRunStatus::Completed,
+            lineage_root_task_id: "a".into(),
+            root_task_id: "a".into(),
+            child_conversation_id: 11,
+            parent_conversation_id: 1,
+            agent_type: "grok".into(),
+            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            history_only: false,
+            created_at: t2,
+            updated_at: t3,
+            ..finished_a.clone()
+        };
+        let open_c = delegation_task_run::Model {
+            task_id: "c".into(),
+            generation: 3,
+            started_at: Some(t3),
+            finished_at: None,
+            status: DelegationRunStatus::Running,
+            lineage_root_task_id: "a".into(),
+            root_task_id: "a".into(),
+            child_conversation_id: 12,
+            parent_conversation_id: 1,
+            agent_type: "grok".into(),
+            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            history_only: false,
+            created_at: t3,
+            updated_at: t3,
+            ..finished_a.clone()
+        };
+
+        let all = [&finished_a, &finished_b, &open_c];
+        // Open latest excluded: 5m + 2m = 7m.
+        assert_eq!(
+            sum_elapsed_completed_ms(&all, Some(&open_c)),
+            Some(7 * 60_000)
+        );
+        // All finished: 5m + 2m = 7m (no third).
+        let done = [&finished_a, &finished_b];
+        assert_eq!(
+            sum_elapsed_completed_ms(&done, Some(&finished_b)),
+            Some(7 * 60_000)
+        );
+    }
+
+    #[test]
+    fn model_and_effort_reads_allowlisted_config_keys() {
+        let (model, effort) = model_and_effort_from_config_json(Some(
+            r#"{"effort":"high","model":"gpt-5.2","permissionMode":"default"}"#,
+        ));
+        assert_eq!(model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(effort.as_deref(), Some("high"));
+
+        let (model2, effort2) =
+            model_and_effort_from_config_json(Some(r#"{"modelId":"sonnet","thinking":"xhigh"}"#));
+        assert_eq!(model2.as_deref(), Some("sonnet"));
+        assert_eq!(effort2.as_deref(), Some("xhigh"));
+
+        // Grok ACP option id — the key historically stripped from snapshots.
+        let (model3, effort3) = model_and_effort_from_config_json(Some(
+            r#"{"model":"grok-4.5","reasoning_effort":"high"}"#,
+        ));
+        assert_eq!(model3.as_deref(), Some("grok-4.5"));
+        assert_eq!(effort3.as_deref(), Some("high"));
+
+        let (empty_m, empty_e) = model_and_effort_from_config_json(Some("{}"));
+        assert!(empty_m.is_none());
+        assert!(empty_e.is_none());
+        assert!(model_and_effort_from_config_json(None).0.is_none());
+    }
+
+    #[test]
+    fn project_run_title_prefers_manifest_then_preview_then_summary() {
+        assert_eq!(
+            project_run_title(Some("Manifest title"), Some("preview"), Some("summary")).as_deref(),
+            Some("Manifest title")
+        );
+        assert_eq!(
+            project_run_title(None, Some("  implement login flow  "), Some("summary")).as_deref(),
+            Some("implement login flow")
+        );
+        assert_eq!(
+            project_run_title(None, None, Some("card summary text")).as_deref(),
+            Some("card summary text")
+        );
+        assert_eq!(project_run_title(None, Some("   "), None), None);
+        assert_eq!(project_run_title(Some(""), Some(""), Some("")), None);
+        // Empty after path-only scrub falls through to next candidate.
+        assert_eq!(
+            project_run_title(None, Some("D:\\secret\\only"), Some("usable summary")).as_deref(),
+            Some("usable summary")
+        );
+    }
+
     use crate::acp::delegation::workflow::key::build_work_unit_key;
     use crate::acp::delegation::workflow::store::{
         publish_workflow_manifest_core, PublishWorkflowRequest,
@@ -2757,6 +3263,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_title_falls_back_to_task_preview_and_child_title() {
+        let (db, parent) = seed_parent().await;
+        let doc = design_plan_doc("proj-title-fallback");
+        let pub_r = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("publish");
+
+        // No card summary yet — title must still come from task_preview.
+        let child_id = insert_run(
+            &db,
+            parent,
+            "title-run",
+            None,
+            DelegationRunStatus::Running,
+            1,
+            None,
+            None,
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "title-run",
+            &pub_r.workflow_id,
+            "task-1-impl",
+            1,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        let run = delegation_task_run::Entity::find_by_id("title-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run_am: delegation_task_run::ActiveModel = run.into();
+        run_am.task_preview = Set(Some("Implement the workflow title fallback".into()));
+        run_am.update(&db.conn).await.unwrap();
+
+        let snap = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("snapshot");
+        let impl_node = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "task-1-impl")
+            .expect("impl node");
+        assert_eq!(
+            impl_node.title.as_deref(),
+            Some("Implement the workflow title fallback"),
+            "running node without manifest title must project task_preview"
+        );
+
+        // Child conversation title upgrades over the longer task preview.
+        let child = crate::db::entities::conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child_am: crate::db::entities::conversation::ActiveModel = child.into();
+        child_am.title = Set(Some("Short session title".into()));
+        child_am.update(&db.conn).await.unwrap();
+
+        let snap2 = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("snapshot after child title");
+        let impl_node2 = snap2
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "task-1-impl")
+            .expect("impl node");
+        assert_eq!(
+            impl_node2.title.as_deref(),
+            Some("Short session title"),
+            "child conversation title should win over task_preview"
+        );
+    }
+
+    #[tokio::test]
     async fn observed_only_from_a1_keys() {
         let (db, parent) = seed_parent().await;
         let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
@@ -3371,6 +3963,8 @@ mod tests {
             phase_id: Some("tasks".into()),
             role: Some("implementer".into()),
             agent_type: Some("grok".into()),
+            model: None,
+            effort: None,
             profile_id: None,
             task_index: Some(task_index),
             task_risk_level: None,
@@ -3388,6 +3982,16 @@ mod tests {
             latest_task_id: Some(task_id.into()),
             latest_child_conversation_id: None,
             latest_run_status: Some("completed".into()),
+            started_at: None,
+            finished_at: None,
+            elapsed_completed_ms: None,
+            tool_call_count: None,
+            edit_tool_call_count: None,
+            touched_file_count: None,
+            touched_files_truncated: false,
+            additions: None,
+            deletions: None,
+            line_counts_complete: None,
             summary: None,
             is_observed: true,
             retained_observed: false,

@@ -804,6 +804,10 @@ export interface WorkflowNodeSnapshot {
   phase_id?: string | null
   role?: string | null
   agent_type?: string | null
+  /** Launch model id from the latest run config snapshot. */
+  model?: string | null
+  /** Reasoning / thinking effort from the latest run config snapshot. */
+  effort?: string | null
   profile_id?: string | null
   task_index?: number | null
   task_risk_level?: "normal" | "high" | null
@@ -821,8 +825,18 @@ export interface WorkflowNodeSnapshot {
   latest_task_id?: string | null
   latest_child_conversation_id?: number | null
   latest_run_status?: string | null
+  /** Latest-run start (ISO) for the live portion of elapsed display. */
+  started_at?: string | null
+  /** Latest-run finish (ISO); absent while running. */
+  finished_at?: string | null
+  /**
+   * Sum of finished-run durations (ms) across the work-unit lineage.
+   * Excludes an in-flight latest run; UI adds `now - started_at` while live.
+   */
+  elapsed_completed_ms?: number | null
   tool_call_count?: number | null
   edit_tool_call_count?: number | null
+  /** Touched-file count only — paths stay off the workflow graph. */
   touched_file_count?: number | null
   touched_files_truncated?: boolean
   additions?: number | null

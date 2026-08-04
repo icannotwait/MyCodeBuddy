@@ -2720,6 +2720,8 @@
         },
         "roleLabel": "역할: {role}",
         "agentLabel": "에이전트: {agent}",
+        "modelLabel": "모델: {model}",
+        "effortLabel": "노력: {effort}",
         "currentWork": "현재: {title}",
         "noSessions": "하위 에이전트 세션이 아직 없습니다",
         "graphTitle": "워크플로 그래프",
