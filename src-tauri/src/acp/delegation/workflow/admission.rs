@@ -2646,7 +2646,7 @@ async fn mark_observed_and_freeze_cohort<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn bump_graph_revision<C: ConnectionTrait>(
+pub(crate) async fn bump_graph_revision<C: ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
     now: chrono::DateTime<Utc>,

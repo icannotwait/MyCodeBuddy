@@ -41,8 +41,10 @@ use crate::acp::delegation::workflow::admission::{
 };
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
-    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, CompletionOutcome,
-    ResolvedArtifact, WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
+    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, ArtifactFailure,
+    CompletionEvidenceError, CompletionIntentReason, CompletionOutcome, CompletionRole,
+    CompletionToolIntent, ResolvedArtifact, TerminalCompletionInput, TerminalCompletionResult,
+    WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -80,6 +82,19 @@ pub const REPLACEMENT_LIMIT: i64 = 1;
 /// Hard ceiling on generation per child thread. Creating generation >
 /// [`MAX_GENERATION`] is refused with `budget_exhausted`.
 pub const MAX_GENERATION: i64 = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCompletionResolverContext {
+    pub role: CompletionRole,
+    pub phase_id: String,
+    pub tool_intents: Vec<CompletionToolIntent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCompletionAttentionMetric {
+    Decision(CompletionIntentReason),
+    ArtifactFailure(ArtifactFailure),
+}
 
 fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -937,6 +952,45 @@ fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
     } else {
         TaskStoreError::Permanent(msg)
     }
+}
+
+fn map_completion_evidence_error(error: CompletionEvidenceError) -> TaskStoreError {
+    TaskStoreError::Permanent(format!("{}: {error}", error.code()))
+}
+
+async fn load_terminal_completion_protocol<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<
+    Option<(
+        i64,
+        crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    )>,
+    TaskStoreError,
+> {
+    let Some(binding) = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+        task_id.to_string(),
+    )
+    .one(conn)
+    .await
+    .map_err(map_db_err)?
+    else {
+        return Ok(None);
+    };
+    let workflow =
+        crate::db::entities::delegation_workflow::Entity::find_by_id(binding.workflow_id)
+            .one(conn)
+            .await
+            .map_err(map_db_err)?
+            .ok_or_else(|| {
+                TaskStoreError::Permanent(
+                    "workflow run binding references a missing workflow".into(),
+                )
+            })?;
+    Ok(Some((
+        workflow.completion_protocol_version,
+        workflow.completion_protocol_mode,
+    )))
 }
 
 /// Map unique-index collisions from gen-1 insert to typed wire errors.
@@ -1977,6 +2031,140 @@ impl RunStore {
 
     pub fn db(&self) -> &Arc<AppDatabase> {
         &self.db
+    }
+
+    pub async fn terminal_completion_protocol(
+        &self,
+        task_id: &str,
+    ) -> Result<
+        Option<(
+            i64,
+            crate::db::entities::delegation_workflow::CompletionProtocolMode,
+        )>,
+        TaskStoreError,
+    > {
+        load_terminal_completion_protocol(&self.db.conn, task_id).await
+    }
+
+    /// Read the platform role and durable tool-intent candidates used by the
+    /// metrics-only v2 shadow resolver. This method never mutates workflow
+    /// state, evidence, attention, or gates.
+    pub async fn terminal_completion_resolver_context(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TerminalCompletionResolverContext>, TaskStoreError> {
+        let Some(binding) =
+            crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+                task_id.to_string(),
+            )
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?
+        else {
+            return Ok(None);
+        };
+        let node = crate::db::entities::delegation_workflow_node_binding::Entity::find_by_id((
+            binding.workflow_id,
+            binding.node_id,
+        ))
+        .one(&self.db.conn)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| TaskStoreError::Permanent("workflow node binding is missing".into()))?;
+        let role = match node.role.as_str() {
+            "reviewer" => CompletionRole::Reviewer,
+            "author" => CompletionRole::Author,
+            "implementer" => CompletionRole::Implementer,
+            "fixer" => CompletionRole::Fixer,
+            _ => {
+                return Err(TaskStoreError::Permanent(
+                    "workflow node has an invalid completion role".into(),
+                ))
+            }
+        };
+        let rows = crate::db::entities::delegation_completion_tool_intent::Entity::find()
+            .filter(
+                crate::db::entities::delegation_completion_tool_intent::Column::TaskId.eq(task_id),
+            )
+            .all(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        let intents = rows
+            .into_iter()
+            .map(|row| {
+                let outcome = serde_json::from_value(serde_json::Value::String(row.outcome))
+                    .map_err(|_| {
+                        TaskStoreError::Permanent(
+                            "stored completion tool intent has an invalid outcome".into(),
+                        )
+                    })?;
+                Ok(CompletionToolIntent {
+                    accepted_ordinal: row.accepted_ordinal,
+                    outcome,
+                    summary: row.summary,
+                    report_file: row.report_hint,
+                })
+            })
+            .collect::<Result<Vec<_>, TaskStoreError>>()?;
+        Ok(Some(TerminalCompletionResolverContext {
+            role,
+            phase_id: node.phase_id,
+            tool_intents: intents,
+        }))
+    }
+
+    pub async fn terminal_completion_attention_metric(
+        &self,
+        task_id: &str,
+        attention_id: &str,
+    ) -> Result<Option<TerminalCompletionAttentionMetric>, TaskStoreError> {
+        let Some(row) = crate::db::entities::delegation_attention_request::Entity::find_by_id(
+            attention_id.to_string(),
+        )
+        .filter(crate::db::entities::delegation_attention_request::Column::TaskId.eq(task_id))
+        .one(&self.db.conn)
+        .await
+        .map_err(map_db_err)?
+        else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(row.payload_json.as_deref().ok_or_else(|| {
+                TaskStoreError::Permanent("completion payload is missing".into())
+            })?)
+            .map_err(|error| TaskStoreError::Permanent(error.to_string()))?;
+        let metric = match row.kind {
+            crate::db::entities::delegation_attention_request::AttentionKind::CompletionDecision => {
+                let reason = serde_json::from_value(
+                    payload
+                        .get("reason_code")
+                        .cloned()
+                        .ok_or_else(|| {
+                            TaskStoreError::Permanent(
+                                "completion decision reason is missing".into(),
+                            )
+                        })?,
+                )
+                .map_err(|error| TaskStoreError::Permanent(error.to_string()))?;
+                Some(TerminalCompletionAttentionMetric::Decision(reason))
+            }
+            crate::db::entities::delegation_attention_request::AttentionKind::CompletionArtifactRecovery => {
+                let failure = serde_json::from_value(
+                    payload
+                        .get("resolver_failure")
+                        .cloned()
+                        .ok_or_else(|| {
+                            TaskStoreError::Permanent(
+                                "completion artifact failure is missing".into(),
+                            )
+                        })?,
+                )
+                .map_err(|error| TaskStoreError::Permanent(error.to_string()))?;
+                Some(TerminalCompletionAttentionMetric::ArtifactFailure(failure))
+            }
+            _ => None,
+        };
+        Ok(metric)
     }
 
     /// Read the workflow identity committed alongside a reserving run before
@@ -3965,6 +4153,17 @@ impl RunStore {
         task_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Settlement, TaskStoreError> {
+        self.settle_terminal_with_completion(task_id, terminal, None)
+            .await
+            .map(|(settlement, _)| settlement)
+    }
+
+    pub async fn settle_terminal_with_completion(
+        &self,
+        task_id: &str,
+        terminal: TerminalTaskWrite,
+        completion_input: Option<TerminalCompletionInput>,
+    ) -> Result<(Settlement, Option<TerminalCompletionResult>), TaskStoreError> {
         #[cfg(any(test, feature = "test-utils"))]
         {
             let gate = self.settle_gate.lock().await.take();
@@ -4007,13 +4206,22 @@ impl RunStore {
         let outcome = self
             .db
             .conn
-            .transaction::<_, (Settlement, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+            .transaction::<
+                _,
+                (
+                    Settlement,
+                    WorkflowTxnSideEffect,
+                    Option<TerminalCompletionResult>,
+                ),
+                TaskStoreError,
+            >(|txn| {
                 let task_id = task_id.to_string();
                 let error_code = error_code.clone();
                 let conversation_status = conversation_status.clone();
                 let card_summary_json = card_summary_json.clone();
                 let termination_evidence = termination_evidence.clone();
                 let final_stats = final_stats.clone();
+                let completion_input = completion_input.clone();
                 Box::pin(async move {
                     let row = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
@@ -4033,6 +4241,7 @@ impl RunStore {
                             return Ok((
                                 Settlement::Existing(persisted.to_persisted_task().to_report(None)),
                                 WorkflowTxnSideEffect::None,
+                                None,
                             ));
                         }
                         DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
@@ -4114,6 +4323,7 @@ impl RunStore {
                         return Ok((
                             Settlement::Existing(persisted.to_persisted_task().to_report(None)),
                             WorkflowTxnSideEffect::None,
+                            None,
                         ));
                     }
 
@@ -4148,15 +4358,84 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
 
-                    let effect = on_terminal_settle_txn(
-                        txn,
-                        &task_id,
-                        parent_id,
-                        card_summary_json.as_deref(),
-                        &run_status,
-                        workspace_path.as_deref(),
-                    )
-                    .await?;
+                    let protocol = load_terminal_completion_protocol(txn, &task_id).await?;
+                    let enforce_v2 = protocol.is_some_and(|(version, mode)| {
+                        version == 2
+                            && mode
+                                == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+                    });
+                    if enforce_v2 {
+                        let mut clear_v1_authority = DelegationTaskRun::update_many().col_expr(
+                            delegation_task_run::Column::CardSummaryJson,
+                            sea_orm::sea_query::Expr::value(Option::<String>::None),
+                        );
+                        if run_status != DelegationRunStatus::Completed {
+                            clear_v1_authority = clear_v1_authority
+                                .col_expr(
+                                    delegation_task_run::Column::CompletionState,
+                                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                                )
+                                .col_expr(
+                                    delegation_task_run::Column::CompletionOutcome,
+                                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                                )
+                                .col_expr(
+                                    delegation_task_run::Column::CompletionEvidenceJson,
+                                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                                );
+                        }
+                        clear_v1_authority
+                            .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                            .exec(txn)
+                            .await
+                            .map_err(map_db_err)?;
+                    }
+                    let (effect, completion) = if enforce_v2
+                        && run_status == DelegationRunStatus::Completed
+                    {
+                        let input = completion_input.ok_or_else(|| {
+                            TaskStoreError::Permanent(
+                                "v2 completed settlement is missing terminal completion input"
+                                    .into(),
+                            )
+                        })?;
+                        let completion = crate::acp::delegation::workflow::materialize_terminal_completion_txn(
+                            txn, input,
+                        )
+                        .await
+                        .map_err(map_completion_evidence_error)?;
+                        let effect = WorkflowTxnSideEffect::GraphChanged {
+                            parent_conversation_id: parent_id,
+                            workflow_id: crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+                                task_id.clone(),
+                            )
+                            .one(txn)
+                            .await
+                            .map_err(map_db_err)?
+                            .ok_or_else(|| {
+                                TaskStoreError::Permanent(
+                                    "v2 completion run binding disappeared".into(),
+                                )
+                            })?
+                            .workflow_id,
+                            graph_revision: completion.graph_revision,
+                        };
+                        (effect, Some(completion))
+                    } else if enforce_v2 {
+                        let effect = on_mapped_run_transition_txn(txn, &task_id, parent_id).await?;
+                        (effect, None)
+                    } else {
+                        let effect = on_terminal_settle_txn(
+                            txn,
+                            &task_id,
+                            parent_id,
+                            card_summary_json.as_deref(),
+                            &run_status,
+                            workspace_path.as_deref(),
+                        )
+                        .await?;
+                        (effect, None)
+                    };
 
                     let won = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
@@ -4169,15 +4448,16 @@ impl RunStore {
                     Ok((
                         Settlement::Won(persisted.to_persisted_task().to_report(None)),
                         effect,
+                        completion,
                     ))
                 })
             })
             .await;
 
         match outcome {
-            Ok((settlement, effect)) => {
+            Ok((settlement, effect, completion)) => {
                 self.emit_workflow_effect(&effect);
-                Ok(settlement)
+                Ok((settlement, completion))
             }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),

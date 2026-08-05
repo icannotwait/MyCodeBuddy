@@ -13,6 +13,35 @@ pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
 pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
 pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CompletionEvidenceError {
+    #[error("completion terminal state is invalid: {0}")]
+    InvalidTerminalState(String),
+    #[error("completion attention is invalid: {0}")]
+    InvalidAttention(String),
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
+    #[error(transparent)]
+    Scope(#[from] EvidenceScopeError),
+    #[error("completion decision was superseded")]
+    DecisionSuperseded,
+    #[error("completion persistence failure: {0}")]
+    Persistence(String),
+}
+
+impl CompletionEvidenceError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidTerminalState(_) => "completion_terminal_state_invalid",
+            Self::InvalidAttention(_) => "completion_attention_invalid",
+            Self::Artifact(error) => error.code(),
+            Self::Scope(error) => error.code(),
+            Self::DecisionSuperseded => "completion_decision_superseded",
+            Self::Persistence(_) => "completion_persistence_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowAdmissionRecoveryError {
     pub message: String,

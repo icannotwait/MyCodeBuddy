@@ -68,8 +68,8 @@ use crate::acp::delegation::attention::{
     NoopDelegationAttentionStore,
 };
 use crate::acp::delegation::card_summary::{
-    card_summary_to_json, extract_card_summary_with_report_fallback, strip_card_summary_comments,
-    CardSummary,
+    card_summary_to_json, collect_report_harvest_candidates,
+    extract_card_summary_with_report_fallback, strip_card_summary_comments, CardSummary,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::launch_snapshot::{
@@ -82,7 +82,8 @@ use crate::acp::delegation::meta_writer::{
     DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::{
-    DelegationRecoveryMetricEvent, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
+    CompletionMetricPhase, DelegationMetrics, DelegationRecoveryMetricEvent,
+    RecoveryMetricEventKind, RuntimeProjectionErrorKind,
 };
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
@@ -91,6 +92,7 @@ use crate::acp::delegation::run_store::{
     derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
     PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
     PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
+    TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -108,6 +110,9 @@ use crate::acp::delegation::types::{
     DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
+use crate::acp::delegation::workflow::{
+    CompletionResolution, CompletionRole, TerminalCompletionInput, ValidatedReportCandidate,
+};
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
     AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
@@ -1670,6 +1675,8 @@ struct SettleContext {
     runtime: Option<Arc<LiveRuntimeState>>,
     /// Validated card summary extracted from final assistant text (frontend-only).
     card_summary: Option<CardSummary>,
+    /// Protocol-v2 semantic candidates consumed inside the terminal DB transaction.
+    completion_input: Option<TerminalCompletionInput>,
 }
 
 /// Observability context for the process-local persistence retry worker.
@@ -1699,6 +1706,7 @@ impl SettleContext {
             attention_resolution: AttentionResolutionCode::TaskTerminal,
             runtime: Some(task.runtime.clone()),
             card_summary: None,
+            completion_input: None,
         }
     }
 }
@@ -2090,6 +2098,151 @@ fn prepare_terminal_with_card_summary(
         None
     };
     (terminal, parent_text, summary)
+}
+
+fn prepare_terminal_for_v2(
+    task_id: &str,
+    mut terminal: TerminalTaskWrite,
+    result_text: Option<String>,
+    pre_read_reports: Vec<ValidatedReportCandidate>,
+) -> (TerminalTaskWrite, Option<String>, TerminalCompletionInput) {
+    let had_text = result_text.is_some();
+    let raw = result_text.unwrap_or_default();
+    terminal.card_summary_json = None;
+    let parent_text = had_text.then(|| strip_card_summary_comments(&raw));
+    let terminal_status = match terminal.status {
+        TaskStatus::Completed => DelegationRunStatus::Completed,
+        TaskStatus::Failed => DelegationRunStatus::Failed,
+        TaskStatus::Canceled => DelegationRunStatus::Canceled,
+        TaskStatus::Running | TaskStatus::Unknown => DelegationRunStatus::Failed,
+    };
+    let input = TerminalCompletionInput {
+        task_id: task_id.to_string(),
+        terminal_status,
+        final_assistant_text: raw,
+        pre_read_reports,
+        pre_read_artifact: None,
+    };
+    (terminal, parent_text, input)
+}
+
+async fn pre_read_completion_reports(
+    raw_final_text: &str,
+    extra_paths: &[std::path::PathBuf],
+    workspace_path: Option<&std::path::Path>,
+) -> Vec<ValidatedReportCandidate> {
+    const MAX_REPORTS: usize = 8;
+    const MAX_REPORT_BYTES: u64 = 512 * 1024;
+    let Some(workspace_path) = workspace_path else {
+        return Vec::new();
+    };
+    let mut candidates =
+        collect_report_harvest_candidates(raw_final_text, extra_paths, Some(workspace_path));
+    for candidate in collect_plain_report_references(raw_final_text, workspace_path) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    let workspace = workspace_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Ok(workspace) = workspace.canonicalize() else {
+            return Vec::new();
+        };
+        candidates
+            .into_iter()
+            .take(MAX_REPORTS)
+            .filter_map(|candidate| {
+                let path = candidate.canonicalize().ok()?;
+                if !path.starts_with(&workspace) {
+                    return None;
+                }
+                let metadata = path.metadata().ok()?;
+                if !metadata.is_file() || metadata.len() > MAX_REPORT_BYTES {
+                    return None;
+                }
+                let contents = std::fs::read_to_string(&path).ok()?;
+                let relative = path.strip_prefix(&workspace).ok()?;
+                let path = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                Some(ValidatedReportCandidate {
+                    path,
+                    contents,
+                    summary: None,
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn collect_plain_report_references(
+    raw_final_text: &str,
+    workspace_path: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    raw_final_text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches('>').trim();
+            let (label, value) = line.split_once(':')?;
+            if !matches!(
+                label.trim().to_ascii_lowercase().as_str(),
+                "report" | "report file"
+            ) {
+                return None;
+            }
+            let value = value
+                .split_whitespace()
+                .next()?
+                .trim_matches(|ch| matches!(ch, '`' | '"' | '\'' | '<' | '>' | '[' | ']'));
+            let lowercase = value.to_ascii_lowercase();
+            if value.is_empty()
+                || value.contains("://")
+                || !(lowercase.ends_with(".md") || lowercase.ends_with(".markdown"))
+            {
+                return None;
+            }
+            let path = std::path::PathBuf::from(value);
+            Some(if path.is_absolute() {
+                path
+            } else {
+                workspace_path.join(path)
+            })
+        })
+        .take(8)
+        .collect()
+}
+
+fn record_completion_resolver_metrics(
+    metrics: &DelegationMetrics,
+    role: CompletionRole,
+    tool_intent_count: usize,
+    resolution: &CompletionResolution,
+) {
+    if tool_intent_count > 1 {
+        metrics.record_completion_tool_supersession(role);
+    }
+    match resolution {
+        CompletionResolution::Resolved(intent) => {
+            metrics.record_completion_resolution(intent.source, role);
+        }
+        CompletionResolution::NeedsDecision { reason_code, .. } => {
+            metrics.record_completion_decision(*reason_code);
+        }
+    }
+}
+
+fn completion_metric_phase(phase_id: &str) -> CompletionMetricPhase {
+    match phase_id {
+        crate::acp::delegation::workflow::types::PHASE_DESIGN => CompletionMetricPhase::Design,
+        crate::acp::delegation::workflow::types::PHASE_PLAN => CompletionMetricPhase::Plan,
+        crate::acp::delegation::workflow::types::PHASE_TASKS => CompletionMetricPhase::Tasks,
+        crate::acp::delegation::workflow::types::PHASE_FINAL => CompletionMetricPhase::Final,
+        _ => CompletionMetricPhase::Unknown,
+    }
 }
 
 /// Harvest candidates + workspace root from a live runtime projector.
@@ -3328,6 +3481,8 @@ pub struct DelegationBroker {
     /// Task ids that currently own a persistence-retry worker. Dedupes
     /// concurrent exhaustion so only one worker runs per task id.
     persistence_retry_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Protocol-v2 terminal candidates retained across persistence retries.
+    pending_terminal_completion: Arc<Mutex<HashMap<String, TerminalCompletionInput>>>,
     /// Peeks a still-running child's live session for a one-line progress hint,
     /// used to enrich `get_delegation_status`'s running report. Defaults to a
     /// no-op ("no hint"); production wires `ConnectionManagerLiveReplyLookup` via
@@ -3521,6 +3676,7 @@ impl DelegationBroker {
             persistence_retry: PersistenceRetryPolicy::production(),
             persistence_retry_worker_interval: Duration::from_secs(30),
             persistence_retry_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            pending_terminal_completion: Arc::new(Mutex::new(HashMap::new())),
             live_reply_lookup: Arc::new(NoopChildLiveReplyLookup),
             pending: Arc::new(PendingCalls::default()),
             tool_calls: Arc::new(ToolCallTracker::default()),
@@ -7077,6 +7233,7 @@ impl DelegationBroker {
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
                         runtime: Some(runtime),
                         card_summary: None,
+                        completion_input: None,
                     };
                     let mut report = self.settle_task(&call_id, terminal, None, ctx).await;
                     if report.error_code.is_none() {
@@ -7389,12 +7546,15 @@ impl DelegationBroker {
                 let terminal = observed.terminal;
                 let result_text = observed.result_text;
                 let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
-                let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
-                    terminal,
-                    result_text,
-                    &extra_paths,
-                    workspace.as_deref(),
-                );
+                let (terminal, result_text, card_summary, completion_input) = self
+                    .prepare_terminal_for_workflow(
+                        &call_id,
+                        terminal,
+                        result_text,
+                        &extra_paths,
+                        workspace.as_deref(),
+                    )
+                    .await;
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -7409,6 +7569,7 @@ impl DelegationBroker {
                     attention_resolution: AttentionResolutionCode::TaskTerminal,
                     runtime: Some(runtime),
                     card_summary,
+                    completion_input,
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -7442,6 +7603,7 @@ impl DelegationBroker {
                     attention_resolution: parent_end.reason.attention_code(),
                     runtime: Some(runtime),
                     card_summary: None,
+                    completion_input: None,
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
             }
@@ -7467,6 +7629,7 @@ impl DelegationBroker {
                     attention_resolution: AttentionResolutionCode::TaskTerminal,
                     runtime: Some(runtime),
                     card_summary: None,
+                    completion_input: None,
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -7567,6 +7730,7 @@ impl DelegationBroker {
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
                         runtime: Some(runtime),
                         card_summary: None,
+                        completion_input: None,
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
@@ -7595,6 +7759,115 @@ impl DelegationBroker {
             running_ack(call_id, child_conversation_id, req.agent_type),
             req.replacement_reason.as_deref(),
         )
+    }
+
+    async fn prepare_terminal_for_workflow(
+        &self,
+        task_id: &str,
+        terminal: TerminalTaskWrite,
+        result_text: Option<String>,
+        extra_report_paths: &[std::path::PathBuf],
+        workspace_path: Option<&std::path::Path>,
+    ) -> (
+        TerminalTaskWrite,
+        Option<String>,
+        Option<CardSummary>,
+        Option<TerminalCompletionInput>,
+    ) {
+        let Some(runs) = self.run_store.as_ref() else {
+            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                terminal,
+                result_text,
+                extra_report_paths,
+                workspace_path,
+            );
+            return (terminal, result_text, card_summary, None);
+        };
+        let protocol = match runs.terminal_completion_protocol(task_id).await {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %error,
+                    "[delegation] completion protocol lookup failed closed"
+                );
+                let reports = pre_read_completion_reports(
+                    result_text.as_deref().unwrap_or_default(),
+                    extra_report_paths,
+                    workspace_path,
+                )
+                .await;
+                let (terminal, result_text, input) =
+                    prepare_terminal_for_v2(task_id, terminal, result_text, reports);
+                return (terminal, result_text, None, Some(input));
+            }
+        };
+        if protocol.as_ref().is_some_and(|(version, mode)| {
+            *version == 2
+                && mode
+                    == &crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+        }) {
+            let reports = pre_read_completion_reports(
+                result_text.as_deref().unwrap_or_default(),
+                extra_report_paths,
+                workspace_path,
+            )
+            .await;
+            let (terminal, result_text, input) =
+                prepare_terminal_for_v2(task_id, terminal, result_text, reports);
+            (terminal, result_text, None, Some(input))
+        } else {
+            if terminal.status == TaskStatus::Completed
+                && protocol.as_ref().is_some_and(|(_, mode)| {
+                    mode
+                        == &crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow
+                })
+            {
+                let reports = pre_read_completion_reports(
+                    result_text.as_deref().unwrap_or_default(),
+                    extra_report_paths,
+                    workspace_path,
+                )
+                .await;
+                if let Ok(Some(context)) =
+                    runs.terminal_completion_resolver_context(task_id).await
+                {
+                    let tool_intent_count = context.tool_intents.len();
+                    let resolution = crate::acp::delegation::workflow::resolve_completion_intent(
+                        &crate::acp::delegation::workflow::CompletionResolverInput {
+                            role: context.role,
+                            tool_intents: context.tool_intents,
+                            final_assistant_text: result_text.clone().unwrap_or_default(),
+                            report_candidates: reports
+                                .into_iter()
+                                .map(|report| {
+                                    crate::acp::delegation::workflow::CompletionReportCandidate {
+                                        path: report.path,
+                                        contents: report.contents,
+                                        summary: report.summary,
+                                    }
+                                })
+                                .collect(),
+                            touched_report_candidates: Vec::new(),
+                            report_read_failures: Vec::new(),
+                        },
+                    );
+                    record_completion_resolver_metrics(
+                        &self.metrics,
+                        context.role,
+                        tool_intent_count,
+                        &resolution,
+                    );
+                }
+            }
+            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                terminal,
+                result_text,
+                extra_report_paths,
+                workspace_path,
+            );
+            (terminal, result_text, card_summary, None)
+        }
     }
 
     /// Durable terminal settlement — every terminal producer calls this before
@@ -7643,9 +7916,62 @@ impl DelegationBroker {
         } else {
             None
         };
-        let settlement = self.settle_with_retry(task_id, terminal).await;
+        let settlement = self
+            .settle_with_retry(task_id, terminal, ctx.completion_input.clone())
+            .await;
         match settlement {
-            Ok(settlement) => {
+            Ok((settlement, completion)) => {
+                if let Some(completion) = completion.as_ref() {
+                    let projection =
+                        crate::acp::delegation::workflow::project_terminal_completion(completion);
+                    let metric_context = match self.run_store.as_ref() {
+                        Some(runs) => runs
+                            .terminal_completion_resolver_context(task_id)
+                            .await
+                            .ok()
+                            .flatten(),
+                        None => None,
+                    };
+                    let role = metric_context
+                        .as_ref()
+                        .map(|context| context.role)
+                        .or_else(|| {
+                            completion
+                                .evidence
+                                .as_ref()
+                                .map(|evidence| evidence.binding.role)
+                        });
+                    if let Some(context) = metric_context.as_ref() {
+                        if context.tool_intents.len() > 1 {
+                            self.metrics
+                                .record_completion_tool_supersession(context.role);
+                        }
+                    }
+                    if let (Some(source), Some(role)) = (projection.source, role) {
+                        self.metrics.record_completion_resolution(source, role);
+                    } else if let (Some(runs), Some(context), Some(attention)) = (
+                        self.run_store.as_ref(),
+                        metric_context.as_ref(),
+                        projection.attention.as_ref(),
+                    ) {
+                        if let Ok(Some(metric)) = runs
+                            .terminal_completion_attention_metric(task_id, &attention.attention_id)
+                            .await
+                        {
+                            match metric {
+                                TerminalCompletionAttentionMetric::Decision(reason) => {
+                                    self.metrics.record_completion_decision(reason);
+                                }
+                                TerminalCompletionAttentionMetric::ArtifactFailure(reason) => {
+                                    self.metrics.record_completion_artifact_failure(
+                                        completion_metric_phase(&context.phase_id),
+                                        reason,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 let won = settlement.won();
                 let mut report = settlement.into_report();
                 // Enrich with producer-local fields the store may not carry.
@@ -8274,11 +8600,33 @@ impl DelegationBroker {
         &self,
         task_id: &str,
         terminal: TerminalTaskWrite,
-    ) -> Result<Settlement, crate::acp::delegation::store::TaskStoreError> {
+        completion_input: Option<TerminalCompletionInput>,
+    ) -> Result<
+        (
+            Settlement,
+            Option<crate::acp::delegation::workflow::TerminalCompletionResult>,
+        ),
+        crate::acp::delegation::store::TaskStoreError,
+    > {
+        if let Some(input) = completion_input.as_ref() {
+            self.pending_terminal_completion
+                .lock()
+                .await
+                .insert(task_id.to_string(), input.clone());
+        }
         let mut attempt = 0u32;
         loop {
-            match self.task_store.settle(task_id, terminal.clone()).await {
-                Ok(s) => return Ok(s),
+            match self
+                .settle_once(task_id, terminal.clone(), completion_input.clone())
+                .await
+            {
+                Ok(result) => {
+                    self.pending_terminal_completion
+                        .lock()
+                        .await
+                        .remove(task_id);
+                    return Ok(result);
+                }
                 Err(e) if e.is_transient() && attempt + 1 < self.persistence_retry.max_attempts => {
                     let delay = self.persistence_retry.delay_for_attempt(attempt);
                     attempt += 1;
@@ -8287,6 +8635,29 @@ impl DelegationBroker {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    async fn settle_once(
+        &self,
+        task_id: &str,
+        terminal: TerminalTaskWrite,
+        completion_input: Option<TerminalCompletionInput>,
+    ) -> Result<
+        (
+            Settlement,
+            Option<crate::acp::delegation::workflow::TerminalCompletionResult>,
+        ),
+        crate::acp::delegation::store::TaskStoreError,
+    > {
+        if let (Some(runs), Some(input)) = (self.run_store.as_ref(), completion_input) {
+            return runs
+                .settle_terminal_with_completion(task_id, terminal, Some(input))
+                .await;
+        }
+        self.task_store
+            .settle(task_id, terminal)
+            .await
+            .map(|settlement| (settlement, None))
     }
 
     /// Spawn at most one process-local persistence retry worker per task id.
@@ -8360,8 +8731,22 @@ impl DelegationBroker {
                 let payload_status = retry.terminal.status;
                 let payload_error_code = retry.terminal.error_code.clone();
                 let terminal = retry.terminal;
-                match store.settle(&task_id, terminal).await {
-                    Ok(settlement) => {
+                let completion_input = broker
+                    .pending_terminal_completion
+                    .lock()
+                    .await
+                    .get(&task_id)
+                    .cloned();
+                match broker
+                    .settle_once(&task_id, terminal, completion_input)
+                    .await
+                {
+                    Ok((settlement, _completion)) => {
+                        broker
+                            .pending_terminal_completion
+                            .lock()
+                            .await
+                            .remove(&task_id);
                         let settlement = align_won_settlement_to_payload(
                             settlement,
                             payload_status,
@@ -8382,6 +8767,11 @@ impl DelegationBroker {
                     }
                     Err(e) if e.is_transient() => continue,
                     Err(err) => {
+                        broker
+                            .pending_terminal_completion
+                            .lock()
+                            .await
+                            .remove(&task_id);
                         tracing::error!(
                             task_id = %task_id,
                             error = %err,
@@ -10129,12 +10519,15 @@ impl DelegationBroker {
             let terminal = observed.terminal;
             let result_text = observed.result_text;
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&runtime));
-            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
-                terminal,
-                result_text,
-                &extra_paths,
-                workspace.as_deref(),
-            );
+            let (terminal, result_text, card_summary, completion_input) = self
+                .prepare_terminal_for_workflow(
+                    &reserved.task_id,
+                    terminal,
+                    result_text,
+                    &extra_paths,
+                    workspace.as_deref(),
+                )
+                .await;
             let mut ctx = SettleContext {
                 parent_connection_id: req.parent_connection_id.clone(),
                 parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -10152,6 +10545,7 @@ impl DelegationBroker {
                 attention_resolution: AttentionResolutionCode::TaskTerminal,
                 runtime: Some(runtime),
                 card_summary,
+                completion_input,
             };
             let (_, _, _, message) = terminal_fields(&outcome);
             ctx.message = message;
@@ -10249,6 +10643,7 @@ impl DelegationBroker {
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
                         runtime: Some(runtime),
                         card_summary: None,
+                        completion_input: None,
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
@@ -11328,8 +11723,11 @@ impl DelegationBroker {
         }
 
         // 4) Bounded settle with intended code (no PE rewrite).
-        match self.settle_with_retry(task_id, terminal.clone()).await {
-            Ok(Settlement::Won(report)) => {
+        match self
+            .settle_with_retry(task_id, terminal.clone(), None)
+            .await
+        {
+            Ok((Settlement::Won(report), _)) => {
                 self.finalize_durable_settlement(
                     task_id,
                     Settlement::Won(report.clone()),
@@ -11380,7 +11778,7 @@ impl DelegationBroker {
                 );
                 PostAcceptPromoteResult::Failed(report)
             }
-            Ok(Settlement::Existing(report)) => {
+            Ok((Settlement::Existing(report), _)) => {
                 self.finalize_durable_settlement(
                     task_id,
                     Settlement::Existing(report.clone()),
@@ -11721,8 +12119,11 @@ impl DelegationBroker {
                 .await;
         }
 
-        match self.settle_with_retry(task_id, terminal.clone()).await {
-            Ok(Settlement::Won(report)) => {
+        match self
+            .settle_with_retry(task_id, terminal.clone(), None)
+            .await
+        {
+            Ok((Settlement::Won(report), _)) => {
                 self.finalize_durable_settlement(
                     task_id,
                     Settlement::Won(report),
@@ -11739,7 +12140,7 @@ impl DelegationBroker {
                 );
                 BootstrapSettleResult::Won
             }
-            Ok(Settlement::Existing(report)) => {
+            Ok((Settlement::Existing(report), _)) => {
                 let code = report.error_code.clone();
                 self.finalize_durable_settlement(
                     task_id,
@@ -12294,6 +12695,7 @@ impl DelegationBroker {
                                 attention_resolution: AttentionResolutionCode::TaskTerminal,
                                 runtime: None,
                                 card_summary: None,
+                                completion_input: None,
                             },
                         );
                         inner.insert_completed(
@@ -12733,14 +13135,18 @@ impl DelegationBroker {
             // Extract validated card summary (chat first, report-file harvest
             // fallback) and strip comments from parent MCP text.
             let (extra_paths, workspace) = report_harvest_context_from_runtime(Some(&task.runtime));
-            let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
-                terminal,
-                result_text,
-                &extra_paths,
-                workspace.as_deref(),
-            );
+            let (terminal, result_text, card_summary, completion_input) = self
+                .prepare_terminal_for_workflow(
+                    call_id,
+                    terminal,
+                    result_text,
+                    &extra_paths,
+                    workspace.as_deref(),
+                )
+                .await;
             let mut ctx = SettleContext::from_running(&task, duration_ms, false);
             ctx.card_summary = card_summary;
+            ctx.completion_input = completion_input;
             tracing::info!(
                 call_id = %call_id,
                 child_conversation_id = task.child_conversation_id,
@@ -30563,6 +30969,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v2_terminal_preparation_ignores_model_card_authority() {
+        let raw = r#"Conclusion: done
+<!-- codeg-card-summary-v1
+{"kind":"author","status":"done","plan_digest":"model-authored"}
+-->"#;
+        let terminal = TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+            .with_card_summary_json("model-authored");
+        let (terminal, parent_text, input) =
+            prepare_terminal_for_v2("task-v2", terminal, Some(raw.into()), Vec::new());
+        assert_eq!(terminal.card_summary_json, None);
+        assert!(!parent_text.unwrap().contains("codeg-card-summary-v1"));
+        assert_eq!(input.task_id, "task-v2");
+        assert_eq!(input.final_assistant_text, raw);
+    }
+
+    #[tokio::test]
+    async fn v2_pre_read_follows_plain_report_reference() {
+        let workspace = tempfile::tempdir().unwrap();
+        let report = workspace.path().join("reports/review.md");
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report, "# Conclusion\n\napprove\n").unwrap();
+
+        let candidates =
+            pre_read_completion_reports("Report: reports/review.md", &[], Some(workspace.path()))
+                .await;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "reports/review.md");
+        assert!(candidates[0].contents.contains("approve"));
+    }
+
+    #[test]
+    fn shadow_completion_observation_records_bounded_resolver_metrics() {
+        let metrics = DelegationMetrics::default();
+        let resolution = crate::acp::delegation::workflow::resolve_completion_intent(
+            &crate::acp::delegation::workflow::CompletionResolverInput {
+                role: crate::acp::delegation::workflow::CompletionRole::Reviewer,
+                tool_intents: vec![
+                    crate::acp::delegation::workflow::CompletionToolIntent {
+                        accepted_ordinal: 1,
+                        outcome: crate::acp::delegation::workflow::CompletionOutcome::Block,
+                        summary: None,
+                        report_file: None,
+                    },
+                    crate::acp::delegation::workflow::CompletionToolIntent {
+                        accepted_ordinal: 2,
+                        outcome: crate::acp::delegation::workflow::CompletionOutcome::Approve,
+                        summary: None,
+                        report_file: None,
+                    },
+                ],
+                final_assistant_text: "Conclusion: block".into(),
+                report_candidates: Vec::new(),
+                touched_report_candidates: Vec::new(),
+                report_read_failures: Vec::new(),
+            },
+        );
+
+        record_completion_resolver_metrics(
+            &metrics,
+            crate::acp::delegation::workflow::CompletionRole::Reviewer,
+            2,
+            &resolution,
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.completion_resolutions["complete_work:reviewer"], 1);
+        assert_eq!(snapshot.completion_tool_supersessions["reviewer"], 1);
+        assert!(snapshot.completion_decisions.is_empty());
+    }
+
     #[tokio::test]
     async fn emitter_harvests_card_summary_from_linked_report_file() {
         let dir = std::env::temp_dir().join(format!(
@@ -31996,6 +32474,7 @@ mod tests {
             attention_resolution: AttentionResolutionCode::TaskTerminal,
             runtime: None,
             card_summary: None,
+            completion_input: None,
         };
 
         let report = broker

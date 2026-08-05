@@ -2,7 +2,9 @@
 
 pub mod admission;
 pub mod artifact_resolver;
+pub mod completion_evidence;
 pub mod completion_intent;
+pub mod completion_projection;
 pub mod dto;
 pub mod error;
 pub mod events;
@@ -31,19 +33,25 @@ pub use artifact_resolver::{
     resolve_reviewer_completion, ArtifactError, ArtifactFailure, ArtifactKind,
     DocumentSha256Artifact, GitHeadV1Artifact, ResolvedArtifact,
 };
+pub use completion_evidence::{
+    materialize_terminal_completion_txn, retry_completion_artifact_txn, ArtifactRecoveryPayloadV1,
+    CompletionAttentionCas, CompletionSourceAuditRef, TerminalCompletionInput,
+    TerminalCompletionResult, ValidatedReportCandidate,
+};
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
     CompletionDiagnosticCode, CompletionIntent, CompletionIntentReason, CompletionIntentSource,
     CompletionOutcome, CompletionReportCandidate, CompletionReportReadFailure,
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
+pub use completion_projection::{project_terminal_completion, CompletionProjectionV2};
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
     WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
     WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
-pub use error::WorkflowStoreError;
+pub use error::{CompletionEvidenceError, WorkflowStoreError};
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     WorkflowRecoveryEvent, WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,

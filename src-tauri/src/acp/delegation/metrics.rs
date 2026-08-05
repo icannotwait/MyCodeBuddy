@@ -25,6 +25,9 @@ use crate::acp::delegation::route::{
 };
 use crate::acp::delegation::transport::CancelDelegationReason;
 use crate::acp::delegation::types::{TaskObservation, TaskStatus};
+use crate::acp::delegation::workflow::{
+    ArtifactFailure, CompletionIntentReason, CompletionIntentSource, CompletionRole,
+};
 use crate::models::AgentType;
 
 // ── Runtime projection diagnostics (Task 8; Task 11 adds counters) ─────────
@@ -36,6 +39,56 @@ pub enum RuntimeProjectionErrorKind {
     Event,
     Persistence,
     TerminalPersistence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionMetricPhase {
+    Design,
+    Plan,
+    Tasks,
+    Final,
+    Unknown,
+}
+
+impl CompletionMetricPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Plan => "plan",
+            Self::Tasks => "tasks",
+            Self::Final => "final",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionScopeInvalidationDimension {
+    Node,
+    Producer,
+    Instruction,
+    Policy,
+    Requirements,
+    FinalFindings,
+    Lineage,
+    TaskScope,
+    Artifact,
+}
+
+impl CompletionScopeInvalidationDimension {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Producer => "producer",
+            Self::Instruction => "instruction",
+            Self::Policy => "policy",
+            Self::Requirements => "requirements",
+            Self::FinalFindings => "final_findings",
+            Self::Lineage => "lineage",
+            Self::TaskScope => "task_scope",
+            Self::Artifact => "artifact",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +424,16 @@ pub struct DelegationMetricsSnapshot {
     pub recovery_events: BTreeMap<String, u64>,
     #[serde(default)]
     pub recovery_lookup_unknown: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_resolutions: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_tool_supersessions: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_decisions: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_artifact_failures: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_scope_invalidations: BTreeMap<String, u64>,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -425,6 +488,11 @@ pub struct DelegationMetrics {
     recovery_event_counts: Mutex<BTreeMap<String, u64>>,
     recovery_lookup_unknown: Mutex<BTreeMap<String, u64>>,
     recovery_event_log: Mutex<Vec<DelegationRecoveryMetricEvent>>,
+    completion_resolutions: Mutex<BTreeMap<String, u64>>,
+    completion_tool_supersessions: Mutex<BTreeMap<String, u64>>,
+    completion_decisions: Mutex<BTreeMap<String, u64>>,
+    completion_artifact_failures: Mutex<BTreeMap<String, u64>>,
+    completion_scope_invalidations: Mutex<BTreeMap<String, u64>>,
 }
 
 impl DelegationMetrics {
@@ -439,6 +507,57 @@ impl DelegationMetrics {
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.entry(key).or_insert(0);
         *entry = (*entry).saturating_add(n);
+    }
+
+    pub fn record_completion_resolution(
+        &self,
+        source: CompletionIntentSource,
+        role: CompletionRole,
+    ) {
+        Self::inc_labeled(
+            &self.completion_resolutions,
+            format!(
+                "{}:{}",
+                completion_source_label(source),
+                completion_role_label(role)
+            ),
+        );
+    }
+
+    pub fn record_completion_tool_supersession(&self, role: CompletionRole) {
+        Self::inc_labeled(
+            &self.completion_tool_supersessions,
+            completion_role_label(role).into(),
+        );
+    }
+
+    pub fn record_completion_decision(&self, reason: CompletionIntentReason) {
+        Self::inc_labeled(
+            &self.completion_decisions,
+            completion_reason_label(reason).into(),
+        );
+    }
+
+    pub fn record_completion_artifact_failure(
+        &self,
+        phase: CompletionMetricPhase,
+        reason: ArtifactFailure,
+    ) {
+        Self::inc_labeled(
+            &self.completion_artifact_failures,
+            format!("{}:{}", phase.as_str(), artifact_failure_label(reason)),
+        );
+    }
+
+    pub fn record_completion_scope_invalidation(
+        &self,
+        phase: CompletionMetricPhase,
+        dimension: CompletionScopeInvalidationDimension,
+    ) {
+        Self::inc_labeled(
+            &self.completion_scope_invalidations,
+            format!("{}:{}", phase.as_str(), dimension.as_str()),
+        );
     }
 
     pub fn record_recovery_event(&self, event: DelegationRecoveryMetricEvent) {
@@ -899,6 +1018,31 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let completion_resolutions = self
+            .completion_resolutions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let completion_tool_supersessions = self
+            .completion_tool_supersessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let completion_decisions = self
+            .completion_decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let completion_artifact_failures = self
+            .completion_artifact_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let completion_scope_invalidations = self
+            .completion_scope_invalidations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         DelegationMetricsSnapshot {
             route_selections,
             safe_fallbacks,
@@ -954,11 +1098,59 @@ impl DelegationMetrics {
             settlement_retry_exhausted: self.settlement_retry_exhausted.load(Ordering::Relaxed),
             recovery_events,
             recovery_lookup_unknown,
+            completion_resolutions,
+            completion_tool_supersessions,
+            completion_decisions,
+            completion_artifact_failures,
+            completion_scope_invalidations,
         }
     }
 }
 
 // ── Label helpers (stable enums only) ──────────────────────────────────────
+
+fn completion_source_label(source: CompletionIntentSource) -> &'static str {
+    match source {
+        CompletionIntentSource::CompleteWork => "complete_work",
+        CompletionIntentSource::AssistantConclusion => "assistant_conclusion",
+        CompletionIntentSource::Report => "report",
+        CompletionIntentSource::UserAdjudication => "user_adjudication",
+    }
+}
+
+fn completion_role_label(role: CompletionRole) -> &'static str {
+    match role {
+        CompletionRole::Reviewer => "reviewer",
+        CompletionRole::Author => "author",
+        CompletionRole::Implementer => "implementer",
+        CompletionRole::Fixer => "fixer",
+    }
+}
+
+fn completion_reason_label(reason: CompletionIntentReason) -> &'static str {
+    match reason {
+        CompletionIntentReason::Missing => "completion_intent_missing",
+        CompletionIntentReason::Conflict => "completion_intent_conflict",
+        CompletionIntentReason::RoleMismatch => "completion_outcome_role_mismatch",
+    }
+}
+
+fn artifact_failure_label(reason: ArtifactFailure) -> &'static str {
+    match reason {
+        ArtifactFailure::InvalidPath => "invalid_path",
+        ArtifactFailure::WorkspaceUnavailable => "workspace_unavailable",
+        ArtifactFailure::WorkspaceEscape => "workspace_escape",
+        ArtifactFailure::NotFile => "not_file",
+        ArtifactFailure::SizeLimitExceeded => "size_limit_exceeded",
+        ArtifactFailure::ReadFailed => "read_failed",
+        ArtifactFailure::GitCommandFailed => "git_command_failed",
+        ArtifactFailure::MissingHead => "missing_head",
+        ArtifactFailure::MalformedHead => "malformed_head",
+        ArtifactFailure::DirtyWorktree => "dirty_worktree",
+        ArtifactFailure::CommitRequired => "commit_required",
+        ArtifactFailure::ExpectedArtifactInvalid => "expected_artifact_invalid",
+    }
+}
 
 /// Stable metrics / audit label for [`AgentType`] (snake_case, low cardinality).
 pub fn agent_type_label(agent: AgentType) -> &'static str {
@@ -1647,6 +1839,45 @@ pub fn emit_promote_structured_log(
 mod tests {
     use super::*;
     use crate::acp::delegation::route::ROUTE_ADAPTER_CONTRACT_VERSION;
+
+    #[test]
+    fn completion_metrics_use_only_bounded_enum_labels() {
+        let metrics = DelegationMetrics::default();
+        metrics.record_completion_resolution(
+            crate::acp::delegation::workflow::CompletionIntentSource::AssistantConclusion,
+            crate::acp::delegation::workflow::CompletionRole::Reviewer,
+        );
+        metrics.record_completion_tool_supersession(
+            crate::acp::delegation::workflow::CompletionRole::Reviewer,
+        );
+        metrics.record_completion_decision(
+            crate::acp::delegation::workflow::CompletionIntentReason::Conflict,
+        );
+        metrics.record_completion_artifact_failure(
+            CompletionMetricPhase::Plan,
+            crate::acp::delegation::workflow::ArtifactFailure::ReadFailed,
+        );
+        metrics.record_completion_scope_invalidation(
+            CompletionMetricPhase::Tasks,
+            CompletionScopeInvalidationDimension::Instruction,
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.completion_resolutions["assistant_conclusion:reviewer"],
+            1
+        );
+        assert_eq!(snapshot.completion_tool_supersessions["reviewer"], 1);
+        assert_eq!(
+            snapshot.completion_decisions["completion_intent_conflict"],
+            1
+        );
+        assert_eq!(snapshot.completion_artifact_failures["plan:read_failed"], 1);
+        assert_eq!(
+            snapshot.completion_scope_invalidations["tasks:instruction"],
+            1
+        );
+    }
 
     #[test]
     fn cursor_uses_stable_metrics_label() {

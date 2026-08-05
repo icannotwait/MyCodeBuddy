@@ -13,13 +13,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::store::is_transient_sqlite;
 use crate::db::entities::conversation::{self, DelegationTaskStatus};
 use crate::db::entities::delegation_attention_request;
+use crate::db::entities::{
+    delegation_task_run, delegation_workflow_node_binding, delegation_workflow_run_binding,
+};
 use crate::db::AppDatabase;
 
 pub const ATTENTION_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
@@ -152,6 +156,108 @@ pub fn validate_attention_payload(text: &str) -> Result<(), AttentionStoreError>
         return Err(AttentionStoreError::BlankPayload);
     }
     Ok(())
+}
+
+pub(crate) struct TerminalCompletionAttentionInput<'a> {
+    pub task_id: &'a str,
+    pub kind: delegation_attention_request::AttentionKind,
+    pub message: &'static str,
+    pub payload_json: &'a str,
+    pub captured_scope_digest: &'a str,
+    pub node_id: &'a str,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Open one completion-family attention row while the caller's terminal
+/// transaction is active. This path authorizes a completed workflow-bound run;
+/// it intentionally does not share the live child-question authorization.
+pub(crate) async fn open_terminal_completion_attention_txn<C: ConnectionTrait>(
+    conn: &C,
+    input: &TerminalCompletionAttentionInput<'_>,
+) -> Result<delegation_attention_request::Model, AttentionStoreError> {
+    if !matches!(
+        input.kind,
+        delegation_attention_request::AttentionKind::CompletionDecision
+            | delegation_attention_request::AttentionKind::CompletionArtifactRecovery
+    ) {
+        return Err(AttentionStoreError::Unauthorized);
+    }
+    validate_attention_payload(input.message)?;
+    if input.payload_json.len() > ATTENTION_PAYLOAD_MAX_BYTES
+        || input.payload_json.trim().is_empty()
+        || input.captured_scope_digest.trim().is_empty()
+        || input.node_id.trim().is_empty()
+    {
+        return Err(AttentionStoreError::PayloadTooLarge);
+    }
+
+    let run = delegation_task_run::Entity::find_by_id(input.task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or(AttentionStoreError::Unauthorized)?;
+    if run.status != delegation_task_run::DelegationRunStatus::Completed {
+        return Err(AttentionStoreError::TaskNotRunning);
+    }
+    let binding = delegation_workflow_run_binding::Entity::find_by_id(input.task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or(AttentionStoreError::Unauthorized)?;
+    if binding.node_id != input.node_id {
+        return Err(AttentionStoreError::Unauthorized);
+    }
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        binding.workflow_id,
+        binding.node_id,
+    ))
+    .one(conn)
+    .await
+    .map_err(map_db)?;
+    if node.is_none() {
+        return Err(AttentionStoreError::Unauthorized);
+    }
+
+    if let Some(existing) = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::TaskId.eq(input.task_id))
+        .filter(delegation_attention_request::Column::Kind.eq(input.kind.clone()))
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .one(conn)
+        .await
+        .map_err(map_db)?
+    {
+        if existing.latest_run_id.as_deref() == Some(input.task_id)
+            && existing.node_id.as_deref() == Some(input.node_id)
+            && existing.captured_scope_digest.as_deref() == Some(input.captured_scope_digest)
+            && existing.payload_json.as_deref() == Some(input.payload_json)
+        {
+            return Ok(existing);
+        }
+        return Err(AttentionStoreError::AlreadyOpen);
+    }
+
+    delegation_attention_request::ActiveModel {
+        request_id: Set(uuid::Uuid::new_v4().to_string()),
+        task_id: Set(input.task_id.to_string()),
+        parent_conversation_id: Set(run.parent_conversation_id),
+        child_conversation_id: Set(Some(run.child_conversation_id)),
+        child_tool_call_id: Set(None),
+        status: Set("open".into()),
+        message: Set(input.message.into()),
+        reply: Set(None),
+        resolution_code: Set(None),
+        created_at: Set(input.created_at),
+        resolved_at: Set(None),
+        kind: Set(input.kind.clone()),
+        latest_run_id: Set(Some(input.task_id.to_string())),
+        node_id: Set(Some(input.node_id.to_string())),
+        payload_json: Set(Some(input.payload_json.to_string())),
+        resolution_json: Set(None),
+        captured_scope_digest: Set(Some(input.captured_scope_digest.to_string())),
+    }
+    .insert(conn)
+    .await
+    .map_err(map_db)
 }
 
 #[async_trait]
