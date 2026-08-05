@@ -36,11 +36,12 @@ pub use artifact_resolver::{
 pub use completion_evidence::{
     materialize_terminal_completion_txn, open_design_self_review_decision_txn,
     reconcile_completion_attentions_txn, resolve_completion_decision_txn,
-    resolve_design_self_review_txn, resolve_workflow_completion_attentions_txn,
-    retry_completion_artifact_for_user_txn, retry_completion_artifact_txn,
-    ArtifactRecoveryPayloadV1, CompletionAttentionCas, CompletionAttentionReconcileReport,
-    CompletionMutationError, CompletionSourceAuditRef, DesignSelfReviewPayloadV1,
-    TerminalCompletionInput, TerminalCompletionResult, ValidatedReportCandidate,
+    resolve_deleted_conversation_completion_attentions_txn, resolve_design_self_review_txn,
+    resolve_workflow_completion_attentions_txn, retry_completion_artifact_for_user_txn,
+    retry_completion_artifact_txn, ArtifactRecoveryPayloadV1, CompletionAttentionCas,
+    CompletionAttentionReconcileReport, CompletionMutationError, CompletionSourceAuditRef,
+    DesignSelfReviewPayloadV1, TerminalCompletionInput, TerminalCompletionResult,
+    ValidatedReportCandidate,
 };
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,

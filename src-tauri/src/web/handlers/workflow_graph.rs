@@ -6,13 +6,18 @@
 
 use std::sync::Arc;
 
-use axum::{extract::Extension, Json};
+use axum::{
+    extract::Extension,
+    http::HeaderValue,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::Deserialize;
 
-use crate::acp::delegation::workflow::WorkflowGraphSnapshot;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::workflow_graph::get_workflow_graph_snapshot_core;
+use crate::web::auth::COMPLETION_CONTEXT_HEADER;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,10 +28,21 @@ pub struct GetWorkflowGraphSnapshotParams {
 pub async fn get_workflow_graph_snapshot(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<GetWorkflowGraphSnapshotParams>,
-) -> Result<Json<Option<WorkflowGraphSnapshot>>, AppCommandError> {
-    Ok(Json(
-        get_workflow_graph_snapshot_core(&state.db, params.conversation_id).await,
-    ))
+) -> Result<Response, AppCommandError> {
+    let snapshot = get_workflow_graph_snapshot_core(&state.db, params.conversation_id).await;
+    let has_snapshot = snapshot.is_some();
+    let mut response = Json(snapshot).into_response();
+    if has_snapshot {
+        let context = state
+            .web_server_state
+            .completion_authorizations()
+            .issue(params.conversation_id);
+        response.headers_mut().insert(
+            COMPLETION_CONTEXT_HEADER,
+            HeaderValue::from_str(&context).expect("UUID completion context is a valid header"),
+        );
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -40,12 +56,13 @@ mod tests {
         MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
         WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
+    use crate::acp::delegation::workflow::WorkflowGraphSnapshot;
     use crate::acp::delegation::workflow::{
         project_workflow_graph_core, publish_workflow_manifest_core, PublishWorkflowRequest,
     };
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
-    use crate::web::auth::require_token;
+    use crate::web::auth::require_token_with_completion_authorizations;
     use crate::web::event_bridge::EventEmitter;
     use axum::http::StatusCode;
     use axum::routing::post;
@@ -68,6 +85,7 @@ mod tests {
 
     /// Mini router matching production: POST snapshot only + 501 fallback.
     fn snapshot_router(state: Arc<AppState>, token: String) -> axum::Router {
+        let completion_authorizations = state.web_server_state.completion_authorizations();
         axum::Router::new()
             .nest(
                 "/api",
@@ -79,7 +97,16 @@ mod tests {
                     .fallback(api_not_found)
                     .layer(axum::middleware::from_fn(move |req, next| {
                         let token = token.clone();
-                        async move { require_token(req, next, token).await }
+                        let completion_authorizations = completion_authorizations.clone();
+                        async move {
+                            require_token_with_completion_authorizations(
+                                req,
+                                next,
+                                token,
+                                completion_authorizations,
+                            )
+                            .await
+                        }
                     })),
             )
             .layer(axum::Extension(state))

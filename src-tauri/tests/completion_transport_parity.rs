@@ -5,6 +5,7 @@ use chrono::Utc;
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
 use codeg_lib::acp::delegation::types::{
     CompletionMutationResult, DelegationReplyResult, ResolveCompletionDecisionRequest,
+    ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
 };
 use codeg_lib::acp::delegation::workflow::store::{
     publish_workflow_manifest_core, PublishWorkflowRequest,
@@ -26,6 +27,7 @@ use codeg_lib::db::entities::delegation_task_run::{self, AdmissionClass, Delegat
 use codeg_lib::db::entities::delegation_workflow::{self, CompletionProtocolMode};
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
+use codeg_lib::web::auth::COMPLETION_CONTEXT_HEADER;
 use codeg_lib::web::event_bridge::EventEmitter;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
@@ -296,11 +298,160 @@ fn error_detail(response: &axum_test::TestResponse) -> String {
         .to_string()
 }
 
+async fn issue_completion_context(fixture: &CompletionHttpFixture) -> String {
+    let response = fixture
+        .server
+        .post("/api/get_workflow_graph_snapshot")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": fixture.parent_conversation_id }))
+        .await;
+    response.assert_status_ok();
+    response
+        .headers()
+        .get(COMPLETION_CONTEXT_HEADER)
+        .expect("snapshot must issue completion context")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn attention_mutation_dto_rejects_request_asserted_parent_owner() {
+    let cas = json!({
+        "attention_id": "attention-1",
+        "task_id": "task-1",
+        "kind": "completion_decision",
+        "captured_scope_digest": format!("sha256:{}", "a".repeat(64)),
+        "latest_run_id": "task-1",
+        "node_id": "plan-author"
+    });
+    let decision = json!({
+        "cas": cas,
+        "outcome": "done"
+    });
+    let retry = json!({
+        "cas": decision["cas"].clone()
+    });
+    let self_review = json!({
+        "cas": decision["cas"].clone(),
+        "outcome": "approve"
+    });
+    assert!(serde_json::from_value::<ResolveCompletionDecisionRequest>(decision.clone()).is_ok());
+    assert!(serde_json::from_value::<RetryCompletionArtifactRequest>(retry.clone()).is_ok());
+    assert!(serde_json::from_value::<ResolveDesignSelfReviewRequest>(self_review.clone()).is_ok());
+
+    let mut decision_with_owner = decision;
+    decision_with_owner["parent_conversation_id"] = json!(42);
+    assert!(
+        serde_json::from_value::<ResolveCompletionDecisionRequest>(decision_with_owner).is_err()
+    );
+    let mut retry_with_owner = retry;
+    retry_with_owner["parent_conversation_id"] = json!(42);
+    assert!(serde_json::from_value::<RetryCompletionArtifactRequest>(retry_with_owner).is_err());
+    let mut self_review_with_owner = self_review;
+    self_review_with_owner["parent_conversation_id"] = json!(42);
+    assert!(
+        serde_json::from_value::<ResolveDesignSelfReviewRequest>(self_review_with_owner).is_err()
+    );
+}
+
+#[tokio::test]
+async fn attention_authenticated_context_owns_durable_root_across_core_and_http() {
+    let matching_fixture = completion_http_fixture().await;
+    let matching_token = issue_completion_context(&matching_fixture).await;
+    let matching_request = ResolveCompletionDecisionRequest {
+        cas: matching_fixture.cas.clone(),
+        outcome: CompletionOutcome::Done,
+    };
+    let global_only = matching_fixture
+        .server
+        .post("/api/resolve_completion_decision")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&matching_request)
+        .await;
+    assert_eq!(global_only.status_code(), 403);
+    assert_eq!(error_detail(&global_only), "unauthorized");
+
+    let matching_context = matching_fixture
+        .state
+        .web_server_state
+        .completion_authorizations()
+        .authenticate(&matching_token)
+        .unwrap()
+        .authorize_completion_root(matching_fixture.parent_conversation_id)
+        .unwrap();
+    let resolved = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
+        &matching_fixture.state.db,
+        matching_fixture.state.completion_outbox_dispatcher.as_ref(),
+        &matching_context,
+        matching_request,
+    )
+    .await
+    .unwrap();
+    assert!(!resolved.idempotent_replay);
+    let audit = codeg_lib::db::entities::delegation_attention_request::Entity::find_by_id(
+        &matching_fixture.cas.attention_id,
+    )
+    .one(&matching_fixture.state.db.conn)
+    .await
+    .unwrap()
+    .unwrap()
+    .resolution_json
+    .unwrap();
+    assert!(audit.contains(&format!(
+        "web_completion_root:{}",
+        matching_fixture.parent_conversation_id
+    )));
+    assert!(!audit.contains(&matching_token));
+    assert!(!audit.contains(&format!("{:x}", Sha256::digest(TEST_TOKEN.as_bytes()))));
+
+    let foreign_fixture = completion_http_fixture().await;
+    let foreign_request = ResolveCompletionDecisionRequest {
+        cas: foreign_fixture.cas.clone(),
+        outcome: CompletionOutcome::Done,
+    };
+    let foreign_token = foreign_fixture
+        .state
+        .web_server_state
+        .completion_authorizations()
+        .issue(foreign_fixture.parent_conversation_id + 1);
+    let foreign_context = foreign_fixture
+        .state
+        .web_server_state
+        .completion_authorizations()
+        .authenticate(&foreign_token)
+        .unwrap()
+        .authorize_completion_root(foreign_fixture.parent_conversation_id + 1)
+        .unwrap();
+    let core_foreign = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
+        &foreign_fixture.state.db,
+        foreign_fixture.state.completion_outbox_dispatcher.as_ref(),
+        &foreign_context,
+        foreign_request.clone(),
+    )
+    .await
+    .unwrap_err();
+    let core_foreign = serde_json::to_value(core_foreign).unwrap();
+
+    let http_foreign = foreign_fixture
+        .server
+        .post("/api/resolve_completion_decision")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, foreign_token)
+        .json(&foreign_request)
+        .await;
+    assert_eq!(http_foreign.status_code(), 403);
+    assert_eq!(
+        error_detail(&http_foreign),
+        core_foreign["detail"].as_str().unwrap()
+    );
+}
+
 #[tokio::test]
 async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict() {
     let fixture = completion_http_fixture().await;
+    let completion_context = issue_completion_context(&fixture).await;
     let request = ResolveCompletionDecisionRequest {
-        parent_conversation_id: fixture.parent_conversation_id,
         cas: fixture.cas.clone(),
         outcome: CompletionOutcome::Done,
     };
@@ -327,36 +478,13 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .await;
     assert_eq!(unauthenticated.status_code(), 401);
 
-    let foreign_request = ResolveCompletionDecisionRequest {
-        parent_conversation_id: fixture.parent_conversation_id + 1,
-        ..request.clone()
-    };
-    let core_foreign = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
-        &fixture.state.db,
-        fixture.state.completion_outbox_dispatcher.as_ref(),
-        foreign_request.clone(),
-    )
-    .await
-    .unwrap_err();
-    let core_foreign = serde_json::to_value(core_foreign).unwrap();
-    let http_foreign = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .json(&foreign_request)
-        .await;
-    assert_eq!(http_foreign.status_code(), 403);
-    assert_eq!(
-        error_detail(&http_foreign),
-        core_foreign["detail"].as_str().unwrap()
-    );
-
     let mut stale_request = request.clone();
     stale_request.cas.node_id.push_str("-stale");
     let stale = fixture
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&stale_request)
         .await;
     assert_eq!(stale.status_code(), 409);
@@ -366,6 +494,7 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&ResolveCompletionDecisionRequest {
             outcome: CompletionOutcome::Approve,
             ..request.clone()
@@ -386,6 +515,7 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&missing)
         .await;
     assert_eq!(missing.status_code(), 422);
@@ -394,6 +524,7 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&request)
         .await;
     first.assert_status_ok();
@@ -404,6 +535,7 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&request)
         .await;
     replay.assert_status_ok();
@@ -415,6 +547,7 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .server
         .post("/api/resolve_completion_decision")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
         .json(&ResolveCompletionDecisionRequest {
             outcome: CompletionOutcome::Blocked,
             ..request

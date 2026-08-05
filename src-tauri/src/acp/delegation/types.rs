@@ -973,13 +973,42 @@ pub enum DelegationReplyResult {
     },
 }
 
+/// Server-owned authority for one root conversation's completion mutations.
+/// This type is deliberately not serializable: transport adapters construct it
+/// only after authenticating the application and resolving the durable
+/// attention owner from the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionMutationContext {
+    parent_conversation_id: i32,
+    actor_identity: String,
+}
+
+impl CompletionMutationContext {
+    pub(crate) fn authenticated(
+        parent_conversation_id: i32,
+        actor_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            parent_conversation_id,
+            actor_identity: actor_identity.into(),
+        }
+    }
+
+    pub(crate) fn parent_conversation_id(&self) -> i32 {
+        self.parent_conversation_id
+    }
+
+    pub(crate) fn actor_identity(&self) -> &str {
+        &self.actor_identity
+    }
+}
+
 /// Authenticated application mutation for a terminal workflow completion.
 /// Actor identity is intentionally absent: desktop/server wrappers derive it
 /// from the authenticated application transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveCompletionDecisionRequest {
-    pub parent_conversation_id: i32,
     pub cas: CompletionAttentionCas,
     pub outcome: CompletionOutcome,
 }
@@ -987,14 +1016,12 @@ pub struct ResolveCompletionDecisionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryCompletionArtifactRequest {
-    pub parent_conversation_id: i32,
     pub cas: CompletionAttentionCas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveDesignSelfReviewRequest {
-    pub parent_conversation_id: i32,
     pub cas: CompletionAttentionCas,
     pub outcome: CompletionOutcome,
 }

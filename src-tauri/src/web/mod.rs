@@ -45,6 +45,7 @@ pub struct WebServerState {
     /// specific bind makes the other interfaces' IPs unreachable.
     host: Mutex<String>,
     running: std::sync::atomic::AtomicBool,
+    completion_authorizations: Arc<auth::CompletionAuthorizationRegistry>,
 }
 
 impl Default for WebServerState {
@@ -63,6 +64,7 @@ impl WebServerState {
             token: Mutex::new(String::new()),
             host: Mutex::new("0.0.0.0".to_string()),
             running: std::sync::atomic::AtomicBool::new(false),
+            completion_authorizations: Arc::new(auth::CompletionAuthorizationRegistry::default()),
         }
     }
 
@@ -91,6 +93,10 @@ impl WebServerState {
     /// this state must be a no-op.
     pub fn is_externally_managed(&self) -> bool {
         self.handle.lock().unwrap().is_none() && self.running.load(Ordering::Acquire)
+    }
+
+    pub fn completion_authorizations(&self) -> Arc<auth::CompletionAuthorizationRegistry> {
+        self.completion_authorizations.clone()
     }
 }
 

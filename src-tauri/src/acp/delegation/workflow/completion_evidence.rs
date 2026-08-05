@@ -40,6 +40,7 @@ use crate::acp::delegation::metrics::{
     CompletionMetricPhase, CompletionScopeInvalidationDimension, DelegationMetrics,
 };
 use crate::acp::delegation::types::CompletionMutationResult;
+use crate::db::entities::conversation;
 use crate::db::entities::delegation_attention_request::{self, AttentionKind};
 use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::CompletionProtocolMode;
@@ -213,6 +214,7 @@ pub struct CompletionAttentionReconcileReport {
     pub retained: usize,
     pub superseded: usize,
     pub reopened: usize,
+    pub workflow_deleted: usize,
 }
 
 enum CompletionAttentionReconcileOutcome {
@@ -241,6 +243,10 @@ pub async fn reconcile_completion_attentions_txn(
                     .map_err(db_error)?;
                 let mut report = CompletionAttentionReconcileReport::default();
                 for row in rows {
+                    if reconcile_deleted_root_attention(txn, &row).await? {
+                        report.workflow_deleted += 1;
+                        continue;
+                    }
                     let outcome = match row.kind {
                         AttentionKind::CompletionDecision
                         | AttentionKind::CompletionArtifactRecovery => {
@@ -294,61 +300,7 @@ pub async fn resolve_workflow_completion_attentions_txn(
         .transaction::<_, usize, CompletionEvidenceError>(|txn| {
             let workflow_id = workflow_id.clone();
             Box::pin(async move {
-                let rows = delegation_attention_request::Entity::find()
-                    .filter(delegation_attention_request::Column::Status.eq("open"))
-                    .filter(
-                        delegation_attention_request::Column::Kind.ne(AttentionKind::ChildQuestion),
-                    )
-                    .all(txn)
-                    .await
-                    .map_err(db_error)?;
-                let mut targets = Vec::new();
-                for row in rows {
-                    let belongs = match row.kind {
-                        AttentionKind::CompletionDecision
-                        | AttentionKind::CompletionArtifactRecovery => {
-                            delegation_workflow_run_binding::Entity::find_by_id(&row.task_id)
-                                .one(txn)
-                                .await
-                                .map_err(db_error)?
-                                .is_some_and(|binding| binding.workflow_id == workflow_id)
-                        }
-                        AttentionKind::DesignSelfReviewDecision => {
-                            delegation_workflow_design_root_binding::Entity::find()
-                                .filter(
-                                    delegation_workflow_design_root_binding::Column::TaskId
-                                        .eq(&row.task_id),
-                                )
-                                .one(txn)
-                                .await
-                                .map_err(db_error)?
-                                .is_some_and(|binding| binding.workflow_id == workflow_id)
-                        }
-                        AttentionKind::ChildQuestion => false,
-                    };
-                    if belongs {
-                        targets.push(row);
-                    }
-                }
-                if targets.is_empty() {
-                    return Ok(0);
-                }
-                let graph_revision = if delegation_workflow::Entity::find_by_id(&workflow_id)
-                    .one(txn)
-                    .await
-                    .map_err(db_error)?
-                    .is_some()
-                {
-                    bump_graph_revision(txn, &workflow_id, Utc::now())
-                        .await
-                        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?
-                } else {
-                    0
-                };
-                for row in &targets {
-                    resolve_completion_attention_row(txn, row, code, graph_revision).await?;
-                }
-                Ok(targets.len())
+                resolve_workflow_completion_attentions(txn, &workflow_id, code).await
             })
         })
         .await
@@ -358,6 +310,138 @@ pub async fn resolve_workflow_completion_attentions_txn(
             }
             sea_orm::TransactionError::Transaction(error) => error,
         })
+}
+
+async fn resolve_workflow_completion_attentions<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    code: CompletionAttentionResolutionCode,
+) -> Result<usize, CompletionEvidenceError> {
+    let rows = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .filter(delegation_attention_request::Column::Kind.ne(AttentionKind::ChildQuestion))
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+    let mut targets = Vec::new();
+    for row in rows {
+        let belongs = match row.kind {
+            AttentionKind::CompletionDecision | AttentionKind::CompletionArtifactRecovery => {
+                delegation_workflow_run_binding::Entity::find_by_id(&row.task_id)
+                    .one(conn)
+                    .await
+                    .map_err(db_error)?
+                    .is_some_and(|binding| binding.workflow_id == workflow_id)
+            }
+            AttentionKind::DesignSelfReviewDecision => {
+                delegation_workflow_design_root_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_design_root_binding::Column::TaskId.eq(&row.task_id),
+                    )
+                    .one(conn)
+                    .await
+                    .map_err(db_error)?
+                    .is_some_and(|binding| binding.workflow_id == workflow_id)
+            }
+            AttentionKind::ChildQuestion => false,
+        };
+        if belongs {
+            targets.push(row);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let graph_revision = if delegation_workflow::Entity::find_by_id(workflow_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?
+        .is_some()
+    {
+        bump_graph_revision(conn, workflow_id, Utc::now())
+            .await
+            .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?
+    } else {
+        0
+    };
+    for row in &targets {
+        resolve_completion_attention_row(conn, row, code, graph_revision).await?;
+    }
+    Ok(targets.len())
+}
+
+pub async fn resolve_deleted_conversation_completion_attentions_txn<C: ConnectionTrait>(
+    conn: &C,
+    parent_conversation_id: i32,
+) -> Result<usize, CompletionEvidenceError> {
+    let workflows = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+    let mut resolved = 0;
+    for workflow in workflows {
+        resolved += resolve_workflow_completion_attentions(
+            conn,
+            &workflow.workflow_id,
+            CompletionAttentionResolutionCode::WorkflowDeleted,
+        )
+        .await?;
+    }
+    Ok(resolved)
+}
+
+async fn reconcile_deleted_root_attention<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+) -> Result<bool, CompletionEvidenceError> {
+    let workflow_id = match row.kind {
+        AttentionKind::CompletionDecision | AttentionKind::CompletionArtifactRecovery => {
+            delegation_workflow_run_binding::Entity::find_by_id(&row.task_id)
+                .one(conn)
+                .await
+                .map_err(db_error)?
+                .map(|binding| binding.workflow_id)
+        }
+        AttentionKind::DesignSelfReviewDecision => {
+            delegation_workflow_design_root_binding::Entity::find()
+                .filter(delegation_workflow_design_root_binding::Column::TaskId.eq(&row.task_id))
+                .one(conn)
+                .await
+                .map_err(db_error)?
+                .map(|binding| binding.workflow_id)
+        }
+        AttentionKind::ChildQuestion => None,
+    };
+    let Some(workflow_id) = workflow_id else {
+        return Ok(false);
+    };
+    let Some(workflow) = delegation_workflow::Entity::find_by_id(&workflow_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(false);
+    };
+    let owner_is_deleted = conversation::Entity::find_by_id(workflow.parent_conversation_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?
+        .is_some_and(|owner| owner.deleted_at.is_some());
+    if !owner_is_deleted {
+        return Ok(false);
+    }
+    let graph_revision = bump_graph_revision(conn, &workflow_id, Utc::now())
+        .await
+        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    resolve_completion_attention_row(
+        conn,
+        row,
+        CompletionAttentionResolutionCode::WorkflowDeleted,
+        graph_revision,
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn reconcile_terminal_attention<C: ConnectionTrait>(
@@ -3146,6 +3230,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.resolution_code.as_deref(), Some("workflow_terminated"));
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_root_deletion_path_closes_as_workflow_deleted() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let original = fixture.materialize().await.attention.unwrap();
+        let coordinator =
+            crate::auto_title::AutoTitleCoordinator::new_inert_for_test(fixture.db.conn.clone());
+
+        crate::commands::conversations::delete_conversation_core(
+            &fixture.db.conn,
+            coordinator.as_ref(),
+            fixture.parent_conversation_id,
+        )
+        .await
+        .unwrap();
+
+        let row = delegation_attention_request::Entity::find_by_id(original.attention_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "resolved");
+        assert_eq!(row.resolution_code.as_deref(), Some("workflow_deleted"));
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_reconcile_closes_already_deleted_root() {
+        use crate::db::entities::conversation;
+
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let original = fixture.materialize().await.attention.unwrap();
+        let parent = conversation::Entity::find_by_id(fixture.parent_conversation_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut deleted: conversation::ActiveModel = parent.into();
+        deleted.deleted_at = Set(Some(Utc::now()));
+        deleted.update(&fixture.db.conn).await.unwrap();
+
+        reconcile_completion_attentions_txn(&fixture.db)
+            .await
+            .unwrap();
+
+        let row = delegation_attention_request::Entity::find_by_id(original.attention_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "resolved");
+        assert_eq!(row.resolution_code.as_deref(), Some("workflow_deleted"));
     }
 
     #[tokio::test]

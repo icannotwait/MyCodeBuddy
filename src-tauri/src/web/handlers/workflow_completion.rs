@@ -11,17 +11,30 @@ use crate::acp::delegation::types::{
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::workflow_completion::{
-    resolve_completion_decision_core, resolve_design_self_review_core,
-    retry_completion_artifact_core,
+    completion_attention_parent_conversation_id, resolve_completion_decision_core,
+    resolve_design_self_review_core, retry_completion_artifact_core,
 };
+use crate::web::auth::AuthenticatedApplication;
+
+fn unauthorized_context_error() -> AppCommandError {
+    AppCommandError::permission_denied("completion attention is owned by another root conversation")
+        .with_detail("unauthorized")
+}
 
 pub async fn resolve_completion_decision(
     Extension(state): Extension<Arc<AppState>>,
+    Extension(authenticated): Extension<AuthenticatedApplication>,
     Json(request): Json<ResolveCompletionDecisionRequest>,
 ) -> Result<Json<CompletionMutationResult>, AppCommandError> {
+    let parent_conversation_id =
+        completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
+    let context = authenticated
+        .authorize_completion_root(parent_conversation_id)
+        .map_err(|()| unauthorized_context_error())?;
     resolve_completion_decision_core(
         &state.db,
         state.completion_outbox_dispatcher.as_ref(),
+        &context,
         request,
     )
     .await
@@ -30,12 +43,19 @@ pub async fn resolve_completion_decision(
 
 pub async fn retry_completion_artifact(
     Extension(state): Extension<Arc<AppState>>,
+    Extension(authenticated): Extension<AuthenticatedApplication>,
     Json(request): Json<RetryCompletionArtifactRequest>,
 ) -> Result<Json<CompletionMutationResult>, AppCommandError> {
+    let parent_conversation_id =
+        completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
+    let context = authenticated
+        .authorize_completion_root(parent_conversation_id)
+        .map_err(|()| unauthorized_context_error())?;
     retry_completion_artifact_core(
         &state.db,
         state.delegation_metrics.as_ref(),
         state.completion_outbox_dispatcher.as_ref(),
+        &context,
         request,
     )
     .await
@@ -44,11 +64,18 @@ pub async fn retry_completion_artifact(
 
 pub async fn resolve_design_self_review(
     Extension(state): Extension<Arc<AppState>>,
+    Extension(authenticated): Extension<AuthenticatedApplication>,
     Json(request): Json<ResolveDesignSelfReviewRequest>,
 ) -> Result<Json<CompletionMutationResult>, AppCommandError> {
+    let parent_conversation_id =
+        completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
+    let context = authenticated
+        .authorize_completion_root(parent_conversation_id)
+        .map_err(|()| unauthorized_context_error())?;
     resolve_design_self_review_core(
         &state.db,
         state.completion_outbox_dispatcher.as_ref(),
+        &context,
         request,
     )
     .await

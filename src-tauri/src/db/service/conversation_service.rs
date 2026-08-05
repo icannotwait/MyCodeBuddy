@@ -645,6 +645,12 @@ pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Res
             "Conversation not found: {conversation_id}"
         )));
     }
+    crate::acp::delegation::workflow::resolve_deleted_conversation_completion_attentions_txn(
+        &txn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| DbError::Database(sea_orm::DbErr::Custom(error.to_string())))?;
     let removed = cancel_job(&txn, conversation_id).await?;
     txn.commit().await?;
     Ok(removed)
