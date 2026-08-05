@@ -5165,6 +5165,42 @@ mod tests {
     }
 
     #[test]
+    fn workflow_manifest_v1_plan_settlement_uses_legacy_request() {
+        let evidence = json!({
+            "kind": "design",
+            "critical_count": 0,
+            "important_count": 0,
+            "minor_count": 0
+        });
+        let req = parse_settle_workflow_args(
+            &json!({
+                "workflow_id": "wf-v1",
+                "manifest_revision": 2,
+                "gate_id": "design",
+                "expected_graph_revision": 3,
+                "gate_cycle": 4,
+                "outcome": "approved",
+                "evidence": evidence,
+                "summary": "legacy settlement"
+            }),
+            "token",
+        )
+        .expect("legacy v1 settlement request parses");
+        let wire = serde_json::to_value(req).expect("serialize legacy broker request");
+        assert_eq!(wire["manifest_revision"], 2);
+        assert_eq!(wire["gate_cycle"], 4);
+        assert_eq!(wire["outcome"], "approved");
+        assert_eq!(wire["evidence"], evidence);
+        for forbidden in [
+            "expected_review_round",
+            "expected_gate_cycle",
+            "expected_outcome",
+        ] {
+            assert!(wire.get(forbidden).is_none(), "v1 wire leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn workflow_manifest_v2_plan_settlement_uses_reduced_request() {
         let req = parse_settle_workflow_args(
             &json!({
@@ -5255,8 +5291,9 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "settle_workflow_gate")
             .expect("settle tool");
-        assert_eq!(settle["inputSchema"]["additionalProperties"], false);
-        let required = settle["inputSchema"]["required"]
+        let settle_schema = &settle["inputSchema"];
+        assert_eq!(settle_schema["additionalProperties"], false);
+        let required = settle_schema["required"]
             .as_array()
             .expect("settle required");
         for field in [
@@ -5267,20 +5304,33 @@ mod tests {
         ] {
             assert!(required.iter().any(|value| value == field));
         }
-        for forbidden in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
-            assert!(
-                settle["inputSchema"]["properties"].get(forbidden).is_none(),
-                "v2 schema exposes legacy field {forbidden}"
-            );
-        }
-        for optional in [
+        for property in [
+            "manifest_revision",
+            "gate_cycle",
+            "outcome",
+            "evidence",
             "expected_review_round",
             "expected_gate_cycle",
             "expected_outcome",
             "recovery_authorization_id",
         ] {
-            assert!(settle["inputSchema"]["properties"].get(optional).is_some());
+            assert!(
+                settle_schema["properties"].get(property).is_some(),
+                "settlement schema omits {property}"
+            );
         }
+        let arms = settle_schema["oneOf"]
+            .as_array()
+            .expect("settlement schema must expose v1 and v2 arms");
+        assert_eq!(arms.len(), 2);
+        assert_eq!(
+            arms[0]["required"],
+            json!(["manifest_revision", "gate_cycle", "outcome", "evidence"])
+        );
+        assert_eq!(
+            arms[1]["propertyNames"]["not"]["enum"],
+            json!(["manifest_revision", "gate_cycle", "outcome", "evidence"])
+        );
     }
 
     #[test]
