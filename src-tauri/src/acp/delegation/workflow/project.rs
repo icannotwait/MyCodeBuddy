@@ -12,14 +12,17 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use crate::acp::delegation::card_summary::{
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
-use crate::db::entities::delegation_task_run::{self, DelegationRunStatus};
+use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
 use crate::db::entities::delegation_workflow_gate_settlement::{self, GateSettlementOutcome};
+use crate::db::entities::delegation_workflow_gate_state;
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
+use super::completion_evidence::load_validated_completion_evidence;
+use super::completion_intent::CompletionOutcome;
 use super::dto::{
     redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
     ProjectedNodeStatus, PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot,
@@ -441,6 +444,21 @@ async fn project_manifest_mode(
         .await
         .map_err(db_err)?;
 
+    let current_gate_lineage_by_id = if header.completion_protocol_version == 2 {
+        delegation_workflow_gate_state::Entity::find()
+            .filter(
+                delegation_workflow_gate_state::Column::WorkflowId.eq(header.workflow_id.clone()),
+            )
+            .all(conn)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|state| (state.gate_id, state.gate_lineage))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+
     // All parent runs (bound + A9 orphan recognized keys without bindings).
     let parent_runs = delegation_task_run::Entity::find()
         .filter(delegation_task_run::Column::ParentConversationId.eq(header.parent_conversation_id))
@@ -449,6 +467,20 @@ async fn project_manifest_mode(
         .map_err(db_err)?;
     let run_by_id: HashMap<String, &delegation_task_run::Model> =
         parent_runs.iter().map(|r| (r.task_id.clone(), r)).collect();
+
+    let mut validated_by_task = HashMap::new();
+    if header.completion_protocol_version == 2 {
+        let mut latest_by_node = HashSet::new();
+        for binding in &run_bindings {
+            if latest_by_node.insert(binding.node_id.as_str()) {
+                if let Ok(validated) =
+                    load_validated_completion_evidence(conn, &binding.task_id).await
+                {
+                    validated_by_task.insert(binding.task_id.clone(), validated);
+                }
+            }
+        }
+    }
 
     // Group run bindings by node_id, ordered by lineage_ordinal desc already.
     let mut rbs_by_node: HashMap<String, Vec<&delegation_workflow_run_binding::Model>> =
@@ -493,7 +525,16 @@ async fn project_manifest_mode(
             .get(&b.work_unit_key)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let snap = project_node_from_binding(b, mn, rbs, key_runs, &run_by_id, &mut id_map);
+        let snap = project_node_from_binding(
+            b,
+            mn,
+            rbs,
+            key_runs,
+            &run_by_id,
+            header.completion_protocol_version,
+            &validated_by_task,
+            &mut id_map,
+        );
         if is_active_gate_binding(b, active_rev, in_manifest)
             && !matches!(snap.status, ProjectedNodeStatus::Superseded)
         {
@@ -520,7 +561,13 @@ async fn project_manifest_mode(
     }
 
     // Build latest evidence + gate overlays on canonical nodes only (before orphans).
-    let evidence_by_node = build_evidence_by_node(&nodes, &rbs_by_node, &run_by_id);
+    let evidence_by_node = build_evidence_by_node(
+        &nodes,
+        &rbs_by_node,
+        &run_by_id,
+        header.completion_protocol_version,
+        &validated_by_task,
+    );
     let gate_summary = apply_execution_gate_overlays(
         &mut nodes,
         &evidence_by_node,
@@ -541,8 +588,8 @@ async fn project_manifest_mode(
         &mut id_map,
     );
 
-    // Document gate snapshots: settlements/evidence use per-gate content
-    // fingerprints; open cycle after non-approve does not re-count settled runs.
+    // Document gate snapshots use v1 content fingerprints or v2 gate lineage;
+    // an open cycle after non-approve does not re-count settled runs.
     let mut gate_snaps: Vec<WorkflowGateSnapshot> = Vec::new();
     for g in &normalized.gates {
         let gate_settlements: Vec<_> = settlements.iter().filter(|s| s.gate_id == g.id).collect();
@@ -550,10 +597,18 @@ async fn project_manifest_mode(
             super::types::DocumentGateKind::Design => header.design_fingerprint.as_str(),
             super::types::DocumentGateKind::Plan => header.plan_fingerprint.as_str(),
         };
-        // Displayed settlement only when it covers current gate content fingerprint.
+        let current_lineage = current_gate_lineage_by_id.get(&g.id).map(String::as_str);
         let latest = gate_settlements
             .iter()
-            .rfind(|s| !s.content_fingerprint.is_empty() && s.content_fingerprint == current_fp)
+            .rfind(|settlement| {
+                document_gate_settlement_matches_current(
+                    header.completion_protocol_version,
+                    &settlement.content_fingerprint,
+                    settlement.gate_lineage.as_deref(),
+                    current_fp,
+                    current_lineage,
+                )
+            })
             .copied();
         let max_cycle = gate_settlements
             .iter()
@@ -590,6 +645,8 @@ async fn project_manifest_mode(
             count_cycle,
             expected_digest,
             current_fp,
+            header.completion_protocol_version,
+            &validated_by_task,
         );
         gate_snaps.push(WorkflowGateSnapshot {
             gate_id: id_map.map_id(&g.id),
@@ -684,6 +741,8 @@ fn project_node_from_binding(
     // Parent runs whose work_unit_key matches this binding (may lack run_binding).
     key_runs: &[&delegation_task_run::Model],
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
+    completion_protocol_version: i64,
+    validated_by_task: &HashMap<String, super::types::ValidatedCompletionEvidence>,
     id_map: &mut PublicIdAllocator,
 ) -> WorkflowNodeSnapshot {
     let latest_rb = rbs.first().copied();
@@ -740,7 +799,14 @@ fn project_node_from_binding(
         n
     };
 
-    let (status, status_reason, summary) = project_node_status(b, latest_rb_for_status, latest_run);
+    let validated = latest_run.and_then(|run| validated_by_task.get(&run.task_id));
+    let (status, status_reason, summary) = project_node_status(
+        b,
+        latest_rb_for_status,
+        latest_run,
+        completion_protocol_version,
+        validated,
+    );
 
     let active_child_generation = latest_run.map(|r| r.generation);
     let round_count = active_child_generation.map(|g| {
@@ -885,6 +951,8 @@ fn project_node_status(
     b: &delegation_workflow_node_binding::Model,
     latest_rb: Option<&delegation_workflow_run_binding::Model>,
     latest_run: Option<&delegation_task_run::Model>,
+    completion_protocol_version: i64,
+    validated: Option<&super::types::ValidatedCompletionEvidence>,
 ) -> (ProjectedNodeStatus, Option<String>, Option<String>) {
     // Precedence (design):
     // 1. Durable blocked/failed with no recovery
@@ -908,6 +976,56 @@ fn project_node_status(
         }
         return (ProjectedNodeStatus::Estimated, None, None);
     };
+
+    if completion_protocol_version == 2 {
+        let summary = validated
+            .and_then(|evidence| evidence.evidence.intent.summary.as_deref())
+            .map(redact_display_string);
+        return match run.status {
+            DelegationRunStatus::Reserving => (ProjectedNodeStatus::Reserving, None, summary),
+            DelegationRunStatus::Running => (ProjectedNodeStatus::Running, None, summary),
+            DelegationRunStatus::Failed => {
+                (ProjectedNodeStatus::Failed, Some("failed".into()), summary)
+            }
+            DelegationRunStatus::Canceled => (
+                ProjectedNodeStatus::Canceled,
+                Some("canceled".into()),
+                summary,
+            ),
+            DelegationRunStatus::Completed => match run.completion_state {
+                Some(CompletionState::NeedsDecision) => (
+                    ProjectedNodeStatus::WaitingAdjudication,
+                    Some("completion_decision_required".into()),
+                    summary,
+                ),
+                Some(CompletionState::ArtifactRecovery) => (
+                    ProjectedNodeStatus::WaitingAdjudication,
+                    Some("completion_artifact_unavailable".into()),
+                    summary,
+                ),
+                Some(CompletionState::Resolved) if validated.is_some() => {
+                    match validated.map(|value| value.evidence.intent.outcome) {
+                        Some(CompletionOutcome::RequestChanges) => (
+                            ProjectedNodeStatus::WaitingReview,
+                            Some("request_changes".into()),
+                            summary,
+                        ),
+                        Some(CompletionOutcome::Block | CompletionOutcome::Blocked) => (
+                            ProjectedNodeStatus::Blocked,
+                            Some("blocked".into()),
+                            summary,
+                        ),
+                        _ => (ProjectedNodeStatus::Completed, None, summary),
+                    }
+                }
+                _ => (
+                    ProjectedNodeStatus::WaitingAdjudication,
+                    Some("completion_evidence_invalid".into()),
+                    summary,
+                ),
+            },
+        };
+    }
 
     let summary_json = run.card_summary_json.as_deref();
     let parsed = summary_json.and_then(parse_and_validate_summary_json);
@@ -1022,6 +1140,8 @@ fn build_evidence_by_node(
     nodes: &[WorkflowNodeSnapshot],
     rbs_by_node: &HashMap<String, Vec<&delegation_workflow_run_binding::Model>>,
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
+    completion_protocol_version: i64,
+    validated_by_task: &HashMap<String, super::types::ValidatedCompletionEvidence>,
 ) -> HashMap<String, ExecutionGateRunEvidence> {
     // Evidence is keyed by projected (public) node_id. Recover via latest_task_id
     // when present; otherwise walk raw bindings that map to the same public id
@@ -1044,9 +1164,15 @@ fn build_evidence_by_node(
             .flatten()
             .find(|rb| rb.task_id == run.task_id);
         if let Some(binding) = binding {
+            let validated = validated_by_task.get(&run.task_id);
             out.insert(
                 n.node_id.clone(),
-                evidence_from_run_and_binding(run, binding),
+                evidence_from_run_binding_and_validated(
+                    run,
+                    binding,
+                    completion_protocol_version,
+                    validated,
+                ),
             );
         }
     }
@@ -2015,12 +2141,36 @@ fn document_gate_evidence_counts(
     count_cycle: i64,
     expected_digest: Option<&str>,
     current_content_fingerprint: &str,
+    completion_protocol_version: i64,
+    validated_by_task: &HashMap<String, super::types::ValidatedCompletionEvidence>,
 ) -> (u64, u64, u64) {
     let mut returned = 0u64;
     let mut running = 0u64;
     let mut blocked = 0u64;
 
     for node_id in required_raw_ids {
+        if completion_protocol_version == 2 {
+            let latest = run_bindings
+                .iter()
+                .find(|binding| binding.node_id == *node_id);
+            let Some(binding) = latest else { continue };
+            let Some(run) = run_by_id.get(&binding.task_id).copied() else {
+                blocked += 1;
+                continue;
+            };
+            match run.status {
+                DelegationRunStatus::Reserving | DelegationRunStatus::Running => running += 1,
+                DelegationRunStatus::Completed
+                    if validated_by_task.contains_key(&binding.task_id) =>
+                {
+                    returned += 1;
+                }
+                DelegationRunStatus::Completed
+                | DelegationRunStatus::Failed
+                | DelegationRunStatus::Canceled => blocked += 1,
+            }
+            continue;
+        }
         let matching: Vec<&delegation_workflow_run_binding::Model> = run_bindings
             .iter()
             .filter(|rb| {
@@ -2055,6 +2205,20 @@ fn document_gate_evidence_counts(
     }
 
     (returned, running, blocked)
+}
+
+fn document_gate_settlement_matches_current(
+    completion_protocol_version: i64,
+    settlement_content_fingerprint: &str,
+    settlement_gate_lineage: Option<&str>,
+    current_content_fingerprint: &str,
+    current_gate_lineage: Option<&str>,
+) -> bool {
+    if completion_protocol_version == 2 {
+        return current_gate_lineage.is_some() && settlement_gate_lineage == current_gate_lineage;
+    }
+    !settlement_content_fingerprint.is_empty()
+        && settlement_content_fingerprint == current_content_fingerprint
 }
 
 fn content_fingerprint_matches(actual: Option<&str>, expected: &str) -> bool {
@@ -2152,6 +2316,10 @@ pub fn evidence_from_run_and_binding(
                 TerminalRunStatus::NonTerminal
             }
         },
+        completion_protocol_version: 1,
+        completion_state: None,
+        completion_outcome: None,
+        completion_evidence_validated: false,
         summary_validated: binding.summary_validated,
         work_status,
         review_verdict,
@@ -2159,6 +2327,25 @@ pub fn evidence_from_run_and_binding(
         reviewed_task_id: binding.reviewed_task_id.clone(),
         reviewed_implementer_generation: binding.reviewed_implementer_generation,
     }
+}
+
+pub(crate) fn evidence_from_run_binding_and_validated(
+    run: &delegation_task_run::Model,
+    binding: &delegation_workflow_run_binding::Model,
+    completion_protocol_version: i64,
+    validated: Option<&super::types::ValidatedCompletionEvidence>,
+) -> ExecutionGateRunEvidence {
+    if completion_protocol_version != 2 {
+        return evidence_from_run_and_binding(run, binding);
+    }
+    let mut evidence = evidence_from_run_and_binding(run, binding);
+    evidence.completion_protocol_version = 2;
+    evidence.completion_state = run.completion_state.clone();
+    evidence.completion_outcome = validated.map(|value| value.evidence.intent.outcome);
+    evidence.completion_evidence_validated =
+        validated.is_some_and(|value| value.evidence_validated);
+    evidence.artifact_digest = validated.map(|value| value.evidence.artifact.digest().to_string());
+    evidence
 }
 
 /// Convenience: evaluate Task gate from two (run, binding) pairs.
@@ -4013,6 +4200,10 @@ mod tests {
             task_id: task_id.into(),
             generation,
             status: TerminalRunStatus::Completed,
+            completion_protocol_version: 1,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
             summary_validated: true,
             work_status: Some(crate::acp::delegation::card_summary::WorkStatus::Done),
             review_verdict: None,
@@ -4020,6 +4211,32 @@ mod tests {
             reviewed_task_id: None,
             reviewed_implementer_generation: None,
         }
+    }
+
+    #[test]
+    fn completion_v2_shared_validator_gate_settlement_ignores_legacy_fingerprint() {
+        let lineage = format!("sha256:{}", "a".repeat(64));
+        assert!(super::document_gate_settlement_matches_current(
+            2,
+            "rotated-legacy-fingerprint",
+            Some(&lineage),
+            "current-legacy-fingerprint",
+            Some(&lineage),
+        ));
+        assert!(!super::document_gate_settlement_matches_current(
+            2,
+            "current-legacy-fingerprint",
+            Some("sha256:stale-lineage"),
+            "current-legacy-fingerprint",
+            Some(&lineage),
+        ));
+        assert!(super::document_gate_settlement_matches_current(
+            1,
+            "current-legacy-fingerprint",
+            None,
+            "current-legacy-fingerprint",
+            None,
+        ));
     }
 
     #[tokio::test]

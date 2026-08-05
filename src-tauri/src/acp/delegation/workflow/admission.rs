@@ -39,7 +39,8 @@ use super::artifact_resolver::{
     resolve_git_head_clean, resolve_producer_completion, resolve_reviewer_completion,
     ArtifactError, ArtifactFailure, ResolvedArtifact,
 };
-use super::error::WorkflowAdmissionRecoveryError;
+use super::completion_evidence::load_validated_completion_evidence;
+use super::error::{CompletionEvidenceError, WorkflowAdmissionRecoveryError};
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::evidence_scope::{
     build_admission_completion_context, AdmissionCandidate, EvidenceScopeError, WorkflowStore,
@@ -49,7 +50,7 @@ use super::gates::{
     RequiredReviewerEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
-use super::project::evidence_from_run_and_binding;
+use super::project::{evidence_from_run_and_binding, evidence_from_run_binding_and_validated};
 use super::recovery_policy::decide_workflow_recovery;
 use super::store::load_workflow_recovery_snapshot_conn;
 use super::types::{
@@ -676,6 +677,10 @@ fn artifact_admission_err(error: ArtifactError) -> TaskStoreError {
 }
 
 fn evidence_admission_err(error: EvidenceScopeError) -> TaskStoreError {
+    admission_err(error.code(), error.to_string())
+}
+
+fn completion_evidence_admission_error(error: CompletionEvidenceError) -> TaskStoreError {
     admission_err(error.code(), error.to_string())
 }
 
@@ -1754,6 +1759,9 @@ async fn reharvest_final_reviewer_card_if_missing<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     rev: &ExecutionGateRunEvidence,
 ) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
+    if header.completion_protocol_version == 2 {
+        return Ok(None);
+    }
     let run = delegation_task_run::Entity::find_by_id(rev.task_id.clone())
         .one(conn)
         .await
@@ -1888,6 +1896,16 @@ fn ensure_workflow_approved_for_final(
 
 /// B6: only completed + validated `request_changes` / `block` open a Final fix cycle.
 fn reviewer_is_request_changes_or_block(ev: &ExecutionGateRunEvidence) -> bool {
+    if ev.completion_protocol_version == 2 {
+        return matches!(ev.status, TerminalRunStatus::Completed)
+            && ev.completion_state
+                == Some(crate::db::entities::delegation_task_run::CompletionState::Resolved)
+            && ev.completion_evidence_validated
+            && matches!(
+                ev.completion_outcome,
+                Some(CompletionOutcome::RequestChanges | CompletionOutcome::Block)
+            );
+    }
     matches!(ev.status, TerminalRunStatus::Completed)
         && ev.summary_validated
         && matches!(
@@ -1904,6 +1922,18 @@ async fn evaluate_final_fixer_terminal_pass<C: ConnectionTrait>(
     let Some(fixer) = fixer else {
         return Ok(None);
     };
+    if fixer.completion_protocol_version == 2 {
+        return Ok(Some(
+            matches!(fixer.status, TerminalRunStatus::Completed)
+                && fixer.completion_state
+                    == Some(crate::db::entities::delegation_task_run::CompletionState::Resolved)
+                && fixer.completion_evidence_validated
+                && matches!(
+                    fixer.completion_outcome,
+                    Some(CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns)
+                ),
+        ));
+    }
     let pass = matches!(fixer.status, TerminalRunStatus::Completed)
         && fixer.summary_validated
         && matches!(
@@ -2057,6 +2087,17 @@ async fn load_latest_node_evidence<C: ConnectionTrait>(
         // Newer non-terminal blocks older terminals for gate readiness.
         return Ok(None);
     }
+    if header.completion_protocol_version == 2 {
+        let validated = load_validated_completion_evidence(conn, &run.task_id)
+            .await
+            .map_err(completion_evidence_admission_error)?;
+        return Ok(Some(evidence_from_run_binding_and_validated(
+            &run,
+            &rb,
+            2,
+            Some(&validated),
+        )));
+    }
     Ok(Some(evidence_from_run_and_binding(&run, &rb)))
 }
 
@@ -2103,6 +2144,29 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                 })?;
             let (author_run, author_binding) =
                 load_latest_plan_author_binding(conn, header).await?;
+            if header.completion_protocol_version == 2 {
+                let validated = load_validated_completion_evidence(conn, &author_run.task_id)
+                    .await
+                    .map_err(completion_evidence_admission_error)?;
+                if !matches!(
+                    validated.evidence.intent.outcome,
+                    CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns
+                ) || validated.evidence.artifact.digest() != plan_digest
+                {
+                    return Err(admission_err(
+                        "plan_author_stale",
+                        "latest active Plan Author evidence does not cover the exact current Plan",
+                    ));
+                }
+                return Ok((
+                    gate_id,
+                    cycle,
+                    Some(plan_digest.to_string()),
+                    Some(author_run.task_id),
+                    Some(author_run.generation),
+                    None,
+                ));
+            }
             let author_digest = author_binding
                 .artifact_digest
                 .as_deref()
@@ -2152,6 +2216,28 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                     format!("Task {task_index} has no implementer run to review"),
                 ));
             };
+            if header.completion_protocol_version == 2 {
+                let validated = load_validated_completion_evidence(conn, &run.task_id)
+                    .await
+                    .map_err(completion_evidence_admission_error)?;
+                if !matches!(
+                    validated.evidence.intent.outcome,
+                    CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns
+                ) {
+                    return Err(artifact_admission_err(ArtifactError::Unavailable(
+                        ArtifactFailure::ExpectedArtifactInvalid,
+                    )));
+                }
+                let digest = validated.evidence.artifact.digest().to_string();
+                return Ok((
+                    None,
+                    None,
+                    Some(digest),
+                    Some(run.task_id),
+                    Some(run.generation),
+                    None,
+                ));
+            }
             let digest = rb
                 .artifact_digest
                 .as_deref()
@@ -2203,22 +2289,25 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
             // stamp branch tip digest (same digest Final gate needs) or workspace HEAD.
             if let Some((run, rb)) = load_latest_fixer_binding(conn, header).await? {
                 if header.completion_protocol_version == 2 {
-                    if run.status != DelegationRunStatus::Completed {
+                    let validated = load_validated_completion_evidence(conn, &run.task_id)
+                        .await
+                        .map_err(completion_evidence_admission_error)?;
+                    if !matches!(
+                        validated.evidence.intent.outcome,
+                        CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns
+                    ) {
                         return Err(artifact_admission_err(ArtifactError::Unavailable(
                             ArtifactFailure::ExpectedArtifactInvalid,
                         )));
                     }
-                    let digest = rb
-                        .artifact_digest
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|digest| !digest.is_empty())
-                        .ok_or_else(|| {
-                            artifact_admission_err(ArtifactError::Unavailable(
-                                ArtifactFailure::ExpectedArtifactInvalid,
-                            ))
-                        })?;
-                    revalidate_v2_reviewer_head(workspace_path, digest).await?;
+                    return Ok((
+                        Some("final".into()),
+                        None,
+                        Some(validated.evidence.artifact.digest().to_string()),
+                        Some(run.task_id),
+                        Some(run.generation),
+                        None,
+                    ));
                 }
                 Ok((
                     Some("final".into()),
@@ -3623,6 +3712,99 @@ mod tests {
 
     fn task9_sha256(bytes: &[u8]) -> String {
         format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    #[tokio::test]
+    async fn completion_v2_shared_validator_admission_ignores_legacy_card_projection() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (workflow_id, _) =
+            publish_approved(&db, &emitter, parent, "task12-admission-validator").await;
+        enable_completion_v2(&db, &workflow_id).await;
+        let repo = AdmissionGitFixture::new();
+        let task_id = "12000000-0000-4000-8000-000000000001";
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let mut insert = gen1_insert(
+            parent,
+            child_for(&db, AgentType::Grok).await,
+            task_id,
+            "grok",
+            Some(&key),
+            None,
+        );
+        insert.workspace_path = Some(repo.path().display().to_string());
+        RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .admit_gen1_reserving(insert)
+        .await
+        .unwrap();
+
+        repo.commit_change();
+        let now = Utc::now();
+        let run = delegation_task_run::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.status = Set(DelegationRunStatus::Completed);
+        run.reached_running_at = Set(Some(now));
+        run.finished_at = Set(Some(now));
+        run.update(&db.conn).await.unwrap();
+        let txn = db.conn.begin().await.unwrap();
+        super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: task_id.into(),
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: "Conclusion: done\n\nTask complete.".into(),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let run = delegation_task_run::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.card_summary_json = Set(Some("{malformed".into()));
+        run.update(&db.conn).await.unwrap();
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+        binding.summary_validated = Set(false);
+        binding.update(&db.conn).await.unwrap();
+
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = load_latest_node_evidence(&db.conn, &header, "task-1-impl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.completion_protocol_version, 2);
+        assert_eq!(
+            evidence.completion_state,
+            Some(crate::db::entities::delegation_task_run::CompletionState::Resolved)
+        );
+        assert_eq!(evidence.completion_outcome, Some(CompletionOutcome::Done));
+        assert!(evidence.completion_evidence_validated);
     }
 
     #[tokio::test]

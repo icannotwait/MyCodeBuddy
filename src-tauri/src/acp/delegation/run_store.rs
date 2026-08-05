@@ -39,12 +39,14 @@ use crate::acp::delegation::types::{DelegationRecoveryProjection, TaskStatus};
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
 };
+use crate::acp::delegation::workflow::completion_evidence::ensure_task_completion_recovery_not_fenced_txn;
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, ArtifactFailure,
-    CompletionEvidenceError, CompletionIntentReason, CompletionOutcome, CompletionRole,
-    CompletionToolIntent, ResolvedArtifact, TerminalCompletionInput, TerminalCompletionResult,
-    WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
+    CompletionEvidenceError, CompletionIntentReason, CompletionOutcome,
+    CompletionRecoveryFenceError, CompletionRole, CompletionToolIntent, ResolvedArtifact,
+    TerminalCompletionInput, TerminalCompletionResult, WorkflowAdmitInput, WorkflowChildMcpBinding,
+    WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -956,6 +958,13 @@ fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
 
 fn map_completion_evidence_error(error: CompletionEvidenceError) -> TaskStoreError {
     TaskStoreError::Permanent(format!("{}: {error}", error.code()))
+}
+
+fn completion_recovery_fence_error(error: CompletionRecoveryFenceError) -> TaskStoreError {
+    TaskStoreError::WorkflowAdmission {
+        code: error.code().into(),
+        message: error.to_string(),
+    }
 }
 
 async fn load_terminal_completion_protocol<C: ConnectionTrait>(
@@ -2494,6 +2503,11 @@ impl RunStore {
                 let insert = insert.clone();
                 let authorization = authorization.clone();
                 Box::pin(async move {
+                    if let Some(source_task_id) = insert.replaced_task_id.as_deref() {
+                        ensure_task_completion_recovery_not_fenced_txn(txn, source_task_id)
+                            .await
+                            .map_err(completion_recovery_fence_error)?;
+                    }
                     if let Some(tool_id) = insert.parent_tool_use_id.as_deref() {
                         let existing = DelegationTaskRun::find()
                             .filter(
@@ -2792,6 +2806,9 @@ impl RunStore {
                     // before every eligibility read so replacement and continue
                     // serialize around the source child.
                     lock_continue_admission_txn(txn, &admission.target_task_id).await?;
+                    ensure_task_completion_recovery_not_fenced_txn(txn, &admission.target_task_id)
+                        .await
+                        .map_err(completion_recovery_fence_error)?;
 
                     // Parent-tool exact-duplicate precedes busy/stale.
                     if !admission.parent_tool_use_id.is_empty() {

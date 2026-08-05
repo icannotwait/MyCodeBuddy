@@ -1,13 +1,22 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::db::entities::delegation_task_run::DelegationRunStatus;
+use crate::db::entities::delegation_task_run::{CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 
+use super::completion_intent::CompletionOutcome;
 use super::plan_review::PlanReviewNextAction;
 use super::types::{ManifestRevisionKind, ManifestWorkflowState, WorkflowBlockCause};
 
 const FINGERPRINT_VERSION: &str = "workflow_recovery_v1";
+
+fn is_v1_completion_protocol(version: &i64) -> bool {
+    *version == 1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowRecoverySnapshot {
@@ -16,6 +25,8 @@ pub struct WorkflowRecoverySnapshot {
     pub workflow_kind: String,
     pub schema_version: u64,
     pub capability_version: String,
+    #[serde(skip_serializing_if = "is_v1_completion_protocol")]
+    pub completion_protocol_version: i64,
     pub header_state: ManifestWorkflowState,
     pub active_manifest_revision: u64,
     pub structural_revision: u64,
@@ -67,6 +78,16 @@ pub struct WorkflowRecoveryPlanIdentity {
     pub latest_task_id: Option<String>,
     pub latest_status: Option<DelegationRunStatus>,
     pub summary_validated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_state: Option<CompletionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_outcome: Option<CompletionOutcome>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub completion_evidence_validated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_scope_digest: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub has_open_completion_attention: bool,
     pub artifact_digest: Option<String>,
     pub gate_id: Option<String>,
     pub gate_cycle: Option<i64>,
@@ -80,6 +101,14 @@ pub struct WorkflowRecoveryPlanGateEvidence {
     pub gate_cycle: i64,
     pub outcome: GateSettlementOutcome,
     pub content_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_scope_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_lineage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_round: Option<i64>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub v2_evidence_consistent: bool,
     pub critical_count: i64,
     pub important_count: i64,
     pub minor_count: i64,
@@ -364,7 +393,7 @@ pub fn decide_workflow_recovery(source: &WorkflowRecoverySnapshot) -> WorkflowRe
     if !source.active_manifest_valid {
         blockers.push(WorkflowRecoveryBlocker::InvalidActiveManifest);
     }
-    if !source.fingerprints_valid
+    if (source.completion_protocol_version != 2 && !source.fingerprints_valid)
         || source
             .latest_plan_gate
             .as_ref()
@@ -548,6 +577,9 @@ fn cause_code(
 }
 
 fn exact_current_plan_approval(source: &WorkflowRecoverySnapshot) -> bool {
+    if source.completion_protocol_version == 2 {
+        return exact_current_plan_approval_v2(source);
+    }
     let (Some(plan), Some(author), Some(gate)) = (
         source.plan.as_ref(),
         source.active_plan_author.as_ref(),
@@ -597,6 +629,73 @@ fn exact_current_plan_approval(source: &WorkflowRecoverySnapshot) -> bool {
     })
 }
 
+fn exact_current_plan_approval_v2(source: &WorkflowRecoverySnapshot) -> bool {
+    let (Some(plan), Some(author), Some(gate)) = (
+        source.plan.as_ref(),
+        source.active_plan_author.as_ref(),
+        source.current_plan_gate.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(author_task_id) = author.latest_task_id.as_deref() else {
+        return false;
+    };
+    if gate.outcome != GateSettlementOutcome::Approved
+        || !gate.v2_evidence_consistent
+        || gate.evidence_scope_digest.is_none()
+        || gate.gate_lineage.is_none()
+        || gate.review_round.is_none()
+        || !v2_current_plan_identity(author, plan, false)
+        || source.current_plan_gate_id.as_deref() != Some(gate.gate_id.as_str())
+        || gate.reviewer_evidence_count != source.required_plan_reviewers.len()
+    {
+        return false;
+    }
+    let mut required = source
+        .required_plan_reviewers
+        .iter()
+        .map(|reviewer| reviewer.node_id.as_str())
+        .collect::<Vec<_>>();
+    let mut settled = gate
+        .required_reviewer_node_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    required.sort_unstable();
+    settled.sort_unstable();
+    required == settled
+        && source.required_plan_reviewers.iter().all(|reviewer| {
+            v2_current_plan_identity(reviewer, plan, true)
+                && reviewer.reviewed_task_id.as_deref() == Some(author_task_id)
+        })
+}
+
+fn v2_current_plan_identity(
+    identity: &WorkflowRecoveryPlanIdentity,
+    plan: &WorkflowRecoveryDocumentIdentity,
+    reviewer: bool,
+) -> bool {
+    identity.active
+        && identity.observed
+        && identity.latest_status == Some(DelegationRunStatus::Completed)
+        && identity.completion_state == Some(CompletionState::Resolved)
+        && identity.completion_evidence_validated
+        && identity.evidence_scope_digest.is_some()
+        && !identity.has_open_completion_attention
+        && identity.artifact_digest.as_deref() == Some(plan.digest.as_str())
+        && if reviewer {
+            matches!(
+                identity.completion_outcome,
+                Some(CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors)
+            )
+        } else {
+            matches!(
+                identity.completion_outcome,
+                Some(CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns)
+            )
+        }
+}
+
 fn current_plan_identity(
     identity: &WorkflowRecoveryPlanIdentity,
     plan: &WorkflowRecoveryDocumentIdentity,
@@ -616,6 +715,28 @@ struct CanonicalWorkflowRecoverySource<'a> {
 
 fn source_state_fingerprint(source: &WorkflowRecoverySnapshot) -> String {
     let mut canonical = source.clone();
+    if canonical.completion_protocol_version == 2 {
+        canonical.fingerprints_valid = true;
+        canonical.design_fingerprint.clear();
+        canonical.plan_fingerprint.clear();
+        for identity in canonical
+            .active_plan_author
+            .iter_mut()
+            .chain(canonical.required_plan_reviewers.iter_mut())
+        {
+            identity.summary_validated = false;
+        }
+        for gate in canonical
+            .latest_plan_gate
+            .iter_mut()
+            .chain(canonical.current_plan_gate.iter_mut())
+        {
+            gate.content_fingerprint.clear();
+            gate.critical_count = 0;
+            gate.important_count = 0;
+            gate.minor_count = 0;
+        }
+    }
     for cohort in &mut canonical.frozen_task_cohorts {
         cohort.reviewer_node_ids.sort();
     }
@@ -684,6 +805,11 @@ mod workflow_recovery_policy {
             latest_task_id: Some("author-task-1".into()),
             latest_status: Some(DelegationRunStatus::Completed),
             summary_validated: true,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
+            evidence_scope_digest: None,
+            has_open_completion_attention: false,
             artifact_digest: Some("sha256:plan".into()),
             gate_id: None,
             gate_cycle: None,
@@ -703,6 +829,11 @@ mod workflow_recovery_policy {
             latest_task_id: Some(format!("{node_id}-task-1")),
             latest_status: Some(DelegationRunStatus::Completed),
             summary_validated: true,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
+            evidence_scope_digest: None,
+            has_open_completion_attention: false,
             artifact_digest: Some("sha256:plan".into()),
             gate_id: Some("plan-gate".into()),
             gate_cycle: Some(4),
@@ -718,6 +849,7 @@ mod workflow_recovery_policy {
             workflow_kind: "brainstorm_to_delivery".into(),
             schema_version: 2,
             capability_version: "workflow_manifest_v2".into(),
+            completion_protocol_version: 1,
             header_state: ManifestWorkflowState::Blocked,
             active_manifest_revision: 8,
             structural_revision: 7,
@@ -743,6 +875,10 @@ mod workflow_recovery_policy {
                 gate_cycle: 4,
                 outcome: GateSettlementOutcome::Approved,
                 content_fingerprint: "plan-fingerprint".into(),
+                evidence_scope_digest: None,
+                gate_lineage: None,
+                review_round: None,
+                v2_evidence_consistent: false,
                 critical_count: 0,
                 important_count: 0,
                 minor_count: 0,
@@ -807,6 +943,70 @@ mod workflow_recovery_policy {
             Some(serde_json::json!({ "target_state": target }))
         );
         assert!(decision.requires_authorization());
+    }
+
+    #[test]
+    fn completion_v2_shared_validator_recovery_ignores_legacy_projection_fields() {
+        let mut snapshot = approved_snapshot();
+        snapshot.completion_protocol_version = 2;
+        for identity in snapshot
+            .active_plan_author
+            .iter_mut()
+            .chain(snapshot.required_plan_reviewers.iter_mut())
+        {
+            identity.completion_state = Some(CompletionState::Resolved);
+            identity.completion_evidence_validated = true;
+            identity.evidence_scope_digest = Some("sha256:current-scope".into());
+            identity.completion_outcome = Some(if identity.reviewed_task_id.is_some() {
+                CompletionOutcome::Approve
+            } else {
+                CompletionOutcome::Done
+            });
+        }
+        for gate in snapshot
+            .latest_plan_gate
+            .iter_mut()
+            .chain(snapshot.current_plan_gate.iter_mut())
+        {
+            gate.evidence_scope_digest = Some("sha256:gate-scope".into());
+            gate.gate_lineage = Some("sha256:gate-lineage".into());
+            gate.review_round = Some(4);
+            gate.v2_evidence_consistent = true;
+        }
+
+        let before = decide_workflow_recovery(&snapshot);
+        snapshot.fingerprints_valid = false;
+        snapshot.design_fingerprint = "rotated-design-fingerprint".into();
+        snapshot.plan_fingerprint = "rotated-plan-fingerprint".into();
+        snapshot
+            .active_plan_author
+            .as_mut()
+            .unwrap()
+            .summary_validated = false;
+        snapshot.required_plan_reviewers[0].summary_validated = false;
+        for gate in snapshot
+            .latest_plan_gate
+            .iter_mut()
+            .chain(snapshot.current_plan_gate.iter_mut())
+        {
+            gate.content_fingerprint = "rotated-legacy-fingerprint".into();
+            gate.critical_count = 99;
+            gate.important_count = 99;
+            gate.minor_count = 99;
+        }
+        let after = decide_workflow_recovery(&snapshot);
+
+        assert_eq!(before.disposition, after.disposition);
+        assert_eq!(
+            before.source_state_fingerprint,
+            after.source_state_fingerprint
+        );
+        assert_eq!(
+            after.disposition,
+            WorkflowRecoveryDisposition::Recover {
+                target_state: ManifestWorkflowState::Approved,
+            }
+        );
     }
 
     #[test]

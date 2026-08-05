@@ -2591,6 +2591,8 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::ReviewedTaskStale(_) => "reviewed_task_stale",
         WorkflowStoreError::ArtifactDigestMismatch(_) => "artifact_digest_mismatch",
         WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
+        WorkflowStoreError::CompletionDecisionRequired => "completion_decision_required",
+        WorkflowStoreError::CompletionArtifactUnavailable => "completion_artifact_unavailable",
         WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
         WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
         WorkflowStoreError::ApprovalWithOpenFindings { .. } => "approval_with_open_findings",

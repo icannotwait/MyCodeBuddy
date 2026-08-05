@@ -34,6 +34,7 @@ pub use artifact_resolver::{
     DocumentSha256Artifact, GitHeadV1Artifact, ResolvedArtifact,
 };
 pub use completion_evidence::{
+    ensure_completion_recovery_not_fenced_txn, load_validated_completion_evidence,
     materialize_terminal_completion_txn, open_design_self_review_decision_txn,
     reconcile_completion_attentions_txn, resolve_completion_decision_txn,
     resolve_deleted_conversation_completion_attentions_txn, resolve_design_self_review_txn,
@@ -56,7 +57,7 @@ pub use dto::{
     WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
-pub use error::{CompletionEvidenceError, WorkflowStoreError};
+pub use error::{CompletionEvidenceError, CompletionRecoveryFenceError, WorkflowStoreError};
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,

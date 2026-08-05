@@ -4,6 +4,8 @@
 //! `settle_workflow_gate_core`; execution gates are projected only.
 
 use crate::acp::delegation::card_summary::{ReviewVerdict, WorkStatus};
+use crate::acp::delegation::workflow::CompletionOutcome;
+use crate::db::entities::delegation_task_run::CompletionState;
 
 /// Which execution gate is being evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,10 @@ pub struct ExecutionGateRunEvidence {
     pub task_id: String,
     pub generation: i64,
     pub status: TerminalRunStatus,
+    pub completion_protocol_version: i64,
+    pub completion_state: Option<CompletionState>,
+    pub completion_outcome: Option<CompletionOutcome>,
+    pub completion_evidence_validated: bool,
     pub summary_validated: bool,
     /// Implementer / Final fixer work status from validated card summary.
     pub work_status: Option<WorkStatus>,
@@ -209,6 +215,14 @@ fn implementer_terminal_pass(ev: &ExecutionGateRunEvidence) -> bool {
     if !matches!(ev.status, TerminalRunStatus::Completed) {
         return false;
     }
+    if ev.completion_protocol_version == 2 {
+        return ev.completion_state == Some(CompletionState::Resolved)
+            && ev.completion_evidence_validated
+            && matches!(
+                ev.completion_outcome,
+                Some(CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns)
+            );
+    }
     if !ev.summary_validated {
         return false;
     }
@@ -221,6 +235,14 @@ fn implementer_terminal_pass(ev: &ExecutionGateRunEvidence) -> bool {
 fn reviewer_verdict_pass(ev: &ExecutionGateRunEvidence) -> bool {
     if !matches!(ev.status, TerminalRunStatus::Completed) {
         return false;
+    }
+    if ev.completion_protocol_version == 2 {
+        return ev.completion_state == Some(CompletionState::Resolved)
+            && ev.completion_evidence_validated
+            && matches!(
+                ev.completion_outcome,
+                Some(CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors)
+            );
     }
     if !ev.summary_validated {
         return false;
@@ -310,6 +332,10 @@ mod tests {
             task_id: task_id.into(),
             generation,
             status: TerminalRunStatus::Completed,
+            completion_protocol_version: 1,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
             summary_validated: true,
             work_status: Some(WorkStatus::Done),
             review_verdict: None,
@@ -347,6 +373,10 @@ mod tests {
             task_id: task_id.into(),
             generation: 1,
             status: TerminalRunStatus::Completed,
+            completion_protocol_version: 1,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
             summary_validated: true,
             work_status: None,
             review_verdict: Some(ReviewVerdict::Approve),
@@ -678,6 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn completion_v2_shared_validator_gate_ignores_legacy_card_projection() {
+        let mut implementer = impl_done("impl-v2", 1, Some("sha-v2"));
+        implementer.completion_protocol_version = 2;
+        implementer.completion_state = Some(CompletionState::Resolved);
+        implementer.completion_outcome = Some(CompletionOutcome::Done);
+        implementer.completion_evidence_validated = true;
+        implementer.summary_validated = false;
+        implementer.work_status = Some(WorkStatus::Blocked);
+
+        let mut reviewer = rev_approve("review-v2", "impl-v2", Some(1), Some("sha-v2"));
+        reviewer.completion_protocol_version = 2;
+        reviewer.completion_state = Some(CompletionState::Resolved);
+        reviewer.completion_outcome = Some(CompletionOutcome::Approve);
+        reviewer.completion_evidence_validated = true;
+        reviewer.summary_validated = false;
+        reviewer.review_verdict = Some(ReviewVerdict::Block);
+
+        let evaluation = evaluate_execution_gate(&task_input(Some(implementer), Some(reviewer)));
+        assert_eq!(evaluation.reason, ExecutionGateReason::Passed);
+        assert!(evaluation.passed);
+    }
+
+    #[test]
     fn a7_task_pass_done_with_concerns_plus_approve_with_minors() {
         let eval = evaluate_execution_gate(&task_input(
             Some(impl_concerns("impl-1")),
@@ -870,6 +923,10 @@ mod tests {
                 task_id: "".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
+                completion_protocol_version: 1,
+                completion_state: None,
+                completion_outcome: None,
+                completion_evidence_validated: false,
                 summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
@@ -891,6 +948,10 @@ mod tests {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
+                completion_protocol_version: 1,
+                completion_state: None,
+                completion_outcome: None,
+                completion_evidence_validated: false,
                 summary_validated: false,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
@@ -911,6 +972,10 @@ mod tests {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
+                completion_protocol_version: 1,
+                completion_state: None,
+                completion_outcome: None,
+                completion_evidence_validated: false,
                 summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
@@ -932,6 +997,10 @@ mod tests {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
+                completion_protocol_version: 1,
+                completion_state: None,
+                completion_outcome: None,
+                completion_evidence_validated: false,
                 summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
@@ -963,6 +1032,10 @@ mod tests {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
+                completion_protocol_version: 1,
+                completion_state: None,
+                completion_outcome: None,
+                completion_evidence_validated: false,
                 summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),

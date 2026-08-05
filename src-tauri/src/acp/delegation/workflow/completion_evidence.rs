@@ -20,16 +20,17 @@ use super::completion_intent::{
     CompletionIntentReason, CompletionIntentSource, CompletionOutcome, CompletionReportCandidate,
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
-use super::error::CompletionEvidenceError;
+use super::error::{CompletionEvidenceError, CompletionRecoveryFenceError};
 use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
-    build_admission_completion_context, validate_completion_evidence, AdmissionCandidate,
-    WorkflowStore,
+    build_admission_completion_context,
+    build_persisted_completion_context as build_persisted_context, validate_completion_evidence,
+    AdmissionCandidate, WorkflowStore,
 };
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
     CompletionEvidenceBindingV2, CompletionEvidenceV2, EvidenceValidationContext,
-    COMPLETION_PROTOCOL_VERSION_V2,
+    ValidatedCompletionEvidence, COMPLETION_PROTOCOL_VERSION_V2,
 };
 use crate::acp::delegation::attention::{
     open_design_self_review_attention_txn, open_terminal_completion_attention_txn,
@@ -1654,6 +1655,199 @@ async fn load_terminal<C: ConnectionTrait>(
     })
 }
 
+/// Load and revalidate one persisted protocol-v2 completion against current
+/// durable workflow scope and the current platform-resolved artifact.
+pub async fn load_validated_completion_evidence<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
+    let loaded = load_terminal(conn, task_id).await?;
+    if loaded.workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2)
+        || loaded.node.retired_revision.is_some()
+        || loaded.node.node_outcome.is_some()
+        || loaded.run.status != DelegationRunStatus::Completed
+        || loaded.run.completion_state != Some(CompletionState::Resolved)
+    {
+        return Err(CompletionEvidenceError::InvalidTerminalState(
+            "completion evidence is not attached to a current resolved v2 run".into(),
+        ));
+    }
+
+    let outcome = loaded
+        .run
+        .completion_outcome
+        .as_deref()
+        .and_then(parse_outcome)
+        .ok_or_else(|| {
+            CompletionEvidenceError::InvalidTerminalState(
+                "resolved run has no legal durable completion outcome".into(),
+            )
+        })?;
+    let evidence_json = loaded
+        .run
+        .completion_evidence_json
+        .as_deref()
+        .ok_or_else(|| {
+            CompletionEvidenceError::InvalidTerminalState(
+                "resolved run has no durable completion evidence".into(),
+            )
+        })?;
+    let context = rebuild_persisted_completion_context(conn, &loaded).await?;
+    ensure_context_matches_binding(&context, &loaded.binding)?;
+    let artifact =
+        completion_artifact(&resolve_terminal_artifact(conn, &loaded, &context, outcome).await?);
+    if loaded.binding.artifact_digest.as_deref() != Some(artifact.digest()) {
+        return Err(CompletionEvidenceError::InvalidTerminalState(
+            "run binding artifact does not match the current platform artifact".into(),
+        ));
+    }
+    let validated = validate_completion_evidence(
+        evidence_json,
+        &EvidenceValidationContext {
+            role: context.scope_role.completion_role(),
+            binding: completion_binding(&loaded, &context)?,
+            artifact,
+            scope: context.evidence_scope,
+        },
+    )?;
+    if !validated.evidence_validated || validated.evidence.intent.outcome != outcome {
+        return Err(CompletionEvidenceError::InvalidTerminalState(
+            "durable completion outcome does not match validated evidence".into(),
+        ));
+    }
+    Ok(validated)
+}
+
+/// Fence unresolved completion recovery for every current v2 workflow node
+/// carrying this node id. Callers that already have a task id should use the
+/// task-scoped wrapper below so workflow-local node ids cannot collide.
+pub async fn ensure_completion_recovery_not_fenced_txn<C: ConnectionTrait>(
+    conn: &C,
+    node_id: &str,
+) -> Result<(), CompletionRecoveryFenceError> {
+    let nodes = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::NodeId.eq(node_id))
+        .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
+        .all(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    for node in nodes {
+        ensure_workflow_node_completion_recovery_not_fenced_txn(
+            conn,
+            &node.workflow_id,
+            &node.node_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_task_completion_recovery_not_fenced_txn<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<(), CompletionRecoveryFenceError> {
+    let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    ensure_workflow_node_completion_recovery_not_fenced_txn(
+        conn,
+        &binding.workflow_id,
+        &binding.node_id,
+    )
+    .await
+}
+
+async fn ensure_workflow_node_completion_recovery_not_fenced_txn<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    node_id: &str,
+) -> Result<(), CompletionRecoveryFenceError> {
+    let workflow = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        .one(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    let Some(workflow) = workflow else {
+        return Ok(());
+    };
+    if workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2) {
+        return Ok(());
+    }
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        workflow_id.to_string(),
+        node_id.to_string(),
+    ))
+    .one(conn)
+    .await
+    .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    let Some(node) = node.filter(|node| node.retired_revision.is_none()) else {
+        return Ok(());
+    };
+    let binding = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(workflow_id))
+        .filter(delegation_workflow_run_binding::Column::NodeId.eq(node_id))
+        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+        .one(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let run = delegation_task_run::Entity::find_by_id(binding.task_id.clone())
+        .one(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    let Some(run) = run else {
+        return Ok(());
+    };
+    let loaded = LoadedTerminal {
+        run,
+        binding,
+        workflow,
+        node,
+    };
+
+    // A material/policy/producer scope change supersedes the old attention.
+    let context = rebuild_completion_context(conn, &loaded)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?;
+    if ensure_context_matches_binding(&context, &loaded.binding).is_err() {
+        return Ok(());
+    }
+
+    let current_attention = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::NodeId.eq(node_id))
+        .filter(delegation_attention_request::Column::LatestRunId.eq(&loaded.run.task_id))
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .order_by_desc(delegation_attention_request::Column::CreatedAt)
+        .one(conn)
+        .await
+        .map_err(|_| CompletionRecoveryFenceError::ArtifactUnavailable)?
+        .filter(|attention| {
+            attention.captured_scope_digest.as_deref()
+                == Some(context.evidence_scope_digest.as_str())
+        });
+
+    match loaded.run.completion_state {
+        Some(CompletionState::NeedsDecision) => Err(CompletionRecoveryFenceError::DecisionRequired),
+        Some(CompletionState::ArtifactRecovery) => {
+            Err(CompletionRecoveryFenceError::ArtifactUnavailable)
+        }
+        _ => match current_attention.map(|attention| attention.kind) {
+            Some(AttentionKind::CompletionDecision) => {
+                Err(CompletionRecoveryFenceError::DecisionRequired)
+            }
+            Some(AttentionKind::CompletionArtifactRecovery) => {
+                Err(CompletionRecoveryFenceError::ArtifactUnavailable)
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
 fn validate_v2_terminal(
     loaded: &LoadedTerminal,
     input: &TerminalCompletionInput,
@@ -1694,6 +1888,36 @@ async fn rebuild_completion_context<C: ConnectionTrait>(
             reviewed_generation: loaded.binding.reviewed_implementer_generation,
             producer_baseline_head: loaded.binding.producer_baseline_head.as_deref(),
         },
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn rebuild_persisted_completion_context<C: ConnectionTrait>(
+    conn: &C,
+    loaded: &LoadedTerminal,
+) -> Result<AdmissionCompletionContextV2, CompletionEvidenceError> {
+    let workspace = loaded
+        .run
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or(ArtifactError::Unavailable(
+            ArtifactFailure::WorkspaceUnavailable,
+        ))?;
+    build_persisted_context(
+        &WorkflowStore::new(conn, Path::new(workspace)),
+        &AdmissionCandidate {
+            workflow: &loaded.workflow,
+            node: &loaded.node,
+            task_id: &loaded.run.task_id,
+            artifact_digest: loaded.binding.artifact_digest.as_deref(),
+            reviewed_task_id: loaded.binding.reviewed_task_id.as_deref(),
+            reviewed_generation: loaded.binding.reviewed_implementer_generation,
+            producer_baseline_head: loaded.binding.producer_baseline_head.as_deref(),
+        },
+        &loaded.binding,
     )
     .await
     .map_err(Into::into)
@@ -2401,7 +2625,7 @@ mod tests {
         CompletionOutboxDispatcher, CompletionRootWakeQueue,
     };
     use crate::acp::delegation::metrics::DelegationMetrics;
-    use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+    use crate::acp::delegation::run_store::{ContinueRunAdmission, ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::{Settlement, TerminalTaskWrite};
     use crate::acp::delegation::workflow::store::{
         publish_workflow_manifest_core, PublishWorkflowRequest,
@@ -2727,6 +2951,147 @@ mod tests {
             assert_eq!(fixture.stored_run().await.card_summary_json, None);
         }
         assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn completion_v2_shared_validator_ignores_cards_and_legacy_binding_projection() {
+        let fixture = TerminalFixture::new(IntentFixture::AssistantText, true).await;
+        let materialized = fixture.materialize().await;
+        assert_eq!(materialized.state, CompletionState::Resolved);
+
+        let run = fixture.stored_run().await;
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.card_summary_json = Set(Some("{malformed".into()));
+        run.update(&fixture.db.conn).await.unwrap();
+
+        let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+            fixture.task_id.clone(),
+        )
+        .one(&fixture.db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut binding: crate::db::entities::delegation_workflow_run_binding::ActiveModel =
+            binding.into();
+        binding.summary_validated = Set(false);
+        binding.content_fingerprint = Set(Some("rotated-legacy-fingerprint".into()));
+        binding.gate_cycle = Set(Some(99));
+        binding.update(&fixture.db.conn).await.unwrap();
+
+        let validated =
+            super::load_validated_completion_evidence(&fixture.db.conn, &fixture.task_id)
+                .await
+                .unwrap();
+        assert!(validated.evidence_validated);
+        assert_eq!(validated.evidence.intent.outcome, CompletionOutcome::Done);
+    }
+
+    #[tokio::test]
+    async fn completion_recovery_fence_rejects_continue_and_replace_before_run_insertion() {
+        for (source, write_plan, expected_code) in [
+            (IntentFixture::Missing, true, "completion_decision_required"),
+            (
+                IntentFixture::AssistantText,
+                false,
+                "completion_artifact_unavailable",
+            ),
+        ] {
+            let fixture = TerminalFixture::new(source, write_plan).await;
+            fixture.materialize().await;
+            let before = delegation_task_run::Entity::find()
+                .all(&fixture.db.conn)
+                .await
+                .unwrap()
+                .len();
+
+            let error = RunStore::new(fixture.db.clone())
+                .admit_continue_reserving(ContinueRunAdmission {
+                    task_id: format!("{}-continue", fixture.task_id),
+                    parent_conversation_id: fixture.parent_conversation_id,
+                    parent_tool_use_id: format!("continue-{}", fixture.task_id),
+                    target_task_id: fixture.task_id.clone(),
+                    task_preview: "must be fenced".into(),
+                    request_fingerprint: format!("continue-fp-{}", fixture.task_id),
+                    work_unit_key: None,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.workflow_admission_code(), Some(expected_code));
+
+            let source_run = fixture.stored_run().await;
+            let replacement_task_id = format!("{}-replacement", fixture.task_id);
+            let replacement_error = RunStore::new(fixture.db.clone())
+                .admit_gen1_reserving(ReservingRunInsert {
+                    task_id: replacement_task_id.clone(),
+                    root_task_id: replacement_task_id.clone(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: fixture.parent_conversation_id,
+                    parent_tool_use_id: Some(format!("replace-{}", fixture.task_id)),
+                    child_conversation_id: source_run.child_conversation_id,
+                    agent_type: source_run.agent_type,
+                    profile_id: source_run.profile_id,
+                    workspace_path: source_run.workspace_path,
+                    route_fingerprint: source_run.route_fingerprint,
+                    launch_snapshot_version: source_run.launch_snapshot_version,
+                    mode_id: source_run.mode_id,
+                    config_values_json: source_run.config_values_json,
+                    task_preview: Some("must be fenced".into()),
+                    request_fingerprint: Some(format!("replace-fp-{}", fixture.task_id)),
+                    admission_class: AdmissionClass::Replacement,
+                    lineage_root_task_id: source_run.lineage_root_task_id,
+                    work_unit_key: source_run.work_unit_key,
+                    history_only: false,
+                    replaced_task_id: Some(fixture.task_id.clone()),
+                    replacement_reason: Some("unresumable".into()),
+                    started_at: Some(Utc::now()),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                replacement_error.workflow_admission_code(),
+                Some(expected_code)
+            );
+            assert_eq!(
+                delegation_task_run::Entity::find()
+                    .all(&fixture.db.conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+        }
+
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        fixture.materialize().await;
+        let run = fixture.stored_run().await;
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.workspace_path = Set(None);
+        run.update(&fixture.db.conn).await.unwrap();
+        let error = super::ensure_task_completion_recovery_not_fenced_txn(
+            &fixture.db.conn,
+            &fixture.task_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            super::CompletionRecoveryFenceError::ArtifactUnavailable
+        );
+
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        fixture.materialize().await;
+        let run = fixture.stored_run().await;
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.completion_state = Set(None);
+        run.update(&fixture.db.conn).await.unwrap();
+        let error = super::ensure_task_completion_recovery_not_fenced_txn(
+            &fixture.db.conn,
+            &fixture.task_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, super::CompletionRecoveryFenceError::DecisionRequired);
     }
 
     #[tokio::test]

@@ -173,6 +173,39 @@ pub async fn build_admission_completion_context<C: ConnectionTrait>(
     store: &WorkflowStore<'_, C>,
     candidate: &AdmissionCandidate<'_>,
 ) -> Result<AdmissionCompletionContextV2, EvidenceScopeError> {
+    build_completion_context(store, candidate, GateRoundSelection::CurrentAdmission).await
+}
+
+pub(crate) async fn build_persisted_completion_context<C: ConnectionTrait>(
+    store: &WorkflowStore<'_, C>,
+    candidate: &AdmissionCandidate<'_>,
+    binding: &delegation_workflow_run_binding::Model,
+) -> Result<AdmissionCompletionContextV2, EvidenceScopeError> {
+    build_completion_context(
+        store,
+        candidate,
+        GateRoundSelection::PersistedEvidence {
+            gate_lineage: binding.gate_lineage.as_deref(),
+            review_round: binding.review_round,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum GateRoundSelection<'a> {
+    CurrentAdmission,
+    PersistedEvidence {
+        gate_lineage: Option<&'a str>,
+        review_round: Option<i64>,
+    },
+}
+
+async fn build_completion_context<C: ConnectionTrait>(
+    store: &WorkflowStore<'_, C>,
+    candidate: &AdmissionCandidate<'_>,
+    gate_round_selection: GateRoundSelection<'_>,
+) -> Result<AdmissionCompletionContextV2, EvidenceScopeError> {
     if candidate.workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2) {
         return Err(EvidenceScopeError::InstructionBindingFailed(
             "unsupported completion protocol version".into(),
@@ -201,8 +234,14 @@ pub async fn build_admission_completion_context<C: ConnectionTrait>(
         profile_id: candidate.node.profile_id.clone(),
         work_unit_key: candidate.node.work_unit_key.clone(),
     };
-    let gate =
-        load_admitted_gate_state(store, &snapshot.normalized, candidate.node, scope_role).await?;
+    let gate = load_admitted_gate_state(
+        store,
+        &snapshot.normalized,
+        candidate.node,
+        scope_role,
+        gate_round_selection,
+    )
+    .await?;
     let gate_id = gate.as_ref().map(|value| value.gate_id.clone());
     let gate_lineage = gate.as_ref().map(|value| value.gate_lineage.clone());
     let review_round = gate.as_ref().and_then(|value| value.review_round);
@@ -549,6 +588,7 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
     manifest: &NormalizedManifest,
     node: &delegation_workflow_node_binding::Model,
     scope_role: CompletionScopeRole,
+    gate_round_selection: GateRoundSelection<'_>,
 ) -> Result<Option<AdmittedGateState>, EvidenceScopeError> {
     if matches!(
         scope_role,
@@ -629,16 +669,65 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
     validate_sha256_token(&state.gate_lineage, false)?;
     let selected: BTreeSet<String> = serde_json::from_str(&state.selected_node_ids_json)
         .map_err(|error| EvidenceScopeError::PlanMaterialInvalid(error.to_string()))?;
-    if !selected.contains(&node.node_id) || state.current_review_round <= 0 {
+    let review_round = if selected.contains(&node.node_id) && state.current_review_round > 0 {
+        state.current_review_round
+    } else if scope_role == CompletionScopeRole::PlanReviewer {
+        match gate_round_selection {
+            GateRoundSelection::PersistedEvidence {
+                gate_lineage: Some(persisted_lineage),
+                review_round: Some(persisted_round),
+            } if persisted_lineage == state.gate_lineage
+                && persisted_round > 0
+                && persisted_round < state.current_review_round =>
+            {
+                let localized_change_proof = delegation_workflow_gate_settlement::Entity::find()
+                    .filter(
+                        delegation_workflow_gate_settlement::Column::WorkflowId
+                            .eq(node.workflow_id.clone()),
+                    )
+                    .filter(
+                        delegation_workflow_gate_settlement::Column::GateLineage
+                            .eq(state.gate_lineage.clone()),
+                    )
+                    .filter(delegation_workflow_gate_settlement::Column::GateId.eq(gate.id.clone()))
+                    .filter(
+                        delegation_workflow_gate_settlement::Column::LocalizedChangeDigest
+                            .is_not_null(),
+                    )
+                    .filter(
+                        delegation_workflow_gate_settlement::Column::ReviewRound
+                            .gt(persisted_round),
+                    )
+                    .one(store.conn)
+                    .await
+                    .map_err(|error| {
+                        EvidenceScopeError::InstructionBindingFailed(error.to_string())
+                    })?;
+                if localized_change_proof.is_none() {
+                    return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
+                        "unselected reviewer {} has no localized-change proof for current lineage",
+                        node.node_id
+                    )));
+                }
+                persisted_round
+            }
+            _ => {
+                return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
+                    "node {} is not selected for gate {} round {}",
+                    node.node_id, gate.id, state.current_review_round
+                )))
+            }
+        }
+    } else {
         return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
             "node {} is not selected for gate {} round {}",
             node.node_id, gate.id, state.current_review_round
         )));
-    }
+    };
     Ok(Some(AdmittedGateState {
         gate_id: gate.id.clone(),
         gate_lineage: state.gate_lineage,
-        review_round: Some(u32::try_from(state.current_review_round).map_err(|_| {
+        review_round: Some(u32::try_from(review_round).map_err(|_| {
             EvidenceScopeError::PlanMaterialInvalid("review round exceeds u32".into())
         })?),
         required_reviewer_node_ids: gate.required_reviewer_node_ids.clone(),

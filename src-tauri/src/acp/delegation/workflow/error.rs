@@ -13,6 +13,23 @@ pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
 pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
 pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CompletionRecoveryFenceError {
+    #[error("completion outcome requires a direct decision before recovery")]
+    DecisionRequired,
+    #[error("completion artifact is unavailable; use the artifact recovery action")]
+    ArtifactUnavailable,
+}
+
+impl CompletionRecoveryFenceError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DecisionRequired => "completion_decision_required",
+            Self::ArtifactUnavailable => "completion_artifact_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompletionEvidenceError {
     #[error("completion terminal state is invalid: {0}")]
@@ -106,6 +123,12 @@ pub enum WorkflowStoreError {
 
     #[error("gate not ready: {0}")]
     GateNotReady(String),
+
+    #[error("completion outcome requires a direct decision before gate reduction")]
+    CompletionDecisionRequired,
+
+    #[error("completion artifact is unavailable before gate reduction")]
+    CompletionArtifactUnavailable,
 
     #[error("gate cycle conflict: {0}")]
     GateCycleConflict(String),
