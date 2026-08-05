@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 /// Marker that opens a v1 card-summary HTML comment block.
@@ -184,17 +185,32 @@ fn push_unique_path(out: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn extract_markdown_link_targets(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(idx) = rest.find("](") {
-        let after = &rest[idx + 2..];
-        let Some(end) = after.find(')') else {
-            break;
-        };
-        let target = after[..end].trim();
-        if !target.is_empty() {
-            out.push(target.to_string());
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    let mut quote_depth = 0usize;
+    let mut code_depth = 0usize;
+    let mut table_depth = 0usize;
+    let mut list_depth = 0usize;
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
+            Event::Start(Tag::CodeBlock(_)) => code_depth += 1,
+            Event::Start(Tag::Table(_)) => table_depth += 1,
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::Start(Tag::Link { dest_url, .. })
+                if quote_depth == 0 && code_depth == 0 && table_depth == 0 && list_depth == 0 =>
+            {
+                let target = dest_url.trim();
+                if !target.is_empty() {
+                    out.push(target.to_string());
+                }
+            }
+            Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
+            Event::End(TagEnd::CodeBlock) => code_depth = code_depth.saturating_sub(1),
+            Event::End(TagEnd::Table) => table_depth = table_depth.saturating_sub(1),
+            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            _ => {}
         }
-        rest = &after[end + 1..];
     }
     out
 }
@@ -961,5 +977,24 @@ mod tests {
             extract_card_summary_with_report_fallback(chat, &[], Some(Path::new("/tmp/ws")))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn report_candidates_ignore_links_in_non_top_level_markdown_contexts() {
+        let workspace = Path::new("/tmp/ws");
+        for text in [
+            "```markdown\n[report](reports/review.md)\n```",
+            "<!-- [report](reports/review.md) -->",
+            "> [report](reports/review.md)",
+            "| Report | Link |\n| --- | --- |\n| review | [report](reports/review.md) |",
+            "- Example: [report](reports/review.md)",
+            "1. Example\n   - [report](reports/review.md)",
+            "    [report](reports/review.md)",
+        ] {
+            assert!(
+                collect_report_harvest_candidates(text, &[], Some(workspace)).is_empty(),
+                "excluded context acquired report authority: {text:?}"
+            );
+        }
     }
 }

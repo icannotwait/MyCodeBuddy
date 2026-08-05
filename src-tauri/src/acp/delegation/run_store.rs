@@ -1924,6 +1924,9 @@ pub struct RunStore {
     /// Test-only: fail the next committed workflow-binding read before spawn.
     #[cfg(any(test, feature = "test-utils"))]
     workflow_binding_load_fail: std::sync::atomic::AtomicBool,
+    /// Test-only: fail the next out-of-transaction terminal protocol pre-read.
+    #[cfg(any(test, feature = "test-utils"))]
+    terminal_completion_protocol_load_fail: std::sync::atomic::AtomicBool,
     /// Test-only: fail after the run CAS write and before child projection.
     #[cfg(any(test, feature = "test-utils"))]
     terminal_transaction_fail: std::sync::atomic::AtomicBool,
@@ -1968,6 +1971,8 @@ impl RunStore {
             identity_load_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             workflow_binding_load_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            terminal_completion_protocol_load_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             terminal_transaction_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
@@ -2043,7 +2048,22 @@ impl RunStore {
         )>,
         TaskStoreError,
     > {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .terminal_completion_protocol_load_fail
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TaskStoreError::Transient(
+                "injected terminal completion protocol load failure".into(),
+            ));
+        }
         load_terminal_completion_protocol(&self.db.conn, task_id).await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_terminal_completion_protocol_load(&self) {
+        self.terminal_completion_protocol_load_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read the platform role and durable tool-intent candidates used by the

@@ -2110,20 +2110,29 @@ fn prepare_terminal_for_v2(
     let raw = result_text.unwrap_or_default();
     terminal.card_summary_json = None;
     let parent_text = had_text.then(|| strip_card_summary_comments(&raw));
+    let input = build_terminal_completion_input(task_id, &terminal, raw, pre_read_reports);
+    (terminal, parent_text, input)
+}
+
+fn build_terminal_completion_input(
+    task_id: &str,
+    terminal: &TerminalTaskWrite,
+    final_assistant_text: String,
+    pre_read_reports: Vec<ValidatedReportCandidate>,
+) -> TerminalCompletionInput {
     let terminal_status = match terminal.status {
         TaskStatus::Completed => DelegationRunStatus::Completed,
         TaskStatus::Failed => DelegationRunStatus::Failed,
         TaskStatus::Canceled => DelegationRunStatus::Canceled,
         TaskStatus::Running | TaskStatus::Unknown => DelegationRunStatus::Failed,
     };
-    let input = TerminalCompletionInput {
+    TerminalCompletionInput {
         task_id: task_id.to_string(),
         terminal_status,
-        final_assistant_text: raw,
+        final_assistant_text,
         pre_read_reports,
         pre_read_artifact: None,
-    };
-    (terminal, parent_text, input)
+    }
 }
 
 async fn pre_read_completion_reports(
@@ -2136,13 +2145,8 @@ async fn pre_read_completion_reports(
     let Some(workspace_path) = workspace_path else {
         return Vec::new();
     };
-    let mut candidates =
+    let candidates =
         collect_report_harvest_candidates(raw_final_text, extra_paths, Some(workspace_path));
-    for candidate in collect_plain_report_references(raw_final_text, workspace_path) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
     let workspace = workspace_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let Ok(workspace) = workspace.canonicalize() else {
@@ -2177,43 +2181,6 @@ async fn pre_read_completion_reports(
     })
     .await
     .unwrap_or_default()
-}
-
-fn collect_plain_report_references(
-    raw_final_text: &str,
-    workspace_path: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
-    raw_final_text
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim().trim_start_matches('>').trim();
-            let (label, value) = line.split_once(':')?;
-            if !matches!(
-                label.trim().to_ascii_lowercase().as_str(),
-                "report" | "report file"
-            ) {
-                return None;
-            }
-            let value = value
-                .split_whitespace()
-                .next()?
-                .trim_matches(|ch| matches!(ch, '`' | '"' | '\'' | '<' | '>' | '[' | ']'));
-            let lowercase = value.to_ascii_lowercase();
-            if value.is_empty()
-                || value.contains("://")
-                || !(lowercase.ends_with(".md") || lowercase.ends_with(".markdown"))
-            {
-                return None;
-            }
-            let path = std::path::PathBuf::from(value);
-            Some(if path.is_absolute() {
-                path
-            } else {
-                workspace_path.join(path)
-            })
-        })
-        .take(8)
-        .collect()
 }
 
 fn record_completion_resolver_metrics(
@@ -7797,9 +7764,19 @@ impl DelegationBroker {
                     workspace_path,
                 )
                 .await;
-                let (terminal, result_text, input) =
-                    prepare_terminal_for_v2(task_id, terminal, result_text, reports);
-                return (terminal, result_text, None, Some(input));
+                let input = build_terminal_completion_input(
+                    task_id,
+                    &terminal,
+                    result_text.clone().unwrap_or_default(),
+                    reports,
+                );
+                let (terminal, result_text, card_summary) = prepare_terminal_with_card_summary(
+                    terminal,
+                    result_text,
+                    extra_report_paths,
+                    workspace_path,
+                );
+                return (terminal, result_text, card_summary, Some(input));
             }
         };
         if protocol.as_ref().is_some_and(|(version, mode)| {
@@ -7883,6 +7860,7 @@ impl DelegationBroker {
         result_text: Option<String>,
         ctx: SettleContext,
     ) -> DelegationTaskReport {
+        let mut ctx = ctx;
         // Capture finished_at before moving the write into settle_with_retry so
         // the terminal runtime snapshot uses the exact same timestamp.
         let finished_at = terminal.finished_at;
@@ -7921,6 +7899,9 @@ impl DelegationBroker {
             .await;
         match settlement {
             Ok((settlement, completion)) => {
+                if completion.is_some() {
+                    ctx.card_summary = None;
+                }
                 if let Some(completion) = completion.as_ref() {
                     let projection =
                         crate::acp::delegation::workflow::project_terminal_completion(completion);
@@ -30986,19 +30967,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_pre_read_follows_plain_report_reference() {
+    async fn v2_pre_read_rejects_plain_and_excluded_report_references() {
         let workspace = tempfile::tempdir().unwrap();
         let report = workspace.path().join("reports/review.md");
         std::fs::create_dir_all(report.parent().unwrap()).unwrap();
         std::fs::write(&report, "# Conclusion\n\napprove\n").unwrap();
 
-        let candidates =
-            pre_read_completion_reports("Report: reports/review.md", &[], Some(workspace.path()))
-                .await;
+        for text in [
+            "Report: reports/review.md",
+            "> Report: reports/review.md",
+            "```markdown\n[report](reports/review.md)\n```",
+            "<!-- [report](reports/review.md) -->",
+            "> [report](reports/review.md)",
+            "| Report | Link |\n| --- | --- |\n| review | [report](reports/review.md) |",
+            "- Example: [report](reports/review.md)",
+            "1. Example\n   - [report](reports/review.md)",
+        ] {
+            let candidates = pre_read_completion_reports(text, &[], Some(workspace.path())).await;
+            assert!(
+                candidates.is_empty(),
+                "excluded reference acquired report authority: {text:?}"
+            );
+        }
+    }
 
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].path, "reports/review.md");
-        assert!(candidates[0].contents.contains("approve"));
+    #[tokio::test]
+    async fn protocol_preflight_error_preserves_v1_card_during_terminal_settlement() {
+        use crate::db::entities::delegation_task_run;
+        use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let (db, runs, _mock, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let workflow = delegation_workflow::Entity::find_by_id("launch-binding-workflow")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut workflow = workflow.into_active_model();
+        workflow.completion_protocol_version = Set(1);
+        workflow.completion_protocol_mode = Set(CompletionProtocolMode::V1);
+        workflow.update(&db.conn).await.unwrap();
+
+        let report = broker
+            .start_delegation(v2_plan_author_request(parent_id, "v1-card-preflight-error"))
+            .await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let task_id = report.task_id.unwrap();
+        runs.fail_next_terminal_completion_protocol_load();
+        let final_text = r#"Conclusion: done
+<!-- codeg-card-summary-v1
+{"kind":"author","status":"done","summary":"Plan is ready.","plan_digest":"sha256:v1-card","report_file":"docs/plan.md"}
+-->"#;
+        assert!(
+            crate::acp::delegation::card_summary::extract_card_summary(final_text).is_some(),
+            "regression fixture must contain a valid v1 Card"
+        );
+        broker
+            .complete_call(&task_id, completed_outcome(final_text))
+            .await;
+
+        let stored = delegation_task_run::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DelegationRunStatus::Completed);
+        assert!(
+            stored
+                .card_summary_json
+                .as_deref()
+                .is_some_and(|json| json.contains("sha256:v1-card")),
+            "v1 settlement lost the model Card: {:?}",
+            stored.card_summary_json
+        );
     }
 
     #[test]

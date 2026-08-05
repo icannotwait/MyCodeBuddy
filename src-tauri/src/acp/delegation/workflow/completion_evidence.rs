@@ -32,6 +32,7 @@ use super::types::{
 };
 use crate::acp::delegation::attention::{
     open_terminal_completion_attention_txn, TerminalCompletionAttentionInput,
+    ATTENTION_PAYLOAD_MAX_BYTES,
 };
 use crate::db::entities::delegation_attention_request::{self, AttentionKind};
 use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
@@ -638,8 +639,7 @@ async fn open_completion_decision<C: ConnectionTrait>(
         bounded_candidates,
         diagnostics,
     };
-    let payload_json = serde_json::to_string(&payload)
-        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    let payload_json = serialize_completion_decision_payload(payload)?;
     let attention = open_attention(
         conn,
         loaded,
@@ -657,6 +657,29 @@ async fn open_completion_decision<C: ConnectionTrait>(
         attention: Some(attention),
         graph_revision,
     })
+}
+
+fn serialize_completion_decision_payload(
+    mut payload: CompletionDecisionPayloadV1,
+) -> Result<String, CompletionEvidenceError> {
+    loop {
+        let json = serde_json::to_string(&payload)
+            .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+        if json.len() <= ATTENTION_PAYLOAD_MAX_BYTES {
+            return Ok(json);
+        }
+        if payload.diagnostics.pop().is_some() {
+            continue;
+        }
+        if payload.bounded_candidates.len() > 2 {
+            let penultimate = payload.bounded_candidates.len() - 2;
+            payload.bounded_candidates.remove(penultimate);
+            continue;
+        }
+        return Err(CompletionEvidenceError::Persistence(
+            "minimum completion decision payload exceeds attention budget".into(),
+        ));
+    }
 }
 
 async fn open_artifact_recovery<C: ConnectionTrait>(
@@ -1061,13 +1084,13 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::{
         materialize_terminal_completion_txn, retry_completion_artifact_txn,
-        TerminalCompletionInput, ValidatedReportCandidate,
+        CompletionDecisionPayloadV1, TerminalCompletionInput, ValidatedReportCandidate,
     };
     use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::{Settlement, TerminalTaskWrite};
@@ -1081,7 +1104,8 @@ mod tests {
         PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
     use crate::acp::delegation::workflow::{
-        build_work_unit_key, resolve_document, CompletionIntentSource, CompletionOutcome,
+        build_work_unit_key, resolve_document, CompletionIntentReason, CompletionIntentSource,
+        CompletionOutcome,
     };
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_attention_request::{self, AttentionKind};
@@ -1399,6 +1423,87 @@ mod tests {
             .filter(|row| row.status == "open" && row.kind == AttentionKind::CompletionDecision)
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn maximum_bounded_ambiguity_commits_terminal_and_one_attention() {
+        use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
+
+        let mut fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let run = fixture.stored_run().await;
+        let mut active: delegation_task_run::ActiveModel = run.into();
+        active.status = Set(DelegationRunStatus::Running);
+        active.finished_at = Set(None);
+        active.completion_state = Set(None);
+        active.completion_outcome = Set(None);
+        active.completion_evidence_json = Set(None);
+        active.update(&fixture.db.conn).await.unwrap();
+
+        fixture.input.final_assistant_text.clear();
+        fixture.input.pre_read_reports = (0..8)
+            .map(|index| {
+                let suffix = format!("{index}.md");
+                let prefix = "reports/";
+                let path = format!(
+                    "{prefix}{}{suffix}",
+                    "x".repeat(1024 - prefix.len() - suffix.len())
+                );
+                assert_eq!(path.len(), 1024);
+                ValidatedReportCandidate {
+                    path,
+                    contents: "# Conclusion\n\napprove\n".into(),
+                    summary: None,
+                }
+            })
+            .collect();
+        let first_path = fixture.input.pre_read_reports.first().unwrap().path.clone();
+        let last_path = fixture.input.pre_read_reports.last().unwrap().path.clone();
+
+        let runs = RunStore::new(fixture.db.clone());
+        let (settlement, completion) = runs
+            .settle_terminal_with_completion(
+                &fixture.task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+                Some(fixture.input.clone()),
+            )
+            .await
+            .expect("bounded ambiguity must not roll back terminal settlement");
+        assert!(matches!(settlement, Settlement::Won(_)));
+        assert_eq!(completion.unwrap().state, CompletionState::NeedsDecision);
+        assert_eq!(
+            fixture.stored_run().await.status,
+            DelegationRunStatus::Completed
+        );
+
+        let attentions = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(&fixture.task_id))
+            .all(&fixture.db.conn)
+            .await
+            .unwrap();
+        assert_eq!(attentions.len(), 1);
+        let payload = attentions[0].payload_json.as_deref().unwrap();
+        assert!(payload.len() <= ATTENTION_PAYLOAD_MAX_BYTES);
+        let payload: CompletionDecisionPayloadV1 = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload.reason_code, CompletionIntentReason::RoleMismatch);
+        assert!(!payload.bounded_candidates.is_empty());
+        assert_eq!(
+            payload
+                .bounded_candidates
+                .first()
+                .unwrap()
+                .report_file
+                .as_deref(),
+            Some(first_path.as_str())
+        );
+        assert_eq!(
+            payload
+                .bounded_candidates
+                .last()
+                .unwrap()
+                .report_file
+                .as_deref(),
+            Some(last_path.as_str())
+        );
     }
 
     #[tokio::test]
