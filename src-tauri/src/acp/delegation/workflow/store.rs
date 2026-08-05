@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::db::entities::conversation;
 use crate::db::entities::delegation_attention_request::{self, AttentionKind};
 use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
+use crate::db::entities::delegation_workflow_design_root_binding;
 use crate::db::entities::delegation_workflow_gate_settlement::{
     self, GateSettlementOutcome, PlanReviewNextAction as DbPlanReviewNextAction,
     PlanReviewScope as DbPlanReviewScope, PlanRevisionKind as DbPlanRevisionKind,
@@ -25,6 +25,7 @@ use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_outbox_event;
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::entities::recovery_authorization;
+use crate::db::entities::{conversation, folder};
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
@@ -36,15 +37,27 @@ use crate::acp::recovery_authorization::{
 use super::super::card_summary::{
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
-use super::artifact_resolver::{resolve_final_delivery, ArtifactError, ResolvedArtifact};
-use super::completion_evidence::{load_validated_completion_evidence, V2GateEvidenceIdentity};
+use super::artifact_resolver::{
+    resolve_document, resolve_final_delivery, ArtifactError, ResolvedArtifact,
+};
+use super::completion_evidence::{
+    load_validated_completion_evidence, open_design_self_review_decision_txn,
+    V2GateEvidenceIdentity,
+};
 use super::completion_intent::CompletionOutcome;
+use super::completion_projection::{
+    validated_design_self_review_outcome, DesignSelfReviewDecisionError,
+};
 use super::error::WorkflowStoreError;
 use super::events::{
     emit_workflow_graph_changed, emit_workflow_recovery_event, WorkflowRecoveryEvent,
 };
+use super::evidence_scope::{
+    build_design_root_review_scope, canonical_json_sha256, DesignRootScopeInput,
+};
 use super::gates::{
-    evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, RequiredReviewerEvidence,
+    evaluate_execution_gate, reduce_design_gate, ExecutionGateInput, ExecutionGateKind,
+    RequiredReviewerEvidence,
 };
 use super::plan_material::{
     plan_publication_material_decision, PlanMaterialError, PlanMaterialMap,
@@ -54,27 +67,29 @@ use super::plan_review::{
     derive_plan_review_round, PlanFindingUpdate, PlanReviewError, PlanReviewNextAction,
     PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
 };
-use super::project::evidence_from_run_and_binding;
+use super::project::evidence_from_run_binding_and_validated;
 use super::recovery_policy::{
     decide_workflow_recovery, hash_displayed_reset_reason, WorkflowRecoveryActiveRun,
     WorkflowRecoveryBindingLifecycle, WorkflowRecoveryCauseCode, WorkflowRecoveryDisposition,
     WorkflowRecoveryDocumentIdentity, WorkflowRecoveryFrozenTaskCohort,
-    WorkflowRecoveryPlanGateEvidence, WorkflowRecoveryPlanIdentity, WorkflowRecoverySnapshot,
+    WorkflowRecoveryPlanGateEvidence, WorkflowRecoveryPlanIdentity,
+    WorkflowRecoveryPlanReviewerRankV2, WorkflowRecoverySnapshot,
 };
 use super::state_dto::{
     project_workflow_state_index, PlanRecoverySourceDto, WorkflowGateStateDto,
     WorkflowNodeStateDto, WorkflowStateDto, WorkflowStateIndexDto,
 };
 use super::types::{
-    DocumentGateKind, ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeOutcome,
-    ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState, NormalizedGate,
-    NormalizedManifest, NormalizedNode, ResolutionMode, WorkflowBlockCause,
+    DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
+    ManifestNodeOutcome, ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
+    NormalizedGate, NormalizedManifest, NormalizedNode, ResolutionMode, WorkflowBlockCause,
     MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
 pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v2";
+const MAX_DESIGN_SELF_REVIEW_BYTES: usize = 2 * 1024 * 1024;
 
 /// One immutable active-manifest row validated against the workflow header.
 /// Completion admission consumes this snapshot instead of caller-provided
@@ -471,6 +486,20 @@ pub struct SettleWorkflowRequest {
     pub gate_cycle: u64,
     pub outcome: GateSettlementOutcome,
     pub evidence: SettleGateEvidence,
+    pub summary: String,
+    pub recovery_authorization_id: Option<String>,
+}
+
+/// Protocol-v2 settlement request. All evidence identity, outcome reduction,
+/// artifact coverage, lineage, round, and settlement-cycle fields come from
+/// durable platform state.
+#[derive(Debug, Clone)]
+pub struct SettleWorkflowV2Request {
+    pub workflow_id: String,
+    pub gate_id: String,
+    pub expected_graph_revision: u64,
+    pub expected_review_round: Option<u64>,
+    pub expected_outcome: Option<GateSettlementOutcome>,
     pub summary: String,
     pub recovery_authorization_id: Option<String>,
 }
@@ -1516,6 +1545,153 @@ pub async fn settle_workflow_gate_core(
     if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
         return Err(WorkflowStoreError::SummaryTooLarge);
     }
+    let protocol_is_v2 = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .is_some_and(|workflow| workflow.completion_protocol_version == 2);
+    if protocol_is_v2 {
+        return Err(WorkflowStoreError::V2CallerEvidenceRejected);
+    }
+    settle_workflow_gate_derived_core(db, emitter, parent_conversation_id, req, None).await
+}
+
+#[derive(Debug, Clone)]
+struct V2SettlementExpectation {
+    review_round: Option<u64>,
+    outcome: Option<GateSettlementOutcome>,
+}
+
+pub async fn settle_workflow_gate_v2_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: SettleWorkflowV2Request,
+) -> Result<SettleResult, WorkflowStoreError> {
+    if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
+        return Err(WorkflowStoreError::SummaryTooLarge);
+    }
+    let preflight = SettleWorkflowRequest {
+        workflow_id: req.workflow_id.clone(),
+        manifest_revision: 0,
+        gate_id: req.gate_id.clone(),
+        expected_graph_revision: req.expected_graph_revision,
+        gate_cycle: req.expected_review_round.unwrap_or(1),
+        outcome: req
+            .expected_outcome
+            .clone()
+            .unwrap_or(GateSettlementOutcome::Approved),
+        evidence: SettleGateEvidence::Design {
+            critical_count: 0,
+            important_count: 0,
+            minor_count: 0,
+        },
+        summary: req.summary.clone(),
+        recovery_authorization_id: req.recovery_authorization_id.clone(),
+    };
+    match prepare_v2_design_self_review(db, parent_conversation_id, &preflight).await? {
+        DesignSelfReviewReadiness::NotApplicable | DesignSelfReviewReadiness::Ready => {}
+        DesignSelfReviewReadiness::DecisionRequired => {
+            return Err(WorkflowStoreError::CompletionDecisionRequired)
+        }
+        DesignSelfReviewReadiness::Superseded => {
+            return Err(WorkflowStoreError::CompletionDecisionSuperseded)
+        }
+    }
+
+    let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
+    if header.parent_conversation_id != parent_conversation_id {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id: header.workflow_id,
+            expected_parent: parent_conversation_id,
+            actual_parent: header.parent_conversation_id,
+        });
+    }
+    if header.completion_protocol_version != 2 {
+        return Err(WorkflowStoreError::GateNotReady(
+            "protocol-v2 settlement requires a protocol-v2 workflow".into(),
+        ));
+    }
+    if req.expected_graph_revision != header.graph_revision as u64 {
+        return Err(WorkflowStoreError::StaleGraphRevision {
+            expected: req.expected_graph_revision,
+            current: header.graph_revision as u64,
+        });
+    }
+    let document = load_active_manifest_document_txn(
+        &db.conn,
+        &header.workflow_id,
+        header.active_manifest_revision,
+    )
+    .await?;
+    let normalized = validate_manifest_document(&document)?;
+    let gate = normalized
+        .gates
+        .iter()
+        .find(|gate| gate.id == req.gate_id)
+        .ok_or_else(|| {
+            WorkflowStoreError::ExecutionGateSettleRejected(format!(
+                "gate_id {} is not a document gate on the active manifest",
+                req.gate_id
+            ))
+        })?;
+    let evidence_payload = match gate.gate_kind {
+        DocumentGateKind::Design => SettleGateEvidence::Design {
+            critical_count: 0,
+            important_count: 0,
+            minor_count: 0,
+        },
+        DocumentGateKind::Plan => SettleGateEvidence::Plan(PlanReviewRoundSubmission {
+            scope: PlanReviewScope::Full,
+            revision_kind: PlanRevisionKind::Initial,
+            scope_reason: String::new(),
+            covered_author_task_id: String::new(),
+            covered_plan_digest: String::new(),
+            required_reviewer_node_ids: Vec::new(),
+            finding_updates: Vec::new(),
+            lineage_reset_reason: None,
+        }),
+    };
+    settle_workflow_gate_derived_core(
+        db,
+        emitter,
+        parent_conversation_id,
+        SettleWorkflowRequest {
+            workflow_id: header.workflow_id,
+            manifest_revision: header.active_manifest_revision as u64,
+            gate_id: gate.id.clone(),
+            expected_graph_revision: req.expected_graph_revision,
+            gate_cycle: 1,
+            outcome: req
+                .expected_outcome
+                .clone()
+                .unwrap_or(GateSettlementOutcome::Approved),
+            evidence: evidence_payload,
+            summary: req.summary,
+            recovery_authorization_id: req.recovery_authorization_id,
+        },
+        Some(V2SettlementExpectation {
+            review_round: req.expected_review_round,
+            outcome: req.expected_outcome,
+        }),
+    )
+    .await
+}
+
+async fn settle_workflow_gate_derived_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: SettleWorkflowRequest,
+    v2_expectation: Option<V2SettlementExpectation>,
+) -> Result<SettleResult, WorkflowStoreError> {
+    if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
+        return Err(WorkflowStoreError::SummaryTooLarge);
+    }
     let legacy_design_error = match &req.evidence {
         SettleGateEvidence::Design {
             critical_count,
@@ -1599,6 +1775,7 @@ pub async fn settle_workflow_gate_core(
         .transaction::<_, (SettleResult, Option<RecoverWorkflowResult>), WorkflowStoreError>(
             |txn| {
                 Box::pin(async move {
+                    let mut req = req;
                     let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
                         .one(txn)
                         .await
@@ -1613,8 +1790,14 @@ pub async fn settle_workflow_gate_core(
                         });
                     }
 
-                    // Existing settlements for this gate — check idempotency before
-                    // graph CAS so same-payload replay does not require a reload.
+                    if v2_expectation.is_some() && header.completion_protocol_version != 2 {
+                        return Err(WorkflowStoreError::GateNotReady(
+                            "protocol-v2 settlement requires a protocol-v2 workflow".into(),
+                        ));
+                    }
+
+                    // v1 preserves cycle-addressed replay before graph CAS. v2
+                    // replays only after current evidence is revalidated below.
                     let gate_prior = delegation_workflow_gate_settlement::Entity::find()
                         .filter(
                             delegation_workflow_gate_settlement::Column::WorkflowId
@@ -1629,25 +1812,27 @@ pub async fn settle_workflow_gate_core(
                         .await
                         .map_err(db_err)?;
 
-                    if let Some(existing) = gate_prior
-                        .iter()
-                        .find(|s| s.gate_cycle as u64 == req.gate_cycle)
-                    {
-                        if settlement_payload_matches(existing, &req)? {
-                            return Ok((
-                                settle_result_from_row(
-                                    existing,
-                                    header.graph_revision as u64,
-                                    header.active_manifest_revision as u64,
-                                    true,
-                                )?,
-                                None,
-                            ));
+                    if v2_expectation.is_none() {
+                        if let Some(existing) = gate_prior
+                            .iter()
+                            .find(|s| s.gate_cycle as u64 == req.gate_cycle)
+                        {
+                            if settlement_payload_matches(existing, &req)? {
+                                return Ok((
+                                    settle_result_from_row(
+                                        existing,
+                                        header.graph_revision as u64,
+                                        header.active_manifest_revision as u64,
+                                        true,
+                                    )?,
+                                    None,
+                                ));
+                            }
+                            return Err(WorkflowStoreError::GateCycleConflict(format!(
+                                "gate {} cycle {} already settled with a different payload",
+                                req.gate_id, req.gate_cycle
+                            )));
                         }
-                        return Err(WorkflowStoreError::GateCycleConflict(format!(
-                            "gate {} cycle {} already settled with a different payload",
-                            req.gate_id, req.gate_cycle
-                        )));
                     }
 
                     if req.manifest_revision != header.active_manifest_revision as u64 {
@@ -1682,16 +1867,68 @@ pub async fn settle_workflow_gate_core(
                         })?;
 
                     let v2_gate_evidence = if header.completion_protocol_version == 2 {
+                        validate_current_design_self_review_bytes_txn(
+                            txn,
+                            &header,
+                            &normalized,
+                            gate,
+                            parent_conversation_id,
+                        )
+                        .await?;
                         let evidence = load_validated_v2_gate_evidence(
                             txn,
                             &header.workflow_id,
                             gate,
                         )
                         .await?;
-                        if req.outcome != evidence.outcome {
+                        let expectation = v2_expectation.as_ref().ok_or_else(|| {
+                            WorkflowStoreError::V2CallerEvidenceRejected
+                        })?;
+                        if expectation.review_round.is_some_and(|expected| {
+                            expected != evidence.identity.review_round as u64
+                        }) {
+                            return Err(WorkflowStoreError::GateCycleConflict(format!(
+                                "gate {} expected review round {:?}, current is {}",
+                                gate.id,
+                                expectation.review_round,
+                                evidence.identity.review_round
+                            )));
+                        }
+                        if expectation
+                            .outcome
+                            .as_ref()
+                            .is_some_and(|expected| *expected != evidence.outcome)
+                        {
                             return Err(WorkflowStoreError::GateNotReady(format!(
                                 "expected outcome {:?} disagrees with complete v2 evidence reduction {:?}",
-                                req.outcome, evidence.outcome
+                                expectation.outcome, evidence.outcome
+                            )));
+                        }
+                        req.outcome = evidence.outcome.clone();
+                        if let Some(existing) = gate_prior
+                            .iter()
+                            .rev()
+                            .find(|settlement| evidence.identity.matches_settlement(settlement))
+                        {
+                            if existing.outcome == evidence.outcome
+                                && existing.summary == req.summary
+                                && existing.manifest_revision == header.active_manifest_revision
+                                && existing.lineage_reset_authorization_id.as_deref()
+                                    == req.recovery_authorization_id.as_deref()
+                            {
+                                return Ok((
+                                    settle_result_from_row(
+                                        existing,
+                                        header.graph_revision as u64,
+                                        header.active_manifest_revision as u64,
+                                        true,
+                                    )?,
+                                    None,
+                                ));
+                            }
+                            return Err(WorkflowStoreError::GateCycleConflict(format!(
+                                "gate {} current v2 evidence is already settled with a different payload",
+                                gate.id
                             )));
                         }
                         Some(evidence)
@@ -1726,7 +1963,9 @@ pub async fn settle_workflow_gate_core(
                         .max()
                         .unwrap_or(0);
                     let expected_next = (max_cycle + 1) as u64;
-                    if req.gate_cycle != expected_next {
+                    if v2_expectation.is_some() {
+                        req.gate_cycle = expected_next;
+                    } else if req.gate_cycle != expected_next {
                         return Err(WorkflowStoreError::GateCycleConflict(format!(
                             "gate {} expected cycle {expected_next}, got {}",
                             req.gate_id, req.gate_cycle
@@ -2274,6 +2513,333 @@ pub async fn settle_workflow_gate_core(
     Ok(result)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesignSelfReviewReadiness {
+    NotApplicable,
+    Ready,
+    DecisionRequired,
+    Superseded,
+}
+
+async fn prepare_v2_design_self_review(
+    db: &AppDatabase,
+    parent_conversation_id: i32,
+    req: &SettleWorkflowRequest,
+) -> Result<DesignSelfReviewReadiness, WorkflowStoreError> {
+    let req = req.clone();
+    let result = db
+        .conn
+        .transaction::<_, DesignSelfReviewReadiness, WorkflowStoreError>(|txn| {
+            Box::pin(async move {
+                let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
+                if header.parent_conversation_id != parent_conversation_id {
+                    return Err(WorkflowStoreError::CrossParent {
+                        workflow_id: header.workflow_id,
+                        expected_parent: parent_conversation_id,
+                        actual_parent: header.parent_conversation_id,
+                    });
+                }
+                if header.completion_protocol_version != 2 {
+                    return Ok(DesignSelfReviewReadiness::NotApplicable);
+                }
+                if req.expected_graph_revision != header.graph_revision as u64 {
+                    return Err(WorkflowStoreError::StaleGraphRevision {
+                        expected: req.expected_graph_revision,
+                        current: header.graph_revision as u64,
+                    });
+                }
+                let document = load_active_manifest_document_txn(
+                    txn,
+                    &header.workflow_id,
+                    header.active_manifest_revision,
+                )
+                .await?;
+                let normalized = validate_manifest_document(&document)?;
+                let Some(gate) = normalized.gates.iter().find(|gate| gate.id == req.gate_id) else {
+                    return Ok(DesignSelfReviewReadiness::NotApplicable);
+                };
+                if gate.gate_kind != DocumentGateKind::Design
+                    || gate.resolution_mode != ResolutionMode::SelfReview
+                    || !gate.required_reviewer_node_ids.is_empty()
+                {
+                    return Ok(DesignSelfReviewReadiness::NotApplicable);
+                }
+                let design = normalized.design.as_ref().ok_or_else(|| {
+                    WorkflowStoreError::GateNotReady(
+                        "Design self-review requires an active Design document".into(),
+                    )
+                })?;
+                let parent = conversation::Entity::find_by_id(parent_conversation_id)
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or(WorkflowStoreError::ParentNotFound(parent_conversation_id))?;
+                let workspace = folder::Entity::find_by_id(parent.folder_id)
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::Persistence(
+                            "Design self-review workspace folder is missing".into(),
+                        )
+                    })?;
+                let resolved = resolve_document(
+                    std::path::Path::new(&workspace.path),
+                    &design.rel_path,
+                    MAX_DESIGN_SELF_REVIEW_BYTES,
+                )
+                .await
+                .map_err(|_| WorkflowStoreError::CompletionArtifactUnavailable)?;
+
+                let desired_lineage = design_self_review_lineage(
+                    &header.workflow_id,
+                    &gate.id,
+                    &header.workflow_kind,
+                    resolved.rel_path(),
+                    resolved.digest(),
+                );
+                let prior_state = delegation_workflow_gate_state::Entity::find_by_id((
+                    header.workflow_id.clone(),
+                    gate.id.clone(),
+                ))
+                .one(txn)
+                .await
+                .map_err(db_err)?;
+                let rotated = prior_state
+                    .as_ref()
+                    .is_some_and(|state| state.gate_lineage != desired_lineage);
+                match prior_state {
+                    Some(state) if state.gate_lineage != desired_lineage => {
+                        let mut active: delegation_workflow_gate_state::ActiveModel = state.into();
+                        active.gate_lineage = Set(desired_lineage.clone());
+                        active.current_review_round = Set(1);
+                        active.selected_node_ids_json = Set("[]".into());
+                        active.update(txn).await.map_err(db_err)?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        delegation_workflow_gate_state::ActiveModel {
+                            workflow_id: Set(header.workflow_id.clone()),
+                            gate_id: Set(gate.id.clone()),
+                            gate_lineage: Set(desired_lineage.clone()),
+                            current_review_round: Set(1),
+                            selected_node_ids_json: Set("[]".into()),
+                        }
+                        .insert(txn)
+                        .await
+                        .map_err(db_err)?;
+                    }
+                }
+
+                let resolved_design = DocumentRef {
+                    rel_path: resolved.rel_path().to_string(),
+                    digest: resolved.digest().to_string(),
+                };
+                let review_scope = build_design_root_review_scope(&DesignRootScopeInput {
+                    workflow_kind: &header.workflow_kind,
+                    design: &resolved_design,
+                    gate_id: &gate.id,
+                    gate_lineage: &desired_lineage,
+                    resolution_mode: gate.resolution_mode,
+                })
+                .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
+                let scope_digest =
+                    canonical_json_sha256("codeg.completion.review_scope.v2", 1, &review_scope)
+                        .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
+                let binding_id = sha256_hex(
+                    format!(
+                        "codeg.design-root-binding.v1\0{}\0{}\0{}",
+                        header.workflow_id, gate.id, desired_lineage
+                    )
+                    .as_bytes(),
+                );
+                let node_id = format!(
+                    "platform-design-root-node:{}",
+                    &sha256_hex(
+                        format!(
+                            "codeg.design-root-node.v1\0{}\0{}",
+                            header.workflow_id, gate.id
+                        )
+                        .as_bytes()
+                    )[..24]
+                );
+                let binding = delegation_workflow_design_root_binding::Entity::find_by_id((
+                    header.workflow_id.clone(),
+                    gate.id.clone(),
+                    desired_lineage.clone(),
+                ))
+                .one(txn)
+                .await
+                .map_err(db_err)?;
+                let binding_created = binding.is_none();
+                let mut binding = match binding {
+                    Some(binding)
+                        if binding.design_identity == resolved.digest()
+                            && binding.evidence_scope_digest == scope_digest =>
+                    {
+                        binding
+                    }
+                    Some(_) => return Ok(DesignSelfReviewReadiness::Superseded),
+                    None => delegation_workflow_design_root_binding::ActiveModel {
+                        workflow_id: Set(header.workflow_id.clone()),
+                        gate_id: Set(gate.id.clone()),
+                        gate_lineage: Set(desired_lineage.clone()),
+                        node_id: Set(node_id),
+                        task_id: Set(format!("platform-design-root-task:{binding_id}")),
+                        latest_run_id: Set(format!(
+                            "platform-design-root-run:{}",
+                            sha256_hex(
+                                format!("{binding_id}\0{}\0{scope_digest}", resolved.digest())
+                                    .as_bytes()
+                            )
+                        )),
+                        design_identity: Set(resolved.digest().to_string()),
+                        evidence_scope_digest: Set(scope_digest),
+                        graph_revision: Set(header.graph_revision),
+                    }
+                    .insert(txn)
+                    .await
+                    .map_err(db_err)?,
+                };
+
+                let attention = delegation_attention_request::Entity::find()
+                    .filter(delegation_attention_request::Column::TaskId.eq(&binding.task_id))
+                    .filter(
+                        delegation_attention_request::Column::Kind
+                            .eq(AttentionKind::DesignSelfReviewDecision),
+                    )
+                    .order_by_desc(delegation_attention_request::Column::CreatedAt)
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?;
+                let validated = validated_design_self_review_outcome(&binding, attention.as_ref());
+                let opens_attention = matches!(&validated, Ok(None)) && attention.is_none();
+                let graph_changed = rotated || binding_created || opens_attention;
+                if graph_changed {
+                    let next_graph = header.graph_revision.checked_add(1).ok_or_else(|| {
+                        WorkflowStoreError::Persistence("graph revision overflow".into())
+                    })?;
+                    if binding.graph_revision != next_graph {
+                        let mut active: delegation_workflow_design_root_binding::ActiveModel =
+                            binding.into();
+                        active.graph_revision = Set(next_graph);
+                        binding = active.update(txn).await.map_err(db_err)?;
+                    }
+                    let mut active: delegation_workflow::ActiveModel = header.clone().into();
+                    active.graph_revision = Set(next_graph);
+                    active.updated_at = Set(Utc::now());
+                    active.update(txn).await.map_err(db_err)?;
+                    if rotated {
+                        supersede_prior_design_self_review_attentions_txn(
+                            txn,
+                            &header.workflow_id,
+                            &binding.task_id,
+                            next_graph as u64,
+                        )
+                        .await?;
+                    }
+                }
+                match validated {
+                    Ok(Some(_)) if !rotated => Ok(DesignSelfReviewReadiness::Ready),
+                    Ok(Some(_)) => Ok(DesignSelfReviewReadiness::Superseded),
+                    Ok(None) => {
+                        open_design_self_review_decision_txn(txn, &binding, parent_conversation_id)
+                            .await
+                            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+                        Ok(if rotated {
+                            DesignSelfReviewReadiness::Superseded
+                        } else {
+                            DesignSelfReviewReadiness::DecisionRequired
+                        })
+                    }
+                    Err(DesignSelfReviewDecisionError::Superseded) => {
+                        Ok(DesignSelfReviewReadiness::Superseded)
+                    }
+                    Err(DesignSelfReviewDecisionError::Corrupt) => {
+                        Err(WorkflowStoreError::Persistence(
+                            "Design self-review decision is corrupt".into(),
+                        ))
+                    }
+                }
+            })
+        })
+        .await;
+    match result {
+        Ok(readiness) => Ok(readiness),
+        Err(sea_orm::TransactionError::Connection(error)) => Err(db_err(error)),
+        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
+    }
+}
+
+fn design_self_review_lineage(
+    workflow_id: &str,
+    gate_id: &str,
+    workflow_kind: &str,
+    design_path: &str,
+    design_digest: &str,
+) -> String {
+    format!(
+        "sha256:{}",
+        sha256_hex(
+            format!(
+                "codeg.design-root-lineage.v1\0{workflow_id}\0{gate_id}\0{workflow_kind}\0{design_path}\0{design_digest}\0self_review"
+            )
+            .as_bytes()
+        )
+    )
+}
+
+async fn supersede_prior_design_self_review_attentions_txn<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    current_task_id: &str,
+    graph_revision: u64,
+) -> Result<(), WorkflowStoreError> {
+    let prior_task_ids = delegation_workflow_design_root_binding::Entity::find()
+        .filter(
+            delegation_workflow_design_root_binding::Column::WorkflowId.eq(workflow_id.to_string()),
+        )
+        .all(conn)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .filter(|binding| binding.task_id != current_task_id)
+        .map(|binding| binding.task_id)
+        .collect::<Vec<_>>();
+    if prior_task_ids.is_empty() {
+        return Ok(());
+    }
+    let open = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::TaskId.is_in(prior_task_ids))
+        .filter(
+            delegation_attention_request::Column::Kind.eq(AttentionKind::DesignSelfReviewDecision),
+        )
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    for row in open {
+        let mut active: delegation_attention_request::ActiveModel = row.into();
+        active.status = Set("resolved".into());
+        active.resolution_code = Set(Some("superseded".into()));
+        active.resolution_json = Set(Some(
+            serde_json::json!({
+                "version": 1,
+                "code": "superseded",
+                "graph_revision": graph_revision,
+            })
+            .to_string(),
+        ));
+        active.resolved_at = Set(Some(Utc::now()));
+        active.update(conn).await.map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// Agent-facing compact recovery read (A5 + B4).
 ///
 /// Entire snapshot is loaded in a single SQLite read transaction for consistency.
@@ -2408,6 +2974,16 @@ pub async fn get_workflow_state_core(
                 };
                 let run_by_id: HashMap<String, &delegation_task_run::Model> =
                     runs.iter().map(|r| (r.task_id.clone(), r)).collect();
+                let mut validated_v2_by_task = HashMap::new();
+                if header.completion_protocol_version == 2 {
+                    for binding in latest_by_node.values() {
+                        if let Ok(validated) =
+                            load_validated_completion_evidence(txn, &binding.task_id).await
+                        {
+                            validated_v2_by_task.insert(binding.task_id.clone(), validated);
+                        }
+                    }
+                }
 
                 let required_node_ids: HashSet<String> = normalized
                     .gates
@@ -2542,7 +3118,12 @@ pub async fn get_workflow_state_core(
                         .get(&policy.route.implementer_node_id)
                         .and_then(|binding| {
                             run_by_id.get(&binding.task_id).map(|run| {
-                                evidence_from_run_and_binding(run, binding)
+                                evidence_from_run_binding_and_validated(
+                                    run,
+                                    binding,
+                                    header.completion_protocol_version,
+                                    validated_v2_by_task.get(&binding.task_id),
+                                )
                             })
                         });
                     let required_reviewers = policy
@@ -2553,7 +3134,12 @@ pub async fn get_workflow_state_core(
                             node_id: node_id.clone(),
                             evidence: latest_by_node.get(node_id).and_then(|binding| {
                                 run_by_id.get(&binding.task_id).map(|run| {
-                                    evidence_from_run_and_binding(run, binding)
+                                    evidence_from_run_binding_and_validated(
+                                        run,
+                                        binding,
+                                        header.completion_protocol_version,
+                                        validated_v2_by_task.get(&binding.task_id),
+                                    )
                                 })
                             }),
                         })
@@ -2958,7 +3544,9 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
         .filter(|attention| {
             matches!(
                 attention.kind,
-                AttentionKind::CompletionDecision | AttentionKind::CompletionArtifactRecovery
+                AttentionKind::CompletionDecision
+                    | AttentionKind::CompletionArtifactRecovery
+                    | AttentionKind::DesignSelfReviewDecision
             )
         })
         .map(|attention| attention.task_id)
@@ -3135,6 +3723,10 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
             gate_lineage: settlement.gate_lineage.clone(),
             review_round: settlement.review_round,
             v2_evidence_consistent,
+            plan_reviewer_ranks_v2: settlement
+                .plan_round_state_v2_json
+                .as_deref()
+                .and_then(parse_plan_reviewer_ranks_v2),
             critical_count: settlement.critical_count.unwrap_or(-1),
             important_count: settlement.important_count.unwrap_or(-1),
             minor_count: settlement.minor_count.unwrap_or(-1),
@@ -4723,6 +5315,76 @@ struct ValidatedV2GateEvidenceSet {
     outcome: GateSettlementOutcome,
 }
 
+async fn validate_current_design_self_review_bytes_txn<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+    normalized: &NormalizedManifest,
+    gate: &NormalizedGate,
+    parent_conversation_id: i32,
+) -> Result<(), WorkflowStoreError> {
+    if gate.gate_kind != DocumentGateKind::Design
+        || gate.resolution_mode != ResolutionMode::SelfReview
+        || !gate.required_reviewer_node_ids.is_empty()
+    {
+        return Ok(());
+    }
+    let design = normalized.design.as_ref().ok_or_else(|| {
+        WorkflowStoreError::GateNotReady(
+            "Design self-review requires an active Design document".into(),
+        )
+    })?;
+    let parent = conversation::Entity::find_by_id(parent_conversation_id)
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .ok_or(WorkflowStoreError::ParentNotFound(parent_conversation_id))?;
+    let workspace = folder::Entity::find_by_id(parent.folder_id)
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            WorkflowStoreError::Persistence("Design self-review workspace folder is missing".into())
+        })?;
+    let resolved = resolve_document(
+        std::path::Path::new(&workspace.path),
+        &design.rel_path,
+        MAX_DESIGN_SELF_REVIEW_BYTES,
+    )
+    .await
+    .map_err(|_| WorkflowStoreError::CompletionArtifactUnavailable)?;
+    let current_lineage = design_self_review_lineage(
+        &header.workflow_id,
+        &gate.id,
+        &header.workflow_kind,
+        resolved.rel_path(),
+        resolved.digest(),
+    );
+    let state = delegation_workflow_gate_state::Entity::find_by_id((
+        header.workflow_id.clone(),
+        gate.id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(db_err)?
+    .ok_or(WorkflowStoreError::CompletionDecisionRequired)?;
+    let binding = delegation_workflow_design_root_binding::Entity::find_by_id((
+        header.workflow_id.clone(),
+        gate.id.clone(),
+        current_lineage.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(db_err)?;
+    if state.gate_lineage != current_lineage
+        || binding
+            .as_ref()
+            .is_none_or(|binding| binding.design_identity != resolved.digest())
+    {
+        return Err(WorkflowStoreError::CompletionDecisionSuperseded);
+    }
+    Ok(())
+}
+
 async fn load_validated_v2_plan_author<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -4769,14 +5431,65 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
     .map_err(db_err)?
     .ok_or_else(|| WorkflowStoreError::GateNotReady("current gate state is missing".into()))?;
     if gate.required_reviewer_node_ids.is_empty() {
-        return Err(WorkflowStoreError::CompletionDecisionRequired);
+        if gate.gate_kind != DocumentGateKind::Design
+            || gate.resolution_mode != ResolutionMode::SelfReview
+        {
+            return Err(WorkflowStoreError::CompletionDecisionRequired);
+        }
+        let binding = delegation_workflow_design_root_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            gate.id.clone(),
+            state.gate_lineage.clone(),
+        ))
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .ok_or(WorkflowStoreError::CompletionDecisionRequired)?;
+        let attention = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(&binding.task_id))
+            .filter(
+                delegation_attention_request::Column::Kind
+                    .eq(AttentionKind::DesignSelfReviewDecision),
+            )
+            .order_by_desc(delegation_attention_request::Column::CreatedAt)
+            .one(conn)
+            .await
+            .map_err(db_err)?;
+        let outcome = match validated_design_self_review_outcome(&binding, attention.as_ref()) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Err(WorkflowStoreError::CompletionDecisionRequired),
+            Err(DesignSelfReviewDecisionError::Superseded) => {
+                return Err(WorkflowStoreError::CompletionDecisionSuperseded)
+            }
+            Err(DesignSelfReviewDecisionError::Corrupt) => {
+                return Err(WorkflowStoreError::Persistence(
+                    "Design self-review decision is corrupt".into(),
+                ))
+            }
+        };
+        let identity = V2GateEvidenceIdentity::new(
+            state.gate_lineage,
+            state.current_review_round,
+            vec![binding.node_id],
+            vec![binding.task_id],
+            vec![binding.evidence_scope_digest],
+        )
+        .ok_or_else(|| {
+            WorkflowStoreError::Persistence(
+                "Design self-review evidence identity is invalid".into(),
+            )
+        })?;
+        return Ok(ValidatedV2GateEvidenceSet {
+            identity,
+            outcome: design_outcome_to_settlement(outcome)?,
+        });
     }
     let selected = serde_json::from_str::<BTreeSet<String>>(&state.selected_node_ids_json)
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
     let required_node_ids = canonical_string_set(&gate.required_reviewer_node_ids);
     let mut task_ids = Vec::with_capacity(required_node_ids.len());
     let mut scope_digests = Vec::with_capacity(required_node_ids.len());
-    let mut outcomes = Vec::with_capacity(required_node_ids.len());
+    let mut evidence = Vec::with_capacity(required_node_ids.len());
 
     for node_id in &required_node_ids {
         let binding = delegation_workflow_run_binding::Entity::find()
@@ -4824,8 +5537,8 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
             .await
             .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
         task_ids.push(binding.task_id);
-        scope_digests.push(validated.evidence.evidence_scope_digest);
-        outcomes.push(validated.evidence.intent.outcome);
+        scope_digests.push(validated.evidence.evidence_scope_digest.clone());
+        evidence.push(validated);
     }
 
     let identity = V2GateEvidenceIdentity::new(
@@ -4840,30 +5553,37 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
             "current v2 gate evidence identity is incomplete or duplicated".into(),
         )
     })?;
-    let outcome = if outcomes
-        .iter()
-        .any(|outcome| *outcome == CompletionOutcome::RequestChanges)
-    {
-        GateSettlementOutcome::ChangesRequested
-    } else if outcomes
-        .iter()
-        .any(|outcome| *outcome == CompletionOutcome::Block)
-    {
-        GateSettlementOutcome::Blocked
-    } else if outcomes.iter().all(|outcome| {
+    if !evidence.iter().all(|validated| {
         matches!(
-            outcome,
-            CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors
+            validated.evidence.intent.outcome,
+            CompletionOutcome::Approve
+                | CompletionOutcome::ApproveWithMinors
+                | CompletionOutcome::RequestChanges
+                | CompletionOutcome::Block
         )
     }) {
-        GateSettlementOutcome::Approved
-    } else {
         return Err(WorkflowStoreError::GateNotReady(
             "required reviewer evidence has a role-invalid outcome".into(),
         ));
-    };
+    }
+    let outcome = reduce_design_gate(&evidence);
 
     Ok(ValidatedV2GateEvidenceSet { identity, outcome })
+}
+
+fn design_outcome_to_settlement(
+    outcome: CompletionOutcome,
+) -> Result<GateSettlementOutcome, WorkflowStoreError> {
+    match outcome {
+        CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors => {
+            Ok(GateSettlementOutcome::Approved)
+        }
+        CompletionOutcome::RequestChanges => Ok(GateSettlementOutcome::ChangesRequested),
+        CompletionOutcome::Block => Ok(GateSettlementOutcome::Blocked),
+        _ => Err(WorkflowStoreError::Persistence(
+            "Design self-review outcome is role-invalid".into(),
+        )),
+    }
 }
 
 fn select_current_v2_plan_settlement<'a>(
@@ -5517,6 +6237,26 @@ fn canonical_string_set(values: &[String]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn parse_plan_reviewer_ranks_v2(json: &str) -> Option<Vec<WorkflowRecoveryPlanReviewerRankV2>> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let reviewers = value.get("reviewers")?.as_array()?;
+    let mut seen = HashSet::with_capacity(reviewers.len());
+    let mut ranks = Vec::with_capacity(reviewers.len());
+    for reviewer in reviewers {
+        let node_id = reviewer.get("node_id")?.as_str()?.trim();
+        let rank = u8::try_from(reviewer.get("rank")?.as_u64()?).ok()?;
+        if node_id.is_empty() || rank > 2 || !seen.insert(node_id.to_string()) {
+            return None;
+        }
+        ranks.push(WorkflowRecoveryPlanReviewerRankV2 {
+            node_id: node_id.to_string(),
+            rank,
+        });
+    }
+    ranks.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Some(ranks)
 }
 
 fn plan_scope_to_db(scope: PlanReviewScope) -> DbPlanReviewScope {
@@ -8267,6 +9007,472 @@ mod tests {
         .await
         .expect("self_review settle");
         assert!(!s.idempotent_replay);
+    }
+
+    #[tokio::test]
+    async fn design_self_review_decision_is_required_and_persists_null_counts() {
+        use crate::acp::delegation::workflow::completion_evidence::{
+            resolve_design_self_review_txn, CompletionAttentionCas,
+        };
+        use crate::db::entities::delegation_workflow::{CompletionProtocolMode, WorkflowState};
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/superpowers/specs")).unwrap();
+        let design_bytes = b"# Current Design\n";
+        std::fs::write(
+            workspace.path().join("docs/superpowers/specs/x.md"),
+            design_bytes,
+        )
+        .unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = zero_reviewer_design_doc("task13-design-self-review");
+        document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.workflow_state, WorkflowState::Estimated);
+        let mut header: delegation_workflow::ActiveModel = header.into();
+        header.completion_protocol_version = Set(2);
+        header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+        header.update(&db.conn).await.unwrap();
+
+        let legacy_request = SettleWorkflowRequest {
+            workflow_id: published.workflow_id.clone(),
+            manifest_revision: 0,
+            gate_id: "design".into(),
+            expected_graph_revision: published.graph_revision,
+            gate_cycle: 1,
+            outcome: GateSettlementOutcome::Approved,
+            evidence: design_evidence(9, 9, 9),
+            summary: "caller fields are not authority".into(),
+            recovery_authorization_id: None,
+        };
+        assert_eq!(
+            settle_workflow_gate_core(&db, &emitter, parent, legacy_request)
+                .await
+                .unwrap_err(),
+            WorkflowStoreError::V2CallerEvidenceRejected
+        );
+        let request = SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "design".into(),
+            expected_graph_revision: published.graph_revision,
+            expected_review_round: Some(1),
+            expected_outcome: Some(GateSettlementOutcome::Approved),
+            summary: "caller fields are not authority".into(),
+            recovery_authorization_id: None,
+        };
+        assert_eq!(
+            settle_workflow_gate_v2_core(&db, &emitter, parent, request.clone())
+                .await
+                .unwrap_err(),
+            WorkflowStoreError::CompletionDecisionRequired
+        );
+
+        let binding = delegation_workflow_design_root_binding::Entity::find()
+            .filter(
+                delegation_workflow_design_root_binding::Column::WorkflowId
+                    .eq(&published.workflow_id),
+            )
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delegation_task_run::Entity::find_by_id(&binding.task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none());
+        let platform_node = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            binding.node_id.clone(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap();
+        assert!(
+            platform_node.is_none(),
+            "platform Design root leaked into manifest node bindings"
+        );
+        let readiness_header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            readiness_header.graph_revision as u64,
+            published.graph_revision + 1,
+            "opening Design self-review authority must rotate graph CAS"
+        );
+        assert_eq!(binding.graph_revision, readiness_header.graph_revision);
+        let attention = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(&binding.task_id))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let cas = CompletionAttentionCas {
+            attention_id: attention.request_id,
+            task_id: attention.task_id,
+            kind: attention.kind,
+            captured_scope_digest: attention.captured_scope_digest.unwrap(),
+            latest_run_id: attention.latest_run_id.unwrap(),
+            node_id: attention.node_id.unwrap(),
+        };
+        let resolved = resolve_design_self_review_txn(
+            &db,
+            parent,
+            cas,
+            CompletionOutcome::Approve,
+            "authenticated-user",
+        )
+        .await
+        .unwrap();
+        let mut request = request;
+        request.expected_graph_revision = resolved.graph_revision;
+        let settled = settle_workflow_gate_v2_core(&db, &emitter, parent, request)
+            .await
+            .unwrap();
+        assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
+        let row = delegation_workflow_gate_settlement::Entity::find_by_id((
+            published.workflow_id,
+            "design".to_string(),
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (row.critical_count, row.important_count, row.minor_count),
+            (None, None, None)
+        );
+
+        let round_mismatch = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: row.workflow_id.clone(),
+                gate_id: "design".into(),
+                expected_graph_revision: settled.graph_revision,
+                expected_review_round: Some(2),
+                expected_outcome: Some(GateSettlementOutcome::Approved),
+                summary: "caller fields are not authority".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            round_mismatch,
+            WorkflowStoreError::GateCycleConflict(_)
+        ));
+
+        let outcome_mismatch = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: row.workflow_id.clone(),
+                gate_id: "design".into(),
+                expected_graph_revision: settled.graph_revision,
+                expected_review_round: Some(1),
+                expected_outcome: Some(GateSettlementOutcome::Blocked),
+                summary: "caller fields are not authority".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            outcome_mismatch,
+            WorkflowStoreError::GateNotReady(_)
+        ));
+
+        let replay = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: row.workflow_id.clone(),
+                gate_id: "design".into(),
+                expected_graph_revision: settled.graph_revision,
+                expected_review_round: Some(1),
+                expected_outcome: None,
+                summary: "caller fields are not authority".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.gate_cycle, 1);
+        assert_eq!(
+            delegation_workflow_gate_settlement::Entity::find()
+                .filter(
+                    delegation_workflow_gate_settlement::Column::WorkflowId.eq(&row.workflow_id),
+                )
+                .filter(delegation_workflow_gate_settlement::Column::GateId.eq("design"))
+                .all(&db.conn)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::write(
+            workspace.path().join("docs/superpowers/specs/x.md"),
+            b"# Changed Design\n",
+        )
+        .unwrap();
+        let header = delegation_workflow::Entity::find_by_id(&row.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let superseded = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: row.workflow_id,
+                gate_id: "design".into(),
+                expected_graph_revision: header.graph_revision as u64,
+                expected_review_round: Some(1),
+                expected_outcome: Some(GateSettlementOutcome::Approved),
+                summary: "stale decision cannot settle changed bytes".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(superseded, WorkflowStoreError::CompletionDecisionSuperseded);
+        let rotated_header = delegation_workflow::Entity::find_by_id(&header.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated_header.graph_revision, header.graph_revision + 1);
+        assert_eq!(
+            delegation_workflow_design_root_binding::Entity::find()
+                .filter(
+                    delegation_workflow_design_root_binding::Column::WorkflowId
+                        .eq(&header.workflow_id),
+                )
+                .all(&db.conn)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn external_design_gate_reduces_current_validated_reviewer_evidence() {
+        use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::workflow::completion_evidence::{
+            materialize_terminal_completion_txn, TerminalCompletionInput,
+        };
+        use crate::db::entities::delegation_completion_tool_intent;
+        use crate::db::entities::delegation_workflow::{CompletionProtocolMode, WorkflowState};
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        for (review_outcome, expected) in [
+            (CompletionOutcome::Approve, GateSettlementOutcome::Approved),
+            (
+                CompletionOutcome::RequestChanges,
+                GateSettlementOutcome::ChangesRequested,
+            ),
+            (CompletionOutcome::Block, GateSettlementOutcome::Blocked),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let design_bytes = format!("# External Design\n\n{}\n", review_outcome.as_str());
+            let design_path = workspace.path().join("docs/superpowers/specs/x.md");
+            std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+            std::fs::write(&design_path, design_bytes.as_bytes()).unwrap();
+
+            let db = fresh_in_memory_db().await;
+            let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+            let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+            let child = seed_conversation(&db, folder, AgentType::Codex).await;
+            let (emitter, _) = emitter_with_rx();
+            let mut document = design_plan_doc(&format!(
+                "task13-external-design-{}",
+                review_outcome.as_str()
+            ));
+            document.design.as_mut().unwrap().digest =
+                format!("sha256:{}", sha256_hex(design_bytes.as_bytes()));
+            let reviewer = document
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "design-reviewer-1")
+                .unwrap();
+            reviewer.agent_type = Some("codex".into());
+            reviewer.profile_id = None;
+            reviewer.work_unit_key = Some(
+                build_work_unit_key(&WorkUnitKeyParts::Design {
+                    rel_doc_path: "docs/superpowers/specs/x.md",
+                    agent_type: "codex",
+                    profile_id: None,
+                })
+                .unwrap(),
+            );
+            let published = publish_workflow_manifest_core(
+                &db,
+                &emitter,
+                parent,
+                PublishWorkflowRequest { document },
+            )
+            .await
+            .unwrap();
+            let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(header.workflow_state, WorkflowState::Estimated);
+            let mut header: delegation_workflow::ActiveModel = header.into();
+            header.completion_protocol_version = Set(2);
+            header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+            header.update(&db.conn).await.unwrap();
+            delegation_workflow_gate_state::ActiveModel {
+                workflow_id: Set(published.workflow_id.clone()),
+                gate_id: Set("design".into()),
+                gate_lineage: Set(format!("sha256:{}", "d".repeat(64))),
+                current_review_round: Set(1),
+                selected_node_ids_json: Set("[\"design-reviewer-1\"]".into()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+
+            let task_id = format!("task13-design-{}", review_outcome.as_str());
+            let node = delegation_workflow_node_binding::Entity::find_by_id((
+                published.workflow_id.clone(),
+                "design-reviewer-1".to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            let runs = RunStore::new(Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            }));
+            runs.admit_gen1_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent,
+                parent_tool_use_id: Some(format!("tool-{task_id}")),
+                child_conversation_id: child,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                route_fingerprint: Some(format!("route-{task_id}")),
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: None,
+                config_values_json: Some("{}".into()),
+                task_preview: Some("Review external Design".into()),
+                request_fingerprint: Some(format!("fingerprint-{task_id}")),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: Some(node.work_unit_key),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+            let run = delegation_task_run::Entity::find_by_id(&task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut run: delegation_task_run::ActiveModel = run.into();
+            run.status = Set(DelegationRunStatus::Completed);
+            run.finished_at = Set(Some(Utc::now()));
+            run.card_summary_json = Set(Some("{malformed legacy card".into()));
+            run.update(&db.conn).await.unwrap();
+            delegation_completion_tool_intent::ActiveModel {
+                intent_id: Set(format!("intent-{task_id}")),
+                task_id: Set(task_id.clone()),
+                child_tool_call_id: Set(format!("call-{task_id}")),
+                accepted_ordinal: Set(1),
+                outcome: Set(review_outcome.as_str().into()),
+                summary: Set(Some("typed reviewer outcome".into())),
+                report_hint: Set(None),
+                request_digest: Set(format!("digest-{task_id}")),
+                created_at: Set(Utc::now()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            let completion = materialize_terminal_completion_txn(
+                &db.conn,
+                TerminalCompletionInput {
+                    task_id: task_id.clone(),
+                    terminal_status: DelegationRunStatus::Completed,
+                    final_assistant_text: "typed completion intent wins".into(),
+                    pre_read_reports: Vec::new(),
+                    pre_read_artifact: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(completion.state, CompletionState::Resolved);
+
+            let current = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let settled = settle_workflow_gate_v2_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowV2Request {
+                    workflow_id: published.workflow_id.clone(),
+                    gate_id: "design".into(),
+                    expected_graph_revision: current.graph_revision as u64,
+                    expected_review_round: Some(1),
+                    expected_outcome: None,
+                    summary: "platform-reduced external Design".into(),
+                    recovery_authorization_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(settled.outcome, expected);
+            let row = delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id,
+                "design".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (row.critical_count, row.important_count, row.minor_count),
+                (None, None, None)
+            );
+        }
     }
 
     #[tokio::test]

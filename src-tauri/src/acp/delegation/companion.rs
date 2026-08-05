@@ -1163,6 +1163,24 @@ fn parse_settle_workflow_args(
     arguments: &Value,
     token: &str,
 ) -> Result<BrokerSettleWorkflowRequest, String> {
+    reject_unknown_arguments(
+        arguments,
+        "settle_workflow_gate",
+        &[
+            "workflow_id",
+            "gate_id",
+            "expected_graph_revision",
+            "expected_review_round",
+            "expected_gate_cycle",
+            "expected_outcome",
+            "recovery_authorization_id",
+            "summary",
+            "manifest_revision",
+            "gate_cycle",
+            "outcome",
+            "evidence",
+        ],
+    )?;
     let workflow_id = arguments
         .get("workflow_id")
         .and_then(Value::as_str)
@@ -1175,57 +1193,83 @@ fn parse_settle_workflow_args(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "settle_workflow_gate requires non-empty gate_id".to_string())?
         .to_string();
-    let outcome = arguments
-        .get("outcome")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "settle_workflow_gate requires outcome \
-             (approved|changes_requested|blocked)"
-                .to_string()
-        })?
-        .to_string();
     let summary = arguments
         .get("summary")
         .and_then(Value::as_str)
         .ok_or_else(|| "settle_workflow_gate requires summary string".to_string())?
         .to_string();
-    let manifest_revision = parse_u64_arg(arguments, "manifest_revision")?;
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
-    let gate_cycle = parse_u64_arg(arguments, "gate_cycle")?;
-    let evidence_value = arguments
+    let manifest_revision = parse_optional_u64_arg(arguments, "manifest_revision")?;
+    let gate_cycle = parse_optional_u64_arg(arguments, "gate_cycle")?;
+    let expected_review_round = parse_optional_u64_arg(arguments, "expected_review_round")?;
+    let expected_gate_cycle = parse_optional_u64_arg(arguments, "expected_gate_cycle")?;
+    let parse_outcome = |key: &str| -> Result<Option<String>, String> {
+        let Some(value) = arguments.get(key) else {
+            return Ok(None);
+        };
+        let value = value.as_str().ok_or_else(|| {
+            format!("settle_workflow_gate {key} must be approved, changes_requested, or blocked")
+        })?;
+        if !matches!(value, "approved" | "changes_requested" | "blocked") {
+            return Err(format!(
+                "settle_workflow_gate {key} must be approved, changes_requested, or blocked"
+            ));
+        }
+        Ok(Some(value.to_string()))
+    };
+    let outcome = parse_outcome("outcome")?;
+    let expected_outcome = parse_outcome("expected_outcome")?;
+    let evidence = arguments
         .get("evidence")
         .cloned()
-        .ok_or_else(|| "settle_workflow_gate requires structured evidence".to_string())?;
-    let evidence: crate::acp::delegation::workflow::SettleGateEvidence =
-        serde_json::from_value(evidence_value)
-            .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
-    if let crate::acp::delegation::workflow::SettleGateEvidence::Design {
-        critical_count,
-        important_count,
-        minor_count,
-    } = &evidence
-    {
-        for (key, value) in [
-            ("critical_count", critical_count),
-            ("important_count", important_count),
-            ("minor_count", minor_count),
-        ] {
-            if *value < 0 {
-                return Err(format!(
-                    "settle_workflow_gate {key} must be a non-negative integer"
-                ));
+        .map(|evidence_value| {
+            let evidence: crate::acp::delegation::workflow::SettleGateEvidence =
+                serde_json::from_value(evidence_value)
+                    .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
+            if let crate::acp::delegation::workflow::SettleGateEvidence::Design {
+                critical_count,
+                important_count,
+                minor_count,
+            } = &evidence
+            {
+                for (key, value) in [
+                    ("critical_count", critical_count),
+                    ("important_count", important_count),
+                    ("minor_count", minor_count),
+                ] {
+                    if *value < 0 {
+                        return Err(format!(
+                            "settle_workflow_gate {key} must be a non-negative integer"
+                        ));
+                    }
+                }
             }
-        }
-    }
-    let evidence = serde_json::to_value(evidence)
-        .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
+            serde_json::to_value(evidence)
+                .map_err(|e| format!("settle_workflow_gate evidence: {e}"))
+        })
+        .transpose()?;
+    let recovery_authorization_id = arguments
+        .get("recovery_authorization_id")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    "settle_workflow_gate recovery_authorization_id must be non-empty".to_string()
+                })
+        })
+        .transpose()?;
     Ok(BrokerSettleWorkflowRequest {
         token: token.to_string(),
         workflow_id,
-        manifest_revision,
         gate_id,
         expected_graph_revision,
+        expected_review_round,
+        expected_gate_cycle,
+        expected_outcome,
+        recovery_authorization_id,
+        manifest_revision,
         gate_cycle,
         outcome,
         evidence,
@@ -1242,6 +1286,23 @@ fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
             .parse::<u64>()
             .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
         _ => Err(format!("settle_workflow_gate requires {key}")),
+    }
+}
+
+fn parse_optional_u64_arg(arguments: &Value, key: &str) -> Result<Option<u64>, String> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer")),
+        Some(Value::String(value)) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
+        Some(_) => Err(format!(
+            "settle_workflow_gate {key} must be a non-negative integer"
+        )),
     }
 }
 
@@ -5104,45 +5165,53 @@ mod tests {
     }
 
     #[test]
-    fn workflow_manifest_v2_plan_settlement_preserves_structured_evidence() {
-        let evidence = json!({
-            "kind": "plan",
-            "scope": "full",
-            "revision_kind": "initial",
-            "scope_reason": "initial independent review",
-            "covered_author_task_id": "author-task-1",
-            "covered_plan_digest": "sha256:plan",
-            "required_reviewer_node_ids": ["plan-reviewer-codex", "plan-reviewer-grok"],
-            "finding_updates": [{
-                "finding_id": "finding-1",
-                "severity": "important",
-                "status": "open",
-                "owner_reviewer_node_ids": ["plan-reviewer-codex"],
-                "summary": "missing failure mode",
-                "evidence_ref": "plan.md:42",
-                "report_file": "reports/plan-review-codex.md"
-            }],
-            "lineage_reset_reason": null
-        });
+    fn workflow_manifest_v2_plan_settlement_uses_reduced_request() {
         let req = parse_settle_workflow_args(
             &json!({
                 "workflow_id": "wf-1",
-                "manifest_revision": 1,
                 "gate_id": "plan",
                 "expected_graph_revision": 1,
-                "gate_cycle": 1,
-                "outcome": "changes_requested",
-                "evidence": evidence,
+                "expected_review_round": 1,
+                "expected_outcome": "changes_requested",
                 "summary": "one important finding"
             }),
             "token",
         )
-        .expect("structured Plan evidence parses");
+        .expect("reduced v2 settlement request parses");
         let wire = serde_json::to_value(req).expect("serialize settle broker request");
-        assert_eq!(wire["evidence"], evidence);
-        assert!(wire.get("critical_count").is_none());
-        assert!(wire.get("important_count").is_none());
-        assert!(wire.get("minor_count").is_none());
+        for forbidden in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
+            assert!(wire.get(forbidden).is_none(), "wire leaked {forbidden}");
+        }
+        assert_eq!(wire["expected_review_round"], 1);
+        assert_eq!(wire["expected_outcome"], "changes_requested");
+    }
+
+    #[test]
+    fn workflow_manifest_v2_settlement_rejects_unknown_arguments() {
+        for field in [
+            "critical_count",
+            "reviewer_task_ids",
+            "covered_digest",
+            "required_node_set",
+            "findings",
+            "gate_lineage",
+            "scope",
+        ] {
+            let mut arguments = json!({
+                "workflow_id": "wf-1",
+                "gate_id": "design",
+                "expected_graph_revision": 1,
+                "summary": "platform evidence decides"
+            });
+            arguments[field] = json!("caller-owned");
+
+            let error = parse_settle_workflow_args(&arguments, "token")
+                .expect_err("unknown settlement argument must be rejected");
+            assert_eq!(
+                error,
+                format!("settle_workflow_gate does not accept `{field}`")
+            );
+        }
     }
 
     #[test]
@@ -5186,26 +5255,32 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "settle_workflow_gate")
             .expect("settle tool");
-        let guidance = tool_guidance(settle);
-        for phrase in [
-            "full",
-            "scoped",
-            "revision_kind",
-            "covered_author_task_id",
-            "required_reviewer_node_ids",
-            "finding_updates",
-            "report_file",
+        assert_eq!(settle["inputSchema"]["additionalProperties"], false);
+        let required = settle["inputSchema"]["required"]
+            .as_array()
+            .expect("settle required");
+        for field in [
+            "workflow_id",
+            "gate_id",
+            "expected_graph_revision",
+            "summary",
         ] {
+            assert!(required.iter().any(|value| value == field));
+        }
+        for forbidden in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
             assert!(
-                guidance.contains(phrase),
-                "settle guidance lost required phrase: {phrase}"
+                settle["inputSchema"]["properties"].get(forbidden).is_none(),
+                "v2 schema exposes legacy field {forbidden}"
             );
         }
-        assert!(settle["inputSchema"]["required"]
-            .as_array()
-            .expect("settle required")
-            .iter()
-            .any(|value| value == "evidence"));
+        for optional in [
+            "expected_review_round",
+            "expected_gate_cycle",
+            "expected_outcome",
+            "recovery_authorization_id",
+        ] {
+            assert!(settle["inputSchema"]["properties"].get(optional).is_some());
+        }
     }
 
     #[test]

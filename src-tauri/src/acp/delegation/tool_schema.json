@@ -339,35 +339,27 @@
   },
   {
     "name": "settle_workflow_gate",
-    "description": "Root-only Design/Plan gate settle.",
+    "description": "Root-only Design/Plan gate settle. Outcome and evidence are reduced from current validated platform records; optional expected values are CAS checks only.",
     "inputSchema": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "workflow_id",
-        "manifest_revision",
         "gate_id",
         "expected_graph_revision",
-        "gate_cycle",
-        "outcome",
-        "evidence",
         "summary"
       ],
       "properties": {
         "workflow_id": { "type": "string" },
-        "manifest_revision": { "type": "integer", "minimum": 0 },
         "gate_id": { "type": "string" },
         "expected_graph_revision": { "type": "integer", "minimum": 0 },
-        "gate_cycle": { "type": "integer", "minimum": 1 },
-        "outcome": {
+        "expected_review_round": { "type": "integer", "minimum": 1 },
+        "expected_gate_cycle": { "type": "integer", "minimum": 1 },
+        "expected_outcome": {
           "type": "string",
           "enum": ["approved", "changes_requested", "blocked"]
         },
-        "evidence": {
-          "type": "object",
-          "description": "kind=design: critical_count, important_count, minor_count. kind=plan: scope full/scoped; revision_kind; scope_reason; covered_author_task_id; covered_plan_digest; required_reviewer_node_ids; finding_updates fields finding_id, severity, status, owner_reviewer_node_ids, summary, evidence_ref, report_file; optional lineage_reset_reason.",
-          "required": ["kind"],
-          "properties": { "kind": { "enum": ["design", "plan"] } }
-        },
+        "recovery_authorization_id": { "type": "string" },
         "summary": { "type": "string" }
       }
     }

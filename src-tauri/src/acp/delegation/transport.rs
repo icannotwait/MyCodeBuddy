@@ -279,14 +279,26 @@ pub struct BrokerPublishWorkflowRequest {
 pub struct BrokerSettleWorkflowRequest {
     pub token: String,
     pub workflow_id: String,
-    pub manifest_revision: u64,
     pub gate_id: String,
     pub expected_graph_revision: u64,
-    pub gate_cycle: u64,
-    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_review_round: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_gate_cycle: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_authorization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_cycle: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     /// Tagged `design` or `plan` evidence. Listener deserializes this into the
     /// canonical store evidence type so nested validation stays in Rust.
-    pub evidence: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
     pub summary: String,
 }
 

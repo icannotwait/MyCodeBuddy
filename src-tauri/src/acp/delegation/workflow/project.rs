@@ -1439,8 +1439,8 @@ fn apply_execution_gate_overlays(
             evidence_by_node.get(&id).cloned()
         });
 
-        // Final first-pass with Task implementers but no tip digests yet → pending.
-        if fix_ev.is_none() && matches!(branch_tip, DerivedBranchTip::Pending) {
+        // Final cannot settle while current Task tip evidence is unavailable.
+        if matches!(branch_tip, DerivedBranchTip::Pending) {
             summary.final_gate_passed = Some(false);
             if matches!(
                 nodes[ri].status,
@@ -1456,7 +1456,7 @@ fn apply_execution_gate_overlays(
                 DerivedBranchTip::Digest(d) => Some(d.clone()),
                 // No tasks: tip match not required (still need non-empty reviewer digest).
                 DerivedBranchTip::NoTasks => None,
-                // Pending handled above for first-pass; with fixer, tip unused.
+                // Pending is handled above before either Final path evaluates.
                 DerivedBranchTip::Pending => None,
             };
             // Never pass None when implementer digests exist (Digest branch).
@@ -1521,15 +1521,40 @@ fn reviewer_returned_for_current_producer(
     let (Some(producer), Some(reviewer)) = (producer, reviewer) else {
         return false;
     };
+    let v2 = producer.completion_protocol_version == 2 && reviewer.completion_protocol_version == 2;
+    let producer_ready = if v2 {
+        producer.completion_state == Some(CompletionState::Resolved)
+            && producer.completion_evidence_validated
+            && matches!(
+                producer.completion_outcome,
+                Some(CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns)
+            )
+    } else {
+        producer.summary_validated
+            && matches!(
+                producer.work_status,
+                Some(WorkStatus::Done) | Some(WorkStatus::DoneWithConcerns)
+            )
+    };
+    let reviewer_ready = if v2 {
+        reviewer.completion_state == Some(CompletionState::Resolved)
+            && reviewer.completion_evidence_validated
+            && matches!(
+                reviewer.completion_outcome,
+                Some(
+                    CompletionOutcome::Approve
+                        | CompletionOutcome::ApproveWithMinors
+                        | CompletionOutcome::RequestChanges
+                        | CompletionOutcome::Block
+                )
+            )
+    } else {
+        reviewer.summary_validated && reviewer.review_verdict.is_some()
+    };
     if !matches!(producer.status, TerminalRunStatus::Completed)
-        || !producer.summary_validated
-        || !matches!(
-            producer.work_status,
-            Some(WorkStatus::Done) | Some(WorkStatus::DoneWithConcerns)
-        )
+        || !producer_ready
         || !matches!(reviewer.status, TerminalRunStatus::Completed)
-        || !reviewer.summary_validated
-        || reviewer.review_verdict.is_none()
+        || !reviewer_ready
         || reviewer.reviewed_task_id.as_deref() != Some(producer.task_id.as_str())
     {
         return false;
@@ -4190,6 +4215,69 @@ mod tests {
             .unwrap();
         assert_ne!(final_n.status, ProjectedNodeStatus::Completed);
         assert_eq!(final_n.status_reason.as_deref(), Some("branch_tip_pending"));
+    }
+
+    #[test]
+    fn completion_outcome_gates_final_fixer_stays_pending_without_task_tip() {
+        let task_node = tip_impl_node("task-1-impl", 1, "task-impl");
+        let mut reviewer_node = tip_impl_node("final-reviewer", 0, "final-review");
+        reviewer_node.phase_id = Some("final".into());
+        reviewer_node.role = Some("reviewer".into());
+        reviewer_node.task_index = None;
+        let mut fixer_node = tip_impl_node("final-fixer", 0, "final-fix");
+        fixer_node.phase_id = Some("final".into());
+        fixer_node.role = Some("fixer".into());
+        fixer_node.task_index = None;
+
+        let mut task_evidence = tip_impl_ev("task-impl", 1, "unused");
+        task_evidence.artifact_digest = None;
+
+        let mut fixer_evidence = tip_impl_ev("final-fix", 1, "final-tip");
+        fixer_evidence.completion_protocol_version = 2;
+        fixer_evidence.completion_state = Some(CompletionState::Resolved);
+        fixer_evidence.completion_outcome = Some(CompletionOutcome::Done);
+        fixer_evidence.completion_evidence_validated = true;
+        fixer_evidence.summary_validated = false;
+
+        let mut reviewer_evidence = tip_impl_ev("final-review", 1, "final-tip");
+        reviewer_evidence.completion_protocol_version = 2;
+        reviewer_evidence.completion_state = Some(CompletionState::Resolved);
+        reviewer_evidence.completion_outcome = Some(CompletionOutcome::Approve);
+        reviewer_evidence.completion_evidence_validated = true;
+        reviewer_evidence.summary_validated = false;
+        reviewer_evidence.work_status = None;
+        reviewer_evidence.reviewed_task_id = Some("final-fix".into());
+        reviewer_evidence.reviewed_implementer_generation = Some(1);
+
+        let mut nodes = vec![task_node, reviewer_node, fixer_node];
+        let evidence_by_node = HashMap::from([
+            ("task-1-impl".into(), task_evidence),
+            ("final-reviewer".into(), reviewer_evidence),
+            ("final-fixer".into(), fixer_evidence),
+        ]);
+        let gate_eligible = HashSet::from([
+            "task-1-impl".into(),
+            "final-reviewer".into(),
+            "final-fixer".into(),
+        ]);
+
+        let summary = apply_execution_gate_overlays(
+            &mut nodes,
+            &evidence_by_node,
+            &gate_eligible,
+            &[],
+            &mut PublicIdAllocator::default(),
+        );
+        let reviewer = nodes
+            .iter()
+            .find(|node| node.node_id == "final-reviewer")
+            .unwrap();
+        assert_eq!(summary.final_gate_passed, Some(false));
+        assert_eq!(reviewer.status, ProjectedNodeStatus::WaitingReview);
+        assert_eq!(
+            reviewer.status_reason.as_deref(),
+            Some("branch_tip_pending")
+        );
     }
 
     fn tip_impl_node(node_id: &str, task_index: u32, task_id: &str) -> WorkflowNodeSnapshot {

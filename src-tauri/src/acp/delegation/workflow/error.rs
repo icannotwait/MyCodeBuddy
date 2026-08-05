@@ -124,8 +124,14 @@ pub enum WorkflowStoreError {
     #[error("gate not ready: {0}")]
     GateNotReady(String),
 
+    #[error("protocol-v2 settlement rejects caller-supplied legacy evidence fields")]
+    V2CallerEvidenceRejected,
+
     #[error("completion outcome requires a direct decision before gate reduction")]
     CompletionDecisionRequired,
+
+    #[error("completion decision was superseded before gate reduction")]
+    CompletionDecisionSuperseded,
 
     #[error("completion artifact is unavailable before gate reduction")]
     CompletionArtifactUnavailable,

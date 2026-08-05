@@ -109,6 +109,8 @@ pub struct WorkflowRecoveryPlanGateEvidence {
     pub review_round: Option<i64>,
     #[serde(skip_serializing_if = "is_false")]
     pub v2_evidence_consistent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_reviewer_ranks_v2: Option<Vec<WorkflowRecoveryPlanReviewerRankV2>>,
     pub critical_count: i64,
     pub important_count: i64,
     pub minor_count: i64,
@@ -119,6 +121,12 @@ pub struct WorkflowRecoveryPlanGateEvidence {
     pub reviewer_evidence_count: usize,
     pub evidence_consistent: bool,
     pub lineage_reset_consumed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRecoveryPlanReviewerRankV2 {
+    pub node_id: String,
+    pub rank: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -633,11 +641,15 @@ fn exact_current_plan_approval_v2(source: &WorkflowRecoverySnapshot) -> bool {
     let (Some(plan), Some(author), Some(gate)) = (
         source.plan.as_ref(),
         source.active_plan_author.as_ref(),
-        source.current_plan_gate.as_ref(),
+        source.latest_plan_gate.as_ref(),
     ) else {
         return false;
     };
-    let Some(author_task_id) = author.latest_task_id.as_deref() else {
+    let (Some(author_task_id), Some(ranks), Some(current_gate)) = (
+        author.latest_task_id.as_deref(),
+        gate.plan_reviewer_ranks_v2.as_ref(),
+        source.current_plan_gate.as_ref(),
+    ) else {
         return false;
     };
     if gate.outcome != GateSettlementOutcome::Approved
@@ -645,9 +657,13 @@ fn exact_current_plan_approval_v2(source: &WorkflowRecoverySnapshot) -> bool {
         || gate.evidence_scope_digest.is_none()
         || gate.gate_lineage.is_none()
         || gate.review_round.is_none()
-        || !v2_current_plan_identity(author, plan, false)
         || source.current_plan_gate_id.as_deref() != Some(gate.gate_id.as_str())
-        || gate.reviewer_evidence_count != source.required_plan_reviewers.len()
+        || current_gate.gate_id != gate.gate_id
+        || current_gate.gate_cycle != gate.gate_cycle
+        || gate.covered_author_task_id.as_deref() != Some(author_task_id)
+        || gate.covered_plan_digest.as_deref() != Some(plan.digest.as_str())
+        || author.artifact_digest.as_deref() != Some(plan.digest.as_str())
+        || author.has_open_completion_attention
     {
         return false;
     }
@@ -656,44 +672,18 @@ fn exact_current_plan_approval_v2(source: &WorkflowRecoverySnapshot) -> bool {
         .iter()
         .map(|reviewer| reviewer.node_id.as_str())
         .collect::<Vec<_>>();
-    let mut settled = gate
-        .required_reviewer_node_ids
+    let mut settled = ranks
         .iter()
-        .map(String::as_str)
+        .map(|reviewer| reviewer.node_id.as_str())
         .collect::<Vec<_>>();
     required.sort_unstable();
     settled.sort_unstable();
     required == settled
-        && source.required_plan_reviewers.iter().all(|reviewer| {
-            v2_current_plan_identity(reviewer, plan, true)
-                && reviewer.reviewed_task_id.as_deref() == Some(author_task_id)
-        })
-}
-
-fn v2_current_plan_identity(
-    identity: &WorkflowRecoveryPlanIdentity,
-    plan: &WorkflowRecoveryDocumentIdentity,
-    reviewer: bool,
-) -> bool {
-    identity.active
-        && identity.observed
-        && identity.latest_status == Some(DelegationRunStatus::Completed)
-        && identity.completion_state == Some(CompletionState::Resolved)
-        && identity.completion_evidence_validated
-        && identity.evidence_scope_digest.is_some()
-        && !identity.has_open_completion_attention
-        && identity.artifact_digest.as_deref() == Some(plan.digest.as_str())
-        && if reviewer {
-            matches!(
-                identity.completion_outcome,
-                Some(CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors)
-            )
-        } else {
-            matches!(
-                identity.completion_outcome,
-                Some(CompletionOutcome::Done | CompletionOutcome::DoneWithConcerns)
-            )
-        }
+        && ranks.iter().all(|reviewer| reviewer.rank == 0)
+        && source
+            .required_plan_reviewers
+            .iter()
+            .all(|reviewer| !reviewer.has_open_completion_attention)
 }
 
 fn current_plan_identity(
@@ -879,6 +869,7 @@ mod workflow_recovery_policy {
                 gate_lineage: None,
                 review_round: None,
                 v2_evidence_consistent: false,
+                plan_reviewer_ranks_v2: None,
                 critical_count: 0,
                 important_count: 0,
                 minor_count: 0,
@@ -972,6 +963,10 @@ mod workflow_recovery_policy {
             gate.gate_lineage = Some("sha256:gate-lineage".into());
             gate.review_round = Some(4);
             gate.v2_evidence_consistent = true;
+            gate.plan_reviewer_ranks_v2 = Some(vec![WorkflowRecoveryPlanReviewerRankV2 {
+                node_id: "plan-reviewer-a".into(),
+                rank: 0,
+            }]);
         }
 
         let before = decide_workflow_recovery(&snapshot);

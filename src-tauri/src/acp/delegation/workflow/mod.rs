@@ -50,7 +50,10 @@ pub use completion_intent::{
     CompletionOutcome, CompletionReportCandidate, CompletionReportReadFailure,
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
-pub use completion_projection::{project_terminal_completion, CompletionProjectionV2};
+pub use completion_projection::{
+    project_terminal_completion, validated_design_self_review_outcome, CompletionProjectionV2,
+    DesignSelfReviewDecisionError,
+};
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
     WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
@@ -64,8 +67,9 @@ pub use events::{
     WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
 };
 pub use gates::{
-    evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
-    ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
+    evaluate_execution_gate, reduce_design_gate, ExecutionGateEval, ExecutionGateInput,
+    ExecutionGateKind, ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence,
+    TerminalRunStatus,
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
 pub use plan_material::{
@@ -106,12 +110,12 @@ pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
     guard_final_delivery_core, load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
-    recover_workflow_core, settle_workflow_gate_core, FinalDeliveryGuardRequest,
-    FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
-    RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence, SettleResult,
-    SettleWorkflowRequest, StateOnlyRevisionRequest, StateOnlyRevisionResult,
-    WorkflowBlockEntryRequest, WorkflowPublicationDisposition, WorkflowRecoveryRequiredProjection,
-    WORKFLOW_CAPABILITY_VERSION,
+    recover_workflow_core, settle_workflow_gate_core, settle_workflow_gate_v2_core,
+    FinalDeliveryGuardRequest, FinalDeliveryGuardResult, FinalReviewReopened, PublishResult,
+    PublishWorkflowRequest, RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence,
+    SettleResult, SettleWorkflowRequest, SettleWorkflowV2Request, StateOnlyRevisionRequest,
+    StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
+    WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;
 pub use validate::validate_manifest_document;

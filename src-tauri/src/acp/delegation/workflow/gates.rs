@@ -4,8 +4,40 @@
 //! `settle_workflow_gate_core`; execution gates are projected only.
 
 use crate::acp::delegation::card_summary::{ReviewVerdict, WorkStatus};
-use crate::acp::delegation::workflow::CompletionOutcome;
+use crate::acp::delegation::workflow::{CompletionOutcome, ValidatedCompletionEvidence};
 use crate::db::entities::delegation_task_run::CompletionState;
+use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
+
+/// Reduce a complete, role-valid Design Reviewer evidence set.
+///
+/// Readiness and role validation are intentionally owned by the store loader;
+/// an empty self-review gate never reaches this reducer.
+pub fn reduce_design_gate(evidence: &[ValidatedCompletionEvidence]) -> GateSettlementOutcome {
+    debug_assert!(!evidence.is_empty());
+    debug_assert!(evidence.iter().all(|validated| {
+        validated.evidence_validated
+            && matches!(
+                validated.evidence.intent.outcome,
+                CompletionOutcome::Approve
+                    | CompletionOutcome::ApproveWithMinors
+                    | CompletionOutcome::RequestChanges
+                    | CompletionOutcome::Block
+            )
+    }));
+    if evidence
+        .iter()
+        .any(|validated| validated.evidence.intent.outcome == CompletionOutcome::RequestChanges)
+    {
+        GateSettlementOutcome::ChangesRequested
+    } else if evidence
+        .iter()
+        .any(|validated| validated.evidence.intent.outcome == CompletionOutcome::Block)
+    {
+        GateSettlementOutcome::Blocked
+    } else {
+        GateSettlementOutcome::Approved
+    }
+}
 
 /// Which execution gate is being evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +130,8 @@ pub struct ExecutionGateEval {
 ///   `approve` / `approve_with_minors`, **and** B13 exact `reviewed_task_id`
 ///   match against the latest implementer/fixer (when one exists), **and**
 ///   non-empty B3 digest match against the producer/fixer artifact.
-/// - `reviewed_implementer_generation` is informational only.
+/// - v2 reviewer evidence must cover the exact producer generation; v1 keeps
+///   `reviewed_implementer_generation` informational for compatibility.
 /// - Final first-pass (no fixer terminal): reviewer terminal completed with
 ///   validated approve summary and non-empty task_id.
 pub fn evaluate_execution_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
@@ -164,6 +197,18 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
         }
         if let Err(reason) = reviewer_covers_implementer(rev, fixer) {
             return fail_for_reviewer(reason, &required.node_id);
+        }
+        if fixer.completion_protocol_version == 2 {
+            if let Some(tip) = input
+                .branch_tip_digest
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if non_empty_digest(fixer.artifact_digest.as_deref()) != Some(tip) {
+                    return fail(ExecutionGateReason::ArtifactDigestMismatch);
+                }
+            }
         }
         return pass();
     }
@@ -263,10 +308,16 @@ fn reviewer_covers_implementer(
     rev: &ExecutionGateRunEvidence,
     impl_ev: &ExecutionGateRunEvidence,
 ) -> Result<(), ExecutionGateReason> {
-    // B13: generation is informational; task_id is authoritative.
+    // B13: task identity is authoritative for every protocol. v2 binds the
+    // reviewer to the exact producer generation as well.
     match rev.reviewed_task_id.as_deref() {
         Some(id) if id == impl_ev.task_id => {}
         _ => return Err(ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer),
+    }
+    if rev.completion_protocol_version == 2
+        && rev.reviewed_implementer_generation != Some(impl_ev.generation)
+    {
+        return Err(ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer);
     }
 
     let impl_digest = non_empty_digest(impl_ev.artifact_digest.as_deref());
@@ -287,7 +338,6 @@ fn reviewer_covers_implementer(
         _ => {}
     }
 
-    let _ = rev.reviewed_implementer_generation; // informational only
     Ok(())
 }
 
@@ -1068,5 +1118,242 @@ mod tests {
         let eval = evaluate_execution_gate(&final_input(Some(fixer), Some(rev), None));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ImplementerNotTerminalPass);
+    }
+}
+
+#[cfg(test)]
+mod completion_outcome_gates {
+    use super::*;
+    use crate::acp::delegation::workflow::completion_intent::{
+        CompletionIntent, CompletionIntentSource, CompletionRole,
+    };
+    use crate::acp::delegation::workflow::types::{
+        CompletionArtifactV2, CompletionEvidenceBindingV2, CompletionEvidenceV2,
+        ValidatedCompletionEvidence,
+    };
+    use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
+
+    fn validated(outcome: CompletionOutcome) -> ValidatedCompletionEvidence {
+        ValidatedCompletionEvidence {
+            evidence: CompletionEvidenceV2 {
+                version: 2,
+                intent: CompletionIntent {
+                    outcome,
+                    summary: None,
+                    report_file: None,
+                    source: CompletionIntentSource::CompleteWork,
+                },
+                binding: CompletionEvidenceBindingV2 {
+                    workflow_id: "workflow".into(),
+                    task_id: format!("task-{}", outcome.as_str()),
+                    node_id: format!("node-{}", outcome.as_str()),
+                    role: CompletionRole::Reviewer,
+                    phase_id: "design".into(),
+                    task_index: None,
+                    gate_id: Some("design".into()),
+                    gate_lineage: Some(format!("sha256:{}", "a".repeat(64))),
+                    review_round: Some(1),
+                    reviewed_task_id: None,
+                    reviewed_generation: None,
+                    manifest_revision_observed: 1,
+                },
+                artifact: CompletionArtifactV2::DocumentSha256 {
+                    rel_path: "docs/design.md".into(),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                },
+                review_scope_digest: format!("sha256:{}", "c".repeat(64)),
+                evidence_scope_digest: format!("sha256:{}", "d".repeat(64)),
+                captured_at: "2026-08-06T00:00:00Z".into(),
+            },
+            evidence_validated: true,
+        }
+    }
+
+    #[test]
+    fn design_gate_reduces_complete_reviewer_outcomes_with_fixed_precedence() {
+        for (outcomes, expected) in [
+            (
+                vec![
+                    CompletionOutcome::Approve,
+                    CompletionOutcome::ApproveWithMinors,
+                ],
+                GateSettlementOutcome::Approved,
+            ),
+            (
+                vec![
+                    CompletionOutcome::Approve,
+                    CompletionOutcome::RequestChanges,
+                ],
+                GateSettlementOutcome::ChangesRequested,
+            ),
+            (
+                vec![CompletionOutcome::Approve, CompletionOutcome::Block],
+                GateSettlementOutcome::Blocked,
+            ),
+            (
+                vec![CompletionOutcome::RequestChanges, CompletionOutcome::Block],
+                GateSettlementOutcome::ChangesRequested,
+            ),
+        ] {
+            let evidence = outcomes.into_iter().map(validated).collect::<Vec<_>>();
+            assert_eq!(reduce_design_gate(&evidence), expected);
+        }
+    }
+
+    fn execution_pair(
+        kind: ExecutionGateKind,
+        producer_outcome: CompletionOutcome,
+        reviewer_outcome: CompletionOutcome,
+    ) -> ExecutionGateEval {
+        let producer = ExecutionGateRunEvidence {
+            task_id: "producer".into(),
+            generation: 1,
+            status: TerminalRunStatus::Completed,
+            completion_protocol_version: 2,
+            completion_state: Some(CompletionState::Resolved),
+            completion_outcome: Some(producer_outcome),
+            completion_evidence_validated: true,
+            summary_validated: false,
+            work_status: None,
+            review_verdict: None,
+            artifact_digest: Some("sha256:artifact".into()),
+            reviewed_task_id: None,
+            reviewed_implementer_generation: None,
+        };
+        let reviewer = ExecutionGateRunEvidence {
+            task_id: "reviewer".into(),
+            generation: 1,
+            status: TerminalRunStatus::Completed,
+            completion_protocol_version: 2,
+            completion_state: Some(CompletionState::Resolved),
+            completion_outcome: Some(reviewer_outcome),
+            completion_evidence_validated: true,
+            summary_validated: false,
+            work_status: None,
+            review_verdict: None,
+            artifact_digest: Some("sha256:artifact".into()),
+            reviewed_task_id: Some("producer".into()),
+            reviewed_implementer_generation: Some(1),
+        };
+        evaluate_execution_gate(&ExecutionGateInput {
+            kind,
+            implementer_or_fixer: Some(producer),
+            required_reviewers: vec![RequiredReviewerEvidence {
+                node_id: "reviewer".into(),
+                evidence: Some(reviewer),
+            }],
+            branch_tip_digest: None,
+        })
+    }
+
+    fn v2_execution_input(kind: ExecutionGateKind, tip: Option<&str>) -> ExecutionGateInput {
+        let reviewer_node_id = match kind {
+            ExecutionGateKind::Task => "task-reviewer",
+            ExecutionGateKind::Final => "final-reviewer",
+        };
+        let mut producer = ExecutionGateRunEvidence {
+            task_id: "producer".into(),
+            generation: 2,
+            status: TerminalRunStatus::Completed,
+            completion_protocol_version: 2,
+            completion_state: Some(CompletionState::Resolved),
+            completion_outcome: Some(CompletionOutcome::Done),
+            completion_evidence_validated: true,
+            summary_validated: false,
+            work_status: None,
+            review_verdict: None,
+            artifact_digest: Some("sha256:current-tip".into()),
+            reviewed_task_id: None,
+            reviewed_implementer_generation: None,
+        };
+        if kind == ExecutionGateKind::Final {
+            producer.completion_outcome = Some(CompletionOutcome::DoneWithConcerns);
+        }
+        let reviewer = ExecutionGateRunEvidence {
+            task_id: "reviewer".into(),
+            generation: 1,
+            status: TerminalRunStatus::Completed,
+            completion_protocol_version: 2,
+            completion_state: Some(CompletionState::Resolved),
+            completion_outcome: Some(CompletionOutcome::Approve),
+            completion_evidence_validated: true,
+            summary_validated: false,
+            work_status: None,
+            review_verdict: None,
+            artifact_digest: Some("sha256:current-tip".into()),
+            reviewed_task_id: Some("producer".into()),
+            reviewed_implementer_generation: Some(2),
+        };
+        ExecutionGateInput {
+            kind,
+            implementer_or_fixer: Some(producer),
+            required_reviewers: vec![RequiredReviewerEvidence {
+                node_id: reviewer_node_id.into(),
+                evidence: Some(reviewer),
+            }],
+            branch_tip_digest: tip.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn task_and_final_pass_use_role_legal_outcomes_only() {
+        for kind in [ExecutionGateKind::Task, ExecutionGateKind::Final] {
+            assert!(
+                execution_pair(kind, CompletionOutcome::Done, CompletionOutcome::Approve).passed
+            );
+            assert!(
+                execution_pair(
+                    kind,
+                    CompletionOutcome::DoneWithConcerns,
+                    CompletionOutcome::ApproveWithMinors,
+                )
+                .passed
+            );
+            assert!(
+                !execution_pair(kind, CompletionOutcome::Blocked, CompletionOutcome::Approve,)
+                    .passed
+            );
+            let nonpass = execution_pair(
+                kind,
+                CompletionOutcome::Done,
+                CompletionOutcome::RequestChanges,
+            );
+            assert!(!nonpass.passed);
+            assert_eq!(nonpass.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+        }
+    }
+
+    #[test]
+    fn v2_task_and_final_require_exact_producer_generation() {
+        for kind in [ExecutionGateKind::Task, ExecutionGateKind::Final] {
+            let mut input = v2_execution_input(kind, Some("sha256:current-tip"));
+            input.required_reviewers[0]
+                .evidence
+                .as_mut()
+                .unwrap()
+                .reviewed_implementer_generation = Some(1);
+
+            let evaluation = evaluate_execution_gate(&input);
+            assert!(!evaluation.passed, "{kind:?} accepted stale generation");
+            assert_eq!(
+                evaluation.reason,
+                ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer
+            );
+        }
+    }
+
+    #[test]
+    fn v2_final_fixer_must_match_current_branch_tip() {
+        let input = v2_execution_input(
+            ExecutionGateKind::Final,
+            Some("sha256:different-current-tip"),
+        );
+
+        let evaluation = evaluate_execution_gate(&input);
+        assert!(!evaluation.passed);
+        assert_eq!(
+            evaluation.reason,
+            ExecutionGateReason::ArtifactDigestMismatch
+        );
     }
 }

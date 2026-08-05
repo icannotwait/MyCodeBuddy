@@ -7,6 +7,78 @@ use super::{
     COMPLETION_PROTOCOL_VERSION_V2,
 };
 use crate::db::entities::delegation_task_run::CompletionState;
+use crate::db::entities::{delegation_attention_request, delegation_workflow_design_root_binding};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DesignSelfReviewDecisionError {
+    #[error("Design self-review decision was superseded")]
+    Superseded,
+    #[error("Design self-review decision is corrupt")]
+    Corrupt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesignSelfReviewResolutionV1 {
+    version: u32,
+    code: String,
+    outcome: CompletionOutcome,
+    actor_identity: String,
+    committed_scope_digest: String,
+    graph_revision: u64,
+}
+
+/// Read the semantic authority for a Design self-review only when the
+/// committed typed attention still matches every platform-owned CAS field.
+pub fn validated_design_self_review_outcome(
+    binding: &delegation_workflow_design_root_binding::Model,
+    attention: Option<&delegation_attention_request::Model>,
+) -> Result<Option<CompletionOutcome>, DesignSelfReviewDecisionError> {
+    let Some(attention) = attention else {
+        return Ok(None);
+    };
+    if attention.kind != delegation_attention_request::AttentionKind::DesignSelfReviewDecision
+        || attention.task_id != binding.task_id
+        || attention.latest_run_id.as_deref() != Some(binding.latest_run_id.as_str())
+        || attention.node_id.as_deref() != Some(binding.node_id.as_str())
+        || attention.captured_scope_digest.as_deref()
+            != Some(binding.evidence_scope_digest.as_str())
+    {
+        return Err(DesignSelfReviewDecisionError::Superseded);
+    }
+    if attention.status == "open" {
+        return Ok(None);
+    }
+    if attention.status != "resolved"
+        || attention.resolution_code.as_deref() != Some("user_outcome_committed")
+    {
+        return Err(DesignSelfReviewDecisionError::Superseded);
+    }
+    let resolution = attention
+        .resolution_json
+        .as_deref()
+        .ok_or(DesignSelfReviewDecisionError::Corrupt)
+        .and_then(|json| {
+            serde_json::from_str::<DesignSelfReviewResolutionV1>(json)
+                .map_err(|_| DesignSelfReviewDecisionError::Corrupt)
+        })?;
+    if resolution.version != 1
+        || resolution.code != "user_outcome_committed"
+        || resolution.actor_identity.trim().is_empty()
+        || resolution.committed_scope_digest != binding.evidence_scope_digest
+        || resolution.graph_revision == 0
+        || !matches!(
+            resolution.outcome,
+            CompletionOutcome::Approve
+                | CompletionOutcome::ApproveWithMinors
+                | CompletionOutcome::RequestChanges
+                | CompletionOutcome::Block
+        )
+    {
+        return Err(DesignSelfReviewDecisionError::Corrupt);
+    }
+    Ok(Some(resolution.outcome))
+}
 
 /// Bounded parent/status projection derived only from the terminal transaction
 /// result. Task 16 extends this into the full display card and transport DTOs.
@@ -64,5 +136,82 @@ mod tests {
         assert_eq!(projection.source, None);
         assert_eq!(projection.attention, Some(attention));
         assert_eq!(projection.graph_revision, 7);
+    }
+}
+
+#[cfg(test)]
+mod design_self_review_decision {
+    use chrono::Utc;
+
+    use super::*;
+    use crate::db::entities::delegation_attention_request::{self, AttentionKind};
+    use crate::db::entities::delegation_workflow_design_root_binding;
+
+    fn binding() -> delegation_workflow_design_root_binding::Model {
+        delegation_workflow_design_root_binding::Model {
+            workflow_id: "workflow".into(),
+            gate_id: "design".into(),
+            gate_lineage: format!("sha256:{}", "a".repeat(64)),
+            node_id: "platform:design-root".into(),
+            task_id: "platform:design-root-task".into(),
+            latest_run_id: "platform:design-root-run".into(),
+            design_identity: format!("sha256:{}", "b".repeat(64)),
+            evidence_scope_digest: format!("sha256:{}", "c".repeat(64)),
+            graph_revision: 1,
+        }
+    }
+
+    fn committed_attention(
+        binding: &delegation_workflow_design_root_binding::Model,
+    ) -> delegation_attention_request::Model {
+        delegation_attention_request::Model {
+            request_id: "attention".into(),
+            task_id: binding.task_id.clone(),
+            parent_conversation_id: 1,
+            child_conversation_id: None,
+            child_tool_call_id: None,
+            status: "resolved".into(),
+            message: "decision".into(),
+            reply: None,
+            resolution_code: Some("user_outcome_committed".into()),
+            created_at: Utc::now(),
+            resolved_at: Some(Utc::now()),
+            kind: AttentionKind::DesignSelfReviewDecision,
+            latest_run_id: Some(binding.latest_run_id.clone()),
+            node_id: Some(binding.node_id.clone()),
+            payload_json: None,
+            resolution_json: Some(
+                serde_json::json!({
+                    "version": 1,
+                    "code": "user_outcome_committed",
+                    "outcome": "approve",
+                    "actor_identity": "authenticated-user",
+                    "committed_scope_digest": binding.evidence_scope_digest,
+                    "graph_revision": 2,
+                })
+                .to_string(),
+            ),
+            captured_scope_digest: Some(binding.evidence_scope_digest.clone()),
+        }
+    }
+
+    #[test]
+    fn committed_decision_requires_the_exact_current_platform_binding() {
+        let binding = binding();
+        let mut attention = committed_attention(&binding);
+        assert_eq!(
+            validated_design_self_review_outcome(&binding, Some(&attention)).unwrap(),
+            Some(CompletionOutcome::Approve)
+        );
+
+        attention.captured_scope_digest = Some(format!("sha256:{}", "d".repeat(64)));
+        assert_eq!(
+            validated_design_self_review_outcome(&binding, Some(&attention)).unwrap_err(),
+            DesignSelfReviewDecisionError::Superseded
+        );
+        assert_eq!(
+            validated_design_self_review_outcome(&binding, None).unwrap(),
+            None
+        );
     }
 }

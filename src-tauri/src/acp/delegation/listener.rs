@@ -54,8 +54,9 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     publish_workflow_manifest_core, recover_workflow_core, settle_workflow_gate_core,
-    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
-    SettleWorkflowRequest, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
+    settle_workflow_gate_v2_core, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
+    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
+    WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -1627,37 +1628,142 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        let outcome = match parse_gate_settlement_outcome(&req.outcome) {
-            Ok(o) => o,
-            Err(msg) => return WorkflowWireError::InvalidArguments(msg).to_value(),
-        };
-        let evidence = match serde_json::from_value(req.evidence) {
-            Ok(evidence) => evidence,
+        let header = match delegation_workflow::Entity::find_by_id(&req.workflow_id)
+            .one(&runs.db().conn)
+            .await
+        {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                return workflow_store_error_value(WorkflowStoreError::NotFound(req.workflow_id))
+            }
             Err(error) => {
-                return WorkflowWireError::InvalidArguments(format!(
-                    "settle_workflow_gate evidence: {error}"
+                return WorkflowWireError::Internal(format!(
+                    "load workflow settlement protocol: {error}"
                 ))
-                .to_value();
+                .to_value()
             }
         };
-        match settle_workflow_gate_core(
-            runs.db(),
-            &self.workflow_emitter,
-            parent_conversation_id,
-            SettleWorkflowRequest {
-                workflow_id: req.workflow_id,
-                manifest_revision: req.manifest_revision,
-                gate_id: req.gate_id,
-                expected_graph_revision: req.expected_graph_revision,
-                gate_cycle: req.gate_cycle,
-                outcome,
-                evidence,
-                summary: req.summary,
-                recovery_authorization_id: None,
-            },
-        )
-        .await
-        {
+        if header.parent_conversation_id != parent_conversation_id {
+            return workflow_store_error_value(WorkflowStoreError::CrossParent {
+                workflow_id: header.workflow_id,
+                expected_parent: parent_conversation_id,
+                actual_parent: header.parent_conversation_id,
+            });
+        }
+
+        let result = if header.completion_protocol_version == 2 {
+            if req.manifest_revision.is_some()
+                || req.gate_cycle.is_some()
+                || req.outcome.is_some()
+                || req.evidence.is_some()
+            {
+                return WorkflowWireError::InvalidArguments(
+                    "protocol-v2 settlement rejects legacy manifest, cycle, outcome, and evidence fields"
+                        .into(),
+                )
+                .to_value();
+            }
+            let expected_review_round = match (req.expected_review_round, req.expected_gate_cycle) {
+                (Some(round), Some(cycle)) if round != cycle => {
+                    return WorkflowWireError::InvalidArguments(
+                        "expected_review_round and expected_gate_cycle disagree".into(),
+                    )
+                    .to_value()
+                }
+                (round, cycle) => round.or(cycle),
+            };
+            let expected_outcome = match req.expected_outcome.as_deref() {
+                Some(value) => match parse_gate_settlement_outcome(value) {
+                    Ok(outcome) => Some(outcome),
+                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
+                },
+                None => None,
+            };
+            settle_workflow_gate_v2_core(
+                runs.db(),
+                &self.workflow_emitter,
+                parent_conversation_id,
+                SettleWorkflowV2Request {
+                    workflow_id: req.workflow_id,
+                    gate_id: req.gate_id,
+                    expected_graph_revision: req.expected_graph_revision,
+                    expected_review_round,
+                    expected_outcome,
+                    summary: req.summary,
+                    recovery_authorization_id: req.recovery_authorization_id,
+                },
+            )
+            .await
+        } else {
+            if req.expected_review_round.is_some()
+                || req.expected_gate_cycle.is_some()
+                || req.expected_outcome.is_some()
+            {
+                return WorkflowWireError::InvalidArguments(
+                    "protocol-v1 settlement requires the legacy request shape".into(),
+                )
+                .to_value();
+            }
+            let outcome = match req.outcome.as_deref() {
+                Some(value) => match parse_gate_settlement_outcome(value) {
+                    Ok(outcome) => outcome,
+                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
+                },
+                None => {
+                    return WorkflowWireError::InvalidArguments(
+                        "protocol-v1 settlement requires outcome".into(),
+                    )
+                    .to_value()
+                }
+            };
+            let evidence = match req.evidence {
+                Some(value) => match serde_json::from_value(value) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        return WorkflowWireError::InvalidArguments(format!(
+                            "settle_workflow_gate evidence: {error}"
+                        ))
+                        .to_value()
+                    }
+                },
+                None => {
+                    return WorkflowWireError::InvalidArguments(
+                        "protocol-v1 settlement requires evidence".into(),
+                    )
+                    .to_value()
+                }
+            };
+            let Some(manifest_revision) = req.manifest_revision else {
+                return WorkflowWireError::InvalidArguments(
+                    "protocol-v1 settlement requires manifest_revision".into(),
+                )
+                .to_value();
+            };
+            let Some(gate_cycle) = req.gate_cycle else {
+                return WorkflowWireError::InvalidArguments(
+                    "protocol-v1 settlement requires gate_cycle".into(),
+                )
+                .to_value();
+            };
+            settle_workflow_gate_core(
+                runs.db(),
+                &self.workflow_emitter,
+                parent_conversation_id,
+                SettleWorkflowRequest {
+                    workflow_id: req.workflow_id,
+                    manifest_revision,
+                    gate_id: req.gate_id,
+                    expected_graph_revision: req.expected_graph_revision,
+                    gate_cycle,
+                    outcome,
+                    evidence,
+                    summary: req.summary,
+                    recovery_authorization_id: req.recovery_authorization_id,
+                },
+            )
+            .await
+        };
+        match result {
             Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
                 WorkflowWireError::Internal(format!("serialize settle result: {e}")).to_value()
             }),
@@ -2591,7 +2697,9 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::ReviewedTaskStale(_) => "reviewed_task_stale",
         WorkflowStoreError::ArtifactDigestMismatch(_) => "artifact_digest_mismatch",
         WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
+        WorkflowStoreError::V2CallerEvidenceRejected => "invalid_arguments",
         WorkflowStoreError::CompletionDecisionRequired => "completion_decision_required",
+        WorkflowStoreError::CompletionDecisionSuperseded => "completion_decision_superseded",
         WorkflowStoreError::CompletionArtifactUnavailable => "completion_artifact_unavailable",
         WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
         WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
@@ -8535,7 +8643,9 @@ mod tests {
             dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
         };
         use crate::acp::delegation::run_store::RunStore;
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::{ActiveModelTrait, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/workflow-v2-listener").await;
@@ -8740,6 +8850,15 @@ mod tests {
             .as_str()
             .expect("published workflow id")
             .to_string();
+        let header = delegation_workflow::Entity::find_by_id(&workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header: delegation_workflow::ActiveModel = header.into();
+        header.completion_protocol_version = Set(2);
+        header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+        header.update(&db.conn).await.unwrap();
 
         let outcome = listener
             .process_get_workflow_state(BrokerGetWorkflowStateRequest {
@@ -8800,33 +8919,24 @@ mod tests {
             "validation"
         );
 
-        let omitted_evidence = json!({
-            "workflow_id": workflow_id,
-            "manifest_revision": 1,
-            "gate_id": "plan-gate",
-            "expected_graph_revision": 1,
-            "gate_cycle": 1,
-            "outcome": "changes_requested",
-            "summary": "missing structured evidence"
-        });
-        let omitted_line = json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "settle_workflow_gate",
-                "arguments": omitted_evidence
-            }
-        })
-        .to_string();
-        let LineAction::Respond(omitted_response) =
-            dispatch_line(&companion, Arc::clone(&inflight), &omitted_line).await
-        else {
-            panic!("omitted evidence must be rejected by the companion")
-        };
+        let reduced = call_companion_workflow(
+            &companion,
+            Arc::clone(&inflight),
+            3,
+            "settle_workflow_gate",
+            json!({
+                "workflow_id": workflow_id,
+                "gate_id": "plan-gate",
+                "expected_graph_revision": 1,
+                "expected_review_round": 1,
+                "expected_outcome": "changes_requested",
+                "summary": "derive evidence from platform state"
+            }),
+        )
+        .await;
         assert_eq!(
-            omitted_response.error.expect("invalid arguments").code,
-            -32602
+            reduced["structuredContent"]["error"]["code"],
+            "gate_not_ready"
         );
 
         let plan_evidence = json!({
@@ -8840,7 +8950,7 @@ mod tests {
             "finding_updates": [],
             "lineage_reset_reason": null
         });
-        let settle_result = call_companion_workflow(
+        let legacy_result = call_companion_workflow(
             &companion,
             inflight,
             4,
@@ -8858,8 +8968,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            settle_result["structuredContent"]["error"]["code"],
-            "artifact_digest_mismatch"
+            legacy_result["structuredContent"]["error"]["code"],
+            "invalid_arguments"
         );
         listener_task.abort();
         let _ = listener_task.await;
