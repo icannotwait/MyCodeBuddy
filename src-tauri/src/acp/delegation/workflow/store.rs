@@ -37,7 +37,7 @@ use super::super::card_summary::{
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
 use super::artifact_resolver::{resolve_final_delivery, ArtifactError, ResolvedArtifact};
-use super::completion_evidence::load_validated_completion_evidence;
+use super::completion_evidence::{load_validated_completion_evidence, V2GateEvidenceIdentity};
 use super::completion_intent::CompletionOutcome;
 use super::error::WorkflowStoreError;
 use super::events::{
@@ -1542,19 +1542,32 @@ pub async fn settle_workflow_gate_core(
         }
         _ => None,
     };
+    let has_legacy_lineage_reset_material = matches!(
+        &req.evidence,
+        SettleGateEvidence::Plan(submission) if submission.lineage_reset_reason.is_some()
+    ) || req.recovery_authorization_id.is_some();
+    let request_protocol_is_v2 =
+        if legacy_design_error.is_some() || has_legacy_lineage_reset_material {
+            delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+                .one(&db.conn)
+                .await
+                .map_err(db_err)?
+                .is_some_and(|workflow| workflow.completion_protocol_version == 2)
+        } else {
+            false
+        };
     if let Some(error) = legacy_design_error {
-        let protocol_is_v2 = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
-            .one(&db.conn)
-            .await
-            .map_err(db_err)?
-            .is_some_and(|workflow| workflow.completion_protocol_version == 2);
-        if !protocol_is_v2 {
+        if !request_protocol_is_v2 {
             return Err(error);
         }
     }
-    let lineage_reset_reason = match &req.evidence {
-        SettleGateEvidence::Plan(submission) => submission.lineage_reset_reason.clone(),
-        SettleGateEvidence::Design { .. } => None,
+    let lineage_reset_reason = if request_protocol_is_v2 {
+        None
+    } else {
+        match &req.evidence {
+            SettleGateEvidence::Plan(submission) => submission.lineage_reset_reason.clone(),
+            SettleGateEvidence::Design { .. } => None,
+        }
     };
     let rejection_workflow_id = req.workflow_id.clone();
     let rejection_authorization_id = req.recovery_authorization_id.clone();
@@ -1870,36 +1883,44 @@ pub async fn settle_workflow_gate_core(
                                     != Some(submission.covered_plan_digest.as_str())
                             {
                                 return Err(WorkflowStoreError::ArtifactDigestMismatch(
-                                "Plan submission digest does not match the active Plan artifact"
-                                    .into(),
-                            ));
+                                    "Plan submission digest does not match the active Plan artifact"
+                                        .into(),
+                                ));
                             }
 
-                            let prior_plan_row = lineage_prior
-                                .iter()
-                                .rev()
-                                .find(|row| row.review_scope.is_some());
-                            let prior_state = prior_plan_row
-                                .map(load_persisted_plan_evidence)
-                                .transpose()?
-                                .map(|evidence| evidence.state);
-                            let mut current_fingerprint_approved = false;
-                            for row in lineage_prior
-                                .iter()
-                                .filter(|row| row.content_fingerprint == content_fp)
-                            {
-                                let evidence = load_persisted_plan_evidence(row)?;
-                                if evidence.state.next_action == PlanReviewNextAction::Approved {
-                                    current_fingerprint_approved = true;
-                                    break;
+                            let prior_state = if header.completion_protocol_version == 2 {
+                                None
+                            } else {
+                                let prior_plan_row = lineage_prior
+                                    .iter()
+                                    .rev()
+                                    .find(|row| row.review_scope.is_some());
+                                let prior_state = prior_plan_row
+                                    .map(load_persisted_plan_evidence)
+                                    .transpose()?
+                                    .map(|evidence| evidence.state);
+                                let mut current_fingerprint_approved = false;
+                                for row in lineage_prior
+                                    .iter()
+                                    .filter(|row| row.content_fingerprint == content_fp)
+                                {
+                                    let evidence = load_persisted_plan_evidence(row)?;
+                                    if evidence.state.next_action
+                                        == PlanReviewNextAction::Approved
+                                    {
+                                        current_fingerprint_approved = true;
+                                        break;
+                                    }
                                 }
-                            }
-                            if current_fingerprint_approved {
-                                return Err(PlanReviewError::InvalidTransition(
-                                    "an approved Plan review lineage cannot be re-entered".into(),
-                                )
-                                .into());
-                            }
+                                if current_fingerprint_approved {
+                                    return Err(PlanReviewError::InvalidTransition(
+                                        "an approved Plan review lineage cannot be re-entered"
+                                            .into(),
+                                    )
+                                    .into());
+                                }
+                                prior_state
+                            };
 
                             let active_author_node_id = normalized
                                 .nodes
@@ -1917,25 +1938,20 @@ pub async fn settle_workflow_gate_core(
                                     )
                                 })?;
 
-                            let mut effective_submission = submission.clone();
                             if header.completion_protocol_version == 2 {
                                 let plan_digest = current_doc_digest.as_deref().ok_or_else(|| {
                                     WorkflowStoreError::GateNotReady(
                                         "active Plan artifact is missing".into(),
                                     )
                                 })?;
-                                let (author_task_id, covered_plan_digest) =
-                                    load_validated_v2_plan_author(
-                                        txn,
-                                        &header.workflow_id,
-                                        active_author_node_id,
-                                        plan_digest,
-                                    )
-                                    .await?;
-                                effective_submission.covered_author_task_id = author_task_id;
-                                effective_submission.covered_plan_digest = covered_plan_digest;
-                                effective_submission.required_reviewer_node_ids =
-                                    active_required.clone();
+                                load_validated_v2_plan_author(
+                                    txn,
+                                    &header.workflow_id,
+                                    active_author_node_id,
+                                    plan_digest,
+                                )
+                                .await?;
+                                (0, 0, 0, None, 0, false, None, None)
                             } else {
                                 verify_plan_gate_ready(
                                     txn,
@@ -1949,32 +1965,36 @@ pub async fn settle_workflow_gate_core(
                                     lineage_prior.last(),
                                 )
                                 .await?;
-                            }
 
-                            // Completed-round-only reducer: this call is deliberately
-                            // after all required runs and Author bindings are validated.
-                            let state = derive_plan_review_round(
-                                prior_state.as_ref(),
-                                &gate.reviewer_cohort_node_ids,
-                                &effective_submission,
-                            )?;
-                            validate_plan_outcome(&req.outcome, &state)?;
-                            let persisted = PersistedPlanReviewEvidence {
-                                submission: effective_submission,
-                                state: state.clone(),
-                            };
-                            let persisted_json = serialize_bounded_plan_evidence(&persisted)?;
-                            let report_files_json = serialize_plan_report_files(&state.findings)?;
-                            (
-                                i64::from(state.critical_count),
-                                i64::from(state.important_count),
-                                i64::from(state.minor_count),
-                                Some(state.next_action),
-                                state.stagnation_count,
-                                state.rewrite_used,
-                                Some((persisted, persisted_json)),
-                                Some(report_files_json),
-                            )
+                                // Completed-round-only reducer: this call is deliberately
+                                // after all required runs and Author bindings are validated.
+                                let state = derive_plan_review_state_for_protocol(
+                                    header.completion_protocol_version,
+                                    prior_state.as_ref(),
+                                    &gate.reviewer_cohort_node_ids,
+                                    submission,
+                                )?
+                                .expect("protocol-v1 Plan review must derive legacy state");
+                                validate_plan_outcome(&req.outcome, &state)?;
+                                let persisted = PersistedPlanReviewEvidence {
+                                    submission: submission.clone(),
+                                    state: state.clone(),
+                                };
+                                let persisted_json =
+                                    serialize_bounded_plan_evidence(&persisted)?;
+                                let report_files_json =
+                                    serialize_plan_report_files(&state.findings)?;
+                                (
+                                    i64::from(state.critical_count),
+                                    i64::from(state.important_count),
+                                    i64::from(state.minor_count),
+                                    Some(state.next_action),
+                                    state.stagnation_count,
+                                    state.rewrite_used,
+                                    Some((persisted, persisted_json)),
+                                    Some(report_files_json),
+                                )
+                            }
                         }
                         (SettleGateEvidence::Design { .. }, DocumentGateKind::Plan)
                         | (SettleGateEvidence::Plan(_), DocumentGateKind::Design) => {
@@ -1996,35 +2016,31 @@ pub async fn settle_workflow_gate_core(
                         content_fingerprint: Set(content_fp),
                         evidence_scope_digest: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| evidence.aggregate_scope_digest.clone())),
+                            .map(|evidence| evidence.identity.aggregate_scope_digest.clone())),
                         gate_lineage: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| evidence.gate_lineage.clone())),
+                            .map(|evidence| evidence.identity.gate_lineage.clone())),
                         review_round: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| evidence.review_round)),
+                            .map(|evidence| evidence.identity.review_round)),
                         required_node_set_json: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| serde_json::to_string(&evidence.required_node_ids))
+                            .map(|evidence| {
+                                serde_json::to_string(&evidence.identity.required_node_ids)
+                            })
                             .transpose()
                             .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?),
                         required_evidence_task_ids_json: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| serde_json::to_string(&evidence.task_ids))
+                            .map(|evidence| serde_json::to_string(&evidence.identity.task_ids))
                             .transpose()
                             .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?),
                         evidence_scope_digests_json: Set(v2_gate_evidence
                             .as_ref()
-                            .map(|evidence| serde_json::to_string(&evidence.scope_digests))
+                            .map(|evidence| serde_json::to_string(&evidence.identity.scope_digests))
                             .transpose()
                             .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?),
-                        plan_round_state_v2_json: Set((header.completion_protocol_version == 2)
-                            .then(|| {
-                                persisted_plan
-                                    .as_ref()
-                                    .map(|(_, persisted_json)| persisted_json.clone())
-                            })
-                            .flatten()),
+                        plan_round_state_v2_json: Set(None),
                         outcome: Set(req.outcome.clone()),
                         critical_count: Set((header.completion_protocol_version != 2)
                             .then_some(critical_count)),
@@ -2061,7 +2077,11 @@ pub async fn settle_workflow_gate_core(
                         rewrite_used: Set(rewrite_used),
                         next_action: Set(plan_next_action.map(plan_next_action_to_db)),
                         report_files_json: Set(report_files_json),
-                        lineage_reset_authorization_id: Set(req.recovery_authorization_id.clone()),
+                        lineage_reset_authorization_id: Set(
+                            (header.completion_protocol_version != 2)
+                                .then(|| req.recovery_authorization_id.clone())
+                                .flatten(),
+                        ),
                         created_at: Set(now),
                         ..Default::default()
                     };
@@ -3017,10 +3037,7 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
         .all(conn)
         .await
         .map_err(db_err)?;
-    let latest_plan_settlement = settlements
-        .iter()
-        .find(|settlement| settlement.review_scope.is_some());
-    let current_plan_lineage = if header.completion_protocol_version == 2 {
+    let current_plan_state = if header.completion_protocol_version == 2 {
         if let Some(gate) = plan_gate {
             delegation_workflow_gate_state::Entity::find_by_id((
                 header.workflow_id.clone(),
@@ -3029,21 +3046,58 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
             .one(conn)
             .await
             .map_err(db_err)?
-            .map(|state| state.gate_lineage)
         } else {
             None
         }
     } else {
         None
     };
-    let current_plan_settlement = settlements.iter().find(|settlement| {
-        settlement.review_scope.is_some()
-            && if header.completion_protocol_version == 2 {
-                settlement.gate_lineage.as_deref() == current_plan_lineage.as_deref()
-            } else {
-                settlement.content_fingerprint == header.plan_fingerprint
+    let current_v2_plan_identity = current_plan_state.as_ref().and_then(|state| {
+        let gate = plan_gate?;
+        if required_plan_reviewers.len() != gate.required_reviewer_node_ids.len() {
+            return None;
+        }
+        let mut node_ids = Vec::with_capacity(required_plan_reviewers.len());
+        let mut task_ids = Vec::with_capacity(required_plan_reviewers.len());
+        let mut scope_digests = Vec::with_capacity(required_plan_reviewers.len());
+        for reviewer in &required_plan_reviewers {
+            if !reviewer.completion_evidence_validated {
+                return None;
             }
+            node_ids.push(reviewer.node_id.clone());
+            task_ids.push(reviewer.latest_task_id.clone()?);
+            scope_digests.push(reviewer.evidence_scope_digest.clone()?);
+        }
+        let identity = V2GateEvidenceIdentity::new(
+            state.gate_lineage.clone(),
+            state.current_review_round,
+            node_ids,
+            task_ids,
+            scope_digests,
+        )?;
+        (identity.required_node_ids == canonical_string_set(&gate.required_reviewer_node_ids))
+            .then_some(identity)
     });
+    let latest_plan_settlement = settlements.iter().find(|settlement| {
+        if header.completion_protocol_version == 2 {
+            plan_gate.is_some_and(|gate| settlement.gate_id == gate.id)
+                && settlement.gate_lineage.is_some()
+        } else {
+            settlement.review_scope.is_some()
+        }
+    });
+    let current_plan_settlement = if header.completion_protocol_version == 2 {
+        plan_gate.and_then(|gate| {
+            current_v2_plan_identity.as_ref().and_then(|identity| {
+                select_current_v2_plan_settlement(&settlements, &gate.id, identity)
+            })
+        })
+    } else {
+        settlements.iter().find(|settlement| {
+            settlement.review_scope.is_some()
+                && settlement.content_fingerprint == header.plan_fingerprint
+        })
+    };
     let project_plan_gate = |settlement: &delegation_workflow_gate_settlement::Model| {
         let persisted_evidence = load_persisted_plan_evidence(settlement);
         let parsed_reviewers = if header.completion_protocol_version == 2 {
@@ -3069,26 +3123,9 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
                     }
             })
             .count();
-        let persisted_task_ids = settlement
-            .required_evidence_task_ids_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok());
-        let persisted_scope_digests = settlement
-            .evidence_scope_digests_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok());
-        let v2_evidence_consistent = settlement.evidence_scope_digest.is_some()
-            && settlement.gate_lineage.is_some()
-            && settlement.review_round.is_some()
-            && settlement.plan_round_state_v2_json.is_some()
-            && parsed_reviewers.is_some()
-            && persisted_task_ids
-                .as_ref()
-                .is_some_and(|task_ids| task_ids.len() == required_reviewer_node_ids.len())
-            && persisted_scope_digests
-                .as_ref()
-                .is_some_and(|digests| digests.len() == required_reviewer_node_ids.len())
-            && reviewer_evidence_count == required_reviewer_node_ids.len();
+        let v2_evidence_consistent = current_v2_plan_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches_settlement(settlement));
         WorkflowRecoveryPlanGateEvidence {
             gate_id: settlement.gate_id.clone(),
             gate_cycle: settlement.gate_cycle,
@@ -4682,12 +4719,7 @@ fn is_canceled_drop(
 
 #[derive(Debug)]
 struct ValidatedV2GateEvidenceSet {
-    gate_lineage: String,
-    review_round: i64,
-    required_node_ids: Vec<String>,
-    task_ids: Vec<String>,
-    scope_digests: Vec<String>,
-    aggregate_scope_digest: String,
+    identity: V2GateEvidenceIdentity,
     outcome: GateSettlementOutcome,
 }
 
@@ -4741,7 +4773,7 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
     }
     let selected = serde_json::from_str::<BTreeSet<String>>(&state.selected_node_ids_json)
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
-    let mut required_node_ids = canonical_string_set(&gate.required_reviewer_node_ids);
+    let required_node_ids = canonical_string_set(&gate.required_reviewer_node_ids);
     let mut task_ids = Vec::with_capacity(required_node_ids.len());
     let mut scope_digests = Vec::with_capacity(required_node_ids.len());
     let mut outcomes = Vec::with_capacity(required_node_ids.len());
@@ -4796,12 +4828,18 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
         outcomes.push(validated.evidence.intent.outcome);
     }
 
-    required_node_ids.sort();
-    task_ids.sort();
-    scope_digests.sort();
-    let aggregate_json = serde_json::to_vec(&scope_digests)
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
-    let aggregate_scope_digest = format!("sha256:{}", sha256_hex(&aggregate_json));
+    let identity = V2GateEvidenceIdentity::new(
+        state.gate_lineage,
+        state.current_review_round,
+        required_node_ids,
+        task_ids,
+        scope_digests,
+    )
+    .ok_or_else(|| {
+        WorkflowStoreError::GateNotReady(
+            "current v2 gate evidence identity is incomplete or duplicated".into(),
+        )
+    })?;
     let outcome = if outcomes
         .iter()
         .any(|outcome| *outcome == CompletionOutcome::RequestChanges)
@@ -4825,15 +4863,17 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
         ));
     };
 
-    Ok(ValidatedV2GateEvidenceSet {
-        gate_lineage: state.gate_lineage,
-        review_round: state.current_review_round,
-        required_node_ids,
-        task_ids,
-        scope_digests,
-        aggregate_scope_digest,
-        outcome,
-    })
+    Ok(ValidatedV2GateEvidenceSet { identity, outcome })
+}
+
+fn select_current_v2_plan_settlement<'a>(
+    settlements: &'a [delegation_workflow_gate_settlement::Model],
+    gate_id: &str,
+    identity: &V2GateEvidenceIdentity,
+) -> Option<&'a delegation_workflow_gate_settlement::Model> {
+    settlements
+        .iter()
+        .find(|settlement| settlement.gate_id == gate_id && identity.matches_settlement(settlement))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5191,7 +5231,120 @@ fn settle_result_from_row(
 
 #[cfg(test)]
 mod completion_v2_shared_validator_replay_tests {
+    use super::super::plan_review::{FindingSeverity, FindingStatus};
     use super::*;
+
+    fn v2_settlement(
+        identity: &V2GateEvidenceIdentity,
+    ) -> delegation_workflow_gate_settlement::Model {
+        delegation_workflow_gate_settlement::Model {
+            workflow_id: "workflow-v2".into(),
+            gate_id: "plan".into(),
+            gate_cycle: 1,
+            manifest_revision: 2,
+            structural_revision: 2,
+            content_fingerprint: "legacy-inert".into(),
+            evidence_scope_digest: Some(identity.aggregate_scope_digest.clone()),
+            gate_lineage: Some(identity.gate_lineage.clone()),
+            review_round: Some(identity.review_round),
+            required_node_set_json: Some(
+                serde_json::to_string(&identity.required_node_ids).unwrap(),
+            ),
+            required_evidence_task_ids_json: Some(
+                serde_json::to_string(&identity.task_ids).unwrap(),
+            ),
+            evidence_scope_digests_json: Some(
+                serde_json::to_string(&identity.scope_digests).unwrap(),
+            ),
+            localized_change_digest: None,
+            plan_round_state_v2_json: None,
+            outcome: GateSettlementOutcome::Approved,
+            critical_count: None,
+            important_count: None,
+            minor_count: None,
+            summary: "approved".into(),
+            graph_revision_at_settle: 4,
+            review_scope: None,
+            revision_kind: None,
+            scope_reason: None,
+            required_reviewer_node_ids_json: None,
+            covered_author_task_id: None,
+            covered_plan_digest: None,
+            finding_ledger_json: None,
+            net_improvement: None,
+            stagnation_count: 0,
+            rewrite_used: false,
+            next_action: None,
+            report_files_json: None,
+            lineage_reset_authorization_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn completion_v2_review_fixes_recovery_requires_current_round_identity() {
+        let lineage = format!("sha256:{}", "a".repeat(64));
+        let round_one = V2GateEvidenceIdentity::new(
+            lineage.clone(),
+            1,
+            vec!["reviewer".into()],
+            vec!["review-task-r1".into()],
+            vec![format!("sha256:{}", "1".repeat(64))],
+        )
+        .unwrap();
+        let settlement = v2_settlement(&round_one);
+        let round_two = V2GateEvidenceIdentity::new(
+            lineage,
+            2,
+            vec!["reviewer".into()],
+            vec!["review-task-r2".into()],
+            vec![format!("sha256:{}", "2".repeat(64))],
+        )
+        .unwrap();
+
+        assert!(select_current_v2_plan_settlement(
+            std::slice::from_ref(&settlement),
+            "plan",
+            &round_two,
+        )
+        .is_none());
+        assert!(select_current_v2_plan_settlement(&[settlement], "plan", &round_one).is_some());
+    }
+
+    #[test]
+    fn completion_v2_review_fixes_plan_payload_does_not_mint_legacy_round_state() {
+        let caller_payload = PlanReviewRoundSubmission {
+            scope: PlanReviewScope::Scoped,
+            revision_kind: PlanRevisionKind::Localized,
+            scope_reason: String::new(),
+            covered_author_task_id: String::new(),
+            covered_plan_digest: String::new(),
+            required_reviewer_node_ids: vec!["reviewer".into()],
+            finding_updates: vec![PlanFindingUpdate {
+                finding_id: "parent-authored".into(),
+                severity: FindingSeverity::Critical,
+                status: FindingStatus::Open,
+                owner_reviewer_node_ids: vec!["reviewer".into()],
+                summary: "must remain legacy-only".into(),
+                evidence_ref: "parent".into(),
+                report_file: "reports/parent.md".into(),
+            }],
+            lineage_reset_reason: Some("parent requested reset".into()),
+        };
+
+        assert_eq!(
+            derive_plan_review_state_for_protocol(2, None, &["reviewer".into()], &caller_payload,)
+                .unwrap(),
+            None
+        );
+        assert!(derive_plan_review_state_for_protocol(
+            1,
+            None,
+            &["reviewer".into()],
+            &caller_payload,
+        )
+        .is_err());
+    }
 
     #[test]
     fn completion_v2_shared_validator_replays_without_legacy_finding_counts() {
@@ -5306,6 +5459,18 @@ fn serialize_plan_report_files(
     serde_json::to_string(&files).map_err(|error| {
         WorkflowStoreError::Persistence(format!("serialize Plan report files: {error}"))
     })
+}
+
+fn derive_plan_review_state_for_protocol(
+    completion_protocol_version: i64,
+    prior: Option<&PlanReviewRoundState>,
+    reviewer_cohort_node_ids: &[String],
+    submission: &PlanReviewRoundSubmission,
+) -> Result<Option<PlanReviewRoundState>, PlanReviewError> {
+    if completion_protocol_version == 2 {
+        return Ok(None);
+    }
+    derive_plan_review_round(prior, reviewer_cohort_node_ids, submission).map(Some)
 }
 
 fn validate_plan_outcome(

@@ -108,3 +108,60 @@ formatting-only hunks will remain unstaged.
 ## Concerns
 
 None within Task 12 scope.
+
+## Review Fix Package
+
+Resolved all three Important findings from the independent Codex review of
+base artifact `80190f07b1e45fb1caf3f65a56c7d9d5c6b27933`.
+
+### TDD RED -> GREEN
+
+- `T12-CODEX-I1` RED: the focused recovery identity test did not compile
+  because no exact v2 gate evidence identity or current-settlement selector
+  existed. GREEN: same-lineage round-1 settlement identity is rejected for
+  round 2 replacement evidence and accepted only for the exact round/task/
+  scope set.
+- `T12-CODEX-I2` RED: advancing only `current_review_round` left projection's
+  `latest_gate_cycle` at `Some(1)`. GREEN: projection now rebuilds the current
+  validated evidence identity and returns no current outcome or summary until
+  a matching settlement exists.
+- `T12-CODEX-I3` RED: the focused Plan payload test did not compile because the
+  protocol-gated Plan reducer entry did not exist. GREEN: v2 returns no legacy
+  round state even for invalid Parent-supplied findings and lineage-reset
+  material, while v1 retains the existing validation error.
+
+### Fix Implementation
+
+- Added one canonical `V2GateEvidenceIdentity` shared by settlement writes,
+  projection, and recovery. Matching requires exact lineage, selected round,
+  required node IDs, evidence task IDs, individual scope digests, and the
+  recomputed aggregate scope digest. Empty, duplicate, partial, or malformed
+  identity sets fail closed.
+- Recovery constructs the identity only from the full current manifest
+  Reviewer set with freshly revalidated evidence. A stale same-lineage
+  settlement is not exposed as current approval.
+- Projection loads the current gate state and rebuilds the selected-round
+  evidence identity. Same-lineage round advancement therefore reopens the
+  gate instead of retaining the old settlement overlay.
+- Protocol-v2 Plan settlement validates platform-derived Author and Reviewer
+  evidence but does not call the v1 finding reducer or count-based outcome
+  validator. It persists no legacy Plan ledger, next action, report files,
+  reset authorization, or `plan_round_state_v2_json`; Task 14 retains ownership
+  of the true v2 reducer. The v1 reducer and persistence path remain explicit.
+
+### Focused Verification
+
+- `cargo test --lib completion_v2_review_fixes -- --list`: 3 tests listed.
+- `cargo test --lib completion_v2_review_fixes -- --nocapture`: 3 passed,
+  0 failed.
+- `cargo test --lib completion_v2_shared_validator -- --list`: 8 tests listed.
+- `cargo test --lib completion_v2_shared_validator -- --nocapture`: 8 passed,
+  0 failed.
+- `cargo test --lib completion_recovery_fence -- --list`: 1 test listed.
+- `cargo test --lib completion_recovery_fence -- --nocapture`: 1 passed,
+  0 failed.
+- `cargo test --lib task4_plan_ -- --list`: 8 v1 Plan tests listed.
+- `cargo test --lib task4_plan_ -- --nocapture`: 8 passed, 0 failed.
+
+No full suite, Clippy, frontend test, push, or PR was run. The existing missing
+`codeg-mcp` sidecar warning remained nonblocking.

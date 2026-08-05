@@ -20,6 +20,7 @@ use super::completion_intent::{
     CompletionIntentReason, CompletionIntentSource, CompletionOutcome, CompletionReportCandidate,
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
+use super::dto::sha256_hex_str;
 use super::error::{CompletionEvidenceError, CompletionRecoveryFenceError};
 use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
@@ -47,8 +48,9 @@ use crate::db::entities::delegation_task_run::{self, CompletionState, Delegation
 use crate::db::entities::delegation_workflow::CompletionProtocolMode;
 use crate::db::entities::{
     delegation_completion_tool_intent, delegation_workflow,
-    delegation_workflow_design_root_binding, delegation_workflow_node_binding,
-    delegation_workflow_outbox_event, delegation_workflow_run_binding,
+    delegation_workflow_design_root_binding, delegation_workflow_gate_settlement,
+    delegation_workflow_node_binding, delegation_workflow_outbox_event,
+    delegation_workflow_run_binding,
 };
 use crate::db::AppDatabase;
 
@@ -56,6 +58,81 @@ const MAX_DOCUMENT_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
 const COMPLETION_DECISION_MESSAGE: &str = "Completion outcome requires a direct decision.";
 const ARTIFACT_RECOVERY_MESSAGE: &str = "Completion artifact is not yet available.";
 const DESIGN_SELF_REVIEW_MESSAGE: &str = "Design self-review requires a direct decision.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V2GateEvidenceIdentity {
+    pub gate_lineage: String,
+    pub review_round: i64,
+    pub required_node_ids: Vec<String>,
+    pub task_ids: Vec<String>,
+    pub scope_digests: Vec<String>,
+    pub aggregate_scope_digest: String,
+}
+
+impl V2GateEvidenceIdentity {
+    pub(crate) fn new(
+        gate_lineage: String,
+        review_round: i64,
+        required_node_ids: Vec<String>,
+        task_ids: Vec<String>,
+        scope_digests: Vec<String>,
+    ) -> Option<Self> {
+        if gate_lineage.is_empty() || review_round <= 0 {
+            return None;
+        }
+        let required_node_ids = canonical_identity_set(required_node_ids)?;
+        let task_ids = canonical_identity_set(task_ids)?;
+        let scope_digests = canonical_identity_set(scope_digests)?;
+        if required_node_ids.is_empty()
+            || task_ids.len() != required_node_ids.len()
+            || scope_digests.len() != required_node_ids.len()
+        {
+            return None;
+        }
+        let scope_json = serde_json::to_string(&scope_digests).ok()?;
+        let aggregate_scope_digest = format!("sha256:{}", sha256_hex_str(&scope_json));
+        Some(Self {
+            gate_lineage,
+            review_round,
+            required_node_ids,
+            task_ids,
+            scope_digests,
+            aggregate_scope_digest,
+        })
+    }
+
+    pub(crate) fn matches_settlement(
+        &self,
+        settlement: &delegation_workflow_gate_settlement::Model,
+    ) -> bool {
+        settlement.gate_lineage.as_deref() == Some(self.gate_lineage.as_str())
+            && settlement.review_round == Some(self.review_round)
+            && settlement.evidence_scope_digest.as_deref()
+                == Some(self.aggregate_scope_digest.as_str())
+            && persisted_identity_set(settlement.required_node_set_json.as_deref()).as_ref()
+                == Some(&self.required_node_ids)
+            && persisted_identity_set(settlement.required_evidence_task_ids_json.as_deref())
+                .as_ref()
+                == Some(&self.task_ids)
+            && persisted_identity_set(settlement.evidence_scope_digests_json.as_deref()).as_ref()
+                == Some(&self.scope_digests)
+    }
+}
+
+fn canonical_identity_set(mut values: Vec<String>) -> Option<Vec<String>> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return None;
+    }
+    values.sort();
+    if values.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    Some(values)
+}
+
+fn persisted_identity_set(json: Option<&str>) -> Option<Vec<String>> {
+    canonical_identity_set(serde_json::from_str(json?).ok()?)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompletionMutationError {

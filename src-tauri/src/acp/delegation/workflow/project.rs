@@ -5,7 +5,7 @@
 //! fails conversation detail: corrupt manifests and projection errors omit the
 //! graph (`None`) with a warn log.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
@@ -21,7 +21,7 @@ use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
-use super::completion_evidence::load_validated_completion_evidence;
+use super::completion_evidence::{load_validated_completion_evidence, V2GateEvidenceIdentity};
 use super::completion_intent::CompletionOutcome;
 use super::dto::{
     redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
@@ -36,8 +36,8 @@ use super::gates::{
 use super::key::parse_recognized_work_unit_key;
 use super::types::{
     ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
-    ManifestWorkflowState, ParsedWorkUnitKey, ResolutionMode, TaskHardTriggerKind, TaskRiskLevel,
-    TaskSoftSignalKind, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    ManifestWorkflowState, NormalizedGate, ParsedWorkUnitKey, ResolutionMode, TaskHardTriggerKind,
+    TaskRiskLevel, TaskSoftSignalKind, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -444,7 +444,7 @@ async fn project_manifest_mode(
         .await
         .map_err(db_err)?;
 
-    let current_gate_lineage_by_id = if header.completion_protocol_version == 2 {
+    let current_gate_state_by_id = if header.completion_protocol_version == 2 {
         delegation_workflow_gate_state::Entity::find()
             .filter(
                 delegation_workflow_gate_state::Column::WorkflowId.eq(header.workflow_id.clone()),
@@ -453,7 +453,7 @@ async fn project_manifest_mode(
             .await
             .map_err(db_err)?
             .into_iter()
-            .map(|state| (state.gate_id, state.gate_lineage))
+            .map(|state| (state.gate_id.clone(), state))
             .collect::<HashMap<_, _>>()
     } else {
         HashMap::new()
@@ -597,16 +597,24 @@ async fn project_manifest_mode(
             super::types::DocumentGateKind::Design => header.design_fingerprint.as_str(),
             super::types::DocumentGateKind::Plan => header.plan_fingerprint.as_str(),
         };
-        let current_lineage = current_gate_lineage_by_id.get(&g.id).map(String::as_str);
+        let current_v2_identity = (header.completion_protocol_version == 2)
+            .then(|| {
+                current_v2_gate_evidence_identity(
+                    g,
+                    current_gate_state_by_id.get(&g.id),
+                    &run_bindings,
+                    &validated_by_task,
+                )
+            })
+            .flatten();
         let latest = gate_settlements
             .iter()
             .rfind(|settlement| {
                 document_gate_settlement_matches_current(
                     header.completion_protocol_version,
-                    &settlement.content_fingerprint,
-                    settlement.gate_lineage.as_deref(),
+                    settlement,
                     current_fp,
-                    current_lineage,
+                    current_v2_identity.as_ref(),
                 )
             })
             .copied();
@@ -2209,16 +2217,50 @@ fn document_gate_evidence_counts(
 
 fn document_gate_settlement_matches_current(
     completion_protocol_version: i64,
-    settlement_content_fingerprint: &str,
-    settlement_gate_lineage: Option<&str>,
+    settlement: &delegation_workflow_gate_settlement::Model,
     current_content_fingerprint: &str,
-    current_gate_lineage: Option<&str>,
+    current_v2_identity: Option<&V2GateEvidenceIdentity>,
 ) -> bool {
     if completion_protocol_version == 2 {
-        return current_gate_lineage.is_some() && settlement_gate_lineage == current_gate_lineage;
+        return current_v2_identity.is_some_and(|identity| identity.matches_settlement(settlement));
     }
-    !settlement_content_fingerprint.is_empty()
-        && settlement_content_fingerprint == current_content_fingerprint
+    !settlement.content_fingerprint.is_empty()
+        && settlement.content_fingerprint == current_content_fingerprint
+}
+
+fn current_v2_gate_evidence_identity(
+    gate: &NormalizedGate,
+    state: Option<&delegation_workflow_gate_state::Model>,
+    run_bindings: &[delegation_workflow_run_binding::Model],
+    validated_by_task: &HashMap<String, super::types::ValidatedCompletionEvidence>,
+) -> Option<V2GateEvidenceIdentity> {
+    let state = state?;
+    let selected = serde_json::from_str::<BTreeSet<String>>(&state.selected_node_ids_json).ok()?;
+    let mut node_ids = Vec::with_capacity(gate.required_reviewer_node_ids.len());
+    let mut task_ids = Vec::with_capacity(gate.required_reviewer_node_ids.len());
+    let mut scope_digests = Vec::with_capacity(gate.required_reviewer_node_ids.len());
+    for node_id in &gate.required_reviewer_node_ids {
+        let binding = run_bindings
+            .iter()
+            .find(|binding| binding.node_id == *node_id)?;
+        if binding.gate_lineage.as_deref() != Some(state.gate_lineage.as_str())
+            || selected.contains(node_id)
+                && binding.review_round != Some(state.current_review_round)
+        {
+            return None;
+        }
+        let validated = validated_by_task.get(&binding.task_id)?;
+        node_ids.push(node_id.clone());
+        task_ids.push(binding.task_id.clone());
+        scope_digests.push(validated.evidence.evidence_scope_digest.clone());
+    }
+    V2GateEvidenceIdentity::new(
+        state.gate_lineage.clone(),
+        state.current_review_round,
+        node_ids,
+        task_ids,
+        scope_digests,
+    )
 }
 
 fn content_fingerprint_matches(actual: Option<&str>, expected: &str) -> bool {
@@ -4216,27 +4258,166 @@ mod tests {
     #[test]
     fn completion_v2_shared_validator_gate_settlement_ignores_legacy_fingerprint() {
         let lineage = format!("sha256:{}", "a".repeat(64));
+        let identity = super::V2GateEvidenceIdentity::new(
+            lineage,
+            1,
+            vec!["reviewer".into()],
+            vec!["task".into()],
+            vec![format!("sha256:{}", "b".repeat(64))],
+        )
+        .unwrap();
+        let settlement = delegation_workflow_gate_settlement::Model {
+            workflow_id: "workflow".into(),
+            gate_id: "plan".into(),
+            gate_cycle: 1,
+            manifest_revision: 1,
+            structural_revision: 1,
+            content_fingerprint: "rotated-legacy-fingerprint".into(),
+            evidence_scope_digest: Some(identity.aggregate_scope_digest.clone()),
+            gate_lineage: Some(identity.gate_lineage.clone()),
+            review_round: Some(identity.review_round),
+            required_node_set_json: Some(
+                serde_json::to_string(&identity.required_node_ids).unwrap(),
+            ),
+            required_evidence_task_ids_json: Some(
+                serde_json::to_string(&identity.task_ids).unwrap(),
+            ),
+            evidence_scope_digests_json: Some(
+                serde_json::to_string(&identity.scope_digests).unwrap(),
+            ),
+            localized_change_digest: None,
+            plan_round_state_v2_json: None,
+            outcome: GateSettlementOutcome::Approved,
+            critical_count: None,
+            important_count: None,
+            minor_count: None,
+            summary: "approved".into(),
+            graph_revision_at_settle: 1,
+            review_scope: None,
+            revision_kind: None,
+            scope_reason: None,
+            required_reviewer_node_ids_json: None,
+            covered_author_task_id: None,
+            covered_plan_digest: None,
+            finding_ledger_json: None,
+            net_improvement: None,
+            stagnation_count: 0,
+            rewrite_used: false,
+            next_action: None,
+            report_files_json: None,
+            lineage_reset_authorization_id: None,
+            created_at: Utc::now(),
+        };
         assert!(super::document_gate_settlement_matches_current(
             2,
-            "rotated-legacy-fingerprint",
-            Some(&lineage),
+            &settlement,
             "current-legacy-fingerprint",
-            Some(&lineage),
+            Some(&identity),
         ));
+        let stale = super::V2GateEvidenceIdentity::new(
+            format!("sha256:{}", "c".repeat(64)),
+            1,
+            vec!["reviewer".into()],
+            vec!["task".into()],
+            vec![format!("sha256:{}", "b".repeat(64))],
+        )
+        .unwrap();
         assert!(!super::document_gate_settlement_matches_current(
             2,
+            &settlement,
             "current-legacy-fingerprint",
-            Some("sha256:stale-lineage"),
-            "current-legacy-fingerprint",
-            Some(&lineage),
+            Some(&stale),
         ));
+        let mut v1_settlement = settlement;
+        v1_settlement.content_fingerprint = "current-legacy-fingerprint".into();
         assert!(super::document_gate_settlement_matches_current(
             1,
-            "current-legacy-fingerprint",
-            None,
+            &v1_settlement,
             "current-legacy-fingerprint",
             None,
         ));
+    }
+
+    #[tokio::test]
+    async fn completion_v2_review_fixes_projection_reopens_same_lineage_new_round() {
+        let (db, parent) = seed_parent().await;
+        let em = emitter();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("task12-round-fresh-projection"),
+            },
+        )
+        .await
+        .unwrap();
+        let header = delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header: delegation_workflow::ActiveModel = header.into();
+        header.completion_protocol_version = Set(2);
+        header.update(&db.conn).await.unwrap();
+
+        let lineage = format!("sha256:{}", "a".repeat(64));
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_lineage: Set(lineage.clone()),
+            current_review_round: Set(2),
+            selected_node_ids_json: Set("[\"plan-reviewer-1\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let round_one = super::super::completion_evidence::V2GateEvidenceIdentity::new(
+            lineage.clone(),
+            1,
+            vec!["plan-reviewer-1".into()],
+            vec!["plan-review-task-r1".into()],
+            vec![format!("sha256:{}", "1".repeat(64))],
+        )
+        .unwrap();
+        delegation_workflow_gate_settlement::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_cycle: Set(1),
+            manifest_revision: Set(published.manifest_revision as i64),
+            structural_revision: Set(published.manifest_revision as i64),
+            content_fingerprint: Set("legacy-inert".into()),
+            evidence_scope_digest: Set(Some(round_one.aggregate_scope_digest)),
+            gate_lineage: Set(Some(lineage)),
+            review_round: Set(Some(1)),
+            required_node_set_json: Set(Some(
+                serde_json::to_string(&round_one.required_node_ids).unwrap(),
+            )),
+            required_evidence_task_ids_json: Set(Some(
+                serde_json::to_string(&round_one.task_ids).unwrap(),
+            )),
+            evidence_scope_digests_json: Set(Some(
+                serde_json::to_string(&round_one.scope_digests).unwrap(),
+            )),
+            outcome: Set(GateSettlementOutcome::Approved),
+            summary: Set("round one approved".into()),
+            graph_revision_at_settle: Set(published.graph_revision as i64),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let snapshot = project_workflow_graph_core(&db, parent).await.unwrap();
+        let plan_gate = snapshot
+            .gates
+            .iter()
+            .find(|gate| gate.gate_kind == "plan")
+            .unwrap();
+        assert_eq!(plan_gate.latest_gate_cycle, None);
+        assert_eq!(plan_gate.latest_outcome, None);
+        assert_eq!(plan_gate.latest_summary, None);
     }
 
     #[tokio::test]
