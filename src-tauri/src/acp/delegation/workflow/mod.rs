@@ -34,9 +34,13 @@ pub use artifact_resolver::{
     DocumentSha256Artifact, GitHeadV1Artifact, ResolvedArtifact,
 };
 pub use completion_evidence::{
-    materialize_terminal_completion_txn, retry_completion_artifact_txn, ArtifactRecoveryPayloadV1,
-    CompletionAttentionCas, CompletionSourceAuditRef, TerminalCompletionInput,
-    TerminalCompletionResult, ValidatedReportCandidate,
+    materialize_terminal_completion_txn, open_design_self_review_decision_txn,
+    reconcile_completion_attentions_txn, resolve_completion_decision_txn,
+    resolve_design_self_review_txn, resolve_workflow_completion_attentions_txn,
+    retry_completion_artifact_for_user_txn, retry_completion_artifact_txn,
+    ArtifactRecoveryPayloadV1, CompletionAttentionCas, CompletionAttentionReconcileReport,
+    CompletionMutationError, CompletionSourceAuditRef, DesignSelfReviewPayloadV1,
+    TerminalCompletionInput, TerminalCompletionResult, ValidatedReportCandidate,
 };
 pub use completion_intent::{
     build_conclusion_suffix, resolve_completion_intent, CompletionCandidate, CompletionDiagnostic,
@@ -54,7 +58,8 @@ pub use dto::{
 pub use error::{CompletionEvidenceError, WorkflowStoreError};
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
-    WorkflowRecoveryEvent, WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+    CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,
+    WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
 };
 pub use gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,

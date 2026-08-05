@@ -36,6 +36,7 @@ pub mod tool_watchdog;
 mod upload_jail;
 pub mod version_control;
 pub mod web_server;
+pub mod workflow_completion;
 pub mod workflow_graph;
 pub mod workspace_files;
 pub mod workspace_state;

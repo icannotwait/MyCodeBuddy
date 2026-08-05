@@ -860,6 +860,10 @@ fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static s
             "unauthorized",
             "delegation attention edge is not authorized",
         ),
+        AttentionStoreError::KindMismatch => (
+            "attention_kind_mismatch",
+            "attention kind does not accept a free-form parent reply",
+        ),
         AttentionStoreError::AlreadyOpen => (
             "already_open",
             "this task already has an open parent decision request",

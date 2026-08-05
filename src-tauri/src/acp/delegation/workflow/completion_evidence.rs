@@ -21,6 +21,7 @@ use super::completion_intent::{
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
 use super::error::CompletionEvidenceError;
+use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
     build_admission_completion_context, validate_completion_evidence, AdmissionCandidate,
     WorkflowStore,
@@ -31,14 +32,20 @@ use super::types::{
     COMPLETION_PROTOCOL_VERSION_V2,
 };
 use crate::acp::delegation::attention::{
-    open_terminal_completion_attention_txn, TerminalCompletionAttentionInput,
-    ATTENTION_PAYLOAD_MAX_BYTES,
+    open_design_self_review_attention_txn, open_terminal_completion_attention_txn,
+    CompletionAttentionResolutionCode, DesignSelfReviewAttentionInput,
+    TerminalCompletionAttentionInput, ATTENTION_PAYLOAD_MAX_BYTES,
 };
+use crate::acp::delegation::metrics::{
+    CompletionMetricPhase, CompletionScopeInvalidationDimension, DelegationMetrics,
+};
+use crate::acp::delegation::types::CompletionMutationResult;
 use crate::db::entities::delegation_attention_request::{self, AttentionKind};
 use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::CompletionProtocolMode;
 use crate::db::entities::{
-    delegation_completion_tool_intent, delegation_workflow, delegation_workflow_node_binding,
+    delegation_completion_tool_intent, delegation_workflow,
+    delegation_workflow_design_root_binding, delegation_workflow_node_binding,
     delegation_workflow_outbox_event, delegation_workflow_run_binding,
 };
 use crate::db::AppDatabase;
@@ -46,6 +53,59 @@ use crate::db::AppDatabase;
 const MAX_DOCUMENT_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
 const COMPLETION_DECISION_MESSAGE: &str = "Completion outcome requires a direct decision.";
 const ARTIFACT_RECOVERY_MESSAGE: &str = "Completion artifact is not yet available.";
+const DESIGN_SELF_REVIEW_MESSAGE: &str = "Design self-review requires a direct decision.";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompletionMutationError {
+    #[error("attention kind does not match this operation")]
+    KindMismatch,
+    #[error("completion attention is owned by another root conversation")]
+    Unauthorized,
+    #[error("completion decision was superseded")]
+    Superseded,
+    #[error("completion decision conflicts with a committed outcome")]
+    Conflict,
+    #[error("completion outcome is not legal for the durable role")]
+    RoleMismatch,
+    #[error("completion attention is invalid: {0}")]
+    InvalidAttention(String),
+    #[error(transparent)]
+    Evidence(#[from] CompletionEvidenceError),
+}
+
+impl CompletionMutationError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::KindMismatch => "attention_kind_mismatch",
+            Self::Unauthorized => "unauthorized",
+            Self::Superseded => "completion_decision_superseded",
+            Self::Conflict => "completion_decision_conflict",
+            Self::RoleMismatch => "completion_outcome_role_mismatch",
+            Self::InvalidAttention(_) => "completion_attention_invalid",
+            Self::Evidence(error) => error.code(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesignSelfReviewPayloadV1 {
+    pub version: u32,
+    pub design_identity: String,
+    pub gate_lineage: String,
+    pub legal_outcomes: Vec<CompletionOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserOutcomeResolutionV1 {
+    version: u32,
+    code: String,
+    outcome: CompletionOutcome,
+    actor_identity: String,
+    committed_scope_digest: String,
+    graph_revision: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedReportCandidate {
@@ -64,6 +124,7 @@ pub struct TerminalCompletionInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionAttentionCas {
     pub attention_id: String,
     pub task_id: String,
@@ -73,7 +134,7 @@ pub struct CompletionAttentionCas {
     pub node_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalCompletionResult {
     pub state: CompletionState,
     pub evidence: Option<CompletionEvidenceV2>,
@@ -131,8 +192,1000 @@ struct LoadedToolIntent {
 
 #[derive(Debug)]
 enum RetryTxnOutcome {
-    Resolved(Box<TerminalCompletionResult>),
+    Resolved {
+        result: Box<TerminalCompletionResult>,
+        idempotent_replay: bool,
+    },
+    Superseded {
+        phase: CompletionMetricPhase,
+        dimension: CompletionScopeInvalidationDimension,
+        record_metric: bool,
+    },
+}
+
+enum DecisionTxnOutcome {
+    Resolved(CompletionMutationResult),
     Superseded,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompletionAttentionReconcileReport {
+    pub retained: usize,
+    pub superseded: usize,
+    pub reopened: usize,
+}
+
+enum CompletionAttentionReconcileOutcome {
+    Retained,
+    Superseded,
+    Reopened,
+}
+
+/// Reconcile completion-family attention before replaying the durable outbox.
+/// Child questions remain owned by the Broker's live-edge reconciliation.
+pub async fn reconcile_completion_attentions_txn(
+    db: &AppDatabase,
+) -> Result<CompletionAttentionReconcileReport, CompletionEvidenceError> {
+    db.conn
+        .transaction::<_, CompletionAttentionReconcileReport, CompletionEvidenceError>(|txn| {
+            Box::pin(async move {
+                let rows = delegation_attention_request::Entity::find()
+                    .filter(delegation_attention_request::Column::Status.eq("open"))
+                    .filter(
+                        delegation_attention_request::Column::Kind.ne(AttentionKind::ChildQuestion),
+                    )
+                    .order_by_asc(delegation_attention_request::Column::CreatedAt)
+                    .order_by_asc(delegation_attention_request::Column::RequestId)
+                    .all(txn)
+                    .await
+                    .map_err(db_error)?;
+                let mut report = CompletionAttentionReconcileReport::default();
+                for row in rows {
+                    let outcome = match row.kind {
+                        AttentionKind::CompletionDecision
+                        | AttentionKind::CompletionArtifactRecovery => {
+                            reconcile_terminal_attention(txn, &row).await?
+                        }
+                        AttentionKind::DesignSelfReviewDecision => {
+                            reconcile_design_attention(txn, &row).await?
+                        }
+                        AttentionKind::ChildQuestion => continue,
+                    };
+                    match outcome {
+                        CompletionAttentionReconcileOutcome::Retained => report.retained += 1,
+                        CompletionAttentionReconcileOutcome::Superseded => report.superseded += 1,
+                        CompletionAttentionReconcileOutcome::Reopened => {
+                            report.superseded += 1;
+                            report.reopened += 1;
+                        }
+                    }
+                }
+                Ok(report)
+            })
+        })
+        .await
+        .map_err(|error| match error {
+            sea_orm::TransactionError::Connection(error) => {
+                CompletionEvidenceError::Persistence(error.to_string())
+            }
+            sea_orm::TransactionError::Transaction(error) => error,
+        })
+}
+
+/// Close every open completion-family row owned by a workflow before an
+/// explicit workflow termination/deletion. Recoverable `Blocked` state never
+/// calls this API.
+pub async fn resolve_workflow_completion_attentions_txn(
+    db: &AppDatabase,
+    workflow_id: &str,
+    code: CompletionAttentionResolutionCode,
+) -> Result<usize, CompletionEvidenceError> {
+    if !matches!(
+        code,
+        CompletionAttentionResolutionCode::WorkflowTerminated
+            | CompletionAttentionResolutionCode::WorkflowDeleted
+    ) {
+        return Err(CompletionEvidenceError::InvalidAttention(
+            "workflow cleanup requires a terminal lifecycle code".into(),
+        ));
+    }
+    let workflow_id = workflow_id.to_string();
+    db.conn
+        .transaction::<_, usize, CompletionEvidenceError>(|txn| {
+            let workflow_id = workflow_id.clone();
+            Box::pin(async move {
+                let rows = delegation_attention_request::Entity::find()
+                    .filter(delegation_attention_request::Column::Status.eq("open"))
+                    .filter(
+                        delegation_attention_request::Column::Kind.ne(AttentionKind::ChildQuestion),
+                    )
+                    .all(txn)
+                    .await
+                    .map_err(db_error)?;
+                let mut targets = Vec::new();
+                for row in rows {
+                    let belongs = match row.kind {
+                        AttentionKind::CompletionDecision
+                        | AttentionKind::CompletionArtifactRecovery => {
+                            delegation_workflow_run_binding::Entity::find_by_id(&row.task_id)
+                                .one(txn)
+                                .await
+                                .map_err(db_error)?
+                                .is_some_and(|binding| binding.workflow_id == workflow_id)
+                        }
+                        AttentionKind::DesignSelfReviewDecision => {
+                            delegation_workflow_design_root_binding::Entity::find()
+                                .filter(
+                                    delegation_workflow_design_root_binding::Column::TaskId
+                                        .eq(&row.task_id),
+                                )
+                                .one(txn)
+                                .await
+                                .map_err(db_error)?
+                                .is_some_and(|binding| binding.workflow_id == workflow_id)
+                        }
+                        AttentionKind::ChildQuestion => false,
+                    };
+                    if belongs {
+                        targets.push(row);
+                    }
+                }
+                if targets.is_empty() {
+                    return Ok(0);
+                }
+                let graph_revision = if delegation_workflow::Entity::find_by_id(&workflow_id)
+                    .one(txn)
+                    .await
+                    .map_err(db_error)?
+                    .is_some()
+                {
+                    bump_graph_revision(txn, &workflow_id, Utc::now())
+                        .await
+                        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?
+                } else {
+                    0
+                };
+                for row in &targets {
+                    resolve_completion_attention_row(txn, row, code, graph_revision).await?;
+                }
+                Ok(targets.len())
+            })
+        })
+        .await
+        .map_err(|error| match error {
+            sea_orm::TransactionError::Connection(error) => {
+                CompletionEvidenceError::Persistence(error.to_string())
+            }
+            sea_orm::TransactionError::Transaction(error) => error,
+        })
+}
+
+async fn reconcile_terminal_attention<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+) -> Result<CompletionAttentionReconcileOutcome, CompletionEvidenceError> {
+    let seed = match load_terminal(conn, &row.task_id).await {
+        Ok(loaded) => loaded,
+        Err(CompletionEvidenceError::InvalidTerminalState(_)) => {
+            supersede_orphaned_attention(conn, row).await?;
+            return Ok(CompletionAttentionReconcileOutcome::Superseded);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(loaded) = load_latest_unresolved_terminal_subject(conn, &seed).await? else {
+        let graph_revision =
+            bump_completion_graph(conn, &seed, "completion_decision_superseded").await?;
+        resolve_lifecycle_attention(
+            conn,
+            &attention_cas(row)?,
+            CompletionAttentionResolutionCode::Superseded,
+            graph_revision,
+        )
+        .await
+        .map_err(completion_mutation_error)?;
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    };
+    let expected_state = match row.kind {
+        AttentionKind::CompletionDecision => CompletionState::NeedsDecision,
+        AttentionKind::CompletionArtifactRecovery => CompletionState::ArtifactRecovery,
+        _ => {
+            return Err(CompletionEvidenceError::InvalidAttention(
+                "invalid terminal attention kind".into(),
+            ))
+        }
+    };
+    if loaded.run.completion_state != Some(expected_state.clone()) {
+        let graph_revision =
+            bump_completion_graph(conn, &loaded, "completion_decision_superseded").await?;
+        resolve_lifecycle_attention(
+            conn,
+            &attention_cas(row)?,
+            CompletionAttentionResolutionCode::Superseded,
+            graph_revision,
+        )
+        .await
+        .map_err(completion_mutation_error)?;
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    }
+    let context = rebuild_completion_context(conn, &loaded).await?;
+    let decision_payload = if row.kind == AttentionKind::CompletionDecision {
+        parse_attention_payload::<CompletionDecisionPayloadV1>(row).ok()
+    } else {
+        None
+    };
+    let artifact_payload = if row.kind == AttentionKind::CompletionArtifactRecovery {
+        parse_attention_payload::<ArtifactRecoveryPayloadV1>(row).ok()
+    } else {
+        None
+    };
+    let payload_is_current = match row.kind {
+        AttentionKind::CompletionDecision => decision_payload.as_ref().is_some_and(|payload| {
+            payload.version == 1
+                && payload.role == context.scope_role.completion_role()
+                && payload.legal_outcomes == legal_outcomes(context.scope_role.completion_role())
+        }),
+        AttentionKind::CompletionArtifactRecovery => {
+            artifact_payload.as_ref().is_some_and(|payload| {
+                payload.version == 1
+                    && payload.producer_task_id == loaded.run.task_id
+                    && payload.producer_generation == loaded.run.generation
+                    && payload.producer_scope_digest == context.evidence_scope_digest
+                    && payload.producer_baseline_head
+                        == loaded
+                            .binding
+                            .producer_baseline_head
+                            .clone()
+                            .unwrap_or_default()
+            })
+        }
+        _ => false,
+    };
+    let current = loaded.run.status == DelegationRunStatus::Completed
+        && loaded.run.completion_state == Some(expected_state.clone())
+        && loaded.run.parent_conversation_id == row.parent_conversation_id
+        && row.latest_run_id.as_deref() == Some(loaded.run.task_id.as_str())
+        && row.node_id.as_deref() == Some(loaded.node.node_id.as_str())
+        && row.captured_scope_digest.as_deref() == Some(context.evidence_scope_digest.as_str())
+        && ensure_context_matches_binding(&context, &loaded.binding).is_ok()
+        && payload_is_current;
+    if current {
+        return Ok(CompletionAttentionReconcileOutcome::Retained);
+    }
+
+    let request = attention_cas(row)?;
+    let graph_revision =
+        bump_completion_graph(conn, &loaded, "completion_decision_superseded").await?;
+    resolve_lifecycle_attention(
+        conn,
+        &request,
+        CompletionAttentionResolutionCode::Superseded,
+        graph_revision,
+    )
+    .await
+    .map_err(completion_mutation_error)?;
+
+    if loaded.run.task_id != row.task_id
+        && delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(&loaded.run.task_id))
+            .filter(delegation_attention_request::Column::Kind.eq(row.kind.clone()))
+            .filter(delegation_attention_request::Column::Status.eq("open"))
+            .one(conn)
+            .await
+            .map_err(db_error)?
+            .is_some()
+    {
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    }
+    if loaded.run.status != DelegationRunStatus::Completed
+        || loaded.run.completion_state != Some(expected_state)
+    {
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    }
+    match row.kind {
+        AttentionKind::CompletionDecision => {
+            let Some(payload) = decision_payload else {
+                return Ok(CompletionAttentionReconcileOutcome::Superseded);
+            };
+            open_completion_decision(
+                conn,
+                &loaded,
+                &context,
+                payload.reason_code,
+                payload.bounded_candidates,
+                payload.diagnostics,
+            )
+            .await?;
+        }
+        AttentionKind::CompletionArtifactRecovery => {
+            let Some(payload) = artifact_payload else {
+                return Ok(CompletionAttentionReconcileOutcome::Superseded);
+            };
+            open_artifact_recovery(
+                conn,
+                &loaded,
+                &context,
+                payload.normalized_intent,
+                payload.source_audit_ref,
+                payload.resolver_failure,
+            )
+            .await?;
+        }
+        _ => unreachable!("terminal kind checked above"),
+    }
+    Ok(CompletionAttentionReconcileOutcome::Reopened)
+}
+
+async fn load_latest_unresolved_terminal_subject<C: ConnectionTrait>(
+    conn: &C,
+    seed: &LoadedTerminal,
+) -> Result<Option<LoadedTerminal>, CompletionEvidenceError> {
+    let bindings = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(&seed.binding.workflow_id))
+        .filter(delegation_workflow_run_binding::Column::NodeId.eq(&seed.binding.node_id))
+        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+        .order_by_desc(delegation_workflow_run_binding::Column::CreatedAt)
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+    for binding in bindings {
+        let run = delegation_task_run::Entity::find_by_id(&binding.task_id)
+            .one(conn)
+            .await
+            .map_err(db_error)?;
+        if run.is_some_and(|run| {
+            run.status == DelegationRunStatus::Completed
+                && matches!(
+                    run.completion_state,
+                    Some(CompletionState::NeedsDecision | CompletionState::ArtifactRecovery)
+                )
+        }) {
+            return load_terminal(conn, &binding.task_id).await.map(Some);
+        }
+    }
+    Ok(None)
+}
+
+async fn reconcile_design_attention<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+) -> Result<CompletionAttentionReconcileOutcome, CompletionEvidenceError> {
+    let binding = delegation_workflow_design_root_binding::Entity::find()
+        .filter(delegation_workflow_design_root_binding::Column::TaskId.eq(&row.task_id))
+        .one(conn)
+        .await
+        .map_err(db_error)?;
+    let Some(binding) = binding else {
+        supersede_orphaned_attention(conn, row).await?;
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    };
+    let workflow = delegation_workflow::Entity::find_by_id(&binding.workflow_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?;
+    let Some(workflow) = workflow else {
+        supersede_orphaned_attention(conn, row).await?;
+        return Ok(CompletionAttentionReconcileOutcome::Superseded);
+    };
+    let payload = parse_attention_payload::<DesignSelfReviewPayloadV1>(row).ok();
+    let current = payload.as_ref().is_some_and(|payload| {
+        payload.version == 1
+            && payload.design_identity == binding.design_identity
+            && payload.gate_lineage == binding.gate_lineage
+            && payload.legal_outcomes == legal_outcomes(CompletionRole::Reviewer)
+            && workflow.parent_conversation_id == row.parent_conversation_id
+            && row.latest_run_id.as_deref() == Some(binding.latest_run_id.as_str())
+            && row.node_id.as_deref() == Some(binding.node_id.as_str())
+            && row.captured_scope_digest.as_deref() == Some(binding.evidence_scope_digest.as_str())
+    });
+    if current {
+        return Ok(CompletionAttentionReconcileOutcome::Retained);
+    }
+
+    let graph_revision = bump_graph_revision(conn, &workflow.workflow_id, Utc::now())
+        .await
+        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    resolve_lifecycle_attention(
+        conn,
+        &attention_cas(row)?,
+        CompletionAttentionResolutionCode::Superseded,
+        graph_revision,
+    )
+    .await
+    .map_err(completion_mutation_error)?;
+    open_design_self_review_decision_txn(conn, &binding, row.parent_conversation_id)
+        .await
+        .map_err(completion_mutation_error)?;
+    Ok(CompletionAttentionReconcileOutcome::Reopened)
+}
+
+async fn supersede_orphaned_attention<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+) -> Result<(), CompletionEvidenceError> {
+    resolve_completion_attention_row(conn, row, CompletionAttentionResolutionCode::Superseded, 0)
+        .await
+}
+
+async fn resolve_completion_attention_row<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+    code: CompletionAttentionResolutionCode,
+    graph_revision: u64,
+) -> Result<(), CompletionEvidenceError> {
+    let resolution_json = serde_json::to_string(&json!({
+        "version": 1,
+        "code": code.as_str(),
+        "graph_revision": graph_revision,
+    }))
+    .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    let result = delegation_attention_request::Entity::update_many()
+        .col_expr(
+            delegation_attention_request::Column::Status,
+            sea_orm::sea_query::Expr::value("resolved"),
+        )
+        .col_expr(
+            delegation_attention_request::Column::ResolutionCode,
+            sea_orm::sea_query::Expr::value(Some(code.as_str().to_string())),
+        )
+        .col_expr(
+            delegation_attention_request::Column::ResolutionJson,
+            sea_orm::sea_query::Expr::value(Some(resolution_json)),
+        )
+        .col_expr(
+            delegation_attention_request::Column::ResolvedAt,
+            sea_orm::sea_query::Expr::value(Some(Utc::now())),
+        )
+        .filter(delegation_attention_request::Column::RequestId.eq(&row.request_id))
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .exec(conn)
+        .await
+        .map_err(db_error)?;
+    if result.rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(CompletionEvidenceError::DecisionSuperseded)
+    }
+}
+
+fn completion_mutation_error(error: CompletionMutationError) -> CompletionEvidenceError {
+    match error {
+        CompletionMutationError::Evidence(error) => error,
+        error => CompletionEvidenceError::InvalidAttention(error.to_string()),
+    }
+}
+
+pub async fn resolve_completion_decision_txn(
+    db: &AppDatabase,
+    parent_conversation_id: i32,
+    request: CompletionAttentionCas,
+    outcome: CompletionOutcome,
+    actor_identity: &str,
+) -> Result<CompletionMutationResult, CompletionMutationError> {
+    let actor_identity = actor_identity.to_string();
+    let result = db
+        .conn
+        .transaction::<_, DecisionTxnOutcome, CompletionMutationError>(|txn| {
+            let request = request.clone();
+            let actor_identity = actor_identity.clone();
+            Box::pin(async move {
+                resolve_completion_decision_once(
+                    txn,
+                    parent_conversation_id,
+                    &request,
+                    outcome,
+                    &actor_identity,
+                )
+                .await
+            })
+        })
+        .await;
+    match result {
+        Ok(DecisionTxnOutcome::Resolved(result)) => Ok(result),
+        Ok(DecisionTxnOutcome::Superseded) => Err(CompletionMutationError::Superseded),
+        Err(sea_orm::TransactionError::Connection(error)) => {
+            Err(CompletionMutationError::Evidence(
+                CompletionEvidenceError::Persistence(error.to_string()),
+            ))
+        }
+        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
+    }
+}
+
+async fn resolve_completion_decision_once<C: ConnectionTrait>(
+    conn: &C,
+    parent_conversation_id: i32,
+    request: &CompletionAttentionCas,
+    outcome: CompletionOutcome,
+    actor_identity: &str,
+) -> Result<DecisionTxnOutcome, CompletionMutationError> {
+    let attention = load_mutation_attention(conn, &request.attention_id).await?;
+    require_attention_kind(&attention, request, AttentionKind::CompletionDecision)?;
+    require_attention_owner(&attention, parent_conversation_id)?;
+    if attention.status == "resolved" {
+        return replay_user_outcome(conn, &attention, request, outcome).await;
+    }
+    if !attention_cas_fields_match(&attention, request) {
+        return Err(CompletionMutationError::Superseded);
+    }
+    validate_attention_cas(&attention, request)?;
+    let payload: CompletionDecisionPayloadV1 = parse_attention_payload(&attention)?;
+    if payload.version != 1
+        || !payload.legal_outcomes.contains(&outcome)
+        || !payload.role.accepts(outcome)
+    {
+        return Err(CompletionMutationError::RoleMismatch);
+    }
+
+    let loaded = load_terminal(conn, &request.task_id).await?;
+    let context = rebuild_completion_context(conn, &loaded).await?;
+    if ensure_context_matches_binding(&context, &loaded.binding).is_err()
+        || context.evidence_scope_digest != request.captured_scope_digest
+        || loaded.run.task_id != request.latest_run_id
+        || loaded.node.node_id != request.node_id
+        || context.scope_role.completion_role() != payload.role
+    {
+        supersede_completion_attention(conn, &loaded, request).await?;
+        return Ok(DecisionTxnOutcome::Superseded);
+    }
+    let intent = CompletionIntent {
+        outcome,
+        summary: None,
+        report_file: None,
+        source: CompletionIntentSource::UserAdjudication,
+    };
+    match resolve_terminal_artifact(conn, &loaded, &context, outcome).await {
+        Ok(artifact) => {
+            let evidence =
+                persist_evidence_state(conn, &loaded, &context, intent, artifact, Utc::now())
+                    .await?;
+            let graph_revision = enqueue_completion_decision_resolved(
+                conn,
+                &loaded.workflow,
+                &loaded.run.task_id,
+                &loaded.node.node_id,
+                AttentionKind::CompletionDecision,
+                outcome,
+                &context.evidence_scope_digest,
+            )
+            .await?;
+            resolve_user_outcome_attention(conn, request, outcome, actor_identity, graph_revision)
+                .await?;
+            Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
+                workflow_id: loaded.workflow.workflow_id,
+                task_id: loaded.run.task_id,
+                node_id: loaded.node.node_id,
+                kind: AttentionKind::CompletionDecision,
+                outcome,
+                evidence_scope_digest: context.evidence_scope_digest,
+                graph_revision,
+                idempotent_replay: false,
+                completion: Some(TerminalCompletionResult {
+                    state: CompletionState::Resolved,
+                    evidence: Some(evidence),
+                    attention: None,
+                    graph_revision,
+                }),
+            }))
+        }
+        Err(ArtifactError::Unavailable(failure)) => {
+            let mut completion = open_artifact_recovery(
+                conn,
+                &loaded,
+                &context,
+                intent,
+                CompletionSourceAuditRef::UserAdjudication,
+                failure,
+            )
+            .await?;
+            let graph_revision = enqueue_completion_decision_resolved(
+                conn,
+                &loaded.workflow,
+                &loaded.run.task_id,
+                &loaded.node.node_id,
+                AttentionKind::CompletionDecision,
+                outcome,
+                &context.evidence_scope_digest,
+            )
+            .await?;
+            completion.graph_revision = graph_revision;
+            resolve_user_outcome_attention(conn, request, outcome, actor_identity, graph_revision)
+                .await?;
+            Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
+                workflow_id: loaded.workflow.workflow_id,
+                task_id: loaded.run.task_id,
+                node_id: loaded.node.node_id,
+                kind: AttentionKind::CompletionDecision,
+                outcome,
+                evidence_scope_digest: context.evidence_scope_digest,
+                graph_revision,
+                idempotent_replay: false,
+                completion: Some(completion),
+            }))
+        }
+        Err(error) => Err(CompletionEvidenceError::Artifact(error).into()),
+    }
+}
+
+pub async fn open_design_self_review_decision_txn<C: ConnectionTrait>(
+    conn: &C,
+    binding: &delegation_workflow_design_root_binding::Model,
+    parent_conversation_id: i32,
+) -> Result<CompletionAttentionCas, CompletionMutationError> {
+    let payload = DesignSelfReviewPayloadV1 {
+        version: 1,
+        design_identity: binding.design_identity.clone(),
+        gate_lineage: binding.gate_lineage.clone(),
+        legal_outcomes: legal_outcomes(CompletionRole::Reviewer),
+    };
+    let payload_json = serde_json::to_string(&payload).map_err(|error| {
+        CompletionMutationError::Evidence(CompletionEvidenceError::Persistence(error.to_string()))
+    })?;
+    let row = open_design_self_review_attention_txn(
+        conn,
+        &DesignSelfReviewAttentionInput {
+            binding,
+            parent_conversation_id,
+            message: DESIGN_SELF_REVIEW_MESSAGE,
+            payload_json: &payload_json,
+            created_at: Utc::now(),
+        },
+    )
+    .await
+    .map_err(|error| CompletionMutationError::InvalidAttention(error.to_string()))?;
+    attention_cas(&row).map_err(Into::into)
+}
+
+pub async fn resolve_design_self_review_txn(
+    db: &AppDatabase,
+    parent_conversation_id: i32,
+    request: CompletionAttentionCas,
+    outcome: CompletionOutcome,
+    actor_identity: &str,
+) -> Result<CompletionMutationResult, CompletionMutationError> {
+    let actor_identity = actor_identity.to_string();
+    let result = db
+        .conn
+        .transaction::<_, DecisionTxnOutcome, CompletionMutationError>(|txn| {
+            let request = request.clone();
+            let actor_identity = actor_identity.clone();
+            Box::pin(async move {
+                let attention = load_mutation_attention(txn, &request.attention_id).await?;
+                require_attention_kind(
+                    &attention,
+                    &request,
+                    AttentionKind::DesignSelfReviewDecision,
+                )?;
+                require_attention_owner(&attention, parent_conversation_id)?;
+                if attention.status == "resolved" {
+                    return replay_user_outcome(txn, &attention, &request, outcome).await;
+                }
+                if !attention_cas_fields_match(&attention, &request) {
+                    return Err(CompletionMutationError::Superseded);
+                }
+                validate_attention_cas(&attention, &request)?;
+                let payload: DesignSelfReviewPayloadV1 = parse_attention_payload(&attention)?;
+                if payload.version != 1
+                    || !payload.legal_outcomes.contains(&outcome)
+                    || !CompletionRole::Reviewer.accepts(outcome)
+                {
+                    return Err(CompletionMutationError::RoleMismatch);
+                }
+                let binding = delegation_workflow_design_root_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_design_root_binding::Column::TaskId
+                            .eq(&request.task_id),
+                    )
+                    .one(txn)
+                    .await
+                    .map_err(db_error)?
+                    .ok_or(CompletionMutationError::Superseded)?;
+                let workflow = delegation_workflow::Entity::find_by_id(&binding.workflow_id)
+                    .one(txn)
+                    .await
+                    .map_err(db_error)?
+                    .ok_or(CompletionMutationError::Superseded)?;
+                if workflow.parent_conversation_id != parent_conversation_id {
+                    return Err(CompletionMutationError::Unauthorized);
+                }
+                if binding.task_id != request.task_id
+                    || binding.latest_run_id != request.latest_run_id
+                    || binding.node_id != request.node_id
+                    || binding.evidence_scope_digest != request.captured_scope_digest
+                    || binding.design_identity != payload.design_identity
+                    || binding.gate_lineage != payload.gate_lineage
+                {
+                    let graph_revision =
+                        bump_graph_revision(txn, &workflow.workflow_id, Utc::now())
+                            .await
+                            .map_err(|error| {
+                                CompletionMutationError::Evidence(
+                                    CompletionEvidenceError::Persistence(error.to_string()),
+                                )
+                            })?;
+                    resolve_lifecycle_attention(
+                        txn,
+                        &request,
+                        CompletionAttentionResolutionCode::Superseded,
+                        graph_revision,
+                    )
+                    .await?;
+                    return Ok(DecisionTxnOutcome::Superseded);
+                }
+                let graph_revision = enqueue_completion_decision_resolved(
+                    txn,
+                    &workflow,
+                    &binding.task_id,
+                    &binding.node_id,
+                    AttentionKind::DesignSelfReviewDecision,
+                    outcome,
+                    &binding.evidence_scope_digest,
+                )
+                .await?;
+                resolve_user_outcome_attention(
+                    txn,
+                    &request,
+                    outcome,
+                    &actor_identity,
+                    graph_revision,
+                )
+                .await?;
+                Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
+                    workflow_id: workflow.workflow_id,
+                    task_id: binding.task_id,
+                    node_id: binding.node_id,
+                    kind: AttentionKind::DesignSelfReviewDecision,
+                    outcome,
+                    evidence_scope_digest: binding.evidence_scope_digest,
+                    graph_revision,
+                    idempotent_replay: false,
+                    completion: None,
+                }))
+            })
+        })
+        .await;
+    match result {
+        Ok(DecisionTxnOutcome::Resolved(result)) => Ok(result),
+        Ok(DecisionTxnOutcome::Superseded) => Err(CompletionMutationError::Superseded),
+        Err(sea_orm::TransactionError::Connection(error)) => {
+            Err(CompletionMutationError::Evidence(
+                CompletionEvidenceError::Persistence(error.to_string()),
+            ))
+        }
+        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
+    }
+}
+
+async fn load_mutation_attention<C: ConnectionTrait>(
+    conn: &C,
+    attention_id: &str,
+) -> Result<delegation_attention_request::Model, CompletionMutationError> {
+    delegation_attention_request::Entity::find_by_id(attention_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?
+        .ok_or(CompletionMutationError::Superseded)
+}
+
+fn require_attention_kind(
+    row: &delegation_attention_request::Model,
+    request: &CompletionAttentionCas,
+    expected: AttentionKind,
+) -> Result<(), CompletionMutationError> {
+    if request.kind == expected && row.kind == expected {
+        Ok(())
+    } else {
+        Err(CompletionMutationError::KindMismatch)
+    }
+}
+
+fn require_attention_owner(
+    row: &delegation_attention_request::Model,
+    parent_conversation_id: i32,
+) -> Result<(), CompletionMutationError> {
+    if row.parent_conversation_id == parent_conversation_id {
+        Ok(())
+    } else {
+        Err(CompletionMutationError::Unauthorized)
+    }
+}
+
+fn parse_attention_payload<T: serde::de::DeserializeOwned>(
+    row: &delegation_attention_request::Model,
+) -> Result<T, CompletionMutationError> {
+    let json = row.payload_json.as_deref().ok_or_else(|| {
+        CompletionMutationError::InvalidAttention("typed attention payload is missing".into())
+    })?;
+    serde_json::from_str(json)
+        .map_err(|error| CompletionMutationError::InvalidAttention(error.to_string()))
+}
+
+async fn replay_user_outcome<C: ConnectionTrait>(
+    conn: &C,
+    row: &delegation_attention_request::Model,
+    request: &CompletionAttentionCas,
+    outcome: CompletionOutcome,
+) -> Result<DecisionTxnOutcome, CompletionMutationError> {
+    if !attention_cas_fields_match(row, request) {
+        return Err(CompletionMutationError::Superseded);
+    }
+    match row.resolution_code.as_deref() {
+        Some("superseded" | "workflow_terminated" | "workflow_deleted") => {
+            return Err(CompletionMutationError::Superseded)
+        }
+        Some("user_outcome_committed") => {}
+        _ => return Err(CompletionMutationError::Conflict),
+    }
+    let resolution: UserOutcomeResolutionV1 = row
+        .resolution_json
+        .as_deref()
+        .ok_or_else(|| {
+            CompletionMutationError::InvalidAttention(
+                "committed attention resolution is missing".into(),
+            )
+        })
+        .and_then(|json| {
+            serde_json::from_str(json)
+                .map_err(|error| CompletionMutationError::InvalidAttention(error.to_string()))
+        })?;
+    if resolution.version != 1
+        || resolution.code != CompletionAttentionResolutionCode::UserOutcomeCommitted.as_str()
+        || resolution.outcome != outcome
+        || resolution.committed_scope_digest != request.captured_scope_digest
+    {
+        return Err(CompletionMutationError::Conflict);
+    }
+
+    let (workflow_id, node_id, completion) = match row.kind {
+        AttentionKind::CompletionDecision => {
+            let loaded = load_terminal(conn, &request.task_id).await?;
+            let mut completion = existing_result(conn, &loaded).await?;
+            if let Some(value) = completion.as_mut() {
+                value.graph_revision = resolution.graph_revision;
+            }
+            (loaded.workflow.workflow_id, loaded.node.node_id, completion)
+        }
+        AttentionKind::DesignSelfReviewDecision => {
+            let binding = delegation_workflow_design_root_binding::Entity::find()
+                .filter(
+                    delegation_workflow_design_root_binding::Column::TaskId.eq(&request.task_id),
+                )
+                .one(conn)
+                .await
+                .map_err(db_error)?
+                .ok_or(CompletionMutationError::Superseded)?;
+            (binding.workflow_id, binding.node_id, None)
+        }
+        _ => return Err(CompletionMutationError::KindMismatch),
+    };
+    Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
+        workflow_id,
+        task_id: request.task_id.clone(),
+        node_id,
+        kind: row.kind.clone(),
+        outcome,
+        evidence_scope_digest: request.captured_scope_digest.clone(),
+        graph_revision: resolution.graph_revision,
+        idempotent_replay: true,
+        completion,
+    }))
+}
+
+async fn resolve_user_outcome_attention<C: ConnectionTrait>(
+    conn: &C,
+    request: &CompletionAttentionCas,
+    outcome: CompletionOutcome,
+    actor_identity: &str,
+    graph_revision: u64,
+) -> Result<(), CompletionMutationError> {
+    let resolution_json = serde_json::to_string(&UserOutcomeResolutionV1 {
+        version: 1,
+        code: CompletionAttentionResolutionCode::UserOutcomeCommitted
+            .as_str()
+            .into(),
+        outcome,
+        actor_identity: actor_identity.to_string(),
+        committed_scope_digest: request.captured_scope_digest.clone(),
+        graph_revision,
+    })
+    .map_err(|error| {
+        CompletionMutationError::Evidence(CompletionEvidenceError::Persistence(error.to_string()))
+    })?;
+    resolve_attention_txn(
+        conn,
+        request,
+        CompletionAttentionResolutionCode::UserOutcomeCommitted.as_str(),
+        Some(resolution_json),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn resolve_lifecycle_attention<C: ConnectionTrait>(
+    conn: &C,
+    request: &CompletionAttentionCas,
+    code: CompletionAttentionResolutionCode,
+    graph_revision: u64,
+) -> Result<(), CompletionMutationError> {
+    let resolution_json = serde_json::to_string(&json!({
+        "version": 1,
+        "code": code.as_str(),
+        "graph_revision": graph_revision,
+    }))
+    .map_err(|error| {
+        CompletionMutationError::Evidence(CompletionEvidenceError::Persistence(error.to_string()))
+    })?;
+    resolve_attention_txn(conn, request, code.as_str(), Some(resolution_json))
+        .await
+        .map_err(Into::into)
+}
+
+async fn supersede_completion_attention<C: ConnectionTrait>(
+    conn: &C,
+    loaded: &LoadedTerminal,
+    request: &CompletionAttentionCas,
+) -> Result<(), CompletionMutationError> {
+    let graph_revision =
+        bump_completion_graph(conn, loaded, "completion_decision_superseded").await?;
+    resolve_lifecycle_attention(
+        conn,
+        request,
+        CompletionAttentionResolutionCode::Superseded,
+        graph_revision,
+    )
+    .await
+}
+
+async fn enqueue_completion_decision_resolved<C: ConnectionTrait>(
+    conn: &C,
+    workflow: &delegation_workflow::Model,
+    task_id: &str,
+    node_id: &str,
+    kind: AttentionKind,
+    outcome: CompletionOutcome,
+    evidence_scope_digest: &str,
+) -> Result<u64, CompletionEvidenceError> {
+    let graph_revision = bump_graph_revision(conn, &workflow.workflow_id, Utc::now())
+        .await
+        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let payload_json = serde_json::to_string(&CompletionDecisionResolvedPayloadV1 {
+        version: 1,
+        event_id: event_id.clone(),
+        workflow_id: workflow.workflow_id.clone(),
+        task_id: task_id.to_string(),
+        node_id: node_id.to_string(),
+        kind: kind.clone(),
+        outcome,
+        evidence_scope_digest: evidence_scope_digest.to_string(),
+        graph_revision,
+    })
+    .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    delegation_workflow_outbox_event::ActiveModel {
+        event_id: Set(event_id),
+        workflow_id: Set(workflow.workflow_id.clone()),
+        graph_revision: Set(i64::try_from(graph_revision).map_err(|_| {
+            CompletionEvidenceError::Persistence("graph revision exceeds i64".into())
+        })?),
+        event_kind: Set(COMPLETION_DECISION_RESOLVED_EVENT.into()),
+        subject_key: Set(format!("{}:{task_id}", attention_kind_label(&kind))),
+        payload_json: Set(payload_json),
+        dispatch_attempts: Set(0),
+        created_at: Set(Utc::now()),
+        delivered_at: Set(None),
+    }
+    .insert(conn)
+    .await
+    .map_err(db_error)?;
+    Ok(graph_revision)
+}
+
+fn attention_kind_label(kind: &AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::ChildQuestion => "child_question",
+        AttentionKind::CompletionDecision => "completion_decision",
+        AttentionKind::CompletionArtifactRecovery => "completion_artifact_recovery",
+        AttentionKind::DesignSelfReviewDecision => "design_self_review_decision",
+    }
 }
 
 pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
@@ -249,8 +1302,77 @@ pub async fn retry_completion_artifact_txn(
         Err(sea_orm::TransactionError::Transaction(error)) => return Err(error),
     };
     match outcome {
-        RetryTxnOutcome::Resolved(result) => Ok(*result),
-        RetryTxnOutcome::Superseded => Err(CompletionEvidenceError::DecisionSuperseded),
+        RetryTxnOutcome::Resolved { result, .. } => Ok(*result),
+        RetryTxnOutcome::Superseded { .. } => Err(CompletionEvidenceError::DecisionSuperseded),
+    }
+}
+
+pub async fn retry_completion_artifact_for_user_txn(
+    db: &AppDatabase,
+    parent_conversation_id: i32,
+    request: CompletionAttentionCas,
+    metrics: &DelegationMetrics,
+) -> Result<CompletionMutationResult, CompletionMutationError> {
+    let result = db
+        .conn
+        .transaction::<_, RetryTxnOutcome, CompletionMutationError>(|txn| {
+            let request = request.clone();
+            Box::pin(async move {
+                let attention = load_mutation_attention(txn, &request.attention_id).await?;
+                require_attention_kind(
+                    &attention,
+                    &request,
+                    AttentionKind::CompletionArtifactRecovery,
+                )?;
+                require_attention_owner(&attention, parent_conversation_id)?;
+                if !attention_cas_fields_match(&attention, &request) {
+                    return Err(CompletionMutationError::Superseded);
+                }
+                retry_completion_artifact_once(txn, &request)
+                    .await
+                    .map_err(Into::into)
+            })
+        })
+        .await;
+    match result {
+        Ok(RetryTxnOutcome::Resolved {
+            result,
+            idempotent_replay,
+        }) => {
+            let completion = *result;
+            let evidence = completion.evidence.as_ref().ok_or_else(|| {
+                CompletionMutationError::InvalidAttention(
+                    "resolved artifact retry has no completion evidence".into(),
+                )
+            })?;
+            Ok(CompletionMutationResult {
+                workflow_id: evidence.binding.workflow_id.clone(),
+                task_id: evidence.binding.task_id.clone(),
+                node_id: evidence.binding.node_id.clone(),
+                kind: AttentionKind::CompletionArtifactRecovery,
+                outcome: evidence.intent.outcome,
+                evidence_scope_digest: evidence.evidence_scope_digest.clone(),
+                graph_revision: completion.graph_revision,
+                idempotent_replay,
+                completion: Some(completion),
+            })
+        }
+        Ok(RetryTxnOutcome::Superseded {
+            phase,
+            dimension,
+            record_metric,
+        }) => {
+            if record_metric {
+                metrics.record_completion_scope_invalidation(phase, dimension);
+            }
+            Err(CompletionMutationError::Superseded)
+        }
+        Err(sea_orm::TransactionError::Connection(error)) => {
+            Err(CompletionMutationError::Evidence(
+                CompletionEvidenceError::Persistence(error.to_string()),
+            ))
+        }
+        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
     }
 }
 
@@ -277,17 +1399,35 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
         return match attention.resolution_code.as_deref() {
             Some("artifact_resolved") => {
                 let loaded = load_terminal(conn, &request.task_id).await?;
-                existing_result(conn, &loaded)
+                let graph_revision = attention
+                    .resolution_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|value| value.get("graph_revision").and_then(|value| value.as_u64()))
+                    .ok_or_else(|| {
+                        CompletionEvidenceError::InvalidAttention(
+                            "resolved artifact attention has no committed graph revision".into(),
+                        )
+                    })?;
+                let mut result = existing_result(conn, &loaded)
                     .await?
                     .filter(|result| result.state == CompletionState::Resolved)
-                    .map(|result| RetryTxnOutcome::Resolved(Box::new(result)))
                     .ok_or_else(|| {
                         CompletionEvidenceError::InvalidAttention(
                             "resolved artifact attention has no resolved evidence".into(),
                         )
-                    })
+                    })?;
+                result.graph_revision = graph_revision;
+                Ok(RetryTxnOutcome::Resolved {
+                    result: Box::new(result),
+                    idempotent_replay: true,
+                })
             }
-            Some("superseded") => Ok(RetryTxnOutcome::Superseded),
+            Some("superseded") => Ok(RetryTxnOutcome::Superseded {
+                phase: CompletionMetricPhase::Unknown,
+                dimension: CompletionScopeInvalidationDimension::Policy,
+                record_metric: false,
+            }),
             _ => Err(CompletionEvidenceError::InvalidAttention(
                 "artifact attention has an incompatible resolution".into(),
             )),
@@ -309,13 +1449,8 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
     }
 
     let loaded = load_terminal(conn, &request.task_id).await?;
-    let context = rebuild_completion_context(conn, &loaded).await;
-    let current = context.as_ref().ok().and_then(|context| {
-        ensure_context_matches_binding(context, &loaded.binding)
-            .ok()
-            .map(|_| context)
-    });
-    let current_matches = current.is_some_and(|context| {
+    let context = rebuild_completion_context(conn, &loaded).await?;
+    let current_matches = ensure_context_matches_binding(&context, &loaded.binding).is_ok() && {
         context.evidence_scope_digest == payload.producer_scope_digest
             && loaded.run.generation == payload.producer_generation
             && loaded
@@ -324,28 +1459,56 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
                 .as_deref()
                 .unwrap_or_default()
                 == payload.producer_baseline_head
-    });
+    };
     if !current_matches {
-        resolve_attention_txn(conn, request, "superseded", None).await?;
-        let _ = bump_completion_graph(conn, &loaded, "completion_decision_superseded").await?;
-        return Ok(RetryTxnOutcome::Superseded);
+        let graph_revision =
+            bump_completion_graph(conn, &loaded, "completion_decision_superseded").await?;
+        let resolution_json = serde_json::to_string(&json!({
+            "version": 1,
+            "code": CompletionAttentionResolutionCode::Superseded.as_str(),
+            "graph_revision": graph_revision,
+        }))
+        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+        resolve_attention_txn(
+            conn,
+            request,
+            CompletionAttentionResolutionCode::Superseded.as_str(),
+            Some(resolution_json),
+        )
+        .await?;
+        let (phase, dimension) = retry_scope_invalidation(&loaded, Some(&context), &payload);
+        return Ok(RetryTxnOutcome::Superseded {
+            phase,
+            dimension,
+            record_metric: true,
+        });
     }
-    let context = current.expect("checked current completion context");
     let artifact =
-        resolve_terminal_artifact(conn, &loaded, context, payload.normalized_intent.outcome)
+        resolve_terminal_artifact(conn, &loaded, &context, payload.normalized_intent.outcome)
             .await?;
     if artifact.kind() != payload.expected_resolver_kind {
         return Err(CompletionEvidenceError::InvalidAttention(
             "resolved artifact kind changed".into(),
         ));
     }
+    let resolved_outcome = payload.normalized_intent.outcome;
     let evidence = persist_evidence_state(
         conn,
         &loaded,
-        context,
+        &context,
         payload.normalized_intent,
         artifact.clone(),
         Utc::now(),
+    )
+    .await?;
+    let graph_revision = enqueue_completion_decision_resolved(
+        conn,
+        &loaded.workflow,
+        &loaded.run.task_id,
+        &loaded.node.node_id,
+        AttentionKind::CompletionArtifactRecovery,
+        resolved_outcome,
+        &context.evidence_scope_digest,
     )
     .await?;
     let resolution_json = serde_json::to_string(&json!({
@@ -353,19 +1516,19 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
         "code": "artifact_resolved",
         "resolver_kind": artifact.kind(),
         "artifact": completion_artifact(&artifact),
+        "graph_revision": graph_revision,
     }))
     .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
     resolve_attention_txn(conn, request, "artifact_resolved", Some(resolution_json)).await?;
-    let graph_revision =
-        bump_completion_graph(conn, &loaded, "completion_artifact_resolved").await?;
-    Ok(RetryTxnOutcome::Resolved(Box::new(
-        TerminalCompletionResult {
+    Ok(RetryTxnOutcome::Resolved {
+        result: Box::new(TerminalCompletionResult {
             state: CompletionState::Resolved,
             evidence: Some(evidence),
             attention: None,
             graph_revision,
-        },
-    )))
+        }),
+        idempotent_replay: false,
+    })
 }
 
 async fn load_terminal<C: ConnectionTrait>(
@@ -471,6 +1634,58 @@ fn ensure_context_matches_binding(
     } else {
         Err(super::evidence_scope::EvidenceScopeError::ScopeChanged.into())
     }
+}
+
+fn retry_scope_invalidation(
+    loaded: &LoadedTerminal,
+    current: Option<&AdmissionCompletionContextV2>,
+    payload: &ArtifactRecoveryPayloadV1,
+) -> (CompletionMetricPhase, CompletionScopeInvalidationDimension) {
+    let phase = match loaded.node.phase_id.as_str() {
+        "design" => CompletionMetricPhase::Design,
+        "plan" => CompletionMetricPhase::Plan,
+        "tasks" => CompletionMetricPhase::Tasks,
+        "final" => CompletionMetricPhase::Final,
+        _ => CompletionMetricPhase::Unknown,
+    };
+    let dimension = if loaded.run.generation != payload.producer_generation
+        || loaded
+            .binding
+            .producer_baseline_head
+            .as_deref()
+            .unwrap_or_default()
+            != payload.producer_baseline_head
+    {
+        CompletionScopeInvalidationDimension::Producer
+    } else if let Some(current) = current {
+        if loaded.binding.instruction_block_digest.as_deref()
+            != Some(current.instruction.digest.as_str())
+        {
+            CompletionScopeInvalidationDimension::Instruction
+        } else if loaded.binding.requirements_identity != current.requirements_identity {
+            CompletionScopeInvalidationDimension::Requirements
+        } else if loaded.binding.final_findings_identity != current.final_findings_identity {
+            CompletionScopeInvalidationDimension::FinalFindings
+        } else if loaded.binding.gate_lineage != current.evidence_scope.gate_lineage
+            || loaded.binding.review_round != current.evidence_scope.review_round.map(i64::from)
+        {
+            CompletionScopeInvalidationDimension::Lineage
+        } else if loaded.binding.task_specification_identity != current.task_specification_identity
+            || loaded.binding.material_selector_digest != current.material_selector_digest
+            || loaded.binding.subject_material_digest != current.subject_material_digest
+        {
+            CompletionScopeInvalidationDimension::TaskScope
+        } else if loaded.binding.evidence_scope_digest.as_deref()
+            != Some(current.evidence_scope_digest.as_str())
+        {
+            CompletionScopeInvalidationDimension::Policy
+        } else {
+            CompletionScopeInvalidationDimension::Artifact
+        }
+    } else {
+        CompletionScopeInvalidationDimension::Artifact
+    };
+    (phase, dimension)
 }
 
 async fn load_tool_intents<C: ConnectionTrait>(
@@ -1081,17 +2296,27 @@ fn db_error(error: sea_orm::DbErr) -> CompletionEvidenceError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::{
-        materialize_terminal_completion_txn, retry_completion_artifact_txn,
-        CompletionDecisionPayloadV1, TerminalCompletionInput, ValidatedReportCandidate,
+        materialize_terminal_completion_txn, open_design_self_review_decision_txn,
+        reconcile_completion_attentions_txn, resolve_completion_decision_txn,
+        resolve_design_self_review_txn, resolve_workflow_completion_attentions_txn,
+        retry_completion_artifact_for_user_txn, retry_completion_artifact_txn,
+        CompletionDecisionPayloadV1, CompletionMutationError, TerminalCompletionInput,
+        ValidatedReportCandidate,
     };
+    use crate::acp::delegation::event_emitter::{
+        CompletionOutboxDispatcher, CompletionRootWakeQueue,
+    };
+    use crate::acp::delegation::metrics::DelegationMetrics;
     use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::{Settlement, TerminalTaskWrite};
     use crate::acp::delegation::workflow::store::{
@@ -1114,6 +2339,10 @@ mod tests {
         self, AdmissionClass, CompletionState, DelegationRunStatus,
     };
     use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
+    use crate::db::entities::{
+        delegation_workflow_design_root_binding, delegation_workflow_gate_state,
+        delegation_workflow_outbox_event,
+    };
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
     use crate::models::AgentType;
@@ -1137,7 +2366,34 @@ mod tests {
         workspace_path: std::path::PathBuf,
         task_id: String,
         workflow_id: String,
+        parent_conversation_id: i32,
         input: TerminalCompletionInput,
+    }
+
+    struct RecordingRootWake {
+        db: Arc<AppDatabase>,
+        event_ids: tokio::sync::Mutex<HashSet<String>>,
+        observed_pending: tokio::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl CompletionRootWakeQueue for RecordingRootWake {
+        async fn enqueue_completion_resolution(
+            &self,
+            event: &super::CompletionDecisionResolvedPayloadV1,
+        ) -> Result<(), String> {
+            let row = delegation_workflow_outbox_event::Entity::find_by_id(&event.event_id)
+                .one(&self.db.conn)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "outbox row disappeared before root wake".to_string())?;
+            self.observed_pending
+                .lock()
+                .await
+                .push(row.delivered_at.is_none());
+            self.event_ids.lock().await.insert(event.event_id.clone());
+            Ok(())
+        }
     }
 
     impl TerminalFixture {
@@ -1271,6 +2527,7 @@ mod tests {
                 workspace_path,
                 task_id,
                 workflow_id,
+                parent_conversation_id: parent,
                 input,
             }
         }
@@ -1423,6 +2680,472 @@ mod tests {
             .filter(|row| row.status == "open" && row.kind == AttentionKind::CompletionDecision)
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_adjudication_enforces_owner_kind_role_cas_and_replay() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let cas = fixture.materialize().await.attention.unwrap();
+
+        let foreign = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id + 1,
+            cas.clone(),
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign, CompletionMutationError::Unauthorized);
+
+        let mut wrong_kind = cas.clone();
+        wrong_kind.kind = AttentionKind::CompletionArtifactRecovery;
+        let wrong_kind = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            wrong_kind,
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_kind, CompletionMutationError::KindMismatch);
+
+        let role_mismatch = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            CompletionOutcome::Approve,
+            "application_user",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(role_mismatch, CompletionMutationError::RoleMismatch);
+
+        for stale in [
+            {
+                let mut value = cas.clone();
+                value.attention_id.push_str("-stale");
+                value
+            },
+            {
+                let mut value = cas.clone();
+                value.task_id.push_str("-stale");
+                value
+            },
+            {
+                let mut value = cas.clone();
+                value.captured_scope_digest = format!("sha256:{}", "f".repeat(64));
+                value
+            },
+            {
+                let mut value = cas.clone();
+                value.latest_run_id.push_str("-stale");
+                value
+            },
+            {
+                let mut value = cas.clone();
+                value.node_id.push_str("-stale");
+                value
+            },
+        ] {
+            let error = resolve_completion_decision_txn(
+                &fixture.db,
+                fixture.parent_conversation_id,
+                stale,
+                CompletionOutcome::Done,
+                "application_user",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, CompletionMutationError::Superseded);
+        }
+
+        let first = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        assert!(!first.idempotent_replay);
+        let replay = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(first.graph_revision, replay.graph_revision);
+        assert_eq!(
+            delegation_workflow_outbox_event::Entity::find()
+                .filter(
+                    delegation_workflow_outbox_event::Column::EventKind
+                        .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
+                )
+                .all(&fixture.db.conn)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let conflict = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas,
+            CompletionOutcome::Blocked,
+            "application_user",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict, CompletionMutationError::Conflict);
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_artifact_retry_is_typed_and_records_scope_invalidation() {
+        let fixture = TerminalFixture::new(IntentFixture::AssistantText, false).await;
+        let cas = fixture.materialize().await.attention.unwrap();
+        let metrics = DelegationMetrics::default();
+
+        let foreign = retry_completion_artifact_for_user_txn(
+            &fixture.db,
+            fixture.parent_conversation_id + 1,
+            cas.clone(),
+            &metrics,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign, CompletionMutationError::Unauthorized);
+
+        let mut wrong_kind = cas.clone();
+        wrong_kind.kind = AttentionKind::CompletionDecision;
+        let wrong_kind = retry_completion_artifact_for_user_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            wrong_kind,
+            &metrics,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_kind, CompletionMutationError::KindMismatch);
+
+        let plan_path = fixture.workspace_path.join(PLAN_REL_PATH);
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan_path, b"# Plan\n\nRecovered.\n").unwrap();
+        let first = retry_completion_artifact_for_user_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            &metrics,
+        )
+        .await
+        .unwrap();
+        let replay = retry_completion_artifact_for_user_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(!first.idempotent_replay);
+        assert!(replay.idempotent_replay);
+        assert_eq!(first.graph_revision, replay.graph_revision);
+
+        let stale = TerminalFixture::new(IntentFixture::Tool, false).await;
+        let stale_cas = stale.materialize().await.attention.unwrap();
+        let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+            stale.task_id.clone(),
+        )
+        .one(&stale.db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut active: crate::db::entities::delegation_workflow_run_binding::ActiveModel =
+            binding.into();
+        active.instruction_block_digest = Set(Some(format!("sha256:{}", "f".repeat(64))));
+        active.update(&stale.db.conn).await.unwrap();
+        let stale_metrics = DelegationMetrics::default();
+        let error = retry_completion_artifact_for_user_txn(
+            &stale.db,
+            stale.parent_conversation_id,
+            stale_cas.clone(),
+            &stale_metrics,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, CompletionMutationError::Superseded);
+        assert_eq!(
+            stale_metrics
+                .snapshot()
+                .completion_scope_invalidations
+                .get("plan:instruction")
+                .copied(),
+            Some(1)
+        );
+        let replay_error = retry_completion_artifact_for_user_txn(
+            &stale.db,
+            stale.parent_conversation_id,
+            stale_cas,
+            &stale_metrics,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(replay_error, CompletionMutationError::Superseded);
+        assert_eq!(
+            stale_metrics
+                .snapshot()
+                .completion_scope_invalidations
+                .get("plan:instruction")
+                .copied(),
+            Some(1),
+            "replaying an already-superseded retry must not double-count"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_decision_wakes_root_when_artifact_recovery_opens() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, false).await;
+        let cas = fixture.materialize().await.attention.unwrap();
+        let result = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas,
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.completion.as_ref().unwrap().state,
+            CompletionState::ArtifactRecovery
+        );
+        let events = delegation_workflow_outbox_event::Entity::find()
+            .filter(
+                delegation_workflow_outbox_event::Column::EventKind
+                    .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
+            )
+            .all(&fixture.db.conn)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].graph_revision, result.graph_revision as i64);
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_design_self_review_is_typed_and_replayable() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(fixture.workflow_id.clone()),
+            gate_id: Set("design".into()),
+            gate_lineage: Set("design-lineage-1".into()),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set(r#"["design-reviewer"]"#.into()),
+        }
+        .insert(&fixture.db.conn)
+        .await
+        .unwrap();
+        let binding = delegation_workflow_design_root_binding::ActiveModel {
+            workflow_id: Set(fixture.workflow_id.clone()),
+            gate_id: Set("design".into()),
+            gate_lineage: Set("design-lineage-1".into()),
+            node_id: Set("design-reviewer".into()),
+            task_id: Set("design-root-task-1".into()),
+            latest_run_id: Set("design-root-run-1".into()),
+            design_identity: Set(format!("sha256:{}", "d".repeat(64))),
+            evidence_scope_digest: Set(format!("sha256:{}", "e".repeat(64))),
+            graph_revision: Set(1),
+        }
+        .insert(&fixture.db.conn)
+        .await
+        .unwrap();
+        let cas = open_design_self_review_decision_txn(
+            &fixture.db.conn,
+            &binding,
+            fixture.parent_conversation_id,
+        )
+        .await
+        .unwrap();
+
+        let first = resolve_design_self_review_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            CompletionOutcome::Approve,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        let replay = resolve_design_self_review_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas,
+            CompletionOutcome::Approve,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.graph_revision, replay.graph_revision);
+        assert!(replay.idempotent_replay);
+        assert!(first.completion.is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_outbox_replays_after_commit_and_dedupes_root_wake() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let cas = fixture.materialize().await.attention.unwrap();
+        resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas,
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+
+        let outbox = delegation_workflow_outbox_event::Entity::find()
+            .filter(
+                delegation_workflow_outbox_event::Column::EventKind
+                    .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
+            )
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outbox.dispatch_attempts, 0);
+        assert!(outbox.delivered_at.is_none());
+
+        let wake = Arc::new(RecordingRootWake {
+            db: fixture.db.clone(),
+            event_ids: tokio::sync::Mutex::new(HashSet::new()),
+            observed_pending: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let dispatcher = CompletionOutboxDispatcher::new(fixture.db.clone(), EventEmitter::Noop)
+            .with_root_wake(wake.clone());
+        assert_eq!(dispatcher.dispatch_pending().await.unwrap(), 2);
+
+        let delivered = delegation_workflow_outbox_event::Entity::find_by_id(&outbox.event_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.dispatch_attempts, 1);
+        assert!(delivered.delivered_at.is_some());
+        assert_eq!(wake.event_ids.lock().await.len(), 1);
+        assert!(wake
+            .observed_pending
+            .lock()
+            .await
+            .iter()
+            .all(|pending| *pending));
+
+        let mut redelivery: delegation_workflow_outbox_event::ActiveModel = delivered.into();
+        redelivery.delivered_at = Set(None);
+        redelivery.update(&fixture.db.conn).await.unwrap();
+        assert_eq!(dispatcher.dispatch_pending().await.unwrap(), 1);
+        assert_eq!(wake.event_ids.lock().await.len(), 1);
+        let replayed = delegation_workflow_outbox_event::Entity::find_by_id(&outbox.event_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.dispatch_attempts, 2);
+        assert!(replayed.delivered_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_startup_reconciliation_retains_current_and_replaces_stale()
+    {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let original = fixture.materialize().await.attention.unwrap();
+
+        let retained = reconcile_completion_attentions_txn(&fixture.db)
+            .await
+            .unwrap();
+        assert_eq!(retained.retained, 1);
+        assert_eq!(retained.superseded, 0);
+        assert_eq!(retained.reopened, 0);
+
+        let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
+            fixture.task_id.clone(),
+        )
+        .one(&fixture.db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut active: crate::db::entities::delegation_workflow_run_binding::ActiveModel =
+            binding.into();
+        active.instruction_block_digest = Set(Some(format!("sha256:{}", "f".repeat(64))));
+        active.update(&fixture.db.conn).await.unwrap();
+
+        let reconciled = reconcile_completion_attentions_txn(&fixture.db)
+            .await
+            .unwrap();
+        assert_eq!(reconciled.retained, 0);
+        assert_eq!(reconciled.superseded, 1);
+        assert_eq!(reconciled.reopened, 1);
+        let old = delegation_attention_request::Entity::find_by_id(&original.attention_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.resolution_code.as_deref(), Some("superseded"));
+        let replacement = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(&fixture.task_id))
+            .filter(
+                delegation_attention_request::Column::Kind.eq(AttentionKind::CompletionDecision),
+            )
+            .filter(delegation_attention_request::Column::Status.eq("open"))
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.request_id, original.attention_id);
+        assert_eq!(
+            replacement.captured_scope_digest.as_deref(),
+            Some(original.captured_scope_digest.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_blocked_survives_but_explicit_termination_closes() {
+        let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let original = fixture.materialize().await.attention.unwrap();
+        let workflow = delegation_workflow::Entity::find_by_id(&fixture.workflow_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut blocked: delegation_workflow::ActiveModel = workflow.into();
+        blocked.workflow_state =
+            Set(crate::db::entities::delegation_workflow::WorkflowState::Blocked);
+        blocked.update(&fixture.db.conn).await.unwrap();
+
+        let retained = reconcile_completion_attentions_txn(&fixture.db)
+            .await
+            .unwrap();
+        assert_eq!(retained.retained, 1);
+        let resolved = resolve_workflow_completion_attentions_txn(
+            &fixture.db,
+            &fixture.workflow_id,
+            crate::acp::delegation::attention::CompletionAttentionResolutionCode::WorkflowTerminated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, 1);
+        let row = delegation_attention_request::Entity::find_by_id(original.attention_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.resolution_code.as_deref(), Some("workflow_terminated"));
     }
 
     #[tokio::test]

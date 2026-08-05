@@ -1,6 +1,9 @@
 //! Workflow graph live events via shared [`EventEmitter`].
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::acp::delegation::workflow::CompletionOutcome;
+use crate::db::entities::delegation_attention_request::AttentionKind;
 
 use crate::web::event_bridge::{emit_event, EventEmitter};
 
@@ -15,6 +18,21 @@ pub const WORKFLOW_GRAPH_CHANGED_EVENT: &str = "workflow_graph://changed";
 
 /// Observed-only compatibility nudge (no durable graph clock).
 pub const WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT: &str = "workflow_graph://compatibility_nudge";
+
+pub const COMPLETION_DECISION_RESOLVED_EVENT: &str = "completion_decision_resolved";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionDecisionResolvedPayloadV1 {
+    pub version: u32,
+    pub event_id: String,
+    pub workflow_id: String,
+    pub task_id: String,
+    pub node_id: String,
+    pub kind: AttentionKind,
+    pub outcome: CompletionOutcome,
+    pub evidence_scope_digest: String,
+    pub graph_revision: u64,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkflowGraphChangedPayload {

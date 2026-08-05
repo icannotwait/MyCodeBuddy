@@ -19,6 +19,9 @@ use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::acp::delegation::recovery_policy::{
     RecoveryDecision, RecoveryDisposition, ReplacementReason,
 };
+use crate::acp::delegation::workflow::{
+    CompletionAttentionCas, CompletionOutcome, TerminalCompletionResult,
+};
 use crate::models::AgentType;
 
 /// MCP tool name for initial delegation — field 0 of `request_fingerprint`.
@@ -968,6 +971,46 @@ pub enum DelegationReplyResult {
         code: String,
         message: String,
     },
+}
+
+/// Authenticated application mutation for a terminal workflow completion.
+/// Actor identity is intentionally absent: desktop/server wrappers derive it
+/// from the authenticated application transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveCompletionDecisionRequest {
+    pub parent_conversation_id: i32,
+    pub cas: CompletionAttentionCas,
+    pub outcome: CompletionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryCompletionArtifactRequest {
+    pub parent_conversation_id: i32,
+    pub cas: CompletionAttentionCas,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveDesignSelfReviewRequest {
+    pub parent_conversation_id: i32,
+    pub cas: CompletionAttentionCas,
+    pub outcome: CompletionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionMutationResult {
+    pub workflow_id: String,
+    pub task_id: String,
+    pub node_id: String,
+    pub kind: crate::db::entities::delegation_attention_request::AttentionKind,
+    pub outcome: CompletionOutcome,
+    pub evidence_scope_digest: String,
+    pub graph_revision: u64,
+    pub idempotent_replay: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TerminalCompletionResult>,
 }
 
 impl DelegationOutcome {

@@ -596,6 +596,14 @@ mod tauri_app {
                         db_conn.clone(),
                         effective_data_dir.clone(),
                     );
+                    let completion_outbox_dispatcher = std::sync::Arc::new(
+                        crate::acp::delegation::event_emitter::CompletionOutboxDispatcher::new(
+                            std::sync::Arc::new(db::AppDatabase {
+                                conn: db_conn.clone(),
+                            }),
+                            crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                        ),
+                    );
                     app.manage(stack.broker.clone());
                     app.manage(stack.tokens.clone());
                     app.manage(stack.leases.clone());
@@ -605,6 +613,7 @@ mod tauri_app {
                     app.manage(stack.runtime_settings.clone());
                     app.manage(stack.metrics.clone());
                     app.manage(stack.continuation_coordinator.clone());
+                    app.manage(completion_outbox_dispatcher.clone());
                     app.manage(crate::commands::delegation::DelegationSocketPath(
                         stack.socket_path.clone(),
                     ));
@@ -685,6 +694,9 @@ mod tauri_app {
 
                     // Tool-execution cancel supervisor (settings already applied).
                     crate::app_state::spawn_tool_watchdog_supervisor(cm_state.clone_ref());
+                    crate::app_state::spawn_completion_outbox_dispatcher(
+                        completion_outbox_dispatcher,
+                    );
 
                     let listener_broker = stack.broker.clone();
                     let workflow_emitter =
@@ -1155,6 +1167,9 @@ mod tauri_app {
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
                 crate::commands::workflow_graph::get_workflow_graph_snapshot,
+                crate::commands::workflow_completion::resolve_completion_decision,
+                crate::commands::workflow_completion::retry_completion_artifact,
+                crate::commands::workflow_completion::resolve_design_self_review,
                 conversations::list_folders,
                 conversations::get_stats,
                 conversations::get_sidebar_data,

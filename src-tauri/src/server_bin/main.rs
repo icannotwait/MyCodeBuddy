@@ -336,6 +336,14 @@ async fn async_main() -> ExitCode {
             registry,
         ));
     }
+    let completion_outbox_dispatcher = Arc::new(
+        codeg_lib::acp::delegation::event_emitter::CompletionOutboxDispatcher::new(
+            Arc::new(codeg_lib::db::AppDatabase {
+                conn: db.conn.clone(),
+            }),
+            emitter.clone(),
+        ),
+    );
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -358,6 +366,7 @@ async fn async_main() -> ExitCode {
         delegation_broker: stack.broker.clone(),
         continuation_coordinator: stack.continuation_coordinator.clone(),
         delegation_metrics: stack.metrics.clone(),
+        completion_outbox_dispatcher: completion_outbox_dispatcher.clone(),
         delegation_runtime_settings: stack.runtime_settings.clone(),
         delegation_tokens: stack.tokens.clone(),
         delegation_leases: stack.leases.clone(),
@@ -368,6 +377,7 @@ async fn async_main() -> ExitCode {
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
+    codeg_lib::app_state::spawn_completion_outbox_dispatcher(completion_outbox_dispatcher);
 
     // Logging phase 3: wire the emitter so the Logs viewer's live tail
     // (`logs://appended`) reaches WS clients.

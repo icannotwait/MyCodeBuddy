@@ -22,7 +22,8 @@ use crate::acp::delegation::store::is_transient_sqlite;
 use crate::db::entities::conversation::{self, DelegationTaskStatus};
 use crate::db::entities::delegation_attention_request;
 use crate::db::entities::{
-    delegation_task_run, delegation_workflow_node_binding, delegation_workflow_run_binding,
+    delegation_task_run, delegation_workflow_design_root_binding, delegation_workflow_node_binding,
+    delegation_workflow_run_binding,
 };
 use crate::db::AppDatabase;
 
@@ -135,6 +136,8 @@ pub enum AttentionStoreError {
     BlankPayload,
     #[error("attention request does not belong to the direct parent/child edge")]
     Unauthorized,
+    #[error("attention kind does not accept a free-form parent reply")]
+    KindMismatch,
     #[error("task already has an open attention request")]
     AlreadyOpen,
     #[error("delegation task is not running")]
@@ -158,6 +161,28 @@ pub fn validate_attention_payload(text: &str) -> Result<(), AttentionStoreError>
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionAttentionResolutionCode {
+    UserOutcomeCommitted,
+    ArtifactResolved,
+    Superseded,
+    WorkflowTerminated,
+    WorkflowDeleted,
+}
+
+impl CompletionAttentionResolutionCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserOutcomeCommitted => "user_outcome_committed",
+            Self::ArtifactResolved => "artifact_resolved",
+            Self::Superseded => "superseded",
+            Self::WorkflowTerminated => "workflow_terminated",
+            Self::WorkflowDeleted => "workflow_deleted",
+        }
+    }
+}
+
 pub(crate) struct TerminalCompletionAttentionInput<'a> {
     pub task_id: &'a str,
     pub kind: delegation_attention_request::AttentionKind,
@@ -165,6 +190,14 @@ pub(crate) struct TerminalCompletionAttentionInput<'a> {
     pub payload_json: &'a str,
     pub captured_scope_digest: &'a str,
     pub node_id: &'a str,
+    pub created_at: DateTime<Utc>,
+}
+
+pub(crate) struct DesignSelfReviewAttentionInput<'a> {
+    pub binding: &'a delegation_workflow_design_root_binding::Model,
+    pub parent_conversation_id: i32,
+    pub message: &'static str,
+    pub payload_json: &'a str,
     pub created_at: DateTime<Utc>,
 }
 
@@ -183,11 +216,8 @@ pub(crate) async fn open_terminal_completion_attention_txn<C: ConnectionTrait>(
         return Err(AttentionStoreError::Unauthorized);
     }
     validate_attention_payload(input.message)?;
-    if input.payload_json.len() > ATTENTION_PAYLOAD_MAX_BYTES
-        || input.payload_json.trim().is_empty()
-        || input.captured_scope_digest.trim().is_empty()
-        || input.node_id.trim().is_empty()
-    {
+    validate_completion_payload_json(input.kind.clone(), input.payload_json)?;
+    if input.captured_scope_digest.trim().is_empty() || input.node_id.trim().is_empty() {
         return Err(AttentionStoreError::PayloadTooLarge);
     }
 
@@ -258,6 +288,114 @@ pub(crate) async fn open_terminal_completion_attention_txn<C: ConnectionTrait>(
     .insert(conn)
     .await
     .map_err(map_db)
+}
+
+/// Open the platform-only Design-root attention subject. Task 13 owns binding
+/// creation/readiness; this repository method only enforces the durable CAS
+/// binding and per-kind payload shape.
+pub(crate) async fn open_design_self_review_attention_txn<C: ConnectionTrait>(
+    conn: &C,
+    input: &DesignSelfReviewAttentionInput<'_>,
+) -> Result<delegation_attention_request::Model, AttentionStoreError> {
+    validate_completion_payload_json(
+        delegation_attention_request::AttentionKind::DesignSelfReviewDecision,
+        input.payload_json,
+    )?;
+    if input.binding.task_id.trim().is_empty()
+        || input.binding.latest_run_id.trim().is_empty()
+        || input.binding.node_id.trim().is_empty()
+        || input.binding.evidence_scope_digest.trim().is_empty()
+    {
+        return Err(AttentionStoreError::Unauthorized);
+    }
+    if let Some(existing) = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::TaskId.eq(&input.binding.task_id))
+        .filter(
+            delegation_attention_request::Column::Kind
+                .eq(delegation_attention_request::AttentionKind::DesignSelfReviewDecision),
+        )
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .one(conn)
+        .await
+        .map_err(map_db)?
+    {
+        if existing.latest_run_id.as_deref() == Some(&input.binding.latest_run_id)
+            && existing.node_id.as_deref() == Some(&input.binding.node_id)
+            && existing.captured_scope_digest.as_deref()
+                == Some(&input.binding.evidence_scope_digest)
+            && existing.payload_json.as_deref() == Some(input.payload_json)
+            && existing.parent_conversation_id == input.parent_conversation_id
+        {
+            return Ok(existing);
+        }
+        return Err(AttentionStoreError::AlreadyOpen);
+    }
+
+    delegation_attention_request::ActiveModel {
+        request_id: Set(uuid::Uuid::new_v4().to_string()),
+        task_id: Set(input.binding.task_id.clone()),
+        parent_conversation_id: Set(input.parent_conversation_id),
+        child_conversation_id: Set(None),
+        child_tool_call_id: Set(None),
+        status: Set("open".into()),
+        message: Set(input.message.into()),
+        reply: Set(None),
+        resolution_code: Set(None),
+        created_at: Set(input.created_at),
+        resolved_at: Set(None),
+        kind: Set(delegation_attention_request::AttentionKind::DesignSelfReviewDecision),
+        latest_run_id: Set(Some(input.binding.latest_run_id.clone())),
+        node_id: Set(Some(input.binding.node_id.clone())),
+        payload_json: Set(Some(input.payload_json.to_string())),
+        resolution_json: Set(None),
+        captured_scope_digest: Set(Some(input.binding.evidence_scope_digest.clone())),
+    }
+    .insert(conn)
+    .await
+    .map_err(map_db)
+}
+
+fn validate_completion_payload_json(
+    kind: delegation_attention_request::AttentionKind,
+    payload_json: &str,
+) -> Result<(), AttentionStoreError> {
+    if payload_json.len() > ATTENTION_PAYLOAD_MAX_BYTES || payload_json.trim().is_empty() {
+        return Err(AttentionStoreError::PayloadTooLarge);
+    }
+    let payload: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|_| AttentionStoreError::Database("typed attention payload is invalid".into()))?;
+    let object = payload.as_object().ok_or_else(|| {
+        AttentionStoreError::Database("typed attention payload is invalid".into())
+    })?;
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(AttentionStoreError::Database(
+            "typed attention payload has an unsupported version".into(),
+        ));
+    }
+    let required = match kind {
+        delegation_attention_request::AttentionKind::CompletionDecision => {
+            &["reason_code", "role", "legal_outcomes"] as &[&str]
+        }
+        delegation_attention_request::AttentionKind::CompletionArtifactRecovery => &[
+            "normalized_intent",
+            "source_audit_ref",
+            "resolver_failure",
+            "producer_scope_digest",
+            "producer_task_id",
+        ],
+        delegation_attention_request::AttentionKind::DesignSelfReviewDecision => {
+            &["design_identity", "gate_lineage", "legal_outcomes"]
+        }
+        delegation_attention_request::AttentionKind::ChildQuestion => {
+            return Err(AttentionStoreError::Unauthorized)
+        }
+    };
+    if required.iter().any(|field| !object.contains_key(*field)) {
+        return Err(AttentionStoreError::Database(
+            "typed attention payload is missing required fields".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -408,7 +546,13 @@ impl DbDelegationAttentionStore {
             .one(&self.db.conn)
             .await
             .map_err(map_db)?;
-        row.map(model_to_record).transpose()
+        match row {
+            Some(row) if row.kind != delegation_attention_request::AttentionKind::ChildQuestion => {
+                Err(AttentionStoreError::KindMismatch)
+            }
+            Some(row) => model_to_record(row).map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn find_by_task_and_tool(
@@ -419,6 +563,10 @@ impl DbDelegationAttentionStore {
         let row = delegation_attention_request::Entity::find()
             .filter(delegation_attention_request::Column::TaskId.eq(task_id))
             .filter(delegation_attention_request::Column::ChildToolCallId.eq(child_tool_call_id))
+            .filter(
+                delegation_attention_request::Column::Kind
+                    .eq(delegation_attention_request::AttentionKind::ChildQuestion),
+            )
             .one(&self.db.conn)
             .await
             .map_err(map_db)?;
@@ -431,6 +579,10 @@ impl DbDelegationAttentionStore {
     ) -> Result<Option<AttentionRecord>, AttentionStoreError> {
         let row = delegation_attention_request::Entity::find()
             .filter(delegation_attention_request::Column::TaskId.eq(task_id))
+            .filter(
+                delegation_attention_request::Column::Kind
+                    .eq(delegation_attention_request::AttentionKind::ChildQuestion),
+            )
             .filter(delegation_attention_request::Column::Status.eq("open"))
             .one(&self.db.conn)
             .await
@@ -614,6 +766,10 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
                     .eq(parent_conversation_id),
             )
             .filter(delegation_attention_request::Column::Status.eq("open"))
+            .filter(
+                delegation_attention_request::Column::Kind
+                    .eq(delegation_attention_request::AttentionKind::ChildQuestion),
+            )
             .filter(delegation_attention_request::Column::TaskId.is_in(task_ids.to_vec()))
             .order_by_asc(delegation_attention_request::Column::CreatedAt)
             .order_by_asc(delegation_attention_request::Column::RequestId)
@@ -700,6 +856,10 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
     ) -> Result<Vec<AttentionRecord>, AttentionStoreError> {
         let open_rows = delegation_attention_request::Entity::find()
             .filter(delegation_attention_request::Column::Status.eq("open"))
+            .filter(
+                delegation_attention_request::Column::Kind
+                    .eq(delegation_attention_request::AttentionKind::ChildQuestion),
+            )
             .all(&self.db.conn)
             .await
             .map_err(map_db)?;
@@ -1012,7 +1172,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use sea_orm::{ConnectionTrait, Database, Statement};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, Set, Statement};
     use tokio::sync::Barrier;
 
     use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
@@ -1365,6 +1525,64 @@ mod tests {
                 .resolution_code,
             Some(AttentionResolutionCode::TaskTerminal)
         );
+    }
+
+    #[tokio::test]
+    async fn typed_completion_attention_lifecycle_cleanup_targets_child_questions_only() {
+        let fixture = Fixture::new().await;
+        fixture.set_task_terminal("task-1").await;
+        delegation_attention_request::ActiveModel {
+            request_id: Set("completion-attention-1".into()),
+            task_id: Set("task-1".into()),
+            parent_conversation_id: Set(fixture.parent.id),
+            child_conversation_id: Set(Some(fixture.child.id)),
+            child_tool_call_id: Set(None),
+            status: Set("open".into()),
+            message: Set("Completion outcome requires a direct decision.".into()),
+            reply: Set(None),
+            resolution_code: Set(None),
+            created_at: Set(Utc::now()),
+            resolved_at: Set(None),
+            kind: Set(delegation_attention_request::AttentionKind::CompletionDecision),
+            latest_run_id: Set(Some("task-1".into())),
+            node_id: Set(Some("plan-reviewer".into())),
+            payload_json: Set(Some(
+                r#"{"version":1,"reason_code":"completion_intent_missing","role":"Reviewer","legal_outcomes":["approve","approve_with_minors","request_changes","block"],"bounded_candidates":[],"diagnostics":[]}"#.into(),
+            )),
+            resolution_json: Set(None),
+            captured_scope_digest: Set(Some(format!("sha256:{}", "a".repeat(64)))),
+        }
+        .insert(&fixture.db.conn)
+        .await
+        .unwrap();
+
+        let store = DbDelegationAttentionStore::new(fixture.db.clone());
+        for code in [
+            AttentionResolutionCode::TaskTerminal,
+            AttentionResolutionCode::HostRestarted,
+            AttentionResolutionCode::ParentCanceled,
+            AttentionResolutionCode::ParentTurnFailed,
+            AttentionResolutionCode::ParentDisconnected,
+            AttentionResolutionCode::JoinAbandoned,
+        ] {
+            assert!(store
+                .resolve_task("task-1", code, Utc::now())
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        let row = delegation_attention_request::Entity::find_by_id("completion-attention-1")
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "open");
+        assert!(row.resolution_code.is_none());
+        assert!(matches!(
+            store.wait_snapshot("completion-attention-1").await,
+            Err(AttentionStoreError::KindMismatch)
+        ));
     }
 
     #[tokio::test]

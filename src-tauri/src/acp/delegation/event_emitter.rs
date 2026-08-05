@@ -22,17 +22,153 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+};
 use std::sync::Arc;
 
 use crate::acp::delegation::attention::AttentionRequestSummary;
 use crate::acp::delegation::card_summary::CardSummary;
 use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
 use crate::acp::delegation::types::TaskObservation;
+use crate::acp::delegation::workflow::{
+    CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT,
+};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
+use crate::db::entities::delegation_workflow_outbox_event;
+use crate::db::AppDatabase;
 use crate::models::{AgentType, ConversationStatePatch};
-use crate::web::event_bridge::emit_with_state;
+use crate::web::event_bridge::{emit_event, emit_with_state, EventEmitter};
+
+#[async_trait]
+pub trait CompletionRootWakeQueue: Send + Sync {
+    /// Implementations deduplicate by `event_id`; redelivery is expected.
+    async fn enqueue_completion_resolution(
+        &self,
+        event: &CompletionDecisionResolvedPayloadV1,
+    ) -> Result<(), String>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompletionOutboxDispatchError {
+    #[error("completion outbox persistence failed: {0}")]
+    Persistence(String),
+    #[error("completion outbox payload is invalid: {0}")]
+    InvalidPayload(String),
+    #[error("completion root wake enqueue failed: {0}")]
+    RootWake(String),
+}
+
+#[derive(Clone)]
+pub struct CompletionOutboxDispatcher {
+    db: Arc<AppDatabase>,
+    emitter: EventEmitter,
+    root_wake: Option<Arc<dyn CompletionRootWakeQueue>>,
+}
+
+impl CompletionOutboxDispatcher {
+    pub fn new(db: Arc<AppDatabase>, emitter: EventEmitter) -> Self {
+        Self {
+            db,
+            emitter,
+            root_wake: None,
+        }
+    }
+
+    pub fn with_root_wake(mut self, root_wake: Arc<dyn CompletionRootWakeQueue>) -> Self {
+        self.root_wake = Some(root_wake);
+        self
+    }
+
+    /// Dispatch all currently pending rows in creation order. A failed row is
+    /// left pending and stops this pass so later rows cannot overtake it.
+    pub async fn dispatch_pending(&self) -> Result<usize, CompletionOutboxDispatchError> {
+        crate::acp::delegation::workflow::reconcile_completion_attentions_txn(&self.db)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        let rows = delegation_workflow_outbox_event::Entity::find()
+            .filter(delegation_workflow_outbox_event::Column::DeliveredAt.is_null())
+            .order_by_asc(delegation_workflow_outbox_event::Column::CreatedAt)
+            .order_by_asc(delegation_workflow_outbox_event::Column::EventId)
+            .all(&self.db.conn)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        let mut delivered = 0;
+        for row in rows {
+            self.dispatch_row(row).await?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    pub async fn pending_count(&self) -> Result<u64, CompletionOutboxDispatchError> {
+        delegation_workflow_outbox_event::Entity::find()
+            .filter(delegation_workflow_outbox_event::Column::DeliveredAt.is_null())
+            .count(&self.db.conn)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))
+    }
+
+    async fn dispatch_row(
+        &self,
+        row: delegation_workflow_outbox_event::Model,
+    ) -> Result<(), CompletionOutboxDispatchError> {
+        let mut attempted: delegation_workflow_outbox_event::ActiveModel = row.clone().into();
+        attempted.dispatch_attempts = Set(row.dispatch_attempts.saturating_add(1));
+        attempted
+            .update(&self.db.conn)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+
+        if row.event_kind == COMPLETION_DECISION_RESOLVED_EVENT {
+            let event: CompletionDecisionResolvedPayloadV1 =
+                serde_json::from_str(&row.payload_json).map_err(|error| {
+                    CompletionOutboxDispatchError::InvalidPayload(error.to_string())
+                })?;
+            let row_revision = u64::try_from(row.graph_revision).map_err(|_| {
+                CompletionOutboxDispatchError::InvalidPayload(
+                    "negative graph revision in outbox row".into(),
+                )
+            })?;
+            if event.version != 1
+                || event.event_id != row.event_id
+                || event.workflow_id != row.workflow_id
+                || event.graph_revision != row_revision
+            {
+                return Err(CompletionOutboxDispatchError::InvalidPayload(
+                    "completion event does not match its durable outbox key".into(),
+                ));
+            }
+            if let Some(root_wake) = &self.root_wake {
+                root_wake
+                    .enqueue_completion_resolution(&event)
+                    .await
+                    .map_err(CompletionOutboxDispatchError::RootWake)?;
+            }
+            emit_event(&self.emitter, COMPLETION_DECISION_RESOLVED_EVENT, &event);
+        } else {
+            let payload: serde_json::Value =
+                serde_json::from_str(&row.payload_json).map_err(|error| {
+                    CompletionOutboxDispatchError::InvalidPayload(error.to_string())
+                })?;
+            emit_event(&self.emitter, &row.event_kind, payload);
+        }
+
+        delegation_workflow_outbox_event::Entity::update_many()
+            .col_expr(
+                delegation_workflow_outbox_event::Column::DeliveredAt,
+                sea_orm::sea_query::Expr::value(Some(Utc::now())),
+            )
+            .filter(delegation_workflow_outbox_event::Column::EventId.eq(&row.event_id))
+            .filter(delegation_workflow_outbox_event::Column::DeliveredAt.is_null())
+            .exec(&self.db.conn)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+}
 
 /// Wire string for [`ConversationStatus`] on `ConversationStatePatch.status`
 /// (must match root lifecycle / conversation_service patches).

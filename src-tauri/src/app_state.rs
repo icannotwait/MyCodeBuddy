@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::acp::delegation::broker::DelegationBroker;
 use crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
+use crate::acp::delegation::event_emitter::CompletionOutboxDispatcher;
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
@@ -64,6 +65,9 @@ pub struct AppState {
     /// Process-local delegation reliability metrics (route/accepted/terminal/
     /// wait/cancel). Shared with broker, supervisor, listener, and route launch.
     pub delegation_metrics: Arc<DelegationMetrics>,
+    /// Durable completion events are dispatched after commit and replayed on
+    /// startup/periodic scans. Shared by Tauri and Axum mutation surfaces.
+    pub completion_outbox_dispatcher: Arc<CompletionOutboxDispatcher>,
     /// Live route_policy / stalled_after_seconds / enabled snapshot shared by
     /// route resolution and the soft-watchdog supervisor. Updated only after
     /// a successful settings transaction (or one clamped load at startup).
@@ -406,6 +410,31 @@ pub fn spawn_delegation_supervisor(
     tokio::spawn(run);
 }
 
+pub fn spawn_completion_outbox_dispatcher(dispatcher: Arc<CompletionOutboxDispatcher>) {
+    let run = async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match dispatcher.dispatch_pending().await {
+                Ok(delivered) if delivered > 0 => tracing::info!(
+                    delivered,
+                    "[delegation] completion outbox dispatch complete"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "[delegation] completion outbox dispatch will retry"
+                ),
+            }
+        }
+    };
+    #[cfg(feature = "tauri-runtime")]
+    tauri::async_runtime::spawn(run);
+    #[cfg(not(feature = "tauri-runtime"))]
+    tokio::spawn(run);
+}
+
 impl AppState {
     /// Test-only constructor: build an `AppState` wired to an in-memory
     /// database and a `WebOnly` event emitter. Suitable for axum-test driven
@@ -443,6 +472,12 @@ impl AppState {
         let metrics = Arc::new(EventBusMetrics::default());
         let acp_event_bus = Arc::new(InternalEventBus::new(metrics));
         let emitter = EventEmitter::web_only(broadcaster.clone(), acp_event_bus.clone());
+        let completion_outbox_dispatcher = Arc::new(CompletionOutboxDispatcher::new(
+            Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            }),
+            emitter.clone(),
+        ));
 
         let connection_manager = default_connection_manager();
         let stack = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
@@ -503,6 +538,7 @@ impl AppState {
             delegation_broker: stack.broker,
             continuation_coordinator: stack.continuation_coordinator,
             delegation_metrics: stack.metrics,
+            completion_outbox_dispatcher,
             delegation_runtime_settings: stack.runtime_settings,
             delegation_tokens: stack.tokens,
             delegation_leases: stack.leases,

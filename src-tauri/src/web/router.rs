@@ -172,6 +172,18 @@ pub fn build_router(
             post(handlers::workflow_graph::get_workflow_graph_snapshot),
         )
         .route(
+            "/resolve_completion_decision",
+            post(handlers::workflow_completion::resolve_completion_decision),
+        )
+        .route(
+            "/retry_completion_artifact",
+            post(handlers::workflow_completion::retry_completion_artifact),
+        )
+        .route(
+            "/resolve_design_self_review",
+            post(handlers::workflow_completion::resolve_design_self_review),
+        )
+        .route(
             "/list_opened_tabs",
             post(handlers::conversations::list_opened_tabs),
         )
