@@ -1,0 +1,157 @@
+{
+  "schema": "CompletionScopeVectorsV1",
+  "vectors": [
+    {
+      "name": "requirements",
+      "domain": "codeg.completion.requirements.v1",
+      "schema_version": 1,
+      "input": {"design_digest":"sha256:00","design_rel_path":"docs/spec.md","design_settlement_scope":null},
+      "canonical_utf8": "{\"design_digest\":\"sha256:00\",\"design_rel_path\":\"docs/spec.md\",\"design_settlement_scope\":null}",
+      "sha256": "sha256:022b1f7dc0721961f7abb9cb77feafa95c4896e89a705ed9c8781204def4ce97"
+    },
+    {
+      "name": "instruction_binding",
+      "domain": "codeg.completion.instruction.v1",
+      "schema_version": 1,
+      "input": {"gate_id":"plan","material_identities":[],"phase_id":"plan","review_round":2,"role":"reviewer","task_index":null,"template_id":"workflow_completion","template_version":1},
+      "canonical_utf8": "{\"gate_id\":\"plan\",\"material_identities\":[],\"phase_id\":\"plan\",\"review_round\":2,\"role\":\"reviewer\",\"task_index\":null,\"template_id\":\"workflow_completion\",\"template_version\":1}",
+      "sha256": "sha256:2ebc508f4d4e7ad663d318f9ec3694f8159dc934a4eec34b103071647a6fda25"
+    },
+    {
+      "name": "instruction_reviewer",
+      "domain": "codeg.completion.instruction.v1",
+      "schema_version": 1,
+      "input": {"conclusion_suffix":"Finish with one plain-language conclusion line:\nConclusion: approve | approve with minor issues | request changes | blocked","gate_id":"plan","material_identities":[{"body_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key":"task.1"}],"phase_id":"plan","review_round":2,"role":"reviewer","task_index":null,"template_id":"workflow_completion","template_version":1},
+      "canonical_utf8": "{\"conclusion_suffix\":\"Finish with one plain-language conclusion line:\\nConclusion: approve | approve with minor issues | request changes | blocked\",\"gate_id\":\"plan\",\"material_identities\":[{\"body_sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"task.1\"}],\"phase_id\":\"plan\",\"review_round\":2,\"role\":\"reviewer\",\"task_index\":null,\"template_id\":\"workflow_completion\",\"template_version\":1}",
+      "sha256": "sha256:03c197395e23d45ed41944283dbe1df971c6ede6d90b03a0b32ca634a3cd12c1"
+    },
+    {
+      "name": "instruction_author",
+      "domain": "codeg.completion.instruction.v1",
+      "schema_version": 1,
+      "input": {"conclusion_suffix":"Finish with one plain-language conclusion line:\nConclusion: done | done with concerns | blocked","gate_id":null,"material_identities":[{"body_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key":"requirements"}],"phase_id":"plan","review_round":null,"role":"author","task_index":null,"template_id":"workflow_completion","template_version":1},
+      "canonical_utf8": "{\"conclusion_suffix\":\"Finish with one plain-language conclusion line:\\nConclusion: done | done with concerns | blocked\",\"gate_id\":null,\"material_identities\":[{\"body_sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"requirements\"}],\"phase_id\":\"plan\",\"review_round\":null,\"role\":\"author\",\"task_index\":null,\"template_id\":\"workflow_completion\",\"template_version\":1}",
+      "sha256": "sha256:d6df0a1dbc89fe465059b11b9b61aac48fbf32b8e42d4a54e1a2330bddf483ea"
+    },
+    {
+      "name": "instruction_implementer",
+      "domain": "codeg.completion.instruction.v1",
+      "schema_version": 1,
+      "input": {"conclusion_suffix":"Finish with one plain-language conclusion line:\nConclusion: done | done with concerns | blocked","gate_id":null,"material_identities":[{"body_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key":"task.9"}],"phase_id":"tasks","review_round":null,"role":"implementer","task_index":9,"template_id":"workflow_completion","template_version":1},
+      "canonical_utf8": "{\"conclusion_suffix\":\"Finish with one plain-language conclusion line:\\nConclusion: done | done with concerns | blocked\",\"gate_id\":null,\"material_identities\":[{\"body_sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"task.9\"}],\"phase_id\":\"tasks\",\"review_round\":null,\"role\":\"implementer\",\"task_index\":9,\"template_id\":\"workflow_completion\",\"template_version\":1}",
+      "sha256": "sha256:43c97d626978e2ad71dddb4c5fef6aa8e5368b2ec4b0d09e89c9940894e5b013"
+    },
+    {
+      "name": "instruction_fixer",
+      "domain": "codeg.completion.instruction.v1",
+      "schema_version": 1,
+      "input": {"conclusion_suffix":"Finish with one plain-language conclusion line:\nConclusion: done | done with concerns | blocked","gate_id":null,"material_identities":[{"body_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key":"final.findings"}],"phase_id":"final","review_round":null,"role":"fixer","task_index":null,"template_id":"workflow_completion","template_version":1},
+      "canonical_utf8": "{\"conclusion_suffix\":\"Finish with one plain-language conclusion line:\\nConclusion: done | done with concerns | blocked\",\"gate_id\":null,\"material_identities\":[{\"body_sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"final.findings\"}],\"phase_id\":\"final\",\"review_round\":null,\"role\":\"fixer\",\"task_index\":null,\"template_id\":\"workflow_completion\",\"template_version\":1}",
+      "sha256": "sha256:e0e8e9873cbe72661a605a62592085b75dc66c33b756587993a452525ca68c0c"
+    },
+    {
+      "name": "task_specification",
+      "domain": "codeg.completion.task_specification.v1",
+      "schema_version": 1,
+      "input": {"body_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","schema":"PlanMaterialSchemaV1","task_index":9},
+      "canonical_utf8": "{\"body_sha256\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"schema\":\"PlanMaterialSchemaV1\",\"task_index\":9}",
+      "sha256": "sha256:32de05bbfbf11f724d0ac39bbe3cd0ba35ba0b1e2ec0f5d30ed3d2248abc57fc"
+    },
+    {
+      "name": "plan_subject",
+      "domain": "codeg.completion.plan_subject.v2",
+      "schema_version": 1,
+      "input": {"gate_lineage":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","material_selector_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","plan_rel_path":"docs/plan.md","selected_material_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+      "canonical_utf8": "{\"gate_lineage\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"material_selector_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"plan_rel_path\":\"docs/plan.md\",\"selected_material_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+      "sha256": "sha256:a81bcf23a87ec90e03126222c7fa1ee4a2b9d79f060ae8ed6e43224656cfa9b7"
+    },
+    {
+      "name": "plan_change",
+      "domain": "codeg.completion.plan_change.v2",
+      "schema_version": 1,
+      "input": {"authorization_id":"auth-1","changed_keys":["plan.global_constraints","task.9"],"classifier_version":"plan_localized_change_v2","current_plan_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","prior_plan_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema":"PlanLocalizedChangeV2"},
+      "canonical_utf8": "{\"authorization_id\":\"auth-1\",\"changed_keys\":[\"plan.global_constraints\",\"task.9\"],\"classifier_version\":\"plan_localized_change_v2\",\"current_plan_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"prior_plan_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"schema\":\"PlanLocalizedChangeV2\"}",
+      "sha256": "sha256:952210af2262488c2a112ef3b1a3af66d0388f884b97a9d7a687da89d0cecf7c"
+    },
+    {
+      "name": "final_package",
+      "domain": "codeg.completion.final_findings.v1",
+      "schema_version": 1,
+      "input": {"gate_id":"final","gate_lineage":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","items":[],"remediation_contexts":[],"source_evaluation_key":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_id":"wf-1"},
+      "canonical_utf8": "{\"gate_id\":\"final\",\"gate_lineage\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"items\":[],\"remediation_contexts\":[],\"source_evaluation_key\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"workflow_id\":\"wf-1\"}",
+      "sha256": "sha256:e7ae2832e1a88fd08a0b92e8c602431a1f9c996529432232da90dc09b09e4aba"
+    },
+    {
+      "name": "design_root_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"design":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rel_path":"docs/design.md"},"gate_lineage":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"design_root","workflow_kind":"brainstorm_to_delivery"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"design\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rel_path\":\"docs/design.md\"},\"gate_lineage\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"design_root\",\"workflow_kind\":\"brainstorm_to_delivery\"}}",
+      "sha256": "sha256:71efa92c3ac2d2d4785428117549e666cfcdd1949b9c915968030b71cdbdc330"
+    },
+    {
+      "name": "design_reviewer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"design":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rel_path":"docs/design.md"},"policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"design_reviewer","workflow_kind":"brainstorm_to_delivery"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"design\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rel_path\":\"docs/design.md\"},\"policy_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"design_reviewer\",\"workflow_kind\":\"brainstorm_to_delivery\"}}",
+      "sha256": "sha256:4eba3795fcc44b88e7eacf08910f0f21145edba35090e307cc864f8ac58aa289"
+    },
+    {
+      "name": "plan_author_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"plan_target_rel_path":"docs/plan.md","requirements_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"plan_author"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"plan_target_rel_path\":\"docs/plan.md\",\"requirements_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"plan_author\"}}",
+      "sha256": "sha256:f3ac12eb5fdecb67f4aaff80d645f4e66fa114c343133bcdc5d3c17044724109"
+    },
+    {
+      "name": "plan_reviewer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"plan_subject":{"gate_lineage":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","material_selector_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","plan_rel_path":"docs/plan.md","selected_material_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"policy_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","requirements_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk_policy_version":"b2d_task_risk_v1","role":"plan_reviewer"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"plan_subject\":{\"gate_lineage\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"material_selector_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"plan_rel_path\":\"docs/plan.md\",\"selected_material_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"policy_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"requirements_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"risk_policy_version\":\"b2d_task_risk_v1\",\"role\":\"plan_reviewer\"}}",
+      "sha256": "sha256:44a6035ce819dac6a1450c7300b055d88360d261ecb6b45b3a3ca1d19fcf71d3"
+    },
+    {
+      "name": "task_implementer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"admitted_plan_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dependency_identities":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"role":"task_implementer","route_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","task_specification_identity":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"admitted_plan_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"dependency_identities\":[\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"],\"role\":\"task_implementer\",\"route_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"task_specification_identity\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "sha256": "sha256:b43e9804ea92b38771c51b0bd7afdb2187d3ad95a555b474b1c7846163117e21"
+    },
+    {
+      "name": "task_reviewer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"admitted_plan_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review_requirements_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","reviewed_producer":{"generation":1,"task_id":"producer-1"},"risk_policy_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role":"task_reviewer","task_specification_identity":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"admitted_plan_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"review_requirements_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reviewed_producer\":{\"generation\":1,\"task_id\":\"producer-1\"},\"risk_policy_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role\":\"task_reviewer\",\"task_specification_identity\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "sha256": "sha256:6c8986a931c3c62efed3dbfcb1ea25cbd81eaf75ca7f5be3ad7c8b4190616d06"
+    },
+    {
+      "name": "final_fixer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"branch_tip":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","final_findings_identity":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"final_fixer"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"branch_tip\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"final_findings_identity\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"final_fixer\"}}",
+      "sha256": "sha256:17b37ac785b93153660fe8956c408dd51c2d4dc6be12a2e168dc47a499bb11b9"
+    },
+    {
+      "name": "final_reviewer_scope",
+      "domain": "codeg.completion.review_scope.v2",
+      "schema_version": 1,
+      "input": {"instruction_block_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role_scope":{"active_plan_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","final_review_requirements_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ordered_task_output_identities":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"role":"final_reviewer"}},
+      "canonical_utf8": "{\"instruction_block_digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role_scope\":{\"active_plan_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"final_review_requirements_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"ordered_task_output_identities\":[\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"],\"role\":\"final_reviewer\"}}",
+      "sha256": "sha256:7b09499a0d1300c86b4e020791fa98ceb8209eb45da28b92b1f153c7c4558a2e"
+    },
+    {
+      "name": "evidence_scope",
+      "domain": "codeg.completion.evidence_scope.v2",
+      "schema_version": 1,
+      "input": {"artifact_subject":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"git_head_v1"},"completion_protocol_version":2,"gate_id":null,"gate_lineage":null,"instruction_block_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","node":{"agent_type":"codex","node_id":"task-9-impl","phase_id":"tasks","profile_id":null,"role":"implementer","task_index":9,"work_unit_key":"task|9|implementer|codex|none"},"review_round":null,"review_scope_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","reviewed_producer":null,"scope_schema_version":2,"workflow_id":"wf-1"},
+      "canonical_utf8": "{\"artifact_subject\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"kind\":\"git_head_v1\"},\"completion_protocol_version\":2,\"gate_id\":null,\"gate_lineage\":null,\"instruction_block_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"node\":{\"agent_type\":\"codex\",\"node_id\":\"task-9-impl\",\"phase_id\":\"tasks\",\"profile_id\":null,\"role\":\"implementer\",\"task_index\":9,\"work_unit_key\":\"task|9|implementer|codex|none\"},\"review_round\":null,\"review_scope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reviewed_producer\":null,\"scope_schema_version\":2,\"workflow_id\":\"wf-1\"}",
+      "sha256": "sha256:57bcd1c798bc4be28930b7bc4dbd8c2de317cbb7997da8a98ee4c4e1c464db59"
+    }
+  ]
+}

@@ -28,6 +28,7 @@ use crate::db::entities::delegation_completion_tool_intent;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
 use crate::db::entities::delegation_workflow_gate_settlement::{self, GateSettlementOutcome};
+use crate::db::entities::delegation_workflow_gate_state;
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding;
 use crate::db::entities::delegation_workflow_run_binding;
@@ -40,6 +41,9 @@ use super::artifact_resolver::{
 };
 use super::error::WorkflowAdmissionRecoveryError;
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
+use super::evidence_scope::{
+    build_admission_completion_context, AdmissionCandidate, EvidenceScopeError, WorkflowStore,
+};
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
     RequiredReviewerEvidence, TerminalRunStatus,
@@ -49,9 +53,10 @@ use super::project::evidence_from_run_and_binding;
 use super::recovery_policy::decide_workflow_recovery;
 use super::store::load_workflow_recovery_snapshot_conn;
 use super::types::{
-    AcceptedToolIntent, CompleteWorkRequest, DocumentGateKind, ManifestDocument, ParsedWorkUnitKey,
-    WorkflowChildMcpBinding, COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES,
-    PHASE_FINAL, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    AcceptedToolIntent, CompleteWorkRequest, DocumentGateKind, InstructionBlockV1,
+    ManifestDocument, ParsedWorkUnitKey, WorkflowChildMcpBinding,
+    COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES, PHASE_FINAL, PHASE_TASKS,
+    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 use super::{CompletionOutcome, CompletionRole};
@@ -670,6 +675,10 @@ fn artifact_admission_err(error: ArtifactError) -> TaskStoreError {
     admission_err(error.code(), error.to_string())
 }
 
+fn evidence_admission_err(error: EvidenceScopeError) -> TaskStoreError {
+    admission_err(error.code(), error.to_string())
+}
+
 async fn resolve_v2_admission_head(workspace_path: Option<&str>) -> Result<String, TaskStoreError> {
     let workspace_path = workspace_path
         .map(str::trim)
@@ -705,6 +714,109 @@ async fn revalidate_v2_reviewer_head(
 
 fn map_db(e: sea_orm::DbErr) -> TaskStoreError {
     TaskStoreError::Permanent(format!("workflow admission db: {e}"))
+}
+
+pub async fn load_admitted_completion_instruction<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<Option<InstructionBlockV1>, TaskStoreError> {
+    let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+    else {
+        return Ok(None);
+    };
+    let workflow = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            admission_err(
+                "completion_instruction_binding_failed",
+                "admitted completion workflow is missing",
+            )
+        })?;
+    if workflow.completion_protocol_version != 2 {
+        return Ok(None);
+    }
+    let node = delegation_workflow_node_binding::Entity::find_by_id((
+        binding.workflow_id.clone(),
+        binding.node_id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(map_db)?
+    .ok_or_else(|| {
+        admission_err(
+            "completion_instruction_binding_failed",
+            "admitted completion node is missing",
+        )
+    })?;
+    let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| TaskStoreError::NotFound(task_id.to_string()))?;
+    let workspace_path = run.workspace_path.as_deref().ok_or_else(|| {
+        admission_err(
+            "completion_instruction_binding_failed",
+            "v2 admitted run has no workspace path",
+        )
+    })?;
+    let store = WorkflowStore::new(conn, FsPath::new(workspace_path));
+    let context = build_admission_completion_context(
+        &store,
+        &AdmissionCandidate {
+            workflow: &workflow,
+            node: &node,
+            task_id,
+            artifact_digest: binding.artifact_digest.as_deref(),
+            reviewed_task_id: binding.reviewed_task_id.as_deref(),
+            reviewed_generation: binding.reviewed_implementer_generation,
+            producer_baseline_head: binding.producer_baseline_head.as_deref(),
+        },
+    )
+    .await
+    .map_err(evidence_admission_err)?;
+    let persisted_round = binding
+        .review_round
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| {
+            admission_err(
+                "completion_instruction_binding_failed",
+                "persisted review round exceeds u32",
+            )
+        })?;
+    if binding.gate_id != context.evidence_scope.gate_id
+        || binding.gate_lineage != context.evidence_scope.gate_lineage
+        || persisted_round != context.evidence_scope.review_round
+        || binding.instruction_block_digest.as_deref() != Some(context.instruction.digest.as_str())
+        || binding.evidence_scope_digest.as_deref() != Some(context.evidence_scope_digest.as_str())
+        || binding.material_selector_digest != context.material_selector_digest
+        || binding.subject_material_digest != context.subject_material_digest
+        || binding.requirements_identity != context.requirements_identity
+        || binding.task_specification_identity != context.task_specification_identity
+        || binding.final_findings_identity != context.final_findings_identity
+    {
+        return Err(admission_err(
+            "completion_instruction_binding_failed",
+            "persisted completion instruction scope does not match durable admission inputs",
+        ));
+    }
+    Ok(Some(context.instruction))
+}
+
+pub async fn append_admitted_completion_instruction<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+    parent_prose: &str,
+) -> Result<String, TaskStoreError> {
+    match load_admitted_completion_instruction(conn, task_id).await? {
+        Some(instruction) => Ok(format!("{parent_prose}\n{}", instruction.canonical_utf8)),
+        None => Ok(parent_prose.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +937,39 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         producer_baseline_head,
     ) = stamp_admission_fields(conn, &header, &binding, &parsed, input.workspace_path).await?;
 
+    let completion_context = if header.completion_protocol_version == 2 {
+        let workspace_path = input.workspace_path.ok_or_else(|| {
+            admission_err(
+                "completion_instruction_binding_failed",
+                "v2 workflow admission requires a workspace path",
+            )
+        })?;
+        let store = WorkflowStore::new(conn, FsPath::new(workspace_path));
+        let context = build_admission_completion_context(
+            &store,
+            &AdmissionCandidate {
+                workflow: &header,
+                node: &binding,
+                task_id: input.task_id,
+                artifact_digest: artifact_digest.as_deref(),
+                reviewed_task_id: reviewed_task_id.as_deref(),
+                reviewed_generation: reviewed_impl_gen,
+                producer_baseline_head: producer_baseline_head.as_deref(),
+            },
+        )
+        .await
+        .map_err(evidence_admission_err)?;
+        if context.evidence_scope.gate_id != gate_id {
+            return Err(admission_err(
+                "completion_instruction_binding_failed",
+                "completion gate identity disagrees with admission stamp",
+            ));
+        }
+        Some(context)
+    } else {
+        None
+    };
+
     let content_fingerprint = document_gate_content_fingerprint(&header, &parsed);
     let rb = delegation_workflow_run_binding::ActiveModel {
         task_id: Set(input.task_id.to_string()),
@@ -834,6 +979,34 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         gate_cycle: Set(gate_cycle),
         manifest_revision: Set(header.active_manifest_revision),
         content_fingerprint: Set(content_fingerprint),
+        evidence_scope_digest: Set(completion_context
+            .as_ref()
+            .map(|context| context.evidence_scope_digest.clone())),
+        gate_lineage: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.evidence_scope.gate_lineage.clone())),
+        review_round: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.evidence_scope.review_round)
+            .map(i64::from)),
+        instruction_block_digest: Set(completion_context
+            .as_ref()
+            .map(|context| context.instruction.digest.clone())),
+        material_selector_digest: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.material_selector_digest.clone())),
+        subject_material_digest: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.subject_material_digest.clone())),
+        requirements_identity: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.requirements_identity.clone())),
+        task_specification_identity: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.task_specification_identity.clone())),
+        final_findings_identity: Set(completion_context
+            .as_ref()
+            .and_then(|context| context.final_findings_identity.clone())),
         producer_baseline_head: Set(producer_baseline_head),
         artifact_digest: Set(artifact_digest),
         reviewed_task_id: Set(reviewed_task_id),
@@ -842,7 +1015,6 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         summary_validated: Set(false),
         created_at: Set(now),
         updated_at: Set(now),
-        ..Default::default()
     };
     rb.insert(conn).await.map_err(map_db)?;
 
@@ -1962,7 +2134,7 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                 cycle,
                 Some(plan_digest.to_string()),
                 Some(author_run.task_id),
-                None,
+                Some(author_run.generation),
                 None,
             ))
         }
@@ -2049,7 +2221,7 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                     revalidate_v2_reviewer_head(workspace_path, digest).await?;
                 }
                 Ok((
-                    None,
+                    Some("final".into()),
                     None,
                     rb.artifact_digest,
                     Some(run.task_id),
@@ -2057,28 +2229,30 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                     None,
                 ))
             } else {
-                let durable_tip = derive_admission_branch_tip_digest(conn, header).await?;
                 let tip = if header.completion_protocol_version == 2 {
-                    let tip = durable_tip.ok_or_else(|| {
-                        artifact_admission_err(ArtifactError::Unavailable(
-                            ArtifactFailure::ExpectedArtifactInvalid,
-                        ))
-                    })?;
-                    revalidate_v2_reviewer_head(workspace_path, &tip).await?;
-                    Some(tip)
+                    Some(resolve_v2_admission_head(workspace_path).await?)
                 } else {
+                    let durable_tip = derive_admission_branch_tip_digest(conn, header).await?;
                     durable_tip.or_else(|| workspace_head_commit(workspace_path))
                 };
-                Ok((None, None, tip, None, None, None))
+                Ok((Some("final".into()), None, tip, None, None, None))
             }
         }
-        ParsedWorkUnitKey::TaskImplementer { .. } | ParsedWorkUnitKey::FinalFixer { .. } => {
+        ParsedWorkUnitKey::TaskImplementer { .. } => {
             let baseline = if header.completion_protocol_version == 2 {
                 Some(resolve_v2_admission_head(workspace_path).await?)
             } else {
                 None
             };
             Ok((None, None, None, None, None, baseline))
+        }
+        ParsedWorkUnitKey::FinalFixer { .. } => {
+            let baseline = if header.completion_protocol_version == 2 {
+                Some(resolve_v2_admission_head(workspace_path).await?)
+            } else {
+                None
+            };
+            Ok((Some("final".into()), None, None, None, None, baseline))
         }
     }
 }
@@ -2228,7 +2402,15 @@ async fn load_latest_implementer_binding<C: ConnectionTrait>(
     )>,
     TaskStoreError,
 > {
-    load_latest_role_run_binding(conn, header, PHASE_TASKS, "implementer", Some(task_index)).await
+    load_latest_role_run_binding(
+        conn,
+        header,
+        PHASE_TASKS,
+        "implementer",
+        Some(task_index),
+        None,
+    )
+    .await
 }
 
 async fn load_latest_fixer_binding<C: ConnectionTrait>(
@@ -2241,7 +2423,35 @@ async fn load_latest_fixer_binding<C: ConnectionTrait>(
     )>,
     TaskStoreError,
 > {
-    load_latest_role_run_binding(conn, header, PHASE_FINAL, "fixer", None).await
+    let gate_scope = if header.completion_protocol_version == 2 {
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            header.workflow_id.clone(),
+            "final".to_string(),
+        ))
+        .one(conn)
+        .await
+        .map_err(map_db)?
+        .ok_or_else(|| {
+            admission_err(
+                "completion_instruction_binding_failed",
+                "Final Reviewer admission requires a durable current Final gate state",
+            )
+        })?;
+        Some((state.gate_id, state.gate_lineage))
+    } else {
+        None
+    };
+    load_latest_role_run_binding(
+        conn,
+        header,
+        PHASE_FINAL,
+        "fixer",
+        None,
+        gate_scope
+            .as_ref()
+            .map(|(gate_id, lineage)| (gate_id.as_str(), lineage.as_str())),
+    )
+    .await
 }
 
 async fn load_latest_role_run_binding<C: ConnectionTrait>(
@@ -2250,6 +2460,7 @@ async fn load_latest_role_run_binding<C: ConnectionTrait>(
     phase: &str,
     role: &str,
     task_index: Option<i64>,
+    gate_scope: Option<(&str, &str)>,
 ) -> Result<
     Option<(
         delegation_task_run::Model,
@@ -2268,13 +2479,16 @@ async fn load_latest_role_run_binding<C: ConnectionTrait>(
     let Some(node) = binding else {
         return Ok(None);
     };
-    let rbs = delegation_workflow_run_binding::Entity::find()
+    let mut run_bindings = delegation_workflow_run_binding::Entity::find()
         .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_run_binding::Column::NodeId.eq(node.node_id))
-        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
-        .all(conn)
-        .await
-        .map_err(map_db)?;
+        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal);
+    if let Some((gate_id, gate_lineage)) = gate_scope {
+        run_bindings = run_bindings
+            .filter(delegation_workflow_run_binding::Column::GateId.eq(gate_id))
+            .filter(delegation_workflow_run_binding::Column::GateLineage.eq(gate_lineage));
+    }
+    let rbs = run_bindings.all(conn).await.map_err(map_db)?;
     for rb in rbs {
         if let Some(run) = delegation_task_run::Entity::find_by_id(rb.task_id.clone())
             .one(conn)
@@ -2486,11 +2700,12 @@ mod tests {
         publish_workflow_manifest_core, PublishWorkflowRequest,
     };
     use crate::acp::delegation::workflow::types::{
-        DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestNodeKind,
-        ManifestNodeRole, ManifestPhase, ManifestTaskHardTrigger, ManifestTaskPolicy,
-        ManifestTaskRisk, ManifestTaskRoute, ManifestWorkflowState, ResolutionMode,
-        TaskHardTriggerKind, TaskRiskLevel, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION,
-        PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+        CompletionScopeRole, DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate,
+        ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase, ManifestTaskHardTrigger,
+        ManifestTaskPolicy, ManifestTaskRisk, ManifestTaskRoute, ManifestWorkflowState,
+        ResolutionMode, TaskHardTriggerKind, TaskRiskLevel, WorkUnitKeyParts,
+        MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
+        WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
     use crate::acp::delegation::workflow::WorkflowStoreError;
     use crate::db::entities::conversation::ConversationStatus;
@@ -2504,6 +2719,10 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    const ADMISSION_DESIGN_BYTES: &[u8] = b"# Design\n\nApproved behavior.\n";
+    const ADMISSION_PLAN_BYTES: &[u8] =
+        b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n";
 
     fn emitter_with_rx() -> (
         EventEmitter,
@@ -2604,11 +2823,11 @@ mod tests {
             workflow_state: state,
             design: Some(DocumentRef {
                 rel_path: design_path.into(),
-                digest: "sha256:design".into(),
+                digest: task9_sha256(ADMISSION_DESIGN_BYTES),
             }),
             plan: Some(DocumentRef {
                 rel_path: plan_path.into(),
-                digest: "sha256:plan".into(),
+                digest: task9_sha256(ADMISSION_PLAN_BYTES),
             }),
             phases: vec![
                 phase(PHASE_DESIGN),
@@ -2933,6 +3152,7 @@ mod tests {
         )
         .await
         .expect("approve publish");
+        seed_approved_plan_gate_state(db, &pub2.workflow_id).await;
         (pub2.workflow_id, pub2.graph_revision)
     }
 
@@ -2972,15 +3192,52 @@ mod tests {
         doc.expected_manifest_revision = Some(published.manifest_revision);
         doc.workflow_state = ManifestWorkflowState::Approved;
         doc.publication_token.push_str("-approved");
-        publish_workflow_manifest_core(
+        let approved = publish_workflow_manifest_core(
             db,
             emitter,
             parent,
             PublishWorkflowRequest { document: doc },
         )
         .await
-        .expect("publish approved document")
-        .workflow_id
+        .expect("publish approved document");
+        seed_approved_plan_gate_state(db, &approved.workflow_id).await;
+        approved.workflow_id
+    }
+
+    fn test_plan_gate_lineage() -> String {
+        format!("sha256:{}", "9".repeat(64))
+    }
+
+    async fn seed_approved_plan_gate_state(db: &AppDatabase, workflow_id: &str) {
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let document = load_active_manifest_doc(&db.conn, &header)
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest = validate_manifest_document(&document).unwrap();
+        let gate = manifest
+            .gates
+            .iter()
+            .find(|gate| gate.gate_kind == DocumentGateKind::Plan)
+            .unwrap();
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(workflow_id.to_string()),
+            gate_id: Set(gate.id.clone()),
+            gate_lineage: Set(test_plan_gate_lineage()),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set(
+                serde_json::to_string(&gate.required_reviewer_node_ids).unwrap()
+            ),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
     }
 
     async fn seed_gate_settlement(
@@ -3002,6 +3259,14 @@ mod tests {
         } else {
             header.design_fingerprint.clone()
         };
+        let covered_plan_digest = if gate_id == "plan" {
+            load_active_manifest_doc(&db.conn, &header)
+                .await
+                .unwrap()
+                .and_then(|document| document.plan.map(|plan| plan.digest))
+        } else {
+            None
+        };
         let row = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(workflow_id.to_string()),
             gate_id: Set(gate_id.to_string()),
@@ -3009,10 +3274,16 @@ mod tests {
             manifest_revision: Set(header.active_manifest_revision),
             structural_revision: Set(header.structural_revision),
             content_fingerprint: Set(content_fp),
+            evidence_scope_digest: Set(
+                (gate_id == "plan").then(|| format!("sha256:{}", "8".repeat(64)))
+            ),
+            gate_lineage: Set((gate_id == "plan").then(test_plan_gate_lineage)),
+            review_round: Set((gate_id == "plan").then_some(cycle)),
             outcome: Set(outcome.clone()),
             critical_count: Set(Some(0)),
             important_count: Set(Some(0)),
             minor_count: Set(Some(0)),
+            covered_plan_digest: Set(covered_plan_digest),
             summary: Set("ok".into()),
             graph_revision_at_settle: Set(header.graph_revision),
             created_at: Set(now),
@@ -3066,6 +3337,100 @@ mod tests {
     async fn child_for(db: &AppDatabase, agent: AgentType) -> i32 {
         let folder = seed_folder(db, &format!("/tmp/child-{}", UuidLike::next())).await;
         seed_conversation(db, folder, agent).await
+    }
+
+    async fn admit_task9_bound_run(
+        db: &AppDatabase,
+        parent: i32,
+        workspace: &Path,
+        workflow_id: &str,
+        node_id: &str,
+        task_id: &str,
+        agent: AgentType,
+        agent_wire: &str,
+    ) -> delegation_workflow_run_binding::Model {
+        let node = delegation_workflow_node_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            node_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let child = child_for(db, agent).await;
+        let mut insert = gen1_insert(
+            parent,
+            child,
+            task_id,
+            agent_wire,
+            Some(&node.work_unit_key),
+            None,
+        );
+        insert.workspace_path = Some(workspace.to_string_lossy().into_owned());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        assert!(matches!(
+            store.admit_gen1_reserving(insert).await.unwrap(),
+            Gen1AdmitOutcome::Created(_)
+        ));
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.workflow_id, workflow_id);
+        assert_eq!(binding.node_id, node_id);
+        assert!(binding.instruction_block_digest.is_some());
+        assert!(binding.evidence_scope_digest.is_some());
+        let instruction = load_admitted_completion_instruction(&db.conn, task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.instruction_block_digest.as_deref(),
+            Some(instruction.digest.as_str())
+        );
+        assert_eq!(
+            append_admitted_completion_instruction(&db.conn, task_id, "parent prose")
+                .await
+                .unwrap(),
+            format!("parent prose\n{}", instruction.canonical_utf8)
+        );
+        binding
+    }
+
+    async fn complete_task9_admitted_run(
+        db: &AppDatabase,
+        task_id: &str,
+        summary_json: &str,
+        artifact_digest: Option<&str>,
+    ) {
+        let now = Utc::now();
+        let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.status = Set(DelegationRunStatus::Completed);
+        run.reached_running_at = Set(Some(now));
+        run.finished_at = Set(Some(now));
+        run.card_summary_json = Set(Some(summary_json.to_string()));
+        run.update(&db.conn).await.unwrap();
+
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+        binding.summary_validated = Set(true);
+        if let Some(digest) = artifact_digest {
+            binding.artifact_digest = Set(Some(digest.to_string()));
+        }
+        binding.updated_at = Set(now);
+        binding.update(&db.conn).await.unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3172,7 +3537,13 @@ mod tests {
             git_fixture_command(dir.path(), &["init", "--quiet"]);
             std::fs::write(dir.path().join("owned.txt"), b"baseline\n")
                 .expect("write admission baseline");
-            git_fixture_command(dir.path(), &["add", "owned.txt"]);
+            let design_path = dir.path().join("docs/superpowers/specs/x.md");
+            let plan_path = dir.path().join("docs/superpowers/plans/p.md");
+            std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+            std::fs::write(design_path, ADMISSION_DESIGN_BYTES).unwrap();
+            std::fs::write(plan_path, ADMISSION_PLAN_BYTES).unwrap();
+            git_fixture_command(dir.path(), &["add", "."]);
             git_fixture_command(
                 dir.path(),
                 &[
@@ -3248,6 +3619,581 @@ mod tests {
         active.completion_protocol_version = Set(2);
         active.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
         active.update(&db.conn).await.expect("enable completion v2");
+    }
+
+    fn task9_sha256(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    #[tokio::test]
+    async fn all_role_instruction_scope_admission_derives_material_from_durable_sources() {
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        const DESIGN_BYTES: &[u8] = b"# Design\n\nApproved behavior.\n";
+        const PLAN_BYTES: &[u8] = b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n";
+
+        let repo = AdmissionGitFixture::new();
+        let design_path = repo.path().join("docs/superpowers/specs/x.md");
+        let plan_path = repo.path().join("docs/superpowers/plans/p.md");
+        std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(&design_path, DESIGN_BYTES).unwrap();
+        std::fs::write(&plan_path, PLAN_BYTES).unwrap();
+
+        let (db, parent) = seed_parent().await;
+        let (emitter, _rx) = emitter_with_rx();
+        let mut document = sample_doc("task9-scope", ManifestWorkflowState::Estimated);
+        document.design.as_mut().unwrap().digest = task9_sha256(DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(PLAN_BYTES);
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        enable_completion_v2(&db, &published.workflow_id).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("design".into()),
+            gate_lineage: Set(format!("sha256:{}", "d".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"design-reviewer-1\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
+            current_review_round: Set(2),
+            selected_node_ids_json: Set("[\"plan-reviewer-1\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let design_task_id = "task9-design-reviewer";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "design-reviewer-1",
+            design_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        let author_task_id = "task9-plan-author";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            author_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            author_task_id,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            Some(document.plan.as_ref().unwrap().digest.as_str()),
+        )
+        .await;
+
+        let task_id = "task9-plan-reviewer";
+        let binding = admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-reviewer-1",
+            task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        assert!(binding.material_selector_digest.is_some());
+        assert!(binding.subject_material_digest.is_some());
+        assert!(binding.instruction_block_digest.is_some());
+        assert!(binding.evidence_scope_digest.is_some());
+        assert_eq!(binding.review_round, Some(2));
+        let instruction = load_admitted_completion_instruction(&db.conn, task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.instruction_block_digest.as_deref(),
+            Some(instruction.digest.as_str())
+        );
+        assert!(instruction.canonical_utf8.contains("task.1"));
+        assert!(instruction.canonical_utf8.contains("request changes"));
+        assert_eq!(
+            append_admitted_completion_instruction(&db.conn, task_id, "parent prose")
+                .await
+                .unwrap(),
+            format!("parent prose\n{}", instruction.canonical_utf8)
+        );
+
+        let task_node = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "task-1-impl".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let branch_tip = repo.head();
+        let workflow_before_plan_approval =
+            delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        let context_store = WorkflowStore::new(&db.conn, repo.path());
+        let missing_approval = build_admission_completion_context(
+            &context_store,
+            &AdmissionCandidate {
+                workflow: &workflow_before_plan_approval,
+                node: &task_node,
+                task_id: "task9-unapproved-plan-probe",
+                artifact_digest: None,
+                reviewed_task_id: None,
+                reviewed_generation: None,
+                producer_baseline_head: Some(&branch_tip),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            missing_approval,
+            EvidenceScopeError::PlanMaterialInvalid(_)
+        ));
+
+        seed_gate_settlement(
+            &db,
+            &published.workflow_id,
+            "plan",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
+        let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut settlement: delegation_workflow_gate_settlement::ActiveModel = settlement.into();
+        settlement.gate_lineage = Set(Some(format!("sha256:{}", "a".repeat(64))));
+        settlement.review_round = Set(Some(2));
+        settlement.evidence_scope_digest = Set(Some(format!("sha256:{}", "b".repeat(64))));
+        settlement.covered_plan_digest = Set(None);
+        settlement.update(&db.conn).await.unwrap();
+
+        let workflow_without_covered_plan =
+            delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        let missing_covered_plan = build_admission_completion_context(
+            &context_store,
+            &AdmissionCandidate {
+                workflow: &workflow_without_covered_plan,
+                node: &task_node,
+                task_id: "task9-uncovered-plan-probe",
+                artifact_digest: None,
+                reviewed_task_id: None,
+                reviewed_generation: None,
+                producer_baseline_head: Some(&branch_tip),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            missing_covered_plan,
+            EvidenceScopeError::PlanMaterialInvalid(_)
+        ));
+        let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut settlement: delegation_workflow_gate_settlement::ActiveModel = settlement.into();
+        settlement.covered_plan_digest = Set(Some(document.plan.as_ref().unwrap().digest.clone()));
+        settlement.update(&db.conn).await.unwrap();
+
+        let task_implementer_task_id = "task9-task-implementer";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "task-1-impl",
+            task_implementer_task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            task_implementer_task_id,
+            implementation_summary(),
+            Some(&branch_tip),
+        )
+        .await;
+        let task_reviewer_task_id = "task9-task-reviewer";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "task-1-rev",
+            task_reviewer_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(&db, task_reviewer_task_id, review_summary(), None).await;
+
+        use crate::db::entities::delegation_final_findings_package::{
+            self, FinalFindingsPackageStatus,
+        };
+        let final_lineage = format!("sha256:{}", "f".repeat(64));
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(final_lineage.clone()),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_final_findings_package::ActiveModel {
+            package_id: Set("task9-final-package".into()),
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(final_lineage.clone()),
+            source_evaluation_key: Set(format!("sha256:{}", "e".repeat(64))),
+            source_evidence_task_ids_json: Set("[]".into()),
+            items_json: Set("[]".into()),
+            remediation_contexts_json: Set("[]".into()),
+            package_digest: Set(format!("sha256:{}", "c".repeat(64))),
+            status: Set(FinalFindingsPackageStatus::Active),
+            created_graph_revision: Set(1),
+            resolved_graph_revision: Set(None),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let final_reviewer_task_id = "task9-final-reviewer";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "final-reviewer",
+            final_reviewer_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            final_reviewer_task_id,
+            r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required","report_file":"reports/final.md"}"#,
+            None,
+        )
+        .await;
+        let final_fixer_task_id = "task9-final-fixer";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "final-fixer",
+            final_fixer_task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+
+        let cases = [
+            (
+                CompletionScopeRole::DesignReviewer,
+                "design-reviewer-1",
+                design_task_id,
+            ),
+            (
+                CompletionScopeRole::PlanAuthor,
+                "plan-author",
+                author_task_id,
+            ),
+            (
+                CompletionScopeRole::PlanReviewer,
+                "plan-reviewer-1",
+                task_id,
+            ),
+            (
+                CompletionScopeRole::TaskImplementer,
+                "task-1-impl",
+                task_implementer_task_id,
+            ),
+            (
+                CompletionScopeRole::TaskReviewer,
+                "task-1-rev",
+                task_reviewer_task_id,
+            ),
+            (
+                CompletionScopeRole::FinalFixer,
+                "final-fixer",
+                final_fixer_task_id,
+            ),
+            (
+                CompletionScopeRole::FinalReviewer,
+                "final-reviewer",
+                final_reviewer_task_id,
+            ),
+        ];
+        let mut admitted_roles = Vec::new();
+        for (expected_role, node_id, admitted_task_id) in cases {
+            let binding =
+                delegation_workflow_run_binding::Entity::find_by_id(admitted_task_id.to_string())
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(binding.node_id, node_id);
+            assert!(binding.instruction_block_digest.is_some());
+            assert!(binding.evidence_scope_digest.is_some());
+            let instruction = load_admitted_completion_instruction(&db.conn, admitted_task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                append_admitted_completion_instruction(&db.conn, admitted_task_id, "parent prose")
+                    .await
+                    .unwrap(),
+                format!("parent prose\n{}", instruction.canonical_utf8)
+            );
+            if matches!(
+                expected_role,
+                CompletionScopeRole::FinalFixer | CompletionScopeRole::FinalReviewer
+            ) {
+                assert_eq!(binding.gate_id.as_deref(), Some("final"));
+                assert_eq!(
+                    binding.gate_lineage.as_deref(),
+                    Some(final_lineage.as_str())
+                );
+                assert_eq!(
+                    binding.review_round,
+                    (expected_role == CompletionScopeRole::FinalReviewer).then_some(1_i64)
+                );
+            }
+            admitted_roles.push(expected_role);
+        }
+        assert_eq!(
+            admitted_roles,
+            [
+                CompletionScopeRole::DesignReviewer,
+                CompletionScopeRole::PlanAuthor,
+                CompletionScopeRole::PlanReviewer,
+                CompletionScopeRole::TaskImplementer,
+                CompletionScopeRole::TaskReviewer,
+                CompletionScopeRole::FinalFixer,
+                CompletionScopeRole::FinalReviewer,
+            ]
+        );
+
+        repo.commit_change();
+        let fixer_head = repo.head();
+        complete_task9_admitted_run(
+            &db,
+            final_fixer_task_id,
+            implementation_summary(),
+            Some(&fixer_head),
+        )
+        .await;
+        let final_state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "final".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut final_state: delegation_workflow_gate_state::ActiveModel = final_state.into();
+        final_state.gate_lineage = Set(format!("sha256:{}", "1".repeat(64)));
+        final_state.update(&db.conn).await.unwrap();
+
+        let final_reviewer = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "final-reviewer".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let final_reviewer_key =
+            parse_recognized_work_unit_key(&final_reviewer.work_unit_key).unwrap();
+        let workflow = delegation_workflow::Entity::find_by_id(published.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let (gate_id, _, artifact_digest, reviewed_task_id, reviewed_generation, _) =
+            stamp_admission_fields(
+                &db.conn,
+                &workflow,
+                &final_reviewer,
+                &final_reviewer_key,
+                repo.path().to_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate_id.as_deref(), Some("final"));
+        assert_eq!(artifact_digest.as_deref(), Some(fixer_head.as_str()));
+        assert_eq!(reviewed_task_id, None);
+        assert_eq!(reviewed_generation, None);
+
+        delegation_workflow_gate_state::Entity::delete_by_id((
+            published.workflow_id.clone(),
+            "final".to_string(),
+        ))
+        .exec(&db.conn)
+        .await
+        .unwrap();
+        let missing_state = load_latest_fixer_binding(&db.conn, &workflow)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing_state.workflow_admission_code(),
+            Some("completion_instruction_binding_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_role_instruction_scope_admission_rejects_malformed_durable_plan_before_binding() {
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        const DESIGN_BYTES: &[u8] = b"# Design\n\nApproved behavior.\n";
+        const MALFORMED_PLAN_BYTES: &[u8] =
+            b"## Task 1: First\n\nbody\n\n## Task 1: Duplicate\n\nother\n";
+
+        let repo = AdmissionGitFixture::new();
+        let design_path = repo.path().join("docs/superpowers/specs/x.md");
+        let plan_path = repo.path().join("docs/superpowers/plans/p.md");
+        std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(&design_path, DESIGN_BYTES).unwrap();
+        std::fs::write(&plan_path, MALFORMED_PLAN_BYTES).unwrap();
+
+        let (db, parent) = seed_parent().await;
+        let (emitter, _rx) = emitter_with_rx();
+        let mut document = sample_doc("task9-malformed-plan", ManifestWorkflowState::Estimated);
+        document.design.as_mut().unwrap().digest = task9_sha256(DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(MALFORMED_PLAN_BYTES);
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        enable_completion_v2(&db, &published.workflow_id).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"plan-reviewer-1\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let author_node = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan-author".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let author_child = child_for(&db, AgentType::Codex).await;
+        seed_completed_bound_run(
+            &db,
+            parent,
+            author_child,
+            &published.workflow_id,
+            "plan-author",
+            "task9-malformed-author",
+            &author_node.work_unit_key,
+            "codex",
+            1,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            Some(document.plan.as_ref().unwrap().digest.as_str()),
+            None,
+            None,
+        )
+        .await;
+
+        let reviewer_node = delegation_workflow_node_binding::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan-reviewer-1".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let reviewer_child = child_for(&db, AgentType::Codex).await;
+        let task_id = "task9-malformed-reviewer";
+        let mut insert = gen1_insert(
+            parent,
+            reviewer_child,
+            task_id,
+            "codex",
+            Some(&reviewer_node.work_unit_key),
+            None,
+        );
+        insert.workspace_path = Some(repo.path().to_string_lossy().into_owned());
+        let run_store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        let error = run_store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(matches!(
+            error,
+            TaskStoreError::WorkflowAdmission { ref code, .. }
+                if code == "completion_plan_material_invalid"
+        ));
+        assert!(
+            delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3403,6 +4349,17 @@ mod tests {
         let (workflow_id, _) =
             publish_approved(&db, &emitter, parent, "tok-task7-final-drift").await;
         enable_completion_v2(&db, &workflow_id).await;
+        let final_lineage = format!("sha256:{}", "7".repeat(64));
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(final_lineage.clone()),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
         let repo = AdmissionGitFixture::new();
         let producer_head = repo.head();
         let implementer_task = "70000000-0000-4000-8000-000000000005";
@@ -3452,6 +4409,7 @@ mod tests {
         )
         .await;
         repo.commit_change();
+        let delivered_head = repo.head();
 
         let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
             agent_type: "codex",
@@ -3471,14 +4429,30 @@ mod tests {
             conn: db.conn.clone(),
         }))
         .with_workflow_emitter(emitter);
-        let error = store
+        let outcome = store
             .admit_gen1_reserving(final_reviewer)
             .await
-            .expect_err("Final reviewer must reject a post-tidy commit mismatch");
+            .expect("Final reviewer must bind the clean post-aggregation HEAD");
+        assert!(matches!(outcome, Gen1AdmitOutcome::Created(_)));
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(
+            "70000000-0000-4000-8000-000000000007".to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            error.workflow_admission_code(),
-            Some("completion_scope_changed")
+            binding.artifact_digest.as_deref(),
+            Some(delivered_head.as_str())
         );
+        assert_eq!(binding.reviewed_task_id, None);
+        assert_eq!(binding.reviewed_implementer_generation, None);
+        assert_eq!(binding.gate_id.as_deref(), Some("final"));
+        assert_eq!(
+            binding.gate_lineage.as_deref(),
+            Some(final_lineage.as_str())
+        );
+        assert_eq!(binding.review_round, Some(1));
     }
 
     #[tokio::test]

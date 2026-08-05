@@ -6,6 +6,7 @@ pub mod completion_intent;
 pub mod dto;
 pub mod error;
 pub mod events;
+pub mod evidence_scope;
 pub mod gates;
 pub mod key;
 pub mod plan_material;

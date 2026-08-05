@@ -73,6 +73,41 @@ use super::validate::validate_manifest_document;
 /// Capability version stamped on new headers (B9 / A15).
 pub const WORKFLOW_CAPABILITY_VERSION: &str = "workflow_manifest_v2";
 
+/// One immutable active-manifest row validated against the workflow header.
+/// Completion admission consumes this snapshot instead of caller-provided
+/// material or a projection assembled from mutable graph state.
+#[derive(Debug, Clone)]
+pub struct ActiveManifestSnapshot {
+    pub document: ManifestDocument,
+    pub normalized: NormalizedManifest,
+}
+
+pub async fn load_active_manifest_snapshot<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workflow: &delegation_workflow::Model,
+) -> Result<ActiveManifestSnapshot, WorkflowStoreError> {
+    let document = load_active_manifest_document_txn(
+        conn,
+        &workflow.workflow_id,
+        workflow.active_manifest_revision,
+    )
+    .await?;
+    let normalized = validate_manifest_document(&document)?;
+    if normalized
+        .workflow_id
+        .as_deref()
+        .is_some_and(|workflow_id| workflow_id != workflow.workflow_id)
+    {
+        return Err(WorkflowStoreError::Persistence(
+            "active manifest workflow identity does not match its durable header".into(),
+        ));
+    }
+    Ok(ActiveManifestSnapshot {
+        document,
+        normalized,
+    })
+}
+
 /// Store-facing validated input for a future durable Plan publication transition.
 pub fn estimated_plan_publication_material_decision(
     prior_manifest: &NormalizedManifest,

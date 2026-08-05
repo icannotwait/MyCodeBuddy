@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::completion_intent::CompletionOutcome;
+use super::completion_intent::{
+    CompletionIntent, CompletionIntentSource, CompletionOutcome, CompletionRole,
+};
 
 /// Max length of a canonical `work_unit_key` after normalization (MCP + A1).
 /// Counted as Unicode scalar values (`str::chars`), not UTF-8 bytes.
@@ -26,6 +28,271 @@ pub const MAX_ADJUDICATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_JSON_BYTES: usize = 512 * 1024;
 pub const COMPLETE_WORK_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 pub const COMPLETE_WORK_REPORT_FILE_MAX_BYTES: usize = 1024;
+pub const COMPLETION_PROTOCOL_VERSION_V2: u32 = 2;
+pub const EVIDENCE_SCOPE_SCHEMA_VERSION_V2: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionScopeRole {
+    DesignRoot,
+    DesignReviewer,
+    PlanAuthor,
+    PlanReviewer,
+    TaskImplementer,
+    TaskReviewer,
+    FinalFixer,
+    FinalReviewer,
+}
+
+impl CompletionScopeRole {
+    pub const fn completion_role(self) -> CompletionRole {
+        match self {
+            Self::DesignRoot
+            | Self::DesignReviewer
+            | Self::PlanReviewer
+            | Self::TaskReviewer
+            | Self::FinalReviewer => CompletionRole::Reviewer,
+            Self::PlanAuthor => CompletionRole::Author,
+            Self::TaskImplementer => CompletionRole::Implementer,
+            Self::FinalFixer => CompletionRole::Fixer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableNodeIdentityV2 {
+    pub node_id: String,
+    pub role: CompletionRole,
+    pub phase_id: String,
+    pub task_index: Option<u32>,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub work_unit_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementsIdentityV1 {
+    pub design_digest: String,
+    pub design_rel_path: String,
+    pub design_settlement_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialIdentitySummary {
+    pub key: String,
+    pub body_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionBlockV1 {
+    pub template_id: String,
+    pub template_version: u32,
+    pub canonical_utf8: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactSubjectIdentityV2 {
+    DocumentSha256 {
+        rel_path: String,
+        digest: String,
+    },
+    GitHeadV1 {
+        digest: String,
+    },
+    PlanMaterial {
+        plan_rel_path: String,
+        gate_lineage: String,
+        material_selector_digest: String,
+        selected_material_digest: String,
+    },
+    PendingDocument {
+        rel_path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedProducerIdentityV2 {
+    pub task_id: String,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceScopeInputV2 {
+    pub completion_protocol_version: u32,
+    pub scope_schema_version: u32,
+    pub workflow_id: String,
+    pub node: StableNodeIdentityV2,
+    pub gate_id: Option<String>,
+    pub gate_lineage: Option<String>,
+    pub review_round: Option<u32>,
+    pub artifact_subject: ArtifactSubjectIdentityV2,
+    pub reviewed_producer: Option<ReviewedProducerIdentityV2>,
+    pub instruction_block_digest: String,
+    pub review_scope_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeNodePolicyV2 {
+    pub node_id: String,
+    pub role: CompletionRole,
+    pub phase_id: String,
+    pub task_index: Option<u32>,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub work_unit_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeEdgeV2 {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleReviewScopeV2 {
+    DesignRoot {
+        workflow_kind: String,
+        design: DocumentRef,
+        gate_lineage: String,
+        policy_digest: String,
+    },
+    DesignReviewer {
+        workflow_kind: String,
+        design: DocumentRef,
+        policy_digest: String,
+    },
+    PlanAuthor {
+        plan_target_rel_path: String,
+        requirements_identity: String,
+    },
+    PlanReviewer {
+        requirements_identity: String,
+        plan_subject: PlanSubjectIdentityV2,
+        risk_policy_version: String,
+        policy_digest: String,
+    },
+    TaskImplementer {
+        task_specification_identity: String,
+        dependency_identities: Vec<String>,
+        route_digest: String,
+        admitted_plan_identity: String,
+    },
+    TaskReviewer {
+        task_specification_identity: String,
+        risk_policy_digest: String,
+        review_requirements_digest: String,
+        admitted_plan_identity: String,
+        reviewed_producer: ReviewedProducerIdentityV2,
+    },
+    FinalFixer {
+        final_findings_identity: String,
+        branch_tip: String,
+    },
+    FinalReviewer {
+        active_plan_identity: String,
+        ordered_task_output_identities: Vec<String>,
+        final_review_requirements_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompletionArtifactV2 {
+    DocumentSha256 { rel_path: String, digest: String },
+    GitHeadV1 { head: String },
+}
+
+impl CompletionArtifactV2 {
+    pub fn digest(&self) -> &str {
+        match self {
+            Self::DocumentSha256 { digest, .. } => digest,
+            Self::GitHeadV1 { head } => head,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionEvidenceBindingV2 {
+    pub workflow_id: String,
+    pub task_id: String,
+    pub node_id: String,
+    pub role: CompletionRole,
+    pub phase_id: String,
+    pub task_index: Option<u32>,
+    pub gate_id: Option<String>,
+    pub gate_lineage: Option<String>,
+    pub review_round: Option<u32>,
+    pub reviewed_task_id: Option<String>,
+    pub reviewed_generation: Option<i64>,
+    pub manifest_revision_observed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionEvidenceV2 {
+    pub version: u32,
+    pub intent: CompletionIntent,
+    pub binding: CompletionEvidenceBindingV2,
+    pub artifact: CompletionArtifactV2,
+    pub review_scope_digest: String,
+    pub evidence_scope_digest: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceValidationContext {
+    pub role: CompletionRole,
+    pub binding: CompletionEvidenceBindingV2,
+    pub artifact: CompletionArtifactV2,
+    pub scope: EvidenceScopeInputV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCompletionEvidence {
+    pub evidence: CompletionEvidenceV2,
+    pub evidence_validated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionCompletionContextV2 {
+    pub scope_role: CompletionScopeRole,
+    pub instruction: InstructionBlockV1,
+    pub review_scope: RoleReviewScopeV2,
+    pub review_scope_digest: String,
+    pub evidence_scope: EvidenceScopeInputV2,
+    pub evidence_scope_digest: String,
+    pub material_selector_digest: Option<String>,
+    pub subject_material_digest: Option<String>,
+    pub requirements_identity: Option<String>,
+    pub task_specification_identity: Option<String>,
+    pub final_findings_identity: Option<String>,
+    pub manifest_revision_observed: u64,
+    pub graph_revision_observed: u64,
+    pub required_reviewer_node_ids: Vec<String>,
+    pub display_title: Option<String>,
+    pub legacy_content_fingerprint: Option<String>,
+}
+
+impl CompletionIntentSource {
+    pub const fn is_platform_supported(self) -> bool {
+        matches!(
+            self,
+            Self::CompleteWork | Self::AssistantConclusion | Self::Report | Self::UserAdjudication
+        )
+    }
+}
 
 /// Semantic payload accepted from the workflow child. Identity and workflow
 /// routing are always supplied by the platform transport/token binding.

@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 pub use super::artifact_resolver::{ArtifactError, ArtifactFailure};
+pub use super::evidence_scope::EvidenceScopeError;
 pub use super::plan_material::{PlanMaterialError, PlanMaterialErrorKind};
 use super::plan_review::PlanReviewError;
 use super::recovery_policy::WorkflowRecoveryProjection;

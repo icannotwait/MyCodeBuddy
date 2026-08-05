@@ -107,6 +107,7 @@ use crate::acp::delegation::types::{
     ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
     DELEGATE_TO_AGENT_TOOL,
 };
+use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
     AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
@@ -2315,6 +2316,31 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
     }
 }
 
+enum WorkflowLaunchLoadError {
+    WorkflowBinding(String),
+    CompletionInstruction(TaskStoreError),
+}
+
+impl WorkflowLaunchLoadError {
+    fn durable_error_code<'a>(&'a self, binding_fallback: &'a str) -> &'a str {
+        match self {
+            Self::WorkflowBinding(_) => binding_fallback,
+            Self::CompletionInstruction(error) => error
+                .workflow_admission_code()
+                .unwrap_or("completion_instruction_binding_failed"),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowLaunchLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkflowBinding(message) => formatter.write_str(message),
+            Self::CompletionInstruction(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
 /// Same-owner intended payloads for permanent-failure finalizer / retry worker
 /// upgrade to sanitized `persistence_error` (Task 4 adds admission codes).
 fn is_same_owner_intended_error_code(code: &str) -> bool {
@@ -4214,7 +4240,10 @@ impl DelegationBroker {
         child_conversation_id: i32,
         agent_type: AgentType,
         inflight_id: u64,
+        error: &WorkflowLaunchLoadError,
     ) -> DelegationTaskReport {
+        let error_code = error.durable_error_code("spawn_failed");
+        let error_message = error.to_string();
         match runs.abandon_unbound_reserving_claim(task_id).await {
             Ok(true) => {
                 let cleanup = self
@@ -4230,7 +4259,10 @@ impl DelegationBroker {
                 }
                 report_err(
                     agent_type,
-                    DelegationError::SpawnFailed("workflow binding load failed".into()),
+                    DelegationError::WorkflowAdmission {
+                        code: error_code.to_string(),
+                        message: error_message.clone(),
+                    },
                     Some(child_conversation_id),
                 )
             }
@@ -4240,7 +4272,7 @@ impl DelegationBroker {
                         task_id,
                         "",
                         failed_terminal(
-                            "spawn_failed",
+                            error_code,
                             DelegationRunStatus::Reserving,
                             false,
                             AcpTerminationSource::Admission,
@@ -4268,7 +4300,10 @@ impl DelegationBroker {
                         ),
                         Ok(None) => report_err(
                             agent_type,
-                            DelegationError::SpawnFailed("workflow binding load failed".into()),
+                            DelegationError::WorkflowAdmission {
+                                code: error_code.to_string(),
+                                message: error_message.clone(),
+                            },
                             Some(child_conversation_id),
                         ),
                         Err(error) => report_err(
@@ -6538,14 +6573,26 @@ impl DelegationBroker {
                 prebound_child.map(|(cid, _)| cid),
             );
         }
-        let workflow_binding = match self.run_store.as_ref() {
-            Some(runs) => match runs.workflow_child_mcp_binding(&call_id).await {
-                Ok(workflow_binding) => workflow_binding,
+        let (workflow_binding, dispatch_prompt) = match self.run_store.as_ref() {
+            Some(runs) => match async {
+                let workflow_binding = runs
+                    .workflow_child_mcp_binding(&call_id)
+                    .await
+                    .map_err(WorkflowLaunchLoadError::WorkflowBinding)?;
+                let prompt =
+                    append_admitted_completion_instruction(&runs.db().conn, &call_id, &req.task)
+                        .await
+                        .map_err(WorkflowLaunchLoadError::CompletionInstruction)?;
+                Ok::<_, WorkflowLaunchLoadError>((workflow_binding, prompt))
+            }
+            .await
+            {
+                Ok(workflow_launch) => workflow_launch,
                 Err(error) => {
                     tracing::error!(
                         task_id = %call_id,
                         error = %error,
-                        "[delegation] workflow binding load failed before gen-1 spawn"
+                        "[delegation] workflow instruction binding load failed before gen-1 spawn"
                     );
                     return self
                         .fail_gen1_workflow_binding_load(
@@ -6556,11 +6603,12 @@ impl DelegationBroker {
                                 .0,
                             req.agent_type,
                             inflight_id,
+                            &error,
                         )
                         .await;
                 }
             },
-            None => None,
+            None => (None, req.task.clone()),
         };
         let spawn_result = self
             .spawner
@@ -6964,7 +7012,7 @@ impl DelegationBroker {
             .spawner
             .send_prompt_linked_for_delegation(
                 &child_connection_id,
-                req.task.clone(),
+                dispatch_prompt,
                 link,
                 prebound_child,
             )
@@ -9341,14 +9389,33 @@ impl DelegationBroker {
             );
         }
 
-        let workflow_binding = match runs.workflow_child_mcp_binding(&reserved.task_id).await {
-            Ok(workflow_binding) => workflow_binding,
+        let workflow_launch = async {
+            let workflow_binding = runs
+                .workflow_child_mcp_binding(&reserved.task_id)
+                .await
+                .map_err(WorkflowLaunchLoadError::WorkflowBinding)?;
+            let prompt = append_admitted_completion_instruction(
+                &runs.db().conn,
+                &reserved.task_id,
+                &req.task,
+            )
+            .await
+            .map_err(WorkflowLaunchLoadError::CompletionInstruction)?;
+            Ok::<_, WorkflowLaunchLoadError>((workflow_binding, prompt))
+        }
+        .await;
+        let (workflow_binding, dispatch_prompt) = match workflow_launch {
+            Ok(workflow_launch) => workflow_launch,
             Err(error) => {
                 tracing::error!(
                     task_id = %reserved.task_id,
                     error = %error,
-                    "[delegation] workflow binding load failed before continuation spawn"
+                    "[delegation] workflow instruction binding load failed before continuation spawn"
                 );
+                let error_code = error
+                    .durable_error_code(crate::acp::delegation::metrics::ADMISSION_FAILED_CODE)
+                    .to_string();
+                let error_message = error.to_string();
                 if let Some(report) = self
                     .continue_abort_if_handoff_closed(ContinueHandoffGate {
                         task_id: &reserved.task_id,
@@ -9368,7 +9435,7 @@ impl DelegationBroker {
                         &reserved.task_id,
                         &handoff.child_connection_id,
                         failed_terminal(
-                            crate::acp::delegation::metrics::ADMISSION_FAILED_CODE,
+                            error_code.clone(),
                             DelegationRunStatus::Reserving,
                             false,
                             AcpTerminationSource::Admission,
@@ -9402,8 +9469,8 @@ impl DelegationBroker {
                             &req.target_task_id,
                             reserved.agent_type,
                             DelegationError::WorkflowAdmission {
-                                code: crate::acp::delegation::metrics::ADMISSION_FAILED_CODE.into(),
-                                message: "workflow binding load failed before child launch".into(),
+                                code: error_code,
+                                message: error_message,
                             },
                             Some(reserved.child_conversation_id),
                         ),
@@ -9706,7 +9773,7 @@ impl DelegationBroker {
             .spawner
             .send_prompt_linked_for_delegation(
                 &child_connection_id,
-                req.task.clone(),
+                dispatch_prompt,
                 link,
                 Some((reserved.child_conversation_id, folder_id)),
             )
@@ -18828,6 +18895,42 @@ mod tests {
             DelegationOutcome::Err { code, .. } => assert_eq!(code, "spawn_failed"),
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gen1_and_continuation_instruction_failures_preserve_admission_codes() {
+        let plan_error =
+            WorkflowLaunchLoadError::CompletionInstruction(TaskStoreError::WorkflowAdmission {
+                code: "completion_plan_material_invalid".into(),
+                message: "persisted Plan changed".into(),
+            });
+        assert_eq!(
+            plan_error.durable_error_code("spawn_failed"),
+            "completion_plan_material_invalid"
+        );
+        assert_eq!(
+            plan_error.durable_error_code(crate::acp::delegation::metrics::ADMISSION_FAILED_CODE),
+            "completion_plan_material_invalid"
+        );
+
+        let persistence_error = WorkflowLaunchLoadError::CompletionInstruction(
+            TaskStoreError::Permanent("instruction read failed".into()),
+        );
+        assert_eq!(
+            persistence_error.durable_error_code("spawn_failed"),
+            "completion_instruction_binding_failed"
+        );
+
+        let binding_error = WorkflowLaunchLoadError::WorkflowBinding("binding read failed".into());
+        assert_eq!(
+            binding_error.durable_error_code("spawn_failed"),
+            "spawn_failed"
+        );
+        assert_eq!(
+            binding_error
+                .durable_error_code(crate::acp::delegation::metrics::ADMISSION_FAILED_CODE),
+            crate::acp::delegation::metrics::ADMISSION_FAILED_CODE
+        );
     }
 
     #[tokio::test]

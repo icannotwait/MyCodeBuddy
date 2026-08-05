@@ -6,6 +6,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use super::types::{
+    AdmissionCompletionContextV2, CompletionEvidenceV2, EvidenceScopeInputV2,
+    EvidenceValidationContext, InstructionBlockV1, RequirementsIdentityV1, RoleReviewScopeV2,
+};
+
 /// Frontend DTO schema version for `WorkflowGraphSnapshot`.
 pub const WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
