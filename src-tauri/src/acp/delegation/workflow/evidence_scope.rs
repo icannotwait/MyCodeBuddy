@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::ser::{
+    SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+    SerializeTupleStruct, SerializeTupleVariant,
+};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1164,6 +1168,7 @@ fn task_output_identity_digest(
 }
 
 pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, EvidenceScopeError> {
+    reject_float_values(value)?;
     let serialized = serde_json::to_vec(value)
         .map_err(|error| EvidenceScopeError::InvalidCanonicalJson(error.to_string()))?;
     if serialized.len() > MAX_CANONICAL_JSON_BYTES {
@@ -1187,6 +1192,297 @@ pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, Evidence
         )));
     }
     Ok(bytes)
+}
+
+fn reject_float_values<T: Serialize + ?Sized>(value: &T) -> Result<(), EvidenceScopeError> {
+    // serde_json coerces non-finite floats to null, so validate the source
+    // Serialize graph before any JSON representation can erase the type.
+    value.serialize(FloatRejectingSerializer)
+}
+
+impl serde::ser::Error for EvidenceScopeError {
+    fn custom<T: std::fmt::Display>(message: T) -> Self {
+        Self::InvalidCanonicalJson(message.to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FloatRejectingSerializer;
+
+impl serde::Serializer for FloatRejectingSerializer {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+    type SerializeSeq = FloatRejectingCompound;
+    type SerializeTuple = FloatRejectingCompound;
+    type SerializeTupleStruct = FloatRejectingCompound;
+    type SerializeTupleVariant = FloatRejectingCompound;
+    type SerializeMap = FloatRejectingCompound;
+    type SerializeStruct = FloatRejectingCompound;
+    type SerializeStructVariant = FloatRejectingCompound;
+
+    fn serialize_bool(self, _value: bool) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i8(self, _value: i8) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i16(self, _value: i16) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i32(self, _value: i32) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i64(self, _value: i64) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i128(self, _value: i128) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u8(self, _value: u8) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u16(self, _value: u16) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u32(self, _value: u32) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u64(self, _value: u64) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u128(self, _value: u128) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_f32(self, _value: f32) -> Result<Self::Ok, Self::Error> {
+        Err(EvidenceScopeError::InvalidCanonicalJson(
+            "floating-point values are forbidden".into(),
+        ))
+    }
+
+    fn serialize_f64(self, _value: f64) -> Result<Self::Ok, Self::Error> {
+        Err(EvidenceScopeError::InvalidCanonicalJson(
+            "floating-point values are forbidden".into(),
+        ))
+    }
+
+    fn serialize_char(self, _value: char) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_str(self, _value: &str) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_bytes(self, _value: &[u8]) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_seq(self, _length: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_tuple(self, _length: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _length: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _length: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_map(self, _length: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _length: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _length: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        Ok(FloatRejectingCompound)
+    }
+}
+
+struct FloatRejectingCompound;
+
+impl SerializeSeq for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeTuple for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeTupleStruct for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeTupleVariant for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeMap for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Self::Error> {
+        key.serialize(FloatRejectingSerializer)
+    }
+
+    fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeStruct for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_field<T: Serialize + ?Sized>(
+        &mut self,
+        _key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeStructVariant for FloatRejectingCompound {
+    type Ok = ();
+    type Error = EvidenceScopeError;
+
+    fn serialize_field<T: Serialize + ?Sized>(
+        &mut self,
+        _key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(FloatRejectingSerializer)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
 }
 
 struct UniqueJsonValue;
@@ -2097,6 +2393,75 @@ mod tests {
             canonical_json_bytes(&json!({"digest": format!("sha256:{}", "A".repeat(64))})).is_err()
         );
         assert!(canonical_json_sha256("codeg.completion.requirements.v1", 2, &json!({})).is_err());
+    }
+
+    #[test]
+    fn canonicalizer_rejects_all_f32_values_before_json_serialization() {
+        let cases = [
+            ("finite", 1.5_f32),
+            ("nan", f32::NAN),
+            ("positive_infinity", f32::INFINITY),
+            ("negative_infinity", f32::NEG_INFINITY),
+        ];
+        let accepted: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, value)| canonical_json_bytes(value).ok().map(|_| *name))
+            .collect();
+        assert!(accepted.is_empty(), "accepted f32 cases: {accepted:?}");
+        for (name, value) in cases {
+            let error = canonical_json_bytes(&value).expect_err(name);
+            assert!(
+                error
+                    .to_string()
+                    .contains("floating-point values are forbidden"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalizer_rejects_all_f64_values_before_json_serialization() {
+        let cases = [
+            ("finite", 1.5_f64),
+            ("nan", f64::NAN),
+            ("positive_infinity", f64::INFINITY),
+            ("negative_infinity", f64::NEG_INFINITY),
+        ];
+        let accepted: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, value)| canonical_json_bytes(value).ok().map(|_| *name))
+            .collect();
+        assert!(accepted.is_empty(), "accepted f64 cases: {accepted:?}");
+        for (name, value) in cases {
+            let error = canonical_json_bytes(&value).expect_err(name);
+            assert!(
+                error
+                    .to_string()
+                    .contains("floating-point values are forbidden"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalizer_rejects_nested_non_finite_floats_before_json_serialization() {
+        #[derive(Serialize)]
+        struct NestedFloats {
+            f32_value: f32,
+            f64_value: Vec<f64>,
+        }
+
+        let error = canonical_json_bytes(&NestedFloats {
+            f32_value: f32::INFINITY,
+            f64_value: vec![f64::NAN],
+        })
+        .expect_err("nested non-finite floats must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("floating-point values are forbidden"),
+            "{error}"
+        );
     }
 
     #[test]
