@@ -161,11 +161,23 @@ impl RecoveryAuthorizationService {
         &self.store
     }
 
+    /// Start the background prune loop.
+    ///
+    /// Desktop Tauri `setup` builds the delegation stack on the main thread
+    /// **outside** a Tokio context, so plain `tokio::spawn` panics with
+    /// "there is no reactor running". Match the rest of the boot stack
+    /// (`spawn_tool_watchdog`, `spawn_delegation_supervisor`): use Tauri's
+    /// global async runtime under `tauri-runtime`, and `tokio::spawn` only
+    /// on the server binary path where a runtime is already entered.
     pub fn start_maintenance(self: &Arc<Self>) {
         let service = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let run = async move {
             run_maintenance(service).await;
-        });
+        };
+        #[cfg(feature = "tauri-runtime")]
+        tauri::async_runtime::spawn(run);
+        #[cfg(not(feature = "tauri-runtime"))]
+        tokio::spawn(run);
     }
 
     pub async fn prepare(
