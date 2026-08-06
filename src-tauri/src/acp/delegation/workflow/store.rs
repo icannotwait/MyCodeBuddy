@@ -596,6 +596,16 @@ pub struct SettleResult {
     pub minor_count: i64,
     pub stagnation_count: u32,
     pub rewrite_used: bool,
+    #[serde(skip)]
+    pub plan_metric_observation: Option<PlanSettlementMetricObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanSettlementMetricObservation {
+    pub change: PlanReviewChangeV2,
+    pub localized_intersection: bool,
+    pub lineage_reset: bool,
+    pub sibling_reruns: u64,
 }
 
 struct ApprovedPlanLineageReset {
@@ -2123,6 +2133,7 @@ async fn settle_workflow_gate_derived_core(
                     let mut v2_plan_author_task_id: Option<String> = None;
                     let mut v2_plan_digest: Option<String> = None;
                     let mut v2_localized_change_digest: Option<String> = None;
+                    let mut plan_metric_observation: Option<PlanSettlementMetricObservation> = None;
 
                     let (
                         critical_count,
@@ -2438,6 +2449,7 @@ async fn settle_workflow_gate_derived_core(
                                     change,
                                 )?;
                                 decision.state.plan_snapshot = Some(current_plan_snapshot);
+                                let localized_intersection = authorized_localized_change.is_some();
                                 decision.state.localized_change = authorized_localized_change;
                                 let derived_outcome =
                                     plan_v2_settlement_outcome(decision.state.next_action);
@@ -2456,6 +2468,16 @@ async fn settle_workflow_gate_derived_core(
                                 let next_action = decision.state.next_action;
                                 let stagnation_count = decision.state.stagnation_count;
                                 let rewrite_used = decision.state.rewrite_used;
+                                plan_metric_observation = Some(PlanSettlementMetricObservation {
+                                    change,
+                                    localized_intersection,
+                                    lineage_reset: lineage_reset_authorization.is_some(),
+                                    sibling_reruns: if prior_v2_state.is_some() {
+                                        decision.state.selected_node_ids.len() as u64
+                                    } else {
+                                        0
+                                    },
+                                });
                                 v2_plan_author_task_id = Some(author_task_id);
                                 v2_plan_digest = Some(covered_plan_digest);
                                 v2_plan_decision = Some(decision);
@@ -2803,6 +2825,7 @@ async fn settle_workflow_gate_derived_core(
                             minor_count,
                             stagnation_count,
                             rewrite_used,
+                            plan_metric_observation,
                         },
                         lineage_reset_event,
                     ))
@@ -6603,6 +6626,7 @@ fn settle_result_from_row(
             WorkflowStoreError::Persistence("invalid persisted Plan stagnation count".into())
         })?,
         rewrite_used: row.rewrite_used,
+        plan_metric_observation: None,
     })
 }
 

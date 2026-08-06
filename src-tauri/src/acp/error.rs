@@ -80,6 +80,8 @@ pub enum AcpError {
     DelegateViewerOnly {
         reason: crate::models::DelegateAccessReason,
     },
+    #[error("legacy completion protocol restart required; successor conversation {successor_conversation_id}")]
+    LegacyCompletionProtocolRestart { successor_conversation_id: i32 },
 }
 
 impl AcpError {
@@ -123,6 +125,9 @@ impl AcpError {
             Self::RouteUnavailable { .. } => Some("route_unavailable"),
             Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
+            Self::LegacyCompletionProtocolRestart { .. } => {
+                Some("legacy_completion_protocol_restart_required")
+            }
             Self::Protocol(_) => None,
         }
     }
@@ -207,6 +212,15 @@ impl AcpError {
                     "backendErrors.delegateViewerOnly",
                     BTreeMap::from([("reason".into(), reason.as_str().into())]),
                 ),
+            ),
+            AcpError::LegacyCompletionProtocolRestart {
+                successor_conversation_id,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::LegacyCompletionProtocolRestartRequired,
+                    "Legacy workflow restarted in a fresh conversation",
+                )
+                .with_detail(successor_conversation_id.to_string()),
             ),
             _ => None,
         }

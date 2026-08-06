@@ -18,9 +18,11 @@ use codeg_lib::acp::delegation::workflow::types::{
 };
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, materialize_terminal_completion_txn, restart_legacy_workflow_core,
-    CompletionOutcome, TerminalCompletionInput,
+    build_work_unit_key, capture_original_request_context, materialize_terminal_completion_txn,
+    restart_legacy_workflow_core, CompletionOutcome, CompletionProtocolRolloutConfig,
+    TerminalCompletionInput,
 };
+use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::entities::delegation_attention_request::AttentionKind;
 use codeg_lib::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
@@ -382,6 +384,7 @@ async fn attention_authenticated_context_owns_durable_root_across_core_and_http(
         .unwrap();
     let resolved = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
         &matching_fixture.state.db,
+        matching_fixture.state.delegation_metrics.as_ref(),
         matching_fixture.state.completion_outbox_dispatcher.as_ref(),
         &matching_context,
         matching_request,
@@ -425,6 +428,7 @@ async fn attention_authenticated_context_owns_durable_root_across_core_and_http(
         .unwrap();
     let core_foreign = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
         &foreign_fixture.state.db,
+        foreign_fixture.state.delegation_metrics.as_ref(),
         foreign_fixture.state.completion_outbox_dispatcher.as_ref(),
         &foreign_context,
         foreign_request.clone(),
@@ -564,6 +568,17 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
     let source_conversation_id = seed_conversation(&db, folder, AgentType::Codex).await;
+    capture_original_request_context(
+        &db.conn,
+        source_conversation_id,
+        "transport-parity-original-request",
+        &[PromptInputBlock::Text {
+            text: "restart this original transport parity request".into(),
+        }],
+        "codex",
+    )
+    .await
+    .unwrap();
     let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
         rel_plan_path: PLAN_REL_PATH,
         agent_type: "codex",
@@ -581,7 +596,11 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
     .await
     .unwrap();
 
-    let state = Arc::new(AppState::new_for_test(db, workspace.path().to_path_buf()));
+    let mut state = AppState::new_for_test(db, workspace.path().to_path_buf());
+    let mut rollout = CompletionProtocolRolloutConfig::default();
+    rollout.default_mode = CompletionProtocolMode::V2Enforce;
+    state.completion_protocol_rollout = Arc::new(rollout);
+    let state = Arc::new(state);
     let server = TestServer::new(build_router(
         state.clone(),
         TEST_TOKEN.into(),

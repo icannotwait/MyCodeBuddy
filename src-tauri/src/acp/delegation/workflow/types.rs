@@ -255,7 +255,19 @@ pub struct LegacyWorkflowRestartProjection {
     pub successor_conversation_id: i32,
     pub open_gate: DocumentGateKind,
     pub completion_protocol: CompletionProtocolWorkflowProjection,
+    pub restart_context: LegacyWorkflowRestartContext,
     pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyWorkflowRestartContext {
+    pub original_conversation_id: i32,
+    pub original_request_id: String,
+    pub original_request_text: String,
+    pub original_request_digest: String,
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

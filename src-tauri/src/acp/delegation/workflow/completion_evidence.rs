@@ -37,7 +37,7 @@ use super::final_findings::{
     resolve_active_final_findings_packages_v1, snapshot_remediation_contexts_v1,
     verify_remediation_context_snapshots_v1, FinalFindingInputV1, FinalFindingsError,
     FinalFindingsPackageInputV1, FinalFindingsPackageV1, FinalReviewerEvaluationV1,
-    RemediationContextInputV1, RemediationContextSnapshotV1,
+    RemediationContextAvailability, RemediationContextInputV1, RemediationContextSnapshotV1,
 };
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
@@ -50,7 +50,8 @@ use crate::acp::delegation::attention::{
     TerminalCompletionAttentionInput, ATTENTION_PAYLOAD_MAX_BYTES,
 };
 use crate::acp::delegation::metrics::{
-    CompletionMetricPhase, CompletionScopeInvalidationDimension, DelegationMetrics,
+    CompletionFinalMetricState, CompletionMetricPhase, CompletionScopeInvalidationDimension,
+    DelegationMetrics,
 };
 use crate::acp::delegation::types::CompletionMutationResult;
 use crate::db::entities::conversation;
@@ -230,6 +231,8 @@ pub struct TerminalCompletionResult {
     pub evidence: Option<CompletionEvidenceV2>,
     pub attention: Option<CompletionAttentionCas>,
     pub graph_revision: u64,
+    #[serde(skip)]
+    pub final_metric_states: Vec<CompletionFinalMetricState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -967,6 +970,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
                     evidence: Some(evidence),
                     attention: None,
                     graph_revision,
+                    final_metric_states: Vec::new(),
                 }),
             }))
         }
@@ -1466,6 +1470,7 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                 expected_graph_revision,
             )
             .await?;
+            let final_metric_states = final_metric_states(&final_evaluation);
             if let FinalFindingsTerminalAction::NeedsDecision { gate_id } = &final_evaluation.action
             {
                 resolve_active_final_findings_packages_v1(
@@ -1478,7 +1483,7 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                 )
                 .await
                 .map_err(map_final_findings_error)?;
-                return open_completion_decision(
+                let mut result = open_completion_decision(
                     conn,
                     &loaded,
                     &context,
@@ -1486,7 +1491,9 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                     Vec::new(),
                     Vec::new(),
                 )
-                .await;
+                .await?;
+                result.final_metric_states = final_metric_states;
+                return Ok(result);
             }
 
             match resolve_terminal_artifact(conn, &loaded, &context, intent.outcome).await {
@@ -1520,6 +1527,7 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                         evidence: Some(evidence),
                         attention: None,
                         graph_revision,
+                        final_metric_states,
                     })
                 }
                 Err(ArtifactError::Unavailable(failure)) => {
@@ -1546,12 +1554,50 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                         result.graph_revision,
                     )
                     .await?;
-                    Ok(result)
+                    Ok(TerminalCompletionResult {
+                        final_metric_states,
+                        ..result
+                    })
                 }
                 Err(error) => Err(error.into()),
             }
         }
     }
+}
+
+fn final_metric_states(
+    evaluation: &FinalFindingsTerminalEvaluation,
+) -> Vec<CompletionFinalMetricState> {
+    let mut states = Vec::new();
+    if let Some(contexts) = evaluation.current_contexts.as_deref() {
+        states.push(
+            if contexts.iter().any(|context| {
+                context.availability == RemediationContextAvailability::Available
+                    && context.byte_len > 0
+            }) {
+                CompletionFinalMetricState::ContextAvailable
+            } else {
+                CompletionFinalMetricState::ContextMissing
+            },
+        );
+    }
+    let package_state = match &evaluation.action {
+        FinalFindingsTerminalAction::NotFinal => None,
+        FinalFindingsTerminalAction::Incomplete => {
+            Some(CompletionFinalMetricState::PackageIncomplete)
+        }
+        FinalFindingsTerminalAction::Resolve { .. } => {
+            Some(CompletionFinalMetricState::PackageResolved)
+        }
+        FinalFindingsTerminalAction::Persist(_) => {
+            Some(CompletionFinalMetricState::PackagePersisted)
+        }
+        FinalFindingsTerminalAction::NeedsDecision { .. } => {
+            Some(CompletionFinalMetricState::DecisionRequired)
+        }
+    };
+    states.extend(package_state);
+    states
 }
 
 async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
@@ -2164,6 +2210,7 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
             evidence: Some(evidence),
             attention: None,
             graph_revision,
+            final_metric_states: Vec::new(),
         }),
         idempotent_replay: false,
     })
@@ -2757,6 +2804,7 @@ async fn open_completion_decision<C: ConnectionTrait>(
         evidence: None,
         attention: Some(attention),
         graph_revision,
+        final_metric_states: Vec::new(),
     })
 }
 
@@ -2837,6 +2885,7 @@ async fn open_artifact_recovery<C: ConnectionTrait>(
         evidence: None,
         attention: Some(attention),
         graph_revision,
+        final_metric_states: Vec::new(),
     })
 }
 
@@ -2944,6 +2993,7 @@ async fn existing_result<C: ConnectionTrait>(
                 evidence: Some(evidence),
                 attention: None,
                 graph_revision,
+                final_metric_states: Vec::new(),
             }))
         }
         CompletionState::NeedsDecision | CompletionState::ArtifactRecovery => {
@@ -2969,6 +3019,7 @@ async fn existing_result<C: ConnectionTrait>(
                 evidence: None,
                 attention: Some(attention_cas(&row)?),
                 graph_revision,
+                final_metric_states: Vec::new(),
             }))
         }
     }

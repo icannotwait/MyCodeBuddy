@@ -25,6 +25,7 @@ pub use super::delegation_workflow_gate_state::Entity as DelegationWorkflowGateS
 pub use super::delegation_workflow_manifest_revision::Entity as DelegationWorkflowManifestRevision;
 pub use super::delegation_workflow_node_binding::Entity as DelegationWorkflowNodeBinding;
 pub use super::delegation_workflow_outbox_event::Entity as DelegationWorkflowOutboxEvent;
+pub use super::delegation_workflow_restart_context::Entity as DelegationWorkflowRestartContext;
 pub use super::delegation_workflow_run_binding::Entity as DelegationWorkflowRunBinding;
 pub use super::folder::Entity as Folder;
 pub use super::folder_command::Entity as FolderCommand;

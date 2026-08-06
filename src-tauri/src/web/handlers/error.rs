@@ -19,6 +19,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::TurnInProgress
         | AppErrorCode::ConversationWaitingForSubagents
         | AppErrorCode::DelegateViewerOnly
+        | AppErrorCode::LegacyCompletionProtocolRestartRequired
         | AppErrorCode::SessionRouteConflict
         | AppErrorCode::Cancelled
         | AppErrorCode::StaleStart

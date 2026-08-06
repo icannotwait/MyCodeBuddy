@@ -2,13 +2,14 @@
 //! root conversation and minimal v2 skeleton are committed atomically.
 
 use chrono::Utc;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
 };
 
 use crate::db::entities::{
     auto_title_job, conversation, delegation_workflow, delegation_workflow_manifest_revision,
-    delegation_workflow_node_binding,
+    delegation_workflow_node_binding, delegation_workflow_restart_context,
 };
 use crate::db::AppDatabase;
 
@@ -20,13 +21,59 @@ use super::store::{
 };
 use super::types::{
     CompletionProtocolSelection, CompletionProtocolWorkflowProjection, DocumentGateKind,
-    LegacyWorkflowLink, LegacyWorkflowRestartProjection, ManifestDocument, ManifestNode,
-    ManifestNodeKind, ManifestNodeRole, ManifestPhase, ManifestWorkflowState, WorkUnitKeyParts,
-    MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_PLAN, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    LegacyWorkflowLink, LegacyWorkflowRestartContext, LegacyWorkflowRestartProjection,
+    ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
+    ManifestWorkflowState, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_PLAN,
+    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
 const LEGACY_RESTART_REASON: &str = "legacy_completion_protocol_restart_required";
+
+/// Capture the first accepted root request once. The visible projection is
+/// capped to 4,000 scalars (at most 16 KiB UTF-8), and oversized untrusted
+/// message identities collapse to a fixed digest.
+pub async fn capture_original_request_context<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+    original_request_id: &str,
+    blocks: &[crate::acp::types::PromptInputBlock],
+    agent_type: &str,
+) -> Result<(), sea_orm::DbErr> {
+    let request_text =
+        crate::auto_title::bound_context(&crate::auto_title::project_visible_prompt(blocks));
+    if request_text.trim().is_empty() {
+        return Ok(());
+    }
+    let original_request_id = if original_request_id.chars().count() <= 200 {
+        original_request_id.to_string()
+    } else {
+        format!("sha256:{}", sha256_hex(original_request_id.as_bytes()))
+    };
+    let now = Utc::now();
+    let model = delegation_workflow_restart_context::ActiveModel {
+        conversation_id: Set(conversation_id),
+        original_conversation_id: Set(conversation_id),
+        original_request_id: Set(original_request_id),
+        original_request_digest: Set(format!("sha256:{}", sha256_hex(request_text.as_bytes()))),
+        original_request_text: Set(request_text),
+        agent_type: Set(agent_type.to_string()),
+        profile_id: Set(None),
+        created_at: Set(now),
+    };
+    match delegation_workflow_restart_context::Entity::insert(model)
+        .on_conflict(
+            OnConflict::column(delegation_workflow_restart_context::Column::ConversationId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(conn)
+        .await
+    {
+        Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 #[cfg(any(test, feature = "test-utils"))]
 thread_local! {
@@ -85,10 +132,7 @@ pub async fn restart_legacy_workflow_core(
                     .await
                     .map_err(db_err)?
                     .ok_or_else(|| WorkflowStoreError::ParentNotFound(source_conversation_id))?;
-                if source.completion_protocol_version != 1
-                    || source.completion_protocol_mode
-                        != delegation_workflow::CompletionProtocolMode::V1
-                {
+                if source.completion_protocol_version != 1 {
                     return Err(WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(
                         "source workflow is not protocol v1".into(),
                     ));
@@ -125,6 +169,28 @@ pub async fn restart_legacy_workflow_core(
                         "source must be a live root conversation".into(),
                     ));
                 }
+                let source_author = delegation_workflow_node_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_node_binding::Column::WorkflowId
+                            .eq(source.workflow_id.clone()),
+                    )
+                    .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
+                    .one(txn)
+                    .await
+                    .map_err(db_err)?;
+                let (author_agent_type, author_profile_id) = source_author
+                    .map(|binding| (binding.agent_type, binding.profile_id))
+                    .unwrap_or_else(|| (source_conversation.agent_type.clone(), None));
+                let source_restart_context =
+                    delegation_workflow_restart_context::Entity::find_by_id(source_conversation_id)
+                        .one(txn)
+                        .await
+                        .map_err(db_err)?
+                        .ok_or_else(|| {
+                            WorkflowStoreError::LegacyCompletionProtocolRestartRequired(
+                                "original request context is unavailable".into(),
+                            )
+                        })?;
 
                 let successor_conversation = conversation::ActiveModel {
                     id: sea_orm::NotSet,
@@ -168,6 +234,20 @@ pub async fn restart_legacy_workflow_core(
                 .await
                 .map_err(db_err)?;
 
+                delegation_workflow_restart_context::ActiveModel {
+                    conversation_id: Set(successor_conversation.id),
+                    original_conversation_id: Set(source_restart_context.original_conversation_id),
+                    original_request_id: Set(source_restart_context.original_request_id),
+                    original_request_text: Set(source_restart_context.original_request_text),
+                    original_request_digest: Set(source_restart_context.original_request_digest),
+                    agent_type: Set(author_agent_type.clone()),
+                    profile_id: Set(author_profile_id.clone()),
+                    created_at: Set(now),
+                }
+                .insert(txn)
+                .await
+                .map_err(db_err)?;
+
                 if let Some(source_job) = auto_title_job::Entity::find_by_id(source_conversation_id)
                     .one(txn)
                     .await
@@ -199,7 +279,11 @@ pub async fn restart_legacy_workflow_core(
                 }
 
                 let successor_workflow_id = uuid::Uuid::new_v4().to_string();
-                let document = restart_skeleton(&successor_workflow_id);
+                let document = restart_skeleton(
+                    &successor_workflow_id,
+                    &author_agent_type,
+                    author_profile_id.as_deref(),
+                );
                 let normalized = validate_manifest_document(&document)?;
                 let stored_document = normalized_to_document(&normalized);
                 let document_json = serde_json::to_string(&stored_document).map_err(|error| {
@@ -269,8 +353,8 @@ pub async fn restart_legacy_workflow_core(
                         .clone()
                         .expect("validated author has work unit key")),
                     role: Set("author".into()),
-                    agent_type: Set("codex".into()),
-                    profile_id: Set(None),
+                    agent_type: Set(author_agent_type),
+                    profile_id: Set(author_profile_id),
                     phase_id: Set(PHASE_PLAN.into()),
                     task_index: Set(None),
                     introduced_revision: Set(1),
@@ -322,6 +406,17 @@ pub async fn restart_legacy_workflow_core(
     let completion_protocol = completion_protocol_projection(&db.conn, &successor)
         .await
         .map_err(restart_db_err)?;
+    let restart_context = delegation_workflow_restart_context::Entity::find_by_id(
+        committed.successor_conversation_id,
+    )
+    .one(&db.conn)
+    .await
+    .map_err(restart_db_err)?
+    .ok_or_else(|| {
+        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(
+            "committed successor restart context is unavailable".into(),
+        )
+    })?;
     Ok(LegacyWorkflowRestartProjection {
         source_workflow_id: committed.source_workflow_id,
         source_conversation_id: committed.source_conversation_id,
@@ -329,8 +424,67 @@ pub async fn restart_legacy_workflow_core(
         successor_conversation_id: committed.successor_conversation_id,
         open_gate: DocumentGateKind::Design,
         completion_protocol,
+        restart_context: LegacyWorkflowRestartContext {
+            original_conversation_id: restart_context.original_conversation_id,
+            original_request_id: restart_context.original_request_id,
+            original_request_text: restart_context.original_request_text,
+            original_request_digest: restart_context.original_request_digest,
+            agent_type: restart_context.agent_type,
+            profile_id: restart_context.profile_id,
+        },
         idempotent_replay: committed.idempotent_replay,
     })
+}
+
+/// Apply the current server-owned rollout policy before a caller mutates a
+/// legacy root. Existing successors remain reusable after a rollout rollback;
+/// creating a new successor requires the current selection to be enforce.
+pub async fn restart_legacy_workflow_if_enforced(
+    db: &AppDatabase,
+    source_conversation_id: i32,
+    rollout_subject: Option<(String, Option<String>)>,
+    rollout: &super::types::CompletionProtocolRolloutConfig,
+) -> Result<Option<LegacyWorkflowRestartProjection>, WorkflowStoreError> {
+    let Some(source) = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::ParentConversationId.eq(source_conversation_id))
+        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+    else {
+        return Ok(None);
+    };
+    if source.completion_protocol_version != 1 {
+        return Ok(None);
+    }
+
+    let has_successor = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(source.workflow_id.clone()))
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .is_some();
+    let (agent, profile) = match rollout_subject {
+        Some(subject) => subject,
+        None => delegation_workflow_node_binding::Entity::find()
+            .filter(
+                delegation_workflow_node_binding::Column::WorkflowId.eq(source.workflow_id.clone()),
+            )
+            .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
+            .one(&db.conn)
+            .await
+            .map_err(db_err)?
+            .map(|binding| (binding.agent_type, binding.profile_id))
+            .unwrap_or_else(|| ("unknown".into(), None)),
+    };
+    let selection = super::types::select_completion_protocol(&agent, profile.as_deref(), rollout);
+    if !has_successor && selection.mode != delegation_workflow::CompletionProtocolMode::V2Enforce {
+        return Ok(None);
+    }
+
+    restart_legacy_workflow_core(db, i64::from(source_conversation_id))
+        .await
+        .map(Some)
 }
 
 pub(crate) async fn completion_protocol_projection<C: ConnectionTrait>(
@@ -370,12 +524,16 @@ pub(crate) async fn completion_protocol_projection<C: ConnectionTrait>(
     })
 }
 
-fn restart_skeleton(workflow_id: &str) -> ManifestDocument {
+fn restart_skeleton(
+    workflow_id: &str,
+    author_agent_type: &str,
+    author_profile_id: Option<&str>,
+) -> ManifestDocument {
     let plan_path = format!("docs/superpowers/plans/restarted-{}.md", &workflow_id[..8]);
     let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
         rel_plan_path: &plan_path,
-        agent_type: "codex",
-        profile_id: None,
+        agent_type: author_agent_type,
+        profile_id: author_profile_id,
     })
     .expect("generated restart Plan path is valid");
     ManifestDocument {
@@ -421,8 +579,8 @@ fn restart_skeleton(workflow_id: &str) -> ManifestDocument {
                 kind: ManifestNodeKind::WorkUnit,
                 phase_id: Some(PHASE_PLAN.into()),
                 role: Some(ManifestNodeRole::Author),
-                agent_type: Some("codex".into()),
-                profile_id: None,
+                agent_type: Some(author_agent_type.into()),
+                profile_id: author_profile_id.map(str::to_string),
                 task_index: None,
                 work_unit_key: Some(author_key),
                 deps: vec!["design-root".into()],

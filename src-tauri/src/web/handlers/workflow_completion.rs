@@ -35,6 +35,7 @@ pub async fn resolve_completion_decision(
         .map_err(|()| unauthorized_context_error())?;
     resolve_completion_decision_core(
         &state.db,
+        state.delegation_metrics.as_ref(),
         state.completion_outbox_dispatcher.as_ref(),
         &context,
         request,
@@ -76,6 +77,7 @@ pub async fn resolve_design_self_review(
         .map_err(|()| unauthorized_context_error())?;
     resolve_design_self_review_core(
         &state.db,
+        state.delegation_metrics.as_ref(),
         state.completion_outbox_dispatcher.as_ref(),
         &context,
         request,
@@ -97,6 +99,7 @@ pub async fn restart_legacy_workflow(
     restart_legacy_workflow_authenticated_core(
         &state.db,
         state.delegation_metrics.as_ref(),
+        state.completion_protocol_rollout.as_ref(),
         &context,
         request,
     )

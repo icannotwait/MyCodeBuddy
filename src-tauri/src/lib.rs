@@ -600,13 +600,18 @@ mod tauri_app {
                         crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env()
                             .map_err(std::io::Error::other)?,
                     );
+                    cm_state.install_completion_protocol_runtime(
+                        completion_protocol_rollout.clone(),
+                        stack.metrics.clone(),
+                    );
                     let completion_outbox_dispatcher = std::sync::Arc::new(
                         crate::acp::delegation::event_emitter::CompletionOutboxDispatcher::new(
                             std::sync::Arc::new(db::AppDatabase {
                                 conn: db_conn.clone(),
                             }),
                             crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
-                        ),
+                        )
+                        .with_metrics(stack.metrics.clone()),
                     );
                     app.manage(stack.broker.clone());
                     app.manage(stack.tokens.clone());

@@ -70,6 +70,7 @@ use crate::acp::delegation::attention::{
 use crate::acp::delegation::card_summary::{
     card_summary_to_json, collect_report_harvest_candidates,
     extract_card_summary_with_report_fallback, strip_card_summary_comments, CardSummary,
+    ReviewVerdict, WorkStatus,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::launch_snapshot::{
@@ -111,7 +112,8 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 use crate::acp::delegation::workflow::{
-    CompletionResolution, CompletionRole, TerminalCompletionInput, ValidatedReportCandidate,
+    CompletionOutcome, CompletionResolution, CompletionRole, TerminalCompletionInput,
+    ValidatedReportCandidate,
 };
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
@@ -2199,21 +2201,53 @@ fn record_completion_resolver_metrics(
     match resolution {
         CompletionResolution::Resolved(intent) => {
             metrics.record_completion_resolution(intent.source, role);
-            metrics.record_completion_shadow_difference(CompletionShadowDifference::Match);
         }
         CompletionResolution::NeedsDecision { reason_code, .. } => {
             metrics.record_completion_decision(*reason_code);
-            metrics.record_completion_shadow_difference(
-                if *reason_code
-                    == crate::acp::delegation::workflow::CompletionIntentReason::RoleMismatch
-                {
-                    CompletionShadowDifference::RoleMismatch
-                } else {
-                    CompletionShadowDifference::NeedsDecision
-                },
-            );
         }
     }
+}
+
+pub fn compare_completion_shadow_outcome(
+    legacy_outcome: Option<CompletionOutcome>,
+    v2: &CompletionResolution,
+) -> CompletionShadowDifference {
+    match v2 {
+        CompletionResolution::Resolved(intent) => match legacy_outcome {
+            Some(outcome) if outcome == intent.outcome => CompletionShadowDifference::Match,
+            Some(_) | None => CompletionShadowDifference::Outcome,
+        },
+        CompletionResolution::NeedsDecision { reason_code, .. }
+            if *reason_code
+                == crate::acp::delegation::workflow::CompletionIntentReason::RoleMismatch =>
+        {
+            CompletionShadowDifference::RoleMismatch
+        }
+        CompletionResolution::NeedsDecision { .. } => CompletionShadowDifference::NeedsDecision,
+    }
+}
+
+fn legacy_card_outcome(card: Option<&CardSummary>) -> Option<CompletionOutcome> {
+    match card? {
+        CardSummary::Review { verdict, .. } => Some(match verdict {
+            ReviewVerdict::Approve => CompletionOutcome::Approve,
+            ReviewVerdict::ApproveWithMinors => CompletionOutcome::ApproveWithMinors,
+            ReviewVerdict::RequestChanges => CompletionOutcome::RequestChanges,
+            ReviewVerdict::Block => CompletionOutcome::Block,
+        }),
+        CardSummary::Author { status, .. } | CardSummary::Implementation { status, .. } => {
+            match status {
+                WorkStatus::Done => Some(CompletionOutcome::Done),
+                WorkStatus::DoneWithConcerns => Some(CompletionOutcome::DoneWithConcerns),
+                WorkStatus::Blocked => Some(CompletionOutcome::Blocked),
+                WorkStatus::NeedsContext => None,
+            }
+        }
+    }
+}
+
+pub fn is_completion_format_repair_prompt(prompt: &str) -> bool {
+    prompt.trim().eq_ignore_ascii_case("CARD RE-EMIT ONLY")
 }
 
 fn completion_metric_phase(phase_id: &str) -> CompletionMetricPhase {
@@ -5966,6 +6000,36 @@ impl DelegationBroker {
                 None,
             );
         }
+        if let (Some(source_task_id), Some(runs)) =
+            (req.replaces_task_id.as_deref(), self.run_store.as_ref())
+        {
+            if is_completion_format_repair_prompt(&req.task) {
+                match runs.terminal_completion_protocol(source_task_id).await {
+                    Ok(Some((2, mode))) => {
+                        self.metrics.record_format_repair_child_run(mode.clone());
+                        self.metrics.record_card_reemit_prompt(mode);
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::WorkflowAdmission {
+                                code: "completion_format_repair_forbidden".into(),
+                                message: "protocol v2 completion is platform-generated".into(),
+                            },
+                            None,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            store_err_to_delegation_error(error),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
             self.drop_inflight(inflight_id).await;
@@ -7820,6 +7884,14 @@ impl DelegationBroker {
                     workspace_path,
                 )
                 .await;
+                let legacy_outcome = legacy_card_outcome(
+                    extract_card_summary_with_report_fallback(
+                        result_text.as_deref().unwrap_or_default(),
+                        extra_report_paths,
+                        workspace_path,
+                    )
+                    .as_ref(),
+                );
                 if let Ok(Some(context)) =
                     runs.terminal_completion_resolver_context(task_id).await
                 {
@@ -7848,6 +7920,13 @@ impl DelegationBroker {
                         context.role,
                         tool_intent_count,
                         &resolution,
+                    );
+                    let difference =
+                        compare_completion_shadow_outcome(legacy_outcome, &resolution);
+                    self.metrics.record_completion_shadow_sample(
+                        &context.agent_type,
+                        context.profile_id.as_deref(),
+                        difference,
                     );
                 }
             }
@@ -7917,6 +7996,9 @@ impl DelegationBroker {
                     ctx.card_summary = None;
                 }
                 if let Some(completion) = completion.as_ref() {
+                    for state in completion.final_metric_states.iter().copied() {
+                        self.metrics.record_completion_final_state(state);
+                    }
                     let projection =
                         crate::acp::delegation::workflow::project_terminal_completion(completion);
                     let metric_context = match self.run_store.as_ref() {
@@ -7956,6 +8038,7 @@ impl DelegationBroker {
                             match metric {
                                 TerminalCompletionAttentionMetric::Decision(reason) => {
                                     self.metrics.record_completion_decision(reason);
+                                    self.metrics.record_completion_decision_opened();
                                 }
                                 TerminalCompletionAttentionMetric::ArtifactFailure(reason) => {
                                     self.metrics.record_completion_artifact_failure(
@@ -9175,6 +9258,32 @@ impl DelegationBroker {
                 );
             }
         };
+
+        if is_completion_format_repair_prompt(&req.task) {
+            match runs.terminal_completion_protocol(&target.task_id).await {
+                Ok(Some((2, mode))) => {
+                    self.metrics.record_card_reemit_prompt(mode);
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        target.agent_type,
+                        DelegationError::WorkflowAdmission {
+                            code: "completion_card_reemit_forbidden".into(),
+                            message: "protocol v2 completion is platform-generated".into(),
+                        },
+                        None,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        target.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            }
+        }
 
         let route_fp = target.route_fingerprint.clone().unwrap_or_default();
         let request_fp = request_fingerprint(

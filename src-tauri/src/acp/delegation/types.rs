@@ -1000,6 +1000,14 @@ impl CompletionMutationContext {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn authenticated_for_test(
+        parent_conversation_id: i32,
+        actor_identity: impl Into<String>,
+    ) -> Self {
+        Self::authenticated(parent_conversation_id, actor_identity)
+    }
+
     pub(crate) fn parent_conversation_id(&self) -> i32 {
         self.parent_conversation_id
     }

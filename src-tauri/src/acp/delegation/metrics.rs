@@ -9,7 +9,7 @@
 //! payloads, or credentials. Labels are stable enums / agent type / error codes
 //! / ids and bounded numeric durations only.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -26,7 +26,10 @@ use crate::acp::delegation::route::{
 use crate::acp::delegation::transport::CancelDelegationReason;
 use crate::acp::delegation::types::{TaskObservation, TaskStatus};
 use crate::acp::delegation::workflow::{
-    ArtifactFailure, CompletionIntentReason, CompletionIntentSource, CompletionRole,
+    completion_protocol_profile_key, evaluate_rollout_window, ArtifactFailure,
+    CompletionIntentReason, CompletionIntentSource, CompletionRole, PlanReviewChangeV2,
+    PlanReviewNextAction, ProfileCompletionWindow, RolloutDecision,
+    COMPLETION_ROLLOUT_MINIMUM_SAMPLES,
 };
 use crate::models::AgentType;
 
@@ -111,6 +114,46 @@ impl CompletionShadowDifference {
             Self::NeedsDecision => "needs_decision",
             Self::ArtifactRecovery => "artifact_recovery",
             Self::RoleMismatch => "role_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionFinalMetricState {
+    ContextAvailable,
+    ContextMissing,
+    PackagePersisted,
+    PackageResolved,
+    PackageIncomplete,
+    DecisionRequired,
+}
+
+impl CompletionFinalMetricState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextAvailable => "context_available",
+            Self::ContextMissing => "context_missing",
+            Self::PackagePersisted => "package_persisted",
+            Self::PackageResolved => "package_resolved",
+            Self::PackageIncomplete => "package_incomplete",
+            Self::DecisionRequired => "decision_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionContinuationReason {
+    DecisionResolved,
+    ArtifactRecovered,
+    PlanReview,
+}
+
+impl CompletionContinuationReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DecisionResolved => "decision_resolved",
+            Self::ArtifactRecovered => "artifact_recovered",
+            Self::PlanReview => "plan_review",
         }
     }
 }
@@ -497,12 +540,16 @@ pub struct CompletionProtocolMetricsSnapshot {
     pub restart_outcomes: BTreeMap<String, u64>,
     pub creation_modes: BTreeMap<String, u64>,
     pub shadow_differences: BTreeMap<String, u64>,
+    pub rollout_windows: BTreeMap<String, ProfileCompletionWindow>,
+    pub rollout_decisions: BTreeMap<String, RolloutDecision>,
     pub continuation_reasons: BTreeMap<String, u64>,
     pub natural_language_fallback_count: u64,
     pub resolution_count: u64,
     pub adjudication_latency_ms_count: u64,
     pub adjudication_latency_ms_total: u64,
     pub oldest_open_decision_age_ms: u64,
+    pub outbox_latency_ms_count: u64,
+    pub outbox_latency_ms_total: u64,
     pub format_only_child_runs: u64,
     pub card_reemit_prompts: u64,
     pub sibling_reruns: u64,
@@ -574,12 +621,15 @@ pub struct DelegationMetrics {
     completion_restart_outcomes: Mutex<BTreeMap<String, u64>>,
     completion_creation_modes: Mutex<BTreeMap<String, u64>>,
     completion_shadow_differences: Mutex<BTreeMap<String, u64>>,
+    completion_rollout_windows: Mutex<BTreeMap<String, VecDeque<CompletionShadowDifference>>>,
     completion_continuation_reasons: Mutex<BTreeMap<String, u64>>,
     completion_natural_language_fallback_count: AtomicU64,
     completion_resolution_count: AtomicU64,
     completion_adjudication_latency_ms_count: AtomicU64,
     completion_adjudication_latency_ms_total: AtomicU64,
     completion_oldest_open_decision_age_ms: AtomicU64,
+    completion_outbox_latency_ms_count: AtomicU64,
+    completion_outbox_latency_ms_total: AtomicU64,
     completion_format_only_child_runs: AtomicU64,
     completion_card_reemit_prompts: AtomicU64,
     completion_sibling_reruns: AtomicU64,
@@ -651,17 +701,160 @@ impl DelegationMetrics {
         );
     }
 
+    pub fn record_completion_shadow_sample(
+        &self,
+        agent: &str,
+        profile: Option<&str>,
+        difference: CompletionShadowDifference,
+    ) {
+        self.record_completion_shadow_difference(difference);
+        const MAX_PROFILE_WINDOWS: usize = 256;
+        let raw_key = completion_protocol_profile_key(agent, profile);
+        let bounded_key = if raw_key.len() <= 256 {
+            raw_key
+        } else {
+            "overflow|none".to_string()
+        };
+        let mut windows = self
+            .completion_rollout_windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let key = if windows.contains_key(&bounded_key) || windows.len() < MAX_PROFILE_WINDOWS {
+            bounded_key
+        } else {
+            "overflow|none".to_string()
+        };
+        let window = windows.entry(key).or_default();
+        if window.len() == COMPLETION_ROLLOUT_MINIMUM_SAMPLES as usize {
+            window.pop_front();
+        }
+        window.push_back(difference);
+    }
+
+    pub fn record_completion_decision_opened(&self) {
+        Self::inc_labeled(&self.completion_decision_lifecycle, "opened".into());
+    }
+
+    pub fn record_completion_decision_resolved(&self, latency: Duration, idempotent_replay: bool) {
+        if idempotent_replay {
+            return;
+        }
+        Self::inc_labeled(&self.completion_decision_lifecycle, "resolved".into());
+        self.completion_adjudication_latency_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.completion_adjudication_latency_ms_total
+            .fetch_add(Self::duration_ms_saturating(latency), Ordering::Relaxed);
+    }
+
+    pub fn record_completion_decision_superseded(&self) {
+        Self::inc_labeled(&self.completion_decision_lifecycle, "superseded".into());
+    }
+
+    pub fn record_completion_open_decision_age(&self, age: Duration) {
+        self.completion_oldest_open_decision_age_ms
+            .store(Self::duration_ms_saturating(age), Ordering::Relaxed);
+    }
+
+    pub fn record_completion_outbox_pending(&self, count: u64) {
+        Self::add_labeled(&self.completion_outbox_states, "pending".into(), count);
+    }
+
+    pub fn record_completion_outbox_retry(&self) {
+        Self::inc_labeled(&self.completion_outbox_states, "retry".into());
+    }
+
+    pub fn record_completion_outbox_delivered(&self, latency: Duration) {
+        Self::inc_labeled(&self.completion_outbox_states, "delivered".into());
+        self.completion_outbox_latency_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.completion_outbox_latency_ms_total
+            .fetch_add(Self::duration_ms_saturating(latency), Ordering::Relaxed);
+    }
+
+    pub fn record_completion_plan_classification(
+        &self,
+        change: PlanReviewChangeV2,
+        localized_intersection: bool,
+        lineage_reset: bool,
+    ) {
+        let change = match change {
+            PlanReviewChangeV2::InitialOrNewLineage => "initial_or_new_lineage",
+            PlanReviewChangeV2::Corrective => "corrective",
+            PlanReviewChangeV2::HolisticRewrite => "holistic_rewrite",
+            PlanReviewChangeV2::RosterOnly => "roster_only",
+        };
+        let intersection = if localized_intersection {
+            "intersects"
+        } else {
+            "full_cohort"
+        };
+        Self::inc_labeled(
+            &self.completion_plan_classifications,
+            format!("{change}:{intersection}"),
+        );
+        if lineage_reset {
+            Self::inc_labeled(
+                &self.completion_plan_classifications,
+                "lineage_reset".into(),
+            );
+        }
+    }
+
+    pub fn record_completion_plan_reducer(
+        &self,
+        action: PlanReviewNextAction,
+        stagnation_count: u32,
+        rewrite_used: bool,
+    ) {
+        let action = match action {
+            PlanReviewNextAction::ContinueReview => "continue_review",
+            PlanReviewNextAction::HolisticRewriteRequired => "holistic_rewrite_required",
+            PlanReviewNextAction::UserDecisionRequired => "user_decision_required",
+            PlanReviewNextAction::Approved => "approved",
+        };
+        let stagnation = match stagnation_count {
+            0 => "stagnation_0",
+            1 => "stagnation_1",
+            _ => "stagnation_2_plus",
+        };
+        let rewrite = if rewrite_used {
+            "rewrite"
+        } else {
+            "no_rewrite"
+        };
+        Self::inc_labeled(
+            &self.completion_plan_reducer_states,
+            format!("{action}:{stagnation}:{rewrite}"),
+        );
+    }
+
+    pub fn record_completion_final_state(&self, state: CompletionFinalMetricState) {
+        Self::inc_labeled(&self.completion_final_context_states, state.as_str().into());
+    }
+
+    pub fn record_completion_continuation(&self, reason: CompletionContinuationReason) {
+        Self::inc_labeled(
+            &self.completion_continuation_reasons,
+            reason.as_str().into(),
+        );
+    }
+
+    pub fn record_completion_sibling_reruns(&self, count: u64) {
+        self.completion_sibling_reruns
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// Guarded invariant boundary. Protocol v2 may never create a format-only
     /// child run; callers receive `false` when the counter was rejected.
     pub fn record_format_repair_child_run(
         &self,
         mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
     ) -> bool {
-        if mode != crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 {
+        if mode == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce {
+            self.completion_format_only_child_runs
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        self.completion_format_only_child_runs
-            .fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -669,11 +862,11 @@ impl DelegationMetrics {
         &self,
         mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
     ) -> bool {
-        if mode != crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 {
+        if mode == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce {
+            self.completion_card_reemit_prompts
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        self.completion_card_reemit_prompts
-            .fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -1196,6 +1389,36 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let rollout_windows = self
+            .completion_rollout_windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(key, samples)| {
+                let window = ProfileCompletionWindow {
+                    samples: samples.len() as u64,
+                    role_mismatch: samples
+                        .iter()
+                        .filter(|sample| **sample == CompletionShadowDifference::RoleMismatch)
+                        .count() as u64,
+                    needs_decision: samples
+                        .iter()
+                        .filter(|sample| {
+                            matches!(
+                                sample,
+                                CompletionShadowDifference::NeedsDecision
+                                    | CompletionShadowDifference::RoleMismatch
+                            )
+                        })
+                        .count() as u64,
+                };
+                (key.clone(), window)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let rollout_decisions = rollout_windows
+            .iter()
+            .map(|(key, window)| (key.clone(), evaluate_rollout_window(window)))
+            .collect();
         let completion_protocol = CompletionProtocolMetricsSnapshot {
             resolutions: completion_resolutions.clone(),
             tool_accepted: self
@@ -1247,6 +1470,8 @@ impl DelegationMetrics {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            rollout_windows,
+            rollout_decisions,
             continuation_reasons: self
                 .completion_continuation_reasons
                 .lock()
@@ -1264,6 +1489,12 @@ impl DelegationMetrics {
                 .load(Ordering::Relaxed),
             oldest_open_decision_age_ms: self
                 .completion_oldest_open_decision_age_ms
+                .load(Ordering::Relaxed),
+            outbox_latency_ms_count: self
+                .completion_outbox_latency_ms_count
+                .load(Ordering::Relaxed),
+            outbox_latency_ms_total: self
+                .completion_outbox_latency_ms_total
                 .load(Ordering::Relaxed),
             format_only_child_runs: self
                 .completion_format_only_child_runs
@@ -2136,8 +2367,8 @@ mod tests {
             snapshot.completion_protocol.shadow_differences["needs_decision"],
             1
         );
-        assert_eq!(snapshot.completion_protocol.format_only_child_runs, 0);
-        assert_eq!(snapshot.completion_protocol.card_reemit_prompts, 0);
+        assert_eq!(snapshot.completion_protocol.format_only_child_runs, 1);
+        assert_eq!(snapshot.completion_protocol.card_reemit_prompts, 1);
     }
 
     #[test]

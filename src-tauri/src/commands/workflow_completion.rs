@@ -9,13 +9,15 @@ use crate::acp::delegation::types::{
     ResolveDesignSelfReviewRequest, RestartLegacyWorkflowRequest, RetryCompletionArtifactRequest,
 };
 use crate::acp::delegation::workflow::{
-    resolve_completion_decision_txn, resolve_design_self_review_txn, restart_legacy_workflow_core,
-    retry_completion_artifact_for_user_txn, CompletionMutationError,
-    LegacyWorkflowRestartProjection, WorkflowStoreError,
+    resolve_completion_decision_txn, resolve_design_self_review_txn,
+    restart_legacy_workflow_if_enforced, retry_completion_artifact_for_user_txn,
+    CompletionMutationError, CompletionProtocolRolloutConfig, LegacyWorkflowRestartProjection,
+    WorkflowStoreError,
 };
 use crate::app_error::AppCommandError;
 use crate::db::entities::delegation_attention_request;
 use crate::db::AppDatabase;
+use chrono::Utc;
 use sea_orm::EntityTrait;
 
 pub async fn completion_attention_parent_conversation_id(
@@ -42,6 +44,7 @@ fn unauthorized_context_error() -> AppCommandError {
 pub async fn restart_legacy_workflow_authenticated_core(
     db: &AppDatabase,
     metrics: &crate::acp::delegation::metrics::DelegationMetrics,
+    rollout: &CompletionProtocolRolloutConfig,
     context: &CompletionMutationContext,
     request: RestartLegacyWorkflowRequest,
 ) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
@@ -51,14 +54,25 @@ pub async fn restart_legacy_workflow_authenticated_core(
         );
         return Err(unauthorized_context_error());
     }
-    match restart_legacy_workflow_core(db, request.source_conversation_id).await {
-        Ok(projection) => {
+    match restart_legacy_workflow_if_enforced(db, context.parent_conversation_id(), None, rollout)
+        .await
+    {
+        Ok(Some(projection)) => {
             metrics.record_completion_restart(if projection.idempotent_replay {
                 crate::acp::delegation::metrics::CompletionRestartOutcome::Reused
             } else {
                 crate::acp::delegation::metrics::CompletionRestartOutcome::Created
             });
             Ok(projection)
+        }
+        Ok(None) => {
+            metrics.record_completion_restart(
+                crate::acp::delegation::metrics::CompletionRestartOutcome::Rejected,
+            );
+            Err(
+                AppCommandError::invalid_input("legacy restart requires current v2_enforce mode")
+                    .with_detail("legacy_completion_protocol_restart_not_required"),
+            )
         }
         Err(error) => {
             metrics.record_completion_restart(
@@ -85,10 +99,17 @@ fn map_legacy_restart_error(error: WorkflowStoreError) -> AppCommandError {
 
 pub async fn resolve_completion_decision_core(
     db: &AppDatabase,
+    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
     dispatcher: &CompletionOutboxDispatcher,
     context: &CompletionMutationContext,
     request: ResolveCompletionDecisionRequest,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    let opened_at = delegation_attention_request::Entity::find_by_id(&request.cas.attention_id)
+        .one(&db.conn)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.created_at);
     let result = resolve_completion_decision_txn(
         db,
         context.parent_conversation_id(),
@@ -96,8 +117,21 @@ pub async fn resolve_completion_decision_core(
         request.outcome,
         context.actor_identity(),
     )
-    .await
-    .map_err(map_completion_mutation_error)?;
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(error, CompletionMutationError::Superseded) {
+                metrics.record_completion_decision_superseded();
+            }
+            return Err(map_completion_mutation_error(error));
+        }
+    };
+    let latency = opened_at
+        .map(|opened_at| Utc::now().signed_duration_since(opened_at))
+        .and_then(|latency| latency.to_std().ok())
+        .unwrap_or_default();
+    metrics.record_completion_decision_resolved(latency, result.idempotent_replay);
     dispatch_after_commit(dispatcher).await;
     Ok(result)
 }
@@ -123,10 +157,17 @@ pub async fn retry_completion_artifact_core(
 
 pub async fn resolve_design_self_review_core(
     db: &AppDatabase,
+    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
     dispatcher: &CompletionOutboxDispatcher,
     context: &CompletionMutationContext,
     request: ResolveDesignSelfReviewRequest,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    let opened_at = delegation_attention_request::Entity::find_by_id(&request.cas.attention_id)
+        .one(&db.conn)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.created_at);
     let result = resolve_design_self_review_txn(
         db,
         context.parent_conversation_id(),
@@ -134,8 +175,21 @@ pub async fn resolve_design_self_review_core(
         request.outcome,
         context.actor_identity(),
     )
-    .await
-    .map_err(map_completion_mutation_error)?;
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(error, CompletionMutationError::Superseded) {
+                metrics.record_completion_decision_superseded();
+            }
+            return Err(map_completion_mutation_error(error));
+        }
+    };
+    let latency = opened_at
+        .map(|opened_at| Utc::now().signed_duration_since(opened_at))
+        .and_then(|latency| latency.to_std().ok())
+        .unwrap_or_default();
+    metrics.record_completion_decision_resolved(latency, result.idempotent_replay);
     dispatch_after_commit(dispatcher).await;
     Ok(result)
 }
@@ -166,6 +220,10 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn resolve_completion_decision(
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
+        '_,
+        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    >,
     #[cfg(feature = "tauri-runtime")] dispatcher: tauri::State<'_, Arc<CompletionOutboxDispatcher>>,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
     request: ResolveCompletionDecisionRequest,
@@ -173,7 +231,14 @@ pub async fn resolve_completion_decision(
     #[cfg(feature = "tauri-runtime")]
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
-        resolve_completion_decision_core(&db, dispatcher.inner(), &context, request).await
+        resolve_completion_decision_core(
+            &db,
+            metrics.inner(),
+            dispatcher.inner(),
+            &context,
+            request,
+        )
+        .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -209,6 +274,10 @@ pub async fn retry_completion_artifact(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn resolve_design_self_review(
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
+        '_,
+        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    >,
     #[cfg(feature = "tauri-runtime")] dispatcher: tauri::State<'_, Arc<CompletionOutboxDispatcher>>,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
     request: ResolveDesignSelfReviewRequest,
@@ -216,7 +285,8 @@ pub async fn resolve_design_self_review(
     #[cfg(feature = "tauri-runtime")]
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
-        resolve_design_self_review_core(&db, dispatcher.inner(), &context, request).await
+        resolve_design_self_review_core(&db, metrics.inner(), dispatcher.inner(), &context, request)
+            .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -232,6 +302,10 @@ pub async fn restart_legacy_workflow(
         '_,
         Arc<crate::acp::delegation::metrics::DelegationMetrics>,
     >,
+    #[cfg(feature = "tauri-runtime")] rollout: tauri::State<
+        '_,
+        Arc<CompletionProtocolRolloutConfig>,
+    >,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
     request: RestartLegacyWorkflowRequest,
 ) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
@@ -240,7 +314,14 @@ pub async fn restart_legacy_workflow(
         let source_conversation_id = i32::try_from(request.source_conversation_id)
             .map_err(|_| AppCommandError::invalid_input("source conversation id is invalid"))?;
         let context = desktop_completion_context_for_label(source_conversation_id, window.label())?;
-        restart_legacy_workflow_authenticated_core(&db, metrics.inner(), &context, request).await
+        restart_legacy_workflow_authenticated_core(
+            &db,
+            metrics.inner(),
+            rollout.inner(),
+            &context,
+            request,
+        )
+        .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::EntityTrait;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(test, feature = "test-utils"))]
@@ -55,7 +55,7 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     publish_workflow_manifest_with_selection_core, recover_workflow_core,
-    restart_legacy_workflow_core, select_completion_protocol, settle_workflow_gate_core,
+    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_core,
     settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, ManifestDocument,
     PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowRequest,
     SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
@@ -73,9 +73,7 @@ use crate::acp::recovery_authorization::{
 };
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
-use crate::db::entities::{
-    delegation_workflow, delegation_workflow_node_binding, recovery_authorization,
-};
+use crate::db::entities::{delegation_workflow, recovery_authorization};
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
@@ -1633,58 +1631,15 @@ impl DelegationListener {
         Option<crate::acp::delegation::workflow::LegacyWorkflowRestartProjection>,
         WorkflowStoreError,
     > {
-        let Some(header) = delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
-            .filter(
-                delegation_workflow::Column::WorkflowKind
-                    .eq(crate::acp::delegation::workflow::WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-            )
-            .one(&db.conn)
-            .await
-            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
-        else {
-            return Ok(None);
-        };
-        if header.completion_protocol_version != 1 {
-            return Ok(None);
-        }
-
-        let has_successor = delegation_workflow::Entity::find()
-            .filter(
-                delegation_workflow::Column::LegacySourceWorkflowId.eq(header.workflow_id.clone()),
-            )
-            .one(&db.conn)
-            .await
-            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
-            .is_some();
-        let (agent, profile) = match rollout_subject {
-            Some(subject) => subject,
-            None => delegation_workflow_node_binding::Entity::find()
-                .filter(
-                    delegation_workflow_node_binding::Column::WorkflowId
-                        .eq(header.workflow_id.clone()),
-                )
-                .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
-                .one(&db.conn)
-                .await
-                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
-                .map(|binding| (binding.agent_type, binding.profile_id))
-                .unwrap_or_else(|| ("unknown".into(), None)),
-        };
-        let selection = select_completion_protocol(
-            &agent,
-            profile.as_deref(),
+        match restart_legacy_workflow_if_enforced(
+            db,
+            parent_conversation_id,
+            rollout_subject,
             &self.completion_protocol_rollout,
-        );
-        if !has_successor
-            && selection.mode
-                != crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+        )
+        .await
         {
-            return Ok(None);
-        }
-
-        match restart_legacy_workflow_core(db, i64::from(parent_conversation_id)).await {
-            Ok(projection) => {
+            Ok(Some(projection)) => {
                 self.metrics
                     .record_completion_restart(if projection.idempotent_replay {
                         CompletionRestartOutcome::Reused
@@ -1693,6 +1648,7 @@ impl DelegationListener {
                     });
                 Ok(Some(projection))
             }
+            Ok(None) => Ok(None),
             Err(error) => {
                 self.metrics
                     .record_completion_restart(CompletionRestartOutcome::Failed);
@@ -1931,9 +1887,30 @@ impl DelegationListener {
             .await
         };
         match result {
-            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
-                WorkflowWireError::Internal(format!("serialize settle result: {e}")).to_value()
-            }),
+            Ok(r) => {
+                if let Some(action) = r.plan_next_action {
+                    self.metrics.record_completion_plan_reducer(
+                        action,
+                        r.stagnation_count,
+                        r.rewrite_used,
+                    );
+                    self.metrics.record_completion_continuation(
+                        crate::acp::delegation::metrics::CompletionContinuationReason::PlanReview,
+                    );
+                }
+                if let Some(observation) = r.plan_metric_observation {
+                    self.metrics.record_completion_plan_classification(
+                        observation.change,
+                        observation.localized_intersection,
+                        observation.lineage_reset,
+                    );
+                    self.metrics
+                        .record_completion_sibling_reruns(observation.sibling_reruns);
+                }
+                serde_json::to_value(r).unwrap_or_else(|e| {
+                    WorkflowWireError::Internal(format!("serialize settle result: {e}")).to_value()
+                })
+            }
             Err(e) => workflow_store_error_value(e),
         }
     }
@@ -2027,8 +2004,15 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        match restart_legacy_workflow_core(runs.db(), req.source_conversation_id).await {
-            Ok(projection) => {
+        match restart_legacy_workflow_if_enforced(
+            runs.db(),
+            parent_conversation_id,
+            None,
+            &self.completion_protocol_rollout,
+        )
+        .await
+        {
+            Ok(Some(projection)) => {
                 self.metrics
                     .record_completion_restart(if projection.idempotent_replay {
                         CompletionRestartOutcome::Reused
@@ -2039,6 +2023,15 @@ impl DelegationListener {
                     WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
                         .to_value()
                 })
+            }
+            Ok(None) => {
+                self.metrics
+                    .record_completion_restart(CompletionRestartOutcome::Rejected);
+                workflow_store_error_value(
+                    WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(
+                        "legacy restart requires current v2_enforce mode".into(),
+                    ),
+                )
             }
             Err(error) => {
                 self.metrics

@@ -200,7 +200,7 @@ pub struct CompanionFeatures {
     pub ask: bool,
     pub sessions: bool,
     /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
-    /// enables all five B9 tools together (structural catalog agreement).
+    /// enables all six B9 tools together (structural catalog agreement).
     pub workflow_v2: bool,
     /// Child-only workflow completion-intent transport.
     pub completion_v2: bool,
@@ -219,9 +219,9 @@ pub const WORKFLOW_V2_TOOLS: &[&str] = &[
 /// Capability catalog classification (B9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowCapabilityMode {
-    /// None of the five workflow tools present; workflow is unavailable.
+    /// None of the six workflow tools present; workflow is unavailable.
     Unavailable,
-    /// All five present → v2 mode (capability must also report true).
+    /// All six present → v2 mode (capability must also report true).
     WorkflowManifestV2,
     /// Partial tool set → inconsistent hard-block.
     Inconsistent,
@@ -5418,7 +5418,19 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        // Root + coordination_v1 + workflow_v2: reply + authorization + five workflow tools.
+        let mut line = serde_json::to_vec(&response).unwrap();
+        line.push(b'\n');
+
+        // Compatibility contract: Grok splits a JSONL line at 8,192 bytes and
+        // does not reassemble it. Keep 512 bytes of headroom; do not raise this
+        // literal to make a growing catalog pass.
+        println!("Grok tools/list JSONL bytes: {}", line.len());
+        assert!(
+            line.len() <= 7_680,
+            "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
+            line.len(),
+        );
+        // Root + coordination_v1 + workflow_v2: reply + authorization + six workflow tools.
         assert_eq!(
             names,
             vec![
@@ -5432,22 +5444,11 @@ mod tests {
                 "request_recovery_authorization",
                 "get_workflow_capabilities",
                 "get_workflow_state",
+                "restart_legacy_workflow",
                 "recover_workflow",
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
             ]
-        );
-        let mut line = serde_json::to_vec(&response).unwrap();
-        line.push(b'\n');
-
-        // Compatibility contract: Grok splits a JSONL line at 8,192 bytes and
-        // does not reassemble it. Keep 512 bytes of headroom; do not raise this
-        // literal to make a growing catalog pass.
-        println!("Grok tools/list JSONL bytes: {}", line.len());
-        assert!(
-            line.len() <= 7_680,
-            "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
-            line.len(),
         );
     }
 

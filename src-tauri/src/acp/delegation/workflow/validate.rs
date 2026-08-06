@@ -404,19 +404,11 @@ fn classify_work_unit_parts<'a>(
 ) -> Result<WorkUnitKeyParts<'a>, WorkflowError> {
     let profile_ref = node.profile_id.as_deref();
     match (role, phase, node.task_index) {
-        (ManifestNodeRole::Author, PHASE_PLAN, None) => {
-            if agent_type != "codex" {
-                return Err(WorkflowError::RoleMismatch(format!(
-                    "Plan Author node {} must use agent_type=codex",
-                    node.id
-                )));
-            }
-            Ok(WorkUnitKeyParts::PlanAuthor {
-                rel_plan_path: plan_target_rel_path,
-                agent_type,
-                profile_id: profile_ref,
-            })
-        }
+        (ManifestNodeRole::Author, PHASE_PLAN, None) => Ok(WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: plan_target_rel_path,
+            agent_type,
+            profile_id: profile_ref,
+        }),
         (ManifestNodeRole::Author, _, Some(_)) => Err(WorkflowError::RoleMismatch(format!(
             "Plan Author node {} must not have task_index",
             node.id
@@ -512,7 +504,7 @@ fn validate_author_and_skeleton(
         .count();
     if author_count != 1 {
         return Err(WorkflowError::InvalidField(format!(
-            "manifest requires exactly one Codex Plan Author node, got {author_count}"
+            "manifest requires exactly one Plan Author node, got {author_count}"
         )));
     }
 

@@ -18,7 +18,7 @@
   },
   {
     "name": "delegate_to_agent",
-    "description": "Cold sub-agent; ASYNCHRONOUS task_id. It cannot see this conversation: task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile. admission_failed/admission_unknown: explicit replacement.",
+    "description": "Start an asynchronous isolated sub-agent; task must include all context. Fan out, then Join. Pass profile_id for a named profile. Admission failure/unknown requires explicit replacement.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -44,7 +44,7 @@
         "task": { "type": "string" },
         "correlation_id": {
           "type": "string",
-          "description": "Fresh per invocation."
+          "description": "Fresh per call."
         },
         "recovery_authorization_id": {
           "type": "string",
@@ -57,16 +57,16 @@
         "work_unit_key": {
           "type": "string",
           "maxLength": 200,
-          "description": "Recovery key; max 200."
+          "description": "Recovery key."
         },
         "replaces_task_id": {
           "type": "string",
-          "description": "Prior task_id; pair with replacement_reason."
+          "description": "Pair with replacement_reason."
         },
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "With replaces_task_id. admission_failed/admission_unknown: explicit replacement, never continue. Established work follows central recovery; cancellation/stall never implies unresumable."
+          "description": "Admission failure/unknown requires replacement; cancellation/stall does not."
         }
       }
     }
@@ -98,7 +98,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "task_ids in input order. Omit wait_ms for an immediate snapshot. Join: return_when=all_terminal_or_attention and wait_ms=0; positive wait_ms is rejected. Returns when all requested tasks are terminal, attention, or unavailable. Answer attention; re-Join only still-running required task_ids. Includes wake_reason and attention_requests.",
+    "description": "Join task_ids in input order. Omit wait_ms for a snapshot; use return_when=all_terminal_or_attention with wait_ms=0. Answer attention, then re-Join running required tasks.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],

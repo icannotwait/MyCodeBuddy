@@ -476,15 +476,17 @@ impl AppState {
         let metrics = Arc::new(EventBusMetrics::default());
         let acp_event_bus = Arc::new(InternalEventBus::new(metrics));
         let emitter = EventEmitter::web_only(broadcaster.clone(), acp_event_bus.clone());
-        let completion_outbox_dispatcher = Arc::new(CompletionOutboxDispatcher::new(
-            Arc::new(AppDatabase {
-                conn: db.conn.clone(),
-            }),
-            emitter.clone(),
-        ));
-
         let connection_manager = default_connection_manager();
         let stack = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
+        let completion_outbox_dispatcher = Arc::new(
+            CompletionOutboxDispatcher::new(
+                Arc::new(AppDatabase {
+                    conn: db.conn.clone(),
+                }),
+                emitter.clone(),
+            )
+            .with_metrics(stack.metrics.clone()),
+        );
         // Freshly migrated fixture DB: empty registry is correct and keeps
         // this constructor synchronous for existing integration tests.
         let internal_sessions =
@@ -517,6 +519,12 @@ impl AppState {
                 db: db.conn.clone(),
             }),
         );
+        let completion_protocol_rollout =
+            Arc::new(crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::default());
+        connection_manager.install_completion_protocol_runtime(
+            completion_protocol_rollout.clone(),
+            stack.metrics.clone(),
+        );
 
         Self {
             db,
@@ -542,9 +550,7 @@ impl AppState {
             delegation_broker: stack.broker,
             continuation_coordinator: stack.continuation_coordinator,
             delegation_metrics: stack.metrics,
-            completion_protocol_rollout: Arc::new(
-                crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::default(),
-            ),
+            completion_protocol_rollout,
             completion_outbox_dispatcher,
             delegation_runtime_settings: stack.runtime_settings,
             delegation_tokens: stack.tokens,

@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use crate::acp::delegation::attention::AttentionRequestSummary;
 use crate::acp::delegation::card_summary::CardSummary;
+use crate::acp::delegation::metrics::{CompletionContinuationReason, DelegationMetrics};
 use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
 use crate::acp::delegation::types::TaskObservation;
 use crate::acp::delegation::workflow::{
@@ -37,7 +38,8 @@ use crate::acp::delegation::workflow::{
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
-use crate::db::entities::delegation_workflow_outbox_event;
+use crate::db::entities::delegation_attention_request::AttentionKind;
+use crate::db::entities::{delegation_attention_request, delegation_workflow_outbox_event};
 use crate::db::AppDatabase;
 use crate::models::{AgentType, ConversationStatePatch};
 use crate::web::event_bridge::{emit_event, emit_with_state, EventEmitter};
@@ -66,6 +68,7 @@ pub struct CompletionOutboxDispatcher {
     db: Arc<AppDatabase>,
     emitter: EventEmitter,
     root_wake: Option<Arc<dyn CompletionRootWakeQueue>>,
+    metrics: Option<Arc<DelegationMetrics>>,
 }
 
 impl CompletionOutboxDispatcher {
@@ -74,11 +77,17 @@ impl CompletionOutboxDispatcher {
             db,
             emitter,
             root_wake: None,
+            metrics: None,
         }
     }
 
     pub fn with_root_wake(mut self, root_wake: Arc<dyn CompletionRootWakeQueue>) -> Self {
         self.root_wake = Some(root_wake);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<DelegationMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -88,6 +97,7 @@ impl CompletionOutboxDispatcher {
         crate::acp::delegation::workflow::reconcile_completion_attentions_txn(&self.db)
             .await
             .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        self.refresh_oldest_open_decision_age().await?;
         let rows = delegation_workflow_outbox_event::Entity::find()
             .filter(delegation_workflow_outbox_event::Column::DeliveredAt.is_null())
             .order_by_asc(delegation_workflow_outbox_event::Column::CreatedAt)
@@ -95,12 +105,44 @@ impl CompletionOutboxDispatcher {
             .all(&self.db.conn)
             .await
             .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_completion_outbox_pending(rows.len() as u64);
+        }
         let mut delivered = 0;
         for row in rows {
-            self.dispatch_row(row).await?;
-            delivered += 1;
+            match self.dispatch_row(row).await {
+                Ok(()) => delivered += 1,
+                Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_completion_outbox_retry();
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(delivered)
+    }
+
+    async fn refresh_oldest_open_decision_age(&self) -> Result<(), CompletionOutboxDispatchError> {
+        let Some(metrics) = &self.metrics else {
+            return Ok(());
+        };
+        let oldest = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::Status.eq("open"))
+            .filter(delegation_attention_request::Column::Kind.is_in([
+                AttentionKind::CompletionDecision,
+                AttentionKind::DesignSelfReviewDecision,
+            ]))
+            .order_by_asc(delegation_attention_request::Column::CreatedAt)
+            .one(&self.db.conn)
+            .await
+            .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        let age = oldest
+            .map(|row| Utc::now().signed_duration_since(row.created_at))
+            .and_then(|age| age.to_std().ok())
+            .unwrap_or_default();
+        metrics.record_completion_open_decision_age(age);
+        Ok(())
     }
 
     pub async fn pending_count(&self) -> Result<u64, CompletionOutboxDispatchError> {
@@ -148,6 +190,18 @@ impl CompletionOutboxDispatcher {
                     .map_err(CompletionOutboxDispatchError::RootWake)?;
             }
             emit_event(&self.emitter, COMPLETION_DECISION_RESOLVED_EVENT, &event);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_completion_continuation(match event.kind {
+                    AttentionKind::CompletionArtifactRecovery => {
+                        CompletionContinuationReason::ArtifactRecovered
+                    }
+                    AttentionKind::CompletionDecision
+                    | AttentionKind::DesignSelfReviewDecision
+                    | AttentionKind::ChildQuestion => {
+                        CompletionContinuationReason::DecisionResolved
+                    }
+                });
+            }
         } else {
             let payload: serde_json::Value =
                 serde_json::from_str(&row.payload_json).map_err(|error| {
@@ -166,6 +220,13 @@ impl CompletionOutboxDispatcher {
             .exec(&self.db.conn)
             .await
             .map_err(|error| CompletionOutboxDispatchError::Persistence(error.to_string()))?;
+        if let Some(metrics) = &self.metrics {
+            let latency = Utc::now()
+                .signed_duration_since(row.created_at)
+                .to_std()
+                .unwrap_or_default();
+            metrics.record_completion_outbox_delivered(latency);
+        }
         Ok(())
     }
 }

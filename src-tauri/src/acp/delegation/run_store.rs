@@ -89,6 +89,8 @@ pub const MAX_GENERATION: i64 = 100;
 pub struct TerminalCompletionResolverContext {
     pub role: CompletionRole,
     pub phase_id: String,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
     pub tool_intents: Vec<CompletionToolIntent>,
 }
 
@@ -2138,6 +2140,8 @@ impl RunStore {
         Ok(Some(TerminalCompletionResolverContext {
             role,
             phase_id: node.phase_id,
+            agent_type: node.agent_type,
+            profile_id: node.profile_id,
             tool_intents: intents,
         }))
     }

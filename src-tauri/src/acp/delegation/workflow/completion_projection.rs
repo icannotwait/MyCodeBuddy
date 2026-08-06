@@ -126,6 +126,7 @@ mod tests {
             evidence: None,
             attention: Some(attention.clone()),
             graph_revision: 7,
+            final_metric_states: Vec::new(),
         };
 
         let projection = super::project_terminal_completion(&result);

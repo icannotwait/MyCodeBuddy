@@ -342,7 +342,8 @@ async fn async_main() -> ExitCode {
                 conn: db.conn.clone(),
             }),
             emitter.clone(),
-        ),
+        )
+        .with_metrics(stack.metrics.clone()),
     );
     let completion_protocol_rollout =
         match codeg_lib::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env() {
@@ -352,6 +353,10 @@ async fn async_main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+    connection_manager.install_completion_protocol_runtime(
+        completion_protocol_rollout.clone(),
+        stack.metrics.clone(),
+    );
     let state = Arc::new(AppState {
         db,
         connection_manager,

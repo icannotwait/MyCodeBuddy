@@ -101,13 +101,8 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
         } => {
             let path = normalize_rel_path(rel_plan_path)?;
             let agent = validate_agent_type(agent_type)?;
-            if agent != "codex" {
-                return Err(WorkflowError::RoleMismatch(
-                    "Plan Author agent_type must be codex".into(),
-                ));
-            }
             let profile = profile_token(profile_id)?;
-            format!("plan|{path}|author|codex|{profile}")
+            format!("plan|{path}|author|{agent}|{profile}")
         }
         WorkUnitKeyParts::PlanReviewer {
             rel_plan_path,
@@ -190,15 +185,16 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
                 profile_id,
             })
         }
-        ["plan", path, "author", "codex", profile] => {
+        ["plan", path, "author", agent, profile] => {
             let rel = normalize_rel_path(path).ok()?;
             if rel != *path {
                 return None;
             }
             let profile_id = parse_profile(profile)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             Some(ParsedWorkUnitKey::PlanAuthor {
                 rel_plan_path: rel,
-                agent_type: "codex".to_string(),
+                agent_type,
                 profile_id,
             })
         }

@@ -7,6 +7,14 @@ selection, root-only restart transports, and bounded protocol observability. A
 legacy root now receives one fresh linked protocol-v2 successor while the
 source remains unchanged and becomes read-only by projection.
 
+The consolidated High dual-review fix closes the one Critical and five
+Important findings from the Codex and Grok reviews. Root prompts now hit the
+same pre-mutation restart fence as workflow tools, every restart transport
+honors the current rollout, successors retain bounded original-request and
+source launch-profile context, production transitions feed the protocol
+metrics, shadow mode compares actual v1 and v2 outcomes, and the Grok catalog
+remains below its fixed stdio limit.
+
 ## TDD Evidence
 
 RED was established before production changes:
@@ -50,6 +58,64 @@ target above compile and pass.
 No full suite, Clippy, frontend test, build, push, or PR was run. Cargo emitted
 the existing warning that the packaged `codeg-mcp` sidecar is absent and a
 zero-byte build placeholder was used.
+
+## Consolidated Review Fix
+
+### Findings Closed
+
+- `T15-CODEX-C1`: fenced `ConnectionManager::send_prompt_linked_impl` before
+  prompt admission, hydration, events, transcript/status mutation, or agent
+  send. Enforce creates or reuses the v2 successor and returns its ID through
+  the typed restart response; the legacy source never receives the prompt.
+- `T15-CODEX-I1`: current server-owned rollout now gates MCP, Tauri, HTTP, and
+  automatic restart. Stored protocol-v1 `v2_shadow` workflows restart when the
+  current selection becomes `v2_enforce`; new successors are rejected in
+  current `v1`/`v2_shadow`, while an existing successor remains reusable.
+- `T15-CODEX-I2` / `T15-GROK-I2`: the first accepted root request is captured
+  once as bounded text, stable identity, and digest. The atomic restart copies
+  that context and derives the active author agent/profile instead of using
+  `codex|none`. Coverage uses Grok with `review-canary` and no auto-title row.
+- `T15-CODEX-I3`: lifecycle, adjudication age/latency, outbox, Plan reducer and
+  classification, Final context/package, continuation, and sibling-rerun
+  recorders now run at production transitions. Shadow samples compare the
+  authoritative v1 Card outcome to the v2 resolver and retain latest-100
+  agent/profile windows. Guarded v2 Card-only repair attempts are rejected and
+  counted.
+- `T15-GROK-I1`: retained the root restart tool while shortening redundant
+  schema prose. The frozen Grok name list includes all six workflow tools and
+  the serialized `tools/list` line measures `7557 / 7680` bytes.
+
+### Fix TDD Evidence
+
+RED was observed before each production correction:
+
+- The observability regression failed compilation because the required live
+  recorder methods and snapshot fields did not exist.
+- The Card-only guard regression failed because no v2 boundary rejected and
+  counted the attempted repair.
+- The Grok catalog regression first failed on the missing restart-tool name;
+  after moving the byte assertion ahead of that list check it exposed the
+  catalog measurement used to reclaim budget.
+- The transport and stored-shadow restart regressions failed with `original
+  request context is unavailable` until their source requests were durably
+  captured.
+- The existing metrics unit regression failed until attempted v2 invariant
+  violations were reported rather than remaining vacuous zeroes.
+
+Fresh focused GREEN verification on the final fix tree:
+
+- `completion_protocol_v2 legacy_restart`: 3 passed.
+- Plain-text root prompt restart fence: 1 passed.
+- `completion_protocol_v2 rollout`: 5 passed.
+- `completion_protocol_v2 completion_protocol_metrics`: 3 passed.
+- Card-only repair boundary: 1 passed.
+- Root-only restart schema: 1 passed.
+- `completion_transport_parity restart`: 1 passed.
+- Library completion-protocol metrics: 1 passed.
+- Grok fixed stdio catalog: 1 passed, `7557 / 7680` bytes.
+- This is 17 focused test executions (16 distinct tests), all passing.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
 
 ## Implementation
 
