@@ -21,6 +21,7 @@ use super::plan_material::{
     bind_plan_material, derive_plan_reviewer_selector, parse_plan_material, BoundPlanMaterialMap,
     MaterialSelectorV1, PlanMaterialMap, MAX_PLAN_MATERIAL_BYTES,
 };
+use super::plan_review::PlanReviewRoundStateV2;
 use super::store::load_active_manifest_snapshot;
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
@@ -690,7 +691,7 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
                 && persisted_round > 0
                 && persisted_round < state.current_review_round =>
             {
-                let localized_change_proof = delegation_workflow_gate_settlement::Entity::find()
+                let localized_change_proofs = delegation_workflow_gate_settlement::Entity::find()
                     .filter(
                         delegation_workflow_gate_settlement::Column::WorkflowId
                             .eq(node.workflow_id.clone()),
@@ -708,16 +709,53 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
                         delegation_workflow_gate_settlement::Column::ReviewRound
                             .gt(persisted_round),
                     )
-                    .one(store.conn)
+                    .order_by_asc(delegation_workflow_gate_settlement::Column::ReviewRound)
+                    .all(store.conn)
                     .await
                     .map_err(|error| {
                         EvidenceScopeError::InstructionBindingFailed(error.to_string())
                     })?;
-                if localized_change_proof.is_none() {
+                if localized_change_proofs.is_empty() {
                     return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
                         "unselected reviewer {} has no localized-change proof for current lineage",
                         node.node_id
                     )));
+                }
+                for proof in localized_change_proofs {
+                    let state_json =
+                        proof.plan_round_state_v2_json.as_deref().ok_or_else(|| {
+                            EvidenceScopeError::PlanMaterialInvalid(
+                                "localized-change proof has no Plan round state".into(),
+                            )
+                        })?;
+                    let proof_state: PlanReviewRoundStateV2 = serde_json::from_str(state_json)
+                        .map_err(|_| {
+                            EvidenceScopeError::PlanMaterialInvalid(
+                                "localized-change Plan round state is corrupt".into(),
+                            )
+                        })?;
+                    let change = proof_state.localized_change.as_ref().ok_or_else(|| {
+                        EvidenceScopeError::PlanMaterialInvalid(
+                            "localized-change proof is missing its authorized change".into(),
+                        )
+                    })?;
+                    let digest = canonical_json_sha256(
+                        "codeg.completion.plan_localized_change.v2",
+                        1,
+                        change,
+                    )?;
+                    if proof.localized_change_digest.as_deref() != Some(digest.as_str())
+                        || proof.gate_lineage.as_deref() != Some(state.gate_lineage.as_str())
+                        || proof.review_round != Some(i64::from(proof_state.review_round))
+                        || proof.covered_plan_digest.as_deref()
+                            != Some(change.current_plan_digest.as_str())
+                        || proof_state.selected_node_ids.contains(&node.node_id)
+                    {
+                        return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
+                            "localized-change proof does not preserve reviewer {}",
+                            node.node_id
+                        )));
+                    }
                 }
                 persisted_round
             }

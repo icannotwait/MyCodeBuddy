@@ -3,15 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::completion_intent::CompletionOutcome;
+use super::types::PlanLocalizedChangeV2;
 
 const MAX_ID_CHARS: usize = 200;
 const MAX_TEXT_BYTES: usize = 4 * 1024;
 const MAX_OWNER_COUNT: usize = 64;
 const MAX_FINDING_COUNT: usize = 400;
-const MAX_ROUND_JSON_BYTES: usize = 512 * 1024;
+const MAX_ROUND_JSON_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +117,18 @@ pub struct PlanReviewRoundStateV2 {
     pub stagnation_count: u32,
     pub rewrite_used: bool,
     pub next_action: PlanReviewNextAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_snapshot: Option<PlanArtifactSnapshotV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localized_change: Option<PlanLocalizedChangeV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanArtifactSnapshotV2 {
+    pub rel_path: String,
+    pub digest: String,
+    pub content_base64: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +308,8 @@ pub fn derive_plan_review_round_v2(
         stagnation_count,
         rewrite_used,
         next_action,
+        plan_snapshot: None,
+        localized_change: None,
     };
     validate_v2_state_size(&state)?;
     Ok(PlanReviewDecisionV2 {
@@ -306,6 +322,31 @@ pub fn derive_next_plan_review_round_v2(
     current: &PlanReviewRoundStateV2,
     passing_change_intersections: &[String],
 ) -> Result<Option<PlanReviewRoundOpeningV2>, PlanReviewError> {
+    if current.next_action == PlanReviewNextAction::HolisticRewriteRequired {
+        if !passing_change_intersections.is_empty() {
+            return Err(PlanReviewError::InvalidTransition(
+                "holistic rewrite opening does not accept localized intersections".into(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"codeg.plan-holistic-lineage.v2\0");
+        hasher.update(current.gate_lineage.as_bytes());
+        hasher.update([0]);
+        hasher.update(current.review_round.to_be_bytes());
+        for reviewer in &current.reviewers {
+            hasher.update([0]);
+            hasher.update(reviewer.node_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(reviewer.evidence_task_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(reviewer.evidence_scope_digest.as_bytes());
+        }
+        return Ok(Some(PlanReviewRoundOpeningV2 {
+            gate_lineage: format!("sha256:{:x}", hasher.finalize()),
+            review_round: 1,
+            selected_node_ids: current.required_node_ids.clone(),
+        }));
+    }
     if current.next_action != PlanReviewNextAction::ContinueReview {
         return Ok(None);
     }
@@ -409,6 +450,19 @@ fn validate_v2_transition(
                 ));
             }
         }
+        (Some(previous), PlanReviewChangeV2::HolisticRewrite) => {
+            if previous.next_action != PlanReviewNextAction::HolisticRewriteRequired
+                || previous.rewrite_used
+                || current.gate_lineage == previous.gate_lineage
+                || current.review_round != 1
+                || current.required_node_ids != previous.required_node_ids
+                || current.selected_node_ids != current.required_node_ids
+            {
+                return Err(PlanReviewError::InvalidTransition(
+                    "holistic rewrite must mint a new full-cohort Plan lineage".into(),
+                ));
+            }
+        }
         (Some(previous), change) => {
             if current.gate_lineage != previous.gate_lineage
                 || current.review_round != previous.review_round.saturating_add(1)
@@ -430,14 +484,6 @@ fn validate_v2_transition(
                 ));
             }
             match change {
-                PlanReviewChangeV2::HolisticRewrite
-                    if previous.next_action != PlanReviewNextAction::HolisticRewriteRequired
-                        || previous.rewrite_used =>
-                {
-                    return Err(PlanReviewError::InvalidTransition(
-                        "holistic rewrite is not currently authorized".into(),
-                    ));
-                }
                 PlanReviewChangeV2::Corrective
                     if previous.next_action == PlanReviewNextAction::HolisticRewriteRequired =>
                 {
@@ -1674,25 +1720,46 @@ mod v2_tests {
             PlanReviewNextAction::HolisticRewriteRequired
         );
 
-        let rewrite = derive(
+        let rewrite_opening = derive_next_plan_review_round_v2(&second.state, &[])
+            .unwrap()
+            .unwrap();
+        assert_ne!(rewrite_opening.gate_lineage, second.state.gate_lineage);
+        assert_eq!(rewrite_opening.review_round, 1);
+        assert_eq!(rewrite_opening.selected_node_ids, vec!["codex"]);
+
+        assert!(derive_plan_review_round_v2(
             Some(&second.state),
-            4,
-            &outcomes,
+            input(4, &outcomes),
             PlanReviewChangeV2::HolisticRewrite,
-        );
+        )
+        .is_err());
+
+        let mut rewrite_input = input(1, &outcomes);
+        rewrite_input.gate_lineage = rewrite_opening.gate_lineage;
+        let rewrite = derive_plan_review_round_v2(
+            Some(&second.state),
+            rewrite_input,
+            PlanReviewChangeV2::HolisticRewrite,
+        )
+        .unwrap();
         assert_eq!(rewrite.state.stagnation_count, 0);
-        let post_one = derive(
+        assert!(rewrite.state.rewrite_used);
+        let mut post_one_input = input(2, &outcomes);
+        post_one_input.gate_lineage = rewrite.state.gate_lineage.clone();
+        let post_one = derive_plan_review_round_v2(
             Some(&rewrite.state),
-            5,
-            &outcomes,
+            post_one_input,
             PlanReviewChangeV2::Corrective,
-        );
-        let post_two = derive(
+        )
+        .unwrap();
+        let mut post_two_input = input(3, &outcomes);
+        post_two_input.gate_lineage = rewrite.state.gate_lineage.clone();
+        let post_two = derive_plan_review_round_v2(
             Some(&post_one.state),
-            6,
-            &outcomes,
+            post_two_input,
             PlanReviewChangeV2::Corrective,
-        );
+        )
+        .unwrap();
         assert_eq!(
             post_two.state.next_action,
             PlanReviewNextAction::UserDecisionRequired

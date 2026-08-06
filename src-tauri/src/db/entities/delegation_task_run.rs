@@ -91,6 +91,8 @@ pub struct Model {
     pub completion_state: Option<CompletionState>,
     pub completion_outcome: Option<String>,
     pub completion_evidence_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub final_remediation_contexts_json: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

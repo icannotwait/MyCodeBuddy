@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -98,12 +100,23 @@ pub struct FinalFindingInputV1 {
     pub remediation_route_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalReviewerEvaluationV1 {
+    pub reviewer_node_id: String,
+    pub evidence_task_id: String,
+    pub evidence_scope_digest: String,
+    pub outcome: CompletionOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalFindingsPackageInputV1 {
     pub workflow_id: String,
     pub gate_id: String,
     pub gate_lineage: String,
+    pub requirements_identity: String,
     pub graph_revision: u64,
+    pub reviewer_evaluations: Vec<FinalReviewerEvaluationV1>,
     pub findings: Vec<FinalFindingInputV1>,
     pub remediation_contexts: Vec<RemediationContextInputV1>,
 }
@@ -260,6 +273,44 @@ pub(crate) fn bounded_terminal_context_v1(
     RemediationContextInputV1::available_terminal(source_evidence_task_id, bytes[start..].to_vec())
 }
 
+pub fn snapshot_remediation_contexts_v1(
+    contexts: Vec<RemediationContextInputV1>,
+) -> Result<Vec<RemediationContextSnapshotV1>, FinalFindingsError> {
+    if contexts.len() > MAX_CONTEXT_COUNT {
+        return Err(FinalFindingsError::BoundsExceeded(format!(
+            "context count exceeds {MAX_CONTEXT_COUNT}"
+        )));
+    }
+    contexts.into_iter().map(build_context).collect()
+}
+
+pub fn remediation_context_inputs_from_snapshots_v1(
+    contexts: &[RemediationContextSnapshotV1],
+) -> Result<Vec<RemediationContextInputV1>, FinalFindingsError> {
+    if contexts.len() > MAX_CONTEXT_COUNT {
+        return Err(FinalFindingsError::EvidenceCorrupt);
+    }
+    contexts
+        .iter()
+        .map(|context| {
+            let bytes = decode_context(context)?;
+            Ok(RemediationContextInputV1 {
+                source_evidence_task_id: context.source_evidence_task_id.clone(),
+                source_kind: context.source_kind,
+                rel_path: context.rel_path.clone(),
+                bytes: (context.availability == RemediationContextAvailability::Available)
+                    .then_some(bytes),
+            })
+        })
+        .collect()
+}
+
+pub fn verify_remediation_context_snapshots_v1(
+    contexts: &[RemediationContextSnapshotV1],
+) -> Result<(), FinalFindingsError> {
+    remediation_context_inputs_from_snapshots_v1(contexts).map(drop)
+}
+
 pub async fn persist_final_findings_package_v1<C: ConnectionTrait>(
     conn: &C,
     package: &FinalFindingsPackageV1,
@@ -372,6 +423,52 @@ pub async fn resolve_active_final_findings_packages_v1<C: ConnectionTrait>(
     Ok(count)
 }
 
+pub async fn count_active_final_findings_packages_for_workflow_v1<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+) -> Result<u64, FinalFindingsError> {
+    delegation_final_findings_package::Entity::find()
+        .filter(delegation_final_findings_package::Column::WorkflowId.eq(workflow_id))
+        .filter(
+            delegation_final_findings_package::Column::Status
+                .eq(FinalFindingsPackageStatus::Active),
+        )
+        .count(conn)
+        .await
+        .map_err(|error| FinalFindingsError::Persistence(error.to_string()))
+}
+
+pub async fn resolve_active_final_findings_packages_for_workflow_v1<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    graph_revision: i64,
+) -> Result<u64, FinalFindingsError> {
+    if graph_revision <= 0 {
+        return Err(FinalFindingsError::InvalidField(
+            "graph_revision must be positive".into(),
+        ));
+    }
+    let active = delegation_final_findings_package::Entity::find()
+        .filter(delegation_final_findings_package::Column::WorkflowId.eq(workflow_id))
+        .filter(
+            delegation_final_findings_package::Column::Status
+                .eq(FinalFindingsPackageStatus::Active),
+        )
+        .all(conn)
+        .await
+        .map_err(|error| FinalFindingsError::Persistence(error.to_string()))?;
+    let count = active.len() as u64;
+    for row in active {
+        let mut row: delegation_final_findings_package::ActiveModel = row.into();
+        row.status = Set(FinalFindingsPackageStatus::Resolved);
+        row.resolved_graph_revision = Set(Some(graph_revision));
+        row.update(conn)
+            .await
+            .map_err(|error| FinalFindingsError::Persistence(error.to_string()))?;
+    }
+    Ok(count)
+}
+
 pub fn verify_final_findings_package_model_v1(
     row: &delegation_final_findings_package::Model,
 ) -> Result<FinalFindingsPackageV1, FinalFindingsError> {
@@ -434,6 +531,7 @@ pub fn build_final_findings_package_v1(
     validate_id("workflow_id", &input.workflow_id)?;
     validate_id("gate_id", &input.gate_id)?;
     validate_id("gate_lineage", &input.gate_lineage)?;
+    validate_sha256("requirements_identity", &input.requirements_identity)?;
     if input.graph_revision == 0 {
         return Err(FinalFindingsError::InvalidField(
             "graph_revision must be positive".into(),
@@ -449,6 +547,7 @@ pub fn build_final_findings_package_v1(
             "context count exceeds {MAX_CONTEXT_COUNT}"
         )));
     }
+    validate_reviewer_evaluations(&input.reviewer_evaluations)?;
 
     let mut items = input
         .findings
@@ -464,6 +563,30 @@ pub fn build_final_findings_package_v1(
             "duplicate Final reviewer evidence".into(),
         ));
     }
+    let nonpass_evaluation_count = input
+        .reviewer_evaluations
+        .iter()
+        .filter(|evaluation| {
+            matches!(
+                evaluation.outcome,
+                CompletionOutcome::RequestChanges | CompletionOutcome::Block
+            )
+        })
+        .count();
+    if nonpass_evaluation_count != items.len()
+        || items.iter().any(|item| {
+            !input.reviewer_evaluations.iter().any(|evaluation| {
+                evaluation.reviewer_node_id == item.reviewer_node_id
+                    && evaluation.evidence_task_id == item.evidence_task_id
+                    && evaluation.evidence_scope_digest == item.evidence_scope_digest
+                    && evaluation.outcome == item.outcome
+            })
+        })
+    {
+        return Err(FinalFindingsError::InvalidField(
+            "Final findings do not exactly match the non-pass evaluation".into(),
+        ));
+    }
 
     let remediation_contexts = input
         .remediation_contexts
@@ -477,19 +600,9 @@ pub fn build_final_findings_package_v1(
     }
     let source_evaluation_key = canonical_hash(&json!({
         "kind": "source_evaluation",
-        "workflow_id": input.workflow_id,
-        "gate_id": input.gate_id,
-        "gate_lineage": input.gate_lineage,
+        "requirements_identity": input.requirements_identity,
         "graph_revision": input.graph_revision,
-        "reviewers": items.iter().map(|item| json!({
-            "finding_id": item.finding_id,
-            "reviewer_node_id": item.reviewer_node_id,
-            "evidence_task_id": item.evidence_task_id,
-            "evidence_scope_digest": item.evidence_scope_digest,
-            "outcome": item.outcome,
-            "target_work_unit_keys": item.target_work_unit_keys,
-            "remediation_route_ids": item.remediation_route_ids,
-        })).collect::<Vec<_>>(),
+        "reviewers": input.reviewer_evaluations,
     }))?;
     let package_digest = package_digest(
         &input.workflow_id,
@@ -510,6 +623,37 @@ pub fn build_final_findings_package_v1(
     };
     verify_final_findings_package_v1(&package)?;
     Ok(package)
+}
+
+fn validate_reviewer_evaluations(
+    evaluations: &[FinalReviewerEvaluationV1],
+) -> Result<(), FinalFindingsError> {
+    if evaluations.is_empty() || evaluations.len() > MAX_FINDING_COUNT {
+        return Err(FinalFindingsError::BoundsExceeded(format!(
+            "reviewer evaluation count must be 1..={MAX_FINDING_COUNT}"
+        )));
+    }
+    let mut reviewer_ids = BTreeSet::new();
+    let mut task_ids = BTreeSet::new();
+    for evaluation in evaluations {
+        validate_id("reviewer_node_id", &evaluation.reviewer_node_id)?;
+        validate_id("evidence_task_id", &evaluation.evidence_task_id)?;
+        validate_sha256("evidence_scope_digest", &evaluation.evidence_scope_digest)?;
+        if !matches!(
+            evaluation.outcome,
+            CompletionOutcome::Approve
+                | CompletionOutcome::ApproveWithMinors
+                | CompletionOutcome::RequestChanges
+                | CompletionOutcome::Block
+        ) || !reviewer_ids.insert(&evaluation.reviewer_node_id)
+            || !task_ids.insert(&evaluation.evidence_task_id)
+        {
+            return Err(FinalFindingsError::InvalidField(
+                "Final reviewer evaluation is invalid or duplicated".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_final_findings_package_v1(
@@ -770,7 +914,22 @@ mod tests {
             workflow_id: "workflow-1".into(),
             gate_id: "final".into(),
             gate_lineage: LINEAGE.into(),
+            requirements_identity: format!("sha256:{}", "a".repeat(64)),
             graph_revision: 9,
+            reviewer_evaluations: vec![
+                FinalReviewerEvaluationV1 {
+                    reviewer_node_id: "codex".into(),
+                    evidence_task_id: "task-codex".into(),
+                    evidence_scope_digest: SCOPE_A.into(),
+                    outcome: CompletionOutcome::RequestChanges,
+                },
+                FinalReviewerEvaluationV1 {
+                    reviewer_node_id: "grok".into(),
+                    evidence_task_id: "task-grok".into(),
+                    evidence_scope_digest: SCOPE_B.into(),
+                    outcome: CompletionOutcome::Block,
+                },
+            ],
             findings: vec![
                 finding("grok", "task-grok", SCOPE_B, CompletionOutcome::Block),
                 finding(
@@ -817,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn final_source_evaluation_identity_binds_durable_routes() {
+    fn final_source_evaluation_identity_excludes_durable_routes() {
         let original = build_final_findings_package_v1(package_input(b"terminal")).unwrap();
         let mut changed_input = package_input(b"terminal");
         changed_input.findings[0]
@@ -825,9 +984,43 @@ mod tests {
             .push("route-c".into());
         let changed = build_final_findings_package_v1(changed_input).unwrap();
 
-        assert_ne!(
+        assert_eq!(
             original.source_evaluation_key,
             changed.source_evaluation_key
+        );
+        assert_ne!(original.package_digest, changed.package_digest);
+
+        let mut changed_evaluation = package_input(b"terminal");
+        changed_evaluation.reviewer_evaluations[1].outcome = CompletionOutcome::Approve;
+        changed_evaluation
+            .findings
+            .retain(|finding| finding.evidence_task_id != "task-grok");
+        changed_evaluation
+            .remediation_contexts
+            .retain(|context| context.source_evidence_task_id != "task-grok");
+        assert_ne!(
+            original.source_evaluation_key,
+            build_final_findings_package_v1(changed_evaluation)
+                .unwrap()
+                .source_evaluation_key
+        );
+
+        let mut changed_requirements = package_input(b"terminal");
+        changed_requirements.requirements_identity = format!("sha256:{}", "9".repeat(64));
+        assert_ne!(
+            original.source_evaluation_key,
+            build_final_findings_package_v1(changed_requirements)
+                .unwrap()
+                .source_evaluation_key
+        );
+
+        let mut changed_graph = package_input(b"terminal");
+        changed_graph.graph_revision += 1;
+        assert_ne!(
+            original.source_evaluation_key,
+            build_final_findings_package_v1(changed_graph)
+                .unwrap()
+                .source_evaluation_key
         );
     }
 

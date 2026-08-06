@@ -2508,6 +2508,7 @@ mod tests {
             completion_state: None,
             completion_outcome: None,
             completion_evidence_json: None,
+            final_remediation_contexts_json: None,
             created_at: t0,
             updated_at: t1,
         };

@@ -2,6 +2,8 @@
 //!
 //! Document gates only for settle. Execution-gate evaluation is Task 4.
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, QueryFilter,
@@ -38,7 +40,8 @@ use super::super::card_summary::{
     parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
 };
 use super::artifact_resolver::{
-    resolve_document, resolve_final_delivery, ArtifactError, ResolvedArtifact,
+    read_bounded_workspace_file, resolve_document, resolve_final_delivery, ArtifactError,
+    ResolvedArtifact,
 };
 use super::completion_evidence::{
     load_validated_completion_evidence, open_design_self_review_decision_txn,
@@ -61,15 +64,16 @@ use super::gates::{
     RequiredReviewerEvidence,
 };
 use super::plan_material::{
-    plan_publication_material_decision, PlanMaterialError, PlanMaterialMap,
-    PlanPublicationMaterialDecisionV1,
+    authorize_localized_plan_change, bind_plan_material, classify_plan_change, parse_plan_material,
+    plan_publication_material_decision, select_corrective_reviewers, PlanMaterialChangeInputV1,
+    PlanMaterialError, PlanMaterialMap, PlanPublicationMaterialDecisionV1, MAX_PLAN_MATERIAL_BYTES,
 };
 use super::plan_review::{
     derive_next_plan_review_round_v2, derive_plan_review_round, derive_plan_review_round_v2,
-    reviewer_outcome_rank, PlanFindingUpdate, PlanReviewChangeV2, PlanReviewDecisionV2,
-    PlanReviewError, PlanReviewNextAction, PlanReviewRoundInputV2, PlanReviewRoundState,
-    PlanReviewRoundStateV2, PlanReviewRoundSubmission, PlanReviewScope, PlanReviewerOutcomeV2,
-    PlanRevisionKind,
+    reviewer_outcome_rank, PlanArtifactSnapshotV2, PlanFindingUpdate, PlanReviewChangeV2,
+    PlanReviewDecisionV2, PlanReviewError, PlanReviewNextAction, PlanReviewRoundInputV2,
+    PlanReviewRoundState, PlanReviewRoundStateV2, PlanReviewRoundSubmission, PlanReviewScope,
+    PlanReviewerOutcomeV2, PlanRevisionKind,
 };
 use super::project::evidence_from_run_binding_and_validated;
 use super::recovery_policy::{
@@ -86,8 +90,8 @@ use super::state_dto::{
 use super::types::{
     DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
     ManifestNodeOutcome, ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
-    NormalizedGate, NormalizedManifest, NormalizedNode, ResolutionMode, WorkflowBlockCause,
-    MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    NormalizedGate, NormalizedManifest, NormalizedNode, PlanChangeClassification, ResolutionMode,
+    WorkflowBlockCause, MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -279,7 +283,7 @@ mod plan_material_publication_tests {
     }
 }
 
-const MAX_PERSISTED_PLAN_EVIDENCE_BYTES: usize = 1024 * 1024;
+const MAX_PERSISTED_PLAN_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PersistedPlanReviewEvidence {
@@ -2097,6 +2101,7 @@ async fn settle_workflow_gate_derived_core(
                     let mut v2_plan_author_task_id: Option<String> = None;
                     let mut v2_plan_digest: Option<String> = None;
                     let mut v2_localized_change_digest: Option<String> = None;
+                    let mut v2_passing_change_intersections: Vec<String> = Vec::new();
 
                     let (
                         critical_count,
@@ -2233,7 +2238,7 @@ async fn settle_workflow_gate_derived_core(
                                         "active Plan artifact is missing".into(),
                                     )
                                 })?;
-                                let (author_task_id, covered_plan_digest) =
+                                let (author_task_id, covered_plan_digest, author_workspace) =
                                     load_validated_v2_plan_author(
                                     txn,
                                     &header.workflow_id,
@@ -2250,15 +2255,23 @@ async fn settle_workflow_gate_derived_core(
                                 let prior_v2_state = lineage_prior
                                     .iter()
                                     .rev()
-                                    .find(|row| {
-                                        row.gate_lineage.as_deref()
-                                            == Some(evidence.identity.gate_lineage.as_str())
-                                            && row.plan_round_state_v2_json.is_some()
-                                    })
+                                    .find(|row| row.plan_round_state_v2_json.is_some())
                                     .map(|row| load_persisted_plan_state_v2(row))
                                     .transpose()?;
                                 let change = match prior_v2_state.as_ref() {
                                     None => PlanReviewChangeV2::InitialOrNewLineage,
+                                    Some(previous)
+                                        if previous.gate_lineage
+                                            != evidence.identity.gate_lineage =>
+                                    {
+                                        if previous.next_action
+                                            == PlanReviewNextAction::HolisticRewriteRequired
+                                        {
+                                            PlanReviewChangeV2::HolisticRewrite
+                                        } else {
+                                            PlanReviewChangeV2::InitialOrNewLineage
+                                        }
+                                    }
                                     Some(previous)
                                         if previous.required_node_ids
                                             != evidence.identity.required_node_ids =>
@@ -2273,7 +2286,82 @@ async fn settle_workflow_gate_derived_core(
                                     }
                                     Some(_) => PlanReviewChangeV2::Corrective,
                                 };
-                                let decision = derive_plan_review_round_v2(
+                                let plan_document = normalized.plan.as_ref().ok_or_else(|| {
+                                    WorkflowStoreError::GateNotReady(
+                                        "active Plan document is missing".into(),
+                                    )
+                                })?;
+                                let current_plan_snapshot = capture_plan_snapshot_v2(
+                                    &author_workspace,
+                                    plan_document,
+                                )
+                                .await?;
+                                let mut authorized_localized_change = None;
+                                if change == PlanReviewChangeV2::Corrective {
+                                    let previous = prior_v2_state.as_ref().ok_or_else(|| {
+                                        WorkflowStoreError::GateNotReady(
+                                            "corrective Plan review has no prior round".into(),
+                                        )
+                                    })?;
+                                    let classification = classify_plan_settlement_change_v2(
+                                        &normalized,
+                                        previous,
+                                        &current_plan_snapshot,
+                                        &author_task_id,
+                                    )?;
+                                    match classification {
+                                        PlanChangeClassification::Localized {
+                                            change,
+                                            corrective_reviewer_node_ids,
+                                        } => {
+                                            let selected = select_corrective_reviewers(
+                                                &PlanChangeClassification::Localized {
+                                                    change: change.clone(),
+                                                    corrective_reviewer_node_ids:
+                                                        corrective_reviewer_node_ids.clone(),
+                                                },
+                                            )
+                                            .into_iter()
+                                            .collect::<Vec<_>>();
+                                            if selected != evidence.selected_node_ids {
+                                                return Err(WorkflowStoreError::GateNotReady(
+                                                    "Plan round selection does not cover the authorized localized change"
+                                                        .into(),
+                                                ));
+                                            }
+                                            v2_passing_change_intersections = previous
+                                                .reviewers
+                                                .iter()
+                                                .filter(|reviewer| {
+                                                    reviewer.rank == 0
+                                                        && corrective_reviewer_node_ids
+                                                            .contains(&reviewer.node_id)
+                                                })
+                                                .map(|reviewer| reviewer.node_id.clone())
+                                                .collect();
+                                            v2_localized_change_digest = Some(
+                                                canonical_json_sha256(
+                                                    "codeg.completion.plan_localized_change.v2",
+                                                    1,
+                                                    &change,
+                                                )
+                                                .map_err(|error| {
+                                                    WorkflowStoreError::Persistence(
+                                                        error.to_string(),
+                                                    )
+                                                })?,
+                                            );
+                                            authorized_localized_change = Some(change);
+                                        }
+                                        PlanChangeClassification::NewLineage { .. } => {
+                                            return Err(WorkflowStoreError::GateNotReady(
+                                                "material Plan change requires a new full-cohort lineage"
+                                                    .into(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                let mut decision = derive_plan_review_round_v2(
                                     prior_v2_state.as_ref(),
                                     PlanReviewRoundInputV2 {
                                         gate_lineage: evidence.identity.gate_lineage.clone(),
@@ -2294,6 +2382,8 @@ async fn settle_workflow_gate_derived_core(
                                     },
                                     change,
                                 )?;
+                                decision.state.plan_snapshot = Some(current_plan_snapshot);
+                                decision.state.localized_change = authorized_localized_change;
                                 let derived_outcome =
                                     plan_v2_settlement_outcome(decision.state.next_action);
                                 if v2_expectation.as_ref().is_some_and(|expectation| {
@@ -2308,26 +2398,6 @@ async fn settle_workflow_gate_derived_core(
                                     )));
                                 }
                                 req.outcome = derived_outcome;
-                                if change == PlanReviewChangeV2::Corrective
-                                    && evidence.selected_node_ids
-                                        != evidence.identity.required_node_ids
-                                {
-                                    v2_localized_change_digest = Some(
-                                        canonical_json_sha256(
-                                            "codeg.completion.plan_change.v2",
-                                            1,
-                                            &serde_json::json!({
-                                                "gate_lineage": evidence.identity.gate_lineage,
-                                                "review_round": evidence.identity.review_round,
-                                                "selected_node_ids": evidence.selected_node_ids,
-                                                "covered_plan_digest": covered_plan_digest,
-                                            }),
-                                        )
-                                        .map_err(|error| {
-                                            WorkflowStoreError::Persistence(error.to_string())
-                                        })?,
-                                    );
-                                }
                                 let next_action = decision.state.next_action;
                                 let stagnation_count = decision.state.stagnation_count;
                                 let rewrite_used = decision.state.rewrite_used;
@@ -2493,7 +2563,10 @@ async fn settle_workflow_gate_derived_core(
 
                     if let Some(decision) = v2_plan_decision.as_ref() {
                         if let Some(opening) =
-                            derive_next_plan_review_round_v2(&decision.state, &[])?
+                            derive_next_plan_review_round_v2(
+                                &decision.state,
+                                &v2_passing_change_intersections,
+                            )?
                         {
                             let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
                                 header.workflow_id.clone(),
@@ -2517,6 +2590,7 @@ async fn settle_workflow_gate_derived_core(
                             }
                             let mut gate_state: delegation_workflow_gate_state::ActiveModel =
                                 gate_state.into();
+                            gate_state.gate_lineage = Set(opening.gate_lineage);
                             gate_state.current_review_round =
                                 Set(i64::from(opening.review_round));
                             gate_state.selected_node_ids_json = Set(
@@ -5594,7 +5668,7 @@ async fn load_validated_v2_plan_author<C: sea_orm::ConnectionTrait>(
     workflow_id: &str,
     node_id: &str,
     expected_plan_digest: &str,
-) -> Result<(String, String), WorkflowStoreError> {
+) -> Result<(String, String, String), WorkflowStoreError> {
     let binding = delegation_workflow_run_binding::Entity::find()
         .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(workflow_id))
         .filter(delegation_workflow_run_binding::Column::NodeId.eq(node_id))
@@ -5615,10 +5689,103 @@ async fn load_validated_v2_plan_author<C: sea_orm::ConnectionTrait>(
             "current Plan Author evidence does not cover the active Plan".into(),
         ));
     }
+    let workspace = delegation_task_run::Entity::find_by_id(&binding.task_id)
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .and_then(|run| run.workspace_path)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            WorkflowStoreError::GateNotReady("current Plan Author workspace is unavailable".into())
+        })?;
     Ok((
         binding.task_id,
         validated.evidence.artifact.digest().to_string(),
+        workspace,
     ))
+}
+
+async fn capture_plan_snapshot_v2(
+    workspace: &str,
+    document: &DocumentRef,
+) -> Result<PlanArtifactSnapshotV2, WorkflowStoreError> {
+    let workspace = PathBuf::from(workspace);
+    let rel_path = document.rel_path.clone();
+    let read_path = rel_path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        read_bounded_workspace_file(&workspace, &read_path, MAX_PLAN_MATERIAL_BYTES)
+    })
+    .await
+    .map_err(|_| WorkflowStoreError::CompletionArtifactUnavailable)?
+    .map_err(|_| WorkflowStoreError::CompletionArtifactUnavailable)?;
+    let digest = format!("sha256:{}", sha256_hex(&bytes));
+    if digest != document.digest {
+        return Err(WorkflowStoreError::ArtifactDigestMismatch(
+            "active Plan bytes do not match the manifest digest".into(),
+        ));
+    }
+    Ok(PlanArtifactSnapshotV2 {
+        rel_path,
+        digest,
+        content_base64: BASE64_STANDARD.encode(bytes),
+    })
+}
+
+fn classify_plan_settlement_change_v2(
+    manifest: &NormalizedManifest,
+    previous: &PlanReviewRoundStateV2,
+    current_snapshot: &PlanArtifactSnapshotV2,
+    authorization_id: &str,
+) -> Result<PlanChangeClassification, WorkflowStoreError> {
+    let prior_snapshot = previous.plan_snapshot.as_ref().ok_or_else(|| {
+        WorkflowStoreError::GateNotReady(
+            "prior Plan round has no immutable material snapshot; new lineage required".into(),
+        )
+    })?;
+    let prior_bytes = decode_plan_snapshot_v2(prior_snapshot)?;
+    let current_bytes = decode_plan_snapshot_v2(current_snapshot)?;
+    let mut task_indices = manifest
+        .task_policies
+        .iter()
+        .map(|policy| policy.task_index)
+        .collect::<Vec<_>>();
+    task_indices.sort_unstable();
+    task_indices.dedup();
+    let prior = parse_plan_material(&prior_bytes, &task_indices)
+        .and_then(|material| bind_plan_material(manifest, &material))
+        .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
+    let current = parse_plan_material(&current_bytes, &task_indices)
+        .and_then(|material| bind_plan_material(manifest, &material))
+        .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
+    let reviewer_states = previous
+        .reviewers
+        .iter()
+        .map(|reviewer| (reviewer.node_id.clone(), reviewer.rank == 0))
+        .collect::<BTreeMap<_, _>>();
+    let authorization =
+        authorize_localized_plan_change(manifest, &current, authorization_id, &reviewer_states)
+            .map_err(|error| WorkflowStoreError::GateNotReady(error.to_string()))?;
+    Ok(classify_plan_change(
+        &PlanMaterialChangeInputV1::parsed(prior),
+        &PlanMaterialChangeInputV1::parsed(current),
+        &authorization,
+    ))
+}
+
+fn decode_plan_snapshot_v2(
+    snapshot: &PlanArtifactSnapshotV2,
+) -> Result<Vec<u8>, WorkflowStoreError> {
+    let bytes = BASE64_STANDARD
+        .decode(&snapshot.content_base64)
+        .map_err(|_| WorkflowStoreError::Persistence("Plan snapshot base64 is corrupt".into()))?;
+    if bytes.len() > MAX_PLAN_MATERIAL_BYTES
+        || format!("sha256:{}", sha256_hex(&bytes)) != snapshot.digest
+    {
+        return Err(WorkflowStoreError::Persistence(
+            "Plan snapshot digest is corrupt".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
@@ -6313,6 +6480,8 @@ mod completion_v2_shared_validator_replay_tests {
             stagnation_count: 0,
             rewrite_used: false,
             next_action: PlanReviewNextAction::ContinueReview,
+            plan_snapshot: None,
+            localized_change: None,
         };
         let mut row = v2_settlement(&identity);
         row.outcome = GateSettlementOutcome::ChangesRequested;
@@ -6468,6 +6637,27 @@ fn load_persisted_plan_state_v2(
     let state: PlanReviewRoundStateV2 = serde_json::from_str(json).map_err(|error| {
         WorkflowStoreError::Persistence(format!("parse v2 Plan round state: {error}"))
     })?;
+    if let Some(snapshot) = state.plan_snapshot.as_ref() {
+        decode_plan_snapshot_v2(snapshot)?;
+        if row.covered_plan_digest.as_deref() != Some(snapshot.digest.as_str()) {
+            return Err(WorkflowStoreError::Persistence(
+                "v2 Plan snapshot disagrees with covered Plan digest".into(),
+            ));
+        }
+    }
+    let localized_change_digest = state
+        .localized_change
+        .as_ref()
+        .map(|change| {
+            canonical_json_sha256("codeg.completion.plan_localized_change.v2", 1, change)
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))
+        })
+        .transpose()?;
+    if row.localized_change_digest != localized_change_digest {
+        return Err(WorkflowStoreError::Persistence(
+            "v2 Plan localized-change proof disagrees with round state".into(),
+        ));
+    }
     let identity = V2GateEvidenceIdentity::new(
         state.gate_lineage.clone(),
         i64::from(state.review_round),
@@ -7366,6 +7556,64 @@ mod tests {
         gate.reviewer_cohort_node_ids = vec!["plan-reviewer-1".into(), "plan-reviewer-2".into()];
         gate.required_reviewer_node_ids = gate.reviewer_cohort_node_ids.clone();
         doc
+    }
+
+    #[test]
+    fn task14_fix_plan_settlement_uses_classifier_selected_reviewers() {
+        let manifest =
+            validate_manifest_document(&two_reviewer_plan_doc("task14-localized-classifier"))
+                .unwrap();
+        let prior_bytes = b"## Task 1\nprior body\n";
+        let current_bytes = b"## Task 1\nchanged body\n";
+        let snapshot = |bytes: &[u8]| PlanArtifactSnapshotV2 {
+            rel_path: "docs/superpowers/plans/p.md".into(),
+            digest: format!("sha256:{}", sha256_hex(bytes)),
+            content_base64: BASE64_STANDARD.encode(bytes),
+        };
+        let prior_state = PlanReviewRoundStateV2 {
+            gate_lineage: format!("sha256:{}", "a".repeat(64)),
+            review_round: 1,
+            required_node_ids: vec!["plan-reviewer-1".into(), "plan-reviewer-2".into()],
+            selected_node_ids: vec!["plan-reviewer-1".into(), "plan-reviewer-2".into()],
+            reviewers: vec![
+                PlanReviewerOutcomeV2 {
+                    node_id: "plan-reviewer-1".into(),
+                    outcome: CompletionOutcome::Done,
+                    rank: 0,
+                    evidence_task_id: "review-task-1".into(),
+                    evidence_scope_digest: format!("sha256:{}", "1".repeat(64)),
+                },
+                PlanReviewerOutcomeV2 {
+                    node_id: "plan-reviewer-2".into(),
+                    outcome: CompletionOutcome::RequestChanges,
+                    rank: 1,
+                    evidence_task_id: "review-task-2".into(),
+                    evidence_scope_digest: format!("sha256:{}", "2".repeat(64)),
+                },
+            ],
+            stagnation_count: 0,
+            rewrite_used: false,
+            next_action: PlanReviewNextAction::ContinueReview,
+            plan_snapshot: Some(snapshot(prior_bytes)),
+            localized_change: None,
+        };
+
+        let classification = classify_plan_settlement_change_v2(
+            &manifest,
+            &prior_state,
+            &snapshot(current_bytes),
+            "task14-localized-authorization",
+        )
+        .unwrap();
+
+        let PlanChangeClassification::Localized { change, .. } = &classification else {
+            panic!("expected a localized Plan change");
+        };
+        assert_eq!(change.changed_keys, BTreeSet::from(["task.1".to_string()]));
+        assert_eq!(
+            select_corrective_reviewers(&classification),
+            BTreeSet::from(["plan-reviewer-1".to_string(), "plan-reviewer-2".to_string(),])
+        );
     }
 
     fn finding(

@@ -4419,6 +4419,10 @@ impl RunStore {
                                 .col_expr(
                                     delegation_task_run::Column::CompletionEvidenceJson,
                                     sea_orm::sea_query::Expr::value(Option::<String>::None),
+                                )
+                                .col_expr(
+                                    delegation_task_run::Column::FinalRemediationContextsJson,
+                                    sea_orm::sea_query::Expr::value(Option::<String>::None),
                                 );
                         }
                         clear_v1_authority

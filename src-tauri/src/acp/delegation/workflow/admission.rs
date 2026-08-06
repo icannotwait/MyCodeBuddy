@@ -3104,6 +3104,26 @@ mod tests {
         doc
     }
 
+    fn two_final_reviewer_doc(token: &str) -> ManifestDocument {
+        let mut doc = final_only_doc(token);
+        let key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.push(wu(
+            "final-reviewer-grok",
+            PHASE_FINAL,
+            ManifestNodeRole::Reviewer,
+            "grok",
+            None,
+            None,
+            key,
+            vec![],
+        ));
+        doc
+    }
+
     fn skeleton_doc(token: &str) -> ManifestDocument {
         let mut doc = sample_doc(token, ManifestWorkflowState::Skeleton);
         doc.plan = None;
@@ -3830,6 +3850,81 @@ mod tests {
         (db, parent, repo, workflow_id, task_id)
     }
 
+    async fn task14_two_final_reviewer_fixture(
+        token: &str,
+    ) -> (
+        AppDatabase,
+        i32,
+        AdmissionGitFixture,
+        String,
+        String,
+        String,
+    ) {
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        let repo = AdmissionGitFixture::new();
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = two_final_reviewer_doc(token);
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let workflow_id = publish_document_approved(&db, &emitter, parent, document).await;
+        enable_completion_v2(&db, &workflow_id).await;
+
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(format!("sha256:{}", "f".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"final-reviewer\",\"final-reviewer-grok\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let codex_task_id = format!("{token}-final-codex");
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-reviewer",
+            &codex_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            &codex_task_id,
+            r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#,
+            None,
+        )
+        .await;
+
+        let grok_task_id = format!("{token}-final-grok");
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-reviewer-grok",
+            &grok_task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            &grok_task_id,
+            r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"approved"}"#,
+            None,
+        )
+        .await;
+
+        (db, parent, repo, workflow_id, codex_task_id, grok_task_id)
+    }
+
     #[tokio::test]
     async fn task14_final_completion_mints_immutable_package_before_fixer_admission() {
         let (db, parent, repo, workflow_id, task_id) =
@@ -4006,6 +4101,64 @@ mod tests {
         .unwrap()
         .expect("artifact recovery must retain the immutable Final snapshot");
         assert_eq!(package.context_bytes(0).unwrap(), report_bytes);
+    }
+
+    #[tokio::test]
+    async fn task14_fix_prior_final_reviewer_terminal_snapshot_is_reused() {
+        let (db, _parent, _repo, workflow_id, codex_task_id, grok_task_id) =
+            task14_two_final_reviewer_fixture("task14-final-prior-snapshot").await;
+        let codex_terminal =
+            "Conclusion: request changes\n\nfirst reviewer immutable remediation bytes";
+
+        let txn = db.conn.begin().await.unwrap();
+        let first = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: codex_task_id,
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: codex_terminal.into(),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(first.state, CompletionState::Resolved);
+
+        let txn = db.conn.begin().await.unwrap();
+        let second = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: grok_task_id,
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: "Conclusion: approve".into(),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(second.state, CompletionState::Resolved);
+
+        let package = load_active_final_findings_package_v1(
+            &db.conn,
+            &workflow_id,
+            "final",
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .expect("complete evaluation must mint a package");
+        assert!(package
+            .remediation_contexts
+            .iter()
+            .enumerate()
+            .any(
+                |(index, context)| context.source_evidence_task_id.contains("final-codex")
+                    && package.context_bytes(index).unwrap() == codex_terminal.as_bytes()
+            ));
     }
 
     #[tokio::test]
@@ -4367,7 +4520,16 @@ mod tests {
                 workflow_id: published.workflow_id.clone(),
                 gate_id: "final".into(),
                 gate_lineage: final_lineage.clone(),
+                requirements_identity: format!("sha256:{}", "b".repeat(64)),
                 graph_revision: 1,
+                reviewer_evaluations: vec![
+                    super::super::final_findings::FinalReviewerEvaluationV1 {
+                        reviewer_node_id: "final-reviewer".into(),
+                        evidence_task_id: "task9-final-source".into(),
+                        evidence_scope_digest: format!("sha256:{}", "e".repeat(64)),
+                        outcome: CompletionOutcome::RequestChanges,
+                    },
+                ],
                 findings: vec![super::super::final_findings::FinalFindingInputV1 {
                     reviewer_node_id: "final-reviewer".into(),
                     evidence_task_id: "task9-final-source".into(),

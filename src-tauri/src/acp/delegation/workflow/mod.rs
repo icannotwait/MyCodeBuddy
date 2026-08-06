@@ -71,10 +71,12 @@ pub use final_findings::{
     build_final_findings_package_v1, capture_report_context_v1, decode_final_findings_package_v1,
     encode_final_findings_package_v1, load_active_final_findings_package_v1,
     persist_final_findings_package_v1, resolve_active_final_findings_packages_v1,
+    remediation_context_inputs_from_snapshots_v1, snapshot_remediation_contexts_v1,
     verify_final_findings_package_model_v1, verify_final_findings_package_v1,
     EncodedFinalFindingsPackageV1, FinalFindingInputV1, FinalFindingItemV1, FinalFindingsError,
-    FinalFindingsPackageInputV1, FinalFindingsPackageV1, RemediationContextAvailability,
-    RemediationContextInputV1, RemediationContextSnapshotV1, RemediationContextSourceKind,
+    FinalFindingsPackageInputV1, FinalFindingsPackageV1, FinalReviewerEvaluationV1,
+    RemediationContextAvailability, RemediationContextInputV1, RemediationContextSnapshotV1,
+    RemediationContextSourceKind,
 };
 pub use gates::{
     evaluate_execution_gate, reduce_design_gate, ExecutionGateEval, ExecutionGateInput,

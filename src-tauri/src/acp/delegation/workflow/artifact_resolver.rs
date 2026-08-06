@@ -147,7 +147,7 @@ fn has_uri_scheme(path: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
-fn read_bounded_workspace_file(
+pub(crate) fn read_bounded_workspace_file(
     workspace: &Path,
     rel_path: &str,
     max_bytes: usize,
