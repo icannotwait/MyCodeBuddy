@@ -1108,13 +1108,236 @@ describe("platform completion orchestration contract", () => {
     })
   }
 
+  for (const [name, clause, rule] of [
+    [
+      "mixed v2 digest request and legacy reference",
+      "For protocol v2, ask the child for the reviewed artifact digest before entering the legacy branch.",
+      "B2D-COMP-002",
+    ],
+    [
+      "mixed v2 format continuation and legacy reference",
+      "For protocol v2, continue the child when completion is malformed before updating legacy records.",
+      "B2D-COMP-003",
+    ],
+    [
+      "mixed v2 terminal-child recovery and legacy reference",
+      "For protocol v2, reopen the completed child, then preserve legacy records.",
+      "B2D-COMP-004",
+    ],
+    [
+      "mixed v2 count gate and legacy reference",
+      "For protocol v2, the Design gate passes on Critical finding counts while preserving legacy records.",
+      "B2D-COMP-015",
+    ],
+    [
+      "direct digest provision",
+      "The reviewer must provide an artifact digest.",
+      "B2D-COMP-002",
+    ],
+    [
+      "direct format retry",
+      "Retry the child when its completion format is malformed.",
+      "B2D-COMP-003",
+    ],
+    [
+      "direct Card return",
+      "The child must return a completion Card.",
+      "B2D-COMP-001",
+    ],
+    [
+      "v1-subject clause mixed with bare v2",
+      "The frozen v1 workflow must return a completion Card for v2.",
+      "B2D-COMP-001",
+    ],
+    [
+      "unfrozen v1 workflow subject",
+      "The v1 workflow must return a completion Card.",
+      "B2D-COMP-001",
+    ],
+    [
+      "frozen-v1 prefix before Card return",
+      "The frozen v1 historical branch remains archival, but the child must return a completion Card.",
+      "B2D-COMP-001",
+    ],
+    [
+      "frozen-v1 prefix before digest provision",
+      "The frozen v1 historical branch remains archival, but the reviewer must provide an artifact digest.",
+      "B2D-COMP-002",
+    ],
+    [
+      "frozen-v1 prefix before format retry",
+      "The frozen v1 historical branch remains archival, but the Parent retries the child when completion is malformed.",
+      "B2D-COMP-003",
+    ],
+    [
+      "frozen-v1 prefix before terminal-child recovery",
+      "The frozen v1 historical branch remains archival, but the Parent reopens the completed child.",
+      "B2D-COMP-004",
+    ],
+    [
+      "frozen-v1 prefix before count gate",
+      "The frozen v1 historical branch remains archival, but the Design gate passes on Critical finding counts.",
+      "B2D-COMP-015",
+    ],
+    [
+      "frozen-v1 prefix before workflow Card return",
+      "The frozen v1 historical branch remains archival, but the workflow must return a completion Card.",
+      "B2D-COMP-001",
+    ],
+    [
+      "frozen-v1 prefix before although digest provision",
+      "The frozen v1 historical branch remains archival, although the reviewer must provide an artifact digest.",
+      "B2D-COMP-002",
+    ],
+    [
+      "frozen-v1 prefix before modified child Card return",
+      "The frozen v1 historical branch remains archival, but another child must return a completion Card.",
+      "B2D-COMP-001",
+    ],
+  ]) {
+    it(`rejects review probe: ${name}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseV2Skill({ completion: `${COMPLETION_PARAGRAPH}\n${clause}` })
+        ).failures,
+        rule
+      )
+    })
+  }
+
+  for (const [name, clause] of [
+    [
+      "report fallback harvest",
+      "Platform may harvest a missing chat card from a markdown-linked report as a fallback.",
+    ],
+    [
+      "platform-harvested settlement",
+      "A platform-harvested and validated card settles.",
+    ],
+    [
+      "missing-chat summary harvest",
+      "Platform harvests the card summary when chat text is missing.",
+    ],
+    [
+      "harvested Final settlement evidence",
+      "A harvested card is sufficient settlement evidence for Final.",
+    ],
+    [
+      "imperative Card harvest",
+      "Harvest codeg-card-summary-v1 before completion.",
+    ],
+    [
+      "prior report fallback sentence",
+      "Platform may harvest a missing chat card from a markdown-linked or touched report .md as a fallback; still require chat emission in child prompts.",
+    ],
+    [
+      "prior quick-reference settlement sentence",
+      "A platform-harvested validated card settles without re-emission.",
+    ],
+    [
+      "prior Final harvest instruction",
+      "Need a platform-validated card. Harvest it or continue the same child to re-emit before Final fixer.",
+    ],
+    [
+      "equivalent Card settlement authority",
+      "A completion Card settles the Task gate.",
+    ],
+    [
+      "Card used as settlement evidence",
+      "Use a completion Card as settlement evidence for the Task gate.",
+    ],
+    ["gate settlement from Card", "Final settles from a completion Card."],
+    [
+      "non-leading imperative harvest",
+      "Read the report and harvest its Card before Final.",
+    ],
+    [
+      "Card accepted for settlement evidence",
+      "The Parent accepts a completion Card for settlement evidence.",
+    ],
+    [
+      "Card treated as authoritative settlement evidence",
+      "The Parent treats a completion Card as authoritative settlement evidence.",
+    ],
+    [
+      "Card authorizes Final settlement",
+      "A completion Card authorizes Final settlement.",
+    ],
+    [
+      "passive gate settlement by Card",
+      "The Task gate is settled by a completion Card.",
+    ],
+    [
+      "imperative gate settlement with Card",
+      "Settle the Task gate with a completion Card.",
+    ],
+    [
+      "unrelated no does not mask Card settlement",
+      "No delay applies and the Parent uses a completion Card as settlement evidence.",
+    ],
+  ]) {
+    it(`rejects Card harvest authority: ${name}`, () => {
+      const failures = validateSkillMarkdown(
+        baseV2Skill({ completion: `${COMPLETION_PARAGRAPH}\n${clause}` })
+      ).failures
+      const ids = failureRuleIds(failures)
+      assert.ok(
+        ids.includes("B2D-COMP-001") && ids.includes("B2D-R008"),
+        `expected B2D-COMP-001 and B2D-R008; got: ${failures.join("; ")}`
+      )
+    })
+  }
+
+  for (const [name, clause] of [
+    ["no Card settlement", "No completion Card settles the Task gate."],
+    [
+      "no harvested-Card settlement",
+      "No harvested Card is sufficient settlement evidence for Final.",
+    ],
+    [
+      "negated platform-harvested settlement",
+      "A platform-harvested Card must not settle Final.",
+    ],
+    [
+      "prepositional frozen-v1 harvest",
+      "For the frozen v1 historical branch, the platform may harvest its legacy Card for settlement.",
+    ],
+    [
+      "no workflow Card settlement",
+      "No workflow settles by a completion Card.",
+    ],
+    [
+      "under-no-circumstances Card settlement",
+      "Under no circumstances may Final settle from a completion Card.",
+    ],
+    [
+      "shall-not Card harvest",
+      "The platform shall not harvest a missing chat Card.",
+    ],
+    [
+      "no workflow Card use",
+      "No workflow may use a completion Card as settlement evidence.",
+    ],
+  ]) {
+    it(`allows Card authority prohibition: ${name}`, () => {
+      assert.deepEqual(
+        validateSkillMarkdown(
+          baseV2Skill({ completion: `${COMPLETION_PARAGRAPH}\n${clause}` })
+        ).failures,
+        []
+      )
+    })
+  }
+
   it("allows explicit v2 prohibitions and the frozen v1 historical branch", () => {
     const skill = baseV2Skill({
       completion: `${COMPLETION_PARAGRAPH}
 
 For protocol v2, never emit codeg-card-summary-v1, do not ask the child for an
-artifact digest, and never continue a terminal child for malformed completion.
-The frozen v1 historical branch may retain legacy Card settlement.`,
+artifact digest, never harvest a Card, and never continue a terminal child for
+malformed completion. A completion Card must not settle.
+The frozen v1 historical branch may retain legacy Card settlement. The frozen
+v1 historical branch may harvest its legacy Card for settlement.`,
     })
     assert.deepEqual(validateSkillMarkdown(skill).failures, [])
   })

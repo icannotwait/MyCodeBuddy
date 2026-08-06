@@ -399,31 +399,48 @@ function normalizedCompletionClauses(skill) {
 }
 
 function isFrozenV1Clause(clause) {
-  return (
-    /\b(?:protocol[- ]?v?1|frozen\s+v1|v1\s+historical|legacy|historical\s+branch)\b/i.test(
-      clause
-    ) && !/\bv2 successor\b[^.;]*\b(?:imports?|accepts?|uses?)\b/i.test(clause)
+  if (/\b(?:protocol[- ]?v?2|v2)\b/i.test(clause)) return false
+  const subject =
+    "(?:frozen\\s+(?:protocol[- ]?v?1|v1)(?:\\s+historical)?\\s+(?:workflow|branch)|" +
+    "(?:protocol[- ]?v?1|v1)\\s+historical\\s+(?:workflow|branch))"
+  const prefix = clause.match(
+    new RegExp(
+      `^(?:(?:for|within|under)\\s+(?:the\\s+)?(?:explicit\\s+)?${subject},\\s*|` +
+        `(?:the\\s+)?(?:explicit\\s+)?${subject}\\b)`,
+      "i"
+    )
+  )
+  if (!prefix) return false
+
+  const remainder = clause.slice(prefix[0].length)
+  return !/[,:]|\b(?:but|however|yet|whereas|while|although|though|and|then)\b/i.test(
+    remainder
   )
 }
 
 function negatesActionOnObject(clause, actions, object) {
+  const target = `\\b(?:${actions})\\b[^.!?;]{0,160}(?:${object})`
   return new RegExp(
     `(?:never|do\\s+not|does\\s+not|must\\s+not|should\\s+not|` +
-      `may\\s+not|cannot|can't)\\s+(?:\\w+\\s+){0,4}` +
-      `(?:${actions})\\b[^.!?;]{0,160}(?:${object})`,
+      `may\\s+not|shall\\s+not|cannot|can't)\\s+` +
+      `(?:\\w+\\s+){0,4}${target}|` +
+      `\\bno\\s+(?:\\w+\\s+){1,3}${target}|` +
+      `\\bunder\\s+no\\s+circumstances\\s+` +
+      `(?:\\w+\\s+){0,3}${target}|` +
+      `(?:is|are)\\s+forbidden\\s+to\\s+(?:\\w+\\s+){0,4}${target}`,
     "i"
   ).test(clause)
 }
 
 function hasUnsafeCardTemplate(skill) {
   const actions =
-    "emits?|requests?|requires?|asks?|includes?|suppl(?:y|ies)|produces?"
+    "emits?|requests?|requires?|asks?|includes?|suppl(?:y|ies)|produces?|provides?|returns?|uses?"
   const object =
     "codeg-card-summary-v1|card(?:\\s+(?:template|block|summary|evidence|settlement))?"
   return normalizedCompletionClauses(skill).some((clause) => {
     if (isFrozenV1Clause(clause)) return false
     if (
-      !new RegExp(`(?:${actions})\\b[^.!?;]{0,160}(?:${object})`, "i").test(
+      !new RegExp(`\\b(?:${actions})\\b[^.!?;]{0,160}(?:${object})`, "i").test(
         clause
       )
     ) {
@@ -433,25 +450,93 @@ function hasUnsafeCardTemplate(skill) {
   })
 }
 
+function hasUnsafeCardHarvestSettlement(skill) {
+  const card =
+    "codeg-card-summary-v1|(?:missing\\s+chat\\s+)?card(?:\\s+(?:template|block|summary|evidence|settlement))?"
+  const harvest = "harvest(?:s|ed|ing)?"
+  const activeHarvest = "harvest(?:s|ing)?"
+  const actor = "platform|parent|workflow|worker|child|reviewer"
+  return normalizedCompletionClauses(skill).some((clause) => {
+    if (isFrozenV1Clause(clause)) return false
+
+    const directHarvest = new RegExp(
+      `\\b(?:${activeHarvest})\\b[^.!?;]{0,160}(?:${card}|it\\b)|` +
+        `\\b(?:${actor})\\b(?!-)[^.!?;]{0,80}\\bharvested\\b` +
+        `[^.!?;]{0,160}(?:${card}|it\\b)`,
+      "i"
+    ).test(clause)
+    if (
+      directHarvest &&
+      !negatesActionOnObject(clause, harvest, `${card}|it\\b`)
+    ) {
+      return true
+    }
+
+    const cardSettlement = new RegExp(
+      `(?:${card})\\s+(?:` +
+        `(?:(?:may|can|must|should|will)\\s+)?settles?\\b|` +
+        `(?:(?:may|can|must|should|will)\\s+)?authorizes?\\b` +
+        `[^.!?;]{0,80}settlement\\b|` +
+        `(?:is|remains|becomes|provides?|constitutes?|serves\\s+as)\\s+` +
+        `(?:a\\s+)?(?:sufficient\\s+|valid\\s+|authoritative\\s+)?` +
+        `settlement(?:\\s+evidence)?\\b` +
+        `)`,
+      "i"
+    ).exec(clause)
+    if (cardSettlement) {
+      const prefix = clause.slice(0, cardSettlement.index)
+      if (!/\bno(?:\s+[\w-]+){0,4}\s*$/i.test(prefix)) return true
+    }
+
+    const settlementActions = "uses?|accepts?|treats?"
+    const cardAsSettlement =
+      `${card}[^.!?;]{0,80}\\b(?:as|for)\\s+` +
+      `(?:(?:valid|sufficient|authoritative)\\s+)?` +
+      `settlement(?:\\s+evidence)?\\b`
+    const usesCardAsSettlement = new RegExp(
+      `\\b(?:${settlementActions})\\b[^.!?;]{0,160}(?:${cardAsSettlement})`,
+      "i"
+    ).test(clause)
+    if (
+      usesCardAsSettlement &&
+      !negatesActionOnObject(clause, settlementActions, cardAsSettlement)
+    ) {
+      return true
+    }
+
+    const settleAction = "settle(?:s|d|ing)?"
+    const settlesFromCard = new RegExp(
+      `\\b(?:${settleAction})\\b[^.!?;]{0,160}(?:${card})`,
+      "i"
+    ).test(clause)
+    return settlesFromCard && !negatesActionOnObject(clause, settleAction, card)
+  })
+}
+
 function hasUnsafeDigestRequest(skill) {
-  const actions = "asks?|requests?|requires?|tells?"
+  const actions =
+    "asks?|requests?|requires?|tells?|provides?|returns?|suppl(?:y|ies)"
+  const actor = "child|worker|model|author|reviewer"
+  const digest = "(?:artifact\\s+)?digest"
   const object =
-    "(?:child|worker|model|author|reviewer)[^.!?;]{0,100}(?:artifact\\s+)?digest|" +
-    "(?:artifact\\s+)?digest[^.!?;]{0,100}(?:from|by)\\s+(?:the\\s+)?(?:child|worker|model|author|reviewer)"
+    `(?:${actor})[^.!?;]{0,100}${digest}|` +
+    `${digest}[^.!?;]{0,100}(?:from|by)\\s+(?:the\\s+)?(?:${actor})`
   return normalizedCompletionClauses(skill).some((clause) => {
     if (isFrozenV1Clause(clause)) return false
     const asksForDigest = new RegExp(
-      `(?:${actions})\\b[^.!?;]{0,180}(?:${object})`,
+      `(?:${actions})\\b[^.!?;]{0,180}(?:${object})|` +
+        `(?:${actor})\\b[^.!?;]{0,100}(?:${actions})\\b[^.!?;]{0,100}${digest}`,
       "i"
     ).test(clause)
     if (!asksForDigest) return false
-    return !negatesActionOnObject(clause, actions, object)
+    return !negatesActionOnObject(clause, actions, digest)
   })
 }
 
 function hasUnsafeFormatContinuation(skill) {
   const clauses = normalizedCompletionClauses(skill)
-  const actions = "continue(?:_delegation)?(?:s|d|ing)?|resumes?|reopens?"
+  const actions =
+    "continue(?:_delegation)?(?:s|d|ing)?|resumes?|reopens?|retr(?:y|ies|ied|ying)"
   const object =
     "(?:missing|malformed|invalid|unavailable|unclear)[^.!?;]{0,80}(?:completion|format|summary|report)|" +
     "(?:completion|format|summary|report)[^.!?;]{0,80}(?:missing|malformed|invalid|unavailable|unclear)"
@@ -1468,10 +1553,14 @@ export function validateSkillMarkdown(skill) {
     pass(`line count ${lines.length} < 500`)
   }
 
-  if (hasUnsafeCardTemplate(skill)) {
-    fail("B2D-COMP-001", "v2 guidance emits or requests a completion Card")
+  const unsafeCardHarvestSettlement = hasUnsafeCardHarvestSettlement(skill)
+  if (hasUnsafeCardTemplate(skill) || unsafeCardHarvestSettlement) {
+    fail(
+      "B2D-COMP-001",
+      "v2 guidance emits, requests, harvests, or settles from a completion Card"
+    )
   } else {
-    pass("v2 completion Card templates are absent")
+    pass("v2 completion Card templates and settlement authority are absent")
   }
   if (hasUnsafeDigestRequest(skill)) {
     fail("B2D-COMP-002", "requests a model-authored artifact digest")
@@ -1825,6 +1914,7 @@ export function validateSkillMarkdown(skill) {
     !completion.platformAuthority ||
     !completion.durableAttention ||
     !completion.rootReentry ||
+    unsafeCardHarvestSettlement ||
     /Reject platform completion\.state and parse the child conclusion directly/i.test(
       skill
     ) ||
