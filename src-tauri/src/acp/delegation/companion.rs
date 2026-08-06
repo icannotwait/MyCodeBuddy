@@ -53,13 +53,14 @@ use crate::acp::delegation::transport::{
     client_get_workflow_state_round_trip, client_parent_decision_round_trip,
     client_publish_workflow_round_trip, client_recover_workflow_round_trip,
     client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
-    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
-    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
-    BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
-    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
-    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_restart_legacy_workflow_round_trip, client_round_trip, client_session_round_trip,
+    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
+    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
+    BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest, BrokerRequest,
+    BrokerResponse, BrokerRestartLegacyWorkflowRequest, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
@@ -212,6 +213,7 @@ pub const WORKFLOW_V2_TOOLS: &[&str] = &[
     "recover_workflow",
     "publish_workflow_manifest",
     "settle_workflow_gate",
+    "restart_legacy_workflow",
 ];
 
 /// Capability catalog classification (B9).
@@ -369,7 +371,10 @@ impl CompanionContext {
             | "get_workflow_state"
             | "publish_workflow_manifest"
             | "settle_workflow_gate"
-            | "recover_workflow" => self.features.workflow_v2 && self.role == CompanionRole::Root,
+            | "recover_workflow"
+            | "restart_legacy_workflow" => {
+                self.features.workflow_v2 && self.role == CompanionRole::Root
+            }
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -998,6 +1003,28 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_recover_workflow_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
+        }
+        "restart_legacy_workflow" => {
+            let request: crate::acp::delegation::types::RestartLegacyWorkflowRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!("invalid restart_legacy_workflow arguments: {error}"),
+                        ));
+                    }
+                };
+            let req = BrokerRestartLegacyWorkflowRequest {
+                token: ctx.token.clone(),
+                source_conversation_id: request.source_conversation_id,
+            };
+            let round_trip =
+                Box::pin(
+                    async move { client_restart_legacy_workflow_round_trip(&socket, &req).await },
+                );
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),

@@ -704,6 +704,9 @@ async fn project_manifest_mode(
     let (current_node_ids, current_phase_id) =
         select_current_nodes(&nodes, &gate_snaps, &settlements);
     let overall_state = derive_overall_state(&header.workflow_state, &nodes, &gate_summary);
+    let completion_protocol = super::workflow_restart::completion_protocol_projection(conn, header)
+        .await
+        .map_err(db_err)?;
 
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
@@ -712,6 +715,7 @@ async fn project_manifest_mode(
         manifest_revision: Some(header.active_manifest_revision as u64),
         graph_revision: Some(header.graph_revision as u64),
         manifest_state: Some(workflow_state_str(&header.workflow_state).to_string()),
+        completion_protocol: Some(completion_protocol),
         compatibility: WorkflowCompatibility::Manifest,
         overall_state,
         current_phase_id,
@@ -2113,6 +2117,7 @@ async fn project_observed_only(
         manifest_revision: None,
         graph_revision: None,
         manifest_state: None,
+        completion_protocol: None,
         compatibility: WorkflowCompatibility::ObservedOnly,
         overall_state: WorkflowOverallState::ObservedOnly,
         current_phase_id,
@@ -3947,6 +3952,7 @@ mod tests {
             manifest_revision: None,
             graph_revision: None,
             manifest_state: None,
+            completion_protocol: None,
             compatibility: WorkflowCompatibility::ObservedOnly,
             overall_state: WorkflowOverallState::ObservedOnly,
             current_phase_id: None,

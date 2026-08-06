@@ -344,6 +344,14 @@ async fn async_main() -> ExitCode {
             emitter.clone(),
         ),
     );
+    let completion_protocol_rollout =
+        match codeg_lib::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env() {
+            Ok(config) => Arc::new(config),
+            Err(error) => {
+                tracing::error!("[delegation][FATAL] invalid completion protocol rollout: {error}");
+                return ExitCode::from(2);
+            }
+        };
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -366,6 +374,7 @@ async fn async_main() -> ExitCode {
         delegation_broker: stack.broker.clone(),
         continuation_coordinator: stack.continuation_coordinator.clone(),
         delegation_metrics: stack.metrics.clone(),
+        completion_protocol_rollout: completion_protocol_rollout.clone(),
         completion_outbox_dispatcher: completion_outbox_dispatcher.clone(),
         delegation_runtime_settings: stack.runtime_settings.clone(),
         delegation_tokens: stack.tokens.clone(),
@@ -459,7 +468,7 @@ async fn async_main() -> ExitCode {
             runs.set_workflow_emitter(state.emitter.clone());
         }
         let listener =
-            codeg_lib::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
+            codeg_lib::acp::delegation::listener::DelegationListener::new_with_workflow_runtime(
                 stack.broker,
                 stack.tokens,
                 stack.leases,
@@ -480,6 +489,7 @@ async fn async_main() -> ExitCode {
                 )),
                 state.connection_manager.wait_cancel_registry(),
                 state.emitter.clone(),
+                completion_protocol_rollout,
             );
         let socket = stack.socket_path.clone();
         tokio::spawn(async move {

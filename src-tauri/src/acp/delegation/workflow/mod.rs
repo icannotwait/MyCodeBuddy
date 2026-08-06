@@ -20,6 +20,7 @@ pub mod state_dto;
 pub mod store;
 pub mod types;
 pub mod validate;
+pub mod workflow_restart;
 
 pub use admission::{
     accept_complete_work_txn, admit_workflow_run_txn, emit_workflow_side_effect,
@@ -124,15 +125,19 @@ pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
     guard_final_delivery_core, load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
-    recover_workflow_core, settle_workflow_gate_core, settle_workflow_gate_v2_core,
-    FinalDeliveryGuardRequest, FinalDeliveryGuardResult, FinalReviewReopened, PublishResult,
-    PublishWorkflowRequest, RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence,
-    SettleResult, SettleWorkflowRequest, SettleWorkflowV2Request, StateOnlyRevisionRequest,
+    publish_workflow_manifest_with_selection_core, recover_workflow_core,
+    settle_workflow_gate_core, settle_workflow_gate_v2_core, FinalDeliveryGuardRequest,
+    FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
+    RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence, SettleResult,
+    SettleWorkflowRequest, SettleWorkflowV2Request, StateOnlyRevisionRequest,
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
 pub use types::*;
 pub use validate::validate_manifest_document;
+#[cfg(any(test, feature = "test-utils"))]
+pub use workflow_restart::inject_legacy_restart_header_failure_once;
+pub use workflow_restart::restart_legacy_workflow_core;
 
 #[cfg(test)]
 mod recovery_tests;

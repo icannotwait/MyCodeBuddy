@@ -75,6 +75,46 @@ pub enum CompletionScopeInvalidationDimension {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRestartOutcome {
+    Created,
+    Reused,
+    Failed,
+    Rejected,
+}
+
+impl CompletionRestartOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Reused => "reused",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionShadowDifference {
+    Match,
+    Outcome,
+    NeedsDecision,
+    ArtifactRecovery,
+    RoleMismatch,
+}
+
+impl CompletionShadowDifference {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Outcome => "outcome",
+            Self::NeedsDecision => "needs_decision",
+            Self::ArtifactRecovery => "artifact_recovery",
+            Self::RoleMismatch => "role_mismatch",
+        }
+    }
+}
+
 impl CompletionScopeInvalidationDimension {
     const fn as_str(self) -> &'static str {
         match self {
@@ -434,6 +474,38 @@ pub struct DelegationMetricsSnapshot {
     pub completion_artifact_failures: BTreeMap<String, u64>,
     #[serde(default)]
     pub completion_scope_invalidations: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub completion_protocol: CompletionProtocolMetricsSnapshot,
+}
+
+/// Bounded completion-protocol observability. Every label is produced from a
+/// closed enum or stored protocol mode; no prompts, paths, report bytes, or
+/// profile configuration enter this snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompletionProtocolMetricsSnapshot {
+    pub resolutions: BTreeMap<String, u64>,
+    pub tool_accepted: BTreeMap<String, u64>,
+    pub tool_superseded: BTreeMap<String, u64>,
+    pub intent_diagnostics: BTreeMap<String, u64>,
+    pub decision_lifecycle: BTreeMap<String, u64>,
+    pub artifact_failures: BTreeMap<String, u64>,
+    pub scope_invalidations: BTreeMap<String, u64>,
+    pub plan_classifications: BTreeMap<String, u64>,
+    pub final_context_states: BTreeMap<String, u64>,
+    pub outbox_states: BTreeMap<String, u64>,
+    pub plan_reducer_states: BTreeMap<String, u64>,
+    pub restart_outcomes: BTreeMap<String, u64>,
+    pub creation_modes: BTreeMap<String, u64>,
+    pub shadow_differences: BTreeMap<String, u64>,
+    pub continuation_reasons: BTreeMap<String, u64>,
+    pub natural_language_fallback_count: u64,
+    pub resolution_count: u64,
+    pub adjudication_latency_ms_count: u64,
+    pub adjudication_latency_ms_total: u64,
+    pub oldest_open_decision_age_ms: u64,
+    pub format_only_child_runs: u64,
+    pub card_reemit_prompts: u64,
+    pub sibling_reruns: u64,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -493,6 +565,24 @@ pub struct DelegationMetrics {
     completion_decisions: Mutex<BTreeMap<String, u64>>,
     completion_artifact_failures: Mutex<BTreeMap<String, u64>>,
     completion_scope_invalidations: Mutex<BTreeMap<String, u64>>,
+    completion_tool_accepted: Mutex<BTreeMap<String, u64>>,
+    completion_decision_lifecycle: Mutex<BTreeMap<String, u64>>,
+    completion_plan_classifications: Mutex<BTreeMap<String, u64>>,
+    completion_final_context_states: Mutex<BTreeMap<String, u64>>,
+    completion_outbox_states: Mutex<BTreeMap<String, u64>>,
+    completion_plan_reducer_states: Mutex<BTreeMap<String, u64>>,
+    completion_restart_outcomes: Mutex<BTreeMap<String, u64>>,
+    completion_creation_modes: Mutex<BTreeMap<String, u64>>,
+    completion_shadow_differences: Mutex<BTreeMap<String, u64>>,
+    completion_continuation_reasons: Mutex<BTreeMap<String, u64>>,
+    completion_natural_language_fallback_count: AtomicU64,
+    completion_resolution_count: AtomicU64,
+    completion_adjudication_latency_ms_count: AtomicU64,
+    completion_adjudication_latency_ms_total: AtomicU64,
+    completion_oldest_open_decision_age_ms: AtomicU64,
+    completion_format_only_child_runs: AtomicU64,
+    completion_card_reemit_prompts: AtomicU64,
+    completion_sibling_reruns: AtomicU64,
 }
 
 impl DelegationMetrics {
@@ -514,6 +604,15 @@ impl DelegationMetrics {
         source: CompletionIntentSource,
         role: CompletionRole,
     ) {
+        self.completion_resolution_count
+            .fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            source,
+            CompletionIntentSource::AssistantConclusion | CompletionIntentSource::Report
+        ) {
+            self.completion_natural_language_fallback_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Self::inc_labeled(
             &self.completion_resolutions,
             format!(
@@ -522,6 +621,60 @@ impl DelegationMetrics {
                 completion_role_label(role)
             ),
         );
+    }
+
+    pub fn record_completion_tool_accepted(&self, role: CompletionRole) {
+        Self::inc_labeled(
+            &self.completion_tool_accepted,
+            completion_role_label(role).into(),
+        );
+    }
+
+    pub fn record_completion_protocol_creation(
+        &self,
+        mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    ) {
+        Self::inc_labeled(
+            &self.completion_creation_modes,
+            completion_protocol_mode_label(&mode).into(),
+        );
+    }
+
+    pub fn record_completion_restart(&self, outcome: CompletionRestartOutcome) {
+        Self::inc_labeled(&self.completion_restart_outcomes, outcome.as_str().into());
+    }
+
+    pub fn record_completion_shadow_difference(&self, difference: CompletionShadowDifference) {
+        Self::inc_labeled(
+            &self.completion_shadow_differences,
+            difference.as_str().into(),
+        );
+    }
+
+    /// Guarded invariant boundary. Protocol v2 may never create a format-only
+    /// child run; callers receive `false` when the counter was rejected.
+    pub fn record_format_repair_child_run(
+        &self,
+        mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    ) -> bool {
+        if mode != crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 {
+            return false;
+        }
+        self.completion_format_only_child_runs
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub fn record_card_reemit_prompt(
+        &self,
+        mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    ) -> bool {
+        if mode != crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 {
+            return false;
+        }
+        self.completion_card_reemit_prompts
+            .fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub fn record_completion_tool_supersession(&self, role: CompletionRole) {
@@ -1043,6 +1196,81 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let completion_protocol = CompletionProtocolMetricsSnapshot {
+            resolutions: completion_resolutions.clone(),
+            tool_accepted: self
+                .completion_tool_accepted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            tool_superseded: completion_tool_supersessions.clone(),
+            intent_diagnostics: completion_decisions.clone(),
+            decision_lifecycle: self
+                .completion_decision_lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            artifact_failures: completion_artifact_failures.clone(),
+            scope_invalidations: completion_scope_invalidations.clone(),
+            plan_classifications: self
+                .completion_plan_classifications
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            final_context_states: self
+                .completion_final_context_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            outbox_states: self
+                .completion_outbox_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            plan_reducer_states: self
+                .completion_plan_reducer_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            restart_outcomes: self
+                .completion_restart_outcomes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            creation_modes: self
+                .completion_creation_modes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            shadow_differences: self
+                .completion_shadow_differences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            continuation_reasons: self
+                .completion_continuation_reasons
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            natural_language_fallback_count: self
+                .completion_natural_language_fallback_count
+                .load(Ordering::Relaxed),
+            resolution_count: self.completion_resolution_count.load(Ordering::Relaxed),
+            adjudication_latency_ms_count: self
+                .completion_adjudication_latency_ms_count
+                .load(Ordering::Relaxed),
+            adjudication_latency_ms_total: self
+                .completion_adjudication_latency_ms_total
+                .load(Ordering::Relaxed),
+            oldest_open_decision_age_ms: self
+                .completion_oldest_open_decision_age_ms
+                .load(Ordering::Relaxed),
+            format_only_child_runs: self
+                .completion_format_only_child_runs
+                .load(Ordering::Relaxed),
+            card_reemit_prompts: self.completion_card_reemit_prompts.load(Ordering::Relaxed),
+            sibling_reruns: self.completion_sibling_reruns.load(Ordering::Relaxed),
+        };
         DelegationMetricsSnapshot {
             route_selections,
             safe_fallbacks,
@@ -1103,6 +1331,7 @@ impl DelegationMetrics {
             completion_decisions,
             completion_artifact_failures,
             completion_scope_invalidations,
+            completion_protocol,
         }
     }
 }
@@ -1115,6 +1344,16 @@ fn completion_source_label(source: CompletionIntentSource) -> &'static str {
         CompletionIntentSource::AssistantConclusion => "assistant_conclusion",
         CompletionIntentSource::Report => "report",
         CompletionIntentSource::UserAdjudication => "user_adjudication",
+    }
+}
+
+fn completion_protocol_mode_label(
+    mode: &crate::db::entities::delegation_workflow::CompletionProtocolMode,
+) -> &'static str {
+    match mode {
+        crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 => "v1",
+        crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow => "v2_shadow",
+        crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce => "v2_enforce",
     }
 }
 
@@ -1844,7 +2083,7 @@ mod tests {
     use crate::acp::delegation::route::ROUTE_ADAPTER_CONTRACT_VERSION;
 
     #[test]
-    fn completion_metrics_use_only_bounded_enum_labels() {
+    fn completion_protocol_metrics_use_only_bounded_enum_labels() {
         let metrics = DelegationMetrics::default();
         metrics.record_completion_resolution(
             crate::acp::delegation::workflow::CompletionIntentSource::AssistantConclusion,
@@ -1864,6 +2103,17 @@ mod tests {
             CompletionMetricPhase::Tasks,
             CompletionScopeInvalidationDimension::Instruction,
         );
+        metrics.record_completion_protocol_creation(
+            crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow,
+        );
+        metrics.record_completion_restart(CompletionRestartOutcome::Created);
+        metrics.record_completion_shadow_difference(CompletionShadowDifference::NeedsDecision);
+        assert!(!metrics.record_format_repair_child_run(
+            crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ));
+        assert!(!metrics.record_card_reemit_prompt(
+            crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ));
 
         let snapshot = metrics.snapshot();
         assert_eq!(
@@ -1880,6 +2130,14 @@ mod tests {
             snapshot.completion_scope_invalidations["tasks:instruction"],
             1
         );
+        assert_eq!(snapshot.completion_protocol.creation_modes["v2_shadow"], 1);
+        assert_eq!(snapshot.completion_protocol.restart_outcomes["created"], 1);
+        assert_eq!(
+            snapshot.completion_protocol.shadow_differences["needs_decision"],
+            1
+        );
+        assert_eq!(snapshot.completion_protocol.format_only_child_runs, 0);
+        assert_eq!(snapshot.completion_protocol.card_reemit_prompts, 0);
     }
 
     #[test]

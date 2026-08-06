@@ -392,6 +392,12 @@ pub struct BrokerGetWorkflowStateRequest {
     pub workflow_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerRestartLegacyWorkflowRequest {
+    pub token: String,
+    pub source_conversation_id: i64,
+}
+
 /// Ask the user to authorize the central recovery action derived for an owned
 /// delegation task or root workflow. Action/target/warning fields are omitted
 /// intentionally: the listener derives them from durable state.
@@ -451,6 +457,7 @@ pub enum BrokerMessage {
     SettleWorkflow(BrokerSettleWorkflowRequest),
     CompleteWork(BrokerCompleteWorkRequest),
     GetWorkflowState(BrokerGetWorkflowStateRequest),
+    RestartLegacyWorkflow(BrokerRestartLegacyWorkflowRequest),
     RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest),
     RecoverWorkflow(BrokerRecoverWorkflowRequest),
 }
@@ -725,6 +732,18 @@ pub async fn client_get_workflow_state_round_trip(
     req: &BrokerGetWorkflowStateRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::GetWorkflowState(req.clone())).await
+}
+
+/// Dispatch `restart_legacy_workflow` and read the linked successor projection.
+pub async fn client_restart_legacy_workflow_round_trip(
+    socket_path: &str,
+    req: &BrokerRestartLegacyWorkflowRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::RestartLegacyWorkflow(req.clone()),
+    )
+    .await
 }
 
 /// Dispatch a blocking typed recovery authorization request.

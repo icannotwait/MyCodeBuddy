@@ -6,13 +6,15 @@ use axum::{extract::Extension, Json};
 
 use crate::acp::delegation::types::{
     CompletionMutationResult, ResolveCompletionDecisionRequest, ResolveDesignSelfReviewRequest,
-    RetryCompletionArtifactRequest,
+    RestartLegacyWorkflowRequest, RetryCompletionArtifactRequest,
 };
+use crate::acp::delegation::workflow::LegacyWorkflowRestartProjection;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::workflow_completion::{
     completion_attention_parent_conversation_id, resolve_completion_decision_core,
-    resolve_design_self_review_core, retry_completion_artifact_core,
+    resolve_design_self_review_core, restart_legacy_workflow_authenticated_core,
+    retry_completion_artifact_core,
 };
 use crate::web::auth::AuthenticatedApplication;
 
@@ -75,6 +77,26 @@ pub async fn resolve_design_self_review(
     resolve_design_self_review_core(
         &state.db,
         state.completion_outbox_dispatcher.as_ref(),
+        &context,
+        request,
+    )
+    .await
+    .map(Json)
+}
+
+pub async fn restart_legacy_workflow(
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(authenticated): Extension<AuthenticatedApplication>,
+    Json(request): Json<RestartLegacyWorkflowRequest>,
+) -> Result<Json<LegacyWorkflowRestartProjection>, AppCommandError> {
+    let source_conversation_id = i32::try_from(request.source_conversation_id)
+        .map_err(|_| AppCommandError::invalid_input("source conversation id is invalid"))?;
+    let context = authenticated
+        .authorize_completion_root(source_conversation_id)
+        .map_err(|()| unauthorized_context_error())?;
+    restart_legacy_workflow_authenticated_core(
+        &state.db,
+        state.delegation_metrics.as_ref(),
         &context,
         request,
     )

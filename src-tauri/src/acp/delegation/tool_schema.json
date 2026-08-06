@@ -287,6 +287,18 @@
     }
   },
   {
+    "name": "restart_legacy_workflow",
+    "description": "Create or return the single empty protocol-v2 successor for this owned legacy root. The source stays read-only and unchanged.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_conversation_id"],
+      "properties": {
+        "source_conversation_id": { "type": "integer" }
+      }
+    }
+  },
+  {
     "name": "recover_workflow",
     "description": "Root only. Call get_workflow_state, then request_recovery_authorization; use its receipt. Never creates a challenge.",
     "inputSchema": {

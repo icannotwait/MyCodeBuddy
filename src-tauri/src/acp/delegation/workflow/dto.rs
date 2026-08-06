@@ -67,6 +67,8 @@ pub struct WorkflowGraphSnapshot {
     pub graph_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_protocol: Option<super::types::CompletionProtocolWorkflowProjection>,
     pub compatibility: WorkflowCompatibility,
     pub overall_state: WorkflowOverallState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,6 +605,7 @@ mod tests {
             graph_revision: Some(1),
             manifest_state: Some("estimated".into()),
             compatibility: WorkflowCompatibility::Manifest,
+            completion_protocol: None,
             overall_state: WorkflowOverallState::Estimated,
             current_phase_id: None,
             current_node_ids: vec![],

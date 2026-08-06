@@ -170,6 +170,12 @@ pub enum WorkflowStoreError {
     #[error("parent conversation {0} not found")]
     ParentNotFound(i32),
 
+    #[error("legacy workflow restart is required: {0}")]
+    LegacyCompletionProtocolRestartRequired(String),
+
+    #[error("legacy workflow restart source is invalid: {0}")]
+    LegacyCompletionProtocolRestartInvalid(String),
+
     /// Transient contention (e.g. publication_token race winner not yet visible).
     /// Callers may safely retry the same publish request.
     #[error("busy (retryable): {0}")]
@@ -195,6 +201,24 @@ pub enum WorkflowStoreError {
 }
 
 impl WorkflowStoreError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::LegacyCompletionProtocolRestartRequired(_) => {
+                "legacy_completion_protocol_restart_required"
+            }
+            Self::LegacyCompletionProtocolRestartInvalid(_) => {
+                "legacy_completion_protocol_restart_invalid"
+            }
+            Self::CrossParent { .. } => "unauthorized",
+            Self::NotFound(_) | Self::ParentNotFound(_) => "workflow_not_found",
+            Self::StaleManifestRevision { .. } => "stale_manifest_revision",
+            Self::StaleGraphRevision { .. } => "stale_graph_revision",
+            Self::Busy(_) => "workflow_busy",
+            Self::Persistence(_) => "workflow_persistence_failure",
+            _ => "workflow_invalid",
+        }
+    }
+
     pub fn workflow_recovery_required() -> Self {
         Self::GateNotReady(WORKFLOW_RECOVERY_REQUIRED.into())
     }
@@ -205,6 +229,9 @@ impl WorkflowStoreError {
 
     /// True when the client may retry the same operation after a short delay.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Busy(_) | Self::Persistence(_))
+        matches!(
+            self,
+            Self::Busy(_) | Self::Persistence(_) | Self::LegacyCompletionProtocolRestartRequired(_)
+        )
     }
 }

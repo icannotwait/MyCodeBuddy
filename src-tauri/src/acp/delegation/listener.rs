@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(test, feature = "test-utils"))]
@@ -30,6 +30,7 @@ use crate::acp::delegation::continuation::{
     foreground_mcp_release_fence, ForegroundMcpReleaseOwner,
 };
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
+use crate::acp::delegation::metrics::CompletionRestartOutcome;
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, RecoveryAction, RecoveryRailSnapshot, RequestedRecoveryOperation,
 };
@@ -41,9 +42,9 @@ use crate::acp::delegation::transport::{
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
     BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
-    CompanionRole,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse,
+    BrokerRestartLegacyWorkflowRequest, BrokerSessionRequest, BrokerSettleWorkflowRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -53,10 +54,11 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
-    publish_workflow_manifest_core, recover_workflow_core, settle_workflow_gate_core,
-    settle_workflow_gate_v2_core, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
-    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
-    WorkflowRecoveryDisposition, WorkflowStoreError,
+    publish_workflow_manifest_with_selection_core, recover_workflow_core,
+    restart_legacy_workflow_core, select_completion_protocol, settle_workflow_gate_core,
+    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, ManifestDocument,
+    PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowRequest,
+    SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -71,7 +73,9 @@ use crate::acp::recovery_authorization::{
 };
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
-use crate::db::entities::{delegation_workflow, recovery_authorization};
+use crate::db::entities::{
+    delegation_workflow, delegation_workflow_node_binding, recovery_authorization,
+};
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
@@ -354,6 +358,7 @@ pub struct DelegationListener {
     pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     /// Shared `EventEmitter` for workflow graph live events (publish/settle).
     pub workflow_emitter: EventEmitter,
+    pub completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
     recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
     #[cfg(any(test, feature = "test-utils"))]
     status_release_decision_gate: Arc<StatusReleaseDecisionGate>,
@@ -420,6 +425,33 @@ impl DelegationListener {
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
         workflow_emitter: EventEmitter,
     ) -> Arc<Self> {
+        Self::new_with_workflow_runtime(
+            broker,
+            tokens,
+            leases,
+            parent_lookup,
+            feedback,
+            questions,
+            session_info,
+            wait_cancel,
+            workflow_emitter,
+            Arc::new(CompletionProtocolRolloutConfig::default()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_workflow_runtime(
+        broker: Arc<DelegationBroker>,
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+        parent_lookup: Arc<dyn ParentSessionLookup>,
+        feedback: Arc<dyn SessionFeedbackAccess>,
+        questions: Arc<dyn SessionQuestionAccess>,
+        session_info: Arc<dyn SessionInfoAccess>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+        workflow_emitter: EventEmitter,
+        completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
+    ) -> Arc<Self> {
         let metrics = broker.metrics();
         let recovery_authorizations = broker
             .run_store()
@@ -435,6 +467,7 @@ impl DelegationListener {
             wait_cancel,
             metrics,
             workflow_emitter,
+            completion_protocol_rollout,
             recovery_authorizations,
             #[cfg(any(test, feature = "test-utils"))]
             status_release_decision_gate: Arc::new(StatusReleaseDecisionGate::default()),
@@ -712,6 +745,9 @@ impl DelegationListener {
             }
             BrokerMessage::GetWorkflowState(req) => {
                 value_response(&self.process_get_workflow_state(req).await)?
+            }
+            BrokerMessage::RestartLegacyWorkflow(req) => {
+                value_response(&self.process_restart_legacy_workflow(req).await)?
             }
             BrokerMessage::RequestRecoveryAuthorization(req) => {
                 let cancelled = CancellationToken::new();
@@ -1588,6 +1624,83 @@ impl DelegationListener {
         Ok((entry, parent_conversation_id))
     }
 
+    async fn restart_legacy_if_required(
+        &self,
+        db: &crate::db::AppDatabase,
+        parent_conversation_id: i32,
+        rollout_subject: Option<(String, Option<String>)>,
+    ) -> Result<
+        Option<crate::acp::delegation::workflow::LegacyWorkflowRestartProjection>,
+        WorkflowStoreError,
+    > {
+        let Some(header) = delegation_workflow::Entity::find()
+            .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(
+                delegation_workflow::Column::WorkflowKind
+                    .eq(crate::acp::delegation::workflow::WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
+            )
+            .one(&db.conn)
+            .await
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if header.completion_protocol_version != 1 {
+            return Ok(None);
+        }
+
+        let has_successor = delegation_workflow::Entity::find()
+            .filter(
+                delegation_workflow::Column::LegacySourceWorkflowId.eq(header.workflow_id.clone()),
+            )
+            .one(&db.conn)
+            .await
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+            .is_some();
+        let (agent, profile) = match rollout_subject {
+            Some(subject) => subject,
+            None => delegation_workflow_node_binding::Entity::find()
+                .filter(
+                    delegation_workflow_node_binding::Column::WorkflowId
+                        .eq(header.workflow_id.clone()),
+                )
+                .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
+                .one(&db.conn)
+                .await
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+                .map(|binding| (binding.agent_type, binding.profile_id))
+                .unwrap_or_else(|| ("unknown".into(), None)),
+        };
+        let selection = select_completion_protocol(
+            &agent,
+            profile.as_deref(),
+            &self.completion_protocol_rollout,
+        );
+        if !has_successor
+            && selection.mode
+                != crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+        {
+            return Ok(None);
+        }
+
+        match restart_legacy_workflow_core(db, i64::from(parent_conversation_id)).await {
+            Ok(projection) => {
+                self.metrics
+                    .record_completion_restart(if projection.idempotent_replay {
+                        CompletionRestartOutcome::Reused
+                    } else {
+                        CompletionRestartOutcome::Created
+                    });
+                Ok(Some(projection))
+            }
+            Err(error) => {
+                self.metrics
+                    .record_completion_restart(CompletionRestartOutcome::Failed);
+                Err(error)
+            }
+        }
+    }
+
     async fn process_publish_workflow(&self, req: BrokerPublishWorkflowRequest) -> Value {
         let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
             Ok((_, id)) => id,
@@ -1605,17 +1718,58 @@ impl DelegationListener {
                 .to_value();
             }
         };
-        match publish_workflow_manifest_core(
+        let rollout_subject = document
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == Some(crate::acp::delegation::workflow::ManifestNodeRole::Author)
+            })
+            .or_else(|| document.nodes.iter().find(|node| node.agent_type.is_some()));
+        let rollout_subject_owned = rollout_subject.map(|node| {
+            (
+                node.agent_type.clone().unwrap_or_else(|| "unknown".into()),
+                node.profile_id.clone(),
+            )
+        });
+        match self
+            .restart_legacy_if_required(runs.db(), parent_conversation_id, rollout_subject_owned)
+            .await
+        {
+            Ok(Some(projection)) => {
+                return serde_json::to_value(projection).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
+                        .to_value()
+                })
+            }
+            Ok(None) => {}
+            Err(error) => return workflow_store_error_value(error),
+        }
+        let selection = select_completion_protocol(
+            rollout_subject
+                .and_then(|node| node.agent_type.as_deref())
+                .unwrap_or("unknown"),
+            rollout_subject.and_then(|node| node.profile_id.as_deref()),
+            &self.completion_protocol_rollout,
+        );
+        let creation_mode = selection.mode.clone();
+        match publish_workflow_manifest_with_selection_core(
             runs.db(),
             &self.workflow_emitter,
             parent_conversation_id,
             PublishWorkflowRequest { document },
+            selection,
         )
         .await
         {
-            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
-                WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
-            }),
+            Ok(r) => {
+                if r.manifest_revision == 1 && !r.idempotent_replay {
+                    self.metrics
+                        .record_completion_protocol_creation(creation_mode);
+                }
+                serde_json::to_value(r).unwrap_or_else(|e| {
+                    WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
+                })
+            }
             Err(e) => workflow_store_error_value(e),
         }
     }
@@ -1649,6 +1803,19 @@ impl DelegationListener {
                 expected_parent: parent_conversation_id,
                 actual_parent: header.parent_conversation_id,
             });
+        }
+        match self
+            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
+            .await
+        {
+            Ok(Some(projection)) => {
+                return serde_json::to_value(projection).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
+                        .to_value()
+                })
+            }
+            Ok(None) => {}
+            Err(error) => return workflow_store_error_value(error),
         }
 
         let result = if header.completion_protocol_version == 2 {
@@ -1805,9 +1972,15 @@ impl DelegationListener {
         )
         .await
         {
-            Ok(intent) => serde_json::to_value(intent).unwrap_or_else(|error| {
-                completion_work_error_value("persistence", &error.to_string())
-            }),
+            Ok(intent) => {
+                if let Ok(Some(context)) = runs.terminal_completion_resolver_context(task_id).await
+                {
+                    self.metrics.record_completion_tool_accepted(context.role);
+                }
+                serde_json::to_value(intent).unwrap_or_else(|error| {
+                    completion_work_error_value("persistence", &error.to_string())
+                })
+            }
             Err(error) => completion_work_error_value(error.code(), &error.to_string()),
         }
     }
@@ -1831,6 +2004,47 @@ impl DelegationListener {
                 WorkflowWireError::Internal(format!("serialize workflow state: {e}")).to_value()
             }),
             Err(e) => workflow_store_error_value(e),
+        }
+    }
+
+    async fn process_restart_legacy_workflow(
+        &self,
+        req: BrokerRestartLegacyWorkflowRequest,
+    ) -> Value {
+        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
+            Ok((_, id)) => id,
+            Err(error) => return error.to_value(),
+        };
+        if i64::from(parent_conversation_id) != req.source_conversation_id {
+            self.metrics
+                .record_completion_restart(CompletionRestartOutcome::Rejected);
+            return workflow_store_error_value(WorkflowStoreError::CrossParent {
+                workflow_id: "legacy_restart".into(),
+                expected_parent: parent_conversation_id,
+                actual_parent: i32::try_from(req.source_conversation_id).unwrap_or_default(),
+            });
+        }
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        match restart_legacy_workflow_core(runs.db(), req.source_conversation_id).await {
+            Ok(projection) => {
+                self.metrics
+                    .record_completion_restart(if projection.idempotent_replay {
+                        CompletionRestartOutcome::Reused
+                    } else {
+                        CompletionRestartOutcome::Created
+                    });
+                serde_json::to_value(projection).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
+                        .to_value()
+                })
+            }
+            Err(error) => {
+                self.metrics
+                    .record_completion_restart(CompletionRestartOutcome::Failed);
+                workflow_store_error_value(error)
+            }
         }
     }
 
@@ -2237,6 +2451,19 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
+        match self
+            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
+            .await
+        {
+            Ok(Some(projection)) => {
+                return serde_json::to_value(projection).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
+                        .to_value()
+                })
+            }
+            Ok(None) => {}
+            Err(error) => return workflow_store_error_value(error),
+        }
         match recover_workflow_core(
             runs.db(),
             &self.workflow_emitter,
@@ -2280,6 +2507,27 @@ impl DelegationListener {
             Some(id) => id,
             None => return cancel("parent has no active conversation"),
         };
+
+        if entry.role == CompanionRole::Root && entry.workflow_v2 {
+            if let Some(runs) = self.broker.run_store() {
+                match self
+                    .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
+                    .await
+                {
+                    Ok(Some(projection)) => {
+                        return report_failed(
+                            "legacy_completion_protocol_restart_required",
+                            &format!(
+                            "legacy workflow is read-only; continue in successor conversation {}",
+                            projection.successor_conversation_id
+                        ),
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(error) => return report_failed(error.code(), &error.to_string()),
+                }
+            }
+        }
 
         let work_unit_key = match parse_work_unit_key(&req.input) {
             Ok(key) => key,
@@ -2710,6 +2958,12 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::SummaryTooLarge => "summary_too_large",
         WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
+        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_) => {
+            "legacy_completion_protocol_restart_required"
+        }
+        WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(_) => {
+            "legacy_completion_protocol_restart_invalid"
+        }
         WorkflowStoreError::Busy(_) => "busy",
         WorkflowStoreError::WorkflowRecoveryNotAvailable => "workflow_recovery_not_available",
         WorkflowStoreError::WorkflowRecoveryConflict => "workflow_recovery_conflict",
@@ -3037,6 +3291,7 @@ mod tests {
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
     };
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+    use crate::acp::delegation::workflow::publish_workflow_manifest_core;
     use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
     use chrono::Utc;
     use serde_json::json;

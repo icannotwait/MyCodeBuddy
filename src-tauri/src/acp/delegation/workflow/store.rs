@@ -618,6 +618,25 @@ pub async fn publish_workflow_manifest_core(
     parent_conversation_id: i32,
     req: PublishWorkflowRequest,
 ) -> Result<PublishResult, WorkflowStoreError> {
+    publish_workflow_manifest_with_selection_core(
+        db,
+        emitter,
+        parent_conversation_id,
+        req,
+        super::types::CompletionProtocolSelection::v1_default(),
+    )
+    .await
+}
+
+/// Publish with a server-selected protocol for a new workflow. Existing
+/// workflow rows ignore `selection` and retain their frozen stored mode.
+pub async fn publish_workflow_manifest_with_selection_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: PublishWorkflowRequest,
+    selection: super::types::CompletionProtocolSelection,
+) -> Result<PublishResult, WorkflowStoreError> {
     ensure_parent_exists(db, parent_conversation_id).await?;
 
     let normalized = validate_manifest_document(&req.document)?;
@@ -643,6 +662,7 @@ pub async fn publish_workflow_manifest_core(
                     &normalized,
                     &document_digest,
                     now,
+                    &selection,
                 )
                 .await
             })
@@ -3205,6 +3225,10 @@ pub async fn get_workflow_state_core(
                             ))
                         })?,
                 };
+                let completion_protocol =
+                    super::workflow_restart::completion_protocol_projection(txn, &header)
+                        .await
+                        .map_err(db_err)?;
 
                 let recovery_snapshot = if header.workflow_state == WorkflowState::Blocked {
                     Some(
@@ -3222,11 +3246,12 @@ pub async fn get_workflow_state_core(
                     Some(loaded) => match loaded.normalized {
                         Some(normalized) => normalized,
                         None => {
-                        return Ok(project_invalid_manifest_recovery_index(
-                            &header,
+                            return Ok(project_invalid_manifest_recovery_index(
+                                &header,
                                 &loaded.snapshot,
-                            recovery.expect("blocked snapshot has projection"),
-                        ));
+                                recovery.expect("blocked snapshot has projection"),
+                                completion_protocol,
+                            ));
                         }
                     },
                     None => {
@@ -3483,6 +3508,7 @@ pub async fn get_workflow_state_core(
                     publication_token: header.publication_token,
                     plan_target_rel_path: normalized.plan_target_rel_path,
                     risk_policy_version: normalized.risk_policy_version,
+                    completion_protocol,
                     task_policies: normalized.task_policies,
                     design: normalized.design,
                     plan: normalized.plan,
@@ -4278,6 +4304,7 @@ fn project_invalid_manifest_recovery_index(
     header: &delegation_workflow::Model,
     snapshot: &WorkflowRecoverySnapshot,
     recovery: super::recovery_policy::WorkflowRecoveryProjection,
+    completion_protocol: super::types::CompletionProtocolWorkflowProjection,
 ) -> WorkflowStateIndexDto {
     WorkflowStateIndexDto {
         workflow_id: header.workflow_id.clone(),
@@ -4291,6 +4318,7 @@ fn project_invalid_manifest_recovery_index(
         schema_version: u64::try_from(header.schema_version).unwrap_or_default(),
         plan_target_rel_path: snapshot.plan_target_rel_path.clone(),
         risk_policy_version: String::new(),
+        completion_protocol,
         recovery: Some(recovery),
         detail: super::state_dto::WorkflowStateDetail::Index,
         inline_findings: false,
@@ -4596,6 +4624,7 @@ async fn publish_in_txn(
     normalized: &NormalizedManifest,
     document_digest: &str,
     now: chrono::DateTime<Utc>,
+    selection: &super::types::CompletionProtocolSelection,
 ) -> Result<PublishResult, WorkflowStoreError> {
     // --- re-read by publication_token (inside write txn) -------------------
     if let Some(by_token) =
@@ -4892,6 +4921,7 @@ async fn publish_in_txn(
             workflow_state,
             &effective_document_digest,
             now,
+            selection,
         )
         .await?
         {
@@ -4963,6 +4993,7 @@ async fn insert_header_create_or_reclassify(
     workflow_state: WorkflowState,
     document_digest: &str,
     now: chrono::DateTime<Utc>,
+    selection: &super::types::CompletionProtocolSelection,
 ) -> Result<Option<PublishResult>, WorkflowStoreError> {
     use sea_orm::ConnectionTrait;
 
@@ -5007,6 +5038,9 @@ async fn insert_header_create_or_reclassify(
         block_source_manifest_revision: Set(
             (workflow_state == WorkflowState::Blocked).then_some(next_manifest_rev)
         ),
+        completion_protocol_version: Set(selection.version),
+        completion_protocol_mode: Set(selection.mode.clone()),
+        legacy_source_workflow_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -7098,11 +7132,11 @@ fn plan_structure_changed(prior: &NormalizedManifest, next: &NormalizedManifest)
     plan_structure_fingerprint(prior) != plan_structure_fingerprint(next)
 }
 
-fn design_fingerprint_hash(m: &NormalizedManifest) -> String {
+pub(crate) fn design_fingerprint_hash(m: &NormalizedManifest) -> String {
     sha256_hex(design_structure_fingerprint(m).as_bytes())
 }
 
-fn plan_fingerprint_hash(m: &NormalizedManifest) -> String {
+pub(crate) fn plan_fingerprint_hash(m: &NormalizedManifest) -> String {
     sha256_hex(plan_structure_fingerprint(m).as_bytes())
 }
 
@@ -7286,7 +7320,7 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     out
 }
 
-fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
+pub(crate) fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
     ManifestDocument {
         schema_version: m.schema_version,
         workflow_kind: m.workflow_kind.clone(),
@@ -7359,7 +7393,7 @@ fn manifests_equal_except_state_authority(
     prior == requested
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(digest.len() * 2);

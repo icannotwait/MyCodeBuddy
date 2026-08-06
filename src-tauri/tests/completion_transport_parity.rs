@@ -18,8 +18,8 @@ use codeg_lib::acp::delegation::workflow::types::{
 };
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, materialize_terminal_completion_txn, CompletionOutcome,
-    TerminalCompletionInput,
+    build_work_unit_key, materialize_terminal_completion_txn, restart_legacy_workflow_core,
+    CompletionOutcome, TerminalCompletionInput,
 };
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::entities::delegation_attention_request::AttentionKind;
@@ -555,4 +555,85 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .await;
     assert_eq!(conflict.status_code(), 409);
     assert_eq!(error_detail(&conflict), "completion_decision_conflict");
+}
+
+#[tokio::test]
+async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
+    let workspace = tempfile::tempdir().unwrap();
+    let static_dir = tempfile::tempdir().unwrap();
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+    let source_conversation_id = seed_conversation(&db, folder, AgentType::Codex).await;
+    let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+        rel_plan_path: PLAN_REL_PATH,
+        agent_type: "codex",
+        profile_id: None,
+    })
+    .unwrap();
+    publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        source_conversation_id,
+        PublishWorkflowRequest {
+            document: completion_manifest(&author_key),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = Arc::new(AppState::new_for_test(db, workspace.path().to_path_buf()));
+    let server = TestServer::new(build_router(
+        state.clone(),
+        TEST_TOKEN.into(),
+        static_dir.path().to_path_buf(),
+        Arc::new(ShutdownSignal::new()),
+    ))
+    .unwrap();
+    let context_response = server
+        .post("/api/get_workflow_graph_snapshot")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": source_conversation_id }))
+        .await;
+    context_response.assert_status_ok();
+    let completion_context = context_response
+        .headers()
+        .get(COMPLETION_CONTEXT_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let direct = restart_legacy_workflow_core(&state.db, i64::from(source_conversation_id))
+        .await
+        .unwrap();
+    let http = server
+        .post("/api/restart_legacy_workflow")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+        .json(&json!({ "source_conversation_id": source_conversation_id }))
+        .await;
+    http.assert_status_ok();
+    let http: codeg_lib::acp::delegation::workflow::LegacyWorkflowRestartProjection = http.json();
+    assert_eq!(
+        direct.successor_conversation_id,
+        http.successor_conversation_id
+    );
+    assert!(http.idempotent_replay);
+
+    let foreign_context = state
+        .web_server_state
+        .completion_authorizations()
+        .issue(source_conversation_id + 1);
+    let foreign = server
+        .post("/api/restart_legacy_workflow")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, foreign_context)
+        .json(&json!({ "source_conversation_id": source_conversation_id }))
+        .await;
+    assert_eq!(foreign.status_code(), 403);
+
+    let router = include_str!("../src/web/router.rs");
+    let lib = include_str!("../src/lib.rs");
+    assert!(router.contains("\"/restart_legacy_workflow\""));
+    assert!(lib.contains("workflow_completion::restart_legacy_workflow"));
 }

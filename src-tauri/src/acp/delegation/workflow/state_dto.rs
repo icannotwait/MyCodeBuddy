@@ -35,6 +35,7 @@ pub struct WorkflowStateDto {
     pub publication_token: String,
     pub plan_target_rel_path: String,
     pub risk_policy_version: String,
+    pub completion_protocol: super::types::CompletionProtocolWorkflowProjection,
     pub task_policies: Vec<ManifestTaskPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<DocumentRef>,
@@ -127,6 +128,7 @@ pub struct WorkflowStateIndexDto {
     pub schema_version: u64,
     pub plan_target_rel_path: String,
     pub risk_policy_version: String,
+    pub completion_protocol: super::types::CompletionProtocolWorkflowProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<WorkflowRecoveryProjection>,
     pub detail: WorkflowStateDetail,
@@ -652,6 +654,7 @@ pub fn project_workflow_state_index(
         schema_version: state.schema_version,
         plan_target_rel_path: state.plan_target_rel_path,
         risk_policy_version: state.risk_policy_version,
+        completion_protocol: state.completion_protocol,
         recovery: None,
         detail: WorkflowStateDetail::Index,
         inline_findings: false,
@@ -917,7 +920,7 @@ mod tests {
         PlanRevisionKind,
     };
     use crate::acp::delegation::workflow::types::{
-        ManifestTaskRisk, ManifestTaskRoute, TaskRiskLevel,
+        CompletionProtocolWorkflowProjection, ManifestTaskRisk, ManifestTaskRoute, TaskRiskLevel,
     };
     use crate::db::entities::delegation_workflow_node_binding;
 
@@ -1125,6 +1128,15 @@ mod tests {
             publication_token: "publication-token".to_string(),
             plan_target_rel_path: "docs/plans/workflow.md".to_string(),
             risk_policy_version: "risk-v1".to_string(),
+            completion_protocol: CompletionProtocolWorkflowProjection {
+                version: 1,
+                mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V1,
+                creation_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V1,
+                legacy_source: None,
+                v2_successor: None,
+                read_only_reason: None,
+                automatic_root_wake: false,
+            },
             task_policies: vec![
                 sample_policy(1, TaskRiskLevel::High, "task-1-impl", "task-1-review-codex"),
                 sample_policy(

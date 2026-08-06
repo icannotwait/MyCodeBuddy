@@ -102,6 +102,12 @@ pub struct DelegationProfileCatalog {
     pub revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartLegacyWorkflowRequest {
+    pub source_conversation_id: i64,
+}
+
 /// Result of a catalog-affecting mutation: the field-specific value plus the
 /// post-commit catalog snapshot (including the advanced revision).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use crate::acp::delegation::event_emitter::CompletionOutboxDispatcher;
 use crate::acp::delegation::types::{
     CompletionMutationContext, CompletionMutationResult, ResolveCompletionDecisionRequest,
-    ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
+    ResolveDesignSelfReviewRequest, RestartLegacyWorkflowRequest, RetryCompletionArtifactRequest,
 };
 use crate::acp::delegation::workflow::{
-    resolve_completion_decision_txn, resolve_design_self_review_txn,
+    resolve_completion_decision_txn, resolve_design_self_review_txn, restart_legacy_workflow_core,
     retry_completion_artifact_for_user_txn, CompletionMutationError,
+    LegacyWorkflowRestartProjection, WorkflowStoreError,
 };
 use crate::app_error::AppCommandError;
 use crate::db::entities::delegation_attention_request;
@@ -36,6 +37,50 @@ pub async fn completion_attention_parent_conversation_id(
 fn unauthorized_context_error() -> AppCommandError {
     AppCommandError::permission_denied("completion attention is owned by another root conversation")
         .with_detail("unauthorized")
+}
+
+pub async fn restart_legacy_workflow_authenticated_core(
+    db: &AppDatabase,
+    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
+    context: &CompletionMutationContext,
+    request: RestartLegacyWorkflowRequest,
+) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
+    if i64::from(context.parent_conversation_id()) != request.source_conversation_id {
+        metrics.record_completion_restart(
+            crate::acp::delegation::metrics::CompletionRestartOutcome::Rejected,
+        );
+        return Err(unauthorized_context_error());
+    }
+    match restart_legacy_workflow_core(db, request.source_conversation_id).await {
+        Ok(projection) => {
+            metrics.record_completion_restart(if projection.idempotent_replay {
+                crate::acp::delegation::metrics::CompletionRestartOutcome::Reused
+            } else {
+                crate::acp::delegation::metrics::CompletionRestartOutcome::Created
+            });
+            Ok(projection)
+        }
+        Err(error) => {
+            metrics.record_completion_restart(
+                crate::acp::delegation::metrics::CompletionRestartOutcome::Failed,
+            );
+            Err(map_legacy_restart_error(error))
+        }
+    }
+}
+
+fn map_legacy_restart_error(error: WorkflowStoreError) -> AppCommandError {
+    let code = error.code();
+    let message = error.to_string();
+    match error {
+        WorkflowStoreError::CrossParent { .. } => {
+            AppCommandError::permission_denied(message).with_detail(code)
+        }
+        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_)
+        | WorkflowStoreError::Persistence(_)
+        | WorkflowStoreError::Busy(_) => AppCommandError::database_error(message).with_detail(code),
+        _ => AppCommandError::invalid_input(message).with_detail(code),
+    }
 }
 
 pub async fn resolve_completion_decision_core(
@@ -172,6 +217,30 @@ pub async fn resolve_design_self_review(
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
         resolve_design_self_review_core(&db, dispatcher.inner(), &context, request).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = request;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn restart_legacy_workflow(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
+        '_,
+        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    >,
+    #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
+    request: RestartLegacyWorkflowRequest,
+) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let source_conversation_id = i32::try_from(request.source_conversation_id)
+            .map_err(|_| AppCommandError::invalid_input("source conversation id is invalid"))?;
+        let context = desktop_completion_context_for_label(source_conversation_id, window.label())?;
+        restart_legacy_workflow_authenticated_core(&db, metrics.inner(), &context, request).await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {

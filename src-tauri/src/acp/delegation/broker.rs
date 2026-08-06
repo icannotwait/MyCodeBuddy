@@ -82,8 +82,8 @@ use crate::acp::delegation::meta_writer::{
     DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::{
-    CompletionMetricPhase, DelegationMetrics, DelegationRecoveryMetricEvent,
-    RecoveryMetricEventKind, RuntimeProjectionErrorKind,
+    CompletionMetricPhase, CompletionShadowDifference, DelegationMetrics,
+    DelegationRecoveryMetricEvent, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
 };
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
@@ -2199,9 +2199,19 @@ fn record_completion_resolver_metrics(
     match resolution {
         CompletionResolution::Resolved(intent) => {
             metrics.record_completion_resolution(intent.source, role);
+            metrics.record_completion_shadow_difference(CompletionShadowDifference::Match);
         }
         CompletionResolution::NeedsDecision { reason_code, .. } => {
             metrics.record_completion_decision(*reason_code);
+            metrics.record_completion_shadow_difference(
+                if *reason_code
+                    == crate::acp::delegation::workflow::CompletionIntentReason::RoleMismatch
+                {
+                    CompletionShadowDifference::RoleMismatch
+                } else {
+                    CompletionShadowDifference::NeedsDecision
+                },
+            );
         }
     }
 }
