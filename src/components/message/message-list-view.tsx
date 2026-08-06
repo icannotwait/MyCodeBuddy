@@ -150,6 +150,8 @@ interface MessageListViewProps {
    * message remains.
    */
   waitingForSubagentsArmedAtMs?: number | null
+  onResumeRoot?: () => void | Promise<void>
+  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }
 
 export function canReloadSessionLoadError(
@@ -1039,6 +1041,8 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   historicalDelegations,
   historicalActivities,
   historicalKey,
+  onResumeRoot,
+  onOpenRootConversation,
 }: {
   conversationId: number
   agentType: AgentType
@@ -1051,6 +1055,8 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
    */
   historicalActivities: DelegationActivityView[]
   historicalKey: string
+  onResumeRoot?: () => void | Promise<void>
+  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }) {
   const snap = useLiveTranscriptConversation(
     isStreaming ? conversationId : null
@@ -1096,6 +1102,8 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       defaultExpanded
       conversationId={conversationId}
       workflowGraph={workflowGraph}
+      onResumeRoot={onResumeRoot}
+      onOpenRootConversation={onOpenRootConversation}
     />
   )
 })
@@ -1118,6 +1126,8 @@ export function MessageListView({
   historyLoadComplete = false,
   focusTurnAnchor = null,
   waitingForSubagentsArmedAtMs = null,
+  onResumeRoot,
+  onOpenRootConversation,
 }: MessageListViewProps) {
   const isWaitingForSubagents =
     waitingForSubagentsArmedAtMs != null &&
@@ -1908,6 +1918,8 @@ export function MessageListView({
             historicalDelegations={allSessionDelegations}
             historicalActivities={sessionActivities}
             historicalKey={subAgentOverlayKey}
+            onResumeRoot={onResumeRoot}
+            onOpenRootConversation={onOpenRootConversation}
           />
         ) : (
           <SubAgentOverlay
@@ -1918,6 +1930,8 @@ export function MessageListView({
             defaultExpanded
             conversationId={conversationId}
             workflowGraph={workflowGraph}
+            onResumeRoot={onResumeRoot}
+            onOpenRootConversation={onOpenRootConversation}
           />
         )}
       </div>

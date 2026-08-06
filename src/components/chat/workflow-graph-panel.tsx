@@ -13,13 +13,24 @@ import {
   useState,
   useSyncExternalStore,
 } from "react"
-import { ArrowRightIcon, ChevronDownIcon, Eye } from "lucide-react"
+import {
+  ArrowRightIcon,
+  ChevronDownIcon,
+  Eye,
+  Loader2,
+  Play,
+  RotateCcw,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
 import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
+import { CompletionDecisionCard } from "@/components/chat/completion-decision-card"
 import { phaseProgressFragments } from "@/components/chat/workflow-phase-rail"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { getWorkflowGraphSnapshot, restartLegacyWorkflow } from "@/lib/api"
+import { toErrorMessage } from "@/lib/app-error"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   computeDelegationElapsedMs,
@@ -32,6 +43,7 @@ import {
   buildPhaseRail,
   canOpenWorkflowNode,
   isEstimatedNode,
+  useWorkflowGraphStore,
   type PhaseRailItem,
   type PhaseRailKind,
 } from "@/lib/workflow-graph-store"
@@ -57,7 +69,10 @@ type LaneBooleanMap = Record<PhaseRailKind, boolean>
 
 interface WorkflowGraphPanelProps {
   snapshot: WorkflowGraphSnapshot
+  conversationId?: number | null
   className?: string
+  onResumeRoot?: () => void | Promise<void>
+  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }
 
 function laneDefaults(phases: readonly PhaseRailItem[]): LaneBooleanMap {
@@ -242,12 +257,18 @@ function buildOperationalLine(
 
 export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   snapshot,
+  conversationId,
   className,
+  onResumeRoot,
+  onOpenRootConversation,
 }: WorkflowGraphPanelProps) {
   const t = useTranslations("Folder.chat.workflowGraph")
   const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tDel = useTranslations("Folder.chat.delegation")
   const [dependenciesExpanded, setDependenciesExpanded] = useState(false)
+  const [restartPending, setRestartPending] = useState(false)
+  const [resumePending, setResumePending] = useState(false)
+  const [protocolError, setProtocolError] = useState<string | null>(null)
 
   const needsLiveClock = useMemo(
     () => snapshot.nodes.some((node) => isLiveNodeStatus(node.status)),
@@ -294,6 +315,13 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       ),
     [snapshot.nodes]
   )
+  const workflowCompletionIsOnNode = useMemo(() => {
+    const attentionId = snapshot.completion?.card.attention?.attention_id
+    if (!attentionId) return false
+    return snapshot.nodes.some(
+      (node) => node.completion?.card.attention?.attention_id === attentionId
+    )
+  }, [snapshot.completion, snapshot.nodes])
 
   const onOpenSession = useCallback(async (node: WorkflowNodeSnapshot) => {
     if (!canOpenWorkflowNode(node)) return
@@ -303,6 +331,49 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       title: node.title,
     })
   }, [])
+
+  const refreshDurableRoot = useCallback(async () => {
+    if (conversationId == null) return null
+    setProtocolError(null)
+    try {
+      const graph = await getWorkflowGraphSnapshot(conversationId)
+      useWorkflowGraphStore.getState().applyFromDetail(conversationId, graph)
+      if (graph == null) return null
+      return useWorkflowGraphStore.getState().getSnapshot(conversationId)
+    } catch (cause: unknown) {
+      setProtocolError(toErrorMessage(cause))
+      return null
+    }
+  }, [conversationId])
+
+  const resumeRoot = useCallback(async () => {
+    if (!onResumeRoot) return
+    setResumePending(true)
+    try {
+      const durable = await refreshDurableRoot()
+      if (durable && !durable.completion_protocol.automatic_root_wake) {
+        await onResumeRoot()
+      }
+    } finally {
+      setResumePending(false)
+    }
+  }, [onResumeRoot, refreshDurableRoot])
+
+  const restartLegacy = useCallback(async () => {
+    if (conversationId == null) return
+    setProtocolError(null)
+    setRestartPending(true)
+    try {
+      await restartLegacyWorkflow({
+        source_conversation_id: conversationId,
+      })
+      await refreshDurableRoot()
+    } catch (cause: unknown) {
+      setProtocolError(toErrorMessage(cause))
+    } finally {
+      setRestartPending(false)
+    }
+  }, [conversationId, refreshDurableRoot])
 
   const renderNodeRow = (
     node: WorkflowNodeSnapshot,
@@ -452,6 +523,9 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
             </button>
           )}
         </div>
+        {node.completion && (
+          <CompletionDecisionCard request={node.completion} />
+        )}
       </div>
     )
   }
@@ -463,6 +537,97 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       role="region"
       aria-label={t("graphTitle")}
     >
+      {snapshot.completion && !workflowCompletionIsOnNode && (
+        <CompletionDecisionCard request={snapshot.completion} />
+      )}
+      {snapshot.completion_protocol && (
+        <div className="space-y-2 rounded-md border bg-muted/20 p-2 text-xs">
+          {snapshot.completion_protocol.read_only_reason && (
+            <p className="font-medium">{t("completionLegacyReadOnly")}</p>
+          )}
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+            {snapshot.completion_protocol.legacy_source && (
+              <button
+                type="button"
+                disabled={!onOpenRootConversation}
+                className="underline-offset-2 enabled:hover:text-foreground enabled:hover:underline disabled:cursor-default"
+                onClick={() =>
+                  void onOpenRootConversation?.(
+                    snapshot.completion_protocol!.legacy_source!.conversation_id
+                  )
+                }
+              >
+                {t("completionLegacySource", {
+                  conversation:
+                    snapshot.completion_protocol.legacy_source.conversation_id,
+                })}
+              </button>
+            )}
+            {snapshot.completion_protocol.v2_successor && (
+              <button
+                type="button"
+                disabled={!onOpenRootConversation}
+                className="underline-offset-2 enabled:hover:text-foreground enabled:hover:underline disabled:cursor-default"
+                onClick={() =>
+                  void onOpenRootConversation?.(
+                    snapshot.completion_protocol!.v2_successor!.conversation_id
+                  )
+                }
+              >
+                {t("completionLegacySuccessor", {
+                  conversation:
+                    snapshot.completion_protocol.v2_successor.conversation_id,
+                })}
+              </button>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {snapshot.completion_protocol.version === 1 && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={restartPending || conversationId == null}
+                onClick={() => void restartLegacy()}
+              >
+                {restartPending ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <RotateCcw className="size-3.5" aria-hidden />
+                )}
+                {t("completionLegacyRestart")}
+              </Button>
+            )}
+            {!snapshot.completion_protocol.automatic_root_wake &&
+              onResumeRoot && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={resumePending || conversationId == null}
+                  onClick={() => void resumeRoot()}
+                >
+                  {resumePending ? (
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                  ) : (
+                    <Play className="size-3.5" aria-hidden />
+                  )}
+                  {t("completionManualRootResume")}
+                </Button>
+              )}
+          </div>
+          {snapshot.completion_protocol.automatic_root_wake && (
+            <p className="text-muted-foreground">
+              {t("completionAutomaticWake")}
+            </p>
+          )}
+          {protocolError && (
+            <p role="alert" className="text-destructive">
+              {protocolError}
+            </p>
+          )}
+        </div>
+      )}
       <div className="flex flex-col gap-2">
         {lanes.map((lane) => {
           const expanded = expandedByLane[lane.kind]

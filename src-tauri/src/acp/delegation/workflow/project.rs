@@ -21,8 +21,11 @@ use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
-use super::completion_evidence::{load_validated_completion_evidence, V2GateEvidenceIdentity};
+use super::completion_evidence::V2GateEvidenceIdentity;
 use super::completion_intent::CompletionOutcome;
+use super::completion_projection::{
+    load_completion_projection, load_workflow_completion_projection_batch,
+};
 use super::dto::{
     redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
     ProjectedNodeStatus, PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot,
@@ -70,12 +73,7 @@ fn model_and_effort_from_config_json(
     (
         lookup(&["model", "model_id", "modelId"]),
         // Prefer Grok's ACP id first; then Codex-style / generic keys.
-        lookup(&[
-            "reasoning_effort",
-            "effort",
-            "reasoning",
-            "thinking",
-        ]),
+        lookup(&["reasoning_effort", "effort", "reasoning", "thinking"]),
     )
 }
 
@@ -104,9 +102,7 @@ fn run_card_runtime(run: &delegation_task_run::Model) -> RunCardRuntime {
         started_at: run.started_at.map(|t| t.to_rfc3339()),
         finished_at: run.finished_at.map(|t| t.to_rfc3339()),
         tool_call_count: run.tool_call_count.and_then(|c| u64::try_from(c).ok()),
-        edit_tool_call_count: run
-            .edit_tool_call_count
-            .and_then(|c| u64::try_from(c).ok()),
+        edit_tool_call_count: run.edit_tool_call_count.and_then(|c| u64::try_from(c).ok()),
         touched_file_count,
         touched_files_truncated: run.touched_files_truncated.unwrap_or(false),
         additions: run.additions,
@@ -176,7 +172,9 @@ fn title_missing(title: &Option<String>) -> bool {
 /// scrubbing that yields an empty string falls through to the next source
 /// (instead of locking in `Some("")`). Pure `[redacted]` placeholders also fall
 /// through so a path-only preview does not block a usable summary / child title.
-fn first_display_title<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+fn first_display_title<'a>(
+    candidates: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<String> {
     let mut last_redacted: Option<String> = None;
     for candidate in candidates {
         let trimmed = candidate.map(str::trim).filter(|s| !s.is_empty());
@@ -286,9 +284,8 @@ async fn enrich_nodes_display_from_children(
         }
 
         let agent = child.agent_type.as_str();
-        let needs_archive = title_missing(&node.title)
-            || node.model.is_none()
-            || node.effort.is_none();
+        let needs_archive =
+            title_missing(&node.title) || node.model.is_none() || node.effort.is_none();
         if needs_archive && agent.eq_ignore_ascii_case("grok") {
             if let Some(ext) = child
                 .external_id
@@ -468,19 +465,18 @@ async fn project_manifest_mode(
     let run_by_id: HashMap<String, &delegation_task_run::Model> =
         parent_runs.iter().map(|r| (r.task_id.clone(), r)).collect();
 
-    let mut validated_by_task = HashMap::new();
-    if header.completion_protocol_version == 2 {
-        let mut latest_by_node = HashSet::new();
-        for binding in &run_bindings {
-            if latest_by_node.insert(binding.node_id.as_str()) {
-                if let Ok(validated) =
-                    load_validated_completion_evidence(conn, &binding.task_id).await
-                {
-                    validated_by_task.insert(binding.task_id.clone(), validated);
-                }
-            }
-        }
-    }
+    let completion_batch = load_workflow_completion_projection_batch(
+        conn,
+        header,
+        &normalized,
+        &bindings,
+        &run_bindings,
+        &parent_runs,
+    )
+    .await
+    .map_err(|error| ProjectError::Persistence(error.to_string()))?;
+    let validated_by_task = completion_batch.validated_by_task;
+    let completion_by_task = completion_batch.completion_by_task;
 
     // Group run bindings by node_id, ordered by lineage_ordinal desc already.
     let mut rbs_by_node: HashMap<String, Vec<&delegation_workflow_run_binding::Model>> =
@@ -533,6 +529,7 @@ async fn project_manifest_mode(
             &run_by_id,
             header.completion_protocol_version,
             &validated_by_task,
+            &completion_by_task,
             &mut id_map,
         );
         if is_active_gate_binding(b, active_rev, in_manifest)
@@ -707,6 +704,35 @@ async fn project_manifest_mode(
     let completion_protocol = super::workflow_restart::completion_protocol_projection(conn, header)
         .await
         .map_err(db_err)?;
+    let design_root_completion =
+        crate::db::entities::delegation_workflow_design_root_binding::Entity::find()
+            .filter(
+                crate::db::entities::delegation_workflow_design_root_binding::Column::WorkflowId
+                    .eq(header.workflow_id.clone()),
+            )
+            .one(conn)
+            .await
+            .map_err(db_err)?
+            .map(|binding| binding.task_id);
+    let design_root_completion = match design_root_completion {
+        Some(task_id) => load_completion_projection(conn, &task_id)
+            .await
+            .map_err(|error| ProjectError::Persistence(error.to_string()))?,
+        None => None,
+    };
+    let completion = design_root_completion.or_else(|| {
+        nodes
+            .iter()
+            .filter_map(|node| node.completion.as_ref())
+            .find(|completion| completion.card.state != super::CompletionCardState::Resolved)
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .filter_map(|node| node.completion.as_ref())
+                    .next()
+            })
+            .cloned()
+    });
 
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
@@ -716,6 +742,7 @@ async fn project_manifest_mode(
         graph_revision: Some(header.graph_revision as u64),
         manifest_state: Some(workflow_state_str(&header.workflow_state).to_string()),
         completion_protocol: Some(completion_protocol),
+        completion,
         compatibility: WorkflowCompatibility::Manifest,
         overall_state,
         current_phase_id,
@@ -755,6 +782,7 @@ fn project_node_from_binding(
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
     completion_protocol_version: i64,
     validated_by_task: &HashMap<String, super::types::ValidatedCompletionEvidence>,
+    completion_by_task: &HashMap<String, super::CompletionProjectionV2>,
     id_map: &mut PublicIdAllocator,
 ) -> WorkflowNodeSnapshot {
     let latest_rb = rbs.first().copied();
@@ -901,6 +929,9 @@ fn project_node_from_binding(
         deletions: runtime.deletions,
         line_counts_complete: runtime.line_counts_complete,
         summary,
+        completion: latest_run
+            .and_then(|run| completion_by_task.get(&run.task_id))
+            .cloned(),
         is_observed: b.is_observed || latest_run.is_some(),
         retained_observed: b.retained_observed,
         required,
@@ -951,6 +982,7 @@ fn project_node_from_manifest_only(
         deletions: None,
         line_counts_complete: None,
         summary: None,
+        completion: None,
         is_observed: false,
         retained_observed: false,
         required: mn.required,
@@ -1812,6 +1844,7 @@ fn append_orphan_observed_nodes(
             deletions: runtime.deletions,
             line_counts_complete: runtime.line_counts_complete,
             summary,
+            completion: None,
             is_observed: true,
             retained_observed: true,
             required: false,
@@ -2080,6 +2113,7 @@ async fn project_observed_only(
             deletions: runtime.deletions,
             line_counts_complete: runtime.line_counts_complete,
             summary,
+            completion: None,
             is_observed: true,
             retained_observed: false,
             required: true,
@@ -2118,6 +2152,7 @@ async fn project_observed_only(
         graph_revision: None,
         manifest_state: None,
         completion_protocol: None,
+        completion: None,
         compatibility: WorkflowCompatibility::ObservedOnly,
         overall_state: WorkflowOverallState::ObservedOnly,
         current_phase_id,
@@ -2486,7 +2521,8 @@ mod tests {
             config_values_json: None,
             task_preview: None,
             request_fingerprint: None,
-            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            admission_class:
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
             reached_running_at: None,
             lineage_root_task_id: "a".into(),
             work_unit_key: None,
@@ -2528,7 +2564,8 @@ mod tests {
             child_conversation_id: 11,
             parent_conversation_id: 1,
             agent_type: "grok".into(),
-            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            admission_class:
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
             history_only: false,
             created_at: t2,
             updated_at: t3,
@@ -2545,7 +2582,8 @@ mod tests {
             child_conversation_id: 12,
             parent_conversation_id: 1,
             agent_type: "grok".into(),
-            admission_class: crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            admission_class:
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
             history_only: false,
             created_at: t3,
             updated_at: t3,
@@ -3135,6 +3173,138 @@ mod tests {
                 assert!(!json.contains("private free-form reason"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn v2_graph_projection_does_not_reload_terminal_rows_per_node() {
+        let (db, parent) = seed_parent().await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("batched-v2-completion-projection"),
+            },
+        )
+        .await
+        .unwrap();
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header: delegation_workflow::ActiveModel = header.into();
+        header.completion_protocol_version = Set(2);
+        header.update(&db.conn).await.unwrap();
+
+        for (task_id, node_id) in [
+            ("batched-v2-impl", "task-1-impl"),
+            ("batched-v2-review", "task-1-rev"),
+        ] {
+            insert_run(
+                &db,
+                parent,
+                task_id,
+                None,
+                DelegationRunStatus::Running,
+                1,
+                None,
+                None,
+                "codex",
+            )
+            .await;
+            insert_run_binding(
+                &db,
+                task_id,
+                &published.workflow_id,
+                node_id,
+                1,
+                false,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        super::super::completion_evidence::reset_terminal_row_load_count();
+        let snapshot = project_workflow_graph_core(&db, parent).await.unwrap();
+
+        assert!(snapshot
+            .nodes
+            .iter()
+            .any(|node| { node.latest_task_id.as_deref() == Some("batched-v2-impl") }));
+        assert!(snapshot
+            .nodes
+            .iter()
+            .any(|node| { node.latest_task_id.as_deref() == Some("batched-v2-review") }));
+        assert_eq!(
+            super::super::completion_evidence::terminal_row_load_count(),
+            0,
+            "graph projection must reuse its batched workflow, node, binding, and run rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_graph_batch_rejects_cross_parent_completion_run_binding() {
+        let (db, parent) = seed_parent().await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("batched-v2-cross-parent"),
+            },
+        )
+        .await
+        .unwrap();
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header: delegation_workflow::ActiveModel = header.into();
+        header.completion_protocol_version = Set(2);
+        header.update(&db.conn).await.unwrap();
+
+        let other_parent = seed_conversation(
+            &db,
+            seed_folder(&db, "/tmp/wf-project-other-parent").await,
+            AgentType::Codex,
+        )
+        .await;
+        insert_run(
+            &db,
+            other_parent,
+            "batched-v2-cross-parent-run",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        let run = delegation_task_run::Entity::find_by_id("batched-v2-cross-parent-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.completion_state = Set(Some(CompletionState::NeedsDecision));
+        run.update(&db.conn).await.unwrap();
+        insert_run_binding(
+            &db,
+            "batched-v2-cross-parent-run",
+            &published.workflow_id,
+            "task-1-impl",
+            1,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(project_workflow_graph_core(&db, parent).await.is_none());
     }
 
     #[tokio::test]
@@ -3953,6 +4123,7 @@ mod tests {
             graph_revision: None,
             manifest_state: None,
             completion_protocol: None,
+            completion: None,
             compatibility: WorkflowCompatibility::ObservedOnly,
             overall_state: WorkflowOverallState::ObservedOnly,
             current_phase_id: None,
@@ -4324,6 +4495,7 @@ mod tests {
             deletions: None,
             line_counts_complete: None,
             summary: None,
+            completion: None,
             is_observed: true,
             retained_observed: false,
             required: true,

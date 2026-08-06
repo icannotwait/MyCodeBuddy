@@ -154,6 +154,11 @@ import type {
   OfficecliSkill,
   SkillSyncReport,
   ConversationStatePatch,
+  CompletionAttentionCas,
+  CompletionOutcome,
+  CompletionProjectionV2,
+  CompletionProtocolMode,
+  LegacyWorkflowRestartProjection,
   WorkflowGraphSnapshot,
 } from "./types"
 
@@ -1925,12 +1930,54 @@ export async function getWorkflowGraphSnapshot(
   return getTransport().call("get_workflow_graph_snapshot", { conversationId })
 }
 
+export interface CompletionMutationResult {
+  workflow_id: string
+  task_id: string
+  node_id: string
+  kind: CompletionAttentionCas["kind"]
+  outcome: CompletionOutcome
+  evidence_scope_digest: string
+  graph_revision: number
+  idempotent_replay: boolean
+  completion?: CompletionProjectionV2 | null
+}
+
+export async function resolveCompletionDecision(request: {
+  cas: CompletionAttentionCas
+  outcome: CompletionOutcome
+}): Promise<CompletionMutationResult> {
+  return getTransport().call("resolve_completion_decision", request)
+}
+
+export async function retryCompletionArtifact(request: {
+  cas: CompletionAttentionCas
+}): Promise<CompletionMutationResult> {
+  return getTransport().call("retry_completion_artifact", request)
+}
+
+export async function resolveDesignSelfReview(request: {
+  cas: CompletionAttentionCas
+  outcome: CompletionOutcome
+}): Promise<CompletionMutationResult> {
+  return getTransport().call("resolve_design_self_review", request)
+}
+
+export async function restartLegacyWorkflow(request: {
+  source_conversation_id: number
+}): Promise<LegacyWorkflowRestartProjection> {
+  return getTransport().call("restart_legacy_workflow", {
+    sourceConversationId: request.source_conversation_id,
+  })
+}
+
 /** Live clock after durable manifest / gate settlement commit. */
 export const WORKFLOW_GRAPH_CHANGED_EVENT = "workflow_graph://changed"
 
 /** Observed-only compatibility nudge (no durable graph clock). */
 export const WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT =
   "workflow_graph://compatibility_nudge"
+
+export const COMPLETION_DECISION_RESOLVED_EVENT = "completion_decision_resolved"
 
 export type WorkflowGraphChangedEventPayload = {
   parent_conversation_id: number
@@ -1940,6 +1987,18 @@ export type WorkflowGraphChangedEventPayload = {
 
 export type WorkflowCompatibilityNudgeEventPayload = {
   parent_conversation_id: number
+}
+
+export type CompletionDecisionResolvedEventPayload = {
+  version: 1
+  event_id: string
+  workflow_id: string
+  task_id: string
+  node_id: string
+  kind: CompletionAttentionCas["kind"]
+  outcome: CompletionOutcome
+  evidence_scope_digest: string
+  graph_revision: number
 }
 
 export async function subscribeWorkflowGraphChanged(
@@ -1956,6 +2015,15 @@ export async function subscribeWorkflowCompatibilityNudge(
 ): Promise<() => void> {
   return getTransport().subscribe<WorkflowCompatibilityNudgeEventPayload>(
     WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+    handler
+  )
+}
+
+export async function subscribeCompletionDecisionResolved(
+  handler: (payload: CompletionDecisionResolvedEventPayload) => void
+): Promise<() => void> {
+  return getTransport().subscribe<CompletionDecisionResolvedEventPayload>(
+    COMPLETION_DECISION_RESOLVED_EVENT,
     handler
   )
 }
@@ -4160,6 +4228,29 @@ export interface DelegationSettings {
   /** Optional per-agent overrides applied when codeg-mcp spawns a subagent.
    * Keyed by `agent_type`. Missing entries mean "use agent defaults." */
   agent_defaults?: Partial<Record<AgentType, AgentDelegationDefaults>>
+}
+
+export interface CompletionProtocolSettingsSnapshot {
+  default_mode: CompletionProtocolMode
+  profile_overrides: Record<string, CompletionProtocolMode>
+  minimum_samples: number
+  creation_modes: Record<string, number>
+  shadow_differences: Record<string, number>
+  rollout_windows: Record<
+    string,
+    { samples: number; role_mismatch: number; needs_decision: number }
+  >
+  rollout_decisions: Record<
+    string,
+    | "insufficient_samples"
+    | "may_expand"
+    | "stop_role_mismatch"
+    | "stop_needs_decision"
+  >
+}
+
+export async function getCompletionProtocolSettings(): Promise<CompletionProtocolSettingsSnapshot> {
+  return getTransport().call("get_completion_protocol_settings")
 }
 
 export async function getDelegationSettings(): Promise<DelegationSettings> {

@@ -8024,12 +8024,12 @@ impl DelegationBroker {
                                 .record_completion_tool_supersession(context.role);
                         }
                     }
-                    if let (Some(source), Some(role)) = (projection.source, role) {
+                    if let (Some(source), Some(role)) = (projection.card.source, role) {
                         self.metrics.record_completion_resolution(source, role);
                     } else if let (Some(runs), Some(context), Some(attention)) = (
                         self.run_store.as_ref(),
                         metric_context.as_ref(),
-                        projection.attention.as_ref(),
+                        projection.card.attention.as_ref(),
                     ) {
                         if let Ok(Some(metric)) = runs
                             .terminal_completion_attention_metric(task_id, &attention.attention_id)

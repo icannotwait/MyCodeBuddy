@@ -133,6 +133,8 @@ interface SubAgentOverlayProps {
    * Detail reseeds do not reinstall active refresh interest.
    */
   workflowGraph?: WorkflowGraphSnapshot | null
+  onResumeRoot?: () => void | Promise<void>
+  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }
 
 function formatActivityTime(iso?: string): string | null {
@@ -353,6 +355,8 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   defaultExpanded = true,
   conversationId = null,
   workflowGraph = null,
+  onResumeRoot,
+  onOpenRootConversation,
 }: SubAgentOverlayProps) {
   const t = useTranslations("Folder.chat.subAgentOverlay")
   const tw = useTranslations("Folder.chat.workflowGraph")
@@ -768,9 +772,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                   {currentNodes.slice(0, 2).map((node) => {
                     const openable = canOpenWorkflowNode(node)
                     const title =
-                      node.title?.trim() ||
-                      node.summary?.trim() ||
-                      node.node_id
+                      node.title?.trim() || node.summary?.trim() || node.node_id
                     const content = (
                       <>
                         <WorkflowStatusIcon visualStatus={node.status} />
@@ -842,7 +844,14 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                   )}
                 </div>
               )}
-              {graphExpanded && <WorkflowGraphPanel snapshot={graph} />}
+              {graphExpanded && (
+                <WorkflowGraphPanel
+                  snapshot={graph}
+                  conversationId={conversationId}
+                  onResumeRoot={onResumeRoot}
+                  onOpenRootConversation={onOpenRootConversation}
+                />
+              )}
             </div>
           )}
 

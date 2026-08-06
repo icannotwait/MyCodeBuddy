@@ -94,16 +94,24 @@ describe("DelegationSettingsSection", () => {
       default_mode: "v2_shadow",
       profile_overrides: { "codex|reviewer": "v2_enforce" },
       minimum_samples: 100,
-      creation_modes: { v2_shadow: 100 },
-      shadow_differences: { role_mismatch: 2 },
+      creation_modes: { v2_shadow: 100, v2_enforce: 7 },
+      shadow_differences: { role_mismatch: 2, needs_decision: 3 },
       rollout_windows: {
         "codex|reviewer": {
           samples: 100,
           role_mismatch: 2,
           needs_decision: 0,
         },
+        "claude|author": {
+          samples: 40,
+          role_mismatch: 0,
+          needs_decision: 3,
+        },
       },
-      rollout_decisions: { "codex|reviewer": "stop_role_mismatch" },
+      rollout_decisions: {
+        "codex|reviewer": "stop_role_mismatch",
+        "claude|author": "stop_needs_decision",
+      },
     })
 
     renderWithIntl()
@@ -113,6 +121,13 @@ describe("DelegationSettingsSection", () => {
       screen.getByText("Rollout paused: role mismatch above 1%")
     ).toBeInTheDocument()
     expect(screen.getByText("100 terminal samples")).toBeInTheDocument()
+    expect(screen.getByText("40 terminal samples")).toBeInTheDocument()
+    expect(screen.queryByText("140 terminal samples")).not.toBeInTheDocument()
+    expect(screen.getByText("v2 shadow: 100 creations")).toBeInTheDocument()
+    expect(screen.getByText("v2 enforce: 7 creations")).toBeInTheDocument()
+    expect(
+      screen.getByText("Rollout paused: decisions required above 5%")
+    ).toBeInTheDocument()
   })
 
   it("renders the enable switch and depth input", async () => {

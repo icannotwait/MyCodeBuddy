@@ -11,10 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
-import {
-  getWorkflowGraphSnapshot,
-  restartLegacyWorkflow,
-} from "@/lib/api"
+import { getWorkflowGraphSnapshot, restartLegacyWorkflow } from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
 import {
@@ -387,13 +384,23 @@ afterEach(() => {
 
 describe("SubAgentOverlay A13 workflow mount", () => {
   it("renders legacy backlinks and resumes only through durable root controls", async () => {
+    const calls: string[] = []
+    const onOpenRootConversation = vi.fn(async (conversationId: number) => {
+      calls.push(`open:${conversationId}`)
+    })
+    const onResumeRoot = vi.fn(async () => {
+      calls.push("resume")
+    })
     const legacy = {
       ...skeletonGraph(),
       completion_protocol: {
         version: 1,
         mode: "v1" as const,
         creation_mode: "v1" as const,
-        legacy_source: null,
+        legacy_source: {
+          workflow_id: "wf-source",
+          conversation_id: 41,
+        },
         v2_successor: {
           workflow_id: "wf-successor",
           conversation_id: 99,
@@ -427,7 +434,10 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       },
       idempotent_replay: false,
     })
-    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(legacy)
+    vi.mocked(getWorkflowGraphSnapshot).mockImplementation(async () => {
+      calls.push("refresh")
+      return legacy
+    })
 
     renderWithIntl(
       <SubAgentOverlay
@@ -436,6 +446,8 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         conversationId={42}
         workflowGraph={legacy}
         defaultExpanded
+        onOpenRootConversation={onOpenRootConversation}
+        onResumeRoot={onResumeRoot}
       />
     )
     await userEvent.click(
@@ -443,7 +455,16 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     )
 
     expect(screen.getByText("Legacy workflow is read-only")).toBeInTheDocument()
-    expect(screen.getByText("Successor workflow #99")).toBeInTheDocument()
+    await userEvent.click(
+      screen.getByRole("button", { name: "Legacy source workflow #41" })
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Successor workflow #99" })
+    )
+    expect(onOpenRootConversation).toHaveBeenNthCalledWith(1, 41)
+    expect(onOpenRootConversation).toHaveBeenNthCalledWith(2, 99)
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
+
     await userEvent.click(
       screen.getByRole("button", { name: "Restart with completion v2" })
     )
@@ -451,10 +472,63 @@ describe("SubAgentOverlay A13 workflow mount", () => {
       source_conversation_id: 42,
     })
 
+    calls.length = 0
     await userEvent.click(
       screen.getByRole("button", { name: "Resume root orchestration" })
     )
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+    await waitFor(() => expect(onResumeRoot).toHaveBeenCalledTimes(1))
+    expect(getWorkflowGraphSnapshot).toHaveBeenLastCalledWith(42)
+    expect(calls).toEqual(["refresh", "resume"])
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
+  })
+
+  it("does not resume after the durable snapshot enables automatic root wake", async () => {
+    const onResumeRoot = vi.fn()
+    const manual = {
+      ...skeletonGraph(),
+      completion_protocol: {
+        version: 2,
+        mode: "v2_enforce" as const,
+        creation_mode: "v2_enforce" as const,
+        legacy_source: null,
+        v2_successor: null,
+        read_only_reason: null,
+        automatic_root_wake: false,
+      },
+    }
+    const automatic = {
+      ...manual,
+      graph_revision: 2,
+      completion_protocol: {
+        ...manual.completion_protocol,
+        automatic_root_wake: true,
+      },
+    }
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(manual)
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={manual}
+        defaultExpanded
+        onResumeRoot={onResumeRoot}
+      />
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    )
+    const resume = screen.getByRole("button", {
+      name: "Resume root orchestration",
+    })
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(automatic)
+    await userEvent.click(resume)
+
+    await waitFor(() =>
+      expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+    )
+    expect(onResumeRoot).not.toHaveBeenCalled()
   })
 
   it("first-seeds a graphless open overlay without expanding the full graph", async () => {

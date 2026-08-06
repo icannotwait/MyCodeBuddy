@@ -655,9 +655,7 @@ async fn build_tools_call_spawn(
         return LineAction::Respond(err(
             Value::Null,
             -32600,
-            format!(
-                "Invalid Request: {name} request id exceeds 256 serialized bytes"
-            ),
+            format!("Invalid Request: {name} request id exceeds 256 serialized bytes"),
         ));
     }
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -2453,7 +2451,10 @@ pub fn render_session_outcome_with_budget(
     }
 
     // 1) Drop oldest message items until only the newest remains.
-    while session_message_items(&outcome).map(|items| items.len() > 1).unwrap_or(false) {
+    while session_message_items(&outcome)
+        .map(|items| items.len() > 1)
+        .unwrap_or(false)
+    {
         drop_oldest_session_message(&mut outcome);
         let candidate = ok(id.clone(), render_session_result(&outcome));
         if serialize_jsonrpc_line(&candidate)?.len() <= max_bytes {
@@ -2540,9 +2541,7 @@ pub fn render_session_outcome_with_budget(
 }
 
 fn session_message_items(outcome: &Value) -> Option<&Vec<Value>> {
-    outcome
-        .pointer("/messages/items")
-        .and_then(Value::as_array)
+    outcome.pointer("/messages/items").and_then(Value::as_array)
 }
 
 fn mark_session_messages_truncated(outcome: &mut Value) {
@@ -2914,6 +2913,31 @@ mod tests {
             "publication_token": "publication-quote\"slash\\界",
             "plan_target_rel_path": "docs/界/plan-quote\"slash\\.md",
             "risk_policy_version": "b2d_task_risk_v1",
+            "completion_protocol": {
+                "version": 2,
+                "mode": "v2_enforce",
+                "creation_mode": "v2_enforce",
+                "automatic_root_wake": false
+            },
+            "completion": {
+                "protocol_version": 2,
+                "graph_revision": 11,
+                "card": {
+                    "state": "needs_decision",
+                    "role": "reviewer",
+                    "summary": "C".repeat(1024),
+                    "source": "assistant_conclusion",
+                    "evidence_validated": false,
+                    "attention": {
+                        "attention_id": "attention-budget",
+                        "task_id": "task-budget",
+                        "kind": "completion_decision",
+                        "captured_scope_digest": format!("sha256:{}", "a".repeat(64)),
+                        "latest_run_id": "task-budget",
+                        "node_id": "plan-reviewer-quote\"slash\\界"
+                    }
+                }
+            },
             "task_policies": [{
                 "task_index": 1,
                 "risk": {
@@ -4741,6 +4765,18 @@ mod tests {
             assert!(index
                 .pointer("/latest_plan_review/findings/0/summary")
                 .is_none());
+            assert_eq!(index["completion"]["protocol_version"], 2);
+            assert_eq!(
+                index["completion"]["card"]["attention"]["attention_id"],
+                "attention-budget"
+            );
+            assert_eq!(
+                index["completion"]["card"]["summary"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                1024
+            );
         }
     }
 
@@ -5898,7 +5934,9 @@ mod tests {
         let structured = &response.result.as_ref().unwrap()["structuredContent"];
         assert_eq!(structured["found"], true);
         assert_eq!(structured["session_id"], 2868);
-        if let Some(items) = structured.pointer("/messages/items").and_then(Value::as_array)
+        if let Some(items) = structured
+            .pointer("/messages/items")
+            .and_then(Value::as_array)
         {
             // Newest turns are at the end (chronological order).
             let last = items.last().unwrap();
@@ -5910,12 +5948,10 @@ mod tests {
             assert_eq!(structured["messages"]["truncated"], true);
         } else {
             // Metadata-only fallback is acceptable when even one message overflows.
-            assert!(
-                structured["note"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("7680-byte")
-            );
+            assert!(structured["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("7680-byte"));
         }
     }
 
@@ -6065,12 +6101,10 @@ mod tests {
         );
         let structured = &response.result.as_ref().unwrap()["structuredContent"];
         assert!(structured.get("messages").is_none());
-        assert!(
-            structured["note"]
-                .as_str()
-                .unwrap_or("")
-                .contains("7680-byte")
-        );
+        assert!(structured["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("7680-byte"));
         assert_eq!(structured["session_id"], 99);
     }
 

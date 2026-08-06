@@ -603,7 +603,19 @@
         "native": "Native"
       },
       "softWatchdog": "소프트 워치독(초)",
-      "softWatchdogHint": "관찰 전용 정체 임계값({min}–{max}). 0이면 정체 표시 비활성. 취소하거나 라우트를 바꾸지 않습니다."
+      "softWatchdogHint": "관찰 전용 정체 임계값({min}–{max}). 0이면 정체 표시 비활성. 취소하거나 라우트를 바꾸지 않습니다.",
+      "completionDefaultMode": "완료 생성 모드",
+      "completionCreations": "{mode}: {count}건 생성",
+      "completionSamples": "터미널 샘플 {count}개",
+      "completionMinimumProgress": "최소 샘플 {minimum}개 중 {count}개",
+      "completionOverride": "{profile}: {mode}",
+      "completionShadowDifference": "{kind}: {count}",
+      "completionRolloutDecision": {
+        "insufficient_samples": "롤아웃이 최소 샘플 수를 기다리는 중입니다",
+        "may_expand": "롤아웃을 확대할 수 있습니다",
+        "stop_role_mismatch": "롤아웃 일시 중지: 역할 불일치가 1%를 초과했습니다",
+        "stop_needs_decision": "롤아웃 일시 중지: 결정 필요 비율이 5%를 초과했습니다"
+      }
     },
     "actions": {
       "dragSort": "드래그하여 순서 변경",
@@ -2763,7 +2775,36 @@
           "waiting_review": "검토 대기",
           "waiting_adjudication": "판정 대기",
           "superseded": "대체됨"
-        }
+        },
+        "completionResolved": "해결됨",
+        "completionNeedsDecision": "결정 필요",
+        "completionBlocked": "차단됨",
+        "completionEvidenceValidated": "증거 검증됨",
+        "completionRetryArtifact": "산출물 다시 시도",
+        "completionStale": "이 결정은 오래되었습니다. 워크플로를 다시 불러오세요.",
+        "completionConflict": "다른 결과가 이미 확정되었습니다.",
+        "completionLegacyReadOnly": "레거시 워크플로는 읽기 전용입니다",
+        "completionLegacyRestart": "완료 프로토콜 v2로 다시 시작",
+        "completionLegacySource": "레거시 원본 워크플로 #{conversation}",
+        "completionLegacySuccessor": "후속 워크플로 #{conversation}",
+        "completionAutomaticWake": "루트 오케스트레이션이 자동으로 재개되었습니다",
+        "completionManualRootResume": "루트 오케스트레이션 재개",
+        "completionOutcome": {
+          "approve": "승인",
+          "approve_with_minors": "경미한 수정 조건부 승인",
+          "request_changes": "변경 요청",
+          "block": "차단",
+          "done": "완료",
+          "done_with_concerns": "우려 사항과 함께 완료",
+          "blocked": "차단됨"
+        },
+        "completionSource": {
+          "complete_work": "완료 도구",
+          "assistant_conclusion": "어시스턴트 결론",
+          "report": "검증된 보고서",
+          "user_adjudication": "사용자 결정"
+        },
+        "completionReportFile": "보고서: {file}"
       },
       "agentPlanOverlay": {
         "title": "에이전트 계획",

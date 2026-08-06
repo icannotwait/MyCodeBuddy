@@ -602,6 +602,18 @@
         "codeg": "Codeg",
         "native": "Native"
       },
+      "completionDefaultMode": "Completion creation mode",
+      "completionCreations": "{mode}: {count} creations",
+      "completionSamples": "{count} terminal samples",
+      "completionMinimumProgress": "{count} / {minimum} minimum samples",
+      "completionOverride": "{profile}: {mode}",
+      "completionShadowDifference": "{kind}: {count}",
+      "completionRolloutDecision": {
+        "insufficient_samples": "Rollout waiting for the minimum sample count",
+        "may_expand": "Rollout may expand",
+        "stop_role_mismatch": "Rollout paused: role mismatch above 1%",
+        "stop_needs_decision": "Rollout paused: decisions required above 5%"
+      },
       "softWatchdog": "Soft watchdog (seconds)",
       "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). 0 disables stall marking. Does not cancel or change route."
     },
@@ -2729,6 +2741,35 @@
         "dependencies": "Dependencies",
         "dependenciesToggle": "Dependencies ({count})",
         "moreCurrentNodes": "+{count}",
+        "completionResolved": "Resolved",
+        "completionNeedsDecision": "Decision required",
+        "completionBlocked": "Blocked",
+        "completionEvidenceValidated": "Evidence validated",
+        "completionReportFile": "Report: {file}",
+        "completionRetryArtifact": "Retry artifact",
+        "completionStale": "This decision is stale. Reload the workflow.",
+        "completionConflict": "A different outcome was already committed.",
+        "completionLegacyReadOnly": "Legacy workflow is read-only",
+        "completionLegacyRestart": "Restart with completion v2",
+        "completionLegacySource": "Legacy source workflow #{conversation}",
+        "completionLegacySuccessor": "Successor workflow #{conversation}",
+        "completionAutomaticWake": "Root orchestration resumed automatically",
+        "completionManualRootResume": "Resume root orchestration",
+        "completionOutcome": {
+          "approve": "Approve",
+          "approve_with_minors": "Approve with minors",
+          "request_changes": "Request changes",
+          "block": "Block",
+          "done": "Done",
+          "done_with_concerns": "Done with concerns",
+          "blocked": "Blocked"
+        },
+        "completionSource": {
+          "complete_work": "Completion tool",
+          "assistant_conclusion": "Assistant conclusion",
+          "report": "Validated report",
+          "user_adjudication": "User decision"
+        },
         "phase": {
           "design": "Design",
           "plan": "Plan",

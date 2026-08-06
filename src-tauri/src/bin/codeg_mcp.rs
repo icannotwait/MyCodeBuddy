@@ -496,6 +496,12 @@ mod tests {
                 "schema_version": 2,
                 "plan_target_rel_path": "docs/plan.md",
                 "risk_policy_version": "b2d_task_risk_v1",
+                "completion_protocol": {
+                    "version": 2,
+                    "mode": "v2_enforce",
+                    "creation_mode": "v2_enforce",
+                    "automatic_root_wake": true
+                },
                 "detail": "index",
                 "inline_findings": false,
                 "payload_truncated": false,

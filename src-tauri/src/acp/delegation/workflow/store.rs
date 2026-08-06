@@ -50,6 +50,7 @@ use super::completion_evidence::{
 };
 use super::completion_intent::CompletionOutcome;
 use super::completion_projection::{
+    load_completion_projection, load_workflow_completion_projection_batch,
     validated_design_self_review_outcome, DesignSelfReviewDecisionError,
 };
 use super::error::WorkflowStoreError;
@@ -3340,16 +3341,18 @@ pub async fn get_workflow_state_core(
                 };
                 let run_by_id: HashMap<String, &delegation_task_run::Model> =
                     runs.iter().map(|r| (r.task_id.clone(), r)).collect();
-                let mut validated_v2_by_task = HashMap::new();
-                if header.completion_protocol_version == 2 {
-                    for binding in latest_by_node.values() {
-                        if let Ok(validated) =
-                            load_validated_completion_evidence(txn, &binding.task_id).await
-                        {
-                            validated_v2_by_task.insert(binding.task_id.clone(), validated);
-                        }
-                    }
-                }
+                let completion_batch = load_workflow_completion_projection_batch(
+                    txn,
+                    &header,
+                    &normalized,
+                    &bindings,
+                    &run_bindings,
+                    &runs,
+                )
+                .await
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+                let validated_v2_by_task = completion_batch.validated_by_task;
+                let completion_v2_by_task = completion_batch.completion_by_task;
 
                 let required_node_ids: HashSet<String> = normalized
                     .gates
@@ -3396,6 +3399,9 @@ pub async fn get_workflow_state_core(
                             reviewed_task_id: latest.and_then(|rb| rb.reviewed_task_id.clone()),
                             verdict,
                             report_file,
+                            completion: latest
+                                .and_then(|rb| completion_v2_by_task.get(&rb.task_id))
+                                .cloned(),
                             gate_id: latest.and_then(|rb| rb.gate_id.clone()),
                             gate_cycle: latest.and_then(|rb| rb.gate_cycle),
                             replaced_task_id: run.and_then(|r| r.replaced_task_id.clone()),
@@ -3519,6 +3525,23 @@ pub async fn get_workflow_state_core(
                     task_gate_passed.insert(policy.task_index, evaluation.passed);
                 }
 
+                let design_root_completion =
+                    delegation_workflow_design_root_binding::Entity::find()
+                        .filter(
+                            delegation_workflow_design_root_binding::Column::WorkflowId
+                                .eq(header.workflow_id.clone()),
+                        )
+                        .one(txn)
+                        .await
+                        .map_err(db_err)?
+                        .map(|binding| binding.task_id);
+                let design_root_completion = match design_root_completion {
+                    Some(task_id) => load_completion_projection(txn, &task_id)
+                        .await
+                        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
+                    None => None,
+                };
+
                 let full_state = WorkflowStateDto {
                     workflow_id: header.workflow_id,
                     parent_conversation_id: header.parent_conversation_id,
@@ -3532,6 +3555,21 @@ pub async fn get_workflow_state_core(
                     plan_target_rel_path: normalized.plan_target_rel_path,
                     risk_policy_version: normalized.risk_policy_version,
                     completion_protocol,
+                    completion: design_root_completion.or_else(|| {
+                        nodes
+                            .iter()
+                            .filter_map(|node| node.completion.as_ref())
+                            .find(|completion| {
+                                completion.card.state != super::CompletionCardState::Resolved
+                            })
+                            .or_else(|| {
+                                nodes
+                                    .iter()
+                                    .filter_map(|node| node.completion.as_ref())
+                                    .next()
+                            })
+                            .cloned()
+                    }),
                     task_policies: normalized.task_policies,
                     design: normalized.design,
                     plan: normalized.plan,
@@ -4342,6 +4380,7 @@ fn project_invalid_manifest_recovery_index(
         plan_target_rel_path: snapshot.plan_target_rel_path.clone(),
         risk_policy_version: String::new(),
         completion_protocol,
+        completion: None,
         recovery: Some(recovery),
         detail: super::state_dto::WorkflowStateDetail::Index,
         inline_findings: false,

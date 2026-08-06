@@ -774,6 +774,88 @@ export type ProjectedNodeStatus =
   | "waiting_adjudication"
   | "superseded"
 
+export type CompletionAttentionKind =
+  | "completion_decision"
+  | "completion_artifact_recovery"
+  | "design_self_review_decision"
+
+export type CompletionOutcome =
+  | "approve"
+  | "approve_with_minors"
+  | "request_changes"
+  | "block"
+  | "done"
+  | "done_with_concerns"
+  | "blocked"
+
+export type CompletionRole = "reviewer" | "author" | "implementer" | "fixer"
+export type CompletionSource =
+  | "complete_work"
+  | "assistant_conclusion"
+  | "report"
+  | "user_adjudication"
+
+export interface CompletionAttentionCas {
+  attention_id: string
+  task_id: string
+  kind: CompletionAttentionKind
+  captured_scope_digest: string
+  latest_run_id: string
+  node_id: string
+}
+
+export interface CompletionCardV2 {
+  state: "resolved" | "needs_decision" | "blocked"
+  role?: CompletionRole | null
+  outcome?: CompletionOutcome | null
+  summary?: string | null
+  report_file?: string | null
+  source?: CompletionSource | null
+  evidence_validated: boolean
+  attention?: CompletionAttentionCas | null
+}
+
+export interface CompletionProjectionV2 {
+  protocol_version: 2
+  card: CompletionCardV2
+  graph_revision: number
+}
+
+export type CompletionProtocolMode = "v1" | "v2_shadow" | "v2_enforce"
+
+export interface LegacyWorkflowLink {
+  workflow_id: string
+  conversation_id: number
+}
+
+export interface CompletionProtocolWorkflowProjection {
+  version: number
+  mode: CompletionProtocolMode
+  creation_mode: CompletionProtocolMode
+  legacy_source?: LegacyWorkflowLink | null
+  v2_successor?: LegacyWorkflowLink | null
+  read_only_reason?: string | null
+  automatic_root_wake: boolean
+}
+
+export interface LegacyWorkflowRestartProjection {
+  source_workflow_id: string
+  source_conversation_id: number
+  successor_workflow_id: string
+  successor_conversation_id: number
+  open_gate: "design" | "plan"
+  completion_protocol: CompletionProtocolWorkflowProjection
+  restart_context: {
+    original_conversation_id: number
+    original_request_id: string
+    original_request_text: string
+    original_request_digest: string
+    agent_type: string
+    profile_id?: string | null
+  }
+  idempotent_replay: boolean
+}
+
 /** Mirrors Rust `WorkflowGraphSnapshot` (redacted — no work_unit_key). */
 export interface WorkflowGraphSnapshot {
   schema_version: number
@@ -782,6 +864,8 @@ export interface WorkflowGraphSnapshot {
   manifest_revision?: number | null
   graph_revision?: number | null
   manifest_state?: string | null
+  completion_protocol?: CompletionProtocolWorkflowProjection | null
+  completion?: CompletionProjectionV2 | null
   compatibility: WorkflowCompatibility
   overall_state: WorkflowOverallState
   current_phase_id?: string | null
@@ -843,6 +927,7 @@ export interface WorkflowNodeSnapshot {
   deletions?: number | null
   line_counts_complete?: boolean | null
   summary?: string | null
+  completion?: CompletionProjectionV2 | null
   is_observed: boolean
   retained_observed: boolean
   required: boolean

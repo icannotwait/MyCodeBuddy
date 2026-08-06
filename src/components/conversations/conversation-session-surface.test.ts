@@ -494,6 +494,11 @@ type CapturedShellProps = {
   children?: unknown
 }
 
+type CapturedMessageListProps = {
+  onResumeRoot?: () => void
+  onOpenRootConversation?: (conversationId: number) => Promise<void>
+}
+
 type QueueItem = {
   id: string
   draft: {
@@ -583,6 +588,8 @@ const surfaceH = vi.hoisted(() => ({
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
+  messageListProps: null as CapturedMessageListProps | null,
+  openTab: vi.fn(async () => true),
   /** Lifecycle mock `conn.supportsFork` (fork affordance wiring). */
   supportsFork: false,
   /** Broker-known delegated-child identity before detail hydration. */
@@ -757,6 +764,7 @@ vi.mock("@/stores/app-workspace-store", () => {
 
 vi.mock("@/contexts/tab-context", () => ({
   useTabActions: () => ({
+    openTab: surfaceH.openTab,
     bindConversationTab: vi.fn(),
     setChatDraftWorkingDir: vi.fn(),
     setTabRuntimeConversationId: vi.fn(),
@@ -891,7 +899,10 @@ vi.mock("zustand/react/shallow", () => ({
 }))
 
 vi.mock("@/components/message/message-list-view", () => ({
-  MessageListView: () => null,
+  MessageListView: (props: CapturedMessageListProps) => {
+    surfaceH.messageListProps = props
+    return null
+  },
 }))
 
 vi.mock("@/components/message/initial-history-scroll-controller", () => ({
@@ -1102,6 +1113,8 @@ function resetSurfaceHarness() {
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
+  surfaceH.messageListProps = null
+  surfaceH.openTab.mockClear()
   surfaceH.renderRoot = null
   surfaceH.supportsFork = false
   surfaceH.isDelegationChild = false
@@ -1140,6 +1153,43 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
     // Keep-alive surfaces stay mounted unless cleaned; prevent lastOptions
     // pollution across cases that mutate surfaceH harness fields.
     cleanup()
+  })
+
+  it("routes durable workflow controls through the root send and tab entries", async () => {
+    surfaceH.conversations = [
+      fullSummary(42, "in_progress", BASELINE),
+      fullSummary(99, "completed", NEWER),
+    ]
+    surfaceH.connStatus = "connected"
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(surfaceH.messageListProps?.onResumeRoot).toEqual(
+      expect.any(Function)
+    )
+    act(() => {
+      surfaceH.messageListProps!.onResumeRoot!()
+    })
+    expect(lifecycleCapture.handleSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        blocks: [
+          {
+            type: "text",
+            text: "Continue root orchestration from the durable workflow state.",
+          },
+        ],
+        displayText:
+          "Continue root orchestration from the durable workflow state.",
+      }),
+      undefined,
+      expect.objectContaining({ conversationId: 42 })
+    )
+
+    await act(async () => {
+      await surfaceH.messageListProps!.onOpenRootConversation!(99)
+    })
+    expect(surfaceH.openTab).toHaveBeenCalledWith(1, 99, "claude", true, "t")
   })
 
   it("passes autoConnectAllowed === false for a missing persisted summary", () => {

@@ -22,11 +22,27 @@ import {
   setToolWatchdogSettings,
   matchReferenceRegex,
   nextReferenceSearchPage,
+  restartLegacyWorkflow,
   saveTranslationAs,
   startReferenceSearch,
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
+
+describe("completion restart transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({})
+  })
+
+  it("uses the Tauri-compatible top-level camelCase argument", async () => {
+    await restartLegacyWorkflow({ source_conversation_id: 42 })
+
+    expect(mockTransport.call).toHaveBeenCalledWith("restart_legacy_workflow", {
+      sourceConversationId: 42,
+    })
+  })
+})
 
 describe("getFolderConversation history window payload", () => {
   beforeEach(() => {

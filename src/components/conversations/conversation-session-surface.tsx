@@ -101,6 +101,9 @@ import {
 } from "@/lib/message-input-draft"
 import type { PromptDraftRestore } from "@/components/chat/message-input"
 
+const ROOT_ORCHESTRATION_RESUME_PROMPT =
+  "Continue root orchestration from the durable workflow state."
+
 /**
  * Durable auto-connect policy for a session surface root.
  *
@@ -388,6 +391,7 @@ export const ConversationSessionSurface = memo(
     )
     const folderId = ownFolderId ?? 0
     const {
+      openTab,
       bindConversationTab,
       setChatDraftWorkingDir,
       setTabRuntimeConversationId,
@@ -2194,6 +2198,36 @@ export const ConversationSessionSurface = memo(
       return Number.isFinite(armedAtMs) ? armedAtMs : Date.now()
     })()
 
+    const handleResumeRoot = useCallback(() => {
+      handleSend({
+        blocks: [{ type: "text", text: ROOT_ORCHESTRATION_RESUME_PROMPT }],
+        displayText: ROOT_ORCHESTRATION_RESUME_PROMPT,
+      })
+    }, [handleSend])
+
+    const handleOpenRootConversation = useCallback(
+      async (rootConversationId: number) => {
+        let summary = useAppWorkspaceStore
+          .getState()
+          .conversations.find((row) => row.id === rootConversationId)
+        if (!summary) {
+          await refreshConversations()
+          summary = useAppWorkspaceStore
+            .getState()
+            .conversations.find((row) => row.id === rootConversationId)
+        }
+        if (!summary || summary.folder_id <= 0) return
+        await openTab(
+          summary.folder_id,
+          summary.id,
+          summary.agent_type,
+          true,
+          summary.title ?? undefined
+        )
+      },
+      [openTab, refreshConversations]
+    )
+
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
@@ -2215,6 +2249,8 @@ export const ConversationSessionSurface = memo(
           historyLoadComplete={detail != null}
           focusTurnAnchor={focusTurnAnchor}
           waitingForSubagentsArmedAtMs={waitingForSubagentsArmedAtMs}
+          onResumeRoot={handleResumeRoot}
+          onOpenRootConversation={handleOpenRootConversation}
         />
       </GoalControlProvider>
     )

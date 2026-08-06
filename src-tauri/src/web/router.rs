@@ -179,6 +179,10 @@ pub fn build_router(
             post(handlers::workflow_completion::resolve_completion_decision),
         )
         .route(
+            "/get_completion_protocol_settings",
+            post(handlers::workflow_completion::get_completion_protocol_settings),
+        )
+        .route(
             "/retry_completion_artifact",
             post(handlers::workflow_completion::retry_completion_artifact),
         )

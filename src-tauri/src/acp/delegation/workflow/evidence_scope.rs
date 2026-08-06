@@ -29,7 +29,8 @@ use super::types::{
     EvidenceScopeInputV2, EvidenceValidationContext, InstructionBlockV1, MaterialIdentitySummary,
     NormalizedManifest, PlanSubjectIdentityV2, RequirementsIdentityV1, ReviewedProducerIdentityV2,
     RoleReviewScopeV2, ScopeEdgeV2, StableNodeIdentityV2, TaskSpecificationIdentityV1,
-    ValidatedCompletionEvidence, COMPLETE_WORK_SUMMARY_MAX_BYTES, COMPLETION_PROTOCOL_VERSION_V2,
+    ValidatedCompletionEvidence, COMPLETE_WORK_REPORT_FILE_MAX_BYTES,
+    COMPLETE_WORK_SUMMARY_MAX_BYTES, COMPLETION_PROTOCOL_VERSION_V2,
     EVIDENCE_SCOPE_SCHEMA_VERSION_V2, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
 };
 use super::{build_conclusion_suffix, normalize_rel_path, CompletionRole};
@@ -52,6 +53,42 @@ const INSTRUCTION_TEMPLATE_VERSION: u32 = 1;
 const INSTRUCTION_DOMAIN: &str = "codeg.completion.instruction.v1";
 const REVIEW_SCOPE_DOMAIN: &str = "codeg.completion.review_scope.v2";
 const EVIDENCE_SCOPE_DOMAIN: &str = "codeg.completion.evidence_scope.v2";
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_CONTEXT_MANIFEST_LOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPLETION_CONTEXT_REQUIREMENTS_LOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_completion_context_prepare_counts() {
+    COMPLETION_CONTEXT_MANIFEST_LOAD_COUNT.with(|count| count.set(0));
+    COMPLETION_CONTEXT_REQUIREMENTS_LOAD_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn completion_context_prepare_counts() -> (usize, usize) {
+    (
+        COMPLETION_CONTEXT_MANIFEST_LOAD_COUNT.with(std::cell::Cell::get),
+        COMPLETION_CONTEXT_REQUIREMENTS_LOAD_COUNT.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn note_completion_context_manifest_load() {
+    COMPLETION_CONTEXT_MANIFEST_LOAD_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_completion_context_manifest_load() {}
+
+#[cfg(test)]
+fn note_completion_context_requirements_load() {
+    COMPLETION_CONTEXT_REQUIREMENTS_LOAD_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_completion_context_requirements_load() {}
 
 const ALLOWED_DIGEST_DOMAINS: &[&str] = &[
     "codeg.completion.requirements.v1",
@@ -144,6 +181,12 @@ pub struct AdmissionCandidate<'a> {
     pub producer_baseline_head: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedCompletionContextPreload {
+    normalized: NormalizedManifest,
+    requirements: Option<(RequirementsIdentityV1, String)>,
+}
+
 pub fn build_design_root_review_scope(
     input: &DesignRootScopeInput<'_>,
 ) -> Result<RoleReviewScopeV2, EvidenceScopeError> {
@@ -195,6 +238,42 @@ pub(crate) async fn build_persisted_completion_context<C: ConnectionTrait>(
     .await
 }
 
+pub(crate) async fn preload_persisted_completion_context<C: ConnectionTrait>(
+    store: &WorkflowStore<'_, C>,
+    workflow: &delegation_workflow::Model,
+    normalized: &NormalizedManifest,
+) -> Result<PersistedCompletionContextPreload, EvidenceScopeError> {
+    if workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2) {
+        return Err(EvidenceScopeError::InstructionBindingFailed(
+            "unsupported completion protocol version".into(),
+        ));
+    }
+    let requirements =
+        build_requirements_identity(store, normalized, &workflow.workflow_id).await?;
+    Ok(PersistedCompletionContextPreload {
+        normalized: normalized.clone(),
+        requirements,
+    })
+}
+
+pub(crate) async fn build_preloaded_persisted_completion_context<C: ConnectionTrait>(
+    store: &WorkflowStore<'_, C>,
+    candidate: &AdmissionCandidate<'_>,
+    binding: &delegation_workflow_run_binding::Model,
+    preload: &PersistedCompletionContextPreload,
+) -> Result<AdmissionCompletionContextV2, EvidenceScopeError> {
+    build_completion_context_from_preload(
+        store,
+        candidate,
+        GateRoundSelection::PersistedEvidence {
+            gate_lineage: binding.gate_lineage.as_deref(),
+            review_round: binding.review_round,
+        },
+        preload,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum GateRoundSelection<'a> {
     CurrentAdmission,
@@ -214,9 +293,31 @@ async fn build_completion_context<C: ConnectionTrait>(
             "unsupported completion protocol version".into(),
         ));
     }
+    note_completion_context_manifest_load();
     let snapshot = load_active_manifest_snapshot(store.conn, candidate.workflow)
         .await
         .map_err(|error| EvidenceScopeError::InstructionBindingFailed(error.to_string()))?;
+    let requirements =
+        build_requirements_identity(store, &snapshot.normalized, &candidate.workflow.workflow_id)
+            .await?;
+    let preload = PersistedCompletionContextPreload {
+        normalized: snapshot.normalized,
+        requirements,
+    };
+    build_completion_context_from_preload(store, candidate, gate_round_selection, &preload).await
+}
+
+async fn build_completion_context_from_preload<C: ConnectionTrait>(
+    store: &WorkflowStore<'_, C>,
+    candidate: &AdmissionCandidate<'_>,
+    gate_round_selection: GateRoundSelection<'_>,
+    snapshot: &PersistedCompletionContextPreload,
+) -> Result<AdmissionCompletionContextV2, EvidenceScopeError> {
+    if candidate.workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2) {
+        return Err(EvidenceScopeError::InstructionBindingFailed(
+            "unsupported completion protocol version".into(),
+        ));
+    }
     let scope_role = completion_scope_role(candidate.node)?;
     let role = scope_role.completion_role();
     let task_index = candidate
@@ -265,9 +366,7 @@ async fn build_completion_context<C: ConnectionTrait>(
         }
     };
 
-    let requirements =
-        build_requirements_identity(store, &snapshot.normalized, &candidate.workflow.workflow_id)
-            .await?;
+    let requirements = snapshot.requirements.clone();
     let requirements_identity = requirements.as_ref().map(|(_, digest)| digest.clone());
     let mut material_identities = Vec::new();
     let mut material_selector_digest = None;
@@ -838,6 +937,7 @@ async fn build_requirements_identity<C: ConnectionTrait>(
     manifest: &NormalizedManifest,
     workflow_id: &str,
 ) -> Result<Option<(RequirementsIdentityV1, String)>, EvidenceScopeError> {
+    note_completion_context_requirements_load();
     let Some(design_ref) = manifest.design.as_ref() else {
         return Ok(None);
     };
@@ -2325,6 +2425,11 @@ fn validate_intent(intent: &super::CompletionIntent) -> Result<(), EvidenceScope
         ));
     }
     if let Some(path) = intent.report_file.as_deref() {
+        if path.len() > COMPLETE_WORK_REPORT_FILE_MAX_BYTES {
+            return Err(EvidenceScopeError::EvidenceCorrupt(
+                "completion report file exceeds bound".into(),
+            ));
+        }
         require_canonical_path(path)?;
     }
     Ok(())
@@ -3196,5 +3301,20 @@ mod tests {
                 .code(),
             "completion_scope_changed"
         );
+    }
+
+    #[test]
+    fn shared_validator_rejects_oversized_canonical_report_file() {
+        let (mut evidence, current) = evidence_fixture();
+        evidence.intent.report_file = Some("x".repeat(
+            crate::acp::delegation::workflow::types::COMPLETE_WORK_REPORT_FILE_MAX_BYTES + 1,
+        ));
+
+        let error =
+            validate_completion_evidence(&serde_json::to_string(&evidence).unwrap(), &current)
+                .unwrap_err();
+
+        assert_eq!(error.code(), "completion_evidence_corrupt");
+        assert!(error.to_string().contains("report file exceeds bound"));
     }
 }

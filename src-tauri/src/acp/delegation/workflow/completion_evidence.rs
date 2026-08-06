@@ -26,8 +26,10 @@ use super::error::{CompletionEvidenceError, CompletionRecoveryFenceError};
 use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
     build_admission_completion_context,
-    build_persisted_completion_context as build_persisted_context, validate_completion_evidence,
-    AdmissionCandidate, WorkflowStore,
+    build_persisted_completion_context as build_persisted_context,
+    build_preloaded_persisted_completion_context, preload_persisted_completion_context,
+    validate_completion_evidence, AdmissionCandidate, PersistedCompletionContextPreload,
+    WorkflowStore,
 };
 use super::final_findings::{
     bounded_terminal_context_v1, build_final_findings_package_v1,
@@ -42,7 +44,8 @@ use super::final_findings::{
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
     CompletionEvidenceBindingV2, CompletionEvidenceV2, CompletionScopeRole,
-    EvidenceValidationContext, ValidatedCompletionEvidence, COMPLETION_PROTOCOL_VERSION_V2,
+    EvidenceValidationContext, NormalizedManifest, ValidatedCompletionEvidence,
+    COMPLETION_PROTOCOL_VERSION_V2,
 };
 use crate::acp::delegation::attention::{
     open_design_self_review_attention_txn, open_terminal_completion_attention_txn,
@@ -70,6 +73,48 @@ const MAX_DOCUMENT_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
 const COMPLETION_DECISION_MESSAGE: &str = "Completion outcome requires a direct decision.";
 const ARTIFACT_RECOVERY_MESSAGE: &str = "Completion artifact is not yet available.";
 const DESIGN_SELF_REVIEW_MESSAGE: &str = "Design self-review requires a direct decision.";
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_ROW_LOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PRELOADED_COMPLETION_VALIDATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_terminal_row_load_count() {
+    TERMINAL_ROW_LOAD_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_row_load_count() -> usize {
+    TERMINAL_ROW_LOAD_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_preloaded_completion_validation_count() {
+    PRELOADED_COMPLETION_VALIDATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn preloaded_completion_validation_count() -> usize {
+    PRELOADED_COMPLETION_VALIDATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_terminal_row_load() {
+    TERMINAL_ROW_LOAD_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_terminal_row_load() {}
+
+#[cfg(test)]
+fn note_preloaded_completion_validation() {
+    PRELOADED_COMPLETION_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_preloaded_completion_validation() {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct V2GateEvidenceIdentity {
@@ -885,16 +930,18 @@ pub async fn resolve_completion_decision_txn(
             })
         })
         .await;
-    match result {
-        Ok(DecisionTxnOutcome::Resolved(result)) => Ok(result),
-        Ok(DecisionTxnOutcome::Superseded) => Err(CompletionMutationError::Superseded),
+    let mut result = match result {
+        Ok(DecisionTxnOutcome::Resolved(result)) => result,
+        Ok(DecisionTxnOutcome::Superseded) => return Err(CompletionMutationError::Superseded),
         Err(sea_orm::TransactionError::Connection(error)) => {
-            Err(CompletionMutationError::Evidence(
+            return Err(CompletionMutationError::Evidence(
                 CompletionEvidenceError::Persistence(error.to_string()),
             ))
         }
-        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
-    }
+        Err(sea_orm::TransactionError::Transaction(error)) => return Err(error),
+    };
+    attach_durable_completion_projection(db, &mut result).await?;
+    Ok(result)
 }
 
 async fn resolve_completion_decision_once<C: ConnectionTrait>(
@@ -965,13 +1012,15 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
                 evidence_scope_digest: context.evidence_scope_digest,
                 graph_revision,
                 idempotent_replay: false,
-                completion: Some(TerminalCompletionResult {
-                    state: CompletionState::Resolved,
-                    evidence: Some(evidence),
-                    attention: None,
-                    graph_revision,
-                    final_metric_states: Vec::new(),
-                }),
+                completion: Some(super::project_terminal_completion(
+                    &TerminalCompletionResult {
+                        state: CompletionState::Resolved,
+                        evidence: Some(evidence),
+                        attention: None,
+                        graph_revision,
+                        final_metric_states: Vec::new(),
+                    },
+                )),
             }))
         }
         Err(ArtifactError::Unavailable(failure)) => {
@@ -1007,7 +1056,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
                 evidence_scope_digest: context.evidence_scope_digest,
                 graph_revision,
                 idempotent_replay: false,
-                completion: Some(completion),
+                completion: Some(super::project_terminal_completion(&completion)),
             }))
         }
         Err(error) => Err(CompletionEvidenceError::Artifact(error).into()),
@@ -1151,16 +1200,33 @@ pub async fn resolve_design_self_review_txn(
             })
         })
         .await;
-    match result {
-        Ok(DecisionTxnOutcome::Resolved(result)) => Ok(result),
-        Ok(DecisionTxnOutcome::Superseded) => Err(CompletionMutationError::Superseded),
+    let mut result = match result {
+        Ok(DecisionTxnOutcome::Resolved(result)) => result,
+        Ok(DecisionTxnOutcome::Superseded) => return Err(CompletionMutationError::Superseded),
         Err(sea_orm::TransactionError::Connection(error)) => {
-            Err(CompletionMutationError::Evidence(
+            return Err(CompletionMutationError::Evidence(
                 CompletionEvidenceError::Persistence(error.to_string()),
             ))
         }
-        Err(sea_orm::TransactionError::Transaction(error)) => Err(error),
+        Err(sea_orm::TransactionError::Transaction(error)) => return Err(error),
+    };
+    attach_durable_completion_projection(db, &mut result).await?;
+    Ok(result)
+}
+
+async fn attach_durable_completion_projection(
+    db: &AppDatabase,
+    result: &mut CompletionMutationResult,
+) -> Result<(), CompletionMutationError> {
+    result.completion = super::load_completion_projection(&db.conn, &result.task_id)
+        .await
+        .map_err(CompletionMutationError::Evidence)?;
+    if result.completion.is_none() {
+        return Err(CompletionMutationError::InvalidAttention(
+            "committed completion projection is missing".into(),
+        ));
     }
+    Ok(())
 }
 
 async fn load_mutation_attention<C: ConnectionTrait>(
@@ -1274,7 +1340,7 @@ async fn replay_user_outcome<C: ConnectionTrait>(
         evidence_scope_digest: request.captured_scope_digest.clone(),
         graph_revision: resolution.graph_revision,
         idempotent_replay: true,
-        completion,
+        completion: completion.as_ref().map(super::project_terminal_completion),
     }))
 }
 
@@ -2028,7 +2094,7 @@ pub async fn retry_completion_artifact_for_user_txn(
                     "resolved artifact retry has no completion evidence".into(),
                 )
             })?;
-            Ok(CompletionMutationResult {
+            let mut mutation = CompletionMutationResult {
                 workflow_id: evidence.binding.workflow_id.clone(),
                 task_id: evidence.binding.task_id.clone(),
                 node_id: evidence.binding.node_id.clone(),
@@ -2037,8 +2103,10 @@ pub async fn retry_completion_artifact_for_user_txn(
                 evidence_scope_digest: evidence.evidence_scope_digest.clone(),
                 graph_revision: completion.graph_revision,
                 idempotent_replay,
-                completion: Some(completion),
-            })
+                completion: None,
+            };
+            attach_durable_completion_projection(db, &mut mutation).await?;
+            Ok(mutation)
         }
         Ok(RetryTxnOutcome::Superseded {
             phase,
@@ -2220,6 +2288,7 @@ async fn load_terminal<C: ConnectionTrait>(
     conn: &C,
     task_id: &str,
 ) -> Result<LoadedTerminal, CompletionEvidenceError> {
+    note_terminal_row_load();
     let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
         .one(conn)
         .await
@@ -2262,6 +2331,83 @@ pub async fn load_validated_completion_evidence<C: ConnectionTrait>(
     task_id: &str,
 ) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
     let loaded = load_terminal(conn, task_id).await?;
+    validate_loaded_completion_evidence(conn, &loaded, None).await
+}
+
+pub(crate) async fn validate_preloaded_completion_evidence<C: ConnectionTrait>(
+    conn: &C,
+    run: &delegation_task_run::Model,
+    binding: &delegation_workflow_run_binding::Model,
+    workflow: &delegation_workflow::Model,
+    node: &delegation_workflow_node_binding::Model,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
+    validate_preloaded_completion_evidence_inner(conn, run, binding, workflow, node, None).await
+}
+
+pub(crate) async fn validate_preloaded_completion_evidence_with_context<C: ConnectionTrait>(
+    conn: &C,
+    run: &delegation_task_run::Model,
+    binding: &delegation_workflow_run_binding::Model,
+    workflow: &delegation_workflow::Model,
+    node: &delegation_workflow_node_binding::Model,
+    preload: &PersistedCompletionContextPreload,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
+    validate_preloaded_completion_evidence_inner(conn, run, binding, workflow, node, Some(preload))
+        .await
+}
+
+async fn validate_preloaded_completion_evidence_inner<C: ConnectionTrait>(
+    conn: &C,
+    run: &delegation_task_run::Model,
+    binding: &delegation_workflow_run_binding::Model,
+    workflow: &delegation_workflow::Model,
+    node: &delegation_workflow_node_binding::Model,
+    preload: Option<&PersistedCompletionContextPreload>,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
+    note_preloaded_completion_validation();
+    validate_loaded_completion_evidence(
+        conn,
+        &LoadedTerminal {
+            run: run.clone(),
+            binding: binding.clone(),
+            workflow: workflow.clone(),
+            node: node.clone(),
+        },
+        preload,
+    )
+    .await
+}
+
+pub(crate) async fn preload_completion_validation_context<C: ConnectionTrait>(
+    conn: &C,
+    workflow: &delegation_workflow::Model,
+    normalized: &NormalizedManifest,
+    workspace: &str,
+) -> Result<PersistedCompletionContextPreload, CompletionEvidenceError> {
+    preload_persisted_completion_context(
+        &WorkflowStore::new(conn, Path::new(workspace)),
+        workflow,
+        normalized,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) fn completion_validation_workspace(
+    run: &delegation_task_run::Model,
+) -> Result<&str, CompletionEvidenceError> {
+    run.workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| ArtifactError::Unavailable(ArtifactFailure::WorkspaceUnavailable).into())
+}
+
+async fn validate_loaded_completion_evidence<C: ConnectionTrait>(
+    conn: &C,
+    loaded: &LoadedTerminal,
+    preload: Option<&PersistedCompletionContextPreload>,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
     if loaded.workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2)
         || loaded.node.retired_revision.is_some()
         || loaded.node.node_outcome.is_some()
@@ -2292,7 +2438,7 @@ pub async fn load_validated_completion_evidence<C: ConnectionTrait>(
                 "resolved run has no durable completion evidence".into(),
             )
         })?;
-    let context = rebuild_persisted_completion_context(conn, &loaded).await?;
+    let context = rebuild_persisted_completion_context(conn, &loaded, preload).await?;
     ensure_context_matches_binding(&context, &loaded.binding)?;
     let artifact =
         completion_artifact(&resolve_terminal_artifact(conn, &loaded, &context, outcome).await?);
@@ -2468,15 +2614,7 @@ async fn rebuild_completion_context<C: ConnectionTrait>(
     conn: &C,
     loaded: &LoadedTerminal,
 ) -> Result<AdmissionCompletionContextV2, CompletionEvidenceError> {
-    let workspace = loaded
-        .run
-        .workspace_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .ok_or(ArtifactError::Unavailable(
-            ArtifactFailure::WorkspaceUnavailable,
-        ))?;
+    let workspace = completion_validation_workspace(&loaded.run)?;
     build_admission_completion_context(
         &WorkflowStore::new(conn, Path::new(workspace)),
         &AdmissionCandidate {
@@ -2496,6 +2634,7 @@ async fn rebuild_completion_context<C: ConnectionTrait>(
 async fn rebuild_persisted_completion_context<C: ConnectionTrait>(
     conn: &C,
     loaded: &LoadedTerminal,
+    preload: Option<&PersistedCompletionContextPreload>,
 ) -> Result<AdmissionCompletionContextV2, CompletionEvidenceError> {
     let workspace = loaded
         .run
@@ -2506,21 +2645,29 @@ async fn rebuild_persisted_completion_context<C: ConnectionTrait>(
         .ok_or(ArtifactError::Unavailable(
             ArtifactFailure::WorkspaceUnavailable,
         ))?;
-    build_persisted_context(
-        &WorkflowStore::new(conn, Path::new(workspace)),
-        &AdmissionCandidate {
-            workflow: &loaded.workflow,
-            node: &loaded.node,
-            task_id: &loaded.run.task_id,
-            artifact_digest: loaded.binding.artifact_digest.as_deref(),
-            reviewed_task_id: loaded.binding.reviewed_task_id.as_deref(),
-            reviewed_generation: loaded.binding.reviewed_implementer_generation,
-            producer_baseline_head: loaded.binding.producer_baseline_head.as_deref(),
-        },
-        &loaded.binding,
-    )
-    .await
-    .map_err(Into::into)
+    let store = WorkflowStore::new(conn, Path::new(workspace));
+    let candidate = AdmissionCandidate {
+        workflow: &loaded.workflow,
+        node: &loaded.node,
+        task_id: &loaded.run.task_id,
+        artifact_digest: loaded.binding.artifact_digest.as_deref(),
+        reviewed_task_id: loaded.binding.reviewed_task_id.as_deref(),
+        reviewed_generation: loaded.binding.reviewed_implementer_generation,
+        producer_baseline_head: loaded.binding.producer_baseline_head.as_deref(),
+    };
+    match preload {
+        Some(preload) => build_preloaded_persisted_completion_context(
+            &store,
+            &candidate,
+            &loaded.binding,
+            preload,
+        )
+        .await
+        .map_err(Into::into),
+        None => build_persisted_context(&store, &candidate, &loaded.binding)
+            .await
+            .map_err(Into::into),
+    }
 }
 
 fn ensure_context_matches_binding(
@@ -3272,13 +3419,19 @@ mod tests {
     use crate::acp::delegation::metrics::DelegationMetrics;
     use crate::acp::delegation::run_store::{ContinueRunAdmission, ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::{Settlement, TerminalTaskWrite};
+    use crate::acp::delegation::workflow::completion_projection::{
+        completion_projection_load_count, reset_completion_projection_load_count,
+    };
+    use crate::acp::delegation::workflow::evidence_scope::{
+        completion_context_prepare_counts, reset_completion_context_prepare_counts,
+    };
     use crate::acp::delegation::workflow::final_findings::{
         build_final_findings_package_v1, load_active_final_findings_package_v1,
         persist_final_findings_package_v1, FinalFindingInputV1, FinalFindingsPackageInputV1,
         FinalReviewerEvaluationV1, RemediationContextInputV1,
     };
     use crate::acp::delegation::workflow::store::{
-        publish_workflow_manifest_core, PublishWorkflowRequest,
+        get_workflow_state_core, publish_workflow_manifest_core, PublishWorkflowRequest,
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode,
@@ -3287,7 +3440,8 @@ mod tests {
         PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
     use crate::acp::delegation::workflow::{
-        build_work_unit_key, resolve_document, CompletionIntentReason, CompletionIntentSource,
+        build_work_unit_key, load_completion_projection, project_workflow_graph_core,
+        resolve_document, CompletionCardState, CompletionIntentReason, CompletionIntentSource,
         CompletionOutcome,
     };
     use crate::db::entities::conversation::ConversationStatus;
@@ -3561,6 +3715,61 @@ mod tests {
         }
     }
 
+    fn reset_projection_load_counters() {
+        reset_completion_projection_load_count();
+        reset_completion_context_prepare_counts();
+        super::reset_terminal_row_load_count();
+        super::reset_preloaded_completion_validation_count();
+    }
+
+    async fn assert_projection_counter_instrumentation(fixture: &TerminalFixture) {
+        reset_projection_load_counters();
+        let completion = load_completion_projection(&fixture.db.conn, &fixture.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.card.state, CompletionCardState::Resolved);
+        assert_eq!(
+            completion_projection_load_count(),
+            1,
+            "the standalone projection counter must observe its own loader"
+        );
+        assert_eq!(
+            super::preloaded_completion_validation_count(),
+            1,
+            "the validation counter must observe resolved evidence validation"
+        );
+        assert_eq!(super::terminal_row_load_count(), 0);
+        assert_eq!(
+            completion_context_prepare_counts(),
+            (1, 1),
+            "the standalone loader prepares its own manifest and requirements context"
+        );
+    }
+
+    fn assert_batched_projection_load_counts() {
+        assert_eq!(
+            completion_projection_load_count(),
+            0,
+            "workflow projection must not call the standalone per-task loader"
+        );
+        assert_eq!(
+            super::terminal_row_load_count(),
+            0,
+            "workflow projection must reuse preloaded terminal rows"
+        );
+        assert_eq!(
+            super::preloaded_completion_validation_count(),
+            1,
+            "resolved evidence must be validated exactly once and reused"
+        );
+        assert_eq!(
+            completion_context_prepare_counts(),
+            (0, 1),
+            "workflow projection must reuse its normalized manifest and prepare requirements once"
+        );
+    }
+
     fn skeleton_document(token: &str, author_key: &str) -> ManifestDocument {
         let design_key = build_work_unit_key(&WorkUnitKeyParts::Design {
             rel_doc_path: DESIGN_REL_PATH,
@@ -3630,6 +3839,54 @@ mod tests {
             }],
             task_policies: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn resolved_graph_projection_reuses_preloaded_completion_rows_and_validation() {
+        let fixture = TerminalFixture::new(IntentFixture::AssistantText, true).await;
+        let materialized = fixture.materialize().await;
+        assert_eq!(materialized.state, CompletionState::Resolved);
+        assert_projection_counter_instrumentation(&fixture).await;
+
+        reset_projection_load_counters();
+        let snapshot = project_workflow_graph_core(&fixture.db, fixture.parent_conversation_id)
+            .await
+            .unwrap();
+        let completion = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.latest_task_id.as_deref() == Some(fixture.task_id.as_str()))
+            .and_then(|node| node.completion.as_ref())
+            .expect("resolved node completion");
+        assert_eq!(completion.card.state, CompletionCardState::Resolved);
+        assert!(completion.card.evidence_validated);
+        assert_batched_projection_load_counts();
+    }
+
+    #[tokio::test]
+    async fn resolved_workflow_state_projection_reuses_preloaded_completion_rows_and_validation() {
+        let fixture = TerminalFixture::new(IntentFixture::AssistantText, true).await;
+        let materialized = fixture.materialize().await;
+        assert_eq!(materialized.state, CompletionState::Resolved);
+        assert_projection_counter_instrumentation(&fixture).await;
+
+        reset_projection_load_counters();
+        let state = get_workflow_state_core(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            Some(&fixture.workflow_id),
+        )
+        .await
+        .unwrap();
+        let completion = state
+            .nodes
+            .iter()
+            .find(|node| node.latest_task_id.as_deref() == Some(fixture.task_id.as_str()))
+            .and_then(|node| node.completion.as_ref())
+            .expect("resolved node completion");
+        assert_eq!(completion.card.state, CompletionCardState::Resolved);
+        assert!(completion.card.evidence_validated);
+        assert_batched_projection_load_counts();
     }
 
     #[tokio::test]
@@ -4009,6 +4266,12 @@ mod tests {
         assert!(!first.idempotent_replay);
         assert!(replay.idempotent_replay);
         assert_eq!(first.graph_revision, replay.graph_revision);
+        let durable = load_completion_projection(&fixture.db.conn, &fixture.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.completion.as_ref(), Some(&durable));
+        assert_eq!(replay.completion.as_ref(), Some(&durable));
 
         let stale = TerminalFixture::new(IntentFixture::Tool, false).await;
         let stale_cas = stale.materialize().await.attention.unwrap();
@@ -4075,8 +4338,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            result.completion.as_ref().unwrap().state,
-            CompletionState::ArtifactRecovery
+            result.completion.as_ref().unwrap().card.state,
+            CompletionCardState::Blocked
         );
         let events = delegation_workflow_outbox_event::Entity::find()
             .filter(
@@ -4145,7 +4408,71 @@ mod tests {
         .unwrap();
         assert_eq!(first.graph_revision, replay.graph_revision);
         assert!(replay.idempotent_replay);
-        assert!(first.completion.is_none());
+        let durable = load_completion_projection(&fixture.db.conn, &binding.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.completion.as_ref(), Some(&durable));
+        assert_eq!(replay.completion.as_ref(), Some(&durable));
+        let state = get_workflow_state_core(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            Some(&fixture.workflow_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.completion.as_ref(), Some(&durable));
+    }
+
+    #[tokio::test]
+    async fn corrupt_open_completion_attention_fails_closed_across_projections() {
+        let scope_fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let scope_cas = scope_fixture.materialize().await.attention.unwrap();
+        let scope_attention =
+            delegation_attention_request::Entity::find_by_id(scope_cas.attention_id.clone())
+                .one(&scope_fixture.db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut active: delegation_attention_request::ActiveModel = scope_attention.into();
+        active.captured_scope_digest = Set(Some(format!("sha256:{}", "f".repeat(64))));
+        active.update(&scope_fixture.db.conn).await.unwrap();
+        assert!(
+            load_completion_projection(&scope_fixture.db.conn, &scope_fixture.task_id)
+                .await
+                .is_err()
+        );
+
+        let payload_fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
+        let payload_cas = payload_fixture.materialize().await.attention.unwrap();
+        let payload_attention =
+            delegation_attention_request::Entity::find_by_id(payload_cas.attention_id)
+                .one(&payload_fixture.db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut active: delegation_attention_request::ActiveModel = payload_attention.into();
+        active.payload_json = Set(Some("{}".into()));
+        active.update(&payload_fixture.db.conn).await.unwrap();
+
+        assert!(
+            load_completion_projection(&payload_fixture.db.conn, &payload_fixture.task_id)
+                .await
+                .is_err()
+        );
+        assert!(project_workflow_graph_core(
+            &payload_fixture.db,
+            payload_fixture.parent_conversation_id,
+        )
+        .await
+        .is_none());
+        assert!(get_workflow_state_core(
+            &payload_fixture.db,
+            payload_fixture.parent_conversation_id,
+            Some(&payload_fixture.workflow_id),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

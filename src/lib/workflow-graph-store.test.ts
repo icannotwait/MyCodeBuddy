@@ -112,6 +112,8 @@ function node(
     phase_id: null,
     role: null,
     agent_type: null,
+    model: null,
+    effort: null,
     profile_id: null,
     task_index: null,
     task_risk_level: null,
@@ -129,6 +131,16 @@ function node(
     latest_task_id: null,
     latest_child_conversation_id: null,
     latest_run_status: null,
+    started_at: null,
+    finished_at: null,
+    elapsed_completed_ms: null,
+    tool_call_count: null,
+    edit_tool_call_count: null,
+    touched_file_count: null,
+    touched_files_truncated: false,
+    additions: null,
+    deletions: null,
+    line_counts_complete: null,
     summary: null,
     is_observed: false,
     retained_observed: false,
@@ -177,7 +189,7 @@ afterEach(() => {
 })
 
 describe("workflow-graph-store revision gate", () => {
-  it("dedupes completion replay, ignores stale events, and restores from snapshots", () => {
+  it("uses completion events only to refetch an authoritative durable snapshot", async () => {
     const needsDecision = baseSnapshot({
       graph_revision: 7,
       nodes: [
@@ -216,64 +228,77 @@ describe("workflow-graph-store revision gate", () => {
       node_id: "n-plan-r1",
       kind: "completion_decision" as const,
       outcome: "approve_with_minors" as const,
-      evidence_scope_digest: `sha256:${"b".repeat(64)}`,
+      evidence_scope_digest: `sha256:${"a".repeat(64)}`,
       graph_revision: 8,
     }
-    const store = useWorkflowGraphStore.getState()
-    store.applyFromDetail(7, needsDecision)
-
-    store.handleCompletionDecisionResolved(event)
-    const afterFirst = useWorkflowGraphStore.getState().getSnapshot(7)
-    expect(afterFirst?.nodes[0].completion?.card).toMatchObject({
-      state: "resolved",
-      outcome: "approve_with_minors",
-      source: "user_adjudication",
-      attention: null,
-    })
-    expect(afterFirst?.graph_revision).toBe(8)
-
-    useWorkflowGraphStore.getState().handleCompletionDecisionResolved(event)
-    expect(useWorkflowGraphStore.getState().getSnapshot(7)).toBe(afterFirst)
-
-    useWorkflowGraphStore.getState().handleCompletionDecisionResolved({
-      ...event,
-      event_id: "event-stale",
-      graph_revision: 6,
-      outcome: "block",
-    })
-    expect(
-      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion
-        ?.card.outcome
-    ).toBe("approve_with_minors")
-
-    const authoritative = baseSnapshot({
-      graph_revision: 9,
+    const artifactRecovery = baseSnapshot({
+      graph_revision: 8,
       nodes: [
         node({
           node_id: "n-plan-r1",
           latest_task_id: "task-1",
           completion: {
             protocol_version: 2,
-            graph_revision: 9,
+            graph_revision: 8,
             card: {
               state: "blocked",
               role: "reviewer",
-              outcome: "block",
-              summary: "Blocked by durable state.",
+              outcome: "approve_with_minors",
+              summary: "Artifact recovery is required.",
               report_file: null,
               source: "user_adjudication",
-              evidence_validated: true,
-              attention: null,
+              evidence_validated: false,
+              attention: {
+                ...needsDecision.nodes[0].completion!.card.attention!,
+                attention_id: "attention-recovery",
+                kind: "completion_artifact_recovery",
+              },
             },
           },
         }),
       ],
     })
-    useWorkflowGraphStore.getState().applyFromDetail(7, authoritative)
+
+    useWorkflowGraphStore.getState().applyFromDetail(7, needsDecision)
+    getWorkflowGraphSnapshot.mockResolvedValueOnce(needsDecision)
+    const release = useWorkflowGraphStore.getState().activateConversation(7)
+    await flushMicrotasks()
+    getWorkflowGraphSnapshot.mockClear()
+    getWorkflowGraphSnapshot.mockResolvedValue(artifactRecovery)
+
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved(event)
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved(event)
+
     expect(
-      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion
-        ?.card.state
+      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion?.card
+        .state
+    ).toBe("needs_decision")
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion?.card
+        .state
     ).toBe("blocked")
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion?.card
+        .attention?.kind
+    ).toBe("completion_artifact_recovery")
+
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved({
+      ...event,
+      event_id: "event-scope-mismatch",
+      evidence_scope_digest: `sha256:${"c".repeat(64)}`,
+      graph_revision: 9,
+    })
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved({
+      ...event,
+      event_id: "event-delayed-task",
+      task_id: "task-previous",
+      graph_revision: 9,
+    })
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    release()
   })
 
   it("applies detail snapshot and discards stale lower graph_revision", () => {

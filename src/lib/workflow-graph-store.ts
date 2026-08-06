@@ -15,9 +15,11 @@
 import { create } from "zustand"
 import {
   getWorkflowGraphSnapshot,
+  subscribeCompletionDecisionResolved,
   subscribeWorkflowCompatibilityNudge,
   subscribeWorkflowGraphChanged,
 } from "@/lib/api"
+import type { CompletionDecisionResolvedEventPayload } from "@/lib/api"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
   DelegationRuntimeStats,
@@ -122,6 +124,9 @@ type WorkflowGraphState = {
     requestGeneration: number
   ) => RefreshApplyOutcome
   handleGraphChanged: (payload: WorkflowGraphChangedPayload) => void
+  handleCompletionDecisionResolved: (
+    payload: CompletionDecisionResolvedEventPayload
+  ) => void
   handleCompatibilityNudge: (payload: WorkflowCompatibilityNudgePayload) => void
   /** Acquire open-overlay interest and return an idempotent cleanup lease. */
   activateOverlayInterest: (conversationId: number) => () => void
@@ -199,9 +204,11 @@ let eventInstallGeneration = 0
 let activeEventInstallGeneration = 0
 let graphChangedUnsub: (() => void) | null = null
 let nudgeUnsub: (() => void) | null = null
+let completionUnsub: (() => void) | null = null
 let eventReadinessPromise: Promise<void> | null = null
 let eventReadinessDeadline: ReturnType<typeof setTimeout> | null = null
 const activeConversations = new Map<number, ActiveConversationRecord>()
+const seenCompletionEvents = new Set<string>()
 let activationEpochCounter = 0
 
 function totalInterest(active: ActiveConversationRecord): number {
@@ -251,21 +258,32 @@ function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
 
   const nudgeAttempt = subscribeWorkflowCompatibilityNudge((payload) => {
     get().handleCompatibilityNudge(payload)
+  }).then((dispose) => {
+    if (activeEventInstallGeneration !== generation) {
+      dispose()
+      return
+    }
+    nudgeUnsub = dispose
+  })
+
+  const completionAttempt = subscribeCompletionDecisionResolved((payload) => {
+    get().handleCompletionDecisionResolved(payload)
   })
     .then((dispose) => {
       if (activeEventInstallGeneration !== generation) {
         dispose()
         return
       }
-      nudgeUnsub = dispose
+      completionUnsub = dispose
     })
     .catch(() => {
-      // Transport without subscribe — refresh-only path.
+      // Older transports converge through graph snapshot refresh.
     })
 
   const attemptsSettled = Promise.allSettled([
     changedAttempt,
     nudgeAttempt,
+    completionAttempt,
   ]).then(() => undefined)
   const deadline = new Promise<void>((resolve) => {
     eventReadinessDeadline = setTimeout(resolve, EVENT_READINESS_TIMEOUT_MS)
@@ -294,8 +312,10 @@ function disposeEventListeners(): void {
   eventReadinessPromise = null
   graphChangedUnsub?.()
   nudgeUnsub?.()
+  completionUnsub?.()
   graphChangedUnsub = null
   nudgeUnsub = null
+  completionUnsub = null
 }
 
 function releaseConversation(
@@ -542,6 +562,43 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
     })
   },
 
+  handleCompletionDecisionResolved: (payload) => {
+    const eventKey = `${payload.event_id}:${payload.graph_revision}`
+    if (seenCompletionEvents.has(eventKey)) return
+
+    for (const [conversationId, entry] of get().byConversationId) {
+      const snapshot = entry.snapshot
+      if (
+        !snapshot ||
+        !activeConversations.has(conversationId) ||
+        snapshot.workflow_id !== payload.workflow_id ||
+        (entry.appliedGraphRevision ?? -1) >= payload.graph_revision
+      ) {
+        continue
+      }
+
+      const node = snapshot.nodes.find(
+        (candidate) =>
+          candidate.node_id === payload.node_id &&
+          candidate.latest_task_id === payload.task_id
+      )
+      const attention =
+        node?.completion?.card.attention ?? snapshot.completion?.card.attention
+      if (
+        !attention ||
+        attention.task_id !== payload.task_id ||
+        attention.node_id !== payload.node_id ||
+        attention.kind !== payload.kind ||
+        attention.captured_scope_digest !== payload.evidence_scope_digest
+      ) {
+        continue
+      }
+
+      seenCompletionEvents.add(eventKey)
+      void get().refresh(conversationId)
+    }
+  },
+
   applyFetchedSnapshot: (conversationId, snapshot, requestGeneration) => {
     const current = get().getEntry(conversationId) ?? emptyEntry()
     // Discard if a newer request superseded this one (nudge / graph-changed).
@@ -638,6 +695,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
       clearFallbackTimer(active)
     }
     activeConversations.clear()
+    seenCompletionEvents.clear()
     activationEpochCounter += 1
     disposeEventListeners()
     // Do not reset `eventInstallGeneration` — monotonic for process lifetime.

@@ -603,7 +603,19 @@
         "native": "Native"
       },
       "softWatchdog": "软看门狗（秒）",
-      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。0 表示关闭停滞标记。不会取消或切换路由。"
+      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。0 表示关闭停滞标记。不会取消或切换路由。",
+      "completionDefaultMode": "完成创建模式",
+      "completionCreations": "{mode}：{count} 次创建",
+      "completionSamples": "{count} 个终态样本",
+      "completionMinimumProgress": "{count} / {minimum} 个最小样本",
+      "completionOverride": "{profile}：{mode}",
+      "completionShadowDifference": "{kind}：{count}",
+      "completionRolloutDecision": {
+        "insufficient_samples": "灰度发布正在等待达到最小样本数",
+        "may_expand": "可扩大灰度发布范围",
+        "stop_role_mismatch": "灰度发布已暂停：角色不匹配率超过 1%",
+        "stop_needs_decision": "灰度发布已暂停：需要决策的比例超过 5%"
+      }
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -2763,7 +2775,36 @@
           "waiting_review": "等待评审",
           "waiting_adjudication": "等待裁定",
           "superseded": "已替换"
-        }
+        },
+        "completionResolved": "已解决",
+        "completionNeedsDecision": "需要决策",
+        "completionBlocked": "已阻塞",
+        "completionEvidenceValidated": "证据已验证",
+        "completionRetryArtifact": "重试产物",
+        "completionStale": "此决策已过期。请重新加载工作流。",
+        "completionConflict": "已提交其他结果。",
+        "completionLegacyReadOnly": "旧版工作流为只读",
+        "completionLegacyRestart": "使用完成协议 v2 重新启动",
+        "completionLegacySource": "旧版源工作流 #{conversation}",
+        "completionLegacySuccessor": "后继工作流 #{conversation}",
+        "completionAutomaticWake": "根编排已自动恢复",
+        "completionManualRootResume": "恢复根编排",
+        "completionOutcome": {
+          "approve": "批准",
+          "approve_with_minors": "附带小修改批准",
+          "request_changes": "请求修改",
+          "block": "阻止",
+          "done": "完成",
+          "done_with_concerns": "完成但有疑虑",
+          "blocked": "已阻塞"
+        },
+        "completionSource": {
+          "complete_work": "完成工具",
+          "assistant_conclusion": "助手结论",
+          "report": "已验证报告",
+          "user_adjudication": "用户决策"
+        },
+        "completionReportFile": "报告：{file}"
       },
       "agentPlanOverlay": {
         "title": "计划任务",

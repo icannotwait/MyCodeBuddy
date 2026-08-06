@@ -560,7 +560,7 @@ impl DelegationListener {
         let mut foreground_release_owner = None;
         let resp = match msg {
             BrokerMessage::Ready(_) => unreachable!("handled above"),
-            BrokerMessage::Call(req) => report_response(self.process(req).await)?,
+            BrokerMessage::Call(req) => self.report_response(self.process(req).await).await?,
             BrokerMessage::Status(req) => {
                 // A status long-poll — especially `wait_ms = 0` (block until
                 // terminal) — can park for the whole lifetime of the child.
@@ -608,14 +608,17 @@ impl DelegationListener {
                 };
                 match reports {
                     Ok(processed) => {
-                        let response = status_response(processed.batch)?;
+                        let response = self.status_response(processed.batch).await?;
                         foreground_release_owner = processed.release_owner;
                         response
                     }
                     Err(_) => value_response(&StatusErrorEnvelope::continuation_arm_failed())?,
                 }
             }
-            BrokerMessage::CancelTask(req) => report_response(self.process_cancel_task(req).await)?,
+            BrokerMessage::CancelTask(req) => {
+                self.report_response(self.process_cancel_task(req).await)
+                    .await?
+            }
             BrokerMessage::Feedback(req) => {
                 // at-least-once delivery: READ pending notes (no mutation),
                 // WRITE the response, and COMMIT them delivered ONLY on a
@@ -2992,12 +2995,69 @@ pub(crate) fn workflow_store_error_code_for_test(err: WorkflowStoreError) -> Str
         .to_string()
 }
 
-fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerResponse> {
-    Ok(BrokerResponse {
-        outcome: serde_json::to_value(&report).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
-        })?,
-    })
+impl DelegationListener {
+    async fn report_response(
+        &self,
+        report: DelegationTaskReport,
+    ) -> std::io::Result<BrokerResponse> {
+        let mut outcome = serde_json::to_value(&report).map_err(invalid_json)?;
+        self.enrich_completion(&mut outcome, report.task_id.as_deref())
+            .await;
+        Ok(BrokerResponse { outcome })
+    }
+
+    async fn status_response(
+        &self,
+        batch: DelegationStatusBatch,
+    ) -> std::io::Result<BrokerResponse> {
+        let task_ids = batch
+            .tasks
+            .iter()
+            .map(|report| report.task_id.clone())
+            .collect::<Vec<_>>();
+        let mut outcome = serde_json::to_value(batch).map_err(invalid_json)?;
+        if let Some(tasks) = outcome.get_mut("tasks").and_then(Value::as_array_mut) {
+            for (task, task_id) in tasks.iter_mut().zip(task_ids.iter()) {
+                self.enrich_completion(task, task_id.as_deref()).await;
+            }
+        }
+        Ok(BrokerResponse { outcome })
+    }
+
+    async fn enrich_completion(&self, value: &mut Value, task_id: Option<&str>) {
+        let (Some(task_id), Some(runs)) = (task_id, self.broker.run_store()) else {
+            return;
+        };
+        match crate::acp::delegation::workflow::load_completion_projection(&runs.db().conn, task_id)
+            .await
+        {
+            Ok(Some(completion)) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "completion".into(),
+                        serde_json::to_value(completion).expect("completion projection serializes"),
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("status".into(), Value::String("failed".into()));
+                    object.insert("error_code".into(), Value::String(error.code().to_string()));
+                    object.insert("message".into(), Value::String(error.to_string()));
+                    object.remove("text");
+                    object.remove("completion");
+                }
+            }
+        }
+    }
+}
+
+fn invalid_json(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("encode broker response: {error}"),
+    )
 }
 
 /// Serialize an arbitrary serde value as the broker outcome envelope.
@@ -3052,17 +3112,6 @@ fn emit_wait_arm_reason(reason: &'static str) {
 /// Serialize a [`DelegationStatusBatch`] for the `Status` arm. Legacy batches
 /// omit Join fields; Join batches include `wake_reason` and
 /// `attention_requests`.
-fn status_response(batch: DelegationStatusBatch) -> std::io::Result<BrokerResponse> {
-    Ok(BrokerResponse {
-        outcome: serde_json::to_value(batch).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("encode status batch: {error}"),
-            )
-        })?,
-    })
-}
-
 /// Serialize the pending feedback notes into a
 /// `{ "count": N, "feedback": [..], "_commit_ids": [..] }` envelope for the
 /// `Feedback` arm. Only the lean `text` + `created_at` reach the agent; the
@@ -8326,17 +8375,21 @@ mod tests {
         use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
         use crate::acp::delegation::transport::BrokerCompleteWorkRequest;
         use crate::acp::delegation::workflow::{
-            accept_complete_work_txn_with_test_control, load_workflow_child_mcp_binding,
-            AcceptedToolIntent, CompleteWorkError, CompleteWorkRequest, CompleteWorkTestControl,
-            CompletionOutcome,
+            accept_complete_work_txn_with_test_control, load_completion_projection,
+            load_workflow_child_mcp_binding, AcceptedToolIntent, CompleteWorkError,
+            CompleteWorkRequest, CompleteWorkTestControl, CompletionOutcome,
         };
-        use crate::db::entities::delegation_completion_tool_intent;
-        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, CompletionState, DelegationRunStatus,
+        };
         use crate::db::entities::delegation_workflow::{
             self, CompletionProtocolMode, WorkflowState,
         };
         use crate::db::entities::delegation_workflow_node_binding;
         use crate::db::entities::delegation_workflow_run_binding;
+        use crate::db::entities::{
+            delegation_attention_request, delegation_completion_tool_intent,
+        };
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
         use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, QueryOrder, Set};
 
@@ -8662,6 +8715,200 @@ mod tests {
             let run = fixture.run().await;
             assert_eq!(run.status, DelegationRunStatus::Running);
             assert_eq!(run.completion_evidence_json, None);
+        }
+
+        #[tokio::test]
+        async fn listener_report_status_and_mcp_render_share_the_durable_completion_projection() {
+            let fixture = completion_tool_fixture().await;
+            let run = fixture.run().await;
+            let parent_conversation_id = run.parent_conversation_id;
+            let mut run: delegation_task_run::ActiveModel = run.into();
+            run.status = Set(DelegationRunStatus::Completed);
+            run.finished_at = Set(Some(Utc::now()));
+            run.completion_state = Set(Some(CompletionState::NeedsDecision));
+            run.update(&fixture.db.conn).await.unwrap();
+            let binding = delegation_workflow_run_binding::Entity::find_by_id(TASK_ID)
+                .one(&fixture.db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+            binding.evidence_scope_digest = Set(Some(format!("sha256:{}", "e".repeat(64))));
+            binding.update(&fixture.db.conn).await.unwrap();
+            delegation_attention_request::ActiveModel {
+                request_id: Set("listener-projection-attention".into()),
+                task_id: Set(TASK_ID.into()),
+                parent_conversation_id: Set(parent_conversation_id),
+                child_conversation_id: Set(None),
+                child_tool_call_id: Set(None),
+                status: Set("open".into()),
+                message: Set("Choose the reviewer outcome.".into()),
+                reply: Set(None),
+                resolution_code: Set(None),
+                created_at: Set(Utc::now()),
+                resolved_at: Set(None),
+                kind: Set(delegation_attention_request::AttentionKind::CompletionDecision),
+                latest_run_id: Set(Some(TASK_ID.into())),
+                node_id: Set(Some(NODE_ID.into())),
+                payload_json: Set(Some(
+                    serde_json::json!({
+                        "version": 1,
+                        "reason_code": "completion_intent_missing",
+                        "role": "reviewer",
+                        "legal_outcomes": [
+                            "approve",
+                            "approve_with_minors",
+                            "request_changes",
+                            "block"
+                        ],
+                        "bounded_candidates": [],
+                        "diagnostics": []
+                    })
+                    .to_string(),
+                )),
+                resolution_json: Set(None),
+                captured_scope_digest: Set(Some(format!("sha256:{}", "e".repeat(64)))),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+
+            let expected = serde_json::to_value(
+                load_completion_projection(&fixture.db.conn, TASK_ID)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let report = DelegationTaskReport {
+                task_id: Some(TASK_ID.into()),
+                continued_from_task_id: None,
+                reused_session: None,
+                status: TaskStatus::Completed,
+                child_conversation_id: None,
+                agent_type: None,
+                text: Some("done".into()),
+                error_code: None,
+                message: None,
+                duration_ms: Some(1),
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+                recovery: None,
+            };
+
+            let report_response = fixture
+                .listener
+                .report_response(report.clone())
+                .await
+                .unwrap();
+            assert_eq!(report_response.outcome["completion"], expected);
+
+            let status_response = fixture
+                .listener
+                .status_response(DelegationStatusBatch::legacy(vec![report]))
+                .await
+                .unwrap();
+            assert_eq!(status_response.outcome["tasks"][0]["completion"], expected);
+
+            let rendered =
+                crate::acp::delegation::companion::render_status_result(&status_response.outcome);
+            assert_eq!(
+                rendered["structuredContent"]["tasks"][0]["completion"],
+                expected
+            );
+        }
+
+        #[tokio::test]
+        async fn listener_report_status_and_mcp_share_completion_projection_corruption() {
+            let fixture = completion_tool_fixture().await;
+            let run = fixture.run().await;
+            let mut run: delegation_task_run::ActiveModel = run.into();
+            run.status = Set(DelegationRunStatus::Completed);
+            run.finished_at = Set(Some(Utc::now()));
+            run.completion_state = Set(Some(CompletionState::NeedsDecision));
+            run.update(&fixture.db.conn).await.unwrap();
+
+            let binding = delegation_workflow_run_binding::Entity::find_by_id(TASK_ID)
+                .one(&fixture.db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+            binding.evidence_scope_digest = Set(Some(format!("sha256:{}", "e".repeat(64))));
+            binding.update(&fixture.db.conn).await.unwrap();
+
+            delegation_attention_request::ActiveModel {
+                request_id: Set("listener-corrupt-projection".into()),
+                task_id: Set(TASK_ID.into()),
+                parent_conversation_id: Set(fixture.run().await.parent_conversation_id),
+                child_conversation_id: Set(None),
+                child_tool_call_id: Set(None),
+                status: Set("open".into()),
+                message: Set("Choose the reviewer outcome.".into()),
+                reply: Set(None),
+                resolution_code: Set(None),
+                created_at: Set(Utc::now()),
+                resolved_at: Set(None),
+                kind: Set(delegation_attention_request::AttentionKind::CompletionDecision),
+                latest_run_id: Set(Some(TASK_ID.into())),
+                node_id: Set(Some(NODE_ID.into())),
+                payload_json: Set(Some("{not-json".into())),
+                resolution_json: Set(None),
+                captured_scope_digest: Set(Some(format!("sha256:{}", "e".repeat(64)))),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+
+            let report = DelegationTaskReport {
+                task_id: Some(TASK_ID.into()),
+                continued_from_task_id: None,
+                reused_session: None,
+                status: TaskStatus::Completed,
+                child_conversation_id: None,
+                agent_type: None,
+                text: Some("done".into()),
+                error_code: None,
+                message: None,
+                duration_ms: Some(1),
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+                recovery: None,
+            };
+
+            let report_response = fixture
+                .listener
+                .report_response(report.clone())
+                .await
+                .unwrap();
+            let status_response = fixture
+                .listener
+                .status_response(DelegationStatusBatch::legacy(vec![report]))
+                .await
+                .unwrap();
+            let report_rendered =
+                crate::acp::delegation::companion::render_task_report(&report_response.outcome);
+            let rendered =
+                crate::acp::delegation::companion::render_status_result(&status_response.outcome);
+
+            for projected in [
+                &report_response.outcome,
+                &status_response.outcome["tasks"][0],
+                &report_rendered["structuredContent"],
+                &rendered["structuredContent"]["tasks"][0],
+            ] {
+                assert_eq!(projected["status"], "failed");
+                assert_eq!(projected["error_code"], "completion_terminal_state_invalid");
+                assert!(projected["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("typed completion attention is corrupt"));
+                assert!(projected.get("completion").is_none());
+            }
+            assert_eq!(report_rendered["isError"], true);
+            assert_eq!(rendered["isError"], true);
         }
 
         #[tokio::test]

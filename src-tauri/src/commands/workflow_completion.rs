@@ -3,6 +3,9 @@
 #[cfg(feature = "tauri-runtime")]
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
 use crate::acp::delegation::event_emitter::CompletionOutboxDispatcher;
 use crate::acp::delegation::types::{
     CompletionMutationContext, CompletionMutationResult, ResolveCompletionDecisionRequest,
@@ -20,6 +23,59 @@ use crate::db::AppDatabase;
 use chrono::Utc;
 use sea_orm::EntityTrait;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionProtocolSettingsSnapshot {
+    pub default_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    pub profile_overrides:
+        BTreeMap<String, crate::db::entities::delegation_workflow::CompletionProtocolMode>,
+    pub minimum_samples: u64,
+    pub creation_modes: BTreeMap<String, u64>,
+    pub shadow_differences: BTreeMap<String, u64>,
+    pub rollout_windows:
+        BTreeMap<String, crate::acp::delegation::workflow::ProfileCompletionWindow>,
+    pub rollout_decisions: BTreeMap<String, crate::acp::delegation::workflow::RolloutDecision>,
+}
+
+pub fn get_completion_protocol_settings_core(
+    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
+    rollout: &CompletionProtocolRolloutConfig,
+) -> CompletionProtocolSettingsSnapshot {
+    let completion = metrics.snapshot().completion_protocol;
+    CompletionProtocolSettingsSnapshot {
+        default_mode: rollout.default_mode.clone(),
+        profile_overrides: rollout.profile_overrides.clone(),
+        minimum_samples: crate::acp::delegation::workflow::COMPLETION_ROLLOUT_MINIMUM_SAMPLES,
+        creation_modes: completion.creation_modes,
+        shadow_differences: completion.shadow_differences,
+        rollout_windows: completion.rollout_windows,
+        rollout_decisions: completion.rollout_decisions,
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub fn get_completion_protocol_settings(
+    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
+        '_,
+        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    >,
+    #[cfg(feature = "tauri-runtime")] rollout: tauri::State<
+        '_,
+        Arc<CompletionProtocolRolloutConfig>,
+    >,
+) -> Result<CompletionProtocolSettingsSnapshot, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        Ok(get_completion_protocol_settings_core(
+            metrics.inner(),
+            rollout.inner(),
+        ))
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
 pub async fn completion_attention_parent_conversation_id(
     db: &AppDatabase,
     attention_id: &str,
@@ -35,7 +91,6 @@ pub async fn completion_attention_parent_conversation_id(
         })
 }
 
-#[cfg(feature = "tauri-runtime")]
 fn unauthorized_context_error() -> AppCommandError {
     AppCommandError::permission_denied("completion attention is owned by another root conversation")
         .with_detail("unauthorized")
@@ -226,8 +281,10 @@ pub async fn resolve_completion_decision(
     >,
     #[cfg(feature = "tauri-runtime")] dispatcher: tauri::State<'_, Arc<CompletionOutboxDispatcher>>,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
-    request: ResolveCompletionDecisionRequest,
+    cas: crate::acp::delegation::workflow::CompletionAttentionCas,
+    outcome: crate::acp::delegation::workflow::CompletionOutcome,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    let request = ResolveCompletionDecisionRequest { cas, outcome };
     #[cfg(feature = "tauri-runtime")]
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
@@ -256,8 +313,9 @@ pub async fn retry_completion_artifact(
     >,
     #[cfg(feature = "tauri-runtime")] dispatcher: tauri::State<'_, Arc<CompletionOutboxDispatcher>>,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
-    request: RetryCompletionArtifactRequest,
+    cas: crate::acp::delegation::workflow::CompletionAttentionCas,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    let request = RetryCompletionArtifactRequest { cas };
     #[cfg(feature = "tauri-runtime")]
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
@@ -280,8 +338,10 @@ pub async fn resolve_design_self_review(
     >,
     #[cfg(feature = "tauri-runtime")] dispatcher: tauri::State<'_, Arc<CompletionOutboxDispatcher>>,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
-    request: ResolveDesignSelfReviewRequest,
+    cas: crate::acp::delegation::workflow::CompletionAttentionCas,
+    outcome: crate::acp::delegation::workflow::CompletionOutcome,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    let request = ResolveDesignSelfReviewRequest { cas, outcome };
     #[cfg(feature = "tauri-runtime")]
     {
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
@@ -307,8 +367,11 @@ pub async fn restart_legacy_workflow(
         Arc<CompletionProtocolRolloutConfig>,
     >,
     #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
-    request: RestartLegacyWorkflowRequest,
+    source_conversation_id: i64,
 ) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
+    let request = RestartLegacyWorkflowRequest {
+        source_conversation_id,
+    };
     #[cfg(feature = "tauri-runtime")]
     {
         let source_conversation_id = i32::try_from(request.source_conversation_id)

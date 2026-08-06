@@ -73,7 +73,7 @@ describe("i18n locale key parity vs en.json", () => {
         "completionStale",
         "completionConflict",
       ]) {
-        expect(workflow[key], `missing workflow completion key ${key}`).toBe(
+        expect(workflow[key], `missing workflow completion key ${key}`).toEqual(
           expect.any(String)
         )
       }

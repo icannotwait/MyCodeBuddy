@@ -53,8 +53,9 @@ pub use completion_intent::{
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
 pub use completion_projection::{
-    project_terminal_completion, validated_design_self_review_outcome, CompletionProjectionV2,
-    DesignSelfReviewDecisionError,
+    load_completion_projection, project_terminal_completion, validated_design_self_review_outcome,
+    CompletionCardState, CompletionCardV2, CompletionProjectionV2, DesignSelfReviewDecisionError,
+    COMPLETION_CARD_SUMMARY_MAX_BYTES,
 };
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,

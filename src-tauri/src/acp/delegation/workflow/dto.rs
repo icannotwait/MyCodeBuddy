@@ -69,6 +69,8 @@ pub struct WorkflowGraphSnapshot {
     pub manifest_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_protocol: Option<super::types::CompletionProtocolWorkflowProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::completion_projection::CompletionProjectionV2>,
     pub compatibility: WorkflowCompatibility,
     pub overall_state: WorkflowOverallState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +179,8 @@ pub struct WorkflowNodeSnapshot {
     /// Bounded, redacted card-summary text when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::completion_projection::CompletionProjectionV2>,
     pub is_observed: bool,
     pub retained_observed: bool,
     pub required: bool,
@@ -606,6 +610,7 @@ mod tests {
             manifest_state: Some("estimated".into()),
             compatibility: WorkflowCompatibility::Manifest,
             completion_protocol: None,
+            completion: None,
             overall_state: WorkflowOverallState::Estimated,
             current_phase_id: None,
             current_node_ids: vec![],
@@ -646,6 +651,7 @@ mod tests {
                 deletions: None,
                 line_counts_complete: None,
                 summary: None,
+                completion: None,
                 is_observed: false,
                 retained_observed: false,
                 required: true,

@@ -18,8 +18,8 @@ use codeg_lib::acp::delegation::workflow::types::{
 };
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, capture_original_request_context, materialize_terminal_completion_txn,
-    load_completion_projection, project_workflow_graph_core, restart_legacy_workflow_core,
+    build_work_unit_key, capture_original_request_context, load_completion_projection,
+    materialize_terminal_completion_txn, project_workflow_graph_core, restart_legacy_workflow_core,
     CompletionOutcome, CompletionProtocolRolloutConfig, TerminalCompletionInput,
 };
 use codeg_lib::acp::types::PromptInputBlock;
@@ -322,12 +322,10 @@ async fn completion_projection_is_identical_across_graph_http_and_mcp_surfaces()
     let fixture = completion_http_fixture().await;
     let context = issue_completion_context(&fixture).await;
 
-    let pending_graph = project_workflow_graph_core(
-        &fixture.state.db,
-        fixture.parent_conversation_id,
-    )
-    .await
-    .unwrap();
+    let pending_graph =
+        project_workflow_graph_core(&fixture.state.db, fixture.parent_conversation_id)
+            .await
+            .unwrap();
     let pending = pending_graph
         .nodes
         .iter()
@@ -348,12 +346,9 @@ async fn completion_projection_is_identical_across_graph_http_and_mcp_surfaces()
         .await;
     response.assert_status_ok();
 
-    let direct = project_workflow_graph_core(
-        &fixture.state.db,
-        fixture.parent_conversation_id,
-    )
-    .await
-    .unwrap();
+    let direct = project_workflow_graph_core(&fixture.state.db, fixture.parent_conversation_id)
+        .await
+        .unwrap();
     let http = fixture
         .server
         .post("/api/get_workflow_graph_snapshot")
@@ -701,7 +696,7 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
         .post("/api/restart_legacy_workflow")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
         .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&json!({ "source_conversation_id": source_conversation_id }))
+        .json(&json!({ "sourceConversationId": source_conversation_id }))
         .await;
     http.assert_status_ok();
     let http: codeg_lib::acp::delegation::workflow::LegacyWorkflowRestartProjection = http.json();

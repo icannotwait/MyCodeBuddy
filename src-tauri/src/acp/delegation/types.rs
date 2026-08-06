@@ -19,9 +19,7 @@ use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::acp::delegation::recovery_policy::{
     RecoveryDecision, RecoveryDisposition, ReplacementReason,
 };
-use crate::acp::delegation::workflow::{
-    CompletionAttentionCas, CompletionOutcome, TerminalCompletionResult,
-};
+use crate::acp::delegation::workflow::{CompletionAttentionCas, CompletionOutcome};
 use crate::models::AgentType;
 
 /// MCP tool name for initial delegation — field 0 of `request_fingerprint`.
@@ -105,6 +103,7 @@ pub struct DelegationProfileCatalog {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartLegacyWorkflowRequest {
+    #[serde(alias = "sourceConversationId")]
     pub source_conversation_id: i64,
 }
 
@@ -1051,7 +1050,7 @@ pub struct CompletionMutationResult {
     pub graph_revision: u64,
     pub idempotent_replay: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion: Option<TerminalCompletionResult>,
+    pub completion: Option<crate::acp::delegation::workflow::CompletionProjectionV2>,
 }
 
 impl DelegationOutcome {

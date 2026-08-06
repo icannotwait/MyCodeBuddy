@@ -603,7 +603,19 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog soft (secondes)",
-      "softWatchdogHint": "Seuil d’inactivité en observation seule ({min}–{max}). 0 désactive le marquage d’attente. N’annule ni ne change la route."
+      "softWatchdogHint": "Seuil d’inactivité en observation seule ({min}–{max}). 0 désactive le marquage d’attente. N’annule ni ne change la route.",
+      "completionDefaultMode": "Mode de création des résultats",
+      "completionCreations": "{mode} : {count} créations",
+      "completionSamples": "{count} échantillons terminaux",
+      "completionMinimumProgress": "{count} / {minimum} échantillons minimum",
+      "completionOverride": "{profile}: {mode}",
+      "completionShadowDifference": "{kind}: {count}",
+      "completionRolloutDecision": {
+        "insufficient_samples": "Le déploiement attend le nombre minimum d’échantillons",
+        "may_expand": "Le déploiement peut être étendu",
+        "stop_role_mismatch": "Déploiement suspendu : incohérence de rôle supérieure à 1 %",
+        "stop_needs_decision": "Déploiement suspendu : décisions requises supérieures à 5 %"
+      }
     },
     "actions": {
       "dragSort": "Glisser pour réordonner",
@@ -2763,7 +2775,36 @@
           "waiting_review": "En attente de revue",
           "waiting_adjudication": "En attente d'arbitrage",
           "superseded": "Remplacé"
-        }
+        },
+        "completionResolved": "Résolu",
+        "completionNeedsDecision": "Décision requise",
+        "completionBlocked": "Bloqué",
+        "completionEvidenceValidated": "Preuve validée",
+        "completionRetryArtifact": "Réessayer l’artefact",
+        "completionStale": "Cette décision est obsolète. Rechargez le flux de travail.",
+        "completionConflict": "Un autre résultat a déjà été validé.",
+        "completionLegacyReadOnly": "Le flux de travail hérité est en lecture seule",
+        "completionLegacyRestart": "Redémarrer avec le protocole de résultat v2",
+        "completionLegacySource": "Flux source hérité nº {conversation}",
+        "completionLegacySuccessor": "Flux successeur nº {conversation}",
+        "completionAutomaticWake": "L’orchestration racine a repris automatiquement",
+        "completionManualRootResume": "Reprendre l’orchestration racine",
+        "completionOutcome": {
+          "approve": "Approuver",
+          "approve_with_minors": "Approuver avec modifications mineures",
+          "request_changes": "Demander des modifications",
+          "block": "Bloquer",
+          "done": "Terminé",
+          "done_with_concerns": "Terminé avec réserves",
+          "blocked": "Bloqué"
+        },
+        "completionSource": {
+          "complete_work": "Outil de finalisation",
+          "assistant_conclusion": "Conclusion de l’assistant",
+          "report": "Rapport validé",
+          "user_adjudication": "Décision de l’utilisateur"
+        },
+        "completionReportFile": "Rapport : {file}"
       },
       "agentPlanOverlay": {
         "title": "Plan de l'agent",

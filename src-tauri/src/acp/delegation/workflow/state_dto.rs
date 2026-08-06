@@ -36,6 +36,8 @@ pub struct WorkflowStateDto {
     pub plan_target_rel_path: String,
     pub risk_policy_version: String,
     pub completion_protocol: super::types::CompletionProtocolWorkflowProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::CompletionProjectionV2>,
     pub task_policies: Vec<ManifestTaskPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<DocumentRef>,
@@ -86,6 +88,8 @@ pub struct WorkflowNodeStateDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::CompletionProjectionV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_cycle: Option<i64>,
@@ -129,6 +133,8 @@ pub struct WorkflowStateIndexDto {
     pub plan_target_rel_path: String,
     pub risk_policy_version: String,
     pub completion_protocol: super::types::CompletionProtocolWorkflowProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::CompletionProjectionV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<WorkflowRecoveryProjection>,
     pub detail: WorkflowStateDetail,
@@ -180,6 +186,8 @@ pub struct WorkflowNodeIndexDto {
     pub verdict: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<super::CompletionProjectionV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,6 +645,7 @@ pub fn project_workflow_state_index(
             child_conversation_id: node.child_conversation_id,
             verdict: node.verdict,
             report_file: node.report_file,
+            completion: node.completion,
             artifact_digest: node.artifact_digest,
             work_unit_key: Some(node.work_unit_key),
         });
@@ -655,6 +664,7 @@ pub fn project_workflow_state_index(
         plan_target_rel_path: state.plan_target_rel_path,
         risk_policy_version: state.risk_policy_version,
         completion_protocol: state.completion_protocol,
+        completion: state.completion,
         recovery: None,
         detail: WorkflowStateDetail::Index,
         inline_findings: false,
@@ -964,6 +974,7 @@ mod tests {
             reviewed_task_id: Some("reviewed-task-that-must-not-leak".to_string()),
             verdict: Some("done".to_string()),
             report_file: Some(format!("reports/{node_id}.md")),
+            completion: None,
             gate_id: None,
             gate_cycle: None,
             replaced_task_id: Some("replacement-that-must-not-leak".to_string()),
@@ -1137,6 +1148,7 @@ mod tests {
                 read_only_reason: None,
                 automatic_root_wake: false,
             },
+            completion: None,
             task_policies: vec![
                 sample_policy(1, TaskRiskLevel::High, "task-1-impl", "task-1-review-codex"),
                 sample_policy(
