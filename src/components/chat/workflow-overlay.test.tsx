@@ -11,7 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
-import { getWorkflowGraphSnapshot } from "@/lib/api"
+import {
+  getWorkflowGraphSnapshot,
+  restartLegacyWorkflow,
+} from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
 import {
@@ -52,6 +55,7 @@ vi.mock("@/lib/api", async () => {
   return {
     ...actual,
     getWorkflowGraphSnapshot: vi.fn(async () => null),
+    restartLegacyWorkflow: vi.fn(),
     subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
     subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
   }
@@ -374,6 +378,7 @@ beforeEach(() => {
   vi.mocked(openDelegatedChildSession).mockClear()
   vi.mocked(getWorkflowGraphSnapshot).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
+  vi.mocked(restartLegacyWorkflow).mockReset()
 })
 
 afterEach(() => {
@@ -381,6 +386,77 @@ afterEach(() => {
 })
 
 describe("SubAgentOverlay A13 workflow mount", () => {
+  it("renders legacy backlinks and resumes only through durable root controls", async () => {
+    const legacy = {
+      ...skeletonGraph(),
+      completion_protocol: {
+        version: 1,
+        mode: "v1" as const,
+        creation_mode: "v1" as const,
+        legacy_source: null,
+        v2_successor: {
+          workflow_id: "wf-successor",
+          conversation_id: 99,
+        },
+        read_only_reason: "legacy_completion_protocol_restart_required",
+        automatic_root_wake: false,
+      },
+    }
+    vi.mocked(restartLegacyWorkflow).mockResolvedValue({
+      source_workflow_id: "wf-test",
+      source_conversation_id: 42,
+      successor_workflow_id: "wf-successor",
+      successor_conversation_id: 99,
+      open_gate: "design",
+      completion_protocol: {
+        ...legacy.completion_protocol,
+        version: 2,
+        mode: "v2_enforce",
+        creation_mode: "v2_enforce",
+        legacy_source: { workflow_id: "wf-test", conversation_id: 42 },
+        v2_successor: null,
+        read_only_reason: null,
+      },
+      restart_context: {
+        original_conversation_id: 42,
+        original_request_id: "request-1",
+        original_request_text: "Build the workflow",
+        original_request_digest: `sha256:${"d".repeat(64)}`,
+        agent_type: "codex",
+        profile_id: null,
+      },
+      idempotent_replay: false,
+    })
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(legacy)
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={legacy}
+        defaultExpanded
+      />
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    )
+
+    expect(screen.getByText("Legacy workflow is read-only")).toBeInTheDocument()
+    expect(screen.getByText("Successor workflow #99")).toBeInTheDocument()
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restart with completion v2" })
+    )
+    expect(restartLegacyWorkflow).toHaveBeenCalledWith({
+      source_conversation_id: 42,
+    })
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Resume root orchestration" })
+    )
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+  })
+
   it("first-seeds a graphless open overlay without expanding the full graph", async () => {
     vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(skeletonGraph())
     renderWithIntl(

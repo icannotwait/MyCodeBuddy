@@ -62,6 +62,21 @@ describe("i18n locale key parity vs en.json", () => {
       expect(workflow.phaseProgressAria).toContain("{phase}")
       expect(workflow.phaseProgressAria).toContain("{status}")
       expect(workflow.phaseProgressAria).toContain("{progress}")
+
+      for (const key of [
+        "completionResolved",
+        "completionNeedsDecision",
+        "completionBlocked",
+        "completionRetryArtifact",
+        "completionLegacyRestart",
+        "completionManualRootResume",
+        "completionStale",
+        "completionConflict",
+      ]) {
+        expect(workflow[key], `missing workflow completion key ${key}`).toBe(
+          expect.any(String)
+        )
+      }
     }
   })
 })

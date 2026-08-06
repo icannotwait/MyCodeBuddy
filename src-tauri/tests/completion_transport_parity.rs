@@ -19,8 +19,8 @@ use codeg_lib::acp::delegation::workflow::types::{
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, capture_original_request_context, materialize_terminal_completion_txn,
-    restart_legacy_workflow_core, CompletionOutcome, CompletionProtocolRolloutConfig,
-    TerminalCompletionInput,
+    load_completion_projection, project_workflow_graph_core, restart_legacy_workflow_core,
+    CompletionOutcome, CompletionProtocolRolloutConfig, TerminalCompletionInput,
 };
 use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::app_state::AppState;
@@ -315,6 +315,78 @@ async fn issue_completion_context(fixture: &CompletionHttpFixture) -> String {
         .to_str()
         .unwrap()
         .to_string()
+}
+
+#[tokio::test]
+async fn completion_projection_is_identical_across_graph_http_and_mcp_surfaces() {
+    let fixture = completion_http_fixture().await;
+    let context = issue_completion_context(&fixture).await;
+
+    let pending_graph = project_workflow_graph_core(
+        &fixture.state.db,
+        fixture.parent_conversation_id,
+    )
+    .await
+    .unwrap();
+    let pending = pending_graph
+        .nodes
+        .iter()
+        .find(|node| node.latest_task_id.as_deref() == Some(fixture.cas.task_id.as_str()))
+        .and_then(|node| node.completion.clone())
+        .expect("pending completion must be projected");
+    assert_eq!(pending.card.state.as_str(), "needs_decision");
+
+    let response = fixture
+        .server
+        .post("/api/resolve_completion_decision")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .add_header(COMPLETION_CONTEXT_HEADER, context)
+        .json(&ResolveCompletionDecisionRequest {
+            cas: fixture.cas.clone(),
+            outcome: CompletionOutcome::Done,
+        })
+        .await;
+    response.assert_status_ok();
+
+    let direct = project_workflow_graph_core(
+        &fixture.state.db,
+        fixture.parent_conversation_id,
+    )
+    .await
+    .unwrap();
+    let http = fixture
+        .server
+        .post("/api/get_workflow_graph_snapshot")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": fixture.parent_conversation_id }))
+        .await;
+    http.assert_status_ok();
+    let http: Value = http.json();
+    assert_eq!(serde_json::to_value(&direct).unwrap(), http);
+
+    let completion = load_completion_projection(&fixture.state.db.conn, &fixture.cas.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let graph_completion = direct
+        .nodes
+        .iter()
+        .find(|node| node.latest_task_id.as_deref() == Some(fixture.cas.task_id.as_str()))
+        .and_then(|node| node.completion.as_ref())
+        .unwrap();
+    assert_eq!(graph_completion, &completion);
+
+    let rendered = codeg_lib::acp::delegation::companion::render_status_result(&json!({
+        "tasks": [{
+            "task_id": fixture.cas.task_id,
+            "status": "completed",
+            "completion": completion,
+        }]
+    }));
+    assert_eq!(
+        rendered["structuredContent"]["tasks"][0]["completion"],
+        serde_json::to_value(graph_completion).unwrap()
+    );
 }
 
 #[test]

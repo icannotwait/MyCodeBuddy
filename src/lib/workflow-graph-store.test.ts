@@ -8,10 +8,12 @@ import type {
 
 const {
   getWorkflowGraphSnapshot,
+  subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
   subscribeWorkflowCompatibilityNudge,
 } = vi.hoisted(() => ({
   getWorkflowGraphSnapshot: vi.fn(),
+  subscribeCompletionDecisionResolved: vi.fn(async () => () => {}),
   subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
   subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
 }))
@@ -20,6 +22,7 @@ const {
 // spreads (TS2556: spread of unknown[] is not a rest tuple).
 vi.mock("@/lib/api", () => ({
   getWorkflowGraphSnapshot,
+  subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
   subscribeWorkflowCompatibilityNudge,
 }))
@@ -162,8 +165,10 @@ beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   getWorkflowGraphSnapshot.mockReset()
   subscribeWorkflowGraphChanged.mockReset()
+  subscribeCompletionDecisionResolved.mockReset()
   subscribeWorkflowCompatibilityNudge.mockReset()
   subscribeWorkflowGraphChanged.mockResolvedValue(() => {})
+  subscribeCompletionDecisionResolved.mockResolvedValue(() => {})
   subscribeWorkflowCompatibilityNudge.mockResolvedValue(() => {})
 })
 
@@ -172,6 +177,105 @@ afterEach(() => {
 })
 
 describe("workflow-graph-store revision gate", () => {
+  it("dedupes completion replay, ignores stale events, and restores from snapshots", () => {
+    const needsDecision = baseSnapshot({
+      graph_revision: 7,
+      nodes: [
+        node({
+          node_id: "n-plan-r1",
+          latest_task_id: "task-1",
+          completion: {
+            protocol_version: 2,
+            graph_revision: 7,
+            card: {
+              state: "needs_decision",
+              role: "reviewer",
+              outcome: null,
+              summary: "Choose an outcome.",
+              report_file: null,
+              source: null,
+              evidence_validated: false,
+              attention: {
+                attention_id: "attention-1",
+                task_id: "task-1",
+                kind: "completion_decision",
+                captured_scope_digest: `sha256:${"a".repeat(64)}`,
+                latest_run_id: "task-1",
+                node_id: "n-plan-r1",
+              },
+            },
+          },
+        }),
+      ],
+    })
+    const event = {
+      version: 1,
+      event_id: "event-1",
+      workflow_id: "wf-1",
+      task_id: "task-1",
+      node_id: "n-plan-r1",
+      kind: "completion_decision" as const,
+      outcome: "approve_with_minors" as const,
+      evidence_scope_digest: `sha256:${"b".repeat(64)}`,
+      graph_revision: 8,
+    }
+    const store = useWorkflowGraphStore.getState()
+    store.applyFromDetail(7, needsDecision)
+
+    store.handleCompletionDecisionResolved(event)
+    const afterFirst = useWorkflowGraphStore.getState().getSnapshot(7)
+    expect(afterFirst?.nodes[0].completion?.card).toMatchObject({
+      state: "resolved",
+      outcome: "approve_with_minors",
+      source: "user_adjudication",
+      attention: null,
+    })
+    expect(afterFirst?.graph_revision).toBe(8)
+
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved(event)
+    expect(useWorkflowGraphStore.getState().getSnapshot(7)).toBe(afterFirst)
+
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved({
+      ...event,
+      event_id: "event-stale",
+      graph_revision: 6,
+      outcome: "block",
+    })
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion
+        ?.card.outcome
+    ).toBe("approve_with_minors")
+
+    const authoritative = baseSnapshot({
+      graph_revision: 9,
+      nodes: [
+        node({
+          node_id: "n-plan-r1",
+          latest_task_id: "task-1",
+          completion: {
+            protocol_version: 2,
+            graph_revision: 9,
+            card: {
+              state: "blocked",
+              role: "reviewer",
+              outcome: "block",
+              summary: "Blocked by durable state.",
+              report_file: null,
+              source: "user_adjudication",
+              evidence_validated: true,
+              attention: null,
+            },
+          },
+        }),
+      ],
+    })
+    useWorkflowGraphStore.getState().applyFromDetail(7, authoritative)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.nodes[0].completion
+        ?.card.state
+    ).toBe("blocked")
+  })
+
   it("applies detail snapshot and discards stale lower graph_revision", () => {
     const store = useWorkflowGraphStore.getState()
     store.applyFromDetail(7, baseSnapshot({ graph_revision: 3 }))

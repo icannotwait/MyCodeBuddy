@@ -107,7 +107,11 @@ pub fn project_terminal_completion(result: &TerminalCompletionResult) -> Complet
 
 #[cfg(test)]
 mod tests {
-    use crate::acp::delegation::workflow::{CompletionAttentionCas, TerminalCompletionResult};
+    use crate::acp::delegation::workflow::{
+        CompletionArtifactV2, CompletionAttentionCas, CompletionEvidenceBindingV2,
+        CompletionEvidenceV2, CompletionIntent, CompletionIntentSource, CompletionOutcome,
+        CompletionRole, TerminalCompletionResult, ValidatedCompletionEvidence,
+    };
     use crate::db::entities::delegation_attention_request::AttentionKind;
     use crate::db::entities::delegation_task_run::CompletionState;
 
@@ -137,6 +141,55 @@ mod tests {
         assert_eq!(projection.source, None);
         assert_eq!(projection.attention, Some(attention));
         assert_eq!(projection.graph_revision, 7);
+    }
+
+    #[test]
+    fn card_v2_is_a_bounded_projection_without_model_claimed_identity() {
+        let validated = ValidatedCompletionEvidence {
+            evidence: CompletionEvidenceV2 {
+                version: 2,
+                intent: CompletionIntent {
+                    outcome: CompletionOutcome::ApproveWithMinors,
+                    summary: Some("x".repeat(5_000)),
+                    report_file: Some("reports/task-16.md".into()),
+                    source: CompletionIntentSource::AssistantConclusion,
+                },
+                binding: CompletionEvidenceBindingV2 {
+                    workflow_id: "workflow-1".into(),
+                    task_id: "task-1".into(),
+                    node_id: "plan-reviewer".into(),
+                    role: CompletionRole::Reviewer,
+                    phase_id: "plan".into(),
+                    task_index: None,
+                    gate_id: Some("plan".into()),
+                    gate_lineage: Some(format!("sha256:{}", "a".repeat(64))),
+                    review_round: Some(1),
+                    reviewed_task_id: None,
+                    reviewed_generation: None,
+                    manifest_revision_observed: 1,
+                },
+                artifact: CompletionArtifactV2::DocumentSha256 {
+                    rel_path: "docs/superpowers/plans/task-16.md".into(),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                },
+                review_scope_digest: format!("sha256:{}", "c".repeat(64)),
+                evidence_scope_digest: format!("sha256:{}", "d".repeat(64)),
+                captured_at: "2026-08-06T00:00:00Z".into(),
+            },
+            evidence_validated: true,
+        };
+
+        let card = super::CompletionCardV2::project(&validated, None);
+
+        assert!(card.summary.as_deref().unwrap().as_bytes().len()
+            <= super::COMPLETION_CARD_SUMMARY_MAX_BYTES);
+        assert!(card.evidence_validated);
+        assert_eq!(card.role, CompletionRole::Reviewer);
+        assert_eq!(card.source, Some(CompletionIntentSource::AssistantConclusion));
+        assert_eq!(card.report_file.as_deref(), Some("reports/task-16.md"));
+        let json = serde_json::to_value(card).unwrap();
+        assert!(json.get("artifact_digest").is_none());
+        assert!(json.get("task_id").is_none());
     }
 }
 
