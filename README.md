@@ -281,6 +281,38 @@ cargo test --no-default-features --features server --bin codeg-server --lib  # s
 cargo insta review                                              # accept parser snapshot updates
 ```
 
+#### Low-memory Rust development
+
+Run these opt-in commands from the repository root:
+
+| Command                                               | Scope                                                                                             |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `pnpm rust:check:low-memory`                          | Shared Rust library without Tauri; the recommended 4 GiB daily check                              |
+| `pnpm rust:test:low-memory -- <test-path> -- --exact` | One exact shared-core test at runtime; compilation still builds the complete library test harness |
+| `pnpm rust:check:desktop:low-memory`                  | Desktop library, including Tauri                                                                  |
+| `pnpm rust:check:server:low-memory`                   | Server library and binary                                                                         |
+| `pnpm rust:check:mcp:low-memory`                      | MCP companion binary                                                                              |
+
+The alternate Cargo configuration limits compilation and test execution to
+one job/thread and disables incremental state and debug information. It is
+opt-in, so normal Cargo commands and CI are unchanged. The first invocation
+can still be slow because it may need a cold build.
+
+On the current Windows codebase, even one filtered unit test first compiles a
+single harness containing all 4,028 library tests. The low-memory profile
+reduced its observed `rustc` peak from roughly 12.2 GiB to 7.55 GiB, but the
+test-name filter only changes execution after compilation. A 4 GiB machine
+should therefore use `rust:check:low-memory` for daily Rust feedback and leave
+Rust tests to CI or a higher-memory machine; a large system page file may help
+but is not guaranteed. The desktop check and Tauri development can also exceed
+4 GiB.
+
+When enough memory is available, an exact test can be run with:
+
+```bash
+pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
+```
+
 > Tip: when you have a fresh `codeg-mcp` build under `src-tauri/target/release/` and want to point a manually-launched `codeg-server` at it without reinstalling, export `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### Server Deployment (opt-in self-host)

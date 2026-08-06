@@ -6,6 +6,10 @@ Approved in conversation on 2026-08-06.
 
 Implementation was authorized in conversation on 2026-08-06.
 
+Validation on 2026-08-06 revised the 4 GiB support boundary: shared-core
+checks are the daily local workflow, while compiling the monolithic library
+test harness requires more than 4 GiB on the measured Windows checkout.
+
 ## Problem
 
 The Rust package is large enough that normal desktop test builds can exceed
@@ -27,8 +31,9 @@ developers and release jobs with adequate resources.
 
 - Provide an explicit, cross-platform low-memory mode using Cargo's native
   configuration system.
-- Make shared-core checks and targeted shared-core library tests the normal
-  workflow on a 4 GiB machine.
+- Make shared-core checks the normal Rust workflow on a 4 GiB machine.
+- Provide a lower-memory targeted-test command for machines with enough
+  physical memory or page file, without representing it as 4 GiB-safe.
 - Provide opt-in desktop, server, and MCP checks under the same constraints.
 - Keep the normal Cargo configuration, release builds, and CI matrix
   unchanged.
@@ -37,6 +42,8 @@ developers and release jobs with adequate resources.
 ## Non-Goals
 
 - Guaranteeing the complete 4,000-plus Rust test suite on a 4 GiB machine.
+- Guaranteeing even one filtered unit test on a 4 GiB machine, because Cargo
+  compiles the complete library test harness before applying the name filter.
 - Guaranteeing `pnpm tauri dev` or desktop release builds on a 4 GiB machine.
 - Changing production binaries, Cargo features, dependency versions, or CI.
 - Adding a separate Cargo target directory or deleting existing build cache.
@@ -92,12 +99,18 @@ Add package scripts that run from `src-tauri` and preserve Cargo's exit code:
 ```
 
 The first two commands intentionally disable default features. They cover the
-shared Rust core without activating Tauri. A targeted test is passed through
-pnpm, for example:
+shared Rust core without activating Tauri. A targeted test can be passed
+through pnpm on a machine with enough available memory, for example:
 
 ```bash
 pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
 ```
+
+The test filter affects execution only. Cargo still compiles one library test
+program containing all 4,028 tests. During validation, the single `rustc`
+process compiling that program peaked at approximately 7.55 GiB even with this
+configuration, compared with approximately 12.2 GiB under the normal profile.
+The command is lower-memory, but it is not a 4 GiB test path.
 
 The desktop command exists for changes under `#[cfg(feature =
 "tauri-runtime")]`, but it is expected to consume more memory than shared-core
@@ -127,7 +140,8 @@ Documentation must state that:
 - the first low-memory build can still be slow;
 - the mode reduces peak pressure but cannot prove success on every 4 GiB
   operating-system configuration;
-- targeted tests are preferred over an unfiltered library suite; and
+- 4 GiB development should default to the shared-core check;
+- exact unit-test filters do not reduce test-harness compilation memory; and
 - full regression remains a CI or higher-memory-machine responsibility.
 
 ## Documentation
@@ -151,9 +165,17 @@ ten translations would add disproportionate maintenance.
 6. Run `git diff --check` and confirm CI, Cargo features, and lockfiles are
    unchanged.
 
-The current machine cannot emulate a 4 GiB memory ceiling reliably, so
-verification proves command behavior and configuration isolation, not a hard
-hardware guarantee.
+All five command entry points completed on the validation host. The exact test
+selected one passing test and filtered out 4,027, but its one `rustc` process
+peaked at approximately 7.55 GiB. The resulting PDB was approximately 88 MiB,
+down from roughly 902 MiB for a recent normal-profile artifact, which confirms
+that disabling debug information materially helped without making the
+monolithic harness fit 4 GiB.
+
+The current machine cannot emulate a 4 GiB memory ceiling reliably. Validation
+therefore proves command behavior, configuration isolation, and measured peak
+reduction. It does not establish a hard 4 GiB guarantee; the documented 4 GiB
+workflow is check-oriented.
 
 ## Alternatives Considered
 

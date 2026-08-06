@@ -5,14 +5,15 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an opt-in Rust development workflow that lowers compiler and
-test-runner memory pressure for 4 GiB machines without changing normal Cargo
+**Goal:** Add an opt-in, check-oriented Rust workflow for 4 GiB machines plus
+a lower-memory test command for larger machines, without changing normal Cargo
 or CI behavior.
 
 **Architecture:** A CLI-supplied Cargo configuration serializes compilation,
 disables incremental state and debug information, and serializes libtest.
 Root pnpm scripts expose shared-core, desktop, server, and MCP entry points;
-documentation makes targeted shared-core work the supported 4 GiB workflow.
+documentation makes shared-core checking the supported 4 GiB workflow and
+keeps test-harness compilation outside that guarantee.
 
 **Tech Stack:** Cargo 1.97, Rust 2021, pnpm 11, PowerShell, JSON, TOML,
 Markdown
@@ -32,7 +33,19 @@ Markdown
   artifacts.
 - Do not claim that full Rust regression, Tauri development, or release builds
   are guaranteed to fit on every 4 GiB machine.
+- Do not claim that an exact unit-test filter makes compilation fit 4 GiB. The
+  measured library test program contains 4,028 tests and its single `rustc`
+  process peaked at approximately 7.55 GiB under this configuration.
 - Keep localized README files unchanged.
+
+## Validation Finding
+
+Task 1 validation confirmed that Cargo compiled the exact filtered test into
+the same monolithic library test program as the other 4,027 unit tests. The
+filter is applied when that program runs, not while Cargo compiles it. The
+implementation therefore keeps `rust:test:low-memory` as a materially smaller
+option for machines with enough memory or page file, but Task 2 documents
+`rust:check:low-memory` as the only recommended 4 GiB Rust path.
 
 ---
 
@@ -246,29 +259,36 @@ absent`.
 - [ ] **Step 2: Add the README workflow**
 
 After the existing Rust test commands in `README.md`, add a `Low-memory Rust
-development (4 GiB machines)` subsection containing:
+development` subsection containing:
 
 ````markdown
-#### Low-memory Rust development (4 GiB machines)
+#### Low-memory Rust development
 
 Run these opt-in commands from the repository root:
 
-| Command | Scope |
-| --- | --- |
-| `pnpm rust:check:low-memory` | Shared Rust library without Tauri (recommended daily check) |
-| `pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact` | One exact shared-core library test |
-| `pnpm rust:check:desktop:low-memory` | Desktop library, including Tauri |
-| `pnpm rust:check:server:low-memory` | Server library and binary |
-| `pnpm rust:check:mcp:low-memory` | MCP companion binary |
+| Command                                                                                                        | Scope                                                                                             |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `pnpm rust:check:low-memory`                                                                                   | Shared Rust library without Tauri; the recommended 4 GiB daily check                              |
+| `pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact`            | One exact shared-core test at runtime; compilation still builds the complete library test harness |
+| `pnpm rust:check:desktop:low-memory`                                                                           | Desktop library, including Tauri                                                                  |
+| `pnpm rust:check:server:low-memory`                                                                            | Server library and binary                                                                         |
+| `pnpm rust:check:mcp:low-memory`                                                                               | MCP companion binary                                                                              |
 
 The alternate Cargo configuration limits compilation and test execution to
-one job/thread and disables incremental state and debug information. The first
-invocation can still be slow because it may need a cold build. These settings
-reduce peak memory pressure but cannot guarantee every desktop build will fit
-within 4 GiB; prefer the shared-core check and exact tests for daily work. Run
-the complete Rust regression suite in CI or on a higher-memory machine.
+one job/thread and disables incremental state and debug information. It is
+opt-in, so normal Cargo commands and CI are unchanged. The first invocation
+can still be slow because it may need a cold build.
 
-For example:
+On the current Windows codebase, even one filtered unit test first compiles a
+single harness containing all 4,028 library tests. The low-memory profile
+reduced its observed `rustc` peak from roughly 12.2 GiB to 7.55 GiB, but the
+test-name filter only changes execution after compilation. A 4 GiB machine
+should therefore use `rust:check:low-memory` for daily Rust feedback and leave
+Rust tests to CI or a higher-memory machine; a large system page file may help
+but is not guaranteed. The desktop check and Tauri development can also exceed
+4 GiB.
+
+When enough memory is available, an exact test can be run with:
 
 ```bash
 pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
@@ -282,22 +302,24 @@ After the normal backend Rust command block in `AGENTS.md`, add:
 ````markdown
 ### 低内存 Rust 开发（在仓库根目录执行）
 
-仅在明确受 4 GiB 内存约束时使用以下 opt-in 命令：
+仅在明确受低内存约束时使用以下 opt-in 命令：
 
 ```bash
-# 日常共享核心检查（不启用 Tauri）
+# 4 GiB 机器的日常 Rust 反馈：只检查共享核心，不启用 Tauri
 pnpm rust:check:low-memory
-# 优先运行单个精确测试；将路径替换为本次改动对应的测试
-pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
-# 仅在改动对应运行面时执行
+# 仅在改动对应运行面时执行；桌面检查仍可能超过 4 GiB
 pnpm rust:check:desktop:low-memory
 pnpm rust:check:server:low-memory
 pnpm rust:check:mcp:low-memory
+# 有更高可用内存或足够页文件时，才运行精确单测
+pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
 ```
 
-低内存配置将编译与测试线程限制为 1，并关闭增量编译和调试信息。首次冷编译
-仍可能较慢，也不能保证完整桌面构建适配所有 4 GiB 环境。日常应优先共享核心
-检查和定向测试；完整 Rust 回归交由 CI 或更高内存机器执行。
+低内存配置将 Cargo 编译任务和测试线程限制为 1，并关闭增量编译和调试信息，
+但首次冷编译仍可能较慢。`--exact` 只过滤测试运行，不会缩小编译目标；当前
+Windows 整库测试程序包含 4,028 个测试，单个 `rustc` 在低内存配置下实测峰值
+仍约 7.55 GiB。因此 4 GiB 机器默认只运行共享核心 check，Rust 单测与完整回归
+交由 CI 或更高内存机器执行；足够大的系统页文件可能有帮助，但不作成功保证。
 ````
 
 - [ ] **Step 4: Assert the documented commands and caveats**
@@ -318,10 +340,10 @@ foreach ($command in $requiredCommands) {
   if (-not $readme.Contains($command)) { throw "README missing $command" }
   if (-not $agents.Contains($command)) { throw "AGENTS missing $command" }
 }
-if (-not $readme.Contains('cannot guarantee every desktop build will fit within 4 GiB')) {
+if (-not $readme.Contains('test-name filter only changes execution after compilation')) {
   throw 'README missing 4 GiB support boundary'
 }
-if (-not $agents.Contains('不能保证完整桌面构建适配所有 4 GiB 环境')) {
+if (-not $agents.Contains('4 GiB 机器默认只运行共享核心 check')) {
   throw 'AGENTS missing 4 GiB support boundary'
 }
 ```
@@ -389,4 +411,5 @@ git diff HEAD~2..HEAD --name-only
 ```
 
 Expected: a clean worktree; implementation changes are limited to
-`.cargo/low-memory.toml`, `package.json`, `README.md`, and `AGENTS.md`.
+`.cargo/low-memory.toml`, `package.json`, `README.md`, `AGENTS.md`, and the
+validation corrections in this plan and its design document.
