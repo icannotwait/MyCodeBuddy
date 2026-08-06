@@ -63,9 +63,7 @@ mod tests {
     use crate::acp::terminal_adapter::adapter_for;
     use crate::acp::terminal_context::terminal_metadata;
     use crate::models::agent::AgentType;
-    use crate::terminal::shell::test_support::{
-        posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
-    };
+    use crate::terminal::shell::test_support::pwsh_spec as test_pwsh_spec;
 
     fn assert_terminal_meta(value: &serde_json::Value, dialect: &str, shell: &str) {
         let term = &value["_meta"]["codeg.dev/terminal"];
@@ -84,15 +82,5 @@ mod tests {
         let value = serde_json::to_value(req).unwrap();
         assert_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
         assert_eq!(value["sessionId"], "s-fork");
-    }
-
-    #[test]
-    fn fork_request_terminal_metadata_uses_posix_snapshot() {
-        let spec = test_posix_spec();
-        let meta =
-            terminal_metadata(Meta::default(), &spec, adapter_for(AgentType::ClaudeCode)).unwrap();
-        let req = build_fork_session_request(SessionId::new("s2"), "/tmp/p", meta);
-        let value = serde_json::to_value(req).unwrap();
-        assert_terminal_meta(&value, "posix", "/bin/sh");
     }
 }

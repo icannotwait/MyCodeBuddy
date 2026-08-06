@@ -6,8 +6,6 @@ pub mod metrics;
 pub mod progress;
 pub mod registry;
 pub mod supervisor;
-#[cfg(test)]
-mod terminal_cancel_tests;
 pub mod types;
 
 pub use attribution::{

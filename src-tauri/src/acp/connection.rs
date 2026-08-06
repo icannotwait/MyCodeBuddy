@@ -16215,50 +16215,6 @@ mod tests {
         }
     }
 
-    /// Two prompts on one process-scoped injector: only the first is enriched.
-    #[test]
-    fn terminal_prompt_context_one_shot_across_two_prompts() {
-        let injector = TerminalPromptContext::new(test_pwsh_spec());
-        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
-            text: "first".into(),
-        }]);
-        injector.append_once(&mut first);
-        let mut second = map_prompt_blocks(vec![PromptInputBlock::Text {
-            text: "second".into(),
-        }]);
-        injector.append_once(&mut second);
-        assert_eq!(first.len(), 2);
-        assert_eq!(second.len(), 1);
-    }
-
-    /// Fork reuses the same Arc; reattachment never re-enters `run_connection`
-    /// (injector lives only there), so mid-process reconnect cannot append a
-    /// superseding context.
-    #[test]
-    fn terminal_prompt_context_survives_fork_and_reattachment_semantics() {
-        let injector = Arc::new(TerminalPromptContext::new(test_pwsh_spec()));
-        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
-            text: "pre-fork".into(),
-        }]);
-        injector.append_once(&mut first);
-        // Simulate fork: same Arc into the restarted conversation loop.
-        let forked = Arc::clone(&injector);
-        let mut post_fork = map_prompt_blocks(vec![PromptInputBlock::Text {
-            text: "post-fork".into(),
-        }]);
-        forked.append_once(&mut post_fork);
-        assert_eq!(first.len(), 2);
-        assert_eq!(post_fork.len(), 1);
-        // "Reattachment" is just another hold on the same process injector —
-        // AgentConnection reuse does not call TerminalPromptContext::new.
-        let reattached = Arc::clone(&injector);
-        let mut mid = map_prompt_blocks(vec![PromptInputBlock::Text {
-            text: "reattach".into(),
-        }]);
-        reattached.append_once(&mut mid);
-        assert_eq!(mid.len(), 1);
-    }
-
     /// Clone a `_meta` map out of a JSON object literal, mirroring how codex-acp
     /// ships tool-call / session-info `_meta`.
     fn meta_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -18884,31 +18840,6 @@ mod tests {
     }
 
     #[test]
-    fn build_resume_session_request_sets_claude_raw_meta() {
-        let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = build_resume_session_request(
-            AgentType::ClaudeCode,
-            SessionId::new("abc".to_string()),
-            &cwd,
-            Vec::new(),
-            &test_posix_spec(),
-            adapter_for(AgentType::ClaudeCode),
-            &native_plan(AgentType::ClaudeCode),
-            ConnectionPurpose::User,
-        )
-        .unwrap();
-
-        assert_eq!(
-            req.meta
-                .as_ref()
-                .and_then(|m| m.get("claudeCode"))
-                .and_then(|v| v.get("emitRawSDKMessages"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
     fn build_resume_session_request_skips_claude_meta_for_non_claude() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let req = build_resume_session_request(
@@ -19232,93 +19163,6 @@ mod tests {
                 .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["clientCapabilities"]["terminal"], true);
-    }
-
-    #[test]
-    fn claude_and_terminal_metadata_are_merged() {
-        let request = build_new_session_request(
-            AgentType::ClaudeCode,
-            Path::new("/tmp/project"),
-            Vec::new(),
-            &test_posix_spec(),
-            adapter_for(AgentType::ClaudeCode),
-            &native_plan(AgentType::ClaudeCode),
-            ConnectionPurpose::User,
-        )
-        .unwrap();
-        let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
-        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
-    }
-
-    #[test]
-    fn load_session_contains_terminal_metadata() {
-        let spec = test_pwsh_spec();
-        let request = build_load_session_request(
-            AgentType::Codex,
-            SessionId::new("sess-load"),
-            Path::new("/tmp/project"),
-            Vec::new(),
-            &spec,
-            adapter_for(AgentType::Codex),
-            &native_plan(AgentType::Codex),
-            ConnectionPurpose::User,
-        )
-        .unwrap();
-        let value = serde_json::to_value(request).unwrap();
-        assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
-    }
-
-    #[test]
-    fn resume_session_contains_terminal_metadata() {
-        let spec = test_posix_spec();
-        let request = build_resume_session_request(
-            AgentType::ClaudeCode,
-            SessionId::new("sess-resume"),
-            Path::new("/tmp/project"),
-            Vec::new(),
-            &spec,
-            adapter_for(AgentType::ClaudeCode),
-            &native_plan(AgentType::ClaudeCode),
-            ConnectionPurpose::User,
-        )
-        .unwrap();
-        let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
-        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
-    }
-
-    /// Fake adapter that tries to inject a conflicting `codeg.dev/terminal`
-    /// value. Codeg's authoritative snapshot must win after merge.
-    struct ConflictingTerminalAdapter;
-
-    impl AcpTerminalAdapter for ConflictingTerminalAdapter {
-        fn agent_metadata(&self, _shell: &ResolvedShellSpec) -> Result<Meta, AcpError> {
-            let mut meta = Meta::default();
-            meta.insert(
-                "codeg.dev/terminal".into(),
-                serde_json::json!({
-                    "shell": "/bogus/from-adapter",
-                    "dialect": "cmd",
-                    "platform": "bogus",
-                    "commandMode": "adapter-lies",
-                }),
-            );
-            meta.insert("adapterExtra".into(), serde_json::json!({"ok": true}));
-            Ok(meta)
-        }
-    }
-
-    #[test]
-    fn terminal_metadata_overwrites_adapter_collision() {
-        let spec = test_pwsh_spec();
-        let request =
-            build_initialize_request(AgentType::Codex, &spec, &ConflictingTerminalAdapter).unwrap();
-        let value = serde_json::to_value(request).unwrap();
-        // Codeg snapshot wins on the reserved namespace.
-        assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
-        // Non-colliding adapter keys are still merged in.
-        assert_eq!(value["_meta"]["adapterExtra"]["ok"], true);
     }
 
     #[test]

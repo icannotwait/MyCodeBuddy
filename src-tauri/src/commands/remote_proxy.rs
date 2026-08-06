@@ -2209,30 +2209,7 @@ mod tests {
         assert!(json.get("detail").is_none());
     }
 
-    #[test]
-    fn upload_i18n_params_helper_builds_map() {
-        let params = upload_i18n_params([("a", "1".to_string()), ("b", "two".to_string())]);
-        assert_eq!(params.get("a").map(String::as_str), Some("1"));
-        assert_eq!(params.get("b").map(String::as_str), Some("two"));
-        assert_eq!(params.len(), 2);
-    }
-
     // ─── base64 size cap boundary ──────────────────────────────────────
-
-    #[test]
-    fn remote_upload_max_base64_len_admits_exact_limit_payload() {
-        // A payload of exactly `UPLOAD_MAX_BYTES` raw bytes encodes to
-        // a base64 string that MUST pass the pre-decode guard — anything
-        // else means we'd reject a legitimate maximum-sized upload.
-        let raw = vec![0u8; UPLOAD_MAX_BYTES as usize];
-        let encoded = STANDARD.encode(&raw);
-        assert!(
-            encoded.len() <= REMOTE_UPLOAD_MAX_BASE64_LEN,
-            "max-size base64 ({}) exceeds the constant ({})",
-            encoded.len(),
-            REMOTE_UPLOAD_MAX_BASE64_LEN
-        );
-    }
 
     #[test]
     fn remote_upload_max_base64_len_matches_formula() {

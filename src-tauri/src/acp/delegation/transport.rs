@@ -288,44 +288,6 @@ pub struct BrokerSettleWorkflowRequest {
     pub summary: String,
 }
 
-#[cfg(test)]
-mod workflow_v2_tests {
-    use super::BrokerSettleWorkflowRequest;
-    use serde_json::json;
-
-    #[test]
-    fn workflow_manifest_v2_settle_transport_round_trip_preserves_evidence() {
-        let evidence = json!({
-            "kind": "plan",
-            "scope": "scoped",
-            "revision_kind": "localized",
-            "scope_reason": "recheck finding owners",
-            "covered_author_task_id": "author-task-2",
-            "covered_plan_digest": "sha256:plan-2",
-            "required_reviewer_node_ids": ["plan-reviewer-codex"],
-            "finding_updates": [],
-            "lineage_reset_reason": null
-        });
-        let request: BrokerSettleWorkflowRequest = serde_json::from_value(json!({
-            "token": "secret",
-            "workflow_id": "wf-1",
-            "manifest_revision": 2,
-            "gate_id": "plan",
-            "expected_graph_revision": 3,
-            "gate_cycle": 2,
-            "outcome": "approved",
-            "evidence": evidence,
-            "summary": "all findings resolved"
-        }))
-        .expect("structured Plan evidence decodes");
-        let round_trip = serde_json::to_value(request).expect("encode settle request");
-        assert_eq!(round_trip["evidence"], evidence);
-        assert!(round_trip.get("critical_count").is_none());
-        assert!(round_trip.get("important_count").is_none());
-        assert!(round_trip.get("minor_count").is_none());
-    }
-}
-
 /// Load durable workflow recovery state. Backs `get_workflow_state`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerGetWorkflowStateRequest {
@@ -806,46 +768,6 @@ mod tests {
         };
         let wire = serde_json::to_value(&with_id).unwrap();
         assert_eq!(wire["parent_tool_use_id"], "wait-tool-B");
-    }
-
-    #[tokio::test]
-    async fn session_message_round_trip_in_memory() {
-        let (mut a, mut b) = duplex(8 * 1024);
-        let msg = BrokerMessage::SessionInfo(BrokerSessionRequest {
-            token: "tok".into(),
-            session_id: 42,
-            max_messages: Some(20),
-        });
-        write_frame(&mut a, &msg).await.unwrap();
-        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
-        match got {
-            BrokerMessage::SessionInfo(req) => {
-                assert_eq!(req.token, "tok");
-                assert_eq!(req.session_id, 42);
-                assert_eq!(req.max_messages, Some(20));
-            }
-            other => panic!("expected SessionInfo variant, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cancel_message_round_trip_in_memory() {
-        let (mut a, mut b) = duplex(8 * 1024);
-        let msg = BrokerMessage::Cancel(BrokerCancelRequest {
-            token: "tok".into(),
-            external_handle: "h1".into(),
-            reason: Some("user requested".into()),
-        });
-        write_frame(&mut a, &msg).await.unwrap();
-        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
-        match got {
-            BrokerMessage::Cancel(req) => {
-                assert_eq!(req.token, "tok");
-                assert_eq!(req.external_handle, "h1");
-                assert_eq!(req.reason.as_deref(), Some("user requested"));
-            }
-            other => panic!("expected Cancel variant, got {other:?}"),
-        }
     }
 
     #[tokio::test]

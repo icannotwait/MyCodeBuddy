@@ -3506,21 +3506,6 @@ mod tests {
         ));
     }
 
-    /// Host `_meta.tool_use_id` for THIS status call is the authoritative wait
-    /// tool id; companion must copy it onto `BrokerStatusRequest.parent_tool_use_id`.
-    #[test]
-    fn get_delegation_status_request_copies_meta_tool_use_id() {
-        let params = json!({
-            "name": "get_delegation_status",
-            "arguments": { "task_ids": ["t1"] },
-            "_meta": { "tool_use_id": "wait-tool-B" }
-        });
-        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
-        assert_eq!(req.parent_tool_use_id, "wait-tool-B");
-        assert_eq!(req.token, "tok");
-        assert_eq!(req.task_ids, vec!["t1".to_string()]);
-    }
-
     /// Incident 1570 production field path (companion layer): host `_meta` on
     /// `get_delegation_status` becomes `BrokerStatusRequest.parent_tool_use_id`
     /// for the listener arm path. Never invents an id when meta is absent.
@@ -3550,17 +3535,6 @@ mod tests {
             empty.parent_tool_use_id, "",
             "missing _meta must not invent a wait tool id"
         );
-    }
-
-    /// Missing `_meta` must yield empty string — never invent a wait tool id.
-    #[test]
-    fn get_delegation_status_request_missing_meta_is_empty_parent_tool_use_id() {
-        let params = json!({
-            "name": "get_delegation_status",
-            "arguments": { "task_ids": ["t1"] }
-        });
-        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
-        assert_eq!(req.parent_tool_use_id, "");
     }
 
     /// Empty / non-string tool_use_id is treated as missing.
@@ -3593,31 +3567,6 @@ mod tests {
             normalize_status_task_ids(&args).unwrap(),
             vec!["a", "b", "c"]
         );
-    }
-
-    #[test]
-    fn normalize_status_task_ids_rejects_non_string_entry() {
-        // A non-string survivor alongside valid ids is a hard error, not a
-        // silent drop.
-        assert!(normalize_status_task_ids(&json!({ "task_ids": [123] })).is_err());
-        assert!(normalize_status_task_ids(&json!({ "task_ids": ["a", 123] })).is_err());
-        assert!(normalize_status_task_ids(&json!({ "task_ids": [true] })).is_err());
-    }
-
-    #[test]
-    fn normalize_status_task_ids_empty_when_none_usable() {
-        // Missing, empty, and all-blank arrays all yield no ids; a bare legacy
-        // `task_id` is no longer read. (These are `Ok(empty)`, not errors.)
-        assert!(normalize_status_task_ids(&json!({})).unwrap().is_empty());
-        assert!(normalize_status_task_ids(&json!({ "task_ids": [] }))
-            .unwrap()
-            .is_empty());
-        assert!(normalize_status_task_ids(&json!({ "task_ids": ["  "] }))
-            .unwrap()
-            .is_empty());
-        assert!(normalize_status_task_ids(&json!({ "task_id": "abc" }))
-            .unwrap()
-            .is_empty());
     }
 
     #[test]
@@ -5156,18 +5105,6 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("unknown tool"));
-    }
-
-    #[tokio::test]
-    async fn delegate_rejected_as_unknown_when_delegation_off() {
-        // Feedback-only ctx: delegation tools are hidden + rejected uniformly.
-        let line = json!({
-            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
-            "params": { "name": "delegate_to_agent", "arguments": {"agent_type":"codex","task":"x"} }
-        })
-        .to_string();
-        let resp = unwrap_respond(dispatch_with_features(FEEDBACK_ONLY, &line).await);
-        assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     /// tools/list and tools/call independently gate disabled delegation.

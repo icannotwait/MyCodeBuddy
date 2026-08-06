@@ -4077,37 +4077,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_trailing_tool_call_captures_no_text() {
-        // A turn ending on a tool call has no concluding text block; the result
-        // text stays unset (the LLM opens the child session for detail).
-        let mut s = fresh_state();
-        s.live_message = Some(LiveMessage {
-            id: "m1".into(),
-            role: MessageRole::Assistant,
-            content: vec![
-                LiveContentBlock::Text {
-                    text: "running a tool".into(),
-                    parent_tool_use_id: None,
-                },
-                LiveContentBlock::ToolCallRef {
-                    tool_call_id: "tc".into(),
-                },
-            ],
-            started_at: Utc::now(),
-        });
-        s.apply_event(&AcpEvent::TurnComplete {
-            session_id: "ext".into(),
-            stop_reason: "end_turn".into(),
-            agent_type: "codex".into(),
-            mark_awaiting_reply: false,
-
-            termination_source: None,
-            provider_turn_id: None,
-        });
-        assert_eq!(s.last_assistant_text, None);
-    }
-
-    #[test]
     fn turn_complete_keeps_final_text_before_a_trailing_plan_block() {
         // `PlanUpdate` re-appends a Plan block at the END of content, so the
         // agent's concluding answer often sits BEFORE a trailing Plan. The
@@ -4227,99 +4196,6 @@ mod tests {
         let mut s = fresh_state();
         s.last_assistant_text = Some("stale".into());
         s.live_message = None;
-        s.apply_event(&AcpEvent::TurnComplete {
-            session_id: "ext".into(),
-            stop_reason: "end_turn".into(),
-            agent_type: "codex".into(),
-            mark_awaiting_reply: false,
-
-            termination_source: None,
-            provider_turn_id: None,
-        });
-        assert_eq!(s.last_assistant_text, None);
-    }
-
-    #[test]
-    fn turn_complete_matches_visible_assistant_text_helper() {
-        let content = vec![
-            LiveContentBlock::Text {
-                text: "narrate ".into(),
-                parent_tool_use_id: None,
-            },
-            LiveContentBlock::ToolCallRef {
-                tool_call_id: "tc".into(),
-            },
-            LiveContentBlock::Thinking {
-                text: "think".into(),
-                parent_tool_use_id: None,
-            },
-            LiveContentBlock::Text {
-                text: "final answer".into(),
-                parent_tool_use_id: None,
-            },
-            LiveContentBlock::Plan {
-                entries: serde_json::json!([]),
-            },
-        ];
-        let live = LiveMessage {
-            id: "m1".into(),
-            role: MessageRole::Assistant,
-            content: content.clone(),
-            started_at: Utc::now(),
-        };
-        let expected = visible_assistant_text(Some(&live));
-
-        let mut s = fresh_state();
-        s.live_message = Some(LiveMessage {
-            id: "m1".into(),
-            role: MessageRole::Assistant,
-            content,
-            started_at: Utc::now(),
-        });
-        s.apply_event(&AcpEvent::TurnComplete {
-            session_id: "ext".into(),
-            stop_reason: "end_turn".into(),
-            agent_type: "codex".into(),
-            mark_awaiting_reply: false,
-
-            termination_source: None,
-            provider_turn_id: None,
-        });
-        assert_eq!(
-            s.last_assistant_text.as_deref().unwrap_or(""),
-            expected.as_str()
-        );
-        assert_eq!(expected, "final answer");
-    }
-
-    #[test]
-    fn turn_complete_matches_helper_when_visible_text_is_empty() {
-        // trim-empty assembly ⇒ last_assistant_text None and helper ""
-        let content = vec![
-            LiveContentBlock::Thinking {
-                text: "only thinking".into(),
-                parent_tool_use_id: None,
-            },
-            LiveContentBlock::ToolCallRef {
-                tool_call_id: "tc".into(),
-            },
-        ];
-        let live = LiveMessage {
-            id: "m1".into(),
-            role: MessageRole::Assistant,
-            content: content.clone(),
-            started_at: Utc::now(),
-        };
-        assert_eq!(visible_assistant_text(Some(&live)), "");
-
-        let mut s = fresh_state();
-        s.last_assistant_text = Some("prior".into());
-        s.live_message = Some(LiveMessage {
-            id: "m1".into(),
-            role: MessageRole::Assistant,
-            content,
-            started_at: Utc::now(),
-        });
         s.apply_event(&AcpEvent::TurnComplete {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),

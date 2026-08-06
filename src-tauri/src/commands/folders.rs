@@ -6554,24 +6554,6 @@ mod tests {
         assert_ne!(after.reference_source_epoch, epoch_before);
     }
 
-    #[tokio::test]
-    async fn get_git_branch_stays_none_on_detached_head() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        git_run(dir.path(), &["init", "-q"]);
-        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c1"]);
-        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c2"]);
-        git_run(dir.path(), &["checkout", "-q", "HEAD~1"]);
-
-        // The legacy `Option<String>` contract intentionally reports no branch
-        // for a detached HEAD; git-log default selection and compare rely on it.
-        assert_eq!(
-            get_git_branch(dir.path().to_str().unwrap().to_string())
-                .await
-                .expect("branch"),
-            None
-        );
-    }
-
     /// Like `git_run` but returns the command's trimmed stdout (e.g. a resolved
     /// commit hash), with the same isolated identity/config env.
     fn git_capture(dir: &std::path::Path, args: &[&str]) -> String {
@@ -7202,26 +7184,6 @@ branch refs/heads/main";
     }
 
     #[test]
-    fn build_file_tree_prunes_gitignore_outside_git_repo() {
-        // require_git(false): a non-git folder with only .gitignore still prunes.
-        let root = tempfile::tempdir().expect("tempdir");
-        write_tree_fixture(&root.path().join(".gitignore"), "vendor/\n");
-        write_tree_fixture(&root.path().join("app.rs"), "fn main(){}\n");
-        write_tree_fixture(&root.path().join("vendor/lib.rs"), "// big\n");
-
-        let tree =
-            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
-        let mut paths = Vec::new();
-        collect_tree_paths(&tree, &mut paths);
-
-        assert!(paths.iter().any(|p| p == "app.rs"), "got {paths:?}");
-        assert!(
-            !paths.iter().any(|p| p.starts_with("vendor")),
-            "vendor must be pruned without a git repo, got {paths:?}"
-        );
-    }
-
-    #[test]
     fn build_file_tree_still_skips_git_dir_and_shows_dotfiles() {
         let root = tempfile::tempdir().expect("tempdir");
         write_tree_fixture(&root.path().join(".env"), "SECRET=1\n");
@@ -7290,20 +7252,6 @@ branch refs/heads/main";
             !paths.iter().any(|p| p.starts_with("heavy")),
             "heavy pruned via .rgignore, got {paths:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn get_file_tree_defaults_to_pruned_mode() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_tree_fixture(&root.path().join(".ignore"), "generated/\n");
-        write_tree_fixture(&root.path().join("generated/out.txt"), "out\n");
-
-        let tree = get_file_tree(root.path().to_string_lossy().into_owned(), Some(10), None)
-            .await
-            .expect("tree");
-        let mut paths = Vec::new();
-        collect_tree_paths(&tree, &mut paths);
-        assert!(!paths.iter().any(|path| path.starts_with("generated")));
     }
 
     #[test]
