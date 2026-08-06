@@ -182,6 +182,27 @@ pub trait AgentParser {
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError>;
 }
 
+/// Construct the parser for one persisted agent type without performing any
+/// discovery or database writes.
+pub(crate) fn parser_for_agent(agent_type: crate::models::AgentType) -> Box<dyn AgentParser> {
+    use crate::models::AgentType;
+
+    match agent_type {
+        AgentType::ClaudeCode => Box::new(claude::ClaudeParser::new()),
+        AgentType::Codex => Box::new(codex::CodexParser::new()),
+        AgentType::OpenCode => Box::new(opencode::OpenCodeParser::new()),
+        AgentType::Gemini => Box::new(gemini::GeminiParser::new()),
+        AgentType::Cline => Box::new(cline::ClineParser::new()),
+        AgentType::Hermes => Box::new(hermes::HermesParser::new()),
+        AgentType::CodeBuddy => Box::new(codebuddy::CodeBuddyParser::new()),
+        AgentType::KimiCode => Box::new(kimi_code::KimiCodeParser::new()),
+        AgentType::Pi => Box::new(pi::PiParser::new()),
+        AgentType::Grok => Box::new(grok::GrokParser::new()),
+        AgentType::Cursor => Box::new(cursor::CursorParser::new()),
+        AgentType::Custom(_) => Box::new(acp_native::AcpNativeParser::new(agent_type)),
+    }
+}
+
 /// Truncate a string to `max_len` characters, appending "..." if truncated.
 pub fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {

@@ -12,6 +12,7 @@ use crate::db::entities::{
     delegation_workflow_node_binding, delegation_workflow_restart_context,
 };
 use crate::db::AppDatabase;
+use crate::models::{AgentType, ContentBlock, TurnRole};
 
 use super::error::WorkflowStoreError;
 use super::key::build_work_unit_key;
@@ -482,9 +483,110 @@ pub async fn restart_legacy_workflow_if_enforced(
         return Ok(None);
     }
 
+    if !has_successor {
+        recover_original_request_context(db, source_conversation_id).await?;
+    }
+
     restart_legacy_workflow_core(db, i64::from(source_conversation_id))
         .await
         .map(Some)
+}
+
+/// Backfill context for protocol-v1 workflows created before the restart
+/// context table existed. The auto-title first prompt is preferred because it
+/// is the bounded text accepted at prompt admission. If that job has already
+/// finalized and been deleted, parse the source transcript directly. This path
+/// never calls the conversation detail loader, whose stale-id fallback may
+/// rewrite `conversation.external_id`.
+async fn recover_original_request_context(
+    db: &AppDatabase,
+    source_conversation_id: i32,
+) -> Result<(), WorkflowStoreError> {
+    if delegation_workflow_restart_context::Entity::find_by_id(source_conversation_id)
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let source_conversation = conversation::Entity::find_by_id(source_conversation_id)
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or(WorkflowStoreError::ParentNotFound(source_conversation_id))?;
+    let agent_type = AgentType::from_wire(&source_conversation.agent_type).ok_or_else(|| {
+        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(
+            "source agent type is unavailable for request recovery".into(),
+        )
+    })?;
+
+    let title_request = auto_title_job::Entity::find_by_id(source_conversation_id)
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .and_then(|job| job.first_user_text)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| (recovered_request_id(&text), text));
+    let recovered = match title_request {
+        Some(request) => Some(request),
+        None => match source_conversation.external_id {
+            Some(external_id) => tokio::task::spawn_blocking(move || {
+                let parser = crate::parsers::parser_for_agent(agent_type);
+                parser
+                    .get_conversation(&external_id)
+                    .ok()
+                    .and_then(|detail| first_visible_user_request(detail.turns))
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "[delegation] legacy request transcript recovery task failed: {error}"
+                );
+                None
+            }),
+            None => None,
+        },
+    };
+
+    if let Some((request_id, request_text)) = recovered {
+        capture_original_request_context(
+            &db.conn,
+            source_conversation_id,
+            &request_id,
+            &[crate::acp::types::PromptInputBlock::Text { text: request_text }],
+            source_conversation.agent_type.as_str(),
+        )
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn first_visible_user_request(turns: Vec<crate::models::MessageTurn>) -> Option<(String, String)> {
+    turns.into_iter().find_map(|turn| {
+        if !matches!(turn.role, TurnRole::User) {
+            return None;
+        }
+        let blocks = turn
+            .blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => {
+                    Some(crate::acp::types::PromptInputBlock::Text { text })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let text =
+            crate::auto_title::bound_context(&crate::auto_title::project_visible_prompt(&blocks));
+        (!text.trim().is_empty()).then_some((turn.id, text))
+    })
+}
+
+fn recovered_request_id(request_text: &str) -> String {
+    format!("recovered:sha256:{}", sha256_hex(request_text.as_bytes()))
 }
 
 pub(crate) async fn completion_protocol_projection<C: ConnectionTrait>(
@@ -601,4 +703,40 @@ fn db_err(error: sea_orm::DbErr) -> WorkflowStoreError {
 
 fn restart_db_err(error: sea_orm::DbErr) -> WorkflowStoreError {
     WorkflowStoreError::LegacyCompletionProtocolRestartRequired(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MessageTurn;
+
+    fn user_turn(id: &str, text: &str) -> MessageTurn {
+        MessageTurn {
+            id: id.into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            reasoning_effort: None,
+            completed_at: None,
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn legacy_archive_recovery_skips_internal_user_turns() {
+        let recovered = first_visible_user_request(vec![
+            user_turn(
+                "internal-route",
+                "Codeg mandatory delegation route: profile_id=\"review\"",
+            ),
+            user_turn("original-turn", "restore the original user request"),
+        ])
+        .expect("visible historical request");
+
+        assert_eq!(recovered.0, "original-turn");
+        assert_eq!(recovered.1, "restore the original user request");
+    }
 }

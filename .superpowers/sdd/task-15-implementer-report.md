@@ -166,3 +166,54 @@ documents were not modified.
 The repository's default filtered Cargo invocation still compiles integration
 tests without their required `test-utils` feature. Task 15 uses explicit
 focused targets and does not broaden scope to alter the shared test harness.
+
+## Fix Round 2 - Upgraded Legacy Restart Context
+
+Closed `T15-CODEX-I2` for protocol-v1 workflows persisted before the restart
+context migration. The enforce wrapper now backfills a missing context before
+successor creation. It prefers the durable, bounded auto-title first prompt;
+when that job has already finalized and been deleted, it directly parses the
+source session archive and selects the first visible user turn. The archive
+path is read-only and does not call the conversation detail fallback that can
+rewrite `conversation.external_id`.
+
+Recovered text is passed through the existing bounding, request-ID limiting,
+digesting, and insert-once capture path. A first-prompt row without a historical
+turn ID receives a stable content-derived ID. Existing context and successors
+remain idempotent. If neither durable source yields non-empty visible request
+bytes, restart still returns the typed retryable
+`legacy_completion_protocol_restart_required` error and creates nothing.
+
+### Fix Round 2 TDD Evidence
+
+RED was observed before production changes with the focused
+`legacy_restart_upgrade` filter: the no-source guard passed, while the upgraded
+v1 resume regression failed because the manager returned
+`Protocol("legacy_completion_protocol_restart_required")` instead of the typed
+successor redirect.
+
+Fresh focused GREEN verification on the final formatted tree:
+
+- `cargo test --features test-utils --test completion_protocol_v2
+  legacy_restart -- --nocapture`: 5 passed, including the upgraded first-resume
+  recovery and no-source fail-closed cases.
+- `cargo test --features test-utils --lib
+  legacy_archive_recovery_skips_internal_user_turns -- --nocapture`: 1 passed.
+- `cargo test --features test-utils --test completion_protocol_v2
+  legacy_prompt_restart -- --nocapture`: 1 passed.
+- `cargo test --features test-utils --test completion_protocol_v2
+  rollout_restart -- --nocapture`: 1 passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+The upgrade regression omits live restart-context capture, sends a distinct
+resume prompt through `ConnectionManager`, and proves the first enforce resume
+creates exactly one linked v2 successor carrying the historical request. The
+source workflow and conversation fingerprint is unchanged, the resume prompt
+is not substituted, and the successor has only its initial manifest revision
+with no task runs or workflow-run evidence bindings.
+
+No full suite, Clippy, frontend test, build, push, or PR was run. Cargo emitted
+the existing warning that the packaged `codeg-mcp` sidecar is absent and a
+zero-byte build placeholder was used. Pre-existing tracked changes and
+untracked publication JSON files remain unstaged.

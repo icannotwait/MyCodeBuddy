@@ -28,14 +28,15 @@ use codeg_lib::acp::manager::ConnectionManager;
 use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::commands::workflow_completion::restart_legacy_workflow_authenticated_core;
 use codeg_lib::db::entities::{
-    delegation_attention_request, delegation_task_run, delegation_workflow,
+    auto_title_job, delegation_attention_request, delegation_task_run, delegation_workflow,
     delegation_workflow_gate_settlement, delegation_workflow_manifest_revision,
-    delegation_workflow_node_binding, delegation_workflow_run_binding,
+    delegation_workflow_node_binding, delegation_workflow_restart_context,
+    delegation_workflow_run_binding,
 };
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
 use codeg_lib::web::event_bridge::EventEmitter;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use serde_json::Value;
 
 fn skeleton(token: &str) -> ManifestDocument {
@@ -426,6 +427,179 @@ async fn legacy_prompt_restart_fences_desktop_and_server_plain_text_before_sourc
             .await
             .unwrap(),
         1
+    );
+}
+
+#[tokio::test]
+async fn legacy_restart_upgrade_recovers_first_request_before_enforce_resume() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade").await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let original_request = "implement the historical Task 15 request after upgrading";
+    let now = chrono::Utc::now();
+    auto_title_job::ActiveModel {
+        conversation_id: Set(parent),
+        state: Set(auto_title_job::AutoTitleJobState::AwaitingTurn),
+        attempts: Set(0),
+        first_user_text: Set(Some(original_request.into())),
+        first_assistant_text: Set(None),
+        first_prompt_at: Set(Some(now)),
+        locale: Set(Some("en".into())),
+        usable_turn_seq: Set(0),
+        attempt_turn_seq: Set(0),
+        last_usable_turn_token: Set(None),
+        config_gen: Set(0),
+        updated_at: Set(now),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: skeleton("task-15-pre-migration-source"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        delegation_workflow_restart_context::Entity::find_by_id(parent)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let before = source_fingerprint(&db, parent, &published.workflow_id).await;
+
+    let metrics = std::sync::Arc::new(DelegationMetrics::default());
+    let mut rollout = CompletionProtocolRolloutConfig::default();
+    rollout.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+    let manager = ConnectionManager::new();
+    manager.install_completion_protocol_runtime(std::sync::Arc::new(rollout), metrics);
+    manager
+        .insert_test_connection(
+            "upgraded-legacy-root",
+            AgentType::Codex,
+            Some(std::path::PathBuf::from("/tmp/task-15-legacy-upgrade")),
+            EventEmitter::Noop,
+        )
+        .await;
+    let state = manager.get_state("upgraded-legacy-root").await.unwrap();
+    state.write().await.conversation_id = Some(parent);
+
+    let error = manager
+        .send_prompt_linked_with_message_id(
+            &db,
+            "upgraded-legacy-root",
+            vec![PromptInputBlock::Text {
+                text: "this resume prompt must not replace the original request".into(),
+            }],
+            Some(folder),
+            Some(parent),
+            None,
+            Some("upgrade-resume-turn".into()),
+            None,
+        )
+        .await
+        .expect_err("first enforce resume must redirect to a recovered successor");
+    let successor_conversation_id = match error {
+        AcpError::LegacyCompletionProtocolRestart {
+            successor_conversation_id,
+        } => successor_conversation_id,
+        other => panic!("expected typed legacy restart, got {other:?}"),
+    };
+
+    assert_eq!(
+        source_fingerprint(&db, parent, &published.workflow_id).await,
+        before,
+        "upgrade recovery must not mutate the source workflow or conversation"
+    );
+    assert!(!state.read().await.turn_in_flight);
+    let context =
+        delegation_workflow_restart_context::Entity::find_by_id(successor_conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(context.original_conversation_id, parent);
+    assert_eq!(context.original_request_text, original_request);
+    assert_ne!(context.original_request_id, "upgrade-resume-turn");
+    let successor = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&published.workflow_id))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(successor.parent_conversation_id, successor_conversation_id);
+    assert_eq!(
+        delegation_workflow_manifest_revision::Entity::find()
+            .filter(
+                delegation_workflow_manifest_revision::Column::WorkflowId
+                    .eq(&successor.workflow_id),
+            )
+            .count(&db.conn)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        delegation_task_run::Entity::find()
+            .filter(
+                delegation_task_run::Column::ParentConversationId.eq(successor_conversation_id),
+            )
+            .count(&db.conn)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        delegation_workflow_run_binding::Entity::find()
+            .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(&successor.workflow_id),)
+            .count(&db.conn)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn legacy_restart_upgrade_without_durable_request_remains_fail_closed() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade-no-context").await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: skeleton("task-15-pre-migration-no-context"),
+        },
+    )
+    .await
+    .unwrap();
+    let before = source_fingerprint(&db, parent, &published.workflow_id).await;
+    let mut enforce = CompletionProtocolRolloutConfig::default();
+    enforce.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+
+    let error = restart_legacy_workflow_if_enforced(&db, parent, None, &enforce)
+        .await
+        .expect_err("missing historical request bytes must remain fail-closed");
+
+    assert_eq!(error.code(), "legacy_completion_protocol_restart_required");
+    assert!(error.to_string().contains("context is unavailable"));
+    assert_eq!(
+        source_fingerprint(&db, parent, &published.workflow_id).await,
+        before
+    );
+    assert_eq!(
+        delegation_workflow::Entity::find()
+            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&published.workflow_id),)
+            .count(&db.conn)
+            .await
+            .unwrap(),
+        0
     );
 }
 
