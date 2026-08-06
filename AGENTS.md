@@ -33,6 +33,9 @@ pnpm build                     # 静态导出构建
 ```bash
 # 桌面模式（默认 feature）
 cargo check
+# 日常快测：只运行库单元测试，跳过二进制与集成测试链接
+cargo test --lib --features test-utils
+# 完整回归：运行库、二进制与集成测试
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
 
