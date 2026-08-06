@@ -120,7 +120,7 @@ function normalizedRecoveryClause(clause) {
 function isAuthorizationIdPrivacyClause(normalized) {
   const id = "(?:the\\s+)?recovery_authorization_id"
   const target =
-    "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics)"
+    "(?:status(?:\\s+projections?)?|ledgers?|reports?|cards?|metrics|completion\\s+projections?)"
   const targets = `${target}(?:\\s*,\\s*${target})*(?:\\s*,?\\s+(?:and|or)\\s+${target})?`
   const destination = `(?:in|into|on|to)\\s+(?:the\\s+)?${targets}`
   const activeAction = "(?:persist|store|project|expose|include|write|record)"
@@ -381,6 +381,194 @@ function hasNegatedDesignTrigger(skill, trigger) {
       `)\\s+(?:an\\s+)?external Design review`,
     "i"
   ).test(skill)
+}
+
+function normalizedCompletionClauses(skill) {
+  return skill
+    .split(/\r?\n\s*\r?\n/)
+    .flatMap((paragraph) =>
+      paragraph
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(" ")
+        .split(/(?<=[.!?;])/)
+    )
+    .map((clause) => clause.replace(/[`*_]/g, "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+}
+
+function isFrozenV1Clause(clause) {
+  return (
+    /\b(?:protocol[- ]?v?1|frozen\s+v1|v1\s+historical|legacy|historical\s+branch)\b/i.test(
+      clause
+    ) && !/\bv2 successor\b[^.;]*\b(?:imports?|accepts?|uses?)\b/i.test(clause)
+  )
+}
+
+function negatesActionOnObject(clause, actions, object) {
+  return new RegExp(
+    `(?:never|do\\s+not|does\\s+not|must\\s+not|should\\s+not|` +
+      `may\\s+not|cannot|can't)\\s+(?:\\w+\\s+){0,4}` +
+      `(?:${actions})\\b[^.!?;]{0,160}(?:${object})`,
+    "i"
+  ).test(clause)
+}
+
+function hasUnsafeCardTemplate(skill) {
+  const actions =
+    "emits?|requests?|requires?|asks?|includes?|suppl(?:y|ies)|produces?"
+  const object =
+    "codeg-card-summary-v1|card(?:\\s+(?:template|block|summary|evidence|settlement))?"
+  return normalizedCompletionClauses(skill).some((clause) => {
+    if (isFrozenV1Clause(clause)) return false
+    if (
+      !new RegExp(`(?:${actions})\\b[^.!?;]{0,160}(?:${object})`, "i").test(
+        clause
+      )
+    ) {
+      return false
+    }
+    return !negatesActionOnObject(clause, actions, object)
+  })
+}
+
+function hasUnsafeDigestRequest(skill) {
+  const actions = "asks?|requests?|requires?|tells?"
+  const object =
+    "(?:child|worker|model|author|reviewer)[^.!?;]{0,100}(?:artifact\\s+)?digest|" +
+    "(?:artifact\\s+)?digest[^.!?;]{0,100}(?:from|by)\\s+(?:the\\s+)?(?:child|worker|model|author|reviewer)"
+  return normalizedCompletionClauses(skill).some((clause) => {
+    if (isFrozenV1Clause(clause)) return false
+    const asksForDigest = new RegExp(
+      `(?:${actions})\\b[^.!?;]{0,180}(?:${object})`,
+      "i"
+    ).test(clause)
+    if (!asksForDigest) return false
+    return !negatesActionOnObject(clause, actions, object)
+  })
+}
+
+function hasUnsafeFormatContinuation(skill) {
+  const clauses = normalizedCompletionClauses(skill)
+  const actions = "continue(?:_delegation)?(?:s|d|ing)?|resumes?|reopens?"
+  const object =
+    "(?:missing|malformed|invalid|unavailable|unclear)[^.!?;]{0,80}(?:completion|format|summary|report)|" +
+    "(?:completion|format|summary|report)[^.!?;]{0,80}(?:missing|malformed|invalid|unavailable|unclear)"
+  return clauses.some((clause) => {
+    if (isFrozenV1Clause(clause)) return false
+    const unsafe = new RegExp(
+      `(?:${actions})\\b[^.!?;]{0,180}(?:${object})|` +
+        `(?:${object})[^.!?;]{0,180}(?:${actions})\\b`,
+      "i"
+    ).test(clause)
+    if (!unsafe) return false
+    return !negatesActionOnObject(clause, actions, object)
+  })
+}
+
+function hasUnsafeReemitOrTerminalRecovery(skill) {
+  const clauses = normalizedCompletionClauses(skill)
+  return clauses.some((clause) => {
+    if (/CARD\s+RE-EMIT\s+ONLY/i.test(clause)) return true
+    if (isFrozenV1Clause(clause)) return false
+    const actions = "continues?|replaces?|reopens?|re-emits?|reemits?"
+    const object =
+      "(?:semantically\\s+)?terminal\\s+child|completed\\s+child|(?:completion\\s+)?card"
+    if (
+      !new RegExp(`(?:${actions})\\b[^.!?;]{0,160}(?:${object})`, "i").test(
+        clause
+      )
+    ) {
+      return false
+    }
+    return !negatesActionOnObject(clause, actions, object)
+  })
+}
+
+function hasUnsafeGateCountReduction(skill) {
+  return normalizedCompletionClauses(skill).some((clause) => {
+    if (isFrozenV1Clause(clause)) return false
+    return /(?:Design|Plan|Task|Final)[^.]{0,80}(?:gate|review)[^.]{0,120}(?:advances?|passes?|settles?|approves?)[^.]{0,120}(?:Critical|Important|findings?|counts?)/i.test(
+      clause
+    )
+  })
+}
+
+function completionContractState(skill) {
+  const plain = skill.replace(/[`*]/g, " ").replace(/\s+/g, " ")
+  return {
+    workerConclusion:
+      /protocol-v2 workflow[^.]{0,120}workers? (?:call|use) complete_work[^.]{0,160}(?:explicit terminal|terminal or report conclusion)[^.]{0,80}otherwise/i.test(
+        plain
+      ),
+    platformAuthority:
+      /Parent advances only from platform completion\.state and workflow admission state/i.test(
+        plain
+      ),
+    durableAttention:
+      /completion\.state is needs_decision or artifact_recovery[^.]{0,160}durable typed attention[^.]{0,80}wait/i.test(
+        plain
+      ),
+    rootReentry:
+      /After resolution or a user continuation turn[^.]{0,180}reload workflow state at the root[^.]{0,160}re-enter gate settlement or admission/i.test(
+        plain
+      ) &&
+      /Never continue, replace, or reopen the semantically terminal child/i.test(
+        plain
+      ),
+    cleanBaseline:
+      /Before every (?:protocol-v2 )?Implementer or Final Fixer admission[^.]{0,260}resolve HEAD[^.]{0,160}git status --porcelain[^.]{0,100}exactly empty[^.]{0,160}producer_baseline_head/i.test(
+        plain
+      ),
+    rejectsUnrelatedDirt:
+      /there is no unrelated-dirt allowance/i.test(plain) &&
+      !/(?:may|can|should|does)\s+(?:allow|accept|ignore)[^.]{0,80}unrelated[- ]dirt/i.test(
+        plain
+      ),
+    producerCommit:
+      /passing (?:Implementer or Final Fixer|producer) completion requires a clean workflow-owned (?:producer )?commit[^.]{0,180}(?:different from|differs from) (?:that|the) baseline/i.test(
+        plain
+      ) &&
+      /durable (?:Task policy )?allow_noop_verification[^.]{0,100}(?:authorize|authorizes)/i.test(
+        plain
+      ) &&
+      /(?:Task and Final code Reviewers|Code Reviewers)[^.]{0,180}(?:validate|re-resolve)[^.]{0,160}clean HEAD[^.]{0,180}(?:admission and completion|admission[^.]{0,80}completion)/i.test(
+        plain
+      ),
+    finalAggregation:
+      /Finish all Final history aggregation[^.]{0,120}before Final Reviewer admission/i.test(
+        plain
+      ) &&
+      !/Admit (?:the )?Final Reviewer before Final history aggregation/i.test(
+        plain
+      ),
+    finalFreeze:
+      /passing Final freezes the (?:reviewed )?delivery HEAD[^.]{0,180}(?:through delivery and reporting|through delivery|frozen commit)/i.test(
+        plain
+      ) &&
+      /Post-settlement (?:HEAD )?drift[^.]{0,100}final_artifact_drift[^.]{0,120}reopen(?:s)? Final/i.test(
+        plain
+      ),
+    protocolBoundary:
+      /(?:explicit )?v1 historical branch|workflow whose frozen completion protocol remains v1/i.test(
+        plain
+      ) &&
+      (/(?:v2 successor)[^.]{0,160}no v1 evidence or settlement (?:may )?cross(?:es)? into it/i.test(
+        plain
+      ) ||
+        /no v1 evidence or settlement (?:may )?cross(?:es)? into (?:a |the )?v2 successor/i.test(
+          plain
+        )),
+    platformGateOutcomes:
+      /Design, Plan, Task, and Final gates advance from platform outcomes and validated scope/i.test(
+        plain
+      ) && !hasUnsafeGateCountReduction(skill),
+    finalFindingsPackage:
+      /For a non-pass Final[^.]{0,180}consume only the platform Final-findings package and context[^.]{0,120}Final Fixer/i.test(
+        plain
+      ),
+  }
 }
 
 /**
@@ -1280,6 +1468,116 @@ export function validateSkillMarkdown(skill) {
     pass(`line count ${lines.length} < 500`)
   }
 
+  if (hasUnsafeCardTemplate(skill)) {
+    fail("B2D-COMP-001", "v2 guidance emits or requests a completion Card")
+  } else {
+    pass("v2 completion Card templates are absent")
+  }
+  if (hasUnsafeDigestRequest(skill)) {
+    fail("B2D-COMP-002", "requests a model-authored artifact digest")
+  } else {
+    pass("model-authored digest requests are absent")
+  }
+  if (hasUnsafeFormatContinuation(skill)) {
+    fail("B2D-COMP-003", "continues a child to repair completion format")
+  } else {
+    pass("format-only completion continuation is absent")
+  }
+  if (hasUnsafeReemitOrTerminalRecovery(skill)) {
+    fail(
+      "B2D-COMP-004",
+      "uses completion re-emission or reopens a semantically terminal child"
+    )
+  } else {
+    pass("completion re-emission and terminal-child recovery are absent")
+  }
+
+  const completion = completionContractState(skill)
+  if (!completion.cleanBaseline) {
+    fail(
+      "B2D-COMP-005",
+      "missing clean resolvable Implementer/Final-Fixer admission baseline"
+    )
+  } else {
+    pass("clean producer admission baseline")
+  }
+  if (!completion.rejectsUnrelatedDirt) {
+    fail("B2D-COMP-006", "unrelated worktree dirt is not rejected")
+  } else {
+    pass("no unrelated-dirt allowance")
+  }
+  if (!completion.producerCommit) {
+    fail(
+      "B2D-COMP-007",
+      "missing workflow-owned producer commit or Reviewer HEAD validation"
+    )
+  } else {
+    pass("workflow-owned producer commit and Reviewer HEAD validation")
+  }
+  if (!completion.finalAggregation) {
+    fail(
+      "B2D-COMP-008",
+      "Final aggregation must finish before Final Reviewer admission"
+    )
+  } else {
+    pass("Final aggregation precedes Final Reviewer admission")
+  }
+  if (!completion.finalFreeze) {
+    fail("B2D-COMP-009", "missing passing Final delivery commit freeze")
+  } else {
+    pass("passing Final freezes the delivery commit")
+  }
+  if (!completion.platformAuthority) {
+    fail(
+      "B2D-COMP-010",
+      "Parent must advance only from platform completion and admission state"
+    )
+  } else {
+    pass("platform completion state is authoritative")
+  }
+  if (!completion.durableAttention) {
+    fail("B2D-COMP-011", "missing durable completion attention wait")
+  } else {
+    pass("durable completion attention waits")
+  }
+  if (!completion.rootReentry) {
+    fail(
+      "B2D-COMP-012",
+      "missing root reload/re-entry after completion attention"
+    )
+  } else {
+    pass("completion resolution re-enters from root state")
+  }
+  if (!completion.protocolBoundary) {
+    fail("B2D-COMP-013", "missing explicit frozen v1/v2 evidence boundary")
+  } else {
+    pass("frozen v1 history is isolated from v2 successors")
+  }
+  if (!completion.workerConclusion) {
+    fail(
+      "B2D-COMP-014",
+      "missing protocol-v2 worker completion conclusion contract"
+    )
+  } else {
+    pass("protocol-v2 worker terminal conclusion contract")
+  }
+  if (!completion.platformGateOutcomes) {
+    fail(
+      "B2D-COMP-015",
+      "Design/Plan/Task/Final gates must reduce platform outcomes and scope"
+    )
+  } else {
+    pass("all v2 gates reduce platform outcomes and scope")
+  }
+  if (!completion.finalFindingsPackage) {
+    fail(
+      "B2D-COMP-016",
+      "non-pass Final must use only the platform Final-findings package"
+    )
+  } else {
+    pass("non-pass Final uses the platform findings package")
+  }
+
   const ownership = validateParentOwnership(skill)
   for (const f of ownership.failures) fail("B2D-006", f)
   for (const n of ownership.notes) pass(n)
@@ -1337,14 +1635,21 @@ export function validateSkillMarkdown(skill) {
 
   const planContracts = [
     [
-      /owners of open Critical|open Critical and Important|owners of all open/i,
-      "scoped owner re-review",
+      /platform-selected Plan nodes|platform-selected reviewer set/i,
+      "platform-selected Plan review nodes",
     ],
     [
-      /full[- ]group|complete cohort|complete Plan review group|restore.*complete/i,
-      "full-group reset",
+      /platform[^.]{0,120}(?:full-group|complete cohort|complete Plan review group)[^.]{0,120}lineage/i,
+      "platform-owned full-group lineage",
     ],
-    [/two (consecutive )?non-improving/i, "stagnation"],
+    [
+      /platform-selected[\s\S]{0,80}holistic\s+rewrite/i,
+      "holistic rewrite route",
+    ],
+    [
+      /user-approved requirements change[\s\S]{0,100}(?:receipt|lineage)/i,
+      "durable requirements-change lineage",
+    ],
     [
       /pre-admission|before.*cohort.*admitted/i,
       "pre-admission risk correction path",
@@ -1380,7 +1685,7 @@ export function validateSkillMarkdown(skill) {
     "Design Gate approved -> dispatch Plan Author automatically.",
     "Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.",
     "Task Gate passed -> dispatch the next eligible Task or Final review automatically.",
-    "Final review approved -> verify, commit, and report automatically.",
+    "Final review approved -> deliver and report the frozen commit automatically.",
   ]
   for (const line of phaseLines) {
     if (!quickReference.includes(line)) {
@@ -1517,18 +1822,20 @@ export function validateSkillMarkdown(skill) {
   }
 
   if (
-    !/platform-harvested and validated card settles/i.test(skill) ||
-    !/Failed or unavailable harvest[\s\S]{0,100}degrades the child[\s\S]{0,120}same-child continue[\s\S]{0,80}re-emit the card/i.test(
+    !completion.platformAuthority ||
+    !completion.durableAttention ||
+    !completion.rootReentry ||
+    /Reject platform completion\.state and parse the child conclusion directly/i.test(
       skill
     ) ||
-    !/prose\s*never settles/i.test(skill) ||
-    /Reject a platform-harvested and validated card/i.test(skill) ||
-    /Prose approval settles the recovery card/i.test(skill) ||
-    /degraded child may finish without same-child card re-emission/i.test(skill)
+    /Prose approval settles the completion decision/i.test(skill) ||
+    /After needs_decision, continue the terminal child instead of root re-entry/i.test(
+      skill
+    )
   ) {
     fail(
       "B2D-R008",
-      "harvest, prose, or degraded-child card contract is invalid"
+      "platform completion attention or root re-entry contract is invalid"
     )
   }
 

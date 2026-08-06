@@ -68,15 +68,50 @@ material Plan revision. Recovery never changes key/profile or resets inherited
 consumption. Exhausted continue uses same-key budget_exhausted_continue replacement
 only while replacement budget remains; after replacement consumption, block.
 
-A platform-harvested and validated card settles. Failed or unavailable harvest
-degrades the child and requires same-child continue to re-emit the card; prose
-never settles. Normal Task review independently recomputes b2d_task_risk_v1;
-migration, security/authorization, concurrency, persistence/state-machine,
+Normal Task review independently recomputes b2d_task_risk_v1; migration,
+security/authorization, concurrency, persistence/state-machine,
 externally visible compatibility, and ambiguity each trigger external Design review.
 
 Before every delegation or continue, write ledger intent with intended key,
 role, agent, profile, and action. Fill latest_task_id after admission and
 reconcile from platform state after recovery.
+`
+
+const COMPLETION_PARAGRAPH = `## Completion and delivery contract
+
+For a protocol-v2 workflow, workers call complete_work when exposed or emit one
+explicit terminal or report conclusion otherwise. The Parent advances only from
+platform completion.state and workflow admission state, never child-authored
+completion metadata.
+
+When completion.state is needs_decision or artifact_recovery, surface durable
+typed attention and wait. After resolution or a user continuation turn, reload
+workflow state at the root and re-enter gate settlement or admission. Never
+continue, replace, or reopen the semantically terminal child. Genuine incomplete
+work, stall, cancellation, and transport or process loss stay on the typed
+recovery path.
+
+Before every Implementer or Final Fixer admission, resolve HEAD, require git
+status --porcelain to be exactly empty, and persist producer_baseline_head.
+Passing producer completion requires a clean workflow-owned commit different
+from that baseline unless durable allow_noop_verification authorizes a no-op.
+There is no unrelated-dirt allowance. Task and Final code Reviewers validate
+clean HEAD against the producer commit at admission and completion.
+
+Finish all Final history aggregation before Final Reviewer admission. A passing
+Final freezes the delivery HEAD through delivery and reporting. Post-settlement
+HEAD drift is final_artifact_drift and reopens Final review.
+
+Plan rounds follow platform-selected nodes and lineage, not findings or count
+ledgers. For a non-pass Final, consume only the platform Final-findings package
+and context before dispatching the Final Fixer. Do not request model-authored
+IDs, digests, Cards, or format repair.
+Design, Plan, Task, and Final gates advance from platform outcomes and validated
+scope.
+
+The explicit v1 historical branch retains frozen legacy Card and count behavior
+only for a workflow whose completion protocol remains v1. No v1 evidence or
+settlement crosses into a v2 successor.
 `
 
 /** Minimal skill that satisfies all contracts (hand-maintained fixture). */
@@ -131,8 +166,13 @@ user-approved requirements change, b2d_task_risk_v1.
 
 ${RECOVERY_PARAGRAPH}
 
-Scoped re-review: owners of open Critical and Important findings only.
-Full-group reset for material changes. Two non-improving rounds trigger stagnation handling.
+${overrides.completion ?? COMPLETION_PARAGRAPH}
+
+Plan rounds follow platform-selected Plan nodes and the current lineage. Material
+changes open the platform-required full-group lineage. Never reconstruct review
+rounds from model findings or severity counts. A platform-selected holistic
+rewrite stays Author-owned. A user-approved requirements change with its durable
+receipt opens a new lineage.
 Pre-admission risk correction uses material Plan revision. Post-admission uses cohort_frozen.
 
 ${route}
@@ -142,13 +182,49 @@ ${route}
 - Design Gate approved -> dispatch Plan Author automatically.
 - Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.
 - Task Gate passed -> dispatch the next eligible Task or Final review automatically.
-- Final review approved -> verify, commit, and report automatically.
+- Final review approved -> deliver and report the frozen commit automatically.
 - Only pause for a hard block, user_decision_required, or an unresolved choice that changes requirements, scope, architecture, or user data handling.
 - If state is stale, call get_workflow_state and continue without extra user approval.
 
 ${overrides.extra ?? ""}
 `
   return body
+}
+
+function baseV2Skill(overrides = {}) {
+  return baseValidSkill(overrides)
+}
+
+function removeAdmissionBaseline(skill) {
+  return skill.replace(
+    /Before every (?:protocol-v2\s+)?Implementer or Final Fixer admission,[\s\S]*?`producer_baseline_head`\.\s*/i,
+    ""
+  )
+}
+
+function allowUnrelatedDirt(skill) {
+  return `${skill}\nProtocol-v2 producer admission may allow unrelated dirt.\n`
+}
+
+function removeProducerCommit(skill) {
+  return skill.replace(
+    /A passing Implementer or Final Fixer completion requires[\s\S]*?authorize a verified no-op\.\s*/i,
+    ""
+  )
+}
+
+function reviewBeforeFinalAggregation(skill) {
+  return skill.replace(
+    /Finish all Final history aggregation,[\s\S]*?before Final Reviewer admission\./i,
+    "Admit the Final Reviewer before Final history aggregation."
+  )
+}
+
+function removeFinalCommitFreeze(skill) {
+  return skill.replace(
+    /A passing Final freezes the reviewed delivery `HEAD`[\s\S]*?adding a post-pass commit\.\s*/i,
+    ""
+  )
 }
 
 describe("extractTaskRouteSection", () => {
@@ -976,6 +1052,172 @@ describe("real SKILL.md", () => {
   })
 })
 
+describe("platform completion orchestration contract", () => {
+  it("accepts platform completion and durable adjudication re-entry", () => {
+    const skill = baseV2Skill({
+      completion: COMPLETION_PARAGRAPH,
+    })
+    assert.deepEqual(validateSkillMarkdown(skill).failures, [])
+  })
+
+  for (const [name, clause, rule] of [
+    [
+      "card template",
+      "Emit codeg-card-summary-v1 before completion.",
+      "B2D-COMP-001",
+    ],
+    [
+      "inflected card request",
+      "The Parent asks the child to emit a completion Card.",
+      "B2D-COMP-001",
+    ],
+    [
+      "digest request",
+      "Ask the child for the reviewed artifact digest.",
+      "B2D-COMP-002",
+    ],
+    [
+      "inflected digest request",
+      "The Parent requires the reviewer to provide an artifact digest.",
+      "B2D-COMP-002",
+    ],
+    [
+      "format retry",
+      "Continue the child when its completion format is malformed.",
+      "B2D-COMP-003",
+    ],
+    [
+      "inflected format retry",
+      "The Parent continues the child when completion is malformed.",
+      "B2D-COMP-003",
+    ],
+    ["re-emit operation", "Request CARD RE-EMIT ONLY.", "B2D-COMP-004"],
+    [
+      "completed-child reopen",
+      "The Parent reopens the completed child for another conclusion.",
+      "B2D-COMP-004",
+    ],
+  ]) {
+    it(`rejects ${name}`, () => {
+      assertHasRuleId(
+        validateSkillMarkdown(
+          baseV2Skill({ completion: `${COMPLETION_PARAGRAPH}\n${clause}` })
+        ).failures,
+        rule
+      )
+    })
+  }
+
+  it("allows explicit v2 prohibitions and the frozen v1 historical branch", () => {
+    const skill = baseV2Skill({
+      completion: `${COMPLETION_PARAGRAPH}
+
+For protocol v2, never emit codeg-card-summary-v1, do not ask the child for an
+artifact digest, and never continue a terminal child for malformed completion.
+The frozen v1 historical branch may retain legacy Card settlement.`,
+    })
+    assert.deepEqual(validateSkillMarkdown(skill).failures, [])
+  })
+
+  it("does not let unrelated negation mask an affirmative v2 Card request", () => {
+    const skill = baseV2Skill({
+      completion: `${COMPLETION_PARAGRAPH}
+
+Never discard work; the Parent asks the child to emit a completion Card.`,
+    })
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-COMP-001")
+  })
+
+  for (const [mutation, rule] of [
+    [
+      (skill) =>
+        skill.replace(
+          /Design, Plan, Task, and Final gates advance from platform outcomes and validated\s+scope\.\s*/i,
+          ""
+        ),
+      "B2D-COMP-015",
+    ],
+    [
+      (skill) =>
+        skill.replace(/For a non-pass Final,[\s\S]*?Final Fixer\.\s*/i, ""),
+      "B2D-COMP-016",
+    ],
+  ]) {
+    it(`requires platform gate evidence for ${rule}`, () => {
+      assertHasRuleId(validateSkillMarkdown(mutation(realSkill)).failures, rule)
+    })
+  }
+
+  it("rejects finding-count gate reduction", () => {
+    const skill = baseV2Skill({
+      extra:
+        "Design Gate advances after Critical and Important findings are clear.\n",
+    })
+    assertHasRuleId(validateSkillMarkdown(skill).failures, "B2D-COMP-015")
+  })
+})
+
+describe("producer and Final ordering contract", () => {
+  it("requires clean workflow-owned producer commits and Final freeze", () => {
+    for (const [mutation, rule] of [
+      [removeAdmissionBaseline, "B2D-COMP-005"],
+      [allowUnrelatedDirt, "B2D-COMP-006"],
+      [removeProducerCommit, "B2D-COMP-007"],
+      [reviewBeforeFinalAggregation, "B2D-COMP-008"],
+      [removeFinalCommitFreeze, "B2D-COMP-009"],
+    ]) {
+      assertHasRuleId(validateSkillMarkdown(mutation(realSkill)).failures, rule)
+    }
+  })
+
+  for (const [mutation, rule] of [
+    [
+      (skill) =>
+        skill.replace(
+          /The Parent advances only\s+from platform `completion\.state`[\s\S]*?completion-format repair\.\s*/i,
+          "The Parent does not advance without platform completion state. "
+        ),
+      "B2D-COMP-010",
+    ],
+    [
+      (skill) =>
+        skill.replace(
+          /When `completion\.state` is `needs_decision` or `artifact_recovery`,[\s\S]*?typed attention and wait\.\s*/i,
+          "The Parent must not ignore durable attention. "
+        ),
+      "B2D-COMP-011",
+    ],
+    [
+      (skill) =>
+        skill.replace(
+          /After resolution or a user continuation turn,[\s\S]*?terminal child\.\s*/i,
+          "Do not skip re-entry after resolution. "
+        ),
+      "B2D-COMP-012",
+    ],
+    [
+      (skill) =>
+        skill.replace(
+          /### Frozen v1 historical branch[\s\S]*?may cross into it\.\s*/i,
+          "Do not mix protocol branches. "
+        ),
+      "B2D-COMP-013",
+    ],
+    [
+      (skill) =>
+        skill.replace(
+          /For a protocol-v2 workflow, workers call `complete_work`[\s\S]*?otherwise\.\s*/i,
+          "Protocol-v2 workers do not omit completion. "
+        ),
+      "B2D-COMP-014",
+    ],
+  ]) {
+    it(`does not accept negated prose for ${rule}`, () => {
+      assertHasRuleId(validateSkillMarkdown(mutation(realSkill)).failures, rule)
+    })
+  }
+})
+
 describe("phase-transition pressure reference", () => {
   it("requires automatic continuation after approved gates and names the only pause conditions", () => {
     const quickReference = realSkill.match(
@@ -997,7 +1239,7 @@ describe("phase-transition pressure reference", () => {
     )
     assert.match(
       quickReference,
-      /Final review approved[\s\S]*?verify[\s\S]*?commit[\s\S]*?report/i
+      /Final review approved[\s\S]*?deliver[\s\S]*?report[\s\S]*?frozen commit/i
     )
     assert.match(
       quickReference,
@@ -1049,7 +1291,7 @@ describe("stable validator rule ids", () => {
       "B2D-010",
       (skill) =>
         skill.replace(
-          /Two non-improving rounds trigger stagnation handling\./,
+          /Plan rounds follow platform-selected Plan nodes and the current lineage\./,
           ""
         ),
     ],
@@ -1078,7 +1320,7 @@ describe("B2D-012 automatic phase transition contract", () => {
     "Design Gate approved -> dispatch Plan Author automatically.",
     "Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically.",
     "Task Gate passed -> dispatch the next eligible Task or Final review automatically.",
-    "Final review approved -> verify, commit, and report automatically.",
+    "Final review approved -> deliver and report the frozen commit automatically.",
   ]
 
   for (const requiredLine of requiredLines) {
@@ -1722,9 +1964,9 @@ Never map cancellation to unresumable.`
   }
 
   for (const mutation of [
-    "Reject a platform-harvested and validated card.",
-    "Prose approval settles the recovery card.",
-    "A degraded child may finish without same-child card re-emission.",
+    "Reject platform completion.state and parse the child conclusion directly.",
+    "Prose approval settles the completion decision.",
+    "After needs_decision, continue the terminal child instead of root re-entry.",
   ]) {
     it(`uses B2D-R008 for ${mutation}`, () => {
       assertHasRuleId(

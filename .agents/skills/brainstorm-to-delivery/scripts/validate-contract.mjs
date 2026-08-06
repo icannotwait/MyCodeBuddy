@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Deterministic contract checks for brainstorm-to-delivery SKILL.md (v2 adaptive routing).
+ * Deterministic checks for v2 adaptive routing and platform completion.
  * Exit 0 on PASS, 1 on FAIL.
  */
 import { readFileSync } from "node:fs"
