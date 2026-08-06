@@ -9,6 +9,7 @@ pub mod dto;
 pub mod error;
 pub mod events;
 pub mod evidence_scope;
+pub mod final_findings;
 pub mod gates;
 pub mod key;
 pub mod plan_material;
@@ -66,6 +67,15 @@ pub use events::{
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,
     WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
 };
+pub use final_findings::{
+    build_final_findings_package_v1, capture_report_context_v1, decode_final_findings_package_v1,
+    encode_final_findings_package_v1, load_active_final_findings_package_v1,
+    persist_final_findings_package_v1, resolve_active_final_findings_packages_v1,
+    verify_final_findings_package_model_v1, verify_final_findings_package_v1,
+    EncodedFinalFindingsPackageV1, FinalFindingInputV1, FinalFindingItemV1, FinalFindingsError,
+    FinalFindingsPackageInputV1, FinalFindingsPackageV1, RemediationContextAvailability,
+    RemediationContextInputV1, RemediationContextSnapshotV1, RemediationContextSourceKind,
+};
 pub use gates::{
     evaluate_execution_gate, reduce_design_gate, ExecutionGateEval, ExecutionGateInput,
     ExecutionGateKind, ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence,
@@ -82,9 +92,11 @@ pub use plan_material::{
     PlanMaterialSchemaV1, PlanPublicationMaterialDecisionV1,
 };
 pub use plan_review::{
-    derive_plan_review_round, FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewError,
-    PlanReviewNextAction, PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope,
-    PlanRevisionKind,
+    derive_plan_review_round, derive_plan_review_round_v2, reviewer_outcome_rank,
+    strictly_improves, FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewChangeV2,
+    PlanReviewDecisionV2, PlanReviewError, PlanReviewNextAction, PlanReviewRoundInputV2,
+    PlanReviewRoundState, PlanReviewRoundStateV2, PlanReviewRoundSubmission, PlanReviewScope,
+    PlanReviewerOutcomeV2, PlanRevisionKind,
 };
 pub use project::{
     evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,

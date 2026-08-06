@@ -55,6 +55,7 @@ use super::events::{
 use super::evidence_scope::{
     build_design_root_review_scope, canonical_json_sha256, DesignRootScopeInput,
 };
+use super::final_findings::resolve_active_final_findings_packages_v1;
 use super::gates::{
     evaluate_execution_gate, reduce_design_gate, ExecutionGateInput, ExecutionGateKind,
     RequiredReviewerEvidence,
@@ -64,8 +65,11 @@ use super::plan_material::{
     PlanPublicationMaterialDecisionV1,
 };
 use super::plan_review::{
-    derive_plan_review_round, PlanFindingUpdate, PlanReviewError, PlanReviewNextAction,
-    PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind,
+    derive_next_plan_review_round_v2, derive_plan_review_round, derive_plan_review_round_v2,
+    reviewer_outcome_rank, PlanFindingUpdate, PlanReviewChangeV2, PlanReviewDecisionV2,
+    PlanReviewError, PlanReviewNextAction, PlanReviewRoundInputV2, PlanReviewRoundState,
+    PlanReviewRoundStateV2, PlanReviewRoundSubmission, PlanReviewScope, PlanReviewerOutcomeV2,
+    PlanRevisionKind,
 };
 use super::project::evidence_from_run_binding_and_validated;
 use super::recovery_policy::{
@@ -776,7 +780,17 @@ async fn guard_final_delivery_txn(
         })?;
     let resolved = resolve_final_delivery(&request.workspace_path, expected_final_head).await;
     let diagnostic = match resolved {
-        Ok(artifact) => return Ok(FinalDeliveryGuardResult::Ready(artifact)),
+        Ok(artifact) => {
+            resolve_active_final_findings_packages_v1(
+                txn,
+                &request.workflow_id,
+                &request.gate_id,
+                header.graph_revision,
+            )
+            .await
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+            return Ok(FinalDeliveryGuardResult::Ready(artifact));
+        }
         Err(diagnostic @ ArtifactError::FinalArtifactDrift { .. }) => diagnostic,
         Err(diagnostic) => return Ok(FinalDeliveryGuardResult::Rejected(diagnostic)),
     };
@@ -1894,23 +1908,34 @@ async fn settle_workflow_gate_derived_core(
                                 evidence.identity.review_round
                             )));
                         }
-                        if expectation
-                            .outcome
-                            .as_ref()
-                            .is_some_and(|expected| *expected != evidence.outcome)
-                        {
-                            return Err(WorkflowStoreError::GateNotReady(format!(
-                                "expected outcome {:?} disagrees with complete v2 evidence reduction {:?}",
-                                expectation.outcome, evidence.outcome
-                            )));
-                        }
-                        req.outcome = evidence.outcome.clone();
                         if let Some(existing) = gate_prior
                             .iter()
                             .rev()
                             .find(|settlement| evidence.identity.matches_settlement(settlement))
                         {
-                            if existing.outcome == evidence.outcome
+                            let reduced_outcome = if gate.gate_kind == DocumentGateKind::Plan {
+                                let state = load_persisted_plan_state_v2(existing)?;
+                                if !plan_state_matches_evidence(&state, &evidence) {
+                                    return Err(WorkflowStoreError::Persistence(
+                                        "persisted v2 Plan state does not match current evidence"
+                                            .into(),
+                                    ));
+                                }
+                                plan_v2_settlement_outcome(state.next_action)
+                            } else {
+                                evidence.outcome.clone()
+                            };
+                            if expectation
+                                .outcome
+                                .as_ref()
+                                .is_some_and(|expected| *expected != reduced_outcome)
+                            {
+                                return Err(WorkflowStoreError::GateNotReady(format!(
+                                    "expected outcome {:?} disagrees with complete v2 evidence reduction {:?}",
+                                    expectation.outcome, reduced_outcome
+                                )));
+                            }
+                            if existing.outcome == reduced_outcome
                                 && existing.summary == req.summary
                                 && existing.manifest_revision == header.active_manifest_revision
                                 && existing.lineage_reset_authorization_id.as_deref()
@@ -1931,6 +1956,19 @@ async fn settle_workflow_gate_derived_core(
                                 gate.id
                             )));
                         }
+                        if gate.gate_kind == DocumentGateKind::Design {
+                            if expectation
+                                .outcome
+                                .as_ref()
+                                .is_some_and(|expected| *expected != evidence.outcome)
+                            {
+                                return Err(WorkflowStoreError::GateNotReady(format!(
+                                    "expected outcome {:?} disagrees with complete v2 evidence reduction {:?}",
+                                    expectation.outcome, evidence.outcome
+                                )));
+                            }
+                            req.outcome = evidence.outcome.clone();
+                        }
                         Some(evidence)
                     } else {
                         None
@@ -1944,7 +1982,15 @@ async fn settle_workflow_gate_derived_core(
                                 .eq(header.workflow_id.clone()),
                         )
                         .filter(
-                            delegation_workflow_gate_settlement::Column::ReviewScope.is_not_null(),
+                            Condition::any()
+                                .add(
+                                    delegation_workflow_gate_settlement::Column::ReviewScope
+                                        .is_not_null(),
+                                )
+                                .add(
+                                    delegation_workflow_gate_settlement::Column::PlanRoundStateV2Json
+                                        .is_not_null(),
+                                ),
                         )
                         .order_by_asc(delegation_workflow_gate_settlement::Column::GateCycle)
                         .order_by_asc(delegation_workflow_gate_settlement::Column::CreatedAt)
@@ -2047,6 +2093,10 @@ async fn settle_workflow_gate_derived_core(
                     // document revision + design/plan digest + content fingerprint.
                     let current_doc_digest = document_digest_for_gate(gate, &normalized)?;
                     let content_fp = gate_content_fingerprint(gate.gate_kind, &header);
+                    let mut v2_plan_decision: Option<PlanReviewDecisionV2> = None;
+                    let mut v2_plan_author_task_id: Option<String> = None;
+                    let mut v2_plan_digest: Option<String> = None;
+                    let mut v2_localized_change_digest: Option<String> = None;
 
                     let (
                         critical_count,
@@ -2183,14 +2233,117 @@ async fn settle_workflow_gate_derived_core(
                                         "active Plan artifact is missing".into(),
                                     )
                                 })?;
-                                load_validated_v2_plan_author(
+                                let (author_task_id, covered_plan_digest) =
+                                    load_validated_v2_plan_author(
                                     txn,
                                     &header.workflow_id,
                                     active_author_node_id,
                                     plan_digest,
                                 )
                                 .await?;
-                                (0, 0, 0, None, 0, false, None, None)
+                                let evidence = v2_gate_evidence.as_ref().ok_or_else(|| {
+                                    WorkflowStoreError::GateNotReady(
+                                        "v2 Plan settlement requires complete platform evidence"
+                                            .into(),
+                                    )
+                                })?;
+                                let prior_v2_state = lineage_prior
+                                    .iter()
+                                    .rev()
+                                    .find(|row| {
+                                        row.gate_lineage.as_deref()
+                                            == Some(evidence.identity.gate_lineage.as_str())
+                                            && row.plan_round_state_v2_json.is_some()
+                                    })
+                                    .map(|row| load_persisted_plan_state_v2(row))
+                                    .transpose()?;
+                                let change = match prior_v2_state.as_ref() {
+                                    None => PlanReviewChangeV2::InitialOrNewLineage,
+                                    Some(previous)
+                                        if previous.required_node_ids
+                                            != evidence.identity.required_node_ids =>
+                                    {
+                                        PlanReviewChangeV2::RosterOnly
+                                    }
+                                    Some(previous)
+                                        if previous.next_action
+                                            == PlanReviewNextAction::HolisticRewriteRequired =>
+                                    {
+                                        PlanReviewChangeV2::HolisticRewrite
+                                    }
+                                    Some(_) => PlanReviewChangeV2::Corrective,
+                                };
+                                let decision = derive_plan_review_round_v2(
+                                    prior_v2_state.as_ref(),
+                                    PlanReviewRoundInputV2 {
+                                        gate_lineage: evidence.identity.gate_lineage.clone(),
+                                        review_round: u32::try_from(
+                                            evidence.identity.review_round,
+                                        )
+                                        .map_err(|_| {
+                                            WorkflowStoreError::Persistence(
+                                                "v2 Plan review round exceeds u32".into(),
+                                            )
+                                        })?,
+                                        required_node_ids: evidence
+                                            .identity
+                                            .required_node_ids
+                                            .clone(),
+                                        selected_node_ids: evidence.selected_node_ids.clone(),
+                                        reviewers: evidence.reviewers.clone(),
+                                    },
+                                    change,
+                                )?;
+                                let derived_outcome =
+                                    plan_v2_settlement_outcome(decision.state.next_action);
+                                if v2_expectation.as_ref().is_some_and(|expectation| {
+                                    expectation
+                                        .outcome
+                                        .as_ref()
+                                        .is_some_and(|expected| *expected != derived_outcome)
+                                }) {
+                                    return Err(WorkflowStoreError::GateNotReady(format!(
+                                        "expected outcome disagrees with derived v2 Plan outcome {:?}",
+                                        derived_outcome
+                                    )));
+                                }
+                                req.outcome = derived_outcome;
+                                if change == PlanReviewChangeV2::Corrective
+                                    && evidence.selected_node_ids
+                                        != evidence.identity.required_node_ids
+                                {
+                                    v2_localized_change_digest = Some(
+                                        canonical_json_sha256(
+                                            "codeg.completion.plan_change.v2",
+                                            1,
+                                            &serde_json::json!({
+                                                "gate_lineage": evidence.identity.gate_lineage,
+                                                "review_round": evidence.identity.review_round,
+                                                "selected_node_ids": evidence.selected_node_ids,
+                                                "covered_plan_digest": covered_plan_digest,
+                                            }),
+                                        )
+                                        .map_err(|error| {
+                                            WorkflowStoreError::Persistence(error.to_string())
+                                        })?,
+                                    );
+                                }
+                                let next_action = decision.state.next_action;
+                                let stagnation_count = decision.state.stagnation_count;
+                                let rewrite_used = decision.state.rewrite_used;
+                                v2_plan_author_task_id = Some(author_task_id);
+                                v2_plan_digest = Some(covered_plan_digest);
+                                v2_plan_decision = Some(decision);
+                                (
+                                    0,
+                                    0,
+                                    0,
+                                    Some(next_action),
+                                    stagnation_count,
+                                    rewrite_used,
+                                    None,
+                                    None,
+                                )
                             } else {
                                 verify_plan_gate_ready(
                                     txn,
@@ -2279,7 +2432,16 @@ async fn settle_workflow_gate_derived_core(
                             .map(|evidence| serde_json::to_string(&evidence.identity.scope_digests))
                             .transpose()
                             .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?),
-                        plan_round_state_v2_json: Set(None),
+                        localized_change_digest: Set(v2_localized_change_digest),
+                        plan_round_state_v2_json: Set(v2_plan_decision
+                            .as_ref()
+                            .map(|decision| serde_json::to_string(&decision.state))
+                            .transpose()
+                            .map_err(|error| {
+                                WorkflowStoreError::Persistence(format!(
+                                    "serialize v2 Plan round state: {error}"
+                                ))
+                            })?),
                         outcome: Set(req.outcome.clone()),
                         critical_count: Set((header.completion_protocol_version != 2)
                             .then_some(critical_count)),
@@ -2302,13 +2464,16 @@ async fn settle_workflow_gate_derived_core(
                                     "serialize Plan reviewer set: {error}"
                                 ))
                             })?),
-                        covered_author_task_id: Set(
+                        covered_author_task_id: Set(v2_plan_author_task_id.or_else(|| {
                             plan_state.map(|state| state.covered_author_task_id.clone())
-                        ),
-                        covered_plan_digest: Set(
+                        })),
+                        covered_plan_digest: Set(v2_plan_digest.or_else(|| {
                             plan_state.map(|state| state.covered_plan_digest.clone())
-                        ),
-                        net_improvement: Set(plan_state.map(|state| state.net_improvement)),
+                        })),
+                        net_improvement: Set(v2_plan_decision
+                            .as_ref()
+                            .map(|decision| decision.strict_improvement)
+                            .or_else(|| plan_state.map(|state| state.net_improvement))),
                         finding_ledger_json: Set(
                             persisted_plan.map(|(_, persisted_json)| persisted_json)
                         ),
@@ -2325,6 +2490,43 @@ async fn settle_workflow_gate_derived_core(
                         ..Default::default()
                     };
                     row.insert(txn).await.map_err(db_err)?;
+
+                    if let Some(decision) = v2_plan_decision.as_ref() {
+                        if let Some(opening) =
+                            derive_next_plan_review_round_v2(&decision.state, &[])?
+                        {
+                            let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
+                                header.workflow_id.clone(),
+                                gate.id.clone(),
+                            ))
+                            .one(txn)
+                            .await
+                            .map_err(db_err)?
+                            .ok_or_else(|| {
+                                WorkflowStoreError::GateNotReady(
+                                    "current Plan gate state is missing".into(),
+                                )
+                            })?;
+                            if gate_state.gate_lineage != decision.state.gate_lineage
+                                || gate_state.current_review_round
+                                    != i64::from(decision.state.review_round)
+                            {
+                                return Err(WorkflowStoreError::GateCycleConflict(
+                                    "current Plan gate state changed during settlement".into(),
+                                ));
+                            }
+                            let mut gate_state: delegation_workflow_gate_state::ActiveModel =
+                                gate_state.into();
+                            gate_state.current_review_round =
+                                Set(i64::from(opening.review_round));
+                            gate_state.selected_node_ids_json = Set(
+                                serde_json::to_string(&opening.selected_node_ids).map_err(
+                                    |error| WorkflowStoreError::Persistence(error.to_string()),
+                                )?,
+                            );
+                            gate_state.update(txn).await.map_err(db_err)?;
+                        }
+                    }
 
                     let state_revision = if let Some(reset) = lineage_reset_authorization.as_ref() {
                         let target_state = match req.outcome {
@@ -5312,6 +5514,8 @@ fn is_canceled_drop(
 #[derive(Debug)]
 struct ValidatedV2GateEvidenceSet {
     identity: V2GateEvidenceIdentity,
+    selected_node_ids: Vec<String>,
+    reviewers: Vec<PlanReviewerOutcomeV2>,
     outcome: GateSettlementOutcome,
 }
 
@@ -5479,8 +5683,11 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
                 "Design self-review evidence identity is invalid".into(),
             )
         })?;
+        let selected_node_ids = identity.required_node_ids.clone();
         return Ok(ValidatedV2GateEvidenceSet {
             identity,
+            selected_node_ids,
+            reviewers: Vec::new(),
             outcome: design_outcome_to_settlement(outcome)?,
         });
     }
@@ -5566,9 +5773,24 @@ async fn load_validated_v2_gate_evidence<C: sea_orm::ConnectionTrait>(
             "required reviewer evidence has a role-invalid outcome".into(),
         ));
     }
+    let reviewers = evidence
+        .iter()
+        .map(|validated| PlanReviewerOutcomeV2 {
+            node_id: validated.evidence.binding.node_id.clone(),
+            outcome: validated.evidence.intent.outcome,
+            rank: reviewer_outcome_rank(validated.evidence.intent.outcome),
+            evidence_task_id: validated.evidence.binding.task_id.clone(),
+            evidence_scope_digest: validated.evidence.evidence_scope_digest.clone(),
+        })
+        .collect();
     let outcome = reduce_design_gate(&evidence);
 
-    Ok(ValidatedV2GateEvidenceSet { identity, outcome })
+    Ok(ValidatedV2GateEvidenceSet {
+        identity,
+        selected_node_ids: selected.into_iter().collect(),
+        reviewers,
+        outcome,
+    })
 }
 
 fn design_outcome_to_settlement(
@@ -6067,6 +6289,45 @@ mod completion_v2_shared_validator_replay_tests {
     }
 
     #[test]
+    fn task14_v2_plan_state_replay_rejects_evidence_column_drift() {
+        let identity = V2GateEvidenceIdentity::new(
+            format!("sha256:{}", "a".repeat(64)),
+            1,
+            vec!["reviewer".into()],
+            vec!["review-task".into()],
+            vec![format!("sha256:{}", "1".repeat(64))],
+        )
+        .unwrap();
+        let state = PlanReviewRoundStateV2 {
+            gate_lineage: identity.gate_lineage.clone(),
+            review_round: 1,
+            required_node_ids: identity.required_node_ids.clone(),
+            selected_node_ids: identity.required_node_ids.clone(),
+            reviewers: vec![PlanReviewerOutcomeV2 {
+                node_id: "reviewer".into(),
+                outcome: CompletionOutcome::RequestChanges,
+                rank: 1,
+                evidence_task_id: "review-task".into(),
+                evidence_scope_digest: format!("sha256:{}", "1".repeat(64)),
+            }],
+            stagnation_count: 0,
+            rewrite_used: false,
+            next_action: PlanReviewNextAction::ContinueReview,
+        };
+        let mut row = v2_settlement(&identity);
+        row.outcome = GateSettlementOutcome::ChangesRequested;
+        row.plan_round_state_v2_json = Some(serde_json::to_string(&state).unwrap());
+        row.next_action = Some(DbPlanReviewNextAction::ContinueReview);
+        row.covered_author_task_id = Some("author-task".into());
+        row.covered_plan_digest = Some(format!("sha256:{}", "2".repeat(64)));
+        row.net_improvement = Some(false);
+
+        assert_eq!(load_persisted_plan_state_v2(&row).unwrap(), state);
+        row.required_evidence_task_ids_json = Some("[\"different-task\"]".into());
+        assert!(load_persisted_plan_state_v2(&row).is_err());
+    }
+
+    #[test]
     fn completion_v2_shared_validator_replays_without_legacy_finding_counts() {
         let row = delegation_workflow_gate_settlement::Model {
             workflow_id: "workflow-v2".into(),
@@ -6191,6 +6452,84 @@ fn derive_plan_review_state_for_protocol(
         return Ok(None);
     }
     derive_plan_review_round(prior, reviewer_cohort_node_ids, submission).map(Some)
+}
+
+fn load_persisted_plan_state_v2(
+    row: &delegation_workflow_gate_settlement::Model,
+) -> Result<PlanReviewRoundStateV2, WorkflowStoreError> {
+    let json = row.plan_round_state_v2_json.as_deref().ok_or_else(|| {
+        WorkflowStoreError::Persistence("v2 Plan settlement is missing round state".into())
+    })?;
+    if json.len() > MAX_PERSISTED_PLAN_EVIDENCE_BYTES {
+        return Err(WorkflowStoreError::Persistence(
+            "v2 Plan round state exceeds the bounded size".into(),
+        ));
+    }
+    let state: PlanReviewRoundStateV2 = serde_json::from_str(json).map_err(|error| {
+        WorkflowStoreError::Persistence(format!("parse v2 Plan round state: {error}"))
+    })?;
+    let identity = V2GateEvidenceIdentity::new(
+        state.gate_lineage.clone(),
+        i64::from(state.review_round),
+        state.required_node_ids.clone(),
+        state
+            .reviewers
+            .iter()
+            .map(|reviewer| reviewer.evidence_task_id.clone())
+            .collect(),
+        state
+            .reviewers
+            .iter()
+            .map(|reviewer| reviewer.evidence_scope_digest.clone())
+            .collect(),
+    )
+    .ok_or_else(|| {
+        WorkflowStoreError::Persistence("v2 Plan round evidence identity is invalid".into())
+    })?;
+    if !identity.matches_settlement(row)
+        || row.review_round != Some(i64::from(state.review_round))
+        || row.required_node_set_json.as_deref()
+            != Some(
+                serde_json::to_string(&state.required_node_ids)
+                    .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+                    .as_str(),
+            )
+        || row.stagnation_count != i64::from(state.stagnation_count)
+        || row.rewrite_used != state.rewrite_used
+        || row.next_action.as_ref().map(plan_next_action_from_db) != Some(state.next_action)
+        || row
+            .covered_author_task_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || row.covered_plan_digest.as_deref().is_none_or(str::is_empty)
+        || row.net_improvement.is_none()
+    {
+        return Err(WorkflowStoreError::Persistence(
+            "v2 Plan settlement columns disagree with round state".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn plan_state_matches_evidence(
+    state: &PlanReviewRoundStateV2,
+    evidence: &ValidatedV2GateEvidenceSet,
+) -> bool {
+    state.gate_lineage == evidence.identity.gate_lineage
+        && i64::from(state.review_round) == evidence.identity.review_round
+        && state.required_node_ids == evidence.identity.required_node_ids
+        && state.selected_node_ids == evidence.selected_node_ids
+        && state.reviewers == evidence.reviewers
+}
+
+fn plan_v2_settlement_outcome(next_action: PlanReviewNextAction) -> GateSettlementOutcome {
+    match next_action {
+        PlanReviewNextAction::Approved => GateSettlementOutcome::Approved,
+        PlanReviewNextAction::ContinueReview | PlanReviewNextAction::HolisticRewriteRequired => {
+            GateSettlementOutcome::ChangesRequested
+        }
+        PlanReviewNextAction::UserDecisionRequired => GateSettlementOutcome::Blocked,
+    }
 }
 
 fn validate_plan_outcome(

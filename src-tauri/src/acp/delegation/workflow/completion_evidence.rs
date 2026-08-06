@@ -1,5 +1,6 @@
 //! Atomic protocol-v2 terminal evidence and artifact-recovery materialization.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
@@ -28,10 +29,16 @@ use super::evidence_scope::{
     build_persisted_completion_context as build_persisted_context, validate_completion_evidence,
     AdmissionCandidate, WorkflowStore,
 };
+use super::final_findings::{
+    bounded_terminal_context_v1, build_final_findings_package_v1, capture_report_context_v1,
+    persist_final_findings_package_v1, resolve_active_final_findings_packages_v1,
+    FinalFindingInputV1, FinalFindingsError, FinalFindingsPackageInputV1, FinalFindingsPackageV1,
+    RemediationContextInputV1,
+};
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
-    CompletionEvidenceBindingV2, CompletionEvidenceV2, EvidenceValidationContext,
-    ValidatedCompletionEvidence, COMPLETION_PROTOCOL_VERSION_V2,
+    CompletionEvidenceBindingV2, CompletionEvidenceV2, CompletionScopeRole,
+    EvidenceValidationContext, ValidatedCompletionEvidence, COMPLETION_PROTOCOL_VERSION_V2,
 };
 use crate::acp::delegation::attention::{
     open_design_self_review_attention_txn, open_terminal_completion_attention_txn,
@@ -49,8 +56,8 @@ use crate::db::entities::delegation_workflow::CompletionProtocolMode;
 use crate::db::entities::{
     delegation_completion_tool_intent, delegation_workflow,
     delegation_workflow_design_root_binding, delegation_workflow_gate_settlement,
-    delegation_workflow_node_binding, delegation_workflow_outbox_event,
-    delegation_workflow_run_binding,
+    delegation_workflow_gate_state, delegation_workflow_node_binding,
+    delegation_workflow_outbox_event, delegation_workflow_run_binding,
 };
 use crate::db::AppDatabase;
 
@@ -261,6 +268,14 @@ struct LoadedTerminal {
     binding: delegation_workflow_run_binding::Model,
     workflow: delegation_workflow::Model,
     node: delegation_workflow_node_binding::Model,
+}
+
+enum FinalFindingsTerminalAction {
+    NotFinal,
+    Incomplete { gate_id: String },
+    Resolve { gate_id: String },
+    Persist(FinalFindingsPackageV1),
+    NeedsDecision { gate_id: String },
 }
 
 #[derive(Debug)]
@@ -1368,20 +1383,21 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
     let context = rebuild_completion_context(conn, &loaded).await?;
     ensure_context_matches_binding(&context, &loaded.binding)?;
     let tool_intents = load_tool_intents(conn, &input.task_id).await?;
+    let final_assistant_text = input.final_assistant_text;
+    let pre_read_reports = input.pre_read_reports;
     let resolution = resolve_completion_intent(&CompletionResolverInput {
         role: context.scope_role.completion_role(),
         tool_intents: tool_intents
             .iter()
             .map(|loaded| loaded.intent.clone())
             .collect(),
-        final_assistant_text: input.final_assistant_text,
-        report_candidates: input
-            .pre_read_reports
-            .into_iter()
+        final_assistant_text: final_assistant_text.clone(),
+        report_candidates: pre_read_reports
+            .iter()
             .map(|report| CompletionReportCandidate {
-                path: report.path,
-                contents: report.contents,
-                summary: report.summary,
+                path: report.path.clone(),
+                contents: report.contents.clone(),
+                summary: report.summary.clone(),
             })
             .collect(),
         touched_report_candidates: Vec::new(),
@@ -1405,6 +1421,46 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
             .await
         }
         CompletionResolution::Resolved(intent) => {
+            let expected_graph_revision = u64::try_from(loaded.workflow.graph_revision)
+                .ok()
+                .and_then(|revision| revision.checked_add(1))
+                .ok_or_else(|| {
+                    CompletionEvidenceError::Persistence(
+                        "workflow graph revision cannot advance".into(),
+                    )
+                })?;
+            let final_action = derive_final_findings_terminal_action(
+                conn,
+                &loaded,
+                &context,
+                &intent,
+                &final_assistant_text,
+                &pre_read_reports,
+                expected_graph_revision,
+            )
+            .await?;
+            if let FinalFindingsTerminalAction::NeedsDecision { gate_id } = &final_action {
+                resolve_active_final_findings_packages_v1(
+                    conn,
+                    &loaded.workflow.workflow_id,
+                    gate_id,
+                    i64::try_from(expected_graph_revision).map_err(|_| {
+                        CompletionEvidenceError::Persistence("graph revision exceeds i64".into())
+                    })?,
+                )
+                .await
+                .map_err(map_final_findings_error)?;
+                return open_completion_decision(
+                    conn,
+                    &loaded,
+                    &context,
+                    CompletionIntentReason::RemediationContextRequired,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            }
+
             match resolve_terminal_artifact(conn, &loaded, &context, intent.outcome).await {
                 Ok(artifact) => {
                     let evidence = persist_evidence_state(
@@ -1418,6 +1474,18 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                     .await?;
                     let graph_revision =
                         bump_completion_graph(conn, &loaded, "completion_resolved").await?;
+                    if graph_revision != expected_graph_revision {
+                        return Err(CompletionEvidenceError::Persistence(
+                            "Final findings graph revision changed during completion".into(),
+                        ));
+                    }
+                    apply_final_findings_terminal_action(
+                        conn,
+                        &loaded,
+                        final_action,
+                        graph_revision,
+                    )
+                    .await?;
                     Ok(TerminalCompletionResult {
                         state: CompletionState::Resolved,
                         evidence: Some(evidence),
@@ -1427,7 +1495,7 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                 }
                 Err(ArtifactError::Unavailable(failure)) => {
                     let source_audit_ref = source_audit_ref(&tool_intents, &intent);
-                    open_artifact_recovery(
+                    let result = open_artifact_recovery(
                         conn,
                         &loaded,
                         &context,
@@ -1435,10 +1503,276 @@ pub async fn materialize_terminal_completion_txn<C: ConnectionTrait>(
                         source_audit_ref,
                         failure,
                     )
-                    .await
+                    .await?;
+                    if result.graph_revision != expected_graph_revision {
+                        return Err(CompletionEvidenceError::Persistence(
+                            "Final findings graph revision changed during artifact recovery".into(),
+                        ));
+                    }
+                    apply_final_findings_terminal_action(
+                        conn,
+                        &loaded,
+                        final_action,
+                        result.graph_revision,
+                    )
+                    .await?;
+                    Ok(result)
                 }
                 Err(error) => Err(error.into()),
             }
+        }
+    }
+}
+
+async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
+    conn: &C,
+    loaded: &LoadedTerminal,
+    context: &AdmissionCompletionContextV2,
+    intent: &CompletionIntent,
+    final_assistant_text: &str,
+    pre_read_reports: &[ValidatedReportCandidate],
+    graph_revision: u64,
+) -> Result<FinalFindingsTerminalAction, CompletionEvidenceError> {
+    if context.scope_role != CompletionScopeRole::FinalReviewer {
+        return Ok(FinalFindingsTerminalAction::NotFinal);
+    }
+    let gate_id = context.evidence_scope.gate_id.clone().ok_or_else(|| {
+        CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer completion has no durable gate id".into(),
+        )
+    })?;
+    let gate_lineage = context.evidence_scope.gate_lineage.clone().ok_or_else(|| {
+        CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer completion has no durable gate lineage".into(),
+        )
+    })?;
+    let review_round = context.evidence_scope.review_round.ok_or_else(|| {
+        CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer completion has no durable review round".into(),
+        )
+    })?;
+    let gate = delegation_workflow_gate_state::Entity::find_by_id((
+        loaded.workflow.workflow_id.clone(),
+        gate_id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| {
+        CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer completion has no current gate state".into(),
+        )
+    })?;
+    if gate.gate_lineage != gate_lineage
+        || u32::try_from(gate.current_review_round).ok() != Some(review_round)
+    {
+        return Err(CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer completion is stale for the current gate state".into(),
+        ));
+    }
+    let selected: Vec<String> =
+        serde_json::from_str(&gate.selected_node_ids_json).map_err(|_| {
+            CompletionEvidenceError::EvidenceCorrupt("Final Reviewer selection is corrupt".into())
+        })?;
+    let unique = selected.iter().cloned().collect::<BTreeSet<_>>();
+    if selected.is_empty()
+        || unique.len() != selected.len()
+        || selected.iter().any(|node_id| node_id.trim().is_empty())
+    {
+        return Err(CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer selection is invalid".into(),
+        ));
+    }
+
+    let snapshot = super::store::load_active_manifest_snapshot(conn, &loaded.workflow)
+        .await
+        .map_err(|error| CompletionEvidenceError::EvidenceCorrupt(error.to_string()))?;
+    let mut target_work_unit_keys = Vec::new();
+    let mut remediation_route_ids = Vec::new();
+    for policy in &snapshot.normalized.task_policies {
+        if let Some(work_unit_key) = snapshot
+            .normalized
+            .nodes
+            .iter()
+            .find(|node| node.id == policy.route.implementer_node_id)
+            .and_then(|node| node.work_unit_key.clone())
+        {
+            target_work_unit_keys.push(work_unit_key);
+        }
+        remediation_route_ids.push(policy.route.implementer_node_id.clone());
+        remediation_route_ids.extend(policy.route.reviewer_node_ids.clone());
+    }
+
+    let workspace = loaded
+        .run
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CompletionEvidenceError::EvidenceCorrupt(
+                "Final Reviewer workspace is unavailable".into(),
+            )
+        })?;
+    let mut findings = Vec::new();
+    let mut remediation_contexts = Vec::new();
+    for node_id in selected {
+        let binding = delegation_workflow_run_binding::Entity::find()
+            .filter(
+                delegation_workflow_run_binding::Column::WorkflowId
+                    .eq(&loaded.workflow.workflow_id),
+            )
+            .filter(delegation_workflow_run_binding::Column::NodeId.eq(&node_id))
+            .filter(delegation_workflow_run_binding::Column::GateId.eq(&gate_id))
+            .filter(delegation_workflow_run_binding::Column::GateLineage.eq(&gate_lineage))
+            .filter(
+                delegation_workflow_run_binding::Column::ReviewRound.eq(i64::from(review_round)),
+            )
+            .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+            .one(conn)
+            .await
+            .map_err(db_error)?;
+        let Some(binding) = binding else {
+            return Ok(FinalFindingsTerminalAction::Incomplete { gate_id });
+        };
+        let is_current = binding.task_id == loaded.run.task_id;
+        let (reviewer_intent, evidence_scope_digest) = if is_current {
+            (intent.clone(), context.evidence_scope_digest.clone())
+        } else {
+            let run = delegation_task_run::Entity::find_by_id(binding.task_id.clone())
+                .one(conn)
+                .await
+                .map_err(db_error)?;
+            if run.as_ref().is_none_or(|run| {
+                run.status != DelegationRunStatus::Completed
+                    || run.completion_state != Some(CompletionState::Resolved)
+            }) {
+                return Ok(FinalFindingsTerminalAction::Incomplete { gate_id });
+            }
+            let validated = load_validated_completion_evidence(conn, &binding.task_id).await?;
+            (
+                validated.evidence.intent,
+                validated.evidence.evidence_scope_digest,
+            )
+        };
+        if !matches!(
+            reviewer_intent.outcome,
+            CompletionOutcome::RequestChanges | CompletionOutcome::Block
+        ) {
+            continue;
+        }
+        findings.push(FinalFindingInputV1 {
+            reviewer_node_id: node_id,
+            evidence_task_id: binding.task_id.clone(),
+            evidence_scope_digest,
+            outcome: reviewer_intent.outcome,
+            target_work_unit_keys: target_work_unit_keys.clone(),
+            remediation_route_ids: remediation_route_ids.clone(),
+        });
+
+        let mut has_available_context = false;
+        if is_current {
+            for report in pre_read_reports {
+                let bytes = report.contents.as_bytes().to_vec();
+                has_available_context |= !bytes.is_empty();
+                remediation_contexts.push(RemediationContextInputV1::available_report(
+                    &binding.task_id,
+                    &report.path,
+                    bytes,
+                ));
+            }
+            if pre_read_reports.is_empty() {
+                if let Some(report_file) = reviewer_intent.report_file.as_deref() {
+                    remediation_contexts.push(RemediationContextInputV1::missing_report(
+                        &binding.task_id,
+                        report_file,
+                    ));
+                }
+            }
+        } else if let Some(report_file) = reviewer_intent.report_file.as_deref() {
+            let report =
+                capture_report_context_v1(Path::new(workspace), &binding.task_id, report_file)
+                    .await
+                    .map_err(map_final_findings_error)?;
+            has_available_context = report.bytes.as_ref().is_some_and(|bytes| !bytes.is_empty());
+            remediation_contexts.push(report);
+        }
+        if !has_available_context {
+            if is_current && !final_assistant_text.is_empty() {
+                remediation_contexts.push(bounded_terminal_context_v1(
+                    &binding.task_id,
+                    final_assistant_text.as_bytes(),
+                ));
+            } else {
+                remediation_contexts.push(RemediationContextInputV1::missing_terminal(
+                    &binding.task_id,
+                ));
+            }
+        }
+    }
+
+    if findings.is_empty() {
+        return Ok(FinalFindingsTerminalAction::Resolve { gate_id });
+    }
+    match build_final_findings_package_v1(FinalFindingsPackageInputV1 {
+        workflow_id: loaded.workflow.workflow_id.clone(),
+        gate_id,
+        gate_lineage,
+        graph_revision,
+        findings,
+        remediation_contexts,
+    }) {
+        Ok(package) => Ok(FinalFindingsTerminalAction::Persist(package)),
+        Err(FinalFindingsError::RemediationContextRequired) => {
+            Ok(FinalFindingsTerminalAction::NeedsDecision {
+                gate_id: gate.gate_id,
+            })
+        }
+        Err(error) => Err(map_final_findings_error(error)),
+    }
+}
+
+async fn apply_final_findings_terminal_action<C: ConnectionTrait>(
+    conn: &C,
+    loaded: &LoadedTerminal,
+    action: FinalFindingsTerminalAction,
+    graph_revision: u64,
+) -> Result<(), CompletionEvidenceError> {
+    let graph_revision = i64::try_from(graph_revision)
+        .map_err(|_| CompletionEvidenceError::Persistence("graph revision exceeds i64".into()))?;
+    match action {
+        FinalFindingsTerminalAction::Persist(package) => {
+            persist_final_findings_package_v1(conn, &package, graph_revision)
+                .await
+                .map_err(map_final_findings_error)?;
+        }
+        FinalFindingsTerminalAction::Incomplete { gate_id }
+        | FinalFindingsTerminalAction::Resolve { gate_id } => {
+            resolve_active_final_findings_packages_v1(
+                conn,
+                &loaded.workflow.workflow_id,
+                &gate_id,
+                graph_revision,
+            )
+            .await
+            .map_err(map_final_findings_error)?;
+        }
+        FinalFindingsTerminalAction::NotFinal => {}
+        FinalFindingsTerminalAction::NeedsDecision { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+fn map_final_findings_error(error: FinalFindingsError) -> CompletionEvidenceError {
+    match error {
+        FinalFindingsError::Persistence(message) => CompletionEvidenceError::Persistence(message),
+        FinalFindingsError::RemediationContextRequired => {
+            CompletionEvidenceError::EvidenceCorrupt(error.to_string())
+        }
+        FinalFindingsError::InvalidField(_)
+        | FinalFindingsError::BoundsExceeded(_)
+        | FinalFindingsError::EvidenceCorrupt => {
+            CompletionEvidenceError::EvidenceCorrupt(error.to_string())
         }
     }
 }

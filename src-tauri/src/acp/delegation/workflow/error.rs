@@ -42,6 +42,8 @@ pub enum CompletionEvidenceError {
     Scope(#[from] EvidenceScopeError),
     #[error("completion decision was superseded")]
     DecisionSuperseded,
+    #[error("completion evidence is corrupt: {0}")]
+    EvidenceCorrupt(String),
     #[error("completion persistence failure: {0}")]
     Persistence(String),
 }
@@ -54,6 +56,7 @@ impl CompletionEvidenceError {
             Self::Artifact(error) => error.code(),
             Self::Scope(error) => error.code(),
             Self::DecisionSuperseded => "completion_decision_superseded",
+            Self::EvidenceCorrupt(_) => "completion_evidence_corrupt",
             Self::Persistence(_) => "completion_persistence_failure",
         }
     }

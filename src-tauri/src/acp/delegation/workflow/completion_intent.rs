@@ -150,6 +150,8 @@ pub enum CompletionIntentReason {
     Conflict,
     #[serde(rename = "completion_outcome_role_mismatch")]
     RoleMismatch,
+    #[serde(rename = "completion_remediation_context_required")]
+    RemediationContextRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

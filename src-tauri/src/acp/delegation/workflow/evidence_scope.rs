@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use super::final_findings::{verify_final_findings_package_model_v1, FinalFindingsPackageV1};
 use super::plan_material::{
     bind_plan_material, derive_plan_reviewer_selector, parse_plan_material, BoundPlanMaterialMap,
     MaterialSelectorV1, PlanMaterialMap, MAX_PLAN_MATERIAL_BYTES,
@@ -42,6 +43,7 @@ use crate::db::entities::{
 const DIGEST_SCHEMA_VERSION: u32 = 1;
 const MAX_CANONICAL_JSON_BYTES: usize = 512 * 1024;
 const MAX_INSTRUCTION_BLOCK_BYTES: usize = 64 * 1024;
+const MAX_FINAL_FIXER_INSTRUCTION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVIDENCE_JSON_BYTES: usize = 64 * 1024;
 const MAX_DESIGN_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 const INSTRUCTION_TEMPLATE_ID: &str = "workflow_completion";
@@ -271,6 +273,7 @@ async fn build_completion_context<C: ConnectionTrait>(
     let mut subject_material_digest = None;
     let mut task_specification_identity = None;
     let mut final_findings_identity = None;
+    let mut final_findings_package = None;
 
     let (review_scope, artifact_subject) = match scope_role {
         CompletionScopeRole::DesignRoot => {
@@ -450,8 +453,9 @@ async fn build_completion_context<C: ConnectionTrait>(
                     "Final Fixer requires a durable Final gate lineage".into(),
                 )
             })?;
-            let final_identity =
-                active_final_findings_identity(store, candidate.workflow, final_gate).await?;
+            let package =
+                active_final_findings_package(store, candidate.workflow, final_gate).await?;
+            let final_identity = package.final_findings_identity().to_owned();
             let branch_tip = candidate.producer_baseline_head.ok_or_else(|| {
                 EvidenceScopeError::InstructionBindingFailed(
                     "Final Fixer requires a durable admission branch tip".into(),
@@ -459,6 +463,7 @@ async fn build_completion_context<C: ConnectionTrait>(
             })?;
             validate_digest_or_git_token("branch_tip", branch_tip)?;
             final_findings_identity = Some(final_identity.clone());
+            final_findings_package = Some(package);
             material_identities.extend([
                 MaterialIdentitySummary {
                     key: "final.branch_tip".into(),
@@ -503,14 +508,19 @@ async fn build_completion_context<C: ConnectionTrait>(
     };
 
     material_identities.sort_by(|left, right| left.key.cmp(&right.key));
-    let instruction = build_instruction_block(&InstructionBlockInput {
+    let instruction_input = InstructionBlockInput {
         role,
         phase_id: &candidate.node.phase_id,
         task_index,
         gate_id: gate_id.as_deref(),
         review_round,
         material_identities: &material_identities,
-    })?;
+    };
+    let instruction = if let Some(package) = final_findings_package.as_ref() {
+        build_final_fixer_instruction_block(&instruction_input, package)?
+    } else {
+        build_instruction_block(&instruction_input)?
+    };
     let review_scope_digest = review_scope_digest(&review_scope, &instruction)?;
     let evidence_scope = EvidenceScopeInputV2 {
         completion_protocol_version: COMPLETION_PROTOCOL_VERSION_V2,
@@ -1144,11 +1154,11 @@ fn git_identity_digest(head: &str) -> Result<String, EvidenceScopeError> {
     )
 }
 
-async fn active_final_findings_identity<C: ConnectionTrait>(
+async fn active_final_findings_package<C: ConnectionTrait>(
     store: &WorkflowStore<'_, C>,
     workflow: &delegation_workflow::Model,
     gate: &AdmittedGateState,
-) -> Result<String, EvidenceScopeError> {
+) -> Result<FinalFindingsPackageV1, EvidenceScopeError> {
     let package = delegation_final_findings_package::Entity::find()
         .filter(
             delegation_final_findings_package::Column::WorkflowId.eq(workflow.workflow_id.clone()),
@@ -1169,8 +1179,10 @@ async fn active_final_findings_identity<C: ConnectionTrait>(
                 "Final Fixer requires an active durable findings package".into(),
             )
         })?;
-    validate_sha256_token(&package.package_digest, false)?;
-    Ok(package.package_digest)
+    let package = verify_final_findings_package_model_v1(&package)
+        .map_err(|error| EvidenceScopeError::EvidenceCorrupt(error.to_string()))?;
+    validate_sha256_token(package.final_findings_identity(), false)?;
+    Ok(package)
 }
 
 async fn ordered_task_output_identities<C: ConnectionTrait>(
@@ -1802,6 +1814,35 @@ pub fn build_instruction_block(
     if bytes.len() > MAX_INSTRUCTION_BLOCK_BYTES {
         return Err(EvidenceScopeError::InstructionBindingFailed(format!(
             "instruction exceeds {MAX_INSTRUCTION_BLOCK_BYTES} bytes"
+        )));
+    }
+    let digest = canonical_json_sha256(INSTRUCTION_DOMAIN, DIGEST_SCHEMA_VERSION, &canonical)?;
+    let canonical_utf8 = String::from_utf8(bytes)
+        .map_err(|error| EvidenceScopeError::InstructionBindingFailed(error.to_string()))?;
+    Ok(InstructionBlockV1 {
+        template_id: INSTRUCTION_TEMPLATE_ID.into(),
+        template_version: INSTRUCTION_TEMPLATE_VERSION,
+        canonical_utf8,
+        digest,
+    })
+}
+
+fn build_final_fixer_instruction_block(
+    input: &InstructionBlockInput<'_>,
+    package: &FinalFindingsPackageV1,
+) -> Result<InstructionBlockV1, EvidenceScopeError> {
+    let base = build_instruction_block(input)?;
+    let base_value: Value = serde_json::from_str(&base.canonical_utf8)
+        .map_err(|error| EvidenceScopeError::EvidenceCorrupt(error.to_string()))?;
+    let canonical = json!({
+        "instruction": base_value,
+        "final_findings_identity": package.final_findings_identity(),
+        "remediation_contexts": package.remediation_contexts,
+    });
+    let bytes = canonical_json_bytes(&canonical)?;
+    if bytes.len() > MAX_FINAL_FIXER_INSTRUCTION_BYTES {
+        return Err(EvidenceScopeError::InstructionBindingFailed(format!(
+            "Final Fixer instruction exceeds {MAX_FINAL_FIXER_INSTRUCTION_BYTES} bytes"
         )));
     }
     let digest = canonical_json_sha256(INSTRUCTION_DOMAIN, DIGEST_SCHEMA_VERSION, &canonical)?;

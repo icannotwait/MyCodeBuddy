@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::completion_intent::CompletionOutcome;
+
 const MAX_ID_CHARS: usize = 200;
 const MAX_TEXT_BYTES: usize = 4 * 1024;
 const MAX_OWNER_COUNT: usize = 64;
@@ -83,6 +85,60 @@ pub enum PlanReviewNextAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanReviewerOutcomeV2 {
+    pub node_id: String,
+    pub outcome: CompletionOutcome,
+    pub rank: u8,
+    pub evidence_task_id: String,
+    pub evidence_scope_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanReviewRoundInputV2 {
+    pub gate_lineage: String,
+    pub review_round: u32,
+    pub required_node_ids: Vec<String>,
+    pub selected_node_ids: Vec<String>,
+    pub reviewers: Vec<PlanReviewerOutcomeV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanReviewRoundStateV2 {
+    pub gate_lineage: String,
+    pub review_round: u32,
+    pub required_node_ids: Vec<String>,
+    pub selected_node_ids: Vec<String>,
+    pub reviewers: Vec<PlanReviewerOutcomeV2>,
+    pub stagnation_count: u32,
+    pub rewrite_used: bool,
+    pub next_action: PlanReviewNextAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReviewChangeV2 {
+    InitialOrNewLineage,
+    Corrective,
+    HolisticRewrite,
+    RosterOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReviewDecisionV2 {
+    pub state: PlanReviewRoundStateV2,
+    pub strict_improvement: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReviewRoundOpeningV2 {
+    pub gate_lineage: String,
+    pub review_round: u32,
+    pub selected_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanReviewRoundState {
     pub scope: PlanReviewScope,
     pub revision_kind: PlanRevisionKind,
@@ -123,6 +179,327 @@ pub enum PlanReviewError {
     InvalidLineageResetReason,
     #[error("invalid Plan review transition: {0}")]
     InvalidTransition(String),
+}
+
+pub const fn reviewer_outcome_rank(outcome: CompletionOutcome) -> u8 {
+    match outcome {
+        CompletionOutcome::Approve | CompletionOutcome::ApproveWithMinors => 0,
+        CompletionOutcome::RequestChanges => 1,
+        CompletionOutcome::Block => 2,
+        CompletionOutcome::Done
+        | CompletionOutcome::DoneWithConcerns
+        | CompletionOutcome::Blocked => u8::MAX,
+    }
+}
+
+pub fn strictly_improves(
+    previous: &[PlanReviewerOutcomeV2],
+    current: &[PlanReviewerOutcomeV2],
+) -> bool {
+    let previous = previous
+        .iter()
+        .map(|reviewer| (reviewer.node_id.as_str(), reviewer.rank))
+        .collect::<BTreeMap<_, _>>();
+    let current = current
+        .iter()
+        .map(|reviewer| (reviewer.node_id.as_str(), reviewer.rank))
+        .collect::<BTreeMap<_, _>>();
+
+    let no_new_blocker = current
+        .iter()
+        .filter(|(_, rank)| **rank > 0)
+        .all(|(node_id, _)| previous.get(node_id).is_some_and(|rank| *rank > 0));
+    let no_survivor_worsened = current.iter().all(|(node_id, rank)| {
+        previous
+            .get(node_id)
+            .is_none_or(|previous_rank| rank <= previous_rank)
+    });
+    let blocker_improved = previous.iter().any(|(node_id, previous_rank)| {
+        *previous_rank > 0
+            && current
+                .get(node_id)
+                .is_some_and(|current_rank| current_rank < previous_rank)
+    });
+
+    no_new_blocker && no_survivor_worsened && blocker_improved
+}
+
+pub fn derive_plan_review_round_v2(
+    previous: Option<&PlanReviewRoundStateV2>,
+    mut current: PlanReviewRoundInputV2,
+    change: PlanReviewChangeV2,
+) -> Result<PlanReviewDecisionV2, PlanReviewError> {
+    validate_id("gate_lineage", &current.gate_lineage)?;
+    if current.review_round == 0 {
+        return Err(PlanReviewError::InvalidField(
+            "review_round must be positive".into(),
+        ));
+    }
+    current.required_node_ids =
+        canonical_reviewer_set("required_node_ids", &current.required_node_ids)?;
+    current.selected_node_ids =
+        canonical_reviewer_set("selected_node_ids", &current.selected_node_ids)?;
+    validate_known_reviewers(&current.required_node_ids, &current.selected_node_ids)?;
+    validate_v2_reviewers(&current.required_node_ids, &mut current.reviewers)?;
+    validate_v2_transition(previous, &current, change)?;
+    if change == PlanReviewChangeV2::RosterOnly {
+        validate_roster_preserves_siblings(
+            previous.expect("roster transition requires previous state"),
+            &current,
+        )?;
+    }
+
+    let strict_improvement = change == PlanReviewChangeV2::Corrective
+        && strictly_improves(
+            &previous
+                .expect("corrective transition requires previous state")
+                .reviewers,
+            &current.reviewers,
+        );
+    let (stagnation_count, rewrite_used) = match change {
+        PlanReviewChangeV2::InitialOrNewLineage => (0, false),
+        PlanReviewChangeV2::Corrective => {
+            let previous = previous.expect("corrective transition requires previous state");
+            (
+                if strict_improvement {
+                    0
+                } else {
+                    previous.stagnation_count.saturating_add(1)
+                },
+                previous.rewrite_used,
+            )
+        }
+        PlanReviewChangeV2::HolisticRewrite => (0, true),
+        PlanReviewChangeV2::RosterOnly => {
+            let previous = previous.expect("roster transition requires previous state");
+            (previous.stagnation_count, previous.rewrite_used)
+        }
+    };
+    let all_pass = current.reviewers.iter().all(|reviewer| reviewer.rank == 0);
+    let next_action = if all_pass {
+        PlanReviewNextAction::Approved
+    } else if stagnation_count >= 2 && rewrite_used {
+        PlanReviewNextAction::UserDecisionRequired
+    } else if stagnation_count >= 2 {
+        PlanReviewNextAction::HolisticRewriteRequired
+    } else {
+        PlanReviewNextAction::ContinueReview
+    };
+    let state = PlanReviewRoundStateV2 {
+        gate_lineage: current.gate_lineage,
+        review_round: current.review_round,
+        required_node_ids: current.required_node_ids,
+        selected_node_ids: current.selected_node_ids,
+        reviewers: current.reviewers,
+        stagnation_count,
+        rewrite_used,
+        next_action,
+    };
+    validate_v2_state_size(&state)?;
+    Ok(PlanReviewDecisionV2 {
+        state,
+        strict_improvement,
+    })
+}
+
+pub fn derive_next_plan_review_round_v2(
+    current: &PlanReviewRoundStateV2,
+    passing_change_intersections: &[String],
+) -> Result<Option<PlanReviewRoundOpeningV2>, PlanReviewError> {
+    if current.next_action != PlanReviewNextAction::ContinueReview {
+        return Ok(None);
+    }
+    let passing_change_intersections =
+        canonical_reviewer_set("passing_change_intersections", passing_change_intersections)?;
+    validate_known_reviewers(&current.required_node_ids, &passing_change_intersections)?;
+    let passing_by_node = current
+        .reviewers
+        .iter()
+        .map(|reviewer| (reviewer.node_id.as_str(), reviewer.rank == 0))
+        .collect::<BTreeMap<_, _>>();
+    if passing_change_intersections.iter().any(|node_id| {
+        passing_by_node
+            .get(node_id.as_str())
+            .is_none_or(|passing| !passing)
+    }) {
+        return Err(PlanReviewError::InvalidTransition(
+            "localized intersections may add only currently passing reviewers".into(),
+        ));
+    }
+    let mut selected_node_ids = current
+        .reviewers
+        .iter()
+        .filter(|reviewer| reviewer.rank > 0)
+        .map(|reviewer| reviewer.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    selected_node_ids.extend(passing_change_intersections);
+    let review_round = current
+        .review_round
+        .checked_add(1)
+        .ok_or_else(|| PlanReviewError::BoundsExceeded("review_round exceeds u32".into()))?;
+    Ok(Some(PlanReviewRoundOpeningV2 {
+        gate_lineage: current.gate_lineage.clone(),
+        review_round,
+        selected_node_ids: selected_node_ids.into_iter().collect(),
+    }))
+}
+
+fn validate_v2_reviewers(
+    required_node_ids: &[String],
+    reviewers: &mut Vec<PlanReviewerOutcomeV2>,
+) -> Result<(), PlanReviewError> {
+    if reviewers.len() > MAX_OWNER_COUNT {
+        return Err(PlanReviewError::BoundsExceeded(format!(
+            "reviewer count exceeds {MAX_OWNER_COUNT}"
+        )));
+    }
+    reviewers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let reviewer_ids = reviewers
+        .iter()
+        .map(|reviewer| reviewer.node_id.clone())
+        .collect::<Vec<_>>();
+    if reviewer_ids != required_node_ids {
+        return Err(PlanReviewError::RequiredReviewerSetMismatch {
+            expected: required_node_ids.to_vec(),
+            actual: reviewer_ids,
+        });
+    }
+    for reviewer in reviewers {
+        validate_id("reviewer node_id", &reviewer.node_id)?;
+        validate_id("reviewer evidence_task_id", &reviewer.evidence_task_id)?;
+        validate_id(
+            "reviewer evidence_scope_digest",
+            &reviewer.evidence_scope_digest,
+        )?;
+        if reviewer.rank != reviewer_outcome_rank(reviewer.outcome) || reviewer.rank > 2 {
+            return Err(PlanReviewError::InvalidField(format!(
+                "reviewer {} has an invalid outcome rank",
+                reviewer.node_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_transition(
+    previous: Option<&PlanReviewRoundStateV2>,
+    current: &PlanReviewRoundInputV2,
+    change: PlanReviewChangeV2,
+) -> Result<(), PlanReviewError> {
+    match (previous, change) {
+        (None, PlanReviewChangeV2::InitialOrNewLineage) => {
+            if current.review_round != 1 || current.selected_node_ids != current.required_node_ids {
+                return Err(PlanReviewError::InvalidTransition(
+                    "initial Plan review must start at round 1 with the full cohort".into(),
+                ));
+            }
+        }
+        (None, _) => {
+            return Err(PlanReviewError::InvalidTransition(
+                "the first v2 Plan review must establish a lineage".into(),
+            ));
+        }
+        (Some(previous), PlanReviewChangeV2::InitialOrNewLineage) => {
+            if current.gate_lineage == previous.gate_lineage
+                || current.review_round != 1
+                || current.selected_node_ids != current.required_node_ids
+            {
+                return Err(PlanReviewError::InvalidTransition(
+                    "new Plan lineage must change identity and restart full-cohort round 1".into(),
+                ));
+            }
+        }
+        (Some(previous), change) => {
+            if current.gate_lineage != previous.gate_lineage
+                || current.review_round != previous.review_round.saturating_add(1)
+            {
+                return Err(PlanReviewError::InvalidTransition(
+                    "same-lineage Plan review must increment the platform round".into(),
+                ));
+            }
+            if change != PlanReviewChangeV2::RosterOnly
+                && current.required_node_ids != previous.required_node_ids
+            {
+                return Err(PlanReviewError::InvalidTransition(
+                    "only roster-only review may change the required reviewer set".into(),
+                ));
+            }
+            if previous.next_action == PlanReviewNextAction::UserDecisionRequired {
+                return Err(PlanReviewError::InvalidTransition(
+                    "user decision is required before another v2 Plan round".into(),
+                ));
+            }
+            match change {
+                PlanReviewChangeV2::HolisticRewrite
+                    if previous.next_action != PlanReviewNextAction::HolisticRewriteRequired
+                        || previous.rewrite_used =>
+                {
+                    return Err(PlanReviewError::InvalidTransition(
+                        "holistic rewrite is not currently authorized".into(),
+                    ));
+                }
+                PlanReviewChangeV2::Corrective
+                    if previous.next_action == PlanReviewNextAction::HolisticRewriteRequired =>
+                {
+                    return Err(PlanReviewError::InvalidTransition(
+                        "the next v2 Plan round must be the holistic rewrite".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_roster_preserves_siblings(
+    previous: &PlanReviewRoundStateV2,
+    current: &PlanReviewRoundInputV2,
+) -> Result<(), PlanReviewError> {
+    let added = current
+        .required_node_ids
+        .iter()
+        .filter(|node_id| previous.required_node_ids.binary_search(node_id).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    if current.selected_node_ids != added {
+        return Err(PlanReviewError::InvalidTransition(
+            "roster-only Plan round must select exactly the newly added reviewers".into(),
+        ));
+    }
+    let current_by_node = current
+        .reviewers
+        .iter()
+        .map(|reviewer| (reviewer.node_id.as_str(), reviewer))
+        .collect::<BTreeMap<_, _>>();
+    for previous_reviewer in &previous.reviewers {
+        if current
+            .required_node_ids
+            .binary_search(&previous_reviewer.node_id)
+            .is_ok()
+            && current_by_node
+                .get(previous_reviewer.node_id.as_str())
+                .is_none_or(|reviewer| *reviewer != previous_reviewer)
+        {
+            return Err(PlanReviewError::InvalidTransition(format!(
+                "roster-only Plan round changed sibling evidence for {}",
+                previous_reviewer.node_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_state_size(state: &PlanReviewRoundStateV2) -> Result<(), PlanReviewError> {
+    let size = serde_json::to_vec(state)
+        .map_err(|error| PlanReviewError::InvalidField(error.to_string()))?
+        .len();
+    if size > MAX_ROUND_JSON_BYTES {
+        return Err(PlanReviewError::BoundsExceeded(format!(
+            "derived v2 state JSON is {size} bytes, maximum is {MAX_ROUND_JSON_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 /// Derives state for one completed round. Incomplete or infrastructure-failed
@@ -1183,5 +1560,204 @@ mod tests {
         assert!(!state.rewrite_used);
         assert_eq!(state.findings.len(), 1);
         assert_eq!(state.findings[0].finding_id, "F-new");
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    const LINEAGE: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn reviewer(node_id: &str, outcome: CompletionOutcome) -> PlanReviewerOutcomeV2 {
+        PlanReviewerOutcomeV2 {
+            node_id: node_id.to_owned(),
+            outcome,
+            rank: reviewer_outcome_rank(outcome),
+            evidence_task_id: format!("task-{node_id}"),
+            evidence_scope_digest: format!(
+                "sha256:{:0>64}",
+                if node_id == "codex" { "1" } else { "2" }
+            ),
+        }
+    }
+
+    fn input(review_round: u32, reviewers: &[(&str, CompletionOutcome)]) -> PlanReviewRoundInputV2 {
+        let reviewers = reviewers
+            .iter()
+            .map(|(node_id, outcome)| reviewer(node_id, *outcome))
+            .collect::<Vec<_>>();
+        let required_node_ids = reviewers
+            .iter()
+            .map(|reviewer| reviewer.node_id.clone())
+            .collect::<Vec<_>>();
+        PlanReviewRoundInputV2 {
+            gate_lineage: LINEAGE.to_owned(),
+            review_round,
+            selected_node_ids: required_node_ids.clone(),
+            required_node_ids,
+            reviewers,
+        }
+    }
+
+    fn derive(
+        previous: Option<&PlanReviewRoundStateV2>,
+        review_round: u32,
+        reviewers: &[(&str, CompletionOutcome)],
+        change: PlanReviewChangeV2,
+    ) -> PlanReviewDecisionV2 {
+        derive_plan_review_round_v2(previous, input(review_round, reviewers), change).unwrap()
+    }
+
+    #[test]
+    fn plan_round_v2_uses_rank_improvement_and_approved_thresholds() {
+        let baseline = derive(
+            None,
+            1,
+            &[
+                ("codex", CompletionOutcome::Block),
+                ("grok", CompletionOutcome::RequestChanges),
+            ],
+            PlanReviewChangeV2::InitialOrNewLineage,
+        );
+        let improved = derive(
+            Some(&baseline.state),
+            2,
+            &[
+                ("codex", CompletionOutcome::RequestChanges),
+                ("grok", CompletionOutcome::RequestChanges),
+            ],
+            PlanReviewChangeV2::Corrective,
+        );
+        let worsened = derive(
+            Some(&improved.state),
+            3,
+            &[
+                ("codex", CompletionOutcome::RequestChanges),
+                ("grok", CompletionOutcome::Block),
+            ],
+            PlanReviewChangeV2::Corrective,
+        );
+
+        assert!(improved.strict_improvement);
+        assert!(!worsened.strict_improvement);
+        let approved = derive(
+            None,
+            1,
+            &[
+                ("codex", CompletionOutcome::Approve),
+                ("grok", CompletionOutcome::ApproveWithMinors),
+            ],
+            PlanReviewChangeV2::InitialOrNewLineage,
+        );
+        assert_eq!(approved.state.next_action, PlanReviewNextAction::Approved);
+    }
+
+    #[test]
+    fn plan_round_v2_hits_rewrite_then_user_decision_after_two_stagnant_rounds() {
+        let outcomes = [("codex", CompletionOutcome::RequestChanges)];
+        let baseline = derive(None, 1, &outcomes, PlanReviewChangeV2::InitialOrNewLineage);
+        let first = derive(
+            Some(&baseline.state),
+            2,
+            &outcomes,
+            PlanReviewChangeV2::Corrective,
+        );
+        let second = derive(
+            Some(&first.state),
+            3,
+            &outcomes,
+            PlanReviewChangeV2::Corrective,
+        );
+        assert_eq!(
+            second.state.next_action,
+            PlanReviewNextAction::HolisticRewriteRequired
+        );
+
+        let rewrite = derive(
+            Some(&second.state),
+            4,
+            &outcomes,
+            PlanReviewChangeV2::HolisticRewrite,
+        );
+        assert_eq!(rewrite.state.stagnation_count, 0);
+        let post_one = derive(
+            Some(&rewrite.state),
+            5,
+            &outcomes,
+            PlanReviewChangeV2::Corrective,
+        );
+        let post_two = derive(
+            Some(&post_one.state),
+            6,
+            &outcomes,
+            PlanReviewChangeV2::Corrective,
+        );
+        assert_eq!(
+            post_two.state.next_action,
+            PlanReviewNextAction::UserDecisionRequired
+        );
+    }
+
+    #[test]
+    fn roster_only_round_preserves_siblings_and_does_not_advance_stagnation() {
+        let baseline = derive(
+            None,
+            1,
+            &[("codex", CompletionOutcome::RequestChanges)],
+            PlanReviewChangeV2::InitialOrNewLineage,
+        );
+        let stagnant = derive(
+            Some(&baseline.state),
+            2,
+            &[("codex", CompletionOutcome::RequestChanges)],
+            PlanReviewChangeV2::Corrective,
+        );
+        let mut roster_input = input(
+            3,
+            &[
+                ("codex", CompletionOutcome::RequestChanges),
+                ("grok", CompletionOutcome::Approve),
+            ],
+        );
+        roster_input.selected_node_ids = vec!["grok".into()];
+
+        let roster = derive_plan_review_round_v2(
+            Some(&stagnant.state),
+            roster_input,
+            PlanReviewChangeV2::RosterOnly,
+        )
+        .unwrap();
+
+        assert_eq!(roster.state.selected_node_ids, vec!["grok"]);
+        assert_eq!(
+            roster.state.stagnation_count,
+            stagnant.state.stagnation_count
+        );
+        assert_eq!(
+            roster.state.reviewers[0].evidence_task_id,
+            stagnant.state.reviewers[0].evidence_task_id
+        );
+    }
+
+    #[test]
+    fn next_plan_round_is_platform_incremented_and_selects_all_affected_reviewers() {
+        let current = derive(
+            None,
+            1,
+            &[
+                ("codex", CompletionOutcome::RequestChanges),
+                ("grok", CompletionOutcome::Approve),
+            ],
+            PlanReviewChangeV2::InitialOrNewLineage,
+        );
+
+        let next = derive_next_plan_review_round_v2(&current.state, &["grok".into()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(next.review_round, 2);
+        assert_eq!(next.selected_node_ids, vec!["codex", "grok"]);
+        assert_eq!(next.gate_lineage, LINEAGE);
     }
 }

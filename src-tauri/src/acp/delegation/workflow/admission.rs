@@ -45,6 +45,7 @@ use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_chang
 use super::evidence_scope::{
     build_admission_completion_context, AdmissionCandidate, EvidenceScopeError, WorkflowStore,
 };
+use super::final_findings::{load_active_final_findings_package_v1, FinalFindingsError};
 use super::gates::{
     evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
     RequiredReviewerEvidence, TerminalRunStatus,
@@ -1749,7 +1750,60 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
         };
         return Err(admission_err("final_fixer_before_non_pass", detail));
     }
+    if header.completion_protocol_version == 2 {
+        ensure_final_findings_package(conn, header).await?;
+    }
     Ok(())
+}
+
+async fn ensure_final_findings_package<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+) -> Result<(), TaskStoreError> {
+    let gate = delegation_workflow_gate_state::Entity::find_by_id((
+        header.workflow_id.clone(),
+        "final".to_string(),
+    ))
+    .one(conn)
+    .await
+    .map_err(map_db)?
+    .ok_or_else(|| {
+        admission_err(
+            "completion_instruction_binding_failed",
+            "Final Fixer requires a durable Final gate state",
+        )
+    })?;
+    let package = load_active_final_findings_package_v1(
+        conn,
+        &header.workflow_id,
+        &gate.gate_id,
+        &gate.gate_lineage,
+    )
+    .await
+    .map_err(map_final_findings_admission_error)?;
+    if package.is_none() {
+        return Err(admission_err(
+            "completion_remediation_context_required",
+            "Final Fixer requires one active current findings package",
+        ));
+    }
+    Ok(())
+}
+
+fn map_final_findings_admission_error(error: FinalFindingsError) -> TaskStoreError {
+    match error {
+        FinalFindingsError::RemediationContextRequired => {
+            admission_err("completion_remediation_context_required", error.to_string())
+        }
+        FinalFindingsError::EvidenceCorrupt => {
+            admission_err("completion_evidence_corrupt", error.to_string())
+        }
+        FinalFindingsError::InvalidField(_)
+        | FinalFindingsError::BoundsExceeded(_)
+        | FinalFindingsError::Persistence(_) => {
+            admission_err("completion_evidence_corrupt", error.to_string())
+        }
+    }
 }
 
 /// If Final reviewer completed without a validated chat card, try harvesting
@@ -2798,7 +2852,9 @@ mod tests {
     };
     use crate::acp::delegation::workflow::WorkflowStoreError;
     use crate::db::entities::conversation::ConversationStatus;
-    use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
+    use crate::db::entities::delegation_task_run::{
+        AdmissionClass as DbAdmissionClass, CompletionState,
+    };
     use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
@@ -3033,6 +3089,19 @@ mod tests {
                 allow_noop_verification: false,
             }],
         }
+    }
+
+    fn final_only_doc(token: &str) -> ManifestDocument {
+        let mut doc = sample_doc(token, ManifestWorkflowState::Estimated);
+        doc.nodes.retain(|node| node.task_index.is_none());
+        for node in &mut doc.nodes {
+            node.deps.retain(|dep| {
+                dep != "task-1-impl" && dep != "task-1-rev" && dep != "plan-reviewer-1"
+            });
+        }
+        doc.edges.clear();
+        doc.task_policies.clear();
+        doc
     }
 
     fn skeleton_doc(token: &str) -> ManifestDocument {
@@ -3714,6 +3783,231 @@ mod tests {
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
+    async fn task14_final_reviewer_fixture(
+        token: &str,
+    ) -> (AppDatabase, i32, AdmissionGitFixture, String, String) {
+        use crate::db::entities::delegation_workflow_gate_state;
+
+        let repo = AdmissionGitFixture::new();
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = final_only_doc(token);
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let workflow_id = publish_document_approved(&db, &emitter, parent, document).await;
+        enable_completion_v2(&db, &workflow_id).await;
+
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(format!("sha256:{}", "f".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let task_id = format!("{token}-final-reviewer");
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-reviewer",
+            &task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            &task_id,
+            r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#,
+            None,
+        )
+        .await;
+        (db, parent, repo, workflow_id, task_id)
+    }
+
+    #[tokio::test]
+    async fn task14_final_completion_mints_immutable_package_before_fixer_admission() {
+        let (db, parent, repo, workflow_id, task_id) =
+            task14_final_reviewer_fixture("task14-final-package").await;
+        let report_path = repo.path().join("reports/final.md");
+        let report_bytes = b"# Verdict\n\nrequest changes\n\noriginal final report bytes\n";
+
+        let txn = db.conn.begin().await.unwrap();
+        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: task_id.clone(),
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: "See the report.".into(),
+                pre_read_reports: vec![
+                    super::super::completion_evidence::ValidatedReportCandidate {
+                        path: "reports/final.md".into(),
+                        contents: String::from_utf8(report_bytes.to_vec()).unwrap(),
+                        summary: Some("changes required".into()),
+                    },
+                ],
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(result.state, CompletionState::Resolved);
+
+        let package = load_active_final_findings_package_v1(
+            &db.conn,
+            &workflow_id,
+            "final",
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .expect("Final package must exist before Fixer admission");
+        assert_eq!(package.context_bytes(0).unwrap(), report_bytes);
+        let fixer_task_id = "task14-final-package-fixer";
+        let fixer_binding = admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-fixer",
+            fixer_task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+        assert_eq!(
+            fixer_binding.final_findings_identity.as_deref(),
+            Some(package.final_findings_identity())
+        );
+        let instruction = load_admitted_completion_instruction(&db.conn, fixer_task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(instruction.canonical_utf8.contains(
+            package.remediation_contexts[0]
+                .content_base64
+                .as_deref()
+                .unwrap()
+        ));
+        std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+        std::fs::write(&report_path, b"mutated after terminal completion").unwrap();
+        assert_eq!(package.context_bytes(0).unwrap(), report_bytes);
+    }
+
+    #[tokio::test]
+    async fn task14_final_nonpass_without_context_opens_decision_without_package() {
+        use crate::db::entities::delegation_attention_request::{self, AttentionKind};
+        use crate::db::entities::delegation_completion_tool_intent;
+
+        let (db, _parent, _repo, workflow_id, task_id) =
+            task14_final_reviewer_fixture("task14-final-no-context").await;
+        delegation_completion_tool_intent::ActiveModel {
+            intent_id: Set(format!("intent-{task_id}")),
+            task_id: Set(task_id.clone()),
+            child_tool_call_id: Set(format!("call-{task_id}")),
+            accepted_ordinal: Set(1),
+            outcome: Set(CompletionOutcome::RequestChanges.as_str().into()),
+            summary: Set(None),
+            report_hint: Set(None),
+            request_digest: Set("digest".into()),
+            created_at: Set(Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let txn = db.conn.begin().await.unwrap();
+        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: task_id.clone(),
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: String::new(),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        assert_eq!(result.state, CompletionState::NeedsDecision);
+        assert_eq!(
+            result.attention.as_ref().unwrap().kind,
+            AttentionKind::CompletionDecision
+        );
+        assert!(load_active_final_findings_package_v1(
+            &db.conn,
+            &workflow_id,
+            "final",
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let attention = delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(task_id))
+            .filter(delegation_attention_request::Column::Status.eq("open"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attention
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("completion_remediation_context_required"));
+    }
+
+    #[tokio::test]
+    async fn task14_final_artifact_recovery_keeps_pre_read_snapshot() {
+        let (db, _parent, repo, workflow_id, task_id) =
+            task14_final_reviewer_fixture("task14-final-artifact-recovery").await;
+        let report_path = repo.path().join("reports/final.md");
+        let report_bytes = b"# Verdict\n\nrequest changes\n\nrecovery snapshot\n";
+        std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+        std::fs::write(&report_path, report_bytes).unwrap();
+
+        let txn = db.conn.begin().await.unwrap();
+        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id,
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: "See the report.".into(),
+                pre_read_reports: vec![
+                    super::super::completion_evidence::ValidatedReportCandidate {
+                        path: "reports/final.md".into(),
+                        contents: String::from_utf8(report_bytes.to_vec()).unwrap(),
+                        summary: Some("changes required".into()),
+                    },
+                ],
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(result.state, CompletionState::ArtifactRecovery);
+
+        let package = load_active_final_findings_package_v1(
+            &db.conn,
+            &workflow_id,
+            "final",
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .expect("artifact recovery must retain the immutable Final snapshot");
+        assert_eq!(package.context_bytes(0).unwrap(), report_bytes);
+    }
+
     #[tokio::test]
     async fn completion_v2_shared_validator_admission_ignores_legacy_card_projection() {
         let (db, parent) = seed_parent().await;
@@ -4068,16 +4362,41 @@ mod tests {
         .insert(&db.conn)
         .await
         .unwrap();
+        let final_package = super::super::final_findings::build_final_findings_package_v1(
+            super::super::final_findings::FinalFindingsPackageInputV1 {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "final".into(),
+                gate_lineage: final_lineage.clone(),
+                graph_revision: 1,
+                findings: vec![super::super::final_findings::FinalFindingInputV1 {
+                    reviewer_node_id: "final-reviewer".into(),
+                    evidence_task_id: "task9-final-source".into(),
+                    evidence_scope_digest: format!("sha256:{}", "e".repeat(64)),
+                    outcome: CompletionOutcome::RequestChanges,
+                    target_work_unit_keys: vec!["task|1|implementer|grok|none".into()],
+                    remediation_route_ids: vec!["task-1-impl".into()],
+                }],
+                remediation_contexts: vec![
+                    super::super::final_findings::RemediationContextInputV1::available_terminal(
+                        "task9-final-source",
+                        b"Final changes required".to_vec(),
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let encoded =
+            super::super::final_findings::encode_final_findings_package_v1(&final_package).unwrap();
         delegation_final_findings_package::ActiveModel {
             package_id: Set("task9-final-package".into()),
             workflow_id: Set(published.workflow_id.clone()),
             gate_id: Set("final".into()),
             gate_lineage: Set(final_lineage.clone()),
-            source_evaluation_key: Set(format!("sha256:{}", "e".repeat(64))),
-            source_evidence_task_ids_json: Set("[]".into()),
-            items_json: Set("[]".into()),
-            remediation_contexts_json: Set("[]".into()),
-            package_digest: Set(format!("sha256:{}", "c".repeat(64))),
+            source_evaluation_key: Set(final_package.source_evaluation_key.clone()),
+            source_evidence_task_ids_json: Set(encoded.source_evidence_task_ids_json),
+            items_json: Set(encoded.items_json),
+            remediation_contexts_json: Set(encoded.remediation_contexts_json),
+            package_digest: Set(final_package.package_digest.clone()),
             status: Set(FinalFindingsPackageStatus::Active),
             created_graph_revision: Set(1),
             resolved_graph_revision: Set(None),

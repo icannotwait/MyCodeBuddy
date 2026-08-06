@@ -1132,6 +1132,9 @@ fn completion_reason_label(reason: CompletionIntentReason) -> &'static str {
         CompletionIntentReason::Missing => "completion_intent_missing",
         CompletionIntentReason::Conflict => "completion_intent_conflict",
         CompletionIntentReason::RoleMismatch => "completion_outcome_role_mismatch",
+        CompletionIntentReason::RemediationContextRequired => {
+            "completion_remediation_context_required"
+        }
     }
 }
 
