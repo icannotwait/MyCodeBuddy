@@ -54,6 +54,7 @@ mod m20260804_000003_completion_tool_intents_and_restart_link;
 mod m20260804_000004_typed_completion_attention;
 mod m20260806_000001_platform_design_root_binding;
 mod m20260806_000002_final_reviewer_snapshots;
+mod m20260806_000003_plan_round_authorization;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -113,6 +114,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000004_typed_completion_attention::Migration),
             Box::new(m20260806_000001_platform_design_root_binding::Migration),
             Box::new(m20260806_000002_final_reviewer_snapshots::Migration),
+            Box::new(m20260806_000003_plan_round_authorization::Migration),
         ]
     }
 }

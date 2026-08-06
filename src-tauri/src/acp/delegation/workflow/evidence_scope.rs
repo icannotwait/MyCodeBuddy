@@ -621,13 +621,29 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
         let review_round = if scope_role == CompletionScopeRole::FinalReviewer {
             let selected: BTreeSet<String> = serde_json::from_str(&state.selected_node_ids_json)
                 .map_err(|error| EvidenceScopeError::InstructionBindingFailed(error.to_string()))?;
-            if !selected.contains(&node.node_id) || state.current_review_round <= 0 {
-                return Err(EvidenceScopeError::InstructionBindingFailed(format!(
-                    "Final Reviewer {} is not selected for round {}",
-                    node.node_id, state.current_review_round
-                )));
-            }
-            Some(u32::try_from(state.current_review_round).map_err(|_| {
+            let admitted_round =
+                if selected.contains(&node.node_id) && state.current_review_round > 0 {
+                    state.current_review_round
+                } else {
+                    match gate_round_selection {
+                        GateRoundSelection::PersistedEvidence {
+                            gate_lineage: Some(persisted_lineage),
+                            review_round: Some(persisted_round),
+                        } if persisted_lineage == state.gate_lineage
+                            && persisted_round > 0
+                            && persisted_round < state.current_review_round =>
+                        {
+                            persisted_round
+                        }
+                        _ => {
+                            return Err(EvidenceScopeError::InstructionBindingFailed(format!(
+                                "Final Reviewer {} is not selected for round {}",
+                                node.node_id, state.current_review_round
+                            )))
+                        }
+                    }
+                };
+            Some(u32::try_from(admitted_round).map_err(|_| {
                 EvidenceScopeError::InstructionBindingFailed(
                     "Final review round exceeds u32".into(),
                 )
@@ -715,12 +731,7 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
                     .map_err(|error| {
                         EvidenceScopeError::InstructionBindingFailed(error.to_string())
                     })?;
-                if localized_change_proofs.is_empty() {
-                    return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
-                        "unselected reviewer {} has no localized-change proof for current lineage",
-                        node.node_id
-                    )));
-                }
+                let mut current_round_proven = false;
                 for proof in localized_change_proofs {
                     let state_json =
                         proof.plan_round_state_v2_json.as_deref().ok_or_else(|| {
@@ -739,11 +750,8 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
                             "localized-change proof is missing its authorized change".into(),
                         )
                     })?;
-                    let digest = canonical_json_sha256(
-                        "codeg.completion.plan_localized_change.v2",
-                        1,
-                        change,
-                    )?;
+                    let digest =
+                        canonical_json_sha256("codeg.completion.plan_change.v2", 1, change)?;
                     if proof.localized_change_digest.as_deref() != Some(digest.as_str())
                         || proof.gate_lineage.as_deref() != Some(state.gate_lineage.as_str())
                         || proof.review_round != Some(i64::from(proof_state.review_round))
@@ -756,6 +764,48 @@ async fn load_admitted_gate_state<C: ConnectionTrait>(
                             node.node_id
                         )));
                     }
+                    current_round_proven |= proof.review_round == Some(state.current_review_round);
+                }
+                let active_authorization = super::store::load_plan_round_authorization_v2(
+                    store.conn,
+                    &node.workflow_id,
+                    &gate.id,
+                )
+                .await
+                .map_err(|error| EvidenceScopeError::PlanMaterialInvalid(error.to_string()))?;
+                if let Some(authorization) = active_authorization {
+                    let state_selected = selected.iter().cloned().collect::<Vec<_>>();
+                    let required_node_ids = gate
+                        .required_reviewer_node_ids
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    if authorization.gate_lineage != state.gate_lineage
+                        || i64::from(authorization.review_round) != state.current_review_round
+                        || authorization.prior_review_round
+                            < u32::try_from(persisted_round).map_err(|_| {
+                                EvidenceScopeError::PlanMaterialInvalid(
+                                    "persisted Plan review round exceeds u32".into(),
+                                )
+                            })?
+                        || authorization.required_node_ids != required_node_ids
+                        || authorization.selected_node_ids != state_selected
+                        || authorization.selected_node_ids.contains(&node.node_id)
+                    {
+                        return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
+                            "active localized-change authorization does not preserve reviewer {}",
+                            node.node_id
+                        )));
+                    }
+                    current_round_proven = true;
+                }
+                if !current_round_proven {
+                    return Err(EvidenceScopeError::PlanMaterialInvalid(format!(
+                        "unselected reviewer {} has no localized-change proof for current lineage",
+                        node.node_id
+                    )));
                 }
                 persisted_round
             }

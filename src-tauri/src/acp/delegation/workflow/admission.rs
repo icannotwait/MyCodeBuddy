@@ -2839,8 +2839,12 @@ mod tests {
         WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
     };
     use crate::acp::delegation::workflow::key::build_work_unit_key;
+    use crate::acp::delegation::workflow::plan_review::{
+        PlanReviewNextAction, PlanReviewRoundStateV2,
+    };
     use crate::acp::delegation::workflow::store::{
-        publish_workflow_manifest_core, PublishWorkflowRequest,
+        publish_workflow_manifest_core, settle_workflow_gate_v2_core, PublishWorkflowRequest,
+        SettleWorkflowV2Request,
     };
     use crate::acp::delegation::workflow::types::{
         CompletionScopeRole, DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate,
@@ -3578,6 +3582,72 @@ mod tests {
         binding
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_task9_continuation_run(
+        db: &AppDatabase,
+        parent: i32,
+        workspace: &Path,
+        workflow_id: &str,
+        node_id: &str,
+        task_id: &str,
+        previous_task_id: &str,
+        lineage_root_task_id: &str,
+        agent: AgentType,
+        agent_wire: &str,
+    ) -> delegation_workflow_run_binding::Model {
+        let node = delegation_workflow_node_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            node_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let child = child_for(db, agent).await;
+        let mut insert = gen1_insert(
+            parent,
+            child,
+            task_id,
+            agent_wire,
+            Some(&node.work_unit_key),
+            None,
+        );
+        insert.root_task_id = lineage_root_task_id.to_string();
+        insert.previous_task_id = Some(previous_task_id.to_string());
+        insert.generation = 2;
+        insert.lineage_root_task_id = lineage_root_task_id.to_string();
+        insert.workspace_path = Some(workspace.to_string_lossy().into_owned());
+        RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .insert_reserving(insert)
+        .await
+        .unwrap();
+        admit_workflow_run_txn(
+            &db.conn,
+            &WorkflowAdmitInput {
+                parent_conversation_id: parent,
+                child_conversation_id: child,
+                task_id,
+                work_unit_key: Some(&node.work_unit_key),
+                agent_type: agent_wire,
+                profile_id: None,
+                lineage_root_task_id,
+                generation: 2,
+                kind: AdmissionDispatchKind::ContinueOrReplacement,
+                admission_class: DbAdmissionClass::NormalRevision,
+                workspace_path: workspace.to_str(),
+            },
+        )
+        .await
+        .unwrap();
+        delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     async fn complete_task9_admitted_run(
         db: &AppDatabase,
         task_id: &str,
@@ -3609,6 +3679,45 @@ mod tests {
         }
         binding.updated_at = Set(now);
         binding.update(&db.conn).await.unwrap();
+    }
+
+    async fn materialize_task14_terminal(
+        db: &AppDatabase,
+        task_id: &str,
+        final_assistant_text: &str,
+    ) -> CompletionState {
+        let txn = db.conn.begin().await.unwrap();
+        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &txn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: task_id.to_string(),
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: final_assistant_text.to_string(),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("materialize task {task_id}: {error:?}"));
+        txn.commit().await.unwrap();
+        result.state
+    }
+
+    async fn record_task14_intent(db: &AppDatabase, task_id: &str, outcome: CompletionOutcome) {
+        delegation_completion_tool_intent::ActiveModel {
+            intent_id: Set(format!("intent-{task_id}")),
+            task_id: Set(task_id.to_string()),
+            child_tool_call_id: Set(format!("call-{task_id}")),
+            accepted_ordinal: Set(1),
+            outcome: Set(outcome.as_str().into()),
+            summary: Set(Some("task14 fix2 typed intent".into())),
+            report_hint: Set(None),
+            request_digest: Set(format!("digest-{task_id}")),
+            created_at: Set(Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3923,6 +4032,414 @@ mod tests {
         .await;
 
         (db, parent, repo, workflow_id, codex_task_id, grok_task_id)
+    }
+
+    #[tokio::test]
+    async fn task14_fix2_plan_authorizes_corrective_round_before_reviewer_admission() {
+        const CORRECTED_PLAN_BYTES: &[u8] =
+            b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\ncorrected body\n";
+
+        let repo = AdmissionGitFixture::new();
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = two_plan_reviewer_doc("task14-fix2-plan-authorization");
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "plan-reviewer-1")
+            .unwrap()
+            .deps = vec!["plan-author".into()];
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        enable_completion_v2(&db, &published.workflow_id).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set(r#"["plan-reviewer-1","plan-reviewer-2"]"#.into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let author_one = "task14-fix2-plan-author-1";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            author_one,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            author_one,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            None,
+        )
+        .await;
+        record_task14_intent(&db, author_one, CompletionOutcome::Done).await;
+        assert_eq!(
+            materialize_task14_terminal(
+                &db,
+                author_one,
+                &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            )
+            .await,
+            CompletionState::Resolved
+        );
+
+        for (node_id, task_id, agent, agent_wire, summary, outcome) in [
+            (
+                "plan-reviewer-1",
+                "task14-fix2-plan-review-1-codex",
+                AgentType::Codex,
+                "codex",
+                review_summary(),
+                CompletionOutcome::Approve,
+            ),
+            (
+                "plan-reviewer-2",
+                "task14-fix2-plan-review-1-grok",
+                AgentType::Grok,
+                "grok",
+                r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#,
+                CompletionOutcome::RequestChanges,
+            ),
+        ] {
+            admit_task9_bound_run(
+                &db,
+                parent,
+                repo.path(),
+                &published.workflow_id,
+                node_id,
+                task_id,
+                agent,
+                agent_wire,
+            )
+            .await;
+            complete_task9_admitted_run(&db, task_id, summary, None).await;
+            record_task14_intent(&db, task_id, outcome).await;
+            assert_eq!(
+                materialize_task14_terminal(&db, task_id, summary).await,
+                CompletionState::Resolved
+            );
+        }
+
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_settlement = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "plan".into(),
+                expected_graph_revision: header.graph_revision as u64,
+                expected_review_round: Some(1),
+                expected_outcome: Some(GateSettlementOutcome::ChangesRequested),
+                summary: "open corrective round".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_settlement.plan_next_action,
+            Some(PlanReviewNextAction::ContinueReview)
+        );
+        let pending = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending.current_review_round, 2);
+        assert_eq!(pending.selected_node_ids_json, "[]");
+
+        std::fs::write(
+            repo.path().join("docs/superpowers/plans/p.md"),
+            CORRECTED_PLAN_BYTES,
+        )
+        .unwrap();
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(first_settlement.manifest_revision);
+        document.publication_token.push_str("-corrected");
+        document.plan.as_mut().unwrap().digest = task9_sha256(CORRECTED_PLAN_BYTES);
+        let corrected = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let author_two = "task14-fix2-plan-author-2";
+        admit_task9_continuation_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            author_two,
+            author_one,
+            author_one,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            author_two,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            None,
+        )
+        .await;
+        record_task14_intent(&db, author_two, CompletionOutcome::Done).await;
+        assert_eq!(
+            materialize_task14_terminal(
+                &db,
+                author_two,
+                &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            )
+            .await,
+            CompletionState::Resolved
+        );
+
+        let authorized = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&authorized.selected_node_ids_json).unwrap(),
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
+        );
+        let authorization = super::super::store::load_plan_round_authorization_v2(
+            &db.conn,
+            &published.workflow_id,
+            "plan",
+        )
+        .await
+        .unwrap()
+        .expect("corrective round must retain its immutable authorization");
+        assert_eq!(authorization.author_task_id, author_two);
+        assert_eq!(
+            authorization.selected_node_ids,
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
+        );
+
+        for (node_id, task_id, previous_task_id, agent, agent_wire) in [
+            (
+                "plan-reviewer-1",
+                "task14-fix2-plan-review-2-codex",
+                "task14-fix2-plan-review-1-codex",
+                AgentType::Codex,
+                "codex",
+            ),
+            (
+                "plan-reviewer-2",
+                "task14-fix2-plan-review-2-grok",
+                "task14-fix2-plan-review-1-grok",
+                AgentType::Grok,
+                "grok",
+            ),
+        ] {
+            let binding = admit_task9_continuation_run(
+                &db,
+                parent,
+                repo.path(),
+                &published.workflow_id,
+                node_id,
+                task_id,
+                previous_task_id,
+                previous_task_id,
+                agent,
+                agent_wire,
+            )
+            .await;
+            assert_eq!(binding.review_round, Some(2));
+            complete_task9_admitted_run(&db, task_id, review_summary(), None).await;
+            record_task14_intent(&db, task_id, CompletionOutcome::Approve).await;
+            assert_eq!(
+                materialize_task14_terminal(&db, task_id, review_summary()).await,
+                CompletionState::Resolved
+            );
+        }
+
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_settlement = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "plan".into(),
+                expected_graph_revision: header.graph_revision as u64,
+                expected_review_round: Some(2),
+                expected_outcome: Some(GateSettlementOutcome::Approved),
+                summary: "settle authorized corrective round".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_settlement.outcome, GateSettlementOutcome::Approved);
+        let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
+            published.workflow_id,
+            "plan".to_string(),
+            2,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let state: PlanReviewRoundStateV2 =
+            serde_json::from_str(settlement.plan_round_state_v2_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            state.localized_change.unwrap().current_plan_digest,
+            document.plan.unwrap().digest
+        );
+        assert!(second_settlement.manifest_revision >= corrected.manifest_revision);
+        assert!(super::super::store::load_plan_round_authorization_v2(
+            &db.conn,
+            &settlement.workflow_id,
+            "plan",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn task14_fix2_final_partial_round_retains_required_nonpass_sibling() {
+        let repo = AdmissionGitFixture::new();
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = two_final_reviewer_doc("task14-fix2-final-required-cohort");
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let workflow_id = publish_document_approved(&db, &emitter, parent, document).await;
+        enable_completion_v2(&db, &workflow_id).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(workflow_id.clone()),
+            gate_id: Set("final".into()),
+            gate_lineage: Set(format!("sha256:{}", "f".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set(r#"["final-reviewer"]"#.into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let codex_task_id = "task14-fix2-final-codex-round-1".to_string();
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-reviewer",
+            &codex_task_id,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            &codex_task_id,
+            r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            materialize_task14_terminal(
+                &db,
+                &codex_task_id,
+                "Conclusion: request changes\n\nretained Codex finding",
+            )
+            .await,
+            CompletionState::Resolved
+        );
+
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            workflow_id.clone(),
+            "final".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut state: delegation_workflow_gate_state::ActiveModel = state.into();
+        state.current_review_round = Set(2);
+        state.selected_node_ids_json = Set(r#"["final-reviewer-grok"]"#.into());
+        state.update(&db.conn).await.unwrap();
+
+        let current_grok_task_id = "task14-fix2-final-grok-round-2";
+        let current_binding = admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &workflow_id,
+            "final-reviewer-grok",
+            current_grok_task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+        assert_eq!(current_binding.review_round, Some(2));
+        complete_task9_admitted_run(&db, current_grok_task_id, review_summary(), None).await;
+        assert_eq!(
+            materialize_task14_terminal(&db, current_grok_task_id, "Conclusion: approve").await,
+            CompletionState::Resolved
+        );
+
+        let package = load_active_final_findings_package_v1(
+            &db.conn,
+            &workflow_id,
+            "final",
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .expect("retained required non-pass sibling must keep a package active");
+        assert!(package.items.iter().any(|item| {
+            item.reviewer_node_id == "final-reviewer"
+                && item.evidence_task_id == codex_task_id
+                && item.outcome == CompletionOutcome::RequestChanges
+        }));
+        assert!(package
+            .remediation_contexts
+            .iter()
+            .any(|context| context.source_evidence_task_id == codex_task_id));
     }
 
     #[tokio::test]

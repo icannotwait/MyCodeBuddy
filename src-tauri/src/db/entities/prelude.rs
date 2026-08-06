@@ -15,6 +15,7 @@ pub use super::delegation_completion_tool_intent::Entity as DelegationCompletion
 pub use super::delegation_continuation::Entity as DelegationContinuation;
 pub use super::delegation_final_findings_package::Entity as DelegationFinalFindingsPackage;
 pub use super::delegation_lineage_budget::Entity as DelegationLineageBudget;
+pub use super::delegation_plan_round_authorization::Entity as DelegationPlanRoundAuthorization;
 pub use super::delegation_task_run::Entity as DelegationTaskRun;
 pub use super::delegation_work_unit_budget::Entity as DelegationWorkUnitBudget;
 pub use super::delegation_workflow::Entity as DelegationWorkflow;

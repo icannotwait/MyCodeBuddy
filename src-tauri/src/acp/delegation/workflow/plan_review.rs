@@ -14,6 +14,9 @@ const MAX_TEXT_BYTES: usize = 4 * 1024;
 const MAX_OWNER_COUNT: usize = 64;
 const MAX_FINDING_COUNT: usize = 400;
 const MAX_ROUND_JSON_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PLAN_ROUND_AUTHORIZATION_JSON_BYTES: usize = 512 * 1024;
+pub const PLAN_ROUND_AUTHORIZATION_SCHEMA_V2: &str = "codeg.plan-round-authorization.v2";
+const PLAN_ROUND_AUTHORIZATION_DIGEST_DOMAIN: &str = "codeg.completion.plan_round_authorization.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +132,139 @@ pub struct PlanArtifactSnapshotV2 {
     pub rel_path: String,
     pub digest: String,
     pub content_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRoundAuthorizationV2 {
+    pub schema: String,
+    pub gate_lineage: String,
+    pub review_round: u32,
+    pub prior_review_round: u32,
+    pub author_task_id: String,
+    pub required_node_ids: Vec<String>,
+    pub selected_node_ids: Vec<String>,
+    pub prior_plan_digest: String,
+    pub current_plan_digest: String,
+    pub localized_change: PlanLocalizedChangeV2,
+}
+
+impl PlanRoundAuthorizationV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        gate_lineage: String,
+        review_round: u32,
+        prior_review_round: u32,
+        author_task_id: String,
+        required_node_ids: Vec<String>,
+        selected_node_ids: Vec<String>,
+        prior_plan_digest: String,
+        current_plan_digest: String,
+        localized_change: PlanLocalizedChangeV2,
+    ) -> Result<Self, PlanReviewError> {
+        let authorization = Self {
+            schema: PLAN_ROUND_AUTHORIZATION_SCHEMA_V2.into(),
+            gate_lineage,
+            review_round,
+            prior_review_round,
+            author_task_id,
+            required_node_ids: canonical_reviewer_set(
+                "authorization required_node_ids",
+                &required_node_ids,
+            )?,
+            selected_node_ids: canonical_reviewer_set(
+                "authorization selected_node_ids",
+                &selected_node_ids,
+            )?,
+            prior_plan_digest,
+            current_plan_digest,
+            localized_change,
+        };
+        validate_plan_round_authorization_v2(&authorization)?;
+        Ok(authorization)
+    }
+}
+
+pub fn validate_plan_round_authorization_v2(
+    authorization: &PlanRoundAuthorizationV2,
+) -> Result<(), PlanReviewError> {
+    if authorization.schema != PLAN_ROUND_AUTHORIZATION_SCHEMA_V2 {
+        return Err(PlanReviewError::InvalidField(
+            "Plan round authorization schema is unsupported".into(),
+        ));
+    }
+    validate_id("authorization gate_lineage", &authorization.gate_lineage)?;
+    validate_id(
+        "authorization author_task_id",
+        &authorization.author_task_id,
+    )?;
+    validate_id(
+        "authorization prior_plan_digest",
+        &authorization.prior_plan_digest,
+    )?;
+    validate_id(
+        "authorization current_plan_digest",
+        &authorization.current_plan_digest,
+    )?;
+    if authorization.prior_review_round == 0
+        || authorization.review_round != authorization.prior_review_round.saturating_add(1)
+    {
+        return Err(PlanReviewError::InvalidTransition(
+            "Plan round authorization must advance exactly one round".into(),
+        ));
+    }
+    if canonical_reviewer_set(
+        "authorization required_node_ids",
+        &authorization.required_node_ids,
+    )? != authorization.required_node_ids
+        || canonical_reviewer_set(
+            "authorization selected_node_ids",
+            &authorization.selected_node_ids,
+        )? != authorization.selected_node_ids
+    {
+        return Err(PlanReviewError::InvalidField(
+            "Plan round authorization reviewer sets are not canonical".into(),
+        ));
+    }
+    if authorization.selected_node_ids.is_empty() {
+        return Err(PlanReviewError::InvalidField(
+            "Plan round authorization selected_node_ids must not be empty".into(),
+        ));
+    }
+    validate_known_reviewers(
+        &authorization.required_node_ids,
+        &authorization.selected_node_ids,
+    )?;
+    if authorization.localized_change.prior_plan_digest != authorization.prior_plan_digest
+        || authorization.localized_change.current_plan_digest != authorization.current_plan_digest
+        || authorization.localized_change.authorization_id != authorization.author_task_id
+    {
+        return Err(PlanReviewError::InvalidField(
+            "Plan round authorization does not match its localized change".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn plan_round_authorization_digest_v2(
+    authorization: &PlanRoundAuthorizationV2,
+) -> Result<String, PlanReviewError> {
+    validate_plan_round_authorization_v2(authorization)?;
+    let json = serde_json::to_vec(authorization).map_err(|error| {
+        PlanReviewError::InvalidField(format!("serialize Plan round authorization: {error}"))
+    })?;
+    if json.len() > MAX_PLAN_ROUND_AUTHORIZATION_JSON_BYTES {
+        return Err(PlanReviewError::BoundsExceeded(format!(
+            "Plan round authorization exceeds {MAX_PLAN_ROUND_AUTHORIZATION_JSON_BYTES} bytes"
+        )));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(PLAN_ROUND_AUTHORIZATION_DIGEST_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(1_u32.to_be_bytes());
+    hasher.update([0]);
+    hasher.update(json);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

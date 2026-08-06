@@ -13,6 +13,12 @@ trusted material classifier, holistic rewrites mint a fresh full-cohort
 lineage, and Final package identity, immutable snapshots, and lifecycle
 transitions are derived from complete platform evidence.
 
+The second High re-review fix closes the two narrowed Important findings.
+Corrective Plan rounds now remain pending until Author completion atomically
+stores the classifier-selected cohort and immutable authorization. Final
+evaluation now assembles every required Reviewer, including validated retained
+sibling evidence, before choosing Resolve or Persist.
+
 ## TDD Evidence
 
 RED was established before production changes:
@@ -63,6 +69,26 @@ Fresh focused GREEN verification:
 - `cargo test --lib task14_v2_plan_state_replay_rejects_evidence_column_drift
   -- --nocapture`: 1 passed.
 - `git diff --check`: passed.
+
+Fix round 2 RED evidence:
+
+- `task14_fix2_plan_authorizes_corrective_round_before_reviewer_admission`
+  observed round 2 open with only the prior non-pass Reviewer instead of an
+  empty pending selection authorized after corrected Author completion.
+- `task14_fix2_final_partial_round_retains_required_nonpass_sibling` observed a
+  Grok-only partial round resolve the active package while Codex's required
+  retained `request_changes` evidence remained in the same requirements and
+  lineage.
+
+Fix round 2 focused GREEN verification:
+
+- Seven focused filters executed 21 tests with 0 failures: `task14_fix2_`,
+  `task14_fix_`, `final_source_evaluation_identity_excludes_durable_routes`,
+  `plan_review::v2_tests`, `final_findings::tests`, `task14_final_`, and
+  `task14_v2_plan_state_replay_rejects_evidence_column_drift`.
+- The two new lifecycle tests cover pending corrective-round opening, Author
+  classification, authorization persistence, Reviewer admission, settlement
+  consumption, and partial Final selection with a retained non-pass sibling.
 
 No full suite, Clippy, frontend test, build, push, or PR was run. Task 18/Final
 owns broad verification. Cargo emitted the existing warning that the packaged
@@ -130,6 +156,23 @@ owns broad verification. Cargo emitted the existing warning that the packaged
 - `T14-CODEX-M1`: this report now records the corrected source-key and replay
   drift assertions.
 
+## High Re-review Fix Round 2
+
+- `T14-CODEX-I1`: a new bounded, digest-verified Plan round authorization row
+  stores lineage, current/prior round, Author task, required/selected cohorts,
+  prior/current Plan digests, and the exact localized classifier result. A
+  `ContinueReview` settlement opens an empty pending selection; resolved Author
+  evidence classifies and authorizes the round in the same transaction as its
+  evidence and graph update. Settlement recomputes the classifier result,
+  requires an exact authorization match, persists that exact localized change,
+  and consumes the active authorization atomically.
+- `T14-CODEX-I3`: Final evaluation derives the canonical required Reviewer
+  cohort from the active normalized manifest. Selected Reviewers require
+  current-round evidence; unselected required siblings may retain older
+  same-lineage evidence only when their persisted completion and active
+  requirements identity revalidate. Resolve and Persist are derived only after
+  the complete required cohort is assembled.
+
 ## Scope And Hygiene
 
 The plan's primary file list did not include the terminal evidence boundary,
@@ -140,6 +183,11 @@ entity, and migration set for atomic lifecycle handling and immutable
 per-Reviewer context storage. Existing generic completion projection and graph
 events already carry the resulting state and revision, so no change was
 required in `completion_projection.rs` or `events.rs`.
+
+Fix round 2 adds one gate-owned authorization entity and migration because the
+classifier proof must exist before Reviewer admission and cannot be represented
+by a completed settlement. The authorization is single-use and deleted in the
+same transaction that settles or conservatively remints the round.
 
 Pre-existing changes in `.superpowers/sdd/progress.md`, the Task 13 report,
 `connection.rs`, `companion.rs`, `launch_snapshot.rs`, and `workflow/project.rs`
@@ -155,3 +203,7 @@ fixture manually marks protocol-v2 upstream runs complete using legacy Card
 fields, so a diagnostic run fails the shared v2 validator before reaching its
 Final assertions. Task 14 uses dedicated terminal-materialization fixtures and
 does not broaden scope to rewrite that pre-existing cross-task harness.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done","summary":"Task 14 fix: Plan localized classifier + holistic full-cohort lineage; Final source key, terminal snapshots, lifecycle resolve; no Incomplete package resolve.","commits":[{"sha":"2f2effaf4563c46635ee85bf7283d5a3ed704fac","subject":"fix: enforce plan and final evidence authority"}],"tests":{"status":"pass","passed":19,"failed":0,"summary":"six focused filters, 19 executions passed"},"concerns":[],"report_file":".superpowers/sdd/task-14-implementer-report.md"}
+-->

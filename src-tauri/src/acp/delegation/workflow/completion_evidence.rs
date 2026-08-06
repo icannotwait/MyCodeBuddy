@@ -1620,6 +1620,33 @@ async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
     let snapshot = super::store::load_active_manifest_snapshot(conn, &loaded.workflow)
         .await
         .map_err(|error| CompletionEvidenceError::EvidenceCorrupt(error.to_string()))?;
+    let required_reviewer_node_ids = snapshot
+        .normalized
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.phase_id.as_deref() == Some(super::types::PHASE_FINAL)
+                && node.role == Some(super::types::ManifestNodeRole::Reviewer)
+                && node.required
+        })
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if required_reviewer_node_ids.is_empty()
+        || unique
+            .iter()
+            .any(|node_id| required_reviewer_node_ids.binary_search(node_id).is_err())
+    {
+        return Err(CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer selection is outside the active required cohort".into(),
+        ));
+    }
+    let requirements_identity = context.requirements_identity.clone().ok_or_else(|| {
+        CompletionEvidenceError::EvidenceCorrupt(
+            "Final Reviewer evaluation has no active requirements identity".into(),
+        )
+    })?;
     let mut target_work_unit_keys = Vec::new();
     let mut remediation_route_ids = Vec::new();
     for policy in &snapshot.normalized.task_policies {
@@ -1645,8 +1672,9 @@ async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
     let mut findings = Vec::new();
     let mut reviewer_evaluations = Vec::new();
     let mut remediation_contexts = Vec::new();
-    for node_id in selected {
-        let binding = delegation_workflow_run_binding::Entity::find()
+    for node_id in required_reviewer_node_ids {
+        let is_selected = unique.contains(&node_id);
+        let mut binding_query = delegation_workflow_run_binding::Entity::find()
             .filter(
                 delegation_workflow_run_binding::Column::WorkflowId
                     .eq(&loaded.workflow.workflow_id),
@@ -1654,19 +1682,28 @@ async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
             .filter(delegation_workflow_run_binding::Column::NodeId.eq(&node_id))
             .filter(delegation_workflow_run_binding::Column::GateId.eq(&gate_id))
             .filter(delegation_workflow_run_binding::Column::GateLineage.eq(&gate_lineage))
-            .filter(
+            .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal);
+        if is_selected {
+            binding_query = binding_query.filter(
                 delegation_workflow_run_binding::Column::ReviewRound.eq(i64::from(review_round)),
-            )
-            .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
-            .one(conn)
-            .await
-            .map_err(db_error)?;
+            );
+        }
+        let binding = binding_query.one(conn).await.map_err(db_error)?;
         let Some(binding) = binding else {
             return Ok(FinalFindingsTerminalEvaluation {
                 action: FinalFindingsTerminalAction::Incomplete,
                 current_contexts: Some(current_contexts),
             });
         };
+        if !is_selected
+            && binding.review_round.is_none_or(|binding_round| {
+                binding_round <= 0 || binding_round >= i64::from(review_round)
+            })
+        {
+            return Err(CompletionEvidenceError::EvidenceCorrupt(
+                "retained Final Reviewer evidence is not from an earlier round".into(),
+            ));
+        }
         let is_current = binding.task_id == loaded.run.task_id;
         let (reviewer_intent, evidence_scope_digest, reviewer_contexts) = if is_current {
             (
@@ -1697,7 +1734,7 @@ async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
                 reviewer_contexts,
             )
         };
-        if binding.requirements_identity.as_deref() != context.requirements_identity.as_deref() {
+        if binding.requirements_identity.as_deref() != Some(requirements_identity.as_str()) {
             return Err(CompletionEvidenceError::EvidenceCorrupt(
                 "Final Reviewer requirements identity changed within the evaluation".into(),
             ));
@@ -1738,11 +1775,7 @@ async fn derive_final_findings_terminal_action<C: ConnectionTrait>(
         workflow_id: loaded.workflow.workflow_id.clone(),
         gate_id,
         gate_lineage,
-        requirements_identity: context.requirements_identity.clone().ok_or_else(|| {
-            CompletionEvidenceError::EvidenceCorrupt(
-                "Final Reviewer evaluation has no active requirements identity".into(),
-            )
-        })?,
+        requirements_identity,
         graph_revision,
         reviewer_evaluations,
         findings,
@@ -2671,6 +2704,23 @@ async fn persist_evidence_state<C: ConnectionTrait>(
     run.updated_at = Set(captured_at);
     run.update(conn).await.map_err(db_error)?;
     update_binding_projection(conn, loaded, context, Some(evidence.artifact.digest())).await?;
+    if context.scope_role == CompletionScopeRole::PlanAuthor {
+        let workspace = loaded.run.workspace_path.as_deref().ok_or_else(|| {
+            CompletionEvidenceError::Persistence(
+                "completed Plan Author has no durable workspace".into(),
+            )
+        })?;
+        super::store::authorize_plan_round_after_author_completion(
+            conn,
+            &loaded.workflow,
+            &loaded.node.node_id,
+            &loaded.run.task_id,
+            workspace,
+            evidence.artifact.digest(),
+        )
+        .await
+        .map_err(|error| CompletionEvidenceError::Persistence(error.to_string()))?;
+    }
     Ok(evidence)
 }
 

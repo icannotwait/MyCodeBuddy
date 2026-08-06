@@ -14,6 +14,7 @@ pub mod delegation_completion_tool_intent;
 pub mod delegation_continuation;
 pub mod delegation_final_findings_package;
 pub mod delegation_lineage_budget;
+pub mod delegation_plan_round_authorization;
 pub mod delegation_task_run;
 pub mod delegation_work_unit_budget;
 pub mod delegation_workflow;

@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::db::entities::delegation_attention_request::{self, AttentionKind};
+use crate::db::entities::delegation_plan_round_authorization;
 use crate::db::entities::delegation_task_run::{self, CompletionState, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
 use crate::db::entities::delegation_workflow_design_root_binding;
@@ -70,10 +71,11 @@ use super::plan_material::{
 };
 use super::plan_review::{
     derive_next_plan_review_round_v2, derive_plan_review_round, derive_plan_review_round_v2,
-    reviewer_outcome_rank, PlanArtifactSnapshotV2, PlanFindingUpdate, PlanReviewChangeV2,
-    PlanReviewDecisionV2, PlanReviewError, PlanReviewNextAction, PlanReviewRoundInputV2,
-    PlanReviewRoundState, PlanReviewRoundStateV2, PlanReviewRoundSubmission, PlanReviewScope,
-    PlanReviewerOutcomeV2, PlanRevisionKind,
+    plan_round_authorization_digest_v2, reviewer_outcome_rank, PlanArtifactSnapshotV2,
+    PlanFindingUpdate, PlanReviewChangeV2, PlanReviewDecisionV2, PlanReviewError,
+    PlanReviewNextAction, PlanReviewRoundInputV2, PlanReviewRoundState, PlanReviewRoundStateV2,
+    PlanReviewRoundSubmission, PlanReviewScope, PlanReviewerOutcomeV2, PlanRevisionKind,
+    PlanRoundAuthorizationV2, MAX_PLAN_ROUND_AUTHORIZATION_JSON_BYTES,
 };
 use super::project::evidence_from_run_binding_and_validated;
 use super::recovery_policy::{
@@ -2101,7 +2103,6 @@ async fn settle_workflow_gate_derived_core(
                     let mut v2_plan_author_task_id: Option<String> = None;
                     let mut v2_plan_digest: Option<String> = None;
                     let mut v2_localized_change_digest: Option<String> = None;
-                    let mut v2_passing_change_intersections: Vec<String> = Vec::new();
 
                     let (
                         critical_count,
@@ -2303,11 +2304,53 @@ async fn settle_workflow_gate_derived_core(
                                             "corrective Plan review has no prior round".into(),
                                         )
                                     })?;
+                                    let authorization = load_plan_round_authorization_v2(
+                                        txn,
+                                        &header.workflow_id,
+                                        &gate.id,
+                                    )
+                                    .await?
+                                    .ok_or_else(|| {
+                                        WorkflowStoreError::GateNotReady(
+                                            "corrective Plan review has no pre-admission authorization"
+                                                .into(),
+                                        )
+                                    })?;
+                                    let prior_plan_digest = previous
+                                        .plan_snapshot
+                                        .as_ref()
+                                        .map(|snapshot| snapshot.digest.as_str())
+                                        .ok_or_else(|| {
+                                            WorkflowStoreError::GateNotReady(
+                                                "corrective Plan review has no prior snapshot"
+                                                    .into(),
+                                            )
+                                        })?;
+                                    if authorization.gate_lineage
+                                        != evidence.identity.gate_lineage
+                                        || i64::from(authorization.review_round)
+                                            != evidence.identity.review_round
+                                        || authorization.prior_review_round
+                                            != previous.review_round
+                                        || authorization.author_task_id != author_task_id
+                                        || authorization.required_node_ids
+                                            != evidence.identity.required_node_ids
+                                        || authorization.selected_node_ids
+                                            != evidence.selected_node_ids
+                                        || authorization.prior_plan_digest != prior_plan_digest
+                                        || authorization.current_plan_digest
+                                            != current_plan_snapshot.digest
+                                    {
+                                        return Err(WorkflowStoreError::GateNotReady(
+                                            "corrective Plan authorization does not match the active evidence"
+                                                .into(),
+                                        ));
+                                    }
                                     let classification = classify_plan_settlement_change_v2(
                                         &normalized,
                                         previous,
                                         &current_plan_snapshot,
-                                        &author_task_id,
+                                        &authorization.author_task_id,
                                     )?;
                                     match classification {
                                         PlanChangeClassification::Localized {
@@ -2323,25 +2366,17 @@ async fn settle_workflow_gate_derived_core(
                                             )
                                             .into_iter()
                                             .collect::<Vec<_>>();
-                                            if selected != evidence.selected_node_ids {
+                                            if selected != authorization.selected_node_ids
+                                                || change != authorization.localized_change
+                                            {
                                                 return Err(WorkflowStoreError::GateNotReady(
-                                                    "Plan round selection does not cover the authorized localized change"
+                                                    "Plan classifier no longer matches the immutable round authorization"
                                                         .into(),
                                                 ));
                                             }
-                                            v2_passing_change_intersections = previous
-                                                .reviewers
-                                                .iter()
-                                                .filter(|reviewer| {
-                                                    reviewer.rank == 0
-                                                        && corrective_reviewer_node_ids
-                                                            .contains(&reviewer.node_id)
-                                                })
-                                                .map(|reviewer| reviewer.node_id.clone())
-                                                .collect();
                                             v2_localized_change_digest = Some(
                                                 canonical_json_sha256(
-                                                    "codeg.completion.plan_localized_change.v2",
+                                                    "codeg.completion.plan_change.v2",
                                                     1,
                                                     &change,
                                                 )
@@ -2562,12 +2597,19 @@ async fn settle_workflow_gate_derived_core(
                     row.insert(txn).await.map_err(db_err)?;
 
                     if let Some(decision) = v2_plan_decision.as_ref() {
-                        if let Some(opening) =
-                            derive_next_plan_review_round_v2(
-                                &decision.state,
-                                &v2_passing_change_intersections,
-                            )?
+                        delegation_plan_round_authorization::Entity::delete_by_id((
+                            header.workflow_id.clone(),
+                            gate.id.clone(),
+                        ))
+                        .exec(txn)
+                        .await
+                        .map_err(db_err)?;
+                        if let Some(mut opening) =
+                            derive_next_plan_review_round_v2(&decision.state, &[])?
                         {
+                            if decision.state.next_action == PlanReviewNextAction::ContinueReview {
+                                opening.selected_node_ids.clear();
+                            }
                             let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
                                 header.workflow_id.clone(),
                                 gate.id.clone(),
@@ -5731,6 +5773,198 @@ async fn capture_plan_snapshot_v2(
     })
 }
 
+pub(super) async fn authorize_plan_round_after_author_completion<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workflow: &delegation_workflow::Model,
+    author_node_id: &str,
+    author_task_id: &str,
+    author_workspace: &str,
+    artifact_digest: &str,
+) -> Result<(), WorkflowStoreError> {
+    if workflow.completion_protocol_version != 2 {
+        return Ok(());
+    }
+    let snapshot = load_active_manifest_snapshot(conn, workflow).await?;
+    let Some(plan_document) = snapshot.normalized.plan.as_ref() else {
+        return Ok(());
+    };
+    let is_active_author = snapshot.normalized.nodes.iter().any(|node| {
+        node.id == author_node_id
+            && node.phase_id.as_deref() == Some(super::types::PHASE_PLAN)
+            && node.role == Some(ManifestNodeRole::Author)
+    });
+    if !is_active_author {
+        return Err(WorkflowStoreError::GateNotReady(
+            "completed Plan Author is not the active manifest Author".into(),
+        ));
+    }
+    let Some(gate) = snapshot
+        .normalized
+        .gates
+        .iter()
+        .find(|gate| gate.gate_kind == DocumentGateKind::Plan)
+    else {
+        return Ok(());
+    };
+    let Some(gate_state) = delegation_workflow_gate_state::Entity::find_by_id((
+        workflow.workflow_id.clone(),
+        gate.id.clone(),
+    ))
+    .one(conn)
+    .await
+    .map_err(db_err)?
+    else {
+        return Ok(());
+    };
+    let selected: Vec<String> = serde_json::from_str(&gate_state.selected_node_ids_json)
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    if !selected.is_empty() {
+        return Ok(());
+    }
+
+    let prior_settlement = delegation_workflow_gate_settlement::Entity::find()
+        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(&workflow.workflow_id))
+        .filter(delegation_workflow_gate_settlement::Column::GateId.eq(&gate.id))
+        .filter(delegation_workflow_gate_settlement::Column::PlanRoundStateV2Json.is_not_null())
+        .order_by_desc(delegation_workflow_gate_settlement::Column::GateCycle)
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            WorkflowStoreError::GateNotReady(
+                "pending Plan reviewer round has no prior settlement".into(),
+            )
+        })?;
+    let prior_state = load_persisted_plan_state_v2(&prior_settlement)?;
+    let current_round = u32::try_from(gate_state.current_review_round).map_err(|_| {
+        WorkflowStoreError::Persistence("pending Plan review round exceeds u32".into())
+    })?;
+    if prior_state.next_action != PlanReviewNextAction::ContinueReview
+        || prior_state.gate_lineage != gate_state.gate_lineage
+        || current_round != prior_state.review_round.saturating_add(1)
+    {
+        return Err(WorkflowStoreError::GateCycleConflict(
+            "pending Plan reviewer round does not follow its corrective settlement".into(),
+        ));
+    }
+    let current_snapshot = capture_plan_snapshot_v2(author_workspace, plan_document).await?;
+    if current_snapshot.digest != artifact_digest {
+        return Err(WorkflowStoreError::ArtifactDigestMismatch(
+            "completed Plan Author artifact does not match the active Plan snapshot".into(),
+        ));
+    }
+    let classification = classify_plan_settlement_change_v2(
+        &snapshot.normalized,
+        &prior_state,
+        &current_snapshot,
+        author_task_id,
+    )?;
+    match classification {
+        PlanChangeClassification::Localized {
+            change,
+            corrective_reviewer_node_ids,
+        } => {
+            let required_node_ids = canonical_string_set(&gate.required_reviewer_node_ids);
+            let selected_node_ids = corrective_reviewer_node_ids.into_iter().collect::<Vec<_>>();
+            let authorization = PlanRoundAuthorizationV2::new(
+                gate_state.gate_lineage.clone(),
+                current_round,
+                prior_state.review_round,
+                author_task_id.to_string(),
+                required_node_ids,
+                selected_node_ids.clone(),
+                change.prior_plan_digest.clone(),
+                change.current_plan_digest.clone(),
+                change,
+            )?;
+            let authorization_digest = plan_round_authorization_digest_v2(&authorization)?;
+            let authorization_json = serde_json::to_string(&authorization)
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+
+            let mut state: delegation_workflow_gate_state::ActiveModel = gate_state.into();
+            state.selected_node_ids_json = Set(serde_json::to_string(&selected_node_ids)
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?);
+            state.update(conn).await.map_err(db_err)?;
+            delegation_plan_round_authorization::ActiveModel {
+                workflow_id: Set(workflow.workflow_id.clone()),
+                gate_id: Set(gate.id.clone()),
+                gate_lineage: Set(authorization.gate_lineage.clone()),
+                review_round: Set(i64::from(authorization.review_round)),
+                author_task_id: Set(authorization.author_task_id.clone()),
+                authorization_json: Set(authorization_json),
+                authorization_digest: Set(authorization_digest),
+                created_at: Set(Utc::now()),
+            }
+            .insert(conn)
+            .await
+            .map_err(db_err)?;
+        }
+        PlanChangeClassification::NewLineage { .. } => {
+            let required_node_ids = canonical_string_set(&gate.required_reviewer_node_ids);
+            let mut hasher = Sha256::new();
+            hasher.update(b"codeg.plan-authorized-lineage.v2\0");
+            hasher.update(prior_state.gate_lineage.as_bytes());
+            hasher.update([0]);
+            hasher.update(prior_state.review_round.to_be_bytes());
+            hasher.update([0]);
+            hasher.update(author_task_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(current_snapshot.digest.as_bytes());
+            let mut state: delegation_workflow_gate_state::ActiveModel = gate_state.into();
+            state.gate_lineage = Set(format!("sha256:{:x}", hasher.finalize()));
+            state.current_review_round = Set(1);
+            state.selected_node_ids_json = Set(serde_json::to_string(&required_node_ids)
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?);
+            state.update(conn).await.map_err(db_err)?;
+            delegation_plan_round_authorization::Entity::delete_by_id((
+                workflow.workflow_id.clone(),
+                gate.id.clone(),
+            ))
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn load_plan_round_authorization_v2<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    gate_id: &str,
+) -> Result<Option<PlanRoundAuthorizationV2>, WorkflowStoreError> {
+    let Some(row) = delegation_plan_round_authorization::Entity::find_by_id((
+        workflow_id.to_string(),
+        gate_id.to_string(),
+    ))
+    .one(conn)
+    .await
+    .map_err(db_err)?
+    else {
+        return Ok(None);
+    };
+    if row.authorization_json.len() > MAX_PLAN_ROUND_AUTHORIZATION_JSON_BYTES {
+        return Err(WorkflowStoreError::Persistence(
+            "Plan round authorization JSON exceeds its bound".into(),
+        ));
+    }
+    let authorization: PlanRoundAuthorizationV2 = serde_json::from_str(&row.authorization_json)
+        .map_err(|_| {
+            WorkflowStoreError::Persistence("Plan round authorization JSON is corrupt".into())
+        })?;
+    let digest = plan_round_authorization_digest_v2(&authorization)?;
+    if row.gate_lineage != authorization.gate_lineage
+        || row.review_round != i64::from(authorization.review_round)
+        || row.author_task_id != authorization.author_task_id
+        || row.authorization_digest != digest
+    {
+        return Err(WorkflowStoreError::Persistence(
+            "Plan round authorization columns disagree with its canonical value".into(),
+        ));
+    }
+    Ok(Some(authorization))
+}
+
 fn classify_plan_settlement_change_v2(
     manifest: &NormalizedManifest,
     previous: &PlanReviewRoundStateV2,
@@ -6649,7 +6883,7 @@ fn load_persisted_plan_state_v2(
         .localized_change
         .as_ref()
         .map(|change| {
-            canonical_json_sha256("codeg.completion.plan_localized_change.v2", 1, change)
+            canonical_json_sha256("codeg.completion.plan_change.v2", 1, change)
                 .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))
         })
         .transpose()?;
