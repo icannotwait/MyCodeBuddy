@@ -134,3 +134,60 @@ No full suite, build, or Clippy run was performed because Task 16 explicitly
 requires focused tests; Task 18 owns repository-wide verification. Cargo
 emitted the existing warning that the packaged `codeg-mcp` sidecar is absent
 and a zero-byte build placeholder was used.
+
+## Dual Review Fix
+
+The High dual review returned Grok approval and two Codex Important findings.
+Both mandatory findings are closed with focused RED -> GREEN evidence.
+
+### T16-CODEX-I1: bounded actionable CAS for long node IDs
+
+A new valid workflow fixture used a 9,012-character path-like node ID. RED
+showed that the durable completion projection copied the raw ID into the CAS;
+the separate MCP regression then returned `payload_too_large` instead of the
+open completion state.
+
+GREEN now derives the CAS node field through the existing deterministic public
+ID mapping. The same bounded value is used by terminal and Design projections,
+decision and retry mutation results, replay results, and completion outbox
+events. Mutation validation compares that public value with the durable raw
+node ID while retaining all six CAS checks and current binding/scope/artifact
+validation. The long-ID fixture successfully adjudicates with the projected
+CAS, and the MCP budget renderer defensively bounds legacy/raw long CAS values
+before applying its omission ladder.
+
+### T16-CODEX-I2: mapped-node completion event refresh
+
+A new frontend fixture contains multiple unresolved nodes, a publicly mapped
+graph node ID, and the corresponding raw path-like event node ID. RED observed
+zero authoritative snapshot requests. GREEN locates the pending completion by
+its unique latest task ID rather than requiring raw/public node-ID equality.
+Workflow identity, graph revision, task, attention kind, and captured scope
+filters remain enforced, and replay deduplication is unchanged.
+
+### Minor disposition
+
+- M1 is not changed in this focused package. The graph projection exposes the
+  workflow's frozen creation-time mode, while restart authorization evaluates
+  the current server rollout selection. Correct UI gating requires a new
+  server-owned availability signal; inferring it from `creation_mode` would
+  incorrectly hide valid enforce-mode restarts.
+- M2's live Tauri/event harness remains follow-up coverage rather than a
+  demonstrated defect. This fix adds direct durable mutation/outbox, MCP
+  budget, mapped-event refetch, and existing seven-test transport coverage
+  without introducing a new runtime harness.
+
+### Focused verification
+
+- Rust: 39 executions passed across the long-ID adjudication regression,
+  typed completion attention, bounded projection, workflow-state MCP budget,
+  listener/status/MCP parity, the seven-test transport parity file, and the
+  no-default `codeg-mcp` one-write test.
+- Frontend: 10 files and 224 tests passed, including the new mapped-node event
+  regression.
+- Focused ESLint and Prettier passed for the changed frontend files.
+- `cargo fmt --check`, `git diff --cached --check`, and `git diff --check`
+  passed.
+
+The independent staged-fix review returned no Critical, Important, or required
+Minor findings, with `Compliant` spec compliance and `Approved` code quality.

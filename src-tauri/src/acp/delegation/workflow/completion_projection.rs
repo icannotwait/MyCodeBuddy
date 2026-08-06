@@ -6,8 +6,9 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder
 use serde::{Deserialize, Serialize};
 
 use super::completion_evidence::{
-    completion_validation_workspace, preload_completion_validation_context,
-    validate_preloaded_completion_evidence, validate_preloaded_completion_evidence_with_context,
+    completion_attention_public_node_id, completion_validation_workspace,
+    preload_completion_validation_context, validate_preloaded_completion_evidence,
+    validate_preloaded_completion_evidence_with_context,
 };
 use super::{
     ArtifactRecoveryPayloadV1, CompletionAttentionCas, CompletionCandidate, CompletionDiagnostic,
@@ -684,7 +685,7 @@ async fn load_design_self_review_projection<C: ConnectionTrait>(
                 kind: attention.kind.clone(),
                 captured_scope_digest: binding.evidence_scope_digest.clone(),
                 latest_run_id: binding.latest_run_id.clone(),
-                node_id: binding.node_id.clone(),
+                node_id: completion_attention_public_node_id(&binding.node_id),
             })
         } else {
             None
@@ -747,7 +748,7 @@ fn validate_terminal_attention(
         kind: attention.kind.clone(),
         captured_scope_digest: binding_scope.to_string(),
         latest_run_id: run.task_id.clone(),
-        node_id: binding.node_id.clone(),
+        node_id: completion_attention_public_node_id(&binding.node_id),
     })
 }
 

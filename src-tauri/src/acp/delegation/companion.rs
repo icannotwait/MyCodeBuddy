@@ -1408,6 +1408,7 @@ fn render_get_workflow_state_response_with_budget(
     mut index: WorkflowStateIndexDto,
     max_bytes: usize,
 ) -> Result<JsonRpcResponse, serde_json::Error> {
+    bound_long_completion_attention_node_ids(&mut index);
     let workflow_id = index.workflow_id.clone();
     let preferred = render_get_workflow_state_response(id.clone(), index.clone());
     let preferred_bytes = serialize_jsonrpc_line(&preferred)?.len();
@@ -1454,6 +1455,30 @@ fn render_get_workflow_state_response_with_budget(
         "get_workflow_state protected payload exceeded line budget"
     );
     Ok(fallback)
+}
+
+fn bound_long_completion_attention_node_ids(index: &mut WorkflowStateIndexDto) {
+    fn bound(completion: &mut Option<crate::acp::delegation::workflow::CompletionProjectionV2>) {
+        let Some(attention) = completion
+            .as_mut()
+            .and_then(|completion| completion.card.attention.as_mut())
+        else {
+            return;
+        };
+        if attention.node_id.chars().count()
+            > crate::acp::delegation::workflow::completion_evidence::COMPLETION_ATTENTION_NODE_ID_MAX_CHARS
+        {
+            attention.node_id =
+                crate::acp::delegation::workflow::completion_evidence::completion_attention_public_node_id(
+                    &attention.node_id,
+                );
+        }
+    }
+
+    bound(&mut index.completion);
+    for node in &mut index.nodes {
+        bound(&mut node.completion);
+    }
 }
 
 fn render_get_workflow_state_outcome_with_budget(
@@ -4778,6 +4803,38 @@ mod tests {
                 1024
             );
         }
+    }
+
+    #[test]
+    fn get_workflow_state_bounds_long_completion_cas_node_id_without_losing_truth() {
+        let raw_node_id = format!("review/path/{}", "n".repeat(9_000));
+        let mut index = representative_large_index();
+        index
+            .completion
+            .as_mut()
+            .unwrap()
+            .card
+            .attention
+            .as_mut()
+            .unwrap()
+            .node_id = raw_node_id.clone();
+
+        let response = render_get_workflow_state_response_with_budget(
+            json!(1),
+            index,
+            GET_WORKFLOW_STATE_MAX_RESULT_BYTES,
+        )
+        .unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_WORKFLOW_STATE_MAX_RESULT_BYTES);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["isError"], false);
+        let projected = response_index(&response);
+        assert_eq!(projected["completion"]["card"]["state"], "needs_decision");
+        assert_eq!(
+            projected["completion"]["card"]["attention"]["node_id"],
+            crate::acp::delegation::workflow::safe_public_id(&raw_node_id)
+        );
     }
 
     #[test]

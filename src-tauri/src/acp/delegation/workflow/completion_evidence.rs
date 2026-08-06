@@ -270,6 +270,12 @@ pub struct CompletionAttentionCas {
     pub node_id: String,
 }
 
+pub const COMPLETION_ATTENTION_NODE_ID_MAX_CHARS: usize = 128;
+
+pub fn completion_attention_public_node_id(node_id: &str) -> String {
+    super::dto::safe_public_id(node_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalCompletionResult {
     pub state: CompletionState,
@@ -974,7 +980,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
     if ensure_context_matches_binding(&context, &loaded.binding).is_err()
         || context.evidence_scope_digest != request.captured_scope_digest
         || loaded.run.task_id != request.latest_run_id
-        || loaded.node.node_id != request.node_id
+        || completion_attention_public_node_id(&loaded.node.node_id) != request.node_id
         || context.scope_role.completion_role() != payload.role
     {
         supersede_completion_attention(conn, &loaded, request).await?;
@@ -1006,7 +1012,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
             Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
                 workflow_id: loaded.workflow.workflow_id,
                 task_id: loaded.run.task_id,
-                node_id: loaded.node.node_id,
+                node_id: completion_attention_public_node_id(&loaded.node.node_id),
                 kind: AttentionKind::CompletionDecision,
                 outcome,
                 evidence_scope_digest: context.evidence_scope_digest,
@@ -1050,7 +1056,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
             Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
                 workflow_id: loaded.workflow.workflow_id,
                 task_id: loaded.run.task_id,
-                node_id: loaded.node.node_id,
+                node_id: completion_attention_public_node_id(&loaded.node.node_id),
                 kind: AttentionKind::CompletionDecision,
                 outcome,
                 evidence_scope_digest: context.evidence_scope_digest,
@@ -1146,7 +1152,7 @@ pub async fn resolve_design_self_review_txn(
                 }
                 if binding.task_id != request.task_id
                     || binding.latest_run_id != request.latest_run_id
-                    || binding.node_id != request.node_id
+                    || completion_attention_public_node_id(&binding.node_id) != request.node_id
                     || binding.evidence_scope_digest != request.captured_scope_digest
                     || binding.design_identity != payload.design_identity
                     || binding.gate_lineage != payload.gate_lineage
@@ -1189,7 +1195,7 @@ pub async fn resolve_design_self_review_txn(
                 Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
                     workflow_id: workflow.workflow_id,
                     task_id: binding.task_id,
-                    node_id: binding.node_id,
+                    node_id: completion_attention_public_node_id(&binding.node_id),
                     kind: AttentionKind::DesignSelfReviewDecision,
                     outcome,
                     evidence_scope_digest: binding.evidence_scope_digest,
@@ -1316,7 +1322,11 @@ async fn replay_user_outcome<C: ConnectionTrait>(
             if let Some(value) = completion.as_mut() {
                 value.graph_revision = resolution.graph_revision;
             }
-            (loaded.workflow.workflow_id, loaded.node.node_id, completion)
+            (
+                loaded.workflow.workflow_id,
+                completion_attention_public_node_id(&loaded.node.node_id),
+                completion,
+            )
         }
         AttentionKind::DesignSelfReviewDecision => {
             let binding = delegation_workflow_design_root_binding::Entity::find()
@@ -1327,7 +1337,11 @@ async fn replay_user_outcome<C: ConnectionTrait>(
                 .await
                 .map_err(db_error)?
                 .ok_or(CompletionMutationError::Superseded)?;
-            (binding.workflow_id, binding.node_id, None)
+            (
+                binding.workflow_id,
+                completion_attention_public_node_id(&binding.node_id),
+                None,
+            )
         }
         _ => return Err(CompletionMutationError::KindMismatch),
     };
@@ -1427,7 +1441,7 @@ async fn enqueue_completion_decision_resolved<C: ConnectionTrait>(
         event_id: event_id.clone(),
         workflow_id: workflow.workflow_id.clone(),
         task_id: task_id.to_string(),
-        node_id: node_id.to_string(),
+        node_id: completion_attention_public_node_id(node_id),
         kind: kind.clone(),
         outcome,
         evidence_scope_digest: evidence_scope_digest.to_string(),
@@ -2097,7 +2111,7 @@ pub async fn retry_completion_artifact_for_user_txn(
             let mut mutation = CompletionMutationResult {
                 workflow_id: evidence.binding.workflow_id.clone(),
                 task_id: evidence.binding.task_id.clone(),
-                node_id: evidence.binding.node_id.clone(),
+                node_id: completion_attention_public_node_id(&evidence.binding.node_id),
                 kind: AttentionKind::CompletionArtifactRecovery,
                 outcome: evidence.intent.outcome,
                 evidence_scope_digest: evidence.evidence_scope_digest.clone(),
@@ -3278,10 +3292,11 @@ fn attention_cas(
         latest_run_id: row.latest_run_id.clone().ok_or_else(|| {
             CompletionEvidenceError::InvalidAttention("latest run is missing".into())
         })?,
-        node_id: row
-            .node_id
-            .clone()
-            .ok_or_else(|| CompletionEvidenceError::InvalidAttention("node is missing".into()))?,
+        node_id: completion_attention_public_node_id(
+            row.node_id.as_deref().ok_or_else(|| {
+                CompletionEvidenceError::InvalidAttention("node is missing".into())
+            })?,
+        ),
     })
 }
 
@@ -3307,7 +3322,10 @@ fn attention_cas_fields_match(
         && row.kind == request.kind
         && row.captured_scope_digest.as_deref() == Some(&request.captured_scope_digest)
         && row.latest_run_id.as_deref() == Some(&request.latest_run_id)
-        && row.node_id.as_deref() == Some(&request.node_id)
+        && row
+            .node_id
+            .as_deref()
+            .is_some_and(|node_id| completion_attention_public_node_id(node_id) == request.node_id)
 }
 
 async fn resolve_attention_txn<C: ConnectionTrait>(
@@ -3341,7 +3359,6 @@ async fn resolve_attention_txn<C: ConnectionTrait>(
                 .eq(&request.captured_scope_digest),
         )
         .filter(delegation_attention_request::Column::LatestRunId.eq(&request.latest_run_id))
-        .filter(delegation_attention_request::Column::NodeId.eq(&request.node_id))
         .filter(delegation_attention_request::Column::Status.eq("open"))
         .exec(conn)
         .await
@@ -3563,6 +3580,14 @@ mod tests {
 
     impl TerminalFixture {
         async fn new(source: IntentFixture, write_plan: bool) -> Self {
+            Self::new_with_node_id(source, write_plan, "plan-author".into()).await
+        }
+
+        async fn new_with_node_id(
+            source: IntentFixture,
+            write_plan: bool,
+            author_node_id: String,
+        ) -> Self {
             let workspace = tempfile::tempdir().expect("workspace");
             let workspace_path = workspace.path().to_path_buf();
             let design_path = workspace_path.join(DESIGN_REL_PATH);
@@ -3584,7 +3609,7 @@ mod tests {
                 profile_id: None,
             })
             .unwrap();
-            let document = skeleton_document("task-10", &author_key);
+            let document = skeleton_document("task-10", &author_key, &author_node_id);
             let published = publish_workflow_manifest_core(
                 &db,
                 &EventEmitter::Noop,
@@ -3770,7 +3795,7 @@ mod tests {
         );
     }
 
-    fn skeleton_document(token: &str, author_key: &str) -> ManifestDocument {
+    fn skeleton_document(token: &str, author_key: &str, author_node_id: &str) -> ManifestDocument {
         let design_key = build_work_unit_key(&WorkUnitKeyParts::Design {
             rel_doc_path: DESIGN_REL_PATH,
             agent_type: "codex",
@@ -3815,7 +3840,7 @@ mod tests {
                     title: None,
                 },
                 ManifestNode {
-                    id: "plan-author".into(),
+                    id: author_node_id.into(),
                     kind: ManifestNodeKind::WorkUnit,
                     phase_id: Some(PHASE_PLAN.into()),
                     role: Some(ManifestNodeRole::Author),
@@ -4214,6 +4239,45 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(conflict, CompletionMutationError::Conflict);
+    }
+
+    #[tokio::test]
+    async fn long_valid_node_id_projects_a_bounded_actionable_completion_cas() {
+        let raw_node_id = format!("review/path/{}", "n".repeat(9_000));
+        let fixture =
+            TerminalFixture::new_with_node_id(IntentFixture::Missing, true, raw_node_id.clone())
+                .await;
+        let cas = fixture.materialize().await.attention.unwrap();
+
+        assert_eq!(
+            cas.node_id,
+            crate::acp::delegation::workflow::safe_public_id(&raw_node_id)
+        );
+        assert!(cas.node_id.len() <= 128);
+
+        let resolved = resolve_completion_decision_txn(
+            &fixture.db,
+            fixture.parent_conversation_id,
+            cas.clone(),
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.outcome, CompletionOutcome::Done);
+
+        let event = delegation_workflow_outbox_event::Entity::find()
+            .filter(
+                delegation_workflow_outbox_event::Column::EventKind
+                    .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
+            )
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: super::CompletionDecisionResolvedPayloadV1 =
+            serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload.node_id, cas.node_id);
     }
 
     #[tokio::test]

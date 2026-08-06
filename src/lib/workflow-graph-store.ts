@@ -578,16 +578,13 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
       }
 
       const node = snapshot.nodes.find(
-        (candidate) =>
-          candidate.node_id === payload.node_id &&
-          candidate.latest_task_id === payload.task_id
+        (candidate) => candidate.latest_task_id === payload.task_id
       )
       const attention =
         node?.completion?.card.attention ?? snapshot.completion?.card.attention
       if (
         !attention ||
         attention.task_id !== payload.task_id ||
-        attention.node_id !== payload.node_id ||
         attention.kind !== payload.kind ||
         attention.captured_scope_digest !== payload.evidence_scope_digest
       ) {

@@ -301,6 +301,88 @@ describe("workflow-graph-store revision gate", () => {
     release()
   })
 
+  it("refetches completion events when raw node ids differ from public graph ids", async () => {
+    const publicNodeId = "pub_8d705a27d44d891f"
+    const rawNodeId = "reviewers/plan/codex"
+    const attention = {
+      attention_id: "attention-mapped",
+      task_id: "task-mapped",
+      kind: "completion_decision" as const,
+      captured_scope_digest: `sha256:${"b".repeat(64)}`,
+      latest_run_id: "task-mapped",
+      node_id: publicNodeId,
+    }
+    const pending = baseSnapshot({
+      graph_revision: 7,
+      completion: {
+        protocol_version: 2,
+        graph_revision: 7,
+        card: {
+          state: "needs_decision",
+          role: "reviewer",
+          outcome: null,
+          summary: "Another decision is selected for the graph summary.",
+          report_file: null,
+          source: null,
+          evidence_validated: false,
+          attention: {
+            ...attention,
+            attention_id: "attention-other",
+            task_id: "task-other",
+            latest_run_id: "task-other",
+            node_id: "plan-reviewer-other",
+          },
+        },
+      },
+      nodes: [
+        node({
+          node_id: publicNodeId,
+          latest_task_id: "task-mapped",
+          completion: {
+            protocol_version: 2,
+            graph_revision: 7,
+            card: {
+              state: "needs_decision",
+              role: "reviewer",
+              outcome: null,
+              summary: "Choose an outcome.",
+              report_file: null,
+              source: null,
+              evidence_validated: false,
+              attention,
+            },
+          },
+        }),
+      ],
+    })
+
+    useWorkflowGraphStore.getState().applyFromDetail(17, pending)
+    getWorkflowGraphSnapshot.mockResolvedValueOnce(pending)
+    const release = useWorkflowGraphStore.getState().activateConversation(17)
+    await flushMicrotasks()
+    getWorkflowGraphSnapshot.mockClear()
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      baseSnapshot({ graph_revision: 8, completion: null, nodes: [] })
+    )
+
+    useWorkflowGraphStore.getState().handleCompletionDecisionResolved({
+      version: 1,
+      event_id: "event-mapped",
+      workflow_id: "wf-1",
+      task_id: "task-mapped",
+      node_id: rawNodeId,
+      kind: "completion_decision",
+      outcome: "approve",
+      evidence_scope_digest: attention.captured_scope_digest,
+      graph_revision: 8,
+    })
+    await flushMicrotasks()
+
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(17)
+    release()
+  })
+
   it("applies detail snapshot and discards stale lower graph_revision", () => {
     const store = useWorkflowGraphStore.getState()
     store.applyFromDetail(7, baseSnapshot({ graph_revision: 3 }))
