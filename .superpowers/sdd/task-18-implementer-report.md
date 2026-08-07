@@ -21,6 +21,14 @@ authorized `ContinueReview` round, roster-only add/remove transitions update
 selection without rotating lineage, and Final report/status enrichment now
 returns each artifact diagnostic's real contract code.
 
+High Fix Round 2 closes `T18-CODEX-RR-I1` and `T18-CODEX-RR-I2`. Final
+delivery now combines current selected-reviewer evidence with validated
+same-lineage evidence retained from earlier rounds, including an empty
+selection after roster removal. A populated corrective Plan authorization is
+preserved only while its Plan digest and required/selected reviewer sets still
+match the active publication; a second different Plan publication rotates to
+round 1 and deletes the stale authorization.
+
 ## Capability Matrix
 
 | Capability / regression | Named fixture | Proven result |
@@ -35,8 +43,8 @@ returns each artifact diagnostic's real contract code.
 | Legacy restart | `legacy_restart_*`, `legacy_prompt_restart_*`, and `rollout_restart_*` | Source remains immutable; one reciprocal v2 successor is idempotent/retryable, fail-closed without context, and routed to Codex Plan Author. |
 | Runtime parity | `completion_projection_is_identical_across_graph_http_and_mcp_surfaces` plus every capability case | Desktop, authenticated HTTP, and MCP expose byte-equivalent completion Cards. |
 | Manual root resume | `workflow-overlay.test.tsx` legacy backlink/root-resume fixture plus attention transport parity | Durable root refresh controls resume; no terminal child is reopened. |
-| Corrective Plan republication | `task14_fix2_plan_authorizes_corrective_round_before_reviewer_admission` | Desktop and server retain the pending corrective round so Plan Author completion persists its immutable authorization. |
-| Reviewer roster transition | `roster_only_republication_selects_only_added_reviewers_and_retires_removed_ones` | Plan and Final additions advance the same lineage and select only added reviewers; removal keeps the round and retires removed selections. |
+| Corrective Plan republication | `task14_fix2_plan_authorizes_corrective_round_before_reviewer_admission` and `second_plan_republication_replaces_stale_corrective_authorization` | Desktop and server retain the first pending corrective round, while a later publication with a replacement Plan digest rotates lineage and deletes the obsolete authorization. |
+| Reviewer roster transition | `roster_only_republication_selects_only_added_reviewers_and_retires_removed_ones` and `roster_only_final_republication_delivers_after_add_and_remove` | Plan and Final additions select only added reviewers; Final delivery succeeds after addition and after removal using validated retained sibling evidence. |
 | Non-drift Final rejection | `final_status_enrichment_preserves_artifact_unavailable_diagnostic` | A dirty Final worktree remains round 1 and reports `completion_artifact_unavailable`, without stale completion text or a false drift reopen. |
 
 ## Cross-Feature Evidence
@@ -51,7 +59,7 @@ Design acceptance criteria:
 | 10-14: durable adjudication, role outcome compatibility, complete-set gates, external gate reduction, authenticated Design self-review | Completion evidence/store unit suites; six-field CAS and authenticated core/HTTP parity fixtures. |
 | 15-21: Plan material/lineage/selective rounds, strict improvement, immutable Final contexts, canonical scope and golden identities | Plan reducer, admission scope, artifact, Final-package, and recovery fixtures in the full desktop/server libraries. |
 | 22-25: transactional migration/rollback, typed attention lifecycle, durable outbox replay, root re-entry and transport parity | Ten migration fixtures; completion attention/outbox tests; seven transport parity fixtures; focused overlay tests. |
-| 26-30: pre-budget recovery fences, exact-current-Plan recovery, session 2889, legacy restart, frozen rollout/rollback thresholds | Completion evidence/store recovery suites and the 22-test protocol-v2 integration binary. |
+| 26-30: pre-budget recovery fences, exact-current-Plan recovery, session 2889, legacy restart, frozen rollout/rollback thresholds | Completion evidence/store recovery suites and the 23-test protocol-v2 integration binary. |
 | 31: shared validation and desktop/server/MCP truth | Shared admission/store/gate/projection/recovery validation exercised by both feature builds; transport parity and MCP checks. |
 
 Specific cross-feature fixtures include:
@@ -82,10 +90,11 @@ Fresh commands were run with `CARGO_BUILD_JOBS=1` for Rust:
   10 passed, 0 failed.
 - `cargo test --features test-utils --test completion_protocol_v2 -- --list`:
   17 tests listed in the original release run; the consolidated Final-review
-  fixer raised that to 20, and the High fix now lists 22.
+  fixer raised that to 20, the High fix raised it to 22, and High Fix Round 2
+  now contains 23.
 - `cargo test --features test-utils --test completion_protocol_v2 -- --nocapture`:
   17 passed, 0 failed in the original release run; 20 passed after the first
-  fixer pass; the High fix passes 22, 0 failed.
+  fixer pass; the High fix passed 22, and High Fix Round 2 passes 23, 0 failed.
 - `cargo test --features test-utils --test completion_transport_parity -- --list`:
   7 tests listed.
 - `cargo test --features test-utils --test completion_transport_parity -- --nocapture`:
@@ -100,15 +109,15 @@ Fresh commands were run with `CARGO_BUILD_JOBS=1` for Rust:
 - `pnpm test`: complete Vitest run exited 0.
 - `pnpm build`: compiled, typechecked, and statically generated 33/33 pages.
 - Desktop `cargo check`: passed.
-- Desktop `cargo test --features test-utils --lib -- --test-threads=4`: library
-  4,276 passed, 0 failed, and 2 ignored in the High fix pass.
+- Desktop `cargo test --features test-utils --lib`: High Fix Round 2 library
+  4,277 passed, 0 failed, and 2 ignored. The prior High fix run passed 4,276.
 - Desktop `cargo clippy --all-targets --features test-utils -- -D warnings`:
   passed.
 - Server `cargo check --no-default-features --features server --bin codeg-server`:
   passed.
-- Server `cargo test --no-default-features --features server --bin codeg-server --lib -- --test-threads=4`:
-  library 4,199 passed, 0 failed, and 2 ignored; server bin had 0 tests and
-  passed.
+- Server `cargo test --no-default-features --features server --bin codeg-server --lib`:
+  High Fix Round 2 library 4,200 passed, 0 failed, and 2 ignored; server bin
+  had 0 tests and passed. The prior High fix run passed 4,199.
 - Server `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
   passed.
 - `cargo check --no-default-features --bin codeg-mcp`: passed.
@@ -224,6 +233,65 @@ The packaged desktop build repeated the known empty `codeg-mcp` sidecar
 placeholder warning. The featureless companion check and warning-denying
 Clippy both passed, so this is not a fix-pass failure.
 
+## High Fix Round 2: RR-I1-RR-I2
+
+The Codex re-review found two remaining Important lifecycle gaps. Both new
+regressions were observed RED before their production changes:
+
+- `roster_only_final_republication_delivers_after_add_and_remove` materialized
+  valid evidence for an added Final Reviewer, then reached the real delivery
+  guard and failed with `GateNotReady("current Final reviewer selection does
+  not cover the required cohort")`.
+- `second_plan_republication_replaces_stale_corrective_authorization` populated
+  a real corrective authorization through Plan Author completion, published a
+  second different Plan digest, and found the old gate lineage unchanged.
+
+`guard_final_delivery_txn` now treats the selected node set as the current
+review delta. Selected required Reviewers must have current-round evidence;
+unselected required Reviewers must have positive earlier-round evidence in the
+same gate lineage. The request must still name the latest required Reviewer
+binding, every required Reviewer must retain validated passing evidence, and a
+selection outside the current required cohort remains fail-closed. The fixture
+proves `Ready` after adding and completing a Reviewer, then after removing that
+Reviewer from the required roster while retaining immutable history as a
+canceled tombstone.
+
+`is_pending_plan_corrective_round_txn` still preserves the empty-selection
+state needed by the first corrective Plan publication. Once authorization is
+populated, preservation additionally requires its `current_plan_digest`,
+canonical required set, and canonical selected set to match the active
+publication and gate state. A mismatch follows the existing transactional
+reset path: new lineage, round 1, full current selection, and authorization
+deletion.
+
+Fresh Round 2 verification used `CARGO_BUILD_JOBS=1` from `src-tauri`:
+
+- Original Task 14 corrective authorization exact test: desktop 1 passed with
+  4,278 filtered; server 1 passed with 4,201 filtered.
+- RR-I2 second-publication exact test: desktop and server each passed 1, with
+  4,278 and 4,201 filtered respectively.
+- RR-I1 Final add/remove delivery: desktop and `server,test-utils` each passed
+  1, with 22 filtered.
+- I3 non-drift diagnostic: desktop and `server,test-utils` each passed 1, with
+  22 filtered; `completion_artifact_unavailable` remains unchanged.
+- Named binaries: migrations 10 passed; protocol v2 23 passed; transport parity
+  7 passed; no failures.
+- Full desktop library: 4,277 passed, 0 failed, 2 ignored.
+- Full server library: 4,200 passed, 0 failed, 2 ignored; server bin passed.
+- Desktop, server, and `codeg-mcp` checks passed.
+- Desktop, server, and `codeg-mcp` Clippy passed with `-D warnings`.
+- Target-owned `rustfmt --check`, scoped working/cached `git diff --check`, and
+  commit-scope inspection passed.
+- Frontend: not rerun because Round 2 changes only Rust workflow product/tests
+  and this report; the prior Task 18 frontend lint/test/build evidence remains
+  recorded above.
+
+One initial server integration command omitted `test-utils` and failed to
+compile only because fixture helper imports are feature-gated. The corrected
+`server,test-utils` command passed and is the result counted above. The known
+empty packaged `codeg-mcp` sidecar warning appeared in desktop commands; the
+real featureless companion check and warning-denying Clippy both passed.
+
 ## Scope And Hygiene
 
 The initial verified implementation commit contains 27 Task 18 files:
@@ -257,6 +325,11 @@ The High fix commit owns only `listener.rs`, workflow `store.rs`, and
 Design, progress, Task 13 report, generated publication JSON, credential
 helper, connection, or launch-snapshot change is staged.
 
+High Fix Round 2 product commit `5f6399b6f482c57aededdb3dbe87630a3cb47b5e`
+owns only workflow `admission.rs`, workflow `store.rs`, and
+`completion_protocol_v2.rs`. Its report follow-up owns only this file. The
+unrelated files listed above remain unstaged, and no Plan or Design changed.
+
 ## Commits
 
 - `ca19622b test: prove platform completion evidence end to end`
@@ -265,10 +338,12 @@ helper, connection, or launch-snapshot change is staged.
 - `e23dd582 docs: finalize task 18 verification report`
 - `59f5bcd9 fix: close task 18 final review gaps`
 - `57bfd24cb81b735deb79c66167a6df09519bc946 fix: preserve task 18 gate lifecycle semantics`
+- `24892fd63e360cf08c9a7a6093f9823f5144370d docs: record task 18 high fix verification`
+- `5f6399b6f482c57aededdb3dbe87630a3cb47b5e fix: close task 18 round 2 review gaps`
 
 ## Review Handoff
 
-The prior Codex and Grok request-changes findings are closed by the High fix
-and fresh matrix above. Formal Task 18 approval remains a parent-workflow gate:
-both independent reviewers must re-review the new unchanged tip against the
-approved Design and all 31 criteria.
+The original Codex/Grok findings and the Codex Round 2 findings are closed by
+the High fixes and fresh matrices above. Formal Task 18 approval remains a
+parent-workflow gate: both independent reviewers must re-review the new
+unchanged tip against the approved Design and all 31 criteria.
