@@ -54,11 +54,12 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
-    publish_workflow_manifest_with_selection_core, recover_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_core,
-    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, ManifestDocument,
-    PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowRequest,
-    SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
+    guard_current_final_delivery_core, publish_workflow_manifest_with_selection_core,
+    recover_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
+    settle_workflow_gate_core, settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig,
+    FinalDeliveryGuardResult, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
+    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
+    WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -1973,6 +1974,26 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
+        match guard_current_final_delivery_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            req.workflow_id.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(FinalDeliveryGuardResult::Ready(_))) | Ok(None) => {}
+            Ok(Some(FinalDeliveryGuardResult::Rejected(diagnostic)))
+            | Ok(Some(FinalDeliveryGuardResult::Reopened { diagnostic, .. })) => {
+                return serde_json::json!({
+                    "error": {
+                        "code": diagnostic.code(),
+                        "message": diagnostic.to_string(),
+                    }
+                });
+            }
+            Err(error) => return workflow_store_error_value(error),
+        }
         match get_workflow_state_core(
             runs.db(),
             parent_conversation_id,

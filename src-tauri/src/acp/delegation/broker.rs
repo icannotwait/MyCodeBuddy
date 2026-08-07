@@ -2189,6 +2189,15 @@ async fn pre_read_completion_reports(
     .unwrap_or_default()
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn pre_read_completion_reports_for_test(
+    raw_final_text: &str,
+    extra_paths: &[std::path::PathBuf],
+    workspace_path: Option<&std::path::Path>,
+) -> Vec<ValidatedReportCandidate> {
+    pre_read_completion_reports(raw_final_text, extra_paths, workspace_path).await
+}
+
 fn record_completion_resolver_metrics(
     metrics: &DelegationMetrics,
     role: CompletionRole,

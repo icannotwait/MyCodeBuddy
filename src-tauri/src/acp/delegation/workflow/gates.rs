@@ -172,13 +172,12 @@ fn evaluate_task_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
 }
 
 fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
-    if input.required_reviewers.len() != 1 {
+    if input.required_reviewers.is_empty() {
         return fail(ExecutionGateReason::MissingReviewer);
     }
-    let required = &input.required_reviewers[0];
 
-    // When a Final fixer terminal exists, gate requires fixer pass + reviewer
-    // covering that exact fixer run (same as Task pair).
+    // When a Final fixer terminal exists, gate requires fixer pass + every
+    // required reviewer covering that exact fixer run (same as Task routes).
     if let Some(fixer) = input.implementer_or_fixer.as_ref() {
         if !implementer_terminal_pass(fixer) {
             return fail(ExecutionGateReason::ImplementerNotTerminalPass);
@@ -186,17 +185,19 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
         if non_empty_digest(fixer.artifact_digest.as_deref()).is_none() {
             return fail(ExecutionGateReason::ArtifactDigestMismatch);
         }
-        let Some(rev) = required.evidence.as_ref() else {
-            return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
-        };
-        if !reviewer_verdict_pass(rev) {
-            return fail_for_reviewer(
-                ExecutionGateReason::ReviewerNotTerminalPass,
-                &required.node_id,
-            );
-        }
-        if let Err(reason) = reviewer_covers_implementer(rev, fixer) {
-            return fail_for_reviewer(reason, &required.node_id);
+        for required in &input.required_reviewers {
+            let Some(rev) = required.evidence.as_ref() else {
+                return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
+            };
+            if !reviewer_verdict_pass(rev) {
+                return fail_for_reviewer(
+                    ExecutionGateReason::ReviewerNotTerminalPass,
+                    &required.node_id,
+                );
+            }
+            if let Err(reason) = reviewer_covers_implementer(rev, fixer) {
+                return fail_for_reviewer(reason, &required.node_id);
+            }
         }
         if fixer.completion_protocol_version == 2 {
             if let Some(tip) = input
@@ -216,23 +217,25 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
     // First-pass Final: no fixer/implementer terminal.
     // Require non-empty terminal evidence with validated approve **and**
     // non-empty artifact coverage (no empty-evidence pass).
-    let Some(rev) = required.evidence.as_ref() else {
-        return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
-    };
-    if rev.task_id.trim().is_empty() {
-        return fail_for_reviewer(
-            ExecutionGateReason::ReviewerNotTerminalPass,
-            &required.node_id,
-        );
-    }
-    if !reviewer_verdict_pass(rev) {
-        return fail_for_reviewer(
-            ExecutionGateReason::ReviewerNotTerminalPass,
-            &required.node_id,
-        );
-    }
-    if let Err(reason) = final_first_pass_coverage(rev, input.branch_tip_digest.as_deref()) {
-        return fail_for_reviewer(reason, &required.node_id);
+    for required in &input.required_reviewers {
+        let Some(rev) = required.evidence.as_ref() else {
+            return fail_for_reviewer(ExecutionGateReason::MissingReviewer, &required.node_id);
+        };
+        if rev.task_id.trim().is_empty() {
+            return fail_for_reviewer(
+                ExecutionGateReason::ReviewerNotTerminalPass,
+                &required.node_id,
+            );
+        }
+        if !reviewer_verdict_pass(rev) {
+            return fail_for_reviewer(
+                ExecutionGateReason::ReviewerNotTerminalPass,
+                &required.node_id,
+            );
+        }
+        if let Err(reason) = final_first_pass_coverage(rev, input.branch_tip_digest.as_deref()) {
+            return fail_for_reviewer(reason, &required.node_id);
+        }
     }
     pass()
 }
@@ -1096,6 +1099,63 @@ mod tests {
             Some("branch-tip-sha"),
         ));
         assert!(eval.passed);
+    }
+
+    #[test]
+    fn final_gate_accepts_complete_required_reviewer_cohort() {
+        let first = ExecutionGateRunEvidence {
+            task_id: "final-rev-codex".into(),
+            generation: 1,
+            status: TerminalRunStatus::Completed,
+            completion_protocol_version: 1,
+            completion_state: None,
+            completion_outcome: None,
+            completion_evidence_validated: false,
+            summary_validated: true,
+            work_status: None,
+            review_verdict: Some(ReviewVerdict::Approve),
+            artifact_digest: Some("branch-tip-sha".into()),
+            reviewed_task_id: None,
+            reviewed_implementer_generation: None,
+        };
+        let mut input = final_input(None, Some(first.clone()), Some("branch-tip-sha"));
+        input.required_reviewers.push(RequiredReviewerEvidence {
+            node_id: "final-reviewer-grok".into(),
+            evidence: Some(ExecutionGateRunEvidence {
+                task_id: "final-rev-grok".into(),
+                ..first
+            }),
+        });
+
+        let eval = evaluate_execution_gate(&input);
+        assert!(eval.passed);
+
+        input.required_reviewers[1].evidence = None;
+        let missing = evaluate_execution_gate(&input);
+        assert!(!missing.passed);
+        assert_eq!(missing.reason, ExecutionGateReason::MissingReviewer);
+        assert_eq!(
+            missing.reviewer_node_id.as_deref(),
+            Some("final-reviewer-grok")
+        );
+    }
+
+    #[test]
+    fn final_gate_after_fixer_accepts_complete_required_reviewer_cohort() {
+        let fixer = impl_done("fixer-1", 1, Some("tip"));
+        let first = rev_approve("final-rev-codex", "fixer-1", Some(1), Some("tip"));
+        let mut input = final_input(Some(fixer), Some(first), Some("tip"));
+        input.required_reviewers.push(RequiredReviewerEvidence {
+            node_id: "final-reviewer-grok".into(),
+            evidence: Some(rev_approve(
+                "final-rev-grok",
+                "fixer-1",
+                Some(1),
+                Some("tip"),
+            )),
+        });
+
+        assert!(evaluate_execution_gate(&input).passed);
     }
 
     #[test]

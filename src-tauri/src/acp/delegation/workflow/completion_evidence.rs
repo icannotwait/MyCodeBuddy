@@ -2353,7 +2353,21 @@ pub async fn load_validated_completion_evidence<C: ConnectionTrait>(
     task_id: &str,
 ) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
     let loaded = load_terminal(conn, task_id).await?;
-    validate_loaded_completion_evidence(conn, &loaded, None).await
+    validate_loaded_completion_evidence(conn, &loaded, None, ArtifactValidationMode::Current).await
+}
+
+pub(crate) async fn load_validated_frozen_git_completion_evidence<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
+    let loaded = load_terminal(conn, task_id).await?;
+    validate_loaded_completion_evidence(
+        conn,
+        &loaded,
+        None,
+        ArtifactValidationMode::FrozenFinalDelivery,
+    )
+    .await
 }
 
 pub(crate) async fn validate_preloaded_completion_evidence<C: ConnectionTrait>(
@@ -2396,8 +2410,15 @@ async fn validate_preloaded_completion_evidence_inner<C: ConnectionTrait>(
             node: node.clone(),
         },
         preload,
+        ArtifactValidationMode::Current,
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactValidationMode {
+    Current,
+    FrozenFinalDelivery,
 }
 
 pub(crate) async fn preload_completion_validation_context<C: ConnectionTrait>(
@@ -2429,6 +2450,7 @@ async fn validate_loaded_completion_evidence<C: ConnectionTrait>(
     conn: &C,
     loaded: &LoadedTerminal,
     preload: Option<&PersistedCompletionContextPreload>,
+    artifact_validation: ArtifactValidationMode,
 ) -> Result<ValidatedCompletionEvidence, CompletionEvidenceError> {
     if loaded.workflow.completion_protocol_version != i64::from(COMPLETION_PROTOCOL_VERSION_V2)
         || loaded.node.retired_revision.is_some()
@@ -2462,8 +2484,44 @@ async fn validate_loaded_completion_evidence<C: ConnectionTrait>(
         })?;
     let context = rebuild_persisted_completion_context(conn, loaded, preload).await?;
     ensure_context_matches_binding(&context, &loaded.binding)?;
-    let artifact =
-        completion_artifact(&resolve_terminal_artifact(conn, loaded, &context, outcome).await?);
+    let artifact = match artifact_validation {
+        ArtifactValidationMode::Current => {
+            completion_artifact(&resolve_terminal_artifact(conn, loaded, &context, outcome).await?)
+        }
+        ArtifactValidationMode::FrozenFinalDelivery => {
+            if !matches!(
+                context.scope_role,
+                CompletionScopeRole::FinalFixer | CompletionScopeRole::FinalReviewer
+            ) {
+                return Err(CompletionEvidenceError::InvalidTerminalState(
+                    "frozen delivery validation requires Final evidence".into(),
+                ));
+            }
+            let expected = loaded
+                .binding
+                .artifact_digest
+                .as_deref()
+                .map(str::trim)
+                .filter(|digest| !digest.is_empty())
+                .ok_or_else(|| {
+                    CompletionEvidenceError::InvalidTerminalState(
+                        "Final evidence has no frozen artifact digest".into(),
+                    )
+                })?;
+            match &context.evidence_scope.artifact_subject {
+                ArtifactSubjectIdentityV2::GitHeadV1 { digest } if digest == expected => {
+                    CompletionArtifactV2::GitHeadV1 {
+                        head: expected.to_string(),
+                    }
+                }
+                _ => {
+                    return Err(CompletionEvidenceError::InvalidTerminalState(
+                        "Final evidence is not bound to its frozen git artifact".into(),
+                    ));
+                }
+            }
+        }
+    };
     if loaded.binding.artifact_digest.as_deref() != Some(artifact.digest()) {
         return Err(ArtifactError::ScopeChanged {
             expected: loaded
