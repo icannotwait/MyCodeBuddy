@@ -798,7 +798,51 @@ pub(crate) async fn guard_current_final_delivery_core(
     if header.completion_protocol_version != 2 {
         return Ok(None);
     }
-    let snapshot = load_active_manifest_snapshot(&db.conn, &header).await?;
+    let Some(request) = current_final_delivery_request(db, &header, None).await? else {
+        return Ok(None);
+    };
+    guard_final_delivery_core(db, emitter, request)
+        .await
+        .map(Some)
+}
+
+/// Run the Final delivery freeze while enriching one terminal task response.
+/// Non-Final, stale, non-required, and incomplete-cohort tasks are not delivery
+/// candidates and therefore leave ordinary completion projection untouched.
+pub(crate) async fn guard_task_final_delivery_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    task_id: &str,
+) -> Result<Option<FinalDeliveryGuardResult>, WorkflowStoreError> {
+    let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+    else {
+        return Ok(None);
+    };
+    let header = delegation_workflow::Entity::find_by_id(binding.workflow_id)
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(task_id.to_string()))?;
+    if header.completion_protocol_version != 2 {
+        return Ok(None);
+    }
+    let Some(request) = current_final_delivery_request(db, &header, Some(task_id)).await? else {
+        return Ok(None);
+    };
+    guard_final_delivery_core(db, emitter, request)
+        .await
+        .map(Some)
+}
+
+async fn current_final_delivery_request(
+    db: &AppDatabase,
+    header: &delegation_workflow::Model,
+    required_task_id: Option<&str>,
+) -> Result<Option<FinalDeliveryGuardRequest>, WorkflowStoreError> {
+    let snapshot = load_active_manifest_snapshot(&db.conn, header).await?;
     let required_final_reviewers = snapshot
         .normalized
         .nodes
@@ -823,6 +867,7 @@ pub(crate) async fn guard_current_final_delivery_core(
         return Ok(None);
     };
     let mut delivery_anchor = None;
+    let mut required_task_anchor = None;
     for reviewer in required_final_reviewers {
         let Some(binding) = delegation_workflow_run_binding::Entity::find()
             .filter(
@@ -860,10 +905,19 @@ pub(crate) async fn guard_current_final_delivery_core(
             return Ok(None);
         }
         if delivery_anchor.is_none() {
-            delivery_anchor = Some((binding, run));
+            delivery_anchor = Some((binding.clone(), run.clone()));
+        }
+        if required_task_id == Some(binding.task_id.as_str()) {
+            required_task_anchor = Some((binding, run));
         }
     }
-    let (binding, run) = delivery_anchor.expect("required Final cohort is non-empty");
+    let (binding, run) = match required_task_id {
+        Some(_) => match required_task_anchor {
+            Some(anchor) => anchor,
+            None => return Ok(None),
+        },
+        None => delivery_anchor.expect("required Final cohort is non-empty"),
+    };
     let workspace_path = run
         .workspace_path
         .as_deref()
@@ -875,18 +929,12 @@ pub(crate) async fn guard_current_final_delivery_core(
                 "current passing Final reviewer has no durable workspace".into(),
             )
         })?;
-    guard_final_delivery_core(
-        db,
-        emitter,
-        FinalDeliveryGuardRequest {
-            workflow_id: header.workflow_id,
-            gate_id: current_final_gate.gate_id,
-            workspace_path,
-            final_reviewer_task_id: binding.task_id,
-        },
-    )
-    .await
-    .map(Some)
+    Ok(Some(FinalDeliveryGuardRequest {
+        workflow_id: header.workflow_id.clone(),
+        gate_id: current_final_gate.gate_id,
+        workspace_path,
+        final_reviewer_task_id: binding.task_id,
+    }))
 }
 
 async fn guard_final_delivery_txn(
@@ -972,13 +1020,19 @@ async fn guard_final_delivery_txn(
             "Final delivery requires a non-empty reviewer cohort".into(),
         ));
     }
-    let selected_node_ids = serde_json::from_str::<Vec<String>>(&gate_state.selected_node_ids_json)
-        .map_err(|error| {
-            WorkflowStoreError::GateNotReady(format!(
-                "current Final reviewer selection is invalid: {error}"
-            ))
-        })?;
-    if selected_node_ids != required_reviewer_node_ids {
+    let selected_node_ids = serde_json::from_str::<BTreeSet<String>>(
+        &gate_state.selected_node_ids_json,
+    )
+    .map_err(|error| {
+        WorkflowStoreError::GateNotReady(format!(
+            "current Final reviewer selection is invalid: {error}"
+        ))
+    })?;
+    let required_reviewer_node_id_set = required_reviewer_node_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if selected_node_ids != required_reviewer_node_id_set {
         return Err(WorkflowStoreError::GateNotReady(
             "current Final reviewer selection does not cover the required cohort".into(),
         ));
@@ -5282,6 +5336,22 @@ async fn publish_in_txn(
 
     apply_binding_diff(txn, next_manifest_rev, binding_diff, now).await?;
 
+    let v2_enforce = prior_header.as_ref().map_or_else(
+        || {
+            selection.version == 2
+                && selection.mode
+                    == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+        },
+        |header| {
+            header.completion_protocol_version == 2
+                && header.completion_protocol_mode
+                    == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
+        },
+    );
+    if v2_enforce {
+        initialize_v2_gate_states_txn(txn, &workflow_id, &effective_normalized).await?;
+    }
+
     let rev_row = delegation_workflow_manifest_revision::ActiveModel {
         workflow_id: Set(workflow_id.clone()),
         manifest_revision: Set(next_manifest_rev),
@@ -5324,6 +5394,120 @@ async fn publish_in_txn(
         active_block_cause.as_deref(),
         active_block_source,
     )
+}
+
+async fn initialize_v2_gate_states_txn(
+    txn: &sea_orm::DatabaseTransaction,
+    workflow_id: &str,
+    normalized: &NormalizedManifest,
+) -> Result<(), WorkflowStoreError> {
+    let mut desired = Vec::new();
+    for gate in &normalized.gates {
+        if gate.required_reviewer_node_ids.is_empty() {
+            continue;
+        }
+        let selected = canonical_string_set(&gate.required_reviewer_node_ids);
+        let material = match gate.gate_kind {
+            DocumentGateKind::Design => serde_json::json!({
+                "workflow_id": workflow_id,
+                "gate_id": gate.id,
+                "gate_kind": gate.gate_kind.as_str(),
+                "resolution_mode": gate.resolution_mode,
+                "design": normalized.design,
+            }),
+            DocumentGateKind::Plan => serde_json::json!({
+                "workflow_id": workflow_id,
+                "gate_id": gate.id,
+                "gate_kind": gate.gate_kind.as_str(),
+                "resolution_mode": gate.resolution_mode,
+                "design": normalized.design,
+                "plan": normalized.plan,
+                "risk_policy_version": normalized.risk_policy_version,
+                "task_policies": normalized.task_policies,
+            }),
+        };
+        let lineage = workflow_gate_lineage(&material)?;
+        desired.push((gate.id.clone(), lineage, selected));
+    }
+
+    let final_reviewers = canonical_string_set(
+        &normalized
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.phase_id.as_deref() == Some(super::types::PHASE_FINAL)
+                    && node.role == Some(ManifestNodeRole::Reviewer)
+                    && node.required
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>(),
+    );
+    if !final_reviewers.is_empty() {
+        let material = serde_json::json!({
+            "workflow_id": workflow_id,
+            "gate_id": "final",
+            "gate_kind": "final",
+            "design": normalized.design,
+            "plan": normalized.plan,
+            "risk_policy_version": normalized.risk_policy_version,
+            "task_policies": normalized.task_policies,
+        });
+        let lineage = workflow_gate_lineage(&material)?;
+        desired.push(("final".to_string(), lineage, final_reviewers));
+    }
+
+    for (gate_id, gate_lineage, selected_node_ids) in desired {
+        let selected_node_ids_json = serde_json::to_string(&selected_node_ids)
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+        let prior = delegation_workflow_gate_state::Entity::find_by_id((
+            workflow_id.to_string(),
+            gate_id.clone(),
+        ))
+        .one(txn)
+        .await
+        .map_err(db_err)?;
+        match prior {
+            Some(state) if state.gate_lineage == gate_lineage => {}
+            Some(state) => {
+                let mut active: delegation_workflow_gate_state::ActiveModel = state.into();
+                active.gate_lineage = Set(gate_lineage);
+                active.current_review_round = Set(1);
+                active.selected_node_ids_json = Set(selected_node_ids_json);
+                active.update(txn).await.map_err(db_err)?;
+                if gate_id == super::types::PHASE_PLAN {
+                    delegation_plan_round_authorization::Entity::delete_by_id((
+                        workflow_id.to_string(),
+                        gate_id,
+                    ))
+                    .exec(txn)
+                    .await
+                    .map_err(db_err)?;
+                }
+            }
+            None => {
+                delegation_workflow_gate_state::ActiveModel {
+                    workflow_id: Set(workflow_id.to_string()),
+                    gate_id: Set(gate_id),
+                    gate_lineage: Set(gate_lineage),
+                    current_review_round: Set(1),
+                    selected_node_ids_json: Set(selected_node_ids_json),
+                }
+                .insert(txn)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workflow_gate_lineage(material: &serde_json::Value) -> Result<String, WorkflowStoreError> {
+    let canonical = canonical_json(material)
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codeg.workflow-gate-lineage.v2\0");
+    hasher.update(canonical.as_bytes());
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Insert create header under SAVEPOINT.

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -23,22 +24,23 @@ use codeg_lib::acp::delegation::metrics::{
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
 use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
 use codeg_lib::acp::delegation::transport::{
-    client_get_workflow_state_round_trip, BrokerGetWorkflowStateRequest, CompanionRole,
+    client_cancel_task_round_trip, client_get_workflow_state_round_trip, client_status_round_trip,
+    BrokerCancelTaskRequest, BrokerGetWorkflowStateRequest, BrokerStatusRequest,
+    CancelDelegationReason, CompanionRole,
 };
 use codeg_lib::acp::delegation::types::{
     CompletionMutationContext, ContinueDelegationRequest, DelegationError,
-    RestartLegacyWorkflowRequest,
+    ResolveCompletionDecisionRequest, RestartLegacyWorkflowRequest,
 };
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, capture_original_request_context, evaluate_rollout_window,
     get_workflow_state_core, guard_final_delivery_core, inject_legacy_restart_header_failure_once,
     materialize_terminal_completion_txn, project_workflow_graph_core,
     publish_workflow_manifest_core, publish_workflow_manifest_with_selection_core,
-    resolve_completion_decision_txn, restart_legacy_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_v2_core,
-    CompletionCardV2, CompletionIntent, CompletionIntentSource, CompletionOutcome,
-    CompletionProtocolRolloutConfig, CompletionProtocolSelection, CompletionResolution,
-    CompletionRole, DocumentGateKind, DocumentRef, FinalDeliveryGuardRequest,
+    restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
+    settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
+    CompletionOutcome, CompletionProtocolRolloutConfig, CompletionProtocolSelection,
+    CompletionResolution, CompletionRole, DocumentGateKind, DocumentRef, FinalDeliveryGuardRequest,
     FinalDeliveryGuardResult, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
     ManifestNodeRole, ManifestPhase, ManifestWorkflowState, PlanReviewChangeV2,
     PlanReviewNextAction, ProfileCompletionWindow, PublishWorkflowRequest, ResolutionMode,
@@ -61,6 +63,7 @@ use codeg_lib::db::entities::{
 };
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
+use codeg_lib::web::auth::COMPLETION_CONTEXT_HEADER;
 use codeg_lib::web::event_bridge::EventEmitter;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
@@ -259,6 +262,376 @@ fn skeleton(token: &str) -> ManifestDocument {
         edges: Vec::new(),
         gates: Vec::new(),
         task_policies: Vec::new(),
+    }
+}
+
+fn complete_gate_state_skeleton(token: &str) -> ManifestDocument {
+    let mut document = skeleton(token);
+    document.phases.push(ManifestPhase {
+        id: PHASE_FINAL.into(),
+        kind: Some(PHASE_FINAL.into()),
+        title: None,
+    });
+    document.nodes.extend([
+        ManifestNode {
+            id: "design-reviewer".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_DESIGN.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::Design {
+                    rel_doc_path: "docs/superpowers/specs/task-18-capability-design.md",
+                    agent_type: "codex",
+                    profile_id: None,
+                })
+                .unwrap(),
+            ),
+            deps: Vec::new(),
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+        ManifestNode {
+            id: "plan-reviewer".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_PLAN.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+                    rel_plan_path: "docs/superpowers/plans/restarted-plan.md",
+                    agent_type: "codex",
+                    profile_id: None,
+                })
+                .unwrap(),
+            ),
+            deps: vec!["plan-author".into()],
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+        ManifestNode {
+            id: "final-reviewer-codex".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_FINAL.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+                    agent_type: "codex",
+                    profile_id: None,
+                })
+                .unwrap(),
+            ),
+            deps: Vec::new(),
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+        ManifestNode {
+            id: "final-reviewer-grok".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_FINAL.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("grok".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+                    agent_type: "grok",
+                    profile_id: None,
+                })
+                .unwrap(),
+            ),
+            deps: Vec::new(),
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+    ]);
+    document.gates.extend([
+        ManifestGate {
+            id: "design".into(),
+            reviewer_cohort_node_ids: vec!["design-reviewer".into()],
+            required_reviewer_node_ids: vec!["design-reviewer".into()],
+            resolution_mode: ResolutionMode::ParentAdjudication,
+            gate_kind: Some(DocumentGateKind::Design),
+        },
+        ManifestGate {
+            id: "plan".into(),
+            reviewer_cohort_node_ids: vec!["plan-reviewer".into()],
+            required_reviewer_node_ids: vec!["plan-reviewer".into()],
+            resolution_mode: ResolutionMode::ParentAdjudication,
+            gate_kind: Some(DocumentGateKind::Plan),
+        },
+    ]);
+    document
+}
+
+#[tokio::test]
+async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
+    const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-capability-design.md";
+    const PLAN_REL_PATH: &str = "docs/superpowers/plans/restarted-plan.md";
+    const DESIGN_BYTES: &[u8] = b"# Design\n\nTask 18 gate-state publication.\n";
+    const PLAN_BYTES: &[u8] = b"# Plan\n\nTask 18 gate-state publication.\n";
+
+    let workspace = tempfile::tempdir().unwrap();
+    for (rel_path, bytes) in [(DESIGN_REL_PATH, DESIGN_BYTES), (PLAN_REL_PATH, PLAN_BYTES)] {
+        let path = workspace.path().join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+    let publish = |parent: i32, token: &str| {
+        let mut document = complete_gate_state_skeleton(token);
+        document.workflow_state = ManifestWorkflowState::Estimated;
+        document.design = Some(DocumentRef {
+            rel_path: DESIGN_REL_PATH.into(),
+            digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+        });
+        document.plan = Some(DocumentRef {
+            rel_path: PLAN_REL_PATH.into(),
+            digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
+        });
+        (parent, PublishWorkflowRequest { document })
+    };
+
+    let enforce_parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let (parent, request) = publish(enforce_parent, "task-18-enforce-gate-state");
+    let enforced = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        request,
+        CompletionProtocolSelection {
+            version: 2,
+            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+            source:
+                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
+        },
+    )
+    .await
+    .unwrap();
+    let states = delegation_workflow_gate_state::Entity::find()
+        .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&enforced.workflow_id))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        states.len(),
+        3,
+        "Design, Plan, and Final need durable state"
+    );
+    let expected = [
+        ("design", BTreeSet::from(["design-reviewer"])),
+        ("plan", BTreeSet::from(["plan-reviewer"])),
+        (
+            "final",
+            BTreeSet::from(["final-reviewer-codex", "final-reviewer-grok"]),
+        ),
+    ];
+    for (gate_id, selected) in expected {
+        let state = states
+            .iter()
+            .find(|state| state.gate_id == gate_id)
+            .unwrap();
+        assert_eq!(state.current_review_round, 1);
+        assert_eq!(state.gate_lineage.len(), 71);
+        assert!(state.gate_lineage.starts_with("sha256:"));
+        assert_eq!(
+            serde_json::from_str::<BTreeSet<&str>>(&state.selected_node_ids_json).unwrap(),
+            selected
+        );
+    }
+
+    let initial_design_lineage = states
+        .iter()
+        .find(|state| state.gate_id == "design")
+        .unwrap()
+        .gate_lineage
+        .clone();
+    let initial_plan_lineage = states
+        .iter()
+        .find(|state| state.gate_id == "plan")
+        .unwrap()
+        .gate_lineage
+        .clone();
+    let initial_final_lineage = states
+        .iter()
+        .find(|state| state.gate_id == "final")
+        .unwrap()
+        .gate_lineage
+        .clone();
+    let plan_state = states
+        .iter()
+        .find(|state| state.gate_id == "plan")
+        .unwrap()
+        .clone();
+    let mut plan_state: delegation_workflow_gate_state::ActiveModel = plan_state.into();
+    plan_state.current_review_round = Set(2);
+    plan_state.selected_node_ids_json = Set("[]".into());
+    plan_state.update(&db.conn).await.unwrap();
+
+    let mut title_only = complete_gate_state_skeleton("task-18-enforce-gate-state");
+    title_only.workflow_id = Some(enforced.workflow_id.clone());
+    title_only.expected_manifest_revision = Some(1);
+    title_only.workflow_state = ManifestWorkflowState::Estimated;
+    title_only.design = Some(DocumentRef {
+        rel_path: DESIGN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+    });
+    title_only.plan = Some(DocumentRef {
+        rel_path: PLAN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
+    });
+    title_only
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "plan-reviewer")
+        .unwrap()
+        .title = Some("Display-only reviewer title".into());
+    let title_result = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        enforce_parent,
+        PublishWorkflowRequest {
+            document: title_only.clone(),
+        },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let preserved_plan = delegation_workflow_gate_state::Entity::find_by_id((
+        enforced.workflow_id.clone(),
+        "plan".to_string(),
+    ))
+    .one(&db.conn)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(preserved_plan.gate_lineage, initial_plan_lineage);
+    assert_eq!(preserved_plan.current_review_round, 2);
+    assert_eq!(preserved_plan.selected_node_ids_json, "[]");
+
+    const PLAN_BYTES_V2: &[u8] = b"# Plan\n\nTask 18 changed gate-state material.\n";
+    std::fs::write(workspace.path().join(PLAN_REL_PATH), PLAN_BYTES_V2).unwrap();
+    title_only.expected_manifest_revision = Some(title_result.manifest_revision);
+    title_only.plan = Some(DocumentRef {
+        rel_path: PLAN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES_V2)),
+    });
+    publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        enforce_parent,
+        PublishWorkflowRequest {
+            document: title_only,
+        },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let rotated_states = delegation_workflow_gate_state::Entity::find()
+        .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&enforced.workflow_id))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    let rotated_design = rotated_states
+        .iter()
+        .find(|state| state.gate_id == "design")
+        .unwrap();
+    let rotated_plan = rotated_states
+        .iter()
+        .find(|state| state.gate_id == "plan")
+        .unwrap();
+    let rotated_final = rotated_states
+        .iter()
+        .find(|state| state.gate_id == "final")
+        .unwrap();
+    assert_eq!(rotated_design.gate_lineage, initial_design_lineage);
+    assert_ne!(rotated_plan.gate_lineage, initial_plan_lineage);
+    assert_ne!(rotated_final.gate_lineage, initial_final_lineage);
+    for state in [rotated_plan, rotated_final] {
+        assert_eq!(state.current_review_round, 1);
+        assert_ne!(state.selected_node_ids_json, "[]");
+    }
+
+    let reviewer_task_id = "task-18-published-design-reviewer";
+    admit_v2_fixture_run(
+        &db,
+        enforce_parent,
+        seed_conversation(&db, folder, AgentType::Codex).await,
+        workspace.path(),
+        reviewer_task_id,
+        "codex",
+        build_work_unit_key(&WorkUnitKeyParts::Design {
+            rel_doc_path: DESIGN_REL_PATH,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Review the published Design",
+    )
+    .await;
+    let reviewer_binding = delegation_workflow_run_binding::Entity::find_by_id(reviewer_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let design_state = states
+        .iter()
+        .find(|state| state.gate_id == "design")
+        .unwrap();
+    assert_eq!(reviewer_binding.gate_id.as_deref(), Some("design"));
+    assert_eq!(
+        reviewer_binding.gate_lineage.as_deref(),
+        Some(design_state.gate_lineage.as_str())
+    );
+    assert_eq!(reviewer_binding.review_round, Some(1));
+
+    for (mode, version, token) in [
+        (
+            delegation_workflow::CompletionProtocolMode::V1,
+            1,
+            "task-18-v1-no-gate-state",
+        ),
+        (
+            delegation_workflow::CompletionProtocolMode::V2Shadow,
+            1,
+            "task-18-shadow-no-gate-state",
+        ),
+    ] {
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let (parent, request) = publish(parent, token);
+        let result = publish_workflow_manifest_with_selection_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            request,
+            CompletionProtocolSelection {
+                version,
+                mode,
+                source: codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            delegation_workflow_gate_state::Entity::find()
+                .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(result.workflow_id))
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }
 
@@ -625,16 +998,45 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
     .await
     .unwrap();
     txn.commit().await.unwrap();
+
+    let static_dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState::new_for_test(
+        codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        },
+        workspace_path.clone(),
+    ));
+    let server = TestServer::new(build_router(
+        state.clone(),
+        "task-18-token".into(),
+        static_dir.path().to_path_buf(),
+        Arc::new(ShutdownSignal::new()),
+    ))
+    .unwrap();
     if matches!(case, CapabilityCase::AmbiguousThenUserAdjudication) {
-        resolve_completion_decision_txn(
-            &db,
-            parent,
-            terminal.attention.expect("ambiguous completion decision"),
-            CompletionOutcome::Done,
-            "application_user",
-        )
-        .await
-        .unwrap();
+        let context_response = server
+            .post("/api/get_workflow_graph_snapshot")
+            .add_header("authorization", "Bearer task-18-token")
+            .json(&json!({ "conversationId": parent }))
+            .await;
+        context_response.assert_status_ok();
+        let context = context_response
+            .headers()
+            .get(COMPLETION_CONTEXT_HEADER)
+            .expect("snapshot must issue a completion context")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let response = server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", "Bearer task-18-token")
+            .add_header(COMPLETION_CONTEXT_HEADER, context)
+            .json(&ResolveCompletionDecisionRequest {
+                cas: terminal.attention.expect("ambiguous completion decision"),
+                outcome: CompletionOutcome::Done,
+            })
+            .await;
+        response.assert_status_ok();
     }
 
     let stored_run = delegation_task_run::Entity::find_by_id(&task_id)
@@ -657,15 +1059,6 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
             .await
             .unwrap();
 
-    let static_dir = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState::new_for_test(db, workspace_path));
-    let server = TestServer::new(build_router(
-        state.clone(),
-        "task-18-token".into(),
-        static_dir.path().to_path_buf(),
-        Arc::new(ShutdownSignal::new()),
-    ))
-    .unwrap();
     let direct = project_workflow_graph_core(&state.db, parent)
         .await
         .unwrap();
@@ -1066,7 +1459,22 @@ async fn run_session_2889_fixture() -> Session2889Result {
     }
 }
 
-async fn run_final_drift_fixture() -> (Value, Value, String, i64) {
+struct FinalDriftResult {
+    response: Value,
+    reopen_signal: Value,
+    reopened: Value,
+    gate_id: String,
+    review_round: i64,
+    graph_has_no_stale_final_completion: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FinalEnrichmentSurface {
+    Report,
+    Status,
+}
+
+async fn run_final_drift_fixture(surface: FinalEnrichmentSurface) -> FinalDriftResult {
     let repo = tempfile::tempdir().expect("Task 18 final repo");
     git_fixture(repo.path(), &["init", "--quiet"]);
     std::fs::write(repo.path().join("verified.txt"), b"reviewed\n").unwrap();
@@ -1129,31 +1537,18 @@ async fn run_final_drift_fixture() -> (Value, Value, String, i64) {
         rel_path: "docs/superpowers/plans/restarted-plan.md".into(),
         digest: format!("sha256:{:x}", Sha256::digest(plan_bytes)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_with_selection_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest { document },
+        CompletionProtocolSelection {
+            version: 2,
+            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+            source:
+                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
+        },
     )
-    .await
-    .unwrap();
-    let workflow = delegation_workflow::Entity::find_by_id(&published.workflow_id)
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
-    workflow.completion_protocol_version = Set(2);
-    workflow.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V2Enforce);
-    workflow.update(&db.conn).await.unwrap();
-    delegation_workflow_gate_state::ActiveModel {
-        workflow_id: Set(published.workflow_id.clone()),
-        gate_id: Set("plan".into()),
-        gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
-        current_review_round: Set(1),
-        selected_node_ids_json: Set("[\"plan-reviewer\"]".into()),
-    }
-    .insert(&db.conn)
     .await
     .unwrap();
 
@@ -1225,16 +1620,17 @@ async fn run_final_drift_fixture() -> (Value, Value, String, i64) {
     .await
     .unwrap();
     assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
-    delegation_workflow_gate_state::ActiveModel {
-        workflow_id: Set(published.workflow_id.clone()),
-        gate_id: Set("final".into()),
-        gate_lineage: Set(format!("sha256:{}", "f".repeat(64))),
-        current_review_round: Set(1),
-        selected_node_ids_json: Set("[\"final-reviewer\",\"final-reviewer-grok\"]".into()),
-    }
-    .insert(&db.conn)
+    let final_state = delegation_workflow_gate_state::Entity::find_by_id((
+        published.workflow_id.clone(),
+        "final".to_string(),
+    ))
+    .one(&db.conn)
     .await
+    .unwrap()
     .unwrap();
+    let mut final_state: delegation_workflow_gate_state::ActiveModel = final_state.into();
+    final_state.selected_node_ids_json = Set("[\"final-reviewer-grok\",\"final-reviewer\"]".into());
+    final_state.update(&db.conn).await.unwrap();
 
     let task_id = "task-18-passing-final-review";
     admit_v2_fixture_run(
@@ -1375,11 +1771,50 @@ async fn run_final_drift_fixture() -> (Value, Value, String, i64) {
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(listener.run(socket_path.clone()));
-    let guarded =
+    let response = match surface {
+        FinalEnrichmentSurface::Report => {
+            client_cancel_task_round_trip(
+                socket_path.to_string_lossy().as_ref(),
+                &BrokerCancelTaskRequest {
+                    token: root_token.into(),
+                    task_id: task_id.into(),
+                    reason: CancelDelegationReason::TaskFail,
+                },
+            )
+            .await
+            .unwrap()
+            .outcome
+        }
+        FinalEnrichmentSurface::Status => {
+            client_status_round_trip(
+                socket_path.to_string_lossy().as_ref(),
+                &BrokerStatusRequest {
+                    token: root_token.into(),
+                    task_ids: vec![task_id.into(), plan_author_task_id.into()],
+                    wait_ms: None,
+                    return_when: None,
+                    parent_tool_use_id: "task-18-final-status".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .outcome
+        }
+    };
+    let reopen_signal =
         wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await;
     let reopened =
         wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await;
     listener_task.abort();
+    let graph = project_workflow_graph_core(&db, parent).await;
+    let graph_has_no_stale_final_completion = graph.as_ref().is_some_and(|graph| {
+        let final_reviewers = graph.nodes.iter().filter(|node| {
+            node.phase_id.as_deref() == Some(PHASE_FINAL)
+                && node.role.as_deref() == Some("reviewer")
+        });
+        let final_reviewers = final_reviewers.collect::<Vec<_>>();
+        final_reviewers.len() == 2 && final_reviewers.iter().all(|node| node.completion.is_none())
+    });
     let gate = delegation_workflow_gate_state::Entity::find_by_id((
         published.workflow_id,
         "final".to_string(),
@@ -1388,7 +1823,14 @@ async fn run_final_drift_fixture() -> (Value, Value, String, i64) {
     .await
     .unwrap()
     .unwrap();
-    (guarded, reopened, gate.gate_id, gate.current_review_round)
+    FinalDriftResult {
+        response,
+        reopen_signal,
+        reopened,
+        gate_id: gate.gate_id,
+        review_round: gate.current_review_round,
+        graph_has_no_stale_final_completion,
+    }
 }
 
 #[tokio::test]
@@ -1404,21 +1846,51 @@ async fn session_2889_and_final_drift_have_no_format_repair_escape() {
     assert_eq!(session.resume_call_count, 0);
     assert_eq!(session.spawn_call_count, 0);
 
-    let (final_delivery, reopened, current_gate, review_round) = run_final_drift_fixture().await;
+    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Status).await;
+    let drifted_final = &final_drift.response["tasks"][0];
     assert_eq!(
-        final_delivery
-            .pointer("/error/code")
-            .and_then(Value::as_str),
+        drifted_final.get("error_code").and_then(Value::as_str),
         Some("final_artifact_drift")
     );
-    assert!(
-        reopened.get("error").is_none(),
-        "the second workflow-state read must project the reopened workflow: {reopened}"
+    assert_eq!(drifted_final["status"], "failed");
+    assert!(drifted_final.get("text").is_none());
+    assert!(drifted_final.get("completion").is_none());
+    assert_ne!(
+        final_drift.response["tasks"][1]
+            .get("error_code")
+            .and_then(Value::as_str),
+        Some("final_artifact_drift"),
+        "non-Final status enrichment must not be rewritten by the delivery guard"
     );
-    assert_eq!(reopened["workflow_state"], "approved");
-    assert_eq!(reopened["detail"], "index");
-    assert_eq!(current_gate, "final");
-    assert_eq!(review_round, 2);
+    assert!(
+        final_drift.reopen_signal.get("error").is_none(),
+        "status enrichment must reopen Final before workflow-state projection: {}",
+        final_drift.reopen_signal
+    );
+    assert!(final_drift.reopened.get("error").is_none());
+    assert_eq!(final_drift.reopened["workflow_state"], "approved");
+    assert_eq!(final_drift.reopened["detail"], "index");
+    assert_eq!(final_drift.gate_id, "final");
+    assert_eq!(final_drift.review_round, 2);
+}
+
+#[tokio::test]
+async fn reopened_final_projection_omits_every_stale_reviewer_completion() {
+    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Status).await;
+    assert!(
+        final_drift.graph_has_no_stale_final_completion,
+        "both stale Final reviewer completions must be absent after drift"
+    );
+}
+
+#[tokio::test]
+async fn final_drift_report_enrichment_reopens_and_omits_stale_completion() {
+    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Report).await;
+    assert_eq!(final_drift.response["status"], "failed");
+    assert_eq!(final_drift.response["error_code"], "final_artifact_drift");
+    assert!(final_drift.response.get("text").is_none());
+    assert!(final_drift.response.get("completion").is_none());
+    assert_eq!(final_drift.review_round, 2);
 }
 
 async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {

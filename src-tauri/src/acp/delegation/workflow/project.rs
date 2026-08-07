@@ -465,12 +465,17 @@ async fn project_manifest_mode(
     let run_by_id: HashMap<String, &delegation_task_run::Model> =
         parent_runs.iter().map(|r| (r.task_id.clone(), r)).collect();
 
+    let completion_run_bindings = completion_eligible_run_bindings(
+        &bindings,
+        &run_bindings,
+        current_gate_state_by_id.get(super::types::PHASE_FINAL),
+    );
     let completion_batch = load_workflow_completion_projection_batch(
         conn,
         header,
         &normalized,
         &bindings,
-        &run_bindings,
+        &completion_run_bindings,
         &parent_runs,
     )
     .await
@@ -771,6 +776,40 @@ impl ExecutionGateOverlaySummary {
     fn any_failed(&self) -> bool {
         self.task_gates_failed > 0 || self.final_gate_passed == Some(false)
     }
+}
+
+fn completion_eligible_run_bindings(
+    bindings: &[delegation_workflow_node_binding::Model],
+    run_bindings: &[delegation_workflow_run_binding::Model],
+    state: Option<&delegation_workflow_gate_state::Model>,
+) -> Vec<delegation_workflow_run_binding::Model> {
+    let final_reviewer_node_ids = bindings
+        .iter()
+        .filter(|binding| {
+            binding.phase_id == super::types::PHASE_FINAL && binding.role == "reviewer"
+        })
+        .map(|binding| binding.node_id.as_str())
+        .collect::<HashSet<_>>();
+    let selected = state.and_then(|state| {
+        serde_json::from_str::<BTreeSet<String>>(&state.selected_node_ids_json).ok()
+    });
+    run_bindings
+        .iter()
+        .filter(|binding| {
+            if !final_reviewer_node_ids.contains(binding.node_id.as_str()) {
+                return true;
+            }
+            state
+                .zip(selected.as_ref())
+                .is_some_and(|(state, selected)| {
+                    binding.gate_id.as_deref() == Some(state.gate_id.as_str())
+                        && binding.gate_lineage.as_deref() == Some(state.gate_lineage.as_str())
+                        && (!selected.contains(&binding.node_id)
+                            || binding.review_round == Some(state.current_review_round))
+                })
+        })
+        .cloned()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)] // Projection inputs mirror the persisted node/run surfaces.
@@ -1449,7 +1488,7 @@ fn apply_execution_gate_overlays(
     }
 
     // --- Final pair: phase=final reviewer + optional fixer (eligible only) ---
-    let mut final_rev: Option<usize> = None;
+    let mut final_reviewers = Vec::new();
     let mut final_fix: Option<usize> = None;
     for (i, n) in nodes.iter().enumerate() {
         if !gate_eligible.contains(&n.node_id) {
@@ -1462,33 +1501,45 @@ fn apply_execution_gate_overlays(
             continue;
         }
         match (n.phase_id.as_deref(), n.role.as_deref()) {
-            (Some("final"), Some("reviewer")) => final_rev = Some(i),
+            (Some("final"), Some("reviewer")) => final_reviewers.push(i),
             (Some("final"), Some("fixer")) => final_fix = Some(i),
             _ => {}
         }
     }
 
-    if let Some(ri) = final_rev {
-        let rev_id = nodes[ri].node_id.clone();
-        let rev_ev = evidence_by_node.get(&rev_id).cloned();
+    if !final_reviewers.is_empty() {
         let fix_ev = final_fix.and_then(|fi| {
             let id = nodes[fi].node_id.clone();
             evidence_by_node.get(&id).cloned()
         });
+        let required_reviewers = final_reviewers
+            .iter()
+            .map(|reviewer_index| {
+                let node_id = nodes[*reviewer_index].node_id.clone();
+                RequiredReviewerEvidence {
+                    evidence: evidence_by_node.get(&node_id).cloned(),
+                    node_id,
+                }
+            })
+            .collect::<Vec<_>>();
 
         // Final cannot settle while current Task tip evidence is unavailable.
         if matches!(branch_tip, DerivedBranchTip::Pending) {
             summary.final_gate_passed = Some(false);
-            if matches!(
-                nodes[ri].status,
-                ProjectedNodeStatus::Completed | ProjectedNodeStatus::WaitingReview
-            ) {
-                nodes[ri].status = ProjectedNodeStatus::WaitingReview;
-                nodes[ri].status_reason = Some("branch_tip_pending".into());
-            } else {
-                nodes[ri].status_reason = Some("branch_tip_pending".into());
+            for reviewer_index in final_reviewers {
+                if matches!(
+                    nodes[reviewer_index].status,
+                    ProjectedNodeStatus::Completed | ProjectedNodeStatus::WaitingReview
+                ) {
+                    nodes[reviewer_index].status = ProjectedNodeStatus::WaitingReview;
+                }
+                nodes[reviewer_index].status_reason = Some("branch_tip_pending".into());
             }
-        } else if rev_ev.is_some() || fix_ev.is_some() {
+        } else if required_reviewers
+            .iter()
+            .any(|reviewer| reviewer.evidence.is_some())
+            || fix_ev.is_some()
+        {
             let tip = match &branch_tip {
                 DerivedBranchTip::Digest(d) => Some(d.clone()),
                 // No tasks: tip match not required (still need non-empty reviewer digest).
@@ -1503,14 +1554,28 @@ fn apply_execution_gate_overlays(
             );
             let eval = evaluate_execution_gate(&ExecutionGateInput {
                 kind: ExecutionGateKind::Final,
-                implementer_or_fixer: fix_ev,
-                required_reviewers: vec![RequiredReviewerEvidence {
-                    node_id: rev_id,
-                    evidence: rev_ev,
-                }],
-                branch_tip_digest: tip,
+                implementer_or_fixer: fix_ev.clone(),
+                required_reviewers: required_reviewers.clone(),
+                branch_tip_digest: tip.clone(),
             });
-            apply_eval_to_final(&mut nodes[ri], &eval, &mut summary);
+            summary.final_gate_passed = Some(eval.passed);
+            for (reviewer_index, reviewer) in final_reviewers.into_iter().zip(required_reviewers) {
+                let outcome_reason = reviewer
+                    .evidence
+                    .as_ref()
+                    .and_then(|evidence| match evidence.completion_outcome {
+                        Some(CompletionOutcome::RequestChanges) => Some("request_changes"),
+                        Some(CompletionOutcome::Block) => Some("block"),
+                        _ => None,
+                    });
+                let individual = evaluate_execution_gate(&ExecutionGateInput {
+                    kind: ExecutionGateKind::Final,
+                    implementer_or_fixer: fix_ev.clone(),
+                    required_reviewers: vec![reviewer],
+                    branch_tip_digest: tip.clone(),
+                });
+                apply_eval_to_final(&mut nodes[reviewer_index], &individual, outcome_reason);
+            }
         }
     }
 
@@ -1691,14 +1756,14 @@ fn apply_eval_to_task(
 fn apply_eval_to_final(
     rev_node: &mut WorkflowNodeSnapshot,
     eval: &ExecutionGateEval,
-    summary: &mut ExecutionGateOverlaySummary,
+    outcome_reason: Option<&str>,
 ) {
-    if eval.passed {
-        summary.final_gate_passed = Some(true);
-        return;
+    if !eval.passed {
+        demote_reviewer_on_gate_fail(rev_node, &eval.reason);
+        if let Some(outcome_reason) = outcome_reason {
+            rev_node.status_reason = Some(outcome_reason.to_string());
+        }
     }
-    summary.final_gate_passed = Some(false);
-    demote_reviewer_on_gate_fail(rev_node, &eval.reason);
 }
 
 fn demote_reviewer_on_gate_fail(rev_node: &mut WorkflowNodeSnapshot, reason: &ExecutionGateReason) {
@@ -4458,6 +4523,48 @@ mod tests {
             reviewer.status_reason.as_deref(),
             Some("branch_tip_pending")
         );
+    }
+
+    #[test]
+    fn final_projection_requires_every_required_reviewer_outcome() {
+        let mut codex = tip_impl_node("final-reviewer-codex", 0, "final-codex");
+        codex.phase_id = Some("final".into());
+        codex.role = Some("reviewer".into());
+        codex.task_index = None;
+        let mut grok = tip_impl_node("final-reviewer-grok", 0, "final-grok");
+        grok.phase_id = Some("final".into());
+        grok.role = Some("reviewer".into());
+        grok.task_index = None;
+
+        let mut request_changes = tip_impl_ev("final-codex", 1, "final-tip");
+        request_changes.completion_protocol_version = 2;
+        request_changes.completion_state = Some(CompletionState::Resolved);
+        request_changes.completion_outcome = Some(CompletionOutcome::RequestChanges);
+        request_changes.completion_evidence_validated = true;
+        request_changes.work_status = None;
+        let mut approve = request_changes.clone();
+        approve.task_id = "final-grok".into();
+        approve.completion_outcome = Some(CompletionOutcome::Approve);
+
+        let mut nodes = vec![codex, grok];
+        let evidence = HashMap::from([
+            ("final-reviewer-codex".into(), request_changes),
+            ("final-reviewer-grok".into(), approve),
+        ]);
+        let eligible = HashSet::from(["final-reviewer-codex".into(), "final-reviewer-grok".into()]);
+
+        let summary = apply_execution_gate_overlays(
+            &mut nodes,
+            &evidence,
+            &eligible,
+            &[],
+            &mut PublicIdAllocator::default(),
+        );
+
+        assert_eq!(summary.final_gate_passed, Some(false));
+        assert_eq!(nodes[0].status, ProjectedNodeStatus::WaitingReview);
+        assert_eq!(nodes[0].status_reason.as_deref(), Some("request_changes"));
+        assert_eq!(nodes[1].status, ProjectedNodeStatus::Completed);
     }
 
     fn tip_impl_node(node_id: &str, task_index: u32, task_id: &str) -> WorkflowNodeSnapshot {

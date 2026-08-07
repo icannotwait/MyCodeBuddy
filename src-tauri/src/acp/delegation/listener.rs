@@ -54,12 +54,13 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
-    guard_current_final_delivery_core, publish_workflow_manifest_with_selection_core,
-    recover_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
-    settle_workflow_gate_core, settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig,
-    FinalDeliveryGuardResult, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
-    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
-    WorkflowRecoveryDisposition, WorkflowStoreError,
+    guard_current_final_delivery_core, guard_task_final_delivery_core,
+    publish_workflow_manifest_with_selection_core, recover_workflow_core,
+    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_core,
+    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, FinalDeliveryGuardResult,
+    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
+    SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition,
+    WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -3049,6 +3050,25 @@ impl DelegationListener {
         let (Some(task_id), Some(runs)) = (task_id, self.broker.run_store()) else {
             return;
         };
+        let final_guard =
+            guard_task_final_delivery_core(runs.db(), &self.workflow_emitter, task_id).await;
+        match final_guard {
+            Ok(Some(FinalDeliveryGuardResult::Reopened { diagnostic, .. }))
+            | Ok(Some(FinalDeliveryGuardResult::Rejected(diagnostic))) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("status".into(), Value::String("failed".into()));
+                    object.insert(
+                        "error_code".into(),
+                        Value::String("final_artifact_drift".into()),
+                    );
+                    object.insert("message".into(), Value::String(diagnostic.to_string()));
+                    object.remove("text");
+                    object.remove("completion");
+                }
+                return;
+            }
+            Ok(Some(FinalDeliveryGuardResult::Ready(_))) | Ok(None) | Err(_) => {}
+        }
         match crate::acp::delegation::workflow::load_completion_projection(&runs.db().conn, task_id)
             .await
         {

@@ -122,7 +122,6 @@ pub use state_dto::{
     WorkflowStateDto, WorkflowStateIndexDto, DIGEST_PREFIX_HEX_CHARS, INDEX_MAX_FINDING_STUBS,
     INDEX_MAX_NODES,
 };
-pub(crate) use store::guard_current_final_delivery_core;
 pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
@@ -135,6 +134,7 @@ pub use store::{
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
+pub(crate) use store::{guard_current_final_delivery_core, guard_task_final_delivery_core};
 pub use types::*;
 pub use validate::validate_manifest_document;
 #[cfg(any(test, feature = "test-utils"))]
