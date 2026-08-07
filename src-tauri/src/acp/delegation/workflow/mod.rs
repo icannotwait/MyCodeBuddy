@@ -125,7 +125,8 @@ pub use state_dto::{
 pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
-    guard_final_delivery_core, load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
+    guard_current_final_delivery_core, guard_final_delivery_core, guard_task_final_delivery_core,
+    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
     publish_workflow_manifest_with_selection_core, recover_workflow_core,
     settle_workflow_gate_core, settle_workflow_gate_v2_core, FinalDeliveryGuardRequest,
     FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
@@ -134,7 +135,6 @@ pub use store::{
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
-pub(crate) use store::{guard_current_final_delivery_core, guard_task_final_delivery_core};
 pub use types::*;
 pub use validate::validate_manifest_document;
 #[cfg(any(test, feature = "test-utils"))]

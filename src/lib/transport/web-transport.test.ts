@@ -356,3 +356,228 @@ describe("WebTransport call abort + timeout", () => {
     expect(removeSpy).toHaveBeenCalled()
   })
 })
+
+describe("WebTransport completion context capture/replay", () => {
+  const COMPLETION_CONTEXT_HEADER = "x-codeg-completion-context"
+
+  function mockJsonResponse(body: unknown, headers?: Record<string, string>) {
+    const headerMap = new Map(
+      Object.entries(headers ?? {}).map(([k, v]) => [k.toLowerCase(), v])
+    )
+    return {
+      status: 200,
+      ok: true,
+      headers: {
+        get: (name: string) => headerMap.get(name.toLowerCase()) ?? null,
+      },
+      json: async () => body,
+    }
+  }
+
+  function callHeaders(callIndex: number): HeadersInit | undefined {
+    const init = fetchMock.mock.calls[callIndex]?.[1] as
+      | { headers?: HeadersInit }
+      | undefined
+    return init?.headers
+  }
+
+  it("captures snapshot capability and replays it on completion mutations", async () => {
+    const t = new WebTransport("http://localhost")
+    const attentionId = "attention-root-42"
+    const token = "completion-token-root-42"
+
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse(
+          {
+            schema_version: 1,
+            workflow_kind: "brainstorm_to_delivery",
+            nodes: [
+              {
+                node_id: "plan-author",
+                kind: "work_unit",
+                completion: {
+                  protocol_version: 2,
+                  graph_revision: 1,
+                  card: {
+                    state: "needs_decision",
+                    evidence_validated: false,
+                    attention: {
+                      attention_id: attentionId,
+                      task_id: "task-1",
+                      kind: "completion_decision",
+                      captured_scope_digest: "sha256:abc",
+                      latest_run_id: "task-1",
+                      node_id: "plan-author",
+                    },
+                  },
+                },
+              },
+            ],
+            edges: [],
+            gates: [],
+            phases: [],
+            current_node_ids: [],
+            overall_state: "in_progress",
+            compatibility: "manifest",
+          },
+          { [COMPLETION_CONTEXT_HEADER]: token }
+        )
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
+
+    await t.call("get_workflow_graph_snapshot", { conversationId: 42 })
+
+    await t.call("resolve_completion_decision", {
+      cas: {
+        attention_id: attentionId,
+        task_id: "task-1",
+        kind: "completion_decision",
+        captured_scope_digest: "sha256:abc",
+        latest_run_id: "task-1",
+        node_id: "plan-author",
+      },
+      outcome: "done",
+    })
+    await t.call("restart_legacy_workflow", { sourceConversationId: 42 })
+
+    const decisionHeaders = callHeaders(1) as Record<string, string>
+    const restartHeaders = callHeaders(2) as Record<string, string>
+    expect(decisionHeaders[COMPLETION_CONTEXT_HEADER]).toBe(token)
+    expect(restartHeaders[COMPLETION_CONTEXT_HEADER]).toBe(token)
+  })
+
+  it("scopes replayed capabilities to the snapshot root", async () => {
+    const t = new WebTransport("http://localhost")
+
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse(
+          {
+            schema_version: 1,
+            workflow_kind: "brainstorm_to_delivery",
+            nodes: [
+              {
+                node_id: "n1",
+                kind: "work_unit",
+                completion: {
+                  protocol_version: 2,
+                  graph_revision: 1,
+                  card: {
+                    state: "needs_decision",
+                    evidence_validated: false,
+                    attention: {
+                      attention_id: "att-1",
+                      task_id: "t1",
+                      kind: "completion_decision",
+                      captured_scope_digest: "sha256:1",
+                      latest_run_id: "t1",
+                      node_id: "n1",
+                    },
+                  },
+                },
+              },
+            ],
+            edges: [],
+            gates: [],
+            phases: [],
+            current_node_ids: [],
+            overall_state: "in_progress",
+            compatibility: "manifest",
+          },
+          { [COMPLETION_CONTEXT_HEADER]: "token-root-1" }
+        )
+      )
+      .mockResolvedValueOnce(
+        mockJsonResponse(
+          {
+            schema_version: 1,
+            workflow_kind: "brainstorm_to_delivery",
+            nodes: [
+              {
+                node_id: "n2",
+                kind: "work_unit",
+                completion: {
+                  protocol_version: 2,
+                  graph_revision: 1,
+                  card: {
+                    state: "needs_decision",
+                    evidence_validated: false,
+                    attention: {
+                      attention_id: "att-2",
+                      task_id: "t2",
+                      kind: "completion_decision",
+                      captured_scope_digest: "sha256:2",
+                      latest_run_id: "t2",
+                      node_id: "n2",
+                    },
+                  },
+                },
+              },
+            ],
+            edges: [],
+            gates: [],
+            phases: [],
+            current_node_ids: [],
+            overall_state: "in_progress",
+            compatibility: "manifest",
+          },
+          { [COMPLETION_CONTEXT_HEADER]: "token-root-2" }
+        )
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
+
+    await t.call("get_workflow_graph_snapshot", { conversationId: 1 })
+    await t.call("get_workflow_graph_snapshot", { conversationId: 2 })
+
+    await t.call("retry_completion_artifact", {
+      cas: {
+        attention_id: "att-1",
+        task_id: "t1",
+        kind: "completion_artifact_recovery",
+        captured_scope_digest: "sha256:1",
+        latest_run_id: "t1",
+        node_id: "n1",
+      },
+    })
+    await t.call("resolve_design_self_review", {
+      cas: {
+        attention_id: "att-2",
+        task_id: "t2",
+        kind: "design_self_review_decision",
+        captured_scope_digest: "sha256:2",
+        latest_run_id: "t2",
+        node_id: "n2",
+      },
+      outcome: "approve",
+    })
+
+    const retryHeaders = callHeaders(2) as Record<string, string>
+    const selfReviewHeaders = callHeaders(3) as Record<string, string>
+    expect(retryHeaders[COMPLETION_CONTEXT_HEADER]).toBe("token-root-1")
+    expect(selfReviewHeaders[COMPLETION_CONTEXT_HEADER]).toBe("token-root-2")
+  })
+
+  it("does not send bearer-only completion mutations without a captured capability", async () => {
+    const t = new WebTransport("http://localhost")
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ ok: true }))
+
+    await t.call("resolve_completion_decision", {
+      cas: {
+        attention_id: "unknown-attention",
+        task_id: "t",
+        kind: "completion_decision",
+        captured_scope_digest: "sha256:x",
+        latest_run_id: "t",
+        node_id: "n",
+      },
+      outcome: "done",
+    })
+
+    const headers = callHeaders(0) as Record<string, string>
+    expect(headers[COMPLETION_CONTEXT_HEADER]).toBeUndefined()
+    expect(headers.Authorization).toBe("Bearer tok")
+  })
+})

@@ -54,6 +54,18 @@ interface WebEvent {
 
 const getToken = getCodegToken
 
+/** Opaque root capability issued by authenticated workflow snapshots. */
+export const COMPLETION_CONTEXT_HEADER = "x-codeg-completion-context"
+
+const COMPLETION_MUTATION_COMMANDS = new Set([
+  "resolve_completion_decision",
+  "retry_completion_artifact",
+  "resolve_design_self_review",
+  "restart_legacy_workflow",
+])
+
+const SNAPSHOT_COMMAND = "get_workflow_graph_snapshot"
+
 export class WebTransport implements Transport {
   private ws: WebSocket | null = null
   private handlers = new Map<string, Set<(payload: unknown) => void>>()
@@ -97,6 +109,11 @@ export class WebTransport implements Transport {
   // a late 200 can't reopen the socket behind the session-expired dialog.
   private probeEpoch = 0
   private probeController: AbortController | null = null
+  // Root-scoped completion capabilities issued by
+  // `get_workflow_graph_snapshot`. Mutations must replay the matching root
+  // token; bearer-only maps to GlobalOperator and is rejected server-side.
+  private completionContextByRoot = new Map<number, string>()
+  private completionContextByAttention = new Map<string, string>()
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl
@@ -175,14 +192,20 @@ export class WebTransport implements Transport {
       throw new DOMException("The operation was aborted.", "AbortError")
     }
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    }
+    const completionContext = this.completionContextForCall(command, args)
+    if (completionContext) {
+      headers[COMPLETION_CONTEXT_HEADER] = completionContext
+    }
+
     let res: Response
     try {
       res = await fetch(`${this.baseUrl}/api/${command}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers,
         body: JSON.stringify(args ?? {}),
         signal: controller.signal,
       })
@@ -213,8 +236,89 @@ export class WebTransport implements Transport {
       }))
       throw error
     }
-    return res.json()
+    const body = (await res.json()) as T
+    this.captureCompletionContext(command, args, res, body)
+    return body
   }
+
+  /**
+   * Resolve the root-scoped capability for a completion mutation. CAS-based
+   * mutations look up the attention_id indexed from the last snapshot for
+   * that root; legacy restart uses sourceConversationId.
+   */
+  private completionContextForCall(
+    command: string,
+    args?: Record<string, unknown>
+  ): string | undefined {
+    if (!COMPLETION_MUTATION_COMMANDS.has(command)) {
+      return undefined
+    }
+    if (command === "restart_legacy_workflow") {
+      const sourceConversationId = args?.sourceConversationId
+      if (typeof sourceConversationId === "number") {
+        return this.completionContextByRoot.get(sourceConversationId)
+      }
+      return undefined
+    }
+    const cas = args?.cas
+    if (cas && typeof cas === "object") {
+      const attentionId = (cas as { attention_id?: unknown }).attention_id
+      if (typeof attentionId === "string" && attentionId.length > 0) {
+        return this.completionContextByAttention.get(attentionId)
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Capture `x-codeg-completion-context` from snapshot responses and index
+   * it by root conversation id and every attention_id projected in the body.
+   */
+  private captureCompletionContext(
+    command: string,
+    args: Record<string, unknown> | undefined,
+    res: Response,
+    body: unknown
+  ): void {
+    if (command !== SNAPSHOT_COMMAND) {
+      return
+    }
+    const context = res.headers.get(COMPLETION_CONTEXT_HEADER)
+    if (!context) {
+      return
+    }
+    const conversationId = args?.conversationId
+    if (typeof conversationId === "number") {
+      this.completionContextByRoot.set(conversationId, context)
+    }
+    this.indexAttentionsFromSnapshot(body, context)
+  }
+
+  private indexAttentionsFromSnapshot(body: unknown, context: string): void {
+    if (!body || typeof body !== "object") {
+      return
+    }
+    const snapshot = body as {
+      completion?: { card?: { attention?: { attention_id?: unknown } } }
+      nodes?: Array<{
+        completion?: { card?: { attention?: { attention_id?: unknown } } }
+      }>
+    }
+    const rootAttention = snapshot.completion?.card?.attention?.attention_id
+    if (typeof rootAttention === "string" && rootAttention.length > 0) {
+      this.completionContextByAttention.set(rootAttention, context)
+    }
+    if (!Array.isArray(snapshot.nodes)) {
+      return
+    }
+    for (const node of snapshot.nodes) {
+      const attentionId = node?.completion?.card?.attention?.attention_id
+      if (typeof attentionId === "string" && attentionId.length > 0) {
+        this.completionContextByAttention.set(attentionId, context)
+      }
+    }
+  }
+
 
   async subscribe<T>(
     event: string,
@@ -592,6 +696,8 @@ export class WebTransport implements Transport {
     this.reconnectCallbacks.clear()
     this.wsReadyCallbacks.clear()
     this.connListeners.clear()
+    this.completionContextByRoot.clear()
+    this.completionContextByAttention.clear()
     this.eventStreamInstance?.destroy()
     this.eventStreamInstance = null
     // Settle any in-flight `subscribe()` awaiters so their promises don't

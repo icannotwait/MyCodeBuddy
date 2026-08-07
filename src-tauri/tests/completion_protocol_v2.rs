@@ -34,7 +34,8 @@ use codeg_lib::acp::delegation::types::{
 };
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, capture_original_request_context, evaluate_rollout_window,
-    get_workflow_state_core, guard_final_delivery_core, inject_legacy_restart_header_failure_once,
+    get_workflow_state_core, guard_current_final_delivery_core, guard_final_delivery_core,
+    guard_task_final_delivery_core, inject_legacy_restart_header_failure_once,
     materialize_terminal_completion_txn, project_workflow_graph_core,
     publish_workflow_manifest_core, publish_workflow_manifest_with_selection_core,
     restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
@@ -1079,22 +1080,33 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
         "Added Final review passed.\n\nConclusion: approve",
     )
     .await;
-    let ready_after_add = guard_final_delivery_core(
+    // Production listener/root paths go through preflight request construction
+    // (`current_final_delivery_request`), not a hand-built guard request.
+    let ready_after_add_task = guard_task_final_delivery_core(&db, &EventEmitter::Noop, extra_task_id)
+        .await
+        .expect("production task delivery path must not fail after roster add");
+    assert!(
+        matches!(
+            ready_after_add_task,
+            Some(FinalDeliveryGuardResult::Ready(_))
+        ),
+        "selected Final reviewer must reach delivery via guard_task_final_delivery_core after roster add; got {ready_after_add_task:?}"
+    );
+    let ready_after_add_current = guard_current_final_delivery_core(
         &db,
         &EventEmitter::Noop,
-        FinalDeliveryGuardRequest {
-            workflow_id: published.workflow_id.clone(),
-            gate_id: PHASE_FINAL.into(),
-            workspace_path: repo.path().to_path_buf(),
-            final_reviewer_task_id: extra_task_id.into(),
-        },
+        parent,
+        Some(&published.workflow_id),
     )
     .await
-    .unwrap();
-    assert!(matches!(
-        ready_after_add,
-        FinalDeliveryGuardResult::Ready(_)
-    ));
+    .expect("production current delivery path must not fail after roster add");
+    assert!(
+        matches!(
+            ready_after_add_current,
+            Some(FinalDeliveryGuardResult::Ready(_))
+        ),
+        "root path must evaluate selective Final delivery after roster add; got {ready_after_add_current:?}"
+    );
 
     document.expected_manifest_revision = Some(added.manifest_revision);
     document.publication_token.push_str("-remove");
@@ -1126,22 +1138,32 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
     assert_eq!(removed_state.current_review_round, 2);
     assert_eq!(removed_state.selected_node_ids_json, "[]");
 
-    let ready_after_remove = guard_final_delivery_core(
+    let ready_after_remove_task =
+        guard_task_final_delivery_core(&db, &EventEmitter::Noop, codex_task_id)
+            .await
+            .expect("production task delivery path must not fail after roster remove");
+    assert!(
+        matches!(
+            ready_after_remove_task,
+            Some(FinalDeliveryGuardResult::Ready(_))
+        ),
+        "retained earlier-round Final reviewer must reach delivery via guard_task_final_delivery_core after roster remove; got {ready_after_remove_task:?}"
+    );
+    let ready_after_remove_current = guard_current_final_delivery_core(
         &db,
         &EventEmitter::Noop,
-        FinalDeliveryGuardRequest {
-            workflow_id: published.workflow_id,
-            gate_id: PHASE_FINAL.into(),
-            workspace_path: repo.path().to_path_buf(),
-            final_reviewer_task_id: codex_task_id.into(),
-        },
+        parent,
+        Some(&published.workflow_id),
     )
     .await
-    .unwrap();
-    assert!(matches!(
-        ready_after_remove,
-        FinalDeliveryGuardResult::Ready(_)
-    ));
+    .expect("production current delivery path must not fail after roster remove");
+    assert!(
+        matches!(
+            ready_after_remove_current,
+            Some(FinalDeliveryGuardResult::Ready(_))
+        ),
+        "root path must evaluate selective Final delivery after roster remove; got {ready_after_remove_current:?}"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]

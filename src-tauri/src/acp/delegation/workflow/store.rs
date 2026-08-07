@@ -762,7 +762,7 @@ pub async fn guard_final_delivery_core(
 /// Run the Final delivery freeze once every required reviewer in the current
 /// Final cohort has a passing run. Root workflow-state reads call this before
 /// projection so a live branch drift cannot bypass the platform-owned gate.
-pub(crate) async fn guard_current_final_delivery_core(
+pub async fn guard_current_final_delivery_core(
     db: &AppDatabase,
     emitter: &EventEmitter,
     parent_conversation_id: i32,
@@ -809,7 +809,7 @@ pub(crate) async fn guard_current_final_delivery_core(
 /// Run the Final delivery freeze while enriching one terminal task response.
 /// Non-Final, stale, non-required, and incomplete-cohort tasks are not delivery
 /// candidates and therefore leave ordinary completion projection untouched.
-pub(crate) async fn guard_task_final_delivery_core(
+pub async fn guard_task_final_delivery_core(
     db: &AppDatabase,
     emitter: &EventEmitter,
     task_id: &str,
@@ -866,7 +866,35 @@ async fn current_final_delivery_request(
     else {
         return Ok(None);
     };
+    // Align with selection-aware `guard_final_delivery_txn`: selected nodes
+    // must cover the current review round, while retained unselected siblings
+    // may keep earlier same-lineage rounds after roster-only add/remove.
+    let selected_node_ids =
+        match serde_json::from_str::<BTreeSet<String>>(&current_final_gate.selected_node_ids_json) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(None),
+        };
+    let required_reviewer_node_ids = required_final_reviewers
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    if !selected_node_ids.is_subset(&required_reviewer_node_ids) {
+        return Ok(None);
+    }
+    let binding_covers_current_selection =
+        |candidate: &delegation_workflow_run_binding::Model| {
+            candidate.gate_id.as_deref() == Some(current_final_gate.gate_id.as_str())
+                && candidate.gate_lineage.as_deref() == Some(current_final_gate.gate_lineage.as_str())
+                && if selected_node_ids.contains(&candidate.node_id) {
+                    candidate.review_round == Some(current_final_gate.current_review_round)
+                } else {
+                    candidate.review_round.is_some_and(|review_round| {
+                        review_round > 0 && review_round < current_final_gate.current_review_round
+                    })
+                }
+        };
     let mut delivery_anchor = None;
+    let mut preferred_selected_anchor = None;
     let mut required_task_anchor = None;
     for reviewer in required_final_reviewers {
         let Some(binding) = delegation_workflow_run_binding::Entity::find()
@@ -881,10 +909,7 @@ async fn current_final_delivery_request(
         else {
             return Ok(None);
         };
-        if binding.gate_id.as_deref() != Some(current_final_gate.gate_id.as_str())
-            || binding.gate_lineage.as_deref() != Some(current_final_gate.gate_lineage.as_str())
-            || binding.review_round != Some(current_final_gate.current_review_round)
-        {
+        if !binding_covers_current_selection(&binding) {
             return Ok(None);
         }
         let Some(run) = delegation_task_run::Entity::find_by_id(&binding.task_id)
@@ -907,6 +932,9 @@ async fn current_final_delivery_request(
         if delivery_anchor.is_none() {
             delivery_anchor = Some((binding.clone(), run.clone()));
         }
+        if selected_node_ids.contains(&binding.node_id) {
+            preferred_selected_anchor = Some((binding.clone(), run.clone()));
+        }
         if required_task_id == Some(binding.task_id.as_str()) {
             required_task_anchor = Some((binding, run));
         }
@@ -916,7 +944,9 @@ async fn current_final_delivery_request(
             Some(anchor) => anchor,
             None => return Ok(None),
         },
-        None => delivery_anchor.expect("required Final cohort is non-empty"),
+        None => preferred_selected_anchor
+            .or(delivery_anchor)
+            .expect("required Final cohort is non-empty"),
     };
     let workspace_path = run
         .workspace_path
