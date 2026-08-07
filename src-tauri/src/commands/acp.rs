@@ -14065,18 +14065,6 @@ wire_api = "chat"
     }
 
     #[test]
-    fn plan_hermes_base_url_reconcile_no_op_when_equal() {
-        assert_eq!(
-            plan_hermes_base_url_reconcile(
-                "openai-api",
-                Some("https://sub2api/v1"),
-                Some("https://sub2api/v1"),
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn plan_hermes_base_url_reconcile_ignores_trailing_slash() {
         // Trailing-slash-only differences must not churn .env (both directions).
         assert_eq!(

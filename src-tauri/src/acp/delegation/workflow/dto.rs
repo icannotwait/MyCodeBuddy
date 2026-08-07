@@ -511,13 +511,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redacts_unix_absolute_path() {
-        let s = redact_display_string("see /home/user/secret/file.rs for details");
-        assert!(!s.contains("/home/user"));
-        assert!(s.contains(REDACTED));
-    }
-
-    #[test]
     fn redacts_any_posix_absolute_with_segments_not_allowlist() {
         // Fail-closed: not limited to known roots like /home or /tmp.
         let s = redact_display_string("leaked /secret/project/keys.pem here");

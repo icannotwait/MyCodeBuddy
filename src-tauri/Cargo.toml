@@ -16,7 +16,9 @@ homepage = "https://github.com/icannotwait/MyCodeBuddy"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "codeg_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop/server binaries and Rust tests only consume the rlib. Tauri mobile
+# builds would additionally require staticlib/cdylib.
+crate-type = ["rlib"]
 
 [features]
 default = ["tauri-runtime"]

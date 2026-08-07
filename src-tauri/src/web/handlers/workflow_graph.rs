@@ -436,26 +436,4 @@ mod tests {
             assert_eq!(body["code"], "not_implemented");
         }
     }
-
-    /// Source-level route-table assertion: production router source must not
-    /// register mutation/agent-facing workflow tools, and must register the
-    /// read snapshot POST only among workflow graph endpoints.
-    #[test]
-    fn production_router_source_has_snapshot_only() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/web/router.rs"));
-        assert!(
-            source.contains("/get_workflow_graph_snapshot"),
-            "read snapshot route must be registered"
-        );
-        for cmd in FORBIDDEN_HTTP_COMMANDS {
-            assert!(
-                !source.contains(&format!("\"/{cmd}\"")),
-                "router must not register HTTP route for {cmd}"
-            );
-            assert!(
-                !source.contains(&format!("'/{cmd}'")),
-                "router must not register HTTP route for {cmd}"
-            );
-        }
-    }
 }

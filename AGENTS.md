@@ -33,6 +33,9 @@ pnpm build                     # 静态导出构建
 ```bash
 # 桌面模式（默认 feature）
 cargo check
+# 日常快测：只运行库单元测试，跳过二进制与集成测试链接
+cargo test --lib --features test-utils
+# 完整回归：运行库、二进制与集成测试
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
 
@@ -49,6 +52,27 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
+
+### 低内存 Rust 开发（在仓库根目录执行）
+
+仅在明确受低内存约束时使用以下 opt-in 命令：
+
+```bash
+# 4 GiB 机器的日常 Rust 反馈：只检查共享核心，不启用 Tauri
+pnpm rust:check:low-memory
+# 仅在改动对应运行面时执行；桌面检查仍可能超过 4 GiB
+pnpm rust:check:desktop:low-memory
+pnpm rust:check:server:low-memory
+pnpm rust:check:mcp:low-memory
+# 有更高可用内存或足够页文件时，才运行精确单测
+pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
+```
+
+低内存配置将 Cargo 编译任务和测试线程限制为 1，并关闭增量编译和调试信息，
+但首次冷编译仍可能较慢。`--exact` 只过滤测试运行，不会缩小编译目标；当前
+Windows 整库测试程序包含 4,028 个测试，单个 `rustc` 在低内存配置下实测峰值
+仍约 7.55 GiB。因此 4 GiB 机器默认只运行共享核心 check，Rust 单测与完整回归
+交由 CI 或更高内存机器执行；足够大的系统页文件可能有帮助，但不作成功保证。
 
 ## 架构
 

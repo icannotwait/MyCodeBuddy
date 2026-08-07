@@ -1507,4 +1507,22 @@ mod recovery_authorization {
         assert!(ids.contains(&"retention-row-1".into()));
         assert!(ids.contains(&"retention-row-6".into()));
     }
+
+    /// Regression: desktop setup calls `build_delegation_stack` (and thus
+    /// `start_maintenance`) on the main thread outside a Tokio context.
+    /// Plain `tokio::spawn` panics there; the tauri-runtime path must not.
+    #[cfg(feature = "tauri-runtime")]
+    #[test]
+    fn start_maintenance_outside_tokio_context_does_not_panic() {
+        let conn = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(async { fresh_in_memory_db().await.conn })
+            // runtime dropped here — no Handle::current()
+        };
+        let service = Arc::new(RecoveryAuthorizationService::new(conn));
+        service.start_maintenance();
+    }
 }

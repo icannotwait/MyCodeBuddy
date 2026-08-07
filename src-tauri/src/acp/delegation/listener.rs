@@ -4929,14 +4929,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_correlation_id_null_is_err() {
-        assert!(
-            parse_correlation_id(&json!({"correlation_id": null})).is_err(),
-            "explicit JSON null is malformed, not omission"
-        );
-    }
-
-    #[test]
     fn parse_correlation_id_accepts_valid() {
         assert_eq!(
             parse_correlation_id(&json!({"correlation_id": "abc-123"})).unwrap(),

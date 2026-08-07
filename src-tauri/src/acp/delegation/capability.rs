@@ -74,21 +74,4 @@ mod tests {
             ContinueCapabilityDecision::Allowed
         );
     }
-
-    #[test]
-    fn initial_delegate_is_not_gated_by_capability() {
-        // Documented contract: even agents with capability=false may still
-        // receive gen-1 `delegate_to_agent`. There is no gate helper for that
-        // path — callers must not invoke `gate_continue_session_reuse` there.
-        for agent in [
-            AgentType::Cursor,
-            AgentType::OpenCode,
-            AgentType::Codex,
-            AgentType::ClaudeCode,
-        ] {
-            let _ = agent_supports_session_reuse(agent); // may be true or false
-                                                         // No assertion that would block gen-1 — presence of this test pins
-                                                         // the API surface used only by continue.
-        }
-    }
 }

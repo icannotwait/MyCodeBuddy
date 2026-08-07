@@ -4501,54 +4501,6 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// Manual smoke check against a real codex JSONL captured locally.
-    /// `#[ignore]` so it doesn't run in CI; activate with
-    /// `cargo test image_generation_smoke_real_session -- --ignored --nocapture`
-    /// while iterating on the parser locally.
-    #[test]
-    #[ignore]
-    fn image_generation_smoke_real_session() {
-        let path = PathBuf::from(
-            "/Users/xggz/.codex/sessions/2026/05/10/rollout-2026-05-10T06-13-43-019e0ecd-b954-7e33-8011-053d08baa62e.jsonl"
-        );
-        if !path.exists() {
-            eprintln!("session not found at {}; skipping", path.display());
-            return;
-        }
-        let parser = CodexParser::new();
-        let detail = parser
-            .parse_conversation_detail(&path, "smoke")
-            .expect("parse ok");
-
-        let mut imagegen_count = 0usize;
-        let mut prompt_chars = 0usize;
-        let mut total_bytes = 0usize;
-        for turn in &detail.turns {
-            for b in &turn.blocks {
-                if let ContentBlock::ImageGeneration {
-                    revised_prompt,
-                    image,
-                } = b
-                {
-                    imagegen_count += 1;
-                    if let Some(p) = revised_prompt {
-                        prompt_chars += p.chars().count();
-                    }
-                    if let Some(img) = image {
-                        total_bytes += img.data.len();
-                    }
-                }
-            }
-        }
-        eprintln!("image_generation_blocks={imagegen_count}");
-        eprintln!("revised_prompt_total_chars={prompt_chars}");
-        eprintln!("total_image_base64_bytes={total_bytes}");
-        assert!(
-            imagegen_count >= 1,
-            "expected at least 1 ContentBlock::ImageGeneration in the smoke session"
-        );
-    }
-
     /// When `revised_prompt` is absent in the payload, the parser must emit
     /// `revised_prompt: None` (codex's `imagegen` skill does not always echo
     /// the prompt back, e.g. when status="failed").

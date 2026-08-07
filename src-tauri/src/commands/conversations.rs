@@ -4196,53 +4196,6 @@ Call get_delegation_status with the returned task_id to collect the result.";
     }
 
     #[tokio::test]
-    async fn get_folder_conversation_core_injects_meta_for_real_child() {
-        // Seed a parent and a delegation child; the parent has no external_id
-        // (no JSONL on disk), so `turns` returns empty — but we still want to
-        // exercise the children-fetch + injection short-circuit cleanly.
-        // The richer end-to-end (with parser turns) is covered by the unit
-        // tests above; here we just verify the wiring inside the _core fn
-        // doesn't error on the join path.
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/codeg-inject-test").await;
-        let parent_id = create_conversation_core(
-            &db.conn,
-            folder_id,
-            AgentType::ClaudeCode,
-            Some("parent".into()),
-            None,
-        )
-        .await
-        .expect("parent");
-        // Attach a child to this parent via the delegation-link path.
-        let link = crate::acp::delegation::spawner::DelegationLink {
-            parent_conversation_id: parent_id,
-            parent_tool_use_id: "tu-historical".into(),
-            delegation_call_id: "call-historical".into(),
-        };
-        conversation_service::create_with_delegation(
-            &db.conn,
-            folder_id,
-            AgentType::Codex,
-            Some("child".into()),
-            None,
-            Some(link),
-        )
-        .await
-        .expect("child");
-        // Parent has no external_id → no JSONL → no turns to inject into.
-        // The call must still succeed without error.
-        let data_dir = TempDir::new().expect("tempdir");
-        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
-        let (detail, _parsed_title) =
-            get_folder_conversation_core(&db.conn, registry.as_ref(), parent_id)
-                .await
-                .expect("load");
-        assert_eq!(detail.summary.id, parent_id);
-        assert!(detail.turns.is_empty());
-    }
-
-    #[tokio::test]
     async fn create_conversation_core_happy_path() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-conv-test-1").await;

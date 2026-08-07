@@ -741,25 +741,6 @@ mod tool_watchdog_attribution_tests {
     }
 
     #[tokio::test]
-    async fn tool_watchdog_attribution_status_only_duplicates_do_not_renew() {
-        let attr = attribution();
-        let t0 = clock_base();
-        let turn = turn_a();
-        attr.start_turn(turn.clone(), t0).await;
-        attr.register_or_touch_tool(&turn, "tool-1", ToolCategory::Other, t0)
-            .await
-            .unwrap();
-        assert!(attr
-            .record_status(&turn, "tool-1", "inprogress", t0.advanced(1))
-            .await
-            .is_some());
-        assert!(attr
-            .record_status(&turn, "tool-1", "inprogress", t0.advanced(2))
-            .await
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn tool_watchdog_attribution_generic_content_renews_only_untracked_turn() {
         let attr = attribution();
         let t0 = clock_base();

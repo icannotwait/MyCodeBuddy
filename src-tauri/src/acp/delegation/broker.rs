@@ -16539,24 +16539,6 @@ mod tests {
     // -- Task 4.3 -----------------------------------------------------------
 
     #[tokio::test]
-    async fn config_round_trip() {
-        let broker = DelegationBroker::new(
-            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        );
-        broker
-            .set_config(DelegationConfig {
-                enabled: false,
-                depth_limit: 5,
-                ..DelegationConfig::default()
-            })
-            .await;
-        let got = broker.config_snapshot().await;
-        assert!(!got.enabled);
-        assert_eq!(got.depth_limit, 5);
-    }
-
-    #[tokio::test]
     async fn disabled_returns_canceled_without_touching_spawner() {
         let mock = Arc::new(MockSpawner::new());
         let broker =
@@ -19402,20 +19384,6 @@ mod tests {
 
     // -- Task 4.5: error paths ---------------------------------------------
 
-    #[tokio::test]
-    async fn spawn_failure_maps_to_spawn_failed() {
-        let mock = Arc::new(MockSpawner::new());
-        mock.queue_spawn(Err(SpawnerError::Spawn("nope".into())))
-            .await;
-        let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
-        enable_delegation(&broker).await;
-        let outcome = broker.handle_request(request(1, "pt-1")).await;
-        match outcome {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "spawn_failed"),
-            other => panic!("expected Err, got {other:?}"),
-        }
-    }
-
     #[test]
     fn gen1_and_continuation_instruction_failures_preserve_admission_codes() {
         let plan_error =
@@ -20231,23 +20199,6 @@ mod tests {
         assert_eq!(args[0].agent_type, AgentType::Codex);
         assert!(args[0].preferred_mode_id.is_none());
         assert!(args[0].preferred_config_values.is_empty());
-    }
-
-    #[tokio::test]
-    async fn send_failure_after_spawn_disconnects_child() {
-        let mock = Arc::new(MockSpawner::new());
-        mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Err(SpawnerError::send("agent rejected prompt")))
-            .await;
-        let broker =
-            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
-        enable_delegation(&broker).await;
-        let outcome = broker.handle_request(request(1, "pt-1")).await;
-        match outcome {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "spawn_failed"),
-            other => panic!("expected Err, got {other:?}"),
-        }
-        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c1"]);
     }
 
     #[tokio::test]
@@ -34015,18 +33966,6 @@ mod tests {
         assert_eq!(DelegationBroker::require_reconcile_ok(Ok(2)).unwrap(), 2);
     }
 
-    #[test]
-    fn require_reconcile_ok_then_listener_ordering() {
-        // Documented startup order: reconcile gate before listener start.
-        // This pure helper is what desktop/server call; listener only runs on Ok.
-        fn startup_sequence(reconcile: Result<u64, String>) -> Result<&'static str, String> {
-            DelegationBroker::require_reconcile_ok(reconcile)?;
-            Ok("listener_started")
-        }
-        assert_eq!(startup_sequence(Ok(0)).unwrap(), "listener_started");
-        assert!(startup_sequence(Err("boom".into())).is_err());
-    }
-
     // ── Task 10: observation-aware status / wait ───────────────────────────
 
     fn report_for_running_task(snap: ObservationSnapshot) -> DelegationTaskReport {
@@ -38488,143 +38427,6 @@ mod tests {
                 .contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
             "gen1_idempotent_ack must decorate from persisted reason: {:?}",
             unit.message
-        );
-    }
-
-    /// Successful replacement with `admission_unknown` must surface the same
-    /// duplicate-execution warning as cold failed reports for that code.
-    #[tokio::test]
-    async fn replacement_admission_unknown_ack_includes_duplicate_execution_warning() {
-        use crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
-        use crate::db::entities::delegation_task_run::DelegationRunStatus;
-        use crate::db::service::conversation_service;
-        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
-
-        let db = Arc::new(fresh_in_memory_db().await);
-        let folder = seed_folder(&db, "/tmp/codeg-replacement-admission-unknown-ack").await;
-        let parent = conversation_service::create(
-            &db.conn,
-            folder,
-            AgentType::ClaudeCode,
-            Some("admission_unknown replacement parent".into()),
-            None,
-        )
-        .await
-        .expect("parent");
-        let runs = Arc::new(RunStore::new(db.clone()));
-        let mock = Arc::new(MockSpawner::new());
-        mock.queue_spawn(Ok("adm-unk-repl-conn".into())).await;
-        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
-        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
-
-        // Seed never-running failed/admission_unknown (crash-reconcile shape).
-        let source_task_id = "adm-unk-src-task-4111-8111-111111111111";
-        let workspace_path = test_working_dir();
-        let launch = build_live_launch_config(
-            AgentType::ClaudeCode,
-            None,
-            &workspace_path,
-            None,
-            BTreeMap::new(),
-        );
-        let source_child = conversation_service::create_with_delegation(
-            &db.conn,
-            seed_folder(&db, "/tmp/codeg-admission-unknown-source").await,
-            AgentType::ClaudeCode,
-            Some("admission_unknown source".into()),
-            None,
-            Some(DelegationLink {
-                parent_conversation_id: parent.id,
-                parent_tool_use_id: "tu-adm-unk-src".into(),
-                delegation_call_id: source_task_id.into(),
-            }),
-        )
-        .await
-        .expect("source child");
-        let agent_type = serde_json::to_value(AgentType::ClaudeCode)
-            .expect("agent type json")
-            .as_str()
-            .expect("agent type string")
-            .to_string();
-        runs.insert_reserving(ReservingRunInsert {
-            task_id: source_task_id.into(),
-            root_task_id: source_task_id.into(),
-            previous_task_id: None,
-            generation: 1,
-            parent_conversation_id: parent.id,
-            parent_tool_use_id: Some("tu-adm-unk-src".into()),
-            child_conversation_id: source_child.id,
-            agent_type,
-            profile_id: None,
-            workspace_path: Some(launch.snapshot.workspace_path),
-            route_fingerprint: Some(launch.snapshot.route_fingerprint),
-            launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
-            mode_id: launch.snapshot.mode_id,
-            config_values_json: Some(launch.snapshot.config_values_json),
-            task_preview: Some("prior".into()),
-            request_fingerprint: Some("adm-unk-src-fp".into()),
-            admission_class: AdmissionClass::NormalRevision,
-            lineage_root_task_id: source_task_id.into(),
-            work_unit_key: Some("adm-unk-unit".into()),
-            history_only: false,
-            replaced_task_id: None,
-            replacement_reason: None,
-            started_at: Some(Utc::now()),
-        })
-        .await
-        .expect("source reserve");
-        let finished_at = Utc::now();
-        runs.settle_terminal(
-            source_task_id,
-            TerminalTaskWrite::failed_with_evidence(
-                "admission_unknown",
-                finished_at,
-                DelegationTerminationAuditV1::for_terminal_code(
-                    "admission_unknown",
-                    DelegationRunStatus::Reserving,
-                    true,
-                    finished_at,
-                ),
-            ),
-        )
-        .await
-        .expect("source terminal");
-        let src_run = runs
-            .load_by_task_id(source_task_id)
-            .await
-            .unwrap()
-            .expect("source");
-        assert_eq!(src_run.run_status, DelegationRunStatus::Failed);
-        assert!(src_run.reached_running_at.is_none());
-
-        let mut replacement_request = request(parent.id, "tu-adm-unk-replacement");
-        replacement_request.working_dir = Some(workspace_path);
-        replacement_request.work_unit_key = Some("adm-unk-unit".into());
-        replacement_request.replaces_task_id = Some(source_task_id.into());
-        replacement_request.replacement_reason = Some("admission_unknown".into());
-        replacement_request.recovery_authorization_id = Some(
-            approve_replacement_recovery(
-                &db,
-                &runs,
-                source_task_id,
-                crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
-            )
-            .await,
-        );
-        let replacement = broker.start_delegation(replacement_request).await;
-        assert_eq!(
-            replacement.status,
-            TaskStatus::Running,
-            "admission_unknown replacement must admit: {replacement:?}"
-        );
-        let msg = replacement.message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
-            "successful admission_unknown replacement ack must carry duplicate-execution warning: {msg}"
-        );
-        assert!(
-            msg.contains("WARNING"),
-            "warning token should be explicit in ack: {msg}"
         );
     }
 

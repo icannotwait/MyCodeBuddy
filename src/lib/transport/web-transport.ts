@@ -319,7 +319,6 @@ export class WebTransport implements Transport {
     }
   }
 
-
   async subscribe<T>(
     event: string,
     handler: (payload: T) => void

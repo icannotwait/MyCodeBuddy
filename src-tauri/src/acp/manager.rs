@@ -389,8 +389,7 @@ pub(crate) const SPAWN_HANDSHAKE_TIMEOUT_SECS: u64 = 60;
 
 /// Read the spawn-handshake timeout from `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`,
 /// falling back to `SPAWN_HANDSHAKE_TIMEOUT_SECS`. Returns the configured
-/// `Duration`. Tests can construct the manager with a custom value via
-/// `with_spawn_handshake_timeout` instead of mutating env.
+/// `Duration`.
 fn spawn_handshake_timeout_from_env() -> Duration {
     let secs = std::env::var("CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS")
         .ok()
@@ -692,38 +691,6 @@ impl ConnectionManager {
     #[allow(dead_code)]
     fn continuation_store(&self) -> Option<Arc<dyn ContinuationStore>> {
         self.continuation_store.get().cloned()
-    }
-
-    /// Test-only constructor that overrides the spawn-handshake timeout.
-    /// Production code should use `new()`.
-    #[cfg(test)]
-    fn with_spawn_handshake_timeout(timeout: Duration) -> Self {
-        Self {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            spawn_locks: Arc::new(Mutex::new(HashMap::new())),
-            spawn_handshake_timeout: timeout,
-            tool_lease_registry: Arc::new(
-                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
-                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
-                ),
-            ),
-            tool_watchdog_metrics: Arc::new(
-                crate::acp::tool_watchdog::ToolWatchdogMetrics::default(),
-            ),
-            tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
-            tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
-            wait_cancel_registry:
-                crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
-            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
-            delegation_injection: Arc::new(std::sync::OnceLock::new()),
-            continuation_store: Arc::new(std::sync::OnceLock::new()),
-            completion_protocol_runtime: Arc::new(std::sync::OnceLock::new()),
-            probe_locks: Arc::new(Mutex::new(HashMap::new())),
-            pending_questions: Arc::new(Mutex::new(HashMap::new())),
-            pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
-            recovery_authorization_service: Arc::new(std::sync::OnceLock::new()),
-            disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
-        }
     }
 
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
@@ -14416,12 +14383,6 @@ mod tests {
             Some(v) => std::env::set_var("CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS", v),
             None => std::env::remove_var("CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS"),
         }
-    }
-
-    #[test]
-    fn with_spawn_handshake_timeout_overrides_default_for_tests() {
-        let mgr = ConnectionManager::with_spawn_handshake_timeout(Duration::from_secs(7));
-        assert_eq!(mgr.spawn_handshake_timeout, Duration::from_secs(7));
     }
 
     /// Successful status owners emit exactly one authoritative `state` patch

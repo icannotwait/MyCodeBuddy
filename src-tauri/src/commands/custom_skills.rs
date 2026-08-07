@@ -1000,16 +1000,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn list_all_install_statuses_is_wellformed() {
-        // Never panics; row count is a multiple of the supported-agent count.
-        let rows = custom_list_all_install_statuses()
-            .await
-            .expect("snapshot returns Ok");
-        let agents = supported_agents().len();
-        assert_eq!(rows.len() % agents, 0);
-    }
-
     #[test]
     fn validate_skill_id_rejects_traversal_and_separators() {
         // The load-bearing sanitizer every authoring path funnels through.

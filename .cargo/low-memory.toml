@@ -1,0 +1,12 @@
+[build]
+jobs = 1
+incremental = false
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[env]
+RUST_TEST_THREADS = { value = "1", force = true }

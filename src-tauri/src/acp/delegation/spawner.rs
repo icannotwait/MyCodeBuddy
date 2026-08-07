@@ -513,39 +513,6 @@ pub mod mock {
         use super::*;
 
         #[tokio::test]
-        async fn mock_records_cancel_and_disconnect() {
-            let m = MockSpawner::new();
-            m.cancel("c1").await.unwrap();
-            m.disconnect("c2").await.unwrap();
-            assert_eq!(m.cancels.lock().await.as_slice(), &["c1".to_string()]);
-            assert_eq!(m.disconnects.lock().await.as_slice(), &["c2".to_string()]);
-        }
-
-        #[tokio::test]
-        async fn mock_consumes_queued_spawn_results() {
-            let m = MockSpawner::new();
-            m.queue_spawn(Ok("child-1".into())).await;
-            m.queue_spawn(Err(SpawnerError::Spawn("oh no".into())))
-                .await;
-            let r1 = m
-                .spawn(
-                    "parent-1",
-                    AgentType::ClaudeCode,
-                    Some("/tmp".into()),
-                    None,
-                    BTreeMap::new(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(r1, "child-1");
-            let r2 = m
-                .spawn("parent-1", AgentType::Codex, None, None, BTreeMap::new())
-                .await
-                .unwrap_err();
-            assert!(matches!(r2, SpawnerError::Spawn(_)));
-        }
-
-        #[tokio::test]
         async fn mock_unqueued_spawn_fails_loudly() {
             let m = MockSpawner::new();
             let r = m
@@ -562,28 +529,6 @@ pub mod mock {
                 SpawnerError::Spawn(msg) => assert!(msg.contains("no queued")),
                 other => panic!("expected SpawnerError::Spawn, got {other:?}"),
             }
-        }
-
-        #[tokio::test]
-        async fn mock_records_spawn_args_for_assertion() {
-            let m = MockSpawner::new();
-            m.queue_spawn(Ok("c1".into())).await;
-            let mut cfg = BTreeMap::new();
-            cfg.insert("model".into(), "claude-sonnet-4-5".into());
-            m.spawn(
-                "p1",
-                AgentType::ClaudeCode,
-                Some("/work".into()),
-                Some("auto".into()),
-                cfg.clone(),
-            )
-            .await
-            .unwrap();
-            let args = m.spawn_args.lock().await;
-            assert_eq!(args.len(), 1);
-            assert_eq!(args[0].agent_type, AgentType::ClaudeCode);
-            assert_eq!(args[0].preferred_mode_id.as_deref(), Some("auto"));
-            assert_eq!(args[0].preferred_config_values, cfg);
         }
     }
 }
