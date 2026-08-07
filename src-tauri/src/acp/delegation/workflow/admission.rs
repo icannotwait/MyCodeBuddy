@@ -4395,6 +4395,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_plan_republication_replaces_stale_corrective_authorization() {
+        const CORRECTED_PLAN_BYTES: &[u8] =
+            b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\ncorrected body\n";
+        const REPLACEMENT_PLAN_BYTES: &[u8] =
+            b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nreplacement body\n";
+
+        let repo = AdmissionGitFixture::new();
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = two_plan_reviewer_doc("task18-rr-plan-authorization");
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "plan-reviewer-1")
+            .unwrap()
+            .deps = vec!["plan-author".into()];
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        enable_completion_v2(&db, &published.workflow_id).await;
+        delegation_workflow_gate_state::ActiveModel {
+            workflow_id: Set(published.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
+            current_review_round: Set(1),
+            selected_node_ids_json: Set(r#"["plan-reviewer-1","plan-reviewer-2"]"#.into()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let author_one = "task18-rr-plan-author-1";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            author_one,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            author_one,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            None,
+        )
+        .await;
+        record_task14_intent(&db, author_one, CompletionOutcome::Done).await;
+        assert_eq!(
+            materialize_task14_terminal(
+                &db,
+                author_one,
+                &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            )
+            .await,
+            CompletionState::Resolved
+        );
+
+        for (node_id, task_id, agent, agent_wire, summary, outcome) in [
+            (
+                "plan-reviewer-1",
+                "task18-rr-plan-review-1-codex",
+                AgentType::Codex,
+                "codex",
+                review_summary(),
+                CompletionOutcome::Approve,
+            ),
+            (
+                "plan-reviewer-2",
+                "task18-rr-plan-review-1-grok",
+                AgentType::Grok,
+                "grok",
+                r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required"}"#,
+                CompletionOutcome::RequestChanges,
+            ),
+        ] {
+            admit_task9_bound_run(
+                &db,
+                parent,
+                repo.path(),
+                &published.workflow_id,
+                node_id,
+                task_id,
+                agent,
+                agent_wire,
+            )
+            .await;
+            complete_task9_admitted_run(&db, task_id, summary, None).await;
+            record_task14_intent(&db, task_id, outcome).await;
+            assert_eq!(
+                materialize_task14_terminal(&db, task_id, summary).await,
+                CompletionState::Resolved
+            );
+        }
+
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_settlement = settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "plan".into(),
+                expected_graph_revision: header.graph_revision as u64,
+                expected_review_round: Some(1),
+                expected_outcome: Some(GateSettlementOutcome::ChangesRequested),
+                summary: "open corrective round for stale authorization regression".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_settlement.plan_next_action,
+            Some(PlanReviewNextAction::ContinueReview)
+        );
+
+        std::fs::write(
+            repo.path().join("docs/superpowers/plans/p.md"),
+            CORRECTED_PLAN_BYTES,
+        )
+        .unwrap();
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(first_settlement.manifest_revision);
+        document.publication_token.push_str("-corrected");
+        document.plan.as_mut().unwrap().digest = task9_sha256(CORRECTED_PLAN_BYTES);
+        let corrected = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let author_two = "task18-rr-plan-author-2";
+        admit_task9_continuation_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            author_two,
+            author_one,
+            author_one,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_task9_admitted_run(
+            &db,
+            author_two,
+            &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            None,
+        )
+        .await;
+        record_task14_intent(&db, author_two, CompletionOutcome::Done).await;
+        assert_eq!(
+            materialize_task14_terminal(
+                &db,
+                author_two,
+                &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
+            )
+            .await,
+            CompletionState::Resolved
+        );
+
+        let stale_state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stale_state.current_review_round, 2);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stale_state.selected_node_ids_json).unwrap(),
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
+        );
+        let stale_authorization = super::super::store::load_plan_round_authorization_v2(
+            &db.conn,
+            &published.workflow_id,
+            "plan",
+        )
+        .await
+        .unwrap()
+        .expect("corrective Plan authorization");
+        assert_eq!(
+            stale_authorization.current_plan_digest,
+            task9_sha256(CORRECTED_PLAN_BYTES)
+        );
+
+        std::fs::write(
+            repo.path().join("docs/superpowers/plans/p.md"),
+            REPLACEMENT_PLAN_BYTES,
+        )
+        .unwrap();
+        document.expected_manifest_revision = Some(corrected.manifest_revision);
+        document.publication_token.push_str("-replacement");
+        document.plan.as_mut().unwrap().digest = task9_sha256(REPLACEMENT_PLAN_BYTES);
+        publish_workflow_manifest_core(&db, &emitter, parent, PublishWorkflowRequest { document })
+            .await
+            .unwrap();
+
+        let replaced_state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(replaced_state.gate_lineage, stale_state.gate_lineage);
+        assert_eq!(replaced_state.current_review_round, 1);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&replaced_state.selected_node_ids_json).unwrap(),
+            vec!["plan-reviewer-1", "plan-reviewer-2"]
+        );
+        assert!(super::super::store::load_plan_round_authorization_v2(
+            &db.conn,
+            &published.workflow_id,
+            "plan",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
     async fn task14_fix2_final_partial_round_retains_required_nonpass_sibling() {
         let repo = AdmissionGitFixture::new();
         let (db, parent) = seed_parent().await;

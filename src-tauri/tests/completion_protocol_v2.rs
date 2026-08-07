@@ -821,6 +821,329 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
     }
 }
 
+#[tokio::test]
+async fn roster_only_final_republication_delivers_after_add_and_remove() {
+    const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-final-roster-design.md";
+    const PLAN_REL_PATH: &str = "docs/superpowers/plans/restarted-plan.md";
+    const DESIGN_BYTES: &[u8] = b"# Design\n\nTask 18 Final roster delivery.\n";
+    const PLAN_BYTES: &[u8] = b"## Global Constraints\n\n- Task 18 Final roster delivery.\n";
+
+    let repo = tempfile::tempdir().expect("Task 18 Final roster repo");
+    git_fixture(repo.path(), &["init", "--quiet"]);
+    for (rel_path, bytes) in [(DESIGN_REL_PATH, DESIGN_BYTES), (PLAN_REL_PATH, PLAN_BYTES)] {
+        let path = repo.path().join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    git_fixture(repo.path(), &["add", "."]);
+    git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Codeg Test",
+            "-c",
+            "user.email=codeg@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "final roster fixture",
+        ],
+    );
+
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, repo.path().to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let mut document = final_review_skeleton("task-18-final-roster-delivery");
+    document.workflow_state = ManifestWorkflowState::Estimated;
+    document.design = Some(DocumentRef {
+        rel_path: DESIGN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+    });
+    document.plan = Some(DocumentRef {
+        rel_path: PLAN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
+    });
+    let published = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: document.clone(),
+        },
+        CompletionProtocolSelection {
+            version: 2,
+            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+            source:
+                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
+        },
+    )
+    .await
+    .unwrap();
+
+    let plan_author_task_id = "task-18-final-roster-plan-author";
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        seed_conversation(&db, folder, AgentType::Codex).await,
+        repo.path(),
+        plan_author_task_id,
+        "codex",
+        build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+            rel_plan_path: PLAN_REL_PATH,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Task 18 Final roster Plan Author",
+    )
+    .await;
+    materialize_v2_fixture_run(
+        &db,
+        plan_author_task_id,
+        "Plan authored.\n\nConclusion: done",
+    )
+    .await;
+    let plan_reviewer_task_id = "task-18-final-roster-plan-reviewer";
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        seed_conversation(&db, folder, AgentType::Codex).await,
+        repo.path(),
+        plan_reviewer_task_id,
+        "codex",
+        build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+            rel_plan_path: PLAN_REL_PATH,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Task 18 Final roster Plan Reviewer",
+    )
+    .await;
+    materialize_v2_fixture_run(
+        &db,
+        plan_reviewer_task_id,
+        "Plan review passed.\n\nConclusion: approve",
+    )
+    .await;
+    let current = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    settle_workflow_gate_v2_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: PHASE_PLAN.into(),
+            expected_graph_revision: current.graph_revision as u64,
+            expected_review_round: Some(1),
+            expected_outcome: Some(GateSettlementOutcome::Approved),
+            summary: "Task 18 Final roster Plan approval".into(),
+            recovery_authorization_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let codex_task_id = "task-18-final-roster-codex";
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        seed_conversation(&db, folder, AgentType::Codex).await,
+        repo.path(),
+        codex_task_id,
+        "codex",
+        build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Task 18 retained Codex Final review",
+    )
+    .await;
+    materialize_v2_fixture_run(
+        &db,
+        codex_task_id,
+        "Final review passed.\n\nConclusion: approve",
+    )
+    .await;
+    let grok_task_id = "task-18-final-roster-grok";
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        seed_conversation(&db, folder, AgentType::Grok).await,
+        repo.path(),
+        grok_task_id,
+        "grok",
+        build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Task 18 retained Grok Final review",
+    )
+    .await;
+    materialize_v2_fixture_run(
+        &db,
+        grok_task_id,
+        "Independent Final review passed.\n\nConclusion: approve",
+    )
+    .await;
+
+    let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    document.workflow_id = Some(published.workflow_id.clone());
+    document.expected_manifest_revision = Some(header.active_manifest_revision as u64);
+    document.publication_token.push_str("-add");
+    document.workflow_state = ManifestWorkflowState::Approved;
+    document.nodes.push(ManifestNode {
+        id: "final-reviewer-extra".into(),
+        kind: ManifestNodeKind::WorkUnit,
+        phase_id: Some(PHASE_FINAL.into()),
+        role: Some(ManifestNodeRole::Reviewer),
+        agent_type: Some("gemini".into()),
+        profile_id: None,
+        task_index: None,
+        work_unit_key: Some(
+            build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+                agent_type: "gemini",
+                profile_id: None,
+            })
+            .unwrap(),
+        ),
+        deps: Vec::new(),
+        required: Some(true),
+        node_outcome: None,
+        title: None,
+    });
+    let added = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: document.clone(),
+        },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let added_state = delegation_workflow_gate_state::Entity::find_by_id((
+        published.workflow_id.clone(),
+        PHASE_FINAL.to_string(),
+    ))
+    .one(&db.conn)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(added_state.current_review_round, 2);
+    assert_eq!(
+        added_state.selected_node_ids_json,
+        r#"["final-reviewer-extra"]"#
+    );
+
+    // Isolate Final delivery after the roster-triggered Plan reapproval prerequisite.
+    let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut header: delegation_workflow::ActiveModel = header.into();
+    header.workflow_state = Set(delegation_workflow::WorkflowState::Approved);
+    header.update(&db.conn).await.unwrap();
+
+    let extra_task_id = "task-18-final-roster-extra";
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        seed_conversation(&db, folder, AgentType::Gemini).await,
+        repo.path(),
+        extra_task_id,
+        "gemini",
+        build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "gemini",
+            profile_id: None,
+        })
+        .unwrap(),
+        "Task 18 added Final review",
+    )
+    .await;
+    materialize_v2_fixture_run(
+        &db,
+        extra_task_id,
+        "Added Final review passed.\n\nConclusion: approve",
+    )
+    .await;
+    let ready_after_add = guard_final_delivery_core(
+        &db,
+        &EventEmitter::Noop,
+        FinalDeliveryGuardRequest {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: PHASE_FINAL.into(),
+            workspace_path: repo.path().to_path_buf(),
+            final_reviewer_task_id: extra_task_id.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        ready_after_add,
+        FinalDeliveryGuardResult::Ready(_)
+    ));
+
+    document.expected_manifest_revision = Some(added.manifest_revision);
+    document.publication_token.push_str("-remove");
+    let removed_reviewer = document
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "final-reviewer-extra")
+        .unwrap();
+    removed_reviewer.required = Some(false);
+    removed_reviewer.node_outcome =
+        Some(codeg_lib::acp::delegation::workflow::ManifestNodeOutcome::Canceled);
+    publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest { document },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let removed_state = delegation_workflow_gate_state::Entity::find_by_id((
+        published.workflow_id.clone(),
+        PHASE_FINAL.to_string(),
+    ))
+    .one(&db.conn)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(removed_state.current_review_round, 2);
+    assert_eq!(removed_state.selected_node_ids_json, "[]");
+
+    let ready_after_remove = guard_final_delivery_core(
+        &db,
+        &EventEmitter::Noop,
+        FinalDeliveryGuardRequest {
+            workflow_id: published.workflow_id,
+            gate_id: PHASE_FINAL.into(),
+            workspace_path: repo.path().to_path_buf(),
+            final_reviewer_task_id: codex_task_id.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        ready_after_remove,
+        FinalDeliveryGuardResult::Ready(_)
+    ));
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CapabilityCase {
     ToolCompleteWork,

@@ -987,10 +987,9 @@ async fn guard_final_delivery_txn(
     }
     if binding.gate_id.as_deref() != Some(request.gate_id.as_str())
         || binding.gate_lineage.as_deref() != Some(gate_state.gate_lineage.as_str())
-        || binding.review_round != Some(gate_state.current_review_round)
     {
         return Err(WorkflowStoreError::GateNotReady(
-            "Final reviewer evidence is not bound to the current gate lineage and round".into(),
+            "Final reviewer evidence is not bound to the current gate lineage".into(),
         ));
     }
     let run = delegation_task_run::Entity::find_by_id(binding.task_id.clone())
@@ -1032,9 +1031,27 @@ async fn guard_final_delivery_txn(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if selected_node_ids != required_reviewer_node_id_set {
+    if !selected_node_ids.is_subset(&required_reviewer_node_id_set) {
         return Err(WorkflowStoreError::GateNotReady(
-            "current Final reviewer selection does not cover the required cohort".into(),
+            "current Final reviewer selection is outside the required cohort".into(),
+        ));
+    }
+    let binding_covers_current_selection = |candidate: &delegation_workflow_run_binding::Model| {
+        candidate.gate_id.as_deref() == Some(request.gate_id.as_str())
+            && candidate.gate_lineage.as_deref() == Some(gate_state.gate_lineage.as_str())
+            && if selected_node_ids.contains(&candidate.node_id) {
+                candidate.review_round == Some(gate_state.current_review_round)
+            } else {
+                candidate.review_round.is_some_and(|review_round| {
+                    review_round > 0 && review_round < gate_state.current_review_round
+                })
+            }
+    };
+    if !required_reviewer_node_id_set.contains(&binding.node_id)
+        || !binding_covers_current_selection(&binding)
+    {
+        return Err(WorkflowStoreError::GateNotReady(
+            "Final reviewer evidence does not cover the current selective review round".into(),
         ));
     }
 
@@ -1052,6 +1069,11 @@ async fn guard_final_delivery_txn(
             .map_err(db_err)?;
         let evidence = match latest_binding {
             Some(latest_binding) => {
+                if !binding_covers_current_selection(&latest_binding) {
+                    return Err(WorkflowStoreError::GateNotReady(format!(
+                        "Final reviewer {reviewer_node_id} evidence does not cover the current selective review round"
+                    )));
+                }
                 request_is_current |= latest_binding.task_id == binding.task_id;
                 let latest_run = delegation_task_run::Entity::find_by_id(&latest_binding.task_id)
                     .one(txn)
@@ -5533,8 +5555,15 @@ async fn initialize_v2_gate_states_txn(
             }
             Some(state) => {
                 if gate_id == super::types::PHASE_PLAN
-                    && is_pending_plan_corrective_round_txn(txn, workflow_id, &gate_id, &state)
-                        .await?
+                    && is_pending_plan_corrective_round_txn(
+                        txn,
+                        workflow_id,
+                        &gate_id,
+                        &state,
+                        normalized.plan.as_ref().map(|plan| plan.digest.as_str()),
+                        &required_node_ids,
+                    )
+                    .await?
                 {
                     continue;
                 }
@@ -5584,6 +5613,8 @@ async fn is_pending_plan_corrective_round_txn(
     workflow_id: &str,
     gate_id: &str,
     state: &delegation_workflow_gate_state::Model,
+    active_plan_digest: Option<&str>,
+    required_node_ids: &[String],
 ) -> Result<bool, WorkflowStoreError> {
     let prior_settlement = delegation_workflow_gate_settlement::Entity::find()
         .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(workflow_id))
@@ -5604,15 +5635,23 @@ async fn is_pending_plan_corrective_round_txn(
         return Ok(false);
     }
 
-    let selected_node_ids = serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json)
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    let selected_node_ids = canonical_string_set(
+        &serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json)
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
+    );
     if selected_node_ids.is_empty() {
         return Ok(true);
     }
+    let Some(active_plan_digest) = active_plan_digest else {
+        return Ok(false);
+    };
     let authorization = load_plan_round_authorization_v2(txn, workflow_id, gate_id).await?;
     Ok(authorization.is_some_and(|authorization| {
         authorization.gate_lineage == state.gate_lineage
             && i64::from(authorization.review_round) == state.current_review_round
+            && authorization.current_plan_digest == active_plan_digest
+            && authorization.required_node_ids == required_node_ids
+            && authorization.selected_node_ids == selected_node_ids
     }))
 }
 
