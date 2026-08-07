@@ -531,6 +531,51 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(onResumeRoot).not.toHaveBeenCalled()
   })
 
+  it("does not resume when the durable snapshot omits completion protocol", async () => {
+    const onResumeRoot = vi.fn()
+    const manual = {
+      ...skeletonGraph(),
+      completion_protocol: {
+        version: 2,
+        mode: "v2_enforce" as const,
+        creation_mode: "v2_enforce" as const,
+        legacy_source: null,
+        v2_successor: null,
+        read_only_reason: null,
+        automatic_root_wake: false,
+      },
+    }
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(manual)
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={manual}
+        defaultExpanded
+        onResumeRoot={onResumeRoot}
+      />
+    )
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    )
+    const resume = screen.getByRole("button", {
+      name: "Resume root orchestration",
+    })
+    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue({
+      ...manual,
+      graph_revision: 2,
+      completion_protocol: null,
+    })
+    await userEvent.click(resume)
+
+    await waitFor(() =>
+      expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+    )
+    expect(onResumeRoot).not.toHaveBeenCalled()
+  })
+
   it("first-seeds a graphless open overlay without expanding the full graph", async () => {
     vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(skeletonGraph())
     renderWithIntl(

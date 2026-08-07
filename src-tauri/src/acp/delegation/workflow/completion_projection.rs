@@ -383,7 +383,7 @@ fn project_loaded_workflow_completion(
         }
         CompletionState::Resolved => unreachable!("resolved completion returned above"),
     };
-    let cas = validate_terminal_attention(attention, &run, &binding, &workflow, &expected_kind)?;
+    let cas = validate_terminal_attention(attention, run, binding, workflow, &expected_kind)?;
     let node_role = parse_role(&node.role)
         .ok_or_else(|| invalid_projection("completion node has an unsupported durable role"))?;
 
@@ -894,10 +894,7 @@ mod tests {
 
         let card = super::CompletionCardV2::project(&validated, None);
 
-        assert!(
-            card.summary.as_deref().unwrap().as_bytes().len()
-                <= super::COMPLETION_CARD_SUMMARY_MAX_BYTES
-        );
+        assert!(card.summary.as_deref().unwrap().len() <= super::COMPLETION_CARD_SUMMARY_MAX_BYTES);
         assert!(card.evidence_validated);
         assert_eq!(card.role, Some(CompletionRole::Reviewer));
         assert_eq!(

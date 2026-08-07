@@ -5537,10 +5537,10 @@ mod tests {
                 "request_recovery_authorization",
                 "get_workflow_capabilities",
                 "get_workflow_state",
-                "restart_legacy_workflow",
                 "recover_workflow",
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
+                "restart_legacy_workflow",
             ]
         );
     }

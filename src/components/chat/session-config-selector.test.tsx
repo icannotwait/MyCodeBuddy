@@ -207,9 +207,7 @@ describe("InlineSessionConfigSelector — model grouping", () => {
       compoundHigh
     )
     const onSelect = vi.fn()
-    render(
-      <InlineSessionConfigSelector option={option} onSelect={onSelect} />
-    )
+    render(<InlineSessionConfigSelector option={option} onSelect={onSelect} />)
 
     // Trigger and menu rows expose the full wire id so effort etc. stay visible.
     const trigger = screen.getByRole("button", { name: /effort=high/ })

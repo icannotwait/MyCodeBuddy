@@ -1,3 +1,8 @@
+use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
+
+use axum_test::TestServer;
 use codeg_lib::acp::delegation::broker::{
     compare_completion_shadow_outcome, is_completion_format_repair_prompt,
 };
@@ -8,36 +13,46 @@ use codeg_lib::acp::delegation::metrics::{
     CompletionContinuationReason, CompletionFinalMetricState, CompletionRestartOutcome,
     CompletionShadowDifference, DelegationMetrics,
 };
+use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
 use codeg_lib::acp::delegation::transport::CompanionRole;
 use codeg_lib::acp::delegation::types::{CompletionMutationContext, RestartLegacyWorkflowRequest};
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, capture_original_request_context, evaluate_rollout_window,
-    get_workflow_state_core, inject_legacy_restart_header_failure_once,
-    project_workflow_graph_core, publish_workflow_manifest_core,
-    publish_workflow_manifest_with_selection_core, restart_legacy_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, CompletionIntent,
-    CompletionIntentSource, CompletionOutcome, CompletionProtocolRolloutConfig,
-    CompletionProtocolSelection, CompletionResolution, CompletionRole, ManifestDocument,
-    ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase, ManifestWorkflowState,
-    PlanReviewChangeV2, PlanReviewNextAction, ProfileCompletionWindow, PublishWorkflowRequest,
-    RolloutDecision, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_PLAN,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    get_workflow_state_core, guard_final_delivery_core, inject_legacy_restart_header_failure_once,
+    materialize_terminal_completion_txn, project_workflow_graph_core,
+    publish_workflow_manifest_core, publish_workflow_manifest_with_selection_core,
+    resolve_completion_decision_txn, restart_legacy_workflow_core,
+    restart_legacy_workflow_if_enforced, select_completion_protocol, CompletionCardV2,
+    CompletionIntent, CompletionIntentSource, CompletionOutcome, CompletionProtocolRolloutConfig,
+    CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentRef,
+    FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument, ManifestNode,
+    ManifestNodeKind, ManifestNodeRole, ManifestPhase, ManifestWorkflowState, PlanReviewChangeV2,
+    PlanReviewNextAction, ProfileCompletionWindow, PublishWorkflowRequest, RolloutDecision,
+    TerminalCompletionInput, ValidatedReportCandidate, WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION,
+    PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::ConnectionManager;
 use codeg_lib::acp::types::PromptInputBlock;
+use codeg_lib::app_state::AppState;
 use codeg_lib::commands::workflow_completion::restart_legacy_workflow_authenticated_core;
 use codeg_lib::db::entities::{
-    auto_title_job, delegation_attention_request, delegation_task_run, delegation_workflow,
-    delegation_workflow_gate_settlement, delegation_workflow_manifest_revision,
+    auto_title_job, delegation_attention_request, delegation_completion_tool_intent,
+    delegation_task_run, delegation_workflow, delegation_workflow_gate_settlement,
+    delegation_workflow_gate_state, delegation_workflow_manifest_revision,
     delegation_workflow_node_binding, delegation_workflow_restart_context,
     delegation_workflow_run_binding,
 };
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
 use codeg_lib::web::event_bridge::EventEmitter;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
-use serde_json::Value;
+use codeg_lib::web::router::build_router;
+use codeg_lib::web::shutdown::ShutdownSignal;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 fn skeleton(token: &str) -> ManifestDocument {
     let plan_path = "docs/superpowers/plans/restarted-plan.md";
@@ -91,6 +106,528 @@ fn skeleton(token: &str) -> ManifestDocument {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CapabilityCase {
+    ToolCompleteWork,
+    TerminalConclusionOnly,
+    ReportConclusionOnly,
+    AmbiguousThenUserAdjudication,
+    ObsoleteCardPlusNaturalConclusion,
+}
+
+struct CapabilityResult {
+    child_run_count: u64,
+    card_summary_json: Option<String>,
+    completion: CompletionCardV2,
+    desktop_completion: Value,
+    server_completion: Value,
+    mcp_completion: Value,
+    format_repair_run_count: usize,
+    card_reemit_prompt_count: usize,
+}
+
+async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
+    const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-capability-design.md";
+    const DESIGN_BYTES: &[u8] = b"# Design\n\nPlatform completion capability matrix.\n";
+
+    let workspace = tempfile::tempdir().expect("capability workspace");
+    let workspace_path = workspace.path().to_path_buf();
+    let design_path = workspace_path.join(DESIGN_REL_PATH);
+    std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+    std::fs::write(&design_path, DESIGN_BYTES).unwrap();
+    let plan_path = workspace_path.join("docs/superpowers/plans/restarted-plan.md");
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+    std::fs::write(&plan_path, b"# Plan\n\nTask 18 capability fixture.\n").unwrap();
+
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let child = seed_conversation(&db, folder, AgentType::Codex).await;
+    capture_original_request_context(
+        &db.conn,
+        parent,
+        "task-18-capability-request",
+        &[PromptInputBlock::Text {
+            text: "Prove the platform completion capability matrix.".into(),
+        }],
+        "codex",
+    )
+    .await
+    .unwrap();
+    let token = format!("task-18-capability-{}", uuid::Uuid::new_v4());
+    let mut document = skeleton(&token);
+    document.design = Some(DocumentRef {
+        rel_path: DESIGN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+    });
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest { document },
+    )
+    .await
+    .unwrap();
+    let workflow = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
+    workflow.completion_protocol_version = Set(2);
+    workflow.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V2Enforce);
+    workflow.update(&db.conn).await.unwrap();
+
+    let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+        rel_plan_path: "docs/superpowers/plans/restarted-plan.md",
+        agent_type: "codex",
+        profile_id: None,
+    })
+    .unwrap();
+    let task_id = format!("task-18-capability-{}", uuid::Uuid::new_v4());
+    RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    }))
+    .admit_gen1_reserving(ReservingRunInsert {
+        task_id: task_id.clone(),
+        root_task_id: task_id.clone(),
+        previous_task_id: None,
+        generation: 1,
+        parent_conversation_id: parent,
+        parent_tool_use_id: Some(format!("tool-{task_id}")),
+        child_conversation_id: child,
+        agent_type: "codex".into(),
+        profile_id: None,
+        workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
+        route_fingerprint: Some("task-18-capability-route".into()),
+        launch_snapshot_version: Some("v1".into()),
+        mode_id: None,
+        config_values_json: Some("{}".into()),
+        task_preview: Some("Task 18 capability".into()),
+        request_fingerprint: Some(format!("fp-{task_id}")),
+        admission_class: delegation_task_run::AdmissionClass::NormalRevision,
+        lineage_root_task_id: task_id.clone(),
+        work_unit_key: Some(author_key),
+        history_only: false,
+        replaced_task_id: None,
+        replacement_reason: None,
+        started_at: Some(chrono::Utc::now()),
+    })
+    .await
+    .unwrap();
+
+    let run = delegation_task_run::Entity::find_by_id(&task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut run: delegation_task_run::ActiveModel = run.into();
+    run.status = Set(delegation_task_run::DelegationRunStatus::Completed);
+    run.finished_at = Set(Some(chrono::Utc::now()));
+    run.card_summary_json = Set(
+        matches!(case, CapabilityCase::ObsoleteCardPlusNaturalConclusion)
+            .then(|| r#"{"kind":"author","status":"done","plan_digest":"model"}"#.into()),
+    );
+    run.update(&db.conn).await.unwrap();
+
+    if matches!(case, CapabilityCase::ToolCompleteWork) {
+        delegation_completion_tool_intent::ActiveModel {
+            intent_id: Set(format!("intent-{task_id}")),
+            task_id: Set(task_id.clone()),
+            child_tool_call_id: Set(format!("call-{task_id}")),
+            accepted_ordinal: Set(1),
+            outcome: Set(CompletionOutcome::Done.as_str().into()),
+            summary: Set(Some("tool completion".into())),
+            report_hint: Set(None),
+            request_digest: Set(format!("digest-{task_id}")),
+            created_at: Set(chrono::Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    let (final_assistant_text, pre_read_reports) = match case {
+        CapabilityCase::ToolCompleteWork => ("Tool completion submitted.".into(), Vec::new()),
+        CapabilityCase::TerminalConclusionOnly => {
+            ("Implementation complete.\n\nConclusion: done".into(), Vec::new())
+        }
+        CapabilityCase::ReportConclusionOnly => (
+            "See [the report](reports/task-18.md).".into(),
+            vec![ValidatedReportCandidate {
+                path: "reports/task-18.md".into(),
+                contents: "# Task 18 report\n\nConclusion: done\n".into(),
+                summary: Some("report completion".into()),
+            }],
+        ),
+        CapabilityCase::AmbiguousThenUserAdjudication => (
+            "Implemented the requested changes without an explicit conclusion.".into(),
+            Vec::new(),
+        ),
+        CapabilityCase::ObsoleteCardPlusNaturalConclusion => (
+            "```json\n{\"kind\":\"author\",\"status\":\"done\",\"plan_digest\":\"model\"}\n```\n\nConclusion: done"
+                .into(),
+            Vec::new(),
+        ),
+    };
+    let txn = db.conn.begin().await.unwrap();
+    let terminal = materialize_terminal_completion_txn(
+        &txn,
+        TerminalCompletionInput {
+            task_id: task_id.clone(),
+            terminal_status: delegation_task_run::DelegationRunStatus::Completed,
+            final_assistant_text,
+            pre_read_reports,
+            pre_read_artifact: None,
+        },
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+    if matches!(case, CapabilityCase::AmbiguousThenUserAdjudication) {
+        resolve_completion_decision_txn(
+            &db,
+            parent,
+            terminal.attention.expect("ambiguous completion decision"),
+            CompletionOutcome::Done,
+            "application_user",
+        )
+        .await
+        .unwrap();
+    }
+
+    let stored_run = delegation_task_run::Entity::find_by_id(&task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let runs = delegation_task_run::Entity::find()
+        .filter(delegation_task_run::Column::ParentConversationId.eq(parent))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    let format_repair_run_count = runs
+        .iter()
+        .filter(|run| run.task_preview.as_deref() == Some("CARD RE-EMIT ONLY"))
+        .count();
+
+    let static_dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState::new_for_test(db, workspace_path));
+    let server = TestServer::new(build_router(
+        state.clone(),
+        "task-18-token".into(),
+        static_dir.path().to_path_buf(),
+        Arc::new(ShutdownSignal::new()),
+    ))
+    .unwrap();
+    let direct = project_workflow_graph_core(&state.db, parent)
+        .await
+        .unwrap();
+    let node_index = direct
+        .nodes
+        .iter()
+        .position(|node| node.latest_task_id.as_deref() == Some(task_id.as_str()))
+        .expect("capability node projection");
+    let desktop = direct.nodes[node_index]
+        .completion
+        .clone()
+        .expect("desktop completion projection");
+    let response = server
+        .post("/api/get_workflow_graph_snapshot")
+        .add_header("authorization", "Bearer task-18-token")
+        .json(&json!({ "conversationId": parent }))
+        .await;
+    response.assert_status_ok();
+    let http: Value = response.json();
+    assert_eq!(http, serde_json::to_value(&direct).unwrap());
+    let server_completion = http["nodes"][node_index]["completion"]["card"].clone();
+    let rendered = codeg_lib::acp::delegation::companion::render_status_result(&json!({
+        "tasks": [{
+            "task_id": task_id,
+            "status": "completed",
+            "completion": desktop,
+        }]
+    }));
+    let mcp_completion = rendered["structuredContent"]["tasks"][0]["completion"]["card"].clone();
+    let desktop_completion = serde_json::to_value(&desktop.card).unwrap();
+
+    CapabilityResult {
+        child_run_count: runs.len() as u64,
+        card_summary_json: stored_run.card_summary_json,
+        completion: desktop.card,
+        desktop_completion,
+        server_completion,
+        mcp_completion,
+        format_repair_run_count,
+        card_reemit_prompt_count: format_repair_run_count,
+    }
+}
+
+#[tokio::test]
+async fn every_model_capability_reaches_one_platform_completion_truth() {
+    for case in [
+        CapabilityCase::ToolCompleteWork,
+        CapabilityCase::TerminalConclusionOnly,
+        CapabilityCase::ReportConclusionOnly,
+        CapabilityCase::AmbiguousThenUserAdjudication,
+        CapabilityCase::ObsoleteCardPlusNaturalConclusion,
+    ] {
+        let result = run_capability_case(case).await;
+        assert_eq!(result.child_run_count, 1, "{case:?}");
+        assert!(result.card_summary_json.is_none(), "{case:?}");
+        assert!(result.completion.evidence_validated, "{case:?}");
+        assert_eq!(
+            result.desktop_completion, result.server_completion,
+            "{case:?}"
+        );
+        assert_eq!(result.server_completion, result.mcp_completion, "{case:?}");
+    }
+}
+
+fn git_fixture(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("run Task 18 git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_string()
+}
+
+fn final_review_skeleton(token: &str) -> ManifestDocument {
+    let mut document = skeleton(token);
+    document.phases.push(ManifestPhase {
+        id: PHASE_FINAL.into(),
+        kind: Some(PHASE_FINAL.into()),
+        title: None,
+    });
+    document.nodes.push(ManifestNode {
+        id: "final-reviewer".into(),
+        kind: ManifestNodeKind::WorkUnit,
+        phase_id: Some(PHASE_FINAL.into()),
+        role: Some(ManifestNodeRole::Reviewer),
+        agent_type: Some("codex".into()),
+        profile_id: None,
+        task_index: None,
+        work_unit_key: Some(
+            build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap(),
+        ),
+        deps: Vec::new(),
+        required: Some(true),
+        node_outcome: None,
+        title: None,
+    });
+    document
+}
+
+async fn run_final_drift_fixture() -> (FinalDeliveryGuardResult, String, i64) {
+    let repo = tempfile::tempdir().expect("Task 18 final repo");
+    git_fixture(repo.path(), &["init", "--quiet"]);
+    std::fs::write(repo.path().join("verified.txt"), b"reviewed\n").unwrap();
+    git_fixture(repo.path(), &["add", "verified.txt"]);
+    git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Codeg Test",
+            "-c",
+            "user.email=codeg@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "reviewed",
+        ],
+    );
+    let reviewed_head = git_fixture(repo.path(), &["rev-parse", "HEAD"]);
+
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, repo.path().to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let child = seed_conversation(&db, folder, AgentType::Codex).await;
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: final_review_skeleton("task-18-final-drift"),
+        },
+    )
+    .await
+    .unwrap();
+    let workflow = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
+    workflow.completion_protocol_version = Set(2);
+    workflow.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V2Enforce);
+    workflow.update(&db.conn).await.unwrap();
+    delegation_workflow_gate_state::ActiveModel {
+        workflow_id: Set(published.workflow_id.clone()),
+        gate_id: Set("final".into()),
+        gate_lineage: Set("sha256:task-18-final-lineage".into()),
+        current_review_round: Set(1),
+        selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+
+    let now = chrono::Utc::now();
+    let task_id = "task-18-passing-final-review";
+    delegation_task_run::ActiveModel {
+        task_id: Set(task_id.into()),
+        root_task_id: Set(task_id.into()),
+        previous_task_id: Set(None),
+        generation: Set(1),
+        parent_conversation_id: Set(parent),
+        parent_tool_use_id: Set(None),
+        child_conversation_id: Set(child),
+        agent_type: Set("codex".into()),
+        profile_id: Set(None),
+        workspace_path: Set(Some(repo.path().to_string_lossy().into_owned())),
+        route_fingerprint: Set(None),
+        launch_snapshot_version: Set(None),
+        mode_id: Set(None),
+        config_values_json: Set(None),
+        task_preview: Set(Some("Task 18 Final review".into())),
+        request_fingerprint: Set(None),
+        admission_class: Set(delegation_task_run::AdmissionClass::NormalRevision),
+        reached_running_at: Set(Some(now)),
+        lineage_root_task_id: Set(task_id.into()),
+        work_unit_key: Set(None),
+        legacy_parent_tool_use_id: Set(None),
+        history_only: Set(false),
+        status: Set(delegation_task_run::DelegationRunStatus::Completed),
+        error_code: Set(None),
+        termination_audit_json: Set(None),
+        started_at: Set(Some(now)),
+        finished_at: Set(Some(now)),
+        tool_call_count: Set(None),
+        edit_tool_call_count: Set(None),
+        touched_files_json: Set(None),
+        touched_files_truncated: Set(None),
+        additions: Set(None),
+        deletions: Set(None),
+        line_counts_complete: Set(None),
+        card_summary_json: Set(None),
+        child_turn_anchor: Set(None),
+        child_connection_id: Set(None),
+        replaced_task_id: Set(None),
+        replacement_reason: Set(None),
+        recovery_authorization_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+    delegation_workflow_run_binding::ActiveModel {
+        task_id: Set(task_id.into()),
+        workflow_id: Set(published.workflow_id.clone()),
+        node_id: Set("final-reviewer".into()),
+        gate_id: Set(Some("final".into())),
+        gate_cycle: Set(Some(1)),
+        manifest_revision: Set(published.manifest_revision as i64),
+        content_fingerprint: Set(None),
+        artifact_digest: Set(Some(reviewed_head)),
+        reviewed_task_id: Set(None),
+        reviewed_implementer_generation: Set(None),
+        lineage_ordinal: Set(1),
+        summary_validated: Set(true),
+        gate_lineage: Set(Some("sha256:task-18-final-lineage".into())),
+        review_round: Set(Some(1)),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+
+    let ready = guard_final_delivery_core(
+        &db,
+        &EventEmitter::Noop,
+        FinalDeliveryGuardRequest {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "final".into(),
+            workspace_path: repo.path().to_path_buf(),
+            final_reviewer_task_id: task_id.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(ready, FinalDeliveryGuardResult::Ready(_)));
+
+    std::fs::write(repo.path().join("verified.txt"), b"post-settlement drift\n").unwrap();
+    git_fixture(repo.path(), &["add", "verified.txt"]);
+    git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Codeg Test",
+            "-c",
+            "user.email=codeg@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "post-settlement drift",
+        ],
+    );
+
+    let guarded = guard_final_delivery_core(
+        &db,
+        &EventEmitter::Noop,
+        FinalDeliveryGuardRequest {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "final".into(),
+            workspace_path: repo.path().to_path_buf(),
+            final_reviewer_task_id: task_id.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let gate = delegation_workflow_gate_state::Entity::find_by_id((
+        published.workflow_id,
+        "final".to_string(),
+    ))
+    .one(&db.conn)
+    .await
+    .unwrap()
+    .unwrap();
+    (guarded, gate.gate_id, gate.current_review_round)
+}
+
+#[tokio::test]
+async fn session_2889_and_final_drift_have_no_format_repair_escape() {
+    let session = run_capability_case(CapabilityCase::ObsoleteCardPlusNaturalConclusion).await;
+    assert_eq!(session.format_repair_run_count, 0);
+    assert_eq!(session.card_reemit_prompt_count, 0);
+    assert_eq!(session.child_run_count, 1);
+
+    let (final_delivery, current_gate, review_round) = run_final_drift_fixture().await;
+    assert_eq!(
+        final_delivery.diagnostic_code(),
+        Some("final_artifact_drift")
+    );
+    assert!(final_delivery.reopened().is_some());
+    assert_eq!(current_gate, "final");
+    assert_eq!(review_round, 2);
+}
+
 async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-legacy-restart").await;
@@ -120,7 +657,7 @@ async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {
 }
 
 #[tokio::test]
-async fn legacy_restart_context_preserves_request_and_non_default_author_without_auto_title() {
+async fn legacy_restart_preserves_non_default_context_but_routes_codex_plan_author() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-request-context").await;
     let parent = seed_conversation(&db, folder, AgentType::Grok).await;
@@ -144,26 +681,33 @@ async fn legacy_restart_context_preserves_request_and_non_default_author_without
     .await
     .unwrap();
 
-    let mut document = skeleton("task-15-grok-profile-source");
-    let author = document.nodes.first_mut().unwrap();
-    author.agent_type = Some("grok".into());
-    author.profile_id = Some("review-canary".into());
-    author.work_unit_key = Some(
-        build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
-            rel_plan_path: &document.plan_target_rel_path,
-            agent_type: "grok",
-            profile_id: Some("review-canary"),
-        })
-        .unwrap(),
-    );
-    publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
-        PublishWorkflowRequest { document },
+        PublishWorkflowRequest {
+            document: skeleton("task-15-grok-profile-source"),
+        },
     )
     .await
     .unwrap();
+    let source_author = delegation_workflow_node_binding::Entity::find()
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(&published.workflow_id))
+        .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut source_author: delegation_workflow_node_binding::ActiveModel = source_author.into();
+    source_author.agent_type = Set("grok".into());
+    source_author.profile_id = Set(Some("review-canary".into()));
+    source_author.work_unit_key = Set(build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+        rel_plan_path: "docs/superpowers/plans/restarted-plan.md",
+        agent_type: "grok",
+        profile_id: Some("review-canary"),
+    })
+    .unwrap());
+    source_author.update(&db.conn).await.unwrap();
 
     let restarted = restart_legacy_workflow_core(&db, i64::from(parent))
         .await
@@ -195,11 +739,8 @@ async fn legacy_restart_context_preserves_request_and_non_default_author_without
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(successor_author.agent_type, "grok");
-    assert_eq!(
-        successor_author.profile_id.as_deref(),
-        Some("review-canary")
-    );
+    assert_eq!(successor_author.agent_type, "codex");
+    assert_eq!(successor_author.profile_id, None);
 }
 
 async fn source_fingerprint(
@@ -373,8 +914,10 @@ async fn legacy_prompt_restart_fences_desktop_and_server_plain_text_before_sourc
         .unwrap()
         .folder_id;
     let metrics = std::sync::Arc::new(DelegationMetrics::default());
-    let mut rollout = CompletionProtocolRolloutConfig::default();
-    rollout.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+    let rollout = CompletionProtocolRolloutConfig {
+        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ..Default::default()
+    };
     let rollout = std::sync::Arc::new(rollout);
     let manager = ConnectionManager::new();
     manager.install_completion_protocol_runtime(rollout, metrics);
@@ -474,8 +1017,10 @@ async fn legacy_restart_upgrade_recovers_first_request_before_enforce_resume() {
     let before = source_fingerprint(&db, parent, &published.workflow_id).await;
 
     let metrics = std::sync::Arc::new(DelegationMetrics::default());
-    let mut rollout = CompletionProtocolRolloutConfig::default();
-    rollout.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+    let rollout = CompletionProtocolRolloutConfig {
+        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ..Default::default()
+    };
     let manager = ConnectionManager::new();
     manager.install_completion_protocol_runtime(std::sync::Arc::new(rollout), metrics);
     manager
@@ -580,8 +1125,10 @@ async fn legacy_restart_upgrade_without_durable_request_remains_fail_closed() {
     .await
     .unwrap();
     let before = source_fingerprint(&db, parent, &published.workflow_id).await;
-    let mut enforce = CompletionProtocolRolloutConfig::default();
-    enforce.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+    let enforce = CompletionProtocolRolloutConfig {
+        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ..Default::default()
+    };
 
     let error = restart_legacy_workflow_if_enforced(&db, parent, None, &enforce)
         .await
@@ -608,8 +1155,10 @@ async fn rollout_mode_is_frozen_per_workflow() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-frozen-rollout").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let mut config = CompletionProtocolRolloutConfig::default();
-    config.default_mode = delegation_workflow::CompletionProtocolMode::V2Shadow;
+    let mut config = CompletionProtocolRolloutConfig {
+        default_mode: delegation_workflow::CompletionProtocolMode::V2Shadow,
+        ..Default::default()
+    };
     let selection = select_completion_protocol("codex", Some("canary"), &config);
     let published = publish_workflow_manifest_with_selection_core(
         &db,
@@ -673,8 +1222,10 @@ async fn rollout_restart_accepts_stored_shadow_only_when_current_policy_is_enfor
     .await
     .unwrap();
 
-    let mut enforce = CompletionProtocolRolloutConfig::default();
-    enforce.default_mode = delegation_workflow::CompletionProtocolMode::V2Enforce;
+    let enforce = CompletionProtocolRolloutConfig {
+        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+        ..Default::default()
+    };
     assert!(restart_legacy_workflow_if_enforced(
         &db,
         parent,

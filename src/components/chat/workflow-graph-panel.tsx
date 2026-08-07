@@ -351,7 +351,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
     setResumePending(true)
     try {
       const durable = await refreshDurableRoot()
-      if (durable && !durable.completion_protocol.automatic_root_wake) {
+      if (durable?.completion_protocol?.automatic_root_wake === false) {
         await onResumeRoot()
       }
     } finally {

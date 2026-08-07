@@ -42,7 +42,7 @@ pub async fn resolve_completion_decision(
         completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
     let context = authenticated
         .authorize_completion_root(parent_conversation_id)
-        .map_err(|()| unauthorized_context_error())?;
+        .ok_or_else(unauthorized_context_error)?;
     resolve_completion_decision_core(
         &state.db,
         state.delegation_metrics.as_ref(),
@@ -63,7 +63,7 @@ pub async fn retry_completion_artifact(
         completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
     let context = authenticated
         .authorize_completion_root(parent_conversation_id)
-        .map_err(|()| unauthorized_context_error())?;
+        .ok_or_else(unauthorized_context_error)?;
     retry_completion_artifact_core(
         &state.db,
         state.delegation_metrics.as_ref(),
@@ -84,7 +84,7 @@ pub async fn resolve_design_self_review(
         completion_attention_parent_conversation_id(&state.db, &request.cas.attention_id).await?;
     let context = authenticated
         .authorize_completion_root(parent_conversation_id)
-        .map_err(|()| unauthorized_context_error())?;
+        .ok_or_else(unauthorized_context_error)?;
     resolve_design_self_review_core(
         &state.db,
         state.delegation_metrics.as_ref(),
@@ -105,7 +105,7 @@ pub async fn restart_legacy_workflow(
         .map_err(|_| AppCommandError::invalid_input("source conversation id is invalid"))?;
     let context = authenticated
         .authorize_completion_root(source_conversation_id)
-        .map_err(|()| unauthorized_context_error())?;
+        .ok_or_else(unauthorized_context_error)?;
     restart_legacy_workflow_authenticated_core(
         &state.db,
         state.delegation_metrics.as_ref(),

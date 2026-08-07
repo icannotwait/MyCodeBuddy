@@ -3521,6 +3521,7 @@ mod tests {
         seed_conversation(db, folder, agent).await
     }
 
+    #[allow(clippy::too_many_arguments)] // The fixture names each persisted admission dimension.
     async fn admit_task9_bound_run(
         db: &AppDatabase,
         parent: i32,
@@ -3703,6 +3704,58 @@ mod tests {
         result.state
     }
 
+    async fn complete_v2_admitted_run(
+        db: &AppDatabase,
+        task_id: &str,
+        summary_json: &str,
+        expected_artifact_digest: Option<&str>,
+        conclusion: &str,
+    ) {
+        complete_task9_admitted_run(db, task_id, summary_json, expected_artifact_digest).await;
+        assert_eq!(
+            materialize_task14_terminal(db, task_id, conclusion).await,
+            CompletionState::Resolved
+        );
+        let validated = load_validated_completion_evidence(&db.conn, task_id)
+            .await
+            .unwrap();
+        assert!(validated.evidence_validated);
+        if let Some(expected) = expected_artifact_digest {
+            assert_eq!(validated.evidence.artifact.digest(), expected);
+        }
+    }
+
+    async fn admit_and_complete_v2_implementer(
+        db: &AppDatabase,
+        parent: i32,
+        repo: &AdmissionGitFixture,
+        workflow_id: &str,
+        task_id: &str,
+    ) -> String {
+        admit_task9_bound_run(
+            db,
+            parent,
+            repo.path(),
+            workflow_id,
+            "task-1-impl",
+            task_id,
+            AgentType::Grok,
+            "grok",
+        )
+        .await;
+        repo.commit_change();
+        let artifact = repo.head();
+        complete_v2_admitted_run(
+            db,
+            task_id,
+            implementation_summary(),
+            Some(&artifact),
+            "Conclusion: done",
+        )
+        .await;
+        artifact
+    }
+
     async fn record_task14_intent(db: &AppDatabase, task_id: &str, outcome: CompletionOutcome) {
         delegation_completion_tool_intent::ActiveModel {
             intent_id: Set(format!("intent-{task_id}")),
@@ -3856,7 +3909,8 @@ mod tests {
         }
 
         fn commit_change(&self) {
-            std::fs::write(self.path().join("owned.txt"), b"changed\n")
+            let contents = format!("changed from {}\n", self.head());
+            std::fs::write(self.path().join("owned.txt"), contents)
                 .expect("write admission change");
             git_fixture_command(self.path(), &["add", "owned.txt"]);
             git_fixture_command(
@@ -4847,11 +4901,12 @@ mod tests {
             "codex",
         )
         .await;
-        complete_task9_admitted_run(
+        complete_v2_admitted_run(
             &db,
             author_task_id,
             &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
             Some(document.plan.as_ref().unwrap().digest.as_str()),
+            "Conclusion: done",
         )
         .await;
 
@@ -4997,11 +5052,14 @@ mod tests {
             "grok",
         )
         .await;
-        complete_task9_admitted_run(
+        repo.commit_change();
+        let implementer_head = repo.head();
+        complete_v2_admitted_run(
             &db,
             task_implementer_task_id,
             implementation_summary(),
-            Some(&branch_tip),
+            Some(&implementer_head),
+            "Conclusion: done",
         )
         .await;
         let task_reviewer_task_id = "task9-task-reviewer";
@@ -5016,11 +5074,15 @@ mod tests {
             "codex",
         )
         .await;
-        complete_task9_admitted_run(&db, task_reviewer_task_id, review_summary(), None).await;
+        complete_v2_admitted_run(
+            &db,
+            task_reviewer_task_id,
+            review_summary(),
+            Some(&implementer_head),
+            "Conclusion: approve",
+        )
+        .await;
 
-        use crate::db::entities::delegation_final_findings_package::{
-            self, FinalFindingsPackageStatus,
-        };
         let final_lineage = format!("sha256:{}", "f".repeat(64));
         delegation_workflow_gate_state::ActiveModel {
             workflow_id: Set(published.workflow_id.clone()),
@@ -5028,57 +5090,6 @@ mod tests {
             gate_lineage: Set(final_lineage.clone()),
             current_review_round: Set(1),
             selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
-        }
-        .insert(&db.conn)
-        .await
-        .unwrap();
-        let final_package = super::super::final_findings::build_final_findings_package_v1(
-            super::super::final_findings::FinalFindingsPackageInputV1 {
-                workflow_id: published.workflow_id.clone(),
-                gate_id: "final".into(),
-                gate_lineage: final_lineage.clone(),
-                requirements_identity: format!("sha256:{}", "b".repeat(64)),
-                graph_revision: 1,
-                reviewer_evaluations: vec![
-                    super::super::final_findings::FinalReviewerEvaluationV1 {
-                        reviewer_node_id: "final-reviewer".into(),
-                        evidence_task_id: "task9-final-source".into(),
-                        evidence_scope_digest: format!("sha256:{}", "e".repeat(64)),
-                        outcome: CompletionOutcome::RequestChanges,
-                    },
-                ],
-                findings: vec![super::super::final_findings::FinalFindingInputV1 {
-                    reviewer_node_id: "final-reviewer".into(),
-                    evidence_task_id: "task9-final-source".into(),
-                    evidence_scope_digest: format!("sha256:{}", "e".repeat(64)),
-                    outcome: CompletionOutcome::RequestChanges,
-                    target_work_unit_keys: vec!["task|1|implementer|grok|none".into()],
-                    remediation_route_ids: vec!["task-1-impl".into()],
-                }],
-                remediation_contexts: vec![
-                    super::super::final_findings::RemediationContextInputV1::available_terminal(
-                        "task9-final-source",
-                        b"Final changes required".to_vec(),
-                    ),
-                ],
-            },
-        )
-        .unwrap();
-        let encoded =
-            super::super::final_findings::encode_final_findings_package_v1(&final_package).unwrap();
-        delegation_final_findings_package::ActiveModel {
-            package_id: Set("task9-final-package".into()),
-            workflow_id: Set(published.workflow_id.clone()),
-            gate_id: Set("final".into()),
-            gate_lineage: Set(final_lineage.clone()),
-            source_evaluation_key: Set(final_package.source_evaluation_key.clone()),
-            source_evidence_task_ids_json: Set(encoded.source_evidence_task_ids_json),
-            items_json: Set(encoded.items_json),
-            remediation_contexts_json: Set(encoded.remediation_contexts_json),
-            package_digest: Set(final_package.package_digest.clone()),
-            status: Set(FinalFindingsPackageStatus::Active),
-            created_graph_revision: Set(1),
-            resolved_graph_revision: Set(None),
         }
         .insert(&db.conn)
         .await
@@ -5096,11 +5107,12 @@ mod tests {
             "codex",
         )
         .await;
-        complete_task9_admitted_run(
+        complete_v2_admitted_run(
             &db,
             final_reviewer_task_id,
             r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"changes required","report_file":"reports/final.md"}"#,
             None,
+            "Conclusion: request changes\n\nFinal changes required.",
         )
         .await;
         let final_fixer_task_id = "task9-final-fixer";
@@ -5205,11 +5217,12 @@ mod tests {
 
         repo.commit_change();
         let fixer_head = repo.head();
-        complete_task9_admitted_run(
+        complete_v2_admitted_run(
             &db,
             final_fixer_task_id,
             implementation_summary(),
             Some(&fixer_head),
+            "Conclusion: done",
         )
         .await;
         let final_state = delegation_workflow_gate_state::Entity::find_by_id((
@@ -5313,29 +5326,23 @@ mod tests {
         .await
         .unwrap();
 
-        let author_node = delegation_workflow_node_binding::Entity::find_by_id((
-            published.workflow_id.clone(),
-            "plan-author".to_string(),
-        ))
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-        let author_child = child_for(&db, AgentType::Codex).await;
-        seed_completed_bound_run(
+        admit_task9_bound_run(
             &db,
             parent,
-            author_child,
+            repo.path(),
             &published.workflow_id,
             "plan-author",
             "task9-malformed-author",
-            &author_node.work_unit_key,
+            AgentType::Codex,
             "codex",
-            1,
+        )
+        .await;
+        complete_v2_admitted_run(
+            &db,
+            "task9-malformed-author",
             &author_summary(document.plan.as_ref().unwrap().digest.as_str()),
             Some(document.plan.as_ref().unwrap().digest.as_str()),
-            None,
-            None,
+            "Conclusion: done",
         )
         .await;
 
@@ -5459,30 +5466,8 @@ mod tests {
             publish_approved(&db, &emitter, parent, "tok-task7-reviewer-drift").await;
         enable_completion_v2(&db, &workflow_id).await;
         let repo = AdmissionGitFixture::new();
-        let producer_head = repo.head();
         let implementer_task = "70000000-0000-4000-8000-000000000003";
-        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
-            task_index: 1,
-            agent_type: "grok",
-            profile_id: None,
-        })
-        .unwrap();
-        seed_completed_bound_run(
-            &db,
-            parent,
-            child_for(&db, AgentType::Grok).await,
-            &workflow_id,
-            "task-1-impl",
-            implementer_task,
-            &implementer_key,
-            "grok",
-            1,
-            implementation_summary(),
-            Some(&producer_head),
-            None,
-            None,
-        )
-        .await;
+        admit_and_complete_v2_implementer(&db, parent, &repo, &workflow_id, implementer_task).await;
         repo.commit_change();
 
         let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
@@ -5541,54 +5526,30 @@ mod tests {
         .await
         .unwrap();
         let repo = AdmissionGitFixture::new();
-        let producer_head = repo.head();
         let implementer_task = "70000000-0000-4000-8000-000000000005";
-        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
-            task_index: 1,
-            agent_type: "grok",
-            profile_id: None,
-        })
-        .unwrap();
-        seed_completed_bound_run(
-            &db,
-            parent,
-            child_for(&db, AgentType::Grok).await,
-            &workflow_id,
-            "task-1-impl",
-            implementer_task,
-            &implementer_key,
-            "grok",
-            1,
-            implementation_summary(),
-            Some(&producer_head),
-            None,
-            None,
-        )
-        .await;
+        let producer_head =
+            admit_and_complete_v2_implementer(&db, parent, &repo, &workflow_id, implementer_task)
+                .await;
         let task_reviewer = "70000000-0000-4000-8000-000000000006";
-        let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
-            task_index: 1,
-            agent_type: "codex",
-            profile_id: None,
-        })
-        .unwrap();
-        seed_completed_bound_run(
+        admit_task9_bound_run(
             &db,
             parent,
-            child_for(&db, AgentType::Codex).await,
+            repo.path(),
             &workflow_id,
             "task-1-rev",
             task_reviewer,
-            &reviewer_key,
+            AgentType::Codex,
             "codex",
-            2,
-            review_summary(),
-            Some(&producer_head),
-            Some(implementer_task),
-            Some(1),
         )
         .await;
-        repo.commit_change();
+        complete_v2_admitted_run(
+            &db,
+            task_reviewer,
+            review_summary(),
+            Some(&producer_head),
+            "Conclusion: approve",
+        )
+        .await;
         let delivered_head = repo.head();
 
         let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
@@ -5721,30 +5682,10 @@ mod tests {
             publish_approved(&db, &emitter, parent, "tok-task7-terminal-reviewer").await;
         enable_completion_v2(&db, &workflow_id).await;
         let repo = AdmissionGitFixture::new();
-        let producer_head = repo.head();
         let implementer_task = "70000000-0000-4000-8000-000000000011";
-        let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
-            task_index: 1,
-            agent_type: "grok",
-            profile_id: None,
-        })
-        .unwrap();
-        seed_completed_bound_run(
-            &db,
-            parent,
-            child_for(&db, AgentType::Grok).await,
-            &workflow_id,
-            "task-1-impl",
-            implementer_task,
-            &implementer_key,
-            "grok",
-            1,
-            implementation_summary(),
-            Some(&producer_head),
-            None,
-            None,
-        )
-        .await;
+        let producer_head =
+            admit_and_complete_v2_implementer(&db, parent, &repo, &workflow_id, implementer_task)
+                .await;
         let producer_run = delegation_task_run::Entity::find_by_id(implementer_task)
             .one(&db.conn)
             .await
@@ -5998,19 +5939,23 @@ mod tests {
     async fn task5_plan_reviewer_requires_latest_author_and_stamps_exact_plan() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
+        let repo = AdmissionGitFixture::new();
+        let mut document = sample_doc(
+            "tok-task5-reviewer-author",
+            ManifestWorkflowState::Estimated,
+        );
+        document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
+        document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
         let published = publish_workflow_manifest_core(
             &db,
             &emitter,
             parent,
-            PublishWorkflowRequest {
-                document: sample_doc(
-                    "tok-task5-reviewer-author",
-                    ManifestWorkflowState::Estimated,
-                ),
-            },
+            PublishWorkflowRequest { document },
         )
         .await
         .unwrap();
+        enable_completion_v2(&db, &published.workflow_id).await;
+        seed_approved_plan_gate_state(&db, &published.workflow_id).await;
         let reviewer_key = build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
@@ -6035,46 +5980,63 @@ mod tests {
             .expect_err("reviewer before Author must reject");
         assert_eq!(err.workflow_admission_code(), Some("plan_author_missing"));
 
-        let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
-            rel_plan_path: "docs/superpowers/plans/p.md",
-            agent_type: "codex",
-            profile_id: None,
-        })
-        .unwrap();
-        for (task_id, digest, ordinal) in [
-            ("50000000-0000-4000-8000-000000000004", "sha256:old-plan", 1),
-            ("50000000-0000-4000-8000-000000000005", "sha256:plan", 2),
-        ] {
-            let child = child_for(&db, AgentType::Codex).await;
-            seed_completed_bound_run(
-                &db,
-                parent,
-                child,
-                &published.workflow_id,
-                "plan-author",
-                task_id,
-                &author_key,
-                "codex",
-                ordinal,
-                &author_summary(digest),
-                Some(digest),
-                None,
-                None,
-            )
-            .await;
-        }
+        let plan_digest = task9_sha256(ADMISSION_PLAN_BYTES);
+        let first_author = "50000000-0000-4000-8000-000000000004";
+        admit_task9_bound_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            first_author,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_v2_admitted_run(
+            &db,
+            first_author,
+            &author_summary(&plan_digest),
+            Some(&plan_digest),
+            "Conclusion: done",
+        )
+        .await;
+        let latest_author = "50000000-0000-4000-8000-000000000005";
+        admit_task9_continuation_run(
+            &db,
+            parent,
+            repo.path(),
+            &published.workflow_id,
+            "plan-author",
+            latest_author,
+            first_author,
+            first_author,
+            AgentType::Codex,
+            "codex",
+        )
+        .await;
+        complete_v2_admitted_run(
+            &db,
+            latest_author,
+            &author_summary(&plan_digest),
+            Some(&plan_digest),
+            "Conclusion: done",
+        )
+        .await;
 
         let reviewer_child = child_for(&db, AgentType::Codex).await;
         let reviewer_task = "50000000-0000-4000-8000-000000000006";
+        let mut reviewer = gen1_insert(
+            parent,
+            reviewer_child,
+            reviewer_task,
+            "codex",
+            Some(&reviewer_key),
+            None,
+        );
+        reviewer.workspace_path = Some(repo.path().to_string_lossy().into_owned());
         store
-            .admit_gen1_reserving(gen1_insert(
-                parent,
-                reviewer_child,
-                reviewer_task,
-                "codex",
-                Some(&reviewer_key),
-                None,
-            ))
+            .admit_gen1_reserving(reviewer)
             .await
             .expect("reviewer after current Author");
         let binding = delegation_workflow_run_binding::Entity::find_by_id(reviewer_task)
@@ -6086,7 +6048,10 @@ mod tests {
             binding.reviewed_task_id.as_deref(),
             Some("50000000-0000-4000-8000-000000000005")
         );
-        assert_eq!(binding.artifact_digest.as_deref(), Some("sha256:plan"));
+        assert_eq!(
+            binding.artifact_digest.as_deref(),
+            Some(plan_digest.as_str())
+        );
     }
 
     #[tokio::test]

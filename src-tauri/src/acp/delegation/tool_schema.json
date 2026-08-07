@@ -18,7 +18,7 @@
   },
   {
     "name": "delegate_to_agent",
-    "description": "Start an asynchronous isolated sub-agent; task must include all context. Fan out, then Join. Pass profile_id for a named profile. Admission failure/unknown requires explicit replacement.",
+    "description": "Asynchronous cold child cannot see this conversation; returns task_id. Task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -66,7 +66,7 @@
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "Admission failure/unknown requires replacement; cancellation/stall does not."
+          "description": "admission_failed/admission_unknown require explicit replacement; cancellation/stall does not; otherwise continue_delegation."
         }
       }
     }
@@ -98,7 +98,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Join task_ids in input order. Omit wait_ms for a snapshot; use return_when=all_terminal_or_attention with wait_ms=0. Answer attention, then re-Join running required tasks.",
+    "description": "Join task_ids in input order. Omit wait_ms for an immediate snapshot. return_when=all_terminal_or_attention; wait_ms=0; positive wait_ms is rejected. wake_reason/attention_requests report attention, unavailable, or all requested tasks are terminal. Re-Join only still-running required tasks.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -122,7 +122,7 @@
   },
   {
     "name": "cancel_delegation",
-    "description": "Cancel only when its result is no longer wanted. timeout is non-canceling: keep waiting with get_delegation_status wait_ms for slow work. Already finished returns final result. taskfail, usercancel, and others cancel.",
+    "description": "Cancel only when its result is no longer wanted. timeout is non-canceling: keep waiting with wait_ms for slow work. Already finished returns final result. taskfail, usercancel, and others cancel.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "reason"],
@@ -137,7 +137,7 @@
   },
   {
     "name": "check_user_feedback",
-    "description": "Messages are available only through this tool. Non-blocking; call before starting implementation, a significant decision, and after a meaningful sub-task. HIGH-PRIORITY; empty result means continue.",
+    "description": "Messages are available only through this tool. Non-blocking; call before starting implementation, a significant decision, and after a meaningful sub-task. HIGH-PRIORITY. Empty result means continue.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -277,24 +277,12 @@
   },
   {
     "name": "get_workflow_state",
-    "description": "Load compact workflow index. Read plan/design/report_file for prose; use get_session_info/get_delegation_status for child/run detail.",
+    "description": "compact workflow index. Read plan/design/report_file for prose; get_session_info/get_delegation_status for detail.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "workflow_id": { "type": "string" },
         "detail": { "type": "string", "enum": ["index"], "default": "index" }
-      }
-    }
-  },
-  {
-    "name": "restart_legacy_workflow",
-    "description": "Create or return the single empty protocol-v2 successor for this owned legacy root. The source stays read-only and unchanged.",
-    "inputSchema": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source_conversation_id"],
-      "properties": {
-        "source_conversation_id": { "type": "integer" }
       }
     }
   },
@@ -395,6 +383,18 @@
         },
         "recovery_authorization_id": { "type": "string" },
         "summary": { "type": "string" }
+      }
+    }
+  },
+  {
+    "name": "restart_legacy_workflow",
+    "description": "Return one empty v2 successor; legacy source stays read-only.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_conversation_id"],
+      "properties": {
+        "source_conversation_id": { "type": "integer" }
       }
     }
   }

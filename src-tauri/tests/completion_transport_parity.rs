@@ -664,8 +664,10 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
     .unwrap();
 
     let mut state = AppState::new_for_test(db, workspace.path().to_path_buf());
-    let mut rollout = CompletionProtocolRolloutConfig::default();
-    rollout.default_mode = CompletionProtocolMode::V2Enforce;
+    let rollout = CompletionProtocolRolloutConfig {
+        default_mode: CompletionProtocolMode::V2Enforce,
+        ..Default::default()
+    };
     state.completion_protocol_rollout = Arc::new(rollout);
     let state = Arc::new(state);
     let server = TestServer::new(build_router(

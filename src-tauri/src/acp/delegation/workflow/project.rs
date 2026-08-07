@@ -773,6 +773,7 @@ impl ExecutionGateOverlaySummary {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Projection inputs mirror the persisted node/run surfaces.
 fn project_node_from_binding(
     b: &delegation_workflow_node_binding::Model,
     mn: Option<&super::types::NormalizedNode>,
@@ -2206,6 +2207,7 @@ fn short_key_tag(work_unit_key: &str) -> String {
 /// Count returned/running/blocked for document gates using run_bindings
 /// matching the target gate cycle, digest, and current content fingerprint
 /// (stale structural-generation runs must not count).
+#[allow(clippy::too_many_arguments)] // Gate evidence is validated against every persisted identity dimension.
 fn document_gate_evidence_counts(
     gate: &super::types::NormalizedGate,
     required_raw_ids: &[String],

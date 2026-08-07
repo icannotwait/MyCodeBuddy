@@ -300,9 +300,7 @@ describe("local open paths under limit", () => {
       tabsHydrated: true,
     })
 
-    await useTabStore
-      .getState()
-      .openTab(1, 100, "claude_code", false, "Parent")
+    await useTabStore.getState().openTab(1, 100, "claude_code", false, "Parent")
 
     const st = useTabStore.getState()
     const parent = st.rawTabs.find((t) => t.conversationId === 100)

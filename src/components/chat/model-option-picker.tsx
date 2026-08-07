@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { ChevronDown } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
@@ -23,6 +23,15 @@ interface ModelOptionPickerProps {
   onSelect: (configId: string, valueId: string) => void
   /** When true, trigger stays visible with the current value but cannot open. */
   disabled?: boolean
+}
+
+function selectedOptionLabel(groups: ModelOptionGroup[], currentValue: string) {
+  for (const group of groups) {
+    for (const option of group.options) {
+      if (option.value === currentValue) return configOptionDisplayLabel(option)
+    }
+  }
+  return currentValue
 }
 
 // Wide-form model picker for LONG model lists: a trigger button opening a
@@ -52,14 +61,7 @@ export function ModelOptionPicker({
     useScrollbarSafeDismiss()
   const kind = option.kind.type === "select" ? option.kind : null
   const currentValue = kind?.current_value ?? ""
-  const currentLabel = useMemo(() => {
-    for (const group of groups) {
-      for (const opt of group.options) {
-        if (opt.value === currentValue) return configOptionDisplayLabel(opt)
-      }
-    }
-    return currentValue
-  }, [groups, currentValue])
+  const currentLabel = selectedOptionLabel(groups, currentValue)
 
   if (!kind) return null
 
@@ -79,9 +81,7 @@ export function ModelOptionPicker({
           variant="ghost"
           size="xs"
           disabled={disabled}
-          title={
-            currentLabel ? `${option.name}: ${currentLabel}` : option.name
-          }
+          title={currentLabel ? `${option.name}: ${currentLabel}` : option.name}
           aria-label={
             currentLabel ? `${option.name}: ${currentLabel}` : option.name
           }

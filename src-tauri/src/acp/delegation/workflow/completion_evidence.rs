@@ -361,7 +361,7 @@ enum RetryTxnOutcome {
 }
 
 enum DecisionTxnOutcome {
-    Resolved(CompletionMutationResult),
+    Resolved(Box<CompletionMutationResult>),
     Superseded,
 }
 
@@ -937,7 +937,7 @@ pub async fn resolve_completion_decision_txn(
         })
         .await;
     let mut result = match result {
-        Ok(DecisionTxnOutcome::Resolved(result)) => result,
+        Ok(DecisionTxnOutcome::Resolved(result)) => *result,
         Ok(DecisionTxnOutcome::Superseded) => return Err(CompletionMutationError::Superseded),
         Err(sea_orm::TransactionError::Connection(error)) => {
             return Err(CompletionMutationError::Evidence(
@@ -1009,25 +1009,27 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
             .await?;
             resolve_user_outcome_attention(conn, request, outcome, actor_identity, graph_revision)
                 .await?;
-            Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
-                workflow_id: loaded.workflow.workflow_id,
-                task_id: loaded.run.task_id,
-                node_id: completion_attention_public_node_id(&loaded.node.node_id),
-                kind: AttentionKind::CompletionDecision,
-                outcome,
-                evidence_scope_digest: context.evidence_scope_digest,
-                graph_revision,
-                idempotent_replay: false,
-                completion: Some(super::project_terminal_completion(
-                    &TerminalCompletionResult {
-                        state: CompletionState::Resolved,
-                        evidence: Some(evidence),
-                        attention: None,
-                        graph_revision,
-                        final_metric_states: Vec::new(),
-                    },
-                )),
-            }))
+            Ok(DecisionTxnOutcome::Resolved(Box::new(
+                CompletionMutationResult {
+                    workflow_id: loaded.workflow.workflow_id,
+                    task_id: loaded.run.task_id,
+                    node_id: completion_attention_public_node_id(&loaded.node.node_id),
+                    kind: AttentionKind::CompletionDecision,
+                    outcome,
+                    evidence_scope_digest: context.evidence_scope_digest,
+                    graph_revision,
+                    idempotent_replay: false,
+                    completion: Some(super::project_terminal_completion(
+                        &TerminalCompletionResult {
+                            state: CompletionState::Resolved,
+                            evidence: Some(evidence),
+                            attention: None,
+                            graph_revision,
+                            final_metric_states: Vec::new(),
+                        },
+                    )),
+                },
+            )))
         }
         Err(ArtifactError::Unavailable(failure)) => {
             let mut completion = open_artifact_recovery(
@@ -1053,17 +1055,19 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
             completion.graph_revision = graph_revision;
             resolve_user_outcome_attention(conn, request, outcome, actor_identity, graph_revision)
                 .await?;
-            Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
-                workflow_id: loaded.workflow.workflow_id,
-                task_id: loaded.run.task_id,
-                node_id: completion_attention_public_node_id(&loaded.node.node_id),
-                kind: AttentionKind::CompletionDecision,
-                outcome,
-                evidence_scope_digest: context.evidence_scope_digest,
-                graph_revision,
-                idempotent_replay: false,
-                completion: Some(super::project_terminal_completion(&completion)),
-            }))
+            Ok(DecisionTxnOutcome::Resolved(Box::new(
+                CompletionMutationResult {
+                    workflow_id: loaded.workflow.workflow_id,
+                    task_id: loaded.run.task_id,
+                    node_id: completion_attention_public_node_id(&loaded.node.node_id),
+                    kind: AttentionKind::CompletionDecision,
+                    outcome,
+                    evidence_scope_digest: context.evidence_scope_digest,
+                    graph_revision,
+                    idempotent_replay: false,
+                    completion: Some(super::project_terminal_completion(&completion)),
+                },
+            )))
         }
         Err(error) => Err(CompletionEvidenceError::Artifact(error).into()),
     }
@@ -1192,22 +1196,24 @@ pub async fn resolve_design_self_review_txn(
                     graph_revision,
                 )
                 .await?;
-                Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
-                    workflow_id: workflow.workflow_id,
-                    task_id: binding.task_id,
-                    node_id: completion_attention_public_node_id(&binding.node_id),
-                    kind: AttentionKind::DesignSelfReviewDecision,
-                    outcome,
-                    evidence_scope_digest: binding.evidence_scope_digest,
-                    graph_revision,
-                    idempotent_replay: false,
-                    completion: None,
-                }))
+                Ok(DecisionTxnOutcome::Resolved(Box::new(
+                    CompletionMutationResult {
+                        workflow_id: workflow.workflow_id,
+                        task_id: binding.task_id,
+                        node_id: completion_attention_public_node_id(&binding.node_id),
+                        kind: AttentionKind::DesignSelfReviewDecision,
+                        outcome,
+                        evidence_scope_digest: binding.evidence_scope_digest,
+                        graph_revision,
+                        idempotent_replay: false,
+                        completion: None,
+                    },
+                )))
             })
         })
         .await;
     let mut result = match result {
-        Ok(DecisionTxnOutcome::Resolved(result)) => result,
+        Ok(DecisionTxnOutcome::Resolved(result)) => *result,
         Ok(DecisionTxnOutcome::Superseded) => return Err(CompletionMutationError::Superseded),
         Err(sea_orm::TransactionError::Connection(error)) => {
             return Err(CompletionMutationError::Evidence(
@@ -1345,17 +1351,19 @@ async fn replay_user_outcome<C: ConnectionTrait>(
         }
         _ => return Err(CompletionMutationError::KindMismatch),
     };
-    Ok(DecisionTxnOutcome::Resolved(CompletionMutationResult {
-        workflow_id,
-        task_id: request.task_id.clone(),
-        node_id,
-        kind: row.kind.clone(),
-        outcome,
-        evidence_scope_digest: request.captured_scope_digest.clone(),
-        graph_revision: resolution.graph_revision,
-        idempotent_replay: true,
-        completion: completion.as_ref().map(super::project_terminal_completion),
-    }))
+    Ok(DecisionTxnOutcome::Resolved(Box::new(
+        CompletionMutationResult {
+            workflow_id,
+            task_id: request.task_id.clone(),
+            node_id,
+            kind: row.kind.clone(),
+            outcome,
+            evidence_scope_digest: request.captured_scope_digest.clone(),
+            graph_revision: resolution.graph_revision,
+            idempotent_replay: true,
+            completion: completion.as_ref().map(super::project_terminal_completion),
+        },
+    )))
 }
 
 async fn resolve_user_outcome_attention<C: ConnectionTrait>(
@@ -2452,20 +2460,27 @@ async fn validate_loaded_completion_evidence<C: ConnectionTrait>(
                 "resolved run has no durable completion evidence".into(),
             )
         })?;
-    let context = rebuild_persisted_completion_context(conn, &loaded, preload).await?;
+    let context = rebuild_persisted_completion_context(conn, loaded, preload).await?;
     ensure_context_matches_binding(&context, &loaded.binding)?;
     let artifact =
-        completion_artifact(&resolve_terminal_artifact(conn, &loaded, &context, outcome).await?);
+        completion_artifact(&resolve_terminal_artifact(conn, loaded, &context, outcome).await?);
     if loaded.binding.artifact_digest.as_deref() != Some(artifact.digest()) {
-        return Err(CompletionEvidenceError::InvalidTerminalState(
-            "run binding artifact does not match the current platform artifact".into(),
-        ));
+        return Err(ArtifactError::ScopeChanged {
+            expected: loaded
+                .binding
+                .artifact_digest
+                .as_deref()
+                .unwrap_or_default()
+                .to_string(),
+            actual: artifact.digest().to_string(),
+        }
+        .into());
     }
     let validated = validate_completion_evidence(
         evidence_json,
         &EvidenceValidationContext {
             role: context.scope_role.completion_role(),
-            binding: completion_binding(&loaded, &context)?,
+            binding: completion_binding(loaded, &context)?,
             artifact,
             scope: context.evidence_scope,
         },

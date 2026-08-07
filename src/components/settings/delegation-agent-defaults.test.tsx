@@ -129,12 +129,8 @@ describe("DelegationAgentDefaultsPanel", () => {
     )
 
     // Default hint uses the full wire value so compound params stay visible.
-    expect(
-      screen.getByText(`Agent default: ${compound}`)
-    ).toBeInTheDocument()
-    expect(
-      screen.getByText(`Default (${compound})`)
-    ).toBeInTheDocument()
+    expect(screen.getByText(`Agent default: ${compound}`)).toBeInTheDocument()
+    expect(screen.getByText(`Default (${compound})`)).toBeInTheDocument()
     // Short display name must not be used as the sole label on a text node.
     expect(
       screen.queryByText("claude-opus-4-6", { exact: true })

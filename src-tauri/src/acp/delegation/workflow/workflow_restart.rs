@@ -89,7 +89,7 @@ pub fn inject_legacy_restart_header_failure_once() {
 fn take_restart_header_failure() -> bool {
     #[cfg(any(test, feature = "test-utils"))]
     {
-        return FAIL_RESTART_HEADER_ONCE.replace(false);
+        FAIL_RESTART_HEADER_ONCE.replace(false)
     }
     #[cfg(not(any(test, feature = "test-utils")))]
     false
@@ -132,7 +132,7 @@ pub async fn restart_legacy_workflow_core(
                     .one(txn)
                     .await
                     .map_err(db_err)?
-                    .ok_or_else(|| WorkflowStoreError::ParentNotFound(source_conversation_id))?;
+                    .ok_or(WorkflowStoreError::ParentNotFound(source_conversation_id))?;
                 if source.completion_protocol_version != 1 {
                     return Err(WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(
                         "source workflow is not protocol v1".into(),
@@ -179,7 +179,7 @@ pub async fn restart_legacy_workflow_core(
                     .one(txn)
                     .await
                     .map_err(db_err)?;
-                let (author_agent_type, author_profile_id) = source_author
+                let (restart_agent_type, restart_profile_id) = source_author
                     .map(|binding| (binding.agent_type, binding.profile_id))
                     .unwrap_or_else(|| (source_conversation.agent_type.clone(), None));
                 let source_restart_context =
@@ -241,8 +241,8 @@ pub async fn restart_legacy_workflow_core(
                     original_request_id: Set(source_restart_context.original_request_id),
                     original_request_text: Set(source_restart_context.original_request_text),
                     original_request_digest: Set(source_restart_context.original_request_digest),
-                    agent_type: Set(author_agent_type.clone()),
-                    profile_id: Set(author_profile_id.clone()),
+                    agent_type: Set(restart_agent_type),
+                    profile_id: Set(restart_profile_id),
                     created_at: Set(now),
                 }
                 .insert(txn)
@@ -280,11 +280,7 @@ pub async fn restart_legacy_workflow_core(
                 }
 
                 let successor_workflow_id = uuid::Uuid::new_v4().to_string();
-                let document = restart_skeleton(
-                    &successor_workflow_id,
-                    &author_agent_type,
-                    author_profile_id.as_deref(),
-                );
+                let document = restart_skeleton(&successor_workflow_id);
                 let normalized = validate_manifest_document(&document)?;
                 let stored_document = normalized_to_document(&normalized);
                 let document_json = serde_json::to_string(&stored_document).map_err(|error| {
@@ -354,8 +350,11 @@ pub async fn restart_legacy_workflow_core(
                         .clone()
                         .expect("validated author has work unit key")),
                     role: Set("author".into()),
-                    agent_type: Set(author_agent_type),
-                    profile_id: Set(author_profile_id),
+                    agent_type: Set(author
+                        .agent_type
+                        .clone()
+                        .expect("validated author has agent type")),
+                    profile_id: Set(author.profile_id.clone()),
                     phase_id: Set(PHASE_PLAN.into()),
                     task_index: Set(None),
                     introduced_revision: Set(1),
@@ -626,16 +625,12 @@ pub(crate) async fn completion_protocol_projection<C: ConnectionTrait>(
     })
 }
 
-fn restart_skeleton(
-    workflow_id: &str,
-    author_agent_type: &str,
-    author_profile_id: Option<&str>,
-) -> ManifestDocument {
+fn restart_skeleton(workflow_id: &str) -> ManifestDocument {
     let plan_path = format!("docs/superpowers/plans/restarted-{}.md", &workflow_id[..8]);
     let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
         rel_plan_path: &plan_path,
-        agent_type: author_agent_type,
-        profile_id: author_profile_id,
+        agent_type: "codex",
+        profile_id: None,
     })
     .expect("generated restart Plan path is valid");
     ManifestDocument {
@@ -681,8 +676,8 @@ fn restart_skeleton(
                 kind: ManifestNodeKind::WorkUnit,
                 phase_id: Some(PHASE_PLAN.into()),
                 role: Some(ManifestNodeRole::Author),
-                agent_type: Some(author_agent_type.into()),
-                profile_id: author_profile_id.map(str::to_string),
+                agent_type: Some("codex".into()),
+                profile_id: None,
                 task_index: None,
                 work_unit_key: Some(author_key),
                 deps: vec!["design-root".into()],

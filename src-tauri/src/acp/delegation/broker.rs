@@ -34574,13 +34574,63 @@ mod tests {
     }
 
     async fn seed_v2_plan_author_workflow(db: &crate::db::AppDatabase, parent_id: i32) {
+        use crate::acp::delegation::workflow::{
+            normalize_rel_path, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
+            ManifestNodeRole, ManifestPhase, ManifestWorkflowState,
+        };
         use crate::db::entities::delegation_workflow::{
             self, CompletionProtocolMode, WorkflowState,
         };
-        use crate::db::entities::delegation_workflow_node_binding;
+        use crate::db::entities::{
+            delegation_workflow_manifest_revision, delegation_workflow_node_binding,
+        };
         use sea_orm::{ActiveModelTrait, Set};
 
         let now = Utc::now();
+        let design_bytes = std::fs::read_to_string("Cargo.toml").unwrap();
+        let plan_path = normalize_rel_path("Cargo.toml").unwrap();
+        let work_unit_key = v2_plan_author_work_unit_key();
+        let document = ManifestDocument {
+            schema_version: 2,
+            workflow_kind: "brainstorm_to_delivery".into(),
+            plan_target_rel_path: plan_path.clone(),
+            risk_policy_version: "b2d_task_risk_v1".into(),
+            workflow_id: None,
+            expected_manifest_revision: None,
+            publication_token: "launch-binding-publication".into(),
+            workflow_state: ManifestWorkflowState::Skeleton,
+            design: Some(DocumentRef {
+                rel_path: plan_path,
+                digest: format!(
+                    "sha256:{}",
+                    crate::acp::delegation::workflow::dto::sha256_hex_str(&design_bytes)
+                ),
+            }),
+            plan: None,
+            phases: vec![ManifestPhase {
+                id: "plan".into(),
+                kind: None,
+                title: None,
+            }],
+            nodes: vec![ManifestNode {
+                id: "launch-binding-author".into(),
+                kind: ManifestNodeKind::WorkUnit,
+                phase_id: Some("plan".into()),
+                role: Some(ManifestNodeRole::Author),
+                agent_type: Some("codex".into()),
+                profile_id: None,
+                task_index: None,
+                work_unit_key: Some(work_unit_key.clone()),
+                deps: Vec::new(),
+                required: Some(true),
+                node_outcome: None,
+                title: None,
+            }],
+            edges: Vec::new(),
+            gates: Vec::new(),
+            task_policies: Vec::new(),
+        };
+        let document_json = serde_json::to_string(&document).unwrap();
         delegation_workflow::ActiveModel {
             workflow_id: Set("launch-binding-workflow".into()),
             parent_conversation_id: Set(parent_id),
@@ -34588,7 +34638,7 @@ mod tests {
             schema_version: Set(2),
             active_manifest_revision: Set(1),
             graph_revision: Set(1),
-            workflow_state: Set(WorkflowState::Estimated),
+            workflow_state: Set(WorkflowState::Skeleton),
             capability_version: Set("workflow_manifest_v2".into()),
             publication_token: Set("launch-binding-publication".into()),
             supersedes_approved_revision: Set(None),
@@ -34606,10 +34656,31 @@ mod tests {
         .insert(&db.conn)
         .await
         .unwrap();
+        delegation_workflow_manifest_revision::ActiveModel {
+            workflow_id: Set("launch-binding-workflow".into()),
+            manifest_revision: Set(1),
+            manifest_state: Set("skeleton".into()),
+            document_digest: Set(crate::acp::delegation::workflow::dto::sha256_hex_str(
+                &document_json,
+            )),
+            document_json: Set(document_json),
+            revision_kind: Set(Some("publication".into())),
+            source_manifest_revision: Set(None),
+            recovery_authorization_id: Set(None),
+            transition_reason_code: Set(None),
+            consumer_correlation_id: Set(None),
+            graph_revision: Set(Some(1)),
+            recovery_source_state_fingerprint: Set(None),
+            recovery_risk_class: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
         delegation_workflow_node_binding::ActiveModel {
             workflow_id: Set("launch-binding-workflow".into()),
             node_id: Set("launch-binding-author".into()),
-            work_unit_key: Set("plan|docs/plan.md|author|codex|none".into()),
+            work_unit_key: Set(work_unit_key),
             role: Set("author".into()),
             agent_type: Set("codex".into()),
             profile_id: Set(None),
@@ -34650,6 +34721,17 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::acp::delegation::workflow::capture_original_request_context(
+            &db.conn,
+            parent.id,
+            "launch-binding-request",
+            &[crate::acp::types::PromptInputBlock::Text {
+                text: "Author the bound Plan.".into(),
+            }],
+            "codex",
+        )
+        .await
+        .unwrap();
         seed_v2_plan_author_workflow(&db, parent.id).await;
         let runs = Arc::new(RunStore::new(db.clone()));
         let mock = Arc::new(MockSpawner::new());
@@ -34663,8 +34745,19 @@ mod tests {
         let mut request = request(parent_id, tool_use_id);
         request.agent_type = AgentType::Codex;
         request.working_dir = Some(test_working_dir());
-        request.work_unit_key = Some("plan|docs/plan.md|author|codex|none".into());
+        request.work_unit_key = Some(v2_plan_author_work_unit_key());
         request
+    }
+
+    fn v2_plan_author_work_unit_key() -> String {
+        crate::acp::delegation::workflow::build_work_unit_key(
+            &crate::acp::delegation::workflow::WorkUnitKeyParts::PlanAuthor {
+                rel_plan_path: "Cargo.toml",
+                agent_type: "codex",
+                profile_id: None,
+            },
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -34778,7 +34871,7 @@ mod tests {
         let task_id = root.task_id.unwrap();
         let child_id = root.child_conversation_id.unwrap();
         broker
-            .complete_call(&task_id, completed_outcome("done"))
+            .complete_call(&task_id, completed_outcome("Conclusion: done"))
             .await;
         let child = conversation::Entity::find_by_id(child_id)
             .one(&db.conn)
@@ -34795,7 +34888,7 @@ mod tests {
     async fn complete_work_continuation_carries_committed_v2_workflow_binding() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
 
-        let (db, _runs, mock, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, mock, broker, parent_id) = v2_plan_author_launch_fixture().await;
         let (root_task_id, child_id) = prepare_v2_bound_root_for_continue(
             db.as_ref(),
             broker.as_ref(),
@@ -34812,9 +34905,9 @@ mod tests {
                 parent_connection_id: "parent-conn".into(),
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "binding-continue-ok".into(),
-                target_task_id: root_task_id,
+                target_task_id: root_task_id.clone(),
                 task: "continue the bound workflow child".into(),
-                work_unit_key: Some("plan|docs/plan.md|author|codex|none".into()),
+                work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
@@ -34822,12 +34915,24 @@ mod tests {
             .await;
 
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let continued_task_id = report.task_id.clone().unwrap();
+        assert_eq!(
+            runs.workflow_child_mcp_binding(&continued_task_id)
+                .await
+                .unwrap(),
+            Some(crate::acp::delegation::workflow::WorkflowChildMcpBinding {
+                task_id: continued_task_id.clone(),
+                workflow_id: "launch-binding-workflow".into(),
+                protocol_version: 2,
+                node_id: "launch-binding-author".into(),
+            })
+        );
         let resume_args = mock.resume_args.lock().await;
         assert_eq!(resume_args.len(), 1);
         assert_eq!(
             resume_args[0].workflow_binding,
             Some(crate::acp::delegation::workflow::WorkflowChildMcpBinding {
-                task_id: report.task_id.unwrap(),
+                task_id: continued_task_id,
                 workflow_id: "launch-binding-workflow".into(),
                 protocol_version: 2,
                 node_id: "launch-binding-author".into(),
@@ -34856,7 +34961,7 @@ mod tests {
                 parent_tool_use_id: "binding-continue-fail".into(),
                 target_task_id: root_task_id,
                 task: "continue the bound workflow child".into(),
-                work_unit_key: Some("plan|docs/plan.md|author|codex|none".into()),
+                work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,

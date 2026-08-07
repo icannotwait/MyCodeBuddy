@@ -507,6 +507,15 @@ fn validate_author_and_skeleton(
             "manifest requires exactly one Plan Author node, got {author_count}"
         )));
     }
+    let author = nodes
+        .iter()
+        .find(|node| node.role == Some(ManifestNodeRole::Author))
+        .expect("author count was validated");
+    if author.agent_type.as_deref() != Some("codex") {
+        return Err(WorkflowError::InvalidField(
+            "Plan Author agent_type must be codex".into(),
+        ));
+    }
 
     if doc.workflow_state == super::types::ManifestWorkflowState::Skeleton {
         if doc.plan.is_some() {

@@ -1864,6 +1864,7 @@ pub async fn get_folder_conversation_with_live_core(
 /// - `history_before_turn_id`: exclusive upper-bound turn id for "load older" pages.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)] // Tauri injects the command state parameters individually.
 pub async fn get_folder_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,

@@ -691,7 +691,7 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 },
             ],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "owners of open Critical and Important findings only",
+            policy_outcome: "platform-selected reviewer nodes and lineage",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -818,7 +818,7 @@ fn skill_forward_routing_invariants_nine_scenarios() {
     // Markers must match current Skill contract language (not legacy prose).
     // Runtime wire codes such as busy_thread are asserted elsewhere.
     for marker in [
-        "Design/Plan",
+        "Design, Plan, Task, and Final gates advance from platform outcomes",
         "continue_delegation",
         "work_unit_key",
         "agent_type: \"grok\"",

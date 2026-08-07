@@ -426,7 +426,7 @@ fn desktop_completion_context_for_label(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tauri-runtime"))]
 mod tests {
     use super::*;
 

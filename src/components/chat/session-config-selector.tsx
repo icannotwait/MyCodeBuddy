@@ -129,9 +129,7 @@ export function InlineSessionConfigSelector({
                       <DropdownMenuRadioItem
                         key={`${group.key}-${item.value}`}
                         value={item.value}
-                        title={
-                          item.name !== label ? item.name : undefined
-                        }
+                        title={item.name !== label ? item.name : undefined}
                       >
                         <DropdownRadioItemContent
                           label={label}

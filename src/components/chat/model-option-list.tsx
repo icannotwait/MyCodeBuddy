@@ -241,9 +241,7 @@ export function ModelOptionList({
                         id={optionId(optionIndex)}
                         aria-selected={selected}
                         title={
-                          row.option.name !== label
-                            ? row.option.name
-                            : label
+                          row.option.name !== label ? row.option.name : label
                         }
                         onMouseMove={() => setActiveIndex(optionIndex)}
                         onClick={() => onSelect(row.option.value)}

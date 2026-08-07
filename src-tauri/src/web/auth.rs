@@ -87,15 +87,15 @@ impl AuthenticatedApplication {
     pub fn authorize_completion_root(
         &self,
         parent_conversation_id: i32,
-    ) -> Result<CompletionMutationContext, ()> {
+    ) -> Option<CompletionMutationContext> {
         match self.completion_root_scope {
             CompletionRootScope::Conversation(owned) if owned == parent_conversation_id => {
-                Ok(CompletionMutationContext::authenticated(
+                Some(CompletionMutationContext::authenticated(
                     parent_conversation_id,
                     self.actor_identity.clone(),
                 ))
             }
-            CompletionRootScope::GlobalOperator | CompletionRootScope::Conversation(_) => Err(()),
+            CompletionRootScope::GlobalOperator | CompletionRootScope::Conversation(_) => None,
         }
     }
 }

@@ -1932,9 +1932,9 @@ async fn settle_workflow_gate_derived_core(
                             gate,
                         )
                         .await?;
-                        let expectation = v2_expectation.as_ref().ok_or_else(|| {
-                            WorkflowStoreError::V2CallerEvidenceRejected
-                        })?;
+                        let expectation = v2_expectation
+                            .as_ref()
+                            .ok_or(WorkflowStoreError::V2CallerEvidenceRejected)?;
                         if expectation.review_round.is_some_and(|expected| {
                             expected != evidence.identity.review_round as u64
                         }) {
@@ -2289,7 +2289,7 @@ async fn settle_workflow_gate_derived_core(
                                     .iter()
                                     .rev()
                                     .find(|row| row.plan_round_state_v2_json.is_some())
-                                    .map(|row| load_persisted_plan_state_v2(row))
+                                    .map(load_persisted_plan_state_v2)
                                     .transpose()?;
                                 let change = match prior_v2_state.as_ref() {
                                     None => PlanReviewChangeV2::InitialOrNewLineage,
@@ -2635,7 +2635,6 @@ async fn settle_workflow_gate_derived_core(
                                 .flatten(),
                         ),
                         created_at: Set(now),
-                        ..Default::default()
                     };
                     row.insert(txn).await.map_err(db_err)?;
 
@@ -5105,7 +5104,6 @@ async fn insert_header_create_or_reclassify(
         legacy_source_workflow_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
-        ..Default::default()
     };
 
     match header.insert(txn).await {
@@ -9930,7 +9928,8 @@ mod tests {
     #[tokio::test]
     async fn design_self_review_decision_is_required_and_persists_null_counts() {
         use crate::acp::delegation::workflow::completion_evidence::{
-            resolve_design_self_review_txn, CompletionAttentionCas,
+            completion_attention_public_node_id, resolve_design_self_review_txn,
+            CompletionAttentionCas,
         };
         use crate::db::entities::delegation_workflow::{CompletionProtocolMode, WorkflowState};
 
@@ -10048,7 +10047,7 @@ mod tests {
             kind: attention.kind,
             captured_scope_digest: attention.captured_scope_digest.unwrap(),
             latest_run_id: attention.latest_run_id.unwrap(),
-            node_id: attention.node_id.unwrap(),
+            node_id: completion_attention_public_node_id(&attention.node_id.unwrap()),
         };
         let resolved = resolve_design_self_review_txn(
             &db,

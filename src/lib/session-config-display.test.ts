@@ -24,15 +24,13 @@ describe("configOptionDisplayLabel", () => {
   })
 
   it("returns the shared text when name and value match", () => {
-    expect(
-      configOptionDisplayLabel({ value: "agent", name: "agent" })
-    ).toBe("agent")
+    expect(configOptionDisplayLabel({ value: "agent", name: "agent" })).toBe(
+      "agent"
+    )
   })
 
   it("falls back to the other side when one side is empty", () => {
     expect(configOptionDisplayLabel({ value: "id", name: "" })).toBe("id")
-    expect(configOptionDisplayLabel({ value: "", name: "Label" })).toBe(
-      "Label"
-    )
+    expect(configOptionDisplayLabel({ value: "", name: "Label" })).toBe("Label")
   })
 })

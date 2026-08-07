@@ -429,5 +429,5 @@ function CompletionProtocolStatus({
 }
 
 function formatProtocolMode(mode: string): string {
-  return mode.replaceAll("_", " ")
+  return mode.replace(/_/g, " ")
 }
