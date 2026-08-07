@@ -10,9 +10,10 @@ through the desktop core, authenticated server route, and `codeg-mcp` surface.
 
 The release fixtures also prove that session-2889-style Card prose causes no
 format-repair or Card re-emission run, post-settlement Final drift returns
-`final_artifact_drift` and reopens Final, and legacy restart creates or reopens
-one linked empty v2 successor while retaining the original request context and
-routing the new Plan Author to Codex.
+`final_artifact_drift` through the normal listener read and reopens Final, stale
+Final evidence is omitted from the next projection, and legacy restart creates
+or reopens one linked empty v2 successor while retaining the original request
+context and routing the new Plan Author to Codex.
 
 ## Capability Matrix
 
@@ -24,7 +25,7 @@ routing the new Plan Author to Codex.
 | Direct adjudication | `every_model_capability_reaches_one_platform_completion_truth` / `AmbiguousThenUserAdjudication` | Ambiguous meaning opens typed attention and authenticated user resolution completes the existing run without child continuation. |
 | Obsolete Card tolerance | `every_model_capability_reaches_one_platform_completion_truth` / `ObsoleteCardPlusNaturalConclusion` | Obsolete Card JSON is ignored; the natural conclusion settles one run and `card_summary_json` is cleared. |
 | Session 2889 | `session_2889_and_final_drift_have_no_format_repair_escape` | Zero format-repair runs, zero Card re-emission prompts, and one child run. |
-| Final drift | `session_2889_and_final_drift_have_no_format_repair_escape` | Delivery reports `final_artifact_drift`, reopens Final, and advances the review round. |
+| Final drift | `session_2889_and_final_drift_have_no_format_repair_escape` | The listener validates the full required Final-reviewer cohort and frozen v2 evidence, reports `final_artifact_drift`, atomically reopens Final with a new lineage/round, and subsequently projects state without obsolete Final evidence. |
 | Legacy restart | `legacy_restart_*`, `legacy_prompt_restart_*`, and `rollout_restart_*` | Source remains immutable; one reciprocal v2 successor is idempotent/retryable, fail-closed without context, and routed to Codex Plan Author. |
 | Runtime parity | `completion_projection_is_identical_across_graph_http_and_mcp_surfaces` plus every capability case | Desktop, authenticated HTTP, and MCP expose byte-equivalent completion Cards. |
 | Manual root resume | `workflow-overlay.test.tsx` legacy backlink/root-resume fixture plus attention transport parity | Durable root refresh controls resume; no terminal child is reopened. |
@@ -37,7 +38,7 @@ Design acceptance criteria:
 | Design criteria | Evidence surface |
 | --- | --- |
 | 1-5: semantic outcomes, tool identity/exposure, prompt binding, durable authority | Five-case capability matrix; Broker committed-binding launch/continuation tests; admission instruction/scope fixtures. |
-| 6-9: clean producer baseline/commit/no-op, Reviewer revalidation, Final freeze, v2 evidence and projection-only Cards | Admission artifact-contract fixtures; Final-drift fixture; shared completion validator and projection tests. |
+| 6-9: clean producer baseline/commit/no-op, Reviewer revalidation, Final freeze, v2 evidence and projection-only Cards | Admission artifact-contract fixtures; automatic listener Final-drift guard over the full current reviewer cohort; shared completion validator and stale-evidence projection tests. |
 | 10-14: durable adjudication, role outcome compatibility, complete-set gates, external gate reduction, authenticated Design self-review | Completion evidence/store unit suites; six-field CAS and authenticated core/HTTP parity fixtures. |
 | 15-21: Plan material/lineage/selective rounds, strict improvement, immutable Final contexts, canonical scope and golden identities | Plan reducer, admission scope, artifact, Final-package, and recovery fixtures in the full desktop/server libraries. |
 | 22-25: transactional migration/rollback, typed attention lifecycle, durable outbox replay, root re-entry and transport parity | Ten migration fixtures; completion attention/outbox tests; seven transport parity fixtures; focused overlay tests. |
@@ -88,26 +89,26 @@ Fresh commands were run with `CARGO_BUILD_JOBS=1` for Rust:
 - `pnpm test`: complete Vitest run exited 0.
 - `pnpm build`: compiled, typechecked, and statically generated 33/33 pages.
 - Desktop `cargo check`: passed.
-- Desktop `cargo test --features test-utils`: library 4,273 passed and 2
+- Desktop `cargo test --features test-utils`: library 4,275 passed and 2
   ignored; all integration binaries and doc tests passed.
 - Desktop `cargo clippy --all-targets --features test-utils -- -D warnings`:
   passed.
 - Server `cargo check --no-default-features --features server --bin codeg-server`:
   passed.
 - Server `cargo test --no-default-features --features server --bin codeg-server --lib`:
-  library 4,196 passed and 2 ignored; server bin passed.
+  library 4,198 passed and 2 ignored; server bin passed.
 - Server `cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings`:
   passed.
 - `cargo check --no-default-features --bin codeg-mcp`: passed.
 - `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --cached --check`: passed.
 
-The first server-suite attempt had one unrelated transient Windows `os error 5`
-in `update::install::tests::swap_dir_via_copy_keeps_backup_and_swaps`. Task 18
-does not modify that module. The exact server-feature test then passed once
-with full output and 10 consecutive times in a reproduction loop; the unchanged
-full server command was rerun and passed 4,196/4,196 non-ignored tests. No
-updater change was made.
+The first full desktop run exposed an obsolete hand-built Final fixture: it no
+longer satisfied the complete v2 Final cohort and frozen-evidence contract.
+The fixture was converted into a valid miniature v2 workflow with Plan
+Author/Reviewer materialization, Plan settlement, Final review, and outbox/event
+assertions. Its exact test passed, then the unchanged full desktop and server
+suites passed with the counts above.
 
 The desktop build emitted the existing warning that the packaged `codeg-mcp`
 sidecar placeholder is empty; the separately required companion check and
@@ -115,10 +116,14 @@ warning-denying Clippy command both passed.
 
 ## Scope And Hygiene
 
-The verified implementation commit contains 27 Task 18 files: capability and
-runtime integration fixtures, production corrections exposed by those
-fixtures, server-only test gating, and lint/build corrections required by the
-full release gate. It adds no new production API.
+The initial verified implementation commit contains 27 Task 18 files:
+capability and runtime integration fixtures, production corrections exposed by
+those fixtures, server-only test gating, and lint/build corrections required by
+the full release gate. The seven-file enforcement follow-up connects the Final
+guard to listener state reads, validates all current Final reviewer bindings,
+rotates drift recovery atomically, filters stale projected evidence, and
+converts the legacy unit fixture to valid v2 evidence. The guard remains
+crate-private, so Task 18 adds no new production API.
 
 The following pre-existing or unrelated files remain unstaged and unchanged by
 Task 18: `.superpowers/sdd/progress.md`, the Task 13 implementer report,
@@ -133,6 +138,8 @@ not committed.
 ## Commits
 
 - `ca19622b test: prove platform completion evidence end to end`
+- `61c8d238 docs: add task 18 implementer report`
+- `3e8455fa fix: enforce final delivery evidence guard`
 
 ## Review Handoff
 
