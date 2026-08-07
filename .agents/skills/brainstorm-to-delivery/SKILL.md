@@ -184,11 +184,12 @@ change requirements, scope, architecture, or user data handling.
    `b2d_task_risk_v1`, and Task Routing Matrix format. **Author owns the Plan
    file and all revisions. Parent must not write or rewrite the Plan**; parent
    may only reject invalid output and adjudicate evidence.
-   **Plan shape rule:** Task sequence is implement → automated verify →
-   (next Task) … → Final review → commit/report. Do **not** insert
-   human-only acceptance, manual QA walkthrough, or “wait for user sign-off”
-   Tasks between logic Tasks. List human UAT/acceptance only in the Plan’s
-   post-delivery / residual work section (or final report follow-ups).
+   **Plan shape rule:** Task sequence is implement → automated verify → producer
+   commit/review → (next Task) … → pre-Final aggregation/freeze → Final review
+   → deliver/report. Do **not** insert human-only acceptance, manual QA
+   walkthrough, or “wait for user sign-off” Tasks between logic Tasks. List
+   human UAT/acceptance only in the Plan’s post-delivery / residual work section
+   (or final report follow-ups).
 3. Publish estimated with the platform-resolved Plan digest, Task Routing
    Matrix, task policies/routes, complete Plan `reviewer_cohort_node_ids`, and
    full initial `required_reviewer_node_ids`. Plan reviewers are separate
