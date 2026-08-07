@@ -5349,7 +5349,13 @@ async fn publish_in_txn(
         },
     );
     if v2_enforce {
-        initialize_v2_gate_states_txn(txn, &workflow_id, &effective_normalized).await?;
+        initialize_v2_gate_states_txn(
+            txn,
+            &workflow_id,
+            &effective_normalized,
+            prior_normalized.as_ref(),
+        )
+        .await?;
     }
 
     let rev_row = delegation_workflow_manifest_revision::ActiveModel {
@@ -5400,6 +5406,7 @@ async fn initialize_v2_gate_states_txn(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
     normalized: &NormalizedManifest,
+    prior_normalized: Option<&NormalizedManifest>,
 ) -> Result<(), WorkflowStoreError> {
     let mut desired = Vec::new();
     for gate in &normalized.gates {
@@ -5427,7 +5434,14 @@ async fn initialize_v2_gate_states_txn(
             }),
         };
         let lineage = workflow_gate_lineage(&material)?;
-        desired.push((gate.id.clone(), lineage, selected));
+        let prior_selected = prior_normalized.and_then(|prior| {
+            prior
+                .gates
+                .iter()
+                .find(|prior_gate| prior_gate.id == gate.id)
+                .map(|prior_gate| canonical_string_set(&prior_gate.required_reviewer_node_ids))
+        });
+        desired.push((gate.id.clone(), lineage, selected, prior_selected));
     }
 
     let final_reviewers = canonical_string_set(
@@ -5453,11 +5467,17 @@ async fn initialize_v2_gate_states_txn(
             "task_policies": normalized.task_policies,
         });
         let lineage = workflow_gate_lineage(&material)?;
-        desired.push(("final".to_string(), lineage, final_reviewers));
+        let prior_final_reviewers = prior_normalized.map(required_final_reviewer_node_ids);
+        desired.push((
+            "final".to_string(),
+            lineage,
+            final_reviewers,
+            prior_final_reviewers,
+        ));
     }
 
-    for (gate_id, gate_lineage, selected_node_ids) in desired {
-        let selected_node_ids_json = serde_json::to_string(&selected_node_ids)
+    for (gate_id, gate_lineage, required_node_ids, prior_required_node_ids) in desired {
+        let selected_node_ids_json = serde_json::to_string(&required_node_ids)
             .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
         let prior = delegation_workflow_gate_state::Entity::find_by_id((
             workflow_id.to_string(),
@@ -5467,21 +5487,64 @@ async fn initialize_v2_gate_states_txn(
         .await
         .map_err(db_err)?;
         match prior {
-            Some(state) if state.gate_lineage == gate_lineage => {}
+            Some(state) if state.gate_lineage == gate_lineage => {
+                let Some(prior_required_node_ids) = prior_required_node_ids else {
+                    continue;
+                };
+                if prior_required_node_ids == required_node_ids {
+                    continue;
+                }
+
+                let added_node_ids = required_node_ids
+                    .iter()
+                    .filter(|node_id| prior_required_node_ids.binary_search(node_id).is_err())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (review_round, selected_node_ids) = if added_node_ids.is_empty() {
+                    let current_required = required_node_ids.iter().collect::<BTreeSet<_>>();
+                    let prior_selected =
+                        serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json)
+                            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+                    (
+                        state.current_review_round,
+                        canonical_string_set(&prior_selected)
+                            .into_iter()
+                            .filter(|node_id| current_required.contains(node_id))
+                            .collect(),
+                    )
+                } else {
+                    (
+                        state.current_review_round.checked_add(1).ok_or_else(|| {
+                            WorkflowStoreError::Persistence(
+                                "workflow gate review round overflow".into(),
+                            )
+                        })?,
+                        added_node_ids,
+                    )
+                };
+                let mut active: delegation_workflow_gate_state::ActiveModel = state.into();
+                active.current_review_round = Set(review_round);
+                active.selected_node_ids_json = Set(serde_json::to_string(&selected_node_ids)
+                    .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?);
+                active.update(txn).await.map_err(db_err)?;
+                if gate_id == super::types::PHASE_PLAN {
+                    delete_plan_round_authorization_txn(txn, workflow_id, &gate_id).await?;
+                }
+            }
             Some(state) => {
+                if gate_id == super::types::PHASE_PLAN
+                    && is_pending_plan_corrective_round_txn(txn, workflow_id, &gate_id, &state)
+                        .await?
+                {
+                    continue;
+                }
                 let mut active: delegation_workflow_gate_state::ActiveModel = state.into();
                 active.gate_lineage = Set(gate_lineage);
                 active.current_review_round = Set(1);
                 active.selected_node_ids_json = Set(selected_node_ids_json);
                 active.update(txn).await.map_err(db_err)?;
                 if gate_id == super::types::PHASE_PLAN {
-                    delegation_plan_round_authorization::Entity::delete_by_id((
-                        workflow_id.to_string(),
-                        gate_id,
-                    ))
-                    .exec(txn)
-                    .await
-                    .map_err(db_err)?;
+                    delete_plan_round_authorization_txn(txn, workflow_id, &gate_id).await?;
                 }
             }
             None => {
@@ -5498,6 +5561,73 @@ async fn initialize_v2_gate_states_txn(
             }
         }
     }
+    Ok(())
+}
+
+fn required_final_reviewer_node_ids(normalized: &NormalizedManifest) -> Vec<String> {
+    canonical_string_set(
+        &normalized
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.phase_id.as_deref() == Some(super::types::PHASE_FINAL)
+                    && node.role == Some(ManifestNodeRole::Reviewer)
+                    && node.required
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+async fn is_pending_plan_corrective_round_txn(
+    txn: &sea_orm::DatabaseTransaction,
+    workflow_id: &str,
+    gate_id: &str,
+    state: &delegation_workflow_gate_state::Model,
+) -> Result<bool, WorkflowStoreError> {
+    let prior_settlement = delegation_workflow_gate_settlement::Entity::find()
+        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(workflow_id))
+        .filter(delegation_workflow_gate_settlement::Column::GateId.eq(gate_id))
+        .filter(delegation_workflow_gate_settlement::Column::PlanRoundStateV2Json.is_not_null())
+        .order_by_desc(delegation_workflow_gate_settlement::Column::GateCycle)
+        .one(txn)
+        .await
+        .map_err(db_err)?;
+    let Some(prior_settlement) = prior_settlement else {
+        return Ok(false);
+    };
+    let prior_state = load_persisted_plan_state_v2(&prior_settlement)?;
+    if prior_state.next_action != PlanReviewNextAction::ContinueReview
+        || prior_state.gate_lineage != state.gate_lineage
+        || i64::from(prior_state.review_round).checked_add(1) != Some(state.current_review_round)
+    {
+        return Ok(false);
+    }
+
+    let selected_node_ids = serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json)
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    if selected_node_ids.is_empty() {
+        return Ok(true);
+    }
+    let authorization = load_plan_round_authorization_v2(txn, workflow_id, gate_id).await?;
+    Ok(authorization.is_some_and(|authorization| {
+        authorization.gate_lineage == state.gate_lineage
+            && i64::from(authorization.review_round) == state.current_review_round
+    }))
+}
+
+async fn delete_plan_round_authorization_txn(
+    txn: &sea_orm::DatabaseTransaction,
+    workflow_id: &str,
+    gate_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    delegation_plan_round_authorization::Entity::delete_by_id((
+        workflow_id.to_string(),
+        gate_id.to_string(),
+    ))
+    .exec(txn)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 

@@ -3057,10 +3057,7 @@ impl DelegationListener {
             | Ok(Some(FinalDeliveryGuardResult::Rejected(diagnostic))) => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("status".into(), Value::String("failed".into()));
-                    object.insert(
-                        "error_code".into(),
-                        Value::String("final_artifact_drift".into()),
-                    );
+                    object.insert("error_code".into(), Value::String(diagnostic.code().into()));
                     object.insert("message".into(), Value::String(diagnostic.to_string()));
                     object.remove("text");
                     object.remove("completion");

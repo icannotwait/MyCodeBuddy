@@ -635,6 +635,192 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
     }
 }
 
+#[tokio::test]
+async fn roster_only_republication_selects_only_added_reviewers_and_retires_removed_ones() {
+    const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-capability-design.md";
+    const PLAN_REL_PATH: &str = "docs/superpowers/plans/restarted-plan.md";
+    const DESIGN_BYTES: &[u8] = b"# Design\n\nTask 18 roster transition.\n";
+    const PLAN_BYTES: &[u8] = b"# Plan\n\nTask 18 roster transition.\n";
+
+    let workspace = tempfile::tempdir().unwrap();
+    for (rel_path, bytes) in [(DESIGN_REL_PATH, DESIGN_BYTES), (PLAN_REL_PATH, PLAN_BYTES)] {
+        let path = workspace.path().join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let mut document = complete_gate_state_skeleton("task-18-roster-transition");
+    document.workflow_state = ManifestWorkflowState::Estimated;
+    document.design = Some(DocumentRef {
+        rel_path: DESIGN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+    });
+    document.plan = Some(DocumentRef {
+        rel_path: PLAN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
+    });
+    let published = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: document.clone(),
+        },
+        CompletionProtocolSelection {
+            version: 2,
+            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+            source:
+                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
+        },
+    )
+    .await
+    .unwrap();
+    let initial_states = delegation_workflow_gate_state::Entity::find()
+        .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&published.workflow_id))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    let initial_lineage = |gate_id: &str| {
+        initial_states
+            .iter()
+            .find(|state| state.gate_id == gate_id)
+            .unwrap()
+            .gate_lineage
+            .clone()
+    };
+
+    document.workflow_id = Some(published.workflow_id.clone());
+    document.expected_manifest_revision = Some(published.manifest_revision);
+    document.publication_token.push_str("-add");
+    document.nodes.extend([
+        ManifestNode {
+            id: "plan-reviewer-grok".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_PLAN.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("grok".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::PlanReviewer {
+                    rel_plan_path: PLAN_REL_PATH,
+                    agent_type: "grok",
+                    profile_id: None,
+                })
+                .unwrap(),
+            ),
+            deps: vec!["plan-author".into()],
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+        ManifestNode {
+            id: "final-reviewer-extra".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_FINAL.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: Some("task-18-extra".into()),
+            task_index: None,
+            work_unit_key: Some(
+                build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+                    agent_type: "codex",
+                    profile_id: Some("task-18-extra"),
+                })
+                .unwrap(),
+            ),
+            deps: Vec::new(),
+            required: Some(true),
+            node_outcome: None,
+            title: None,
+        },
+    ]);
+    let plan_gate = document
+        .gates
+        .iter_mut()
+        .find(|gate| gate.id == PHASE_PLAN)
+        .unwrap();
+    plan_gate
+        .reviewer_cohort_node_ids
+        .push("plan-reviewer-grok".into());
+    plan_gate
+        .required_reviewer_node_ids
+        .push("plan-reviewer-grok".into());
+    let added = publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: document.clone(),
+        },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let added_states = delegation_workflow_gate_state::Entity::find()
+        .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&published.workflow_id))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    for (gate_id, added_reviewer) in [
+        (PHASE_PLAN, "plan-reviewer-grok"),
+        (PHASE_FINAL, "final-reviewer-extra"),
+    ] {
+        let state = added_states
+            .iter()
+            .find(|state| state.gate_id == gate_id)
+            .unwrap();
+        assert_eq!(state.gate_lineage, initial_lineage(gate_id));
+        assert_eq!(state.current_review_round, 2);
+        assert_eq!(
+            serde_json::from_str::<BTreeSet<&str>>(&state.selected_node_ids_json).unwrap(),
+            BTreeSet::from([added_reviewer])
+        );
+    }
+
+    document.expected_manifest_revision = Some(added.manifest_revision);
+    document.publication_token.push_str("-remove");
+    document
+        .nodes
+        .retain(|node| node.id != "plan-reviewer-grok" && node.id != "final-reviewer-extra");
+    let plan_gate = document
+        .gates
+        .iter_mut()
+        .find(|gate| gate.id == PHASE_PLAN)
+        .unwrap();
+    plan_gate
+        .reviewer_cohort_node_ids
+        .retain(|node_id| node_id != "plan-reviewer-grok");
+    plan_gate
+        .required_reviewer_node_ids
+        .retain(|node_id| node_id != "plan-reviewer-grok");
+    publish_workflow_manifest_with_selection_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest { document },
+        CompletionProtocolSelection::v1_default(),
+    )
+    .await
+    .unwrap();
+    let removed_states = delegation_workflow_gate_state::Entity::find()
+        .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&published.workflow_id))
+        .all(&db.conn)
+        .await
+        .unwrap();
+    for gate_id in [PHASE_PLAN, PHASE_FINAL] {
+        let state = removed_states
+            .iter()
+            .find(|state| state.gate_id == gate_id)
+            .unwrap();
+        assert_eq!(state.gate_lineage, initial_lineage(gate_id));
+        assert_eq!(state.current_review_round, 2);
+        assert_eq!(state.selected_node_ids_json, "[]");
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CapabilityCase {
     ToolCompleteWork,
@@ -1459,7 +1645,7 @@ async fn run_session_2889_fixture() -> Session2889Result {
     }
 }
 
-struct FinalDriftResult {
+struct FinalDeliveryResult {
     response: Value,
     reopen_signal: Value,
     reopened: Value,
@@ -1474,7 +1660,16 @@ enum FinalEnrichmentSurface {
     Status,
 }
 
-async fn run_final_drift_fixture(surface: FinalEnrichmentSurface) -> FinalDriftResult {
+#[derive(Clone, Copy)]
+enum FinalArtifactMutation {
+    CommitDrift,
+    DirtyWorktree,
+}
+
+async fn run_final_delivery_fixture(
+    surface: FinalEnrichmentSurface,
+    mutation: FinalArtifactMutation,
+) -> FinalDeliveryResult {
     let repo = tempfile::tempdir().expect("Task 18 final repo");
     git_fixture(repo.path(), &["init", "--quiet"]);
     std::fs::write(repo.path().join("verified.txt"), b"reviewed\n").unwrap();
@@ -1716,20 +1911,22 @@ async fn run_final_drift_fixture(surface: FinalEnrichmentSurface) -> FinalDriftR
     assert!(matches!(ready, FinalDeliveryGuardResult::Ready(_)));
 
     std::fs::write(repo.path().join("verified.txt"), b"post-settlement drift\n").unwrap();
-    git_fixture(repo.path(), &["add", "verified.txt"]);
-    git_fixture(
-        repo.path(),
-        &[
-            "-c",
-            "user.name=Codeg Test",
-            "-c",
-            "user.email=codeg@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "post-settlement drift",
-        ],
-    );
+    if matches!(mutation, FinalArtifactMutation::CommitDrift) {
+        git_fixture(repo.path(), &["add", "verified.txt"]);
+        git_fixture(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Codeg Test",
+                "-c",
+                "user.email=codeg@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "post-settlement drift",
+            ],
+        );
+    }
 
     let runs = Arc::new(RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
@@ -1801,10 +1998,14 @@ async fn run_final_drift_fixture(surface: FinalEnrichmentSurface) -> FinalDriftR
             .outcome
         }
     };
-    let reopen_signal =
-        wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await;
-    let reopened =
-        wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await;
+    let (reopen_signal, reopened) = if matches!(mutation, FinalArtifactMutation::CommitDrift) {
+        (
+            wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await,
+            wait_for_workflow_listener(&socket_path, root_token, &published.workflow_id).await,
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
     listener_task.abort();
     let graph = project_workflow_graph_core(&db, parent).await;
     let graph_has_no_stale_final_completion = graph.as_ref().is_some_and(|graph| {
@@ -1823,7 +2024,7 @@ async fn run_final_drift_fixture(surface: FinalEnrichmentSurface) -> FinalDriftR
     .await
     .unwrap()
     .unwrap();
-    FinalDriftResult {
+    FinalDeliveryResult {
         response,
         reopen_signal,
         reopened,
@@ -1846,7 +2047,11 @@ async fn session_2889_and_final_drift_have_no_format_repair_escape() {
     assert_eq!(session.resume_call_count, 0);
     assert_eq!(session.spawn_call_count, 0);
 
-    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Status).await;
+    let final_drift = run_final_delivery_fixture(
+        FinalEnrichmentSurface::Status,
+        FinalArtifactMutation::CommitDrift,
+    )
+    .await;
     let drifted_final = &final_drift.response["tasks"][0];
     assert_eq!(
         drifted_final.get("error_code").and_then(Value::as_str),
@@ -1876,7 +2081,11 @@ async fn session_2889_and_final_drift_have_no_format_repair_escape() {
 
 #[tokio::test]
 async fn reopened_final_projection_omits_every_stale_reviewer_completion() {
-    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Status).await;
+    let final_drift = run_final_delivery_fixture(
+        FinalEnrichmentSurface::Status,
+        FinalArtifactMutation::CommitDrift,
+    )
+    .await;
     assert!(
         final_drift.graph_has_no_stale_final_completion,
         "both stale Final reviewer completions must be absent after drift"
@@ -1885,12 +2094,36 @@ async fn reopened_final_projection_omits_every_stale_reviewer_completion() {
 
 #[tokio::test]
 async fn final_drift_report_enrichment_reopens_and_omits_stale_completion() {
-    let final_drift = run_final_drift_fixture(FinalEnrichmentSurface::Report).await;
+    let final_drift = run_final_delivery_fixture(
+        FinalEnrichmentSurface::Report,
+        FinalArtifactMutation::CommitDrift,
+    )
+    .await;
     assert_eq!(final_drift.response["status"], "failed");
     assert_eq!(final_drift.response["error_code"], "final_artifact_drift");
     assert!(final_drift.response.get("text").is_none());
     assert!(final_drift.response.get("completion").is_none());
     assert_eq!(final_drift.review_round, 2);
+}
+
+#[tokio::test]
+async fn final_status_enrichment_preserves_artifact_unavailable_diagnostic() {
+    let unavailable = run_final_delivery_fixture(
+        FinalEnrichmentSurface::Status,
+        FinalArtifactMutation::DirtyWorktree,
+    )
+    .await;
+    let rejected_final = &unavailable.response["tasks"][0];
+    assert_eq!(rejected_final["status"], "failed");
+    assert_eq!(
+        rejected_final["error_code"],
+        "completion_artifact_unavailable"
+    );
+    assert!(rejected_final.get("text").is_none());
+    assert!(rejected_final.get("completion").is_none());
+    assert_eq!(unavailable.review_round, 1);
+    assert!(unavailable.reopen_signal.is_null());
+    assert!(unavailable.reopened.is_null());
 }
 
 async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {
