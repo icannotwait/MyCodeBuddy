@@ -1,12 +1,13 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use tauri::Manager;
 
 pub(crate) const REGISTERED_WINDOW_LABELS_MAX: usize = 16;
 const WEBVIEW2_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
@@ -60,6 +61,7 @@ pub(crate) struct ProcessState {
 
 static PROCESS_STATE: OnceLock<ProcessState> = OnceLock::new();
 static DIAGNOSTICS_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+static WINDOW_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn current_process_state() -> &'static ProcessState {
     PROCESS_STATE
@@ -291,6 +293,452 @@ pub(crate) fn sanitize_diagnostic_text(value: &str) -> String {
         .chars()
         .take(DIAGNOSTIC_TEXT_MAX_CHARS)
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorProjection {
+    failure_kind: &'static str,
+    error_hresult: Option<String>,
+    error_message: String,
+}
+
+fn project_error(error: &(dyn std::error::Error + 'static)) -> ErrorProjection {
+    let hresult = extract_hresult(error);
+    ErrorProjection {
+        failure_kind: classify_hresult(hresult),
+        error_hresult: hresult.map(|value| format!("0x{value:08x}")),
+        error_message: sanitize_diagnostic_text(&error.to_string()),
+    }
+}
+
+fn extract_hresult(error: &(dyn std::error::Error + 'static)) -> Option<u32> {
+    static HRESULT_PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = HRESULT_PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\bHRESULT(?:\s*\(\s*|\s+)0x([0-9a-f]{8})\b").expect("valid HRESULT regex")
+    });
+    let mut current = Some(error);
+
+    while let Some(source) = current {
+        let message = source.to_string();
+        if let Some(value) = pattern
+            .captures(&message)
+            .and_then(|captures| captures.get(1))
+            .and_then(|value| u32::from_str_radix(value.as_str(), 16).ok())
+        {
+            return Some(value);
+        }
+        current = source.source();
+    }
+    None
+}
+
+fn classify_hresult(hresult: Option<u32>) -> &'static str {
+    match hresult {
+        Some(0x80010108) => "rpc_disconnected",
+        _ => "unknown",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKind {
+    Main,
+    ConversationPopout,
+    Settings,
+    ImportSessions,
+    Commit,
+    Merge,
+    Stash,
+    Push,
+    ProjectBoot,
+    Pet,
+    PetPanel,
+    RemoteWorkspace,
+}
+
+impl WindowKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::ConversationPopout => "conversation_popout",
+            Self::Settings => "settings",
+            Self::ImportSessions => "import_sessions",
+            Self::Commit => "commit",
+            Self::Merge => "merge",
+            Self::Stash => "stash",
+            Self::Push => "push",
+            Self::ProjectBoot => "project_boot",
+            Self::Pet => "pet",
+            Self::PetPanel => "pet_panel",
+            Self::RemoteWorkspace => "remote_workspace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowIdentity {
+    attempt_id: String,
+    window_kind: WindowKind,
+    window_label: String,
+    caller_label: Option<String>,
+    operation_id: Option<String>,
+    app_pid: u32,
+    app_uptime_ms: u128,
+    registered_window_count: usize,
+    registered_window_labels: Vec<String>,
+    registered_window_labels_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagnosticEvent {
+    Started(WindowIdentity),
+    Succeeded {
+        attempt_id: String,
+        window_kind: WindowKind,
+        window_label: String,
+        elapsed_ms: u128,
+    },
+    Failed {
+        identity: WindowIdentity,
+        elapsed_ms: u128,
+        error: ErrorProjection,
+        webview_version: Option<String>,
+        safe_switches: SafeSwitchState,
+    },
+    Abandoned {
+        identity: WindowIdentity,
+        elapsed_ms: u128,
+    },
+}
+
+impl DiagnosticEvent {
+    fn event_name(&self) -> &'static str {
+        match self {
+            Self::Started(_) => "window_create_started",
+            Self::Succeeded { .. } => "window_create_succeeded",
+            Self::Failed { .. } => "window_create_failed",
+            Self::Abandoned { .. } => "window_create_abandoned",
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Started(_))
+    }
+}
+
+trait DiagnosticSink: Send + Sync {
+    fn emit(&self, event: DiagnosticEvent) -> Result<(), String>;
+}
+
+struct TracingDiagnosticSink;
+
+impl DiagnosticSink for TracingDiagnosticSink {
+    fn emit(&self, event: DiagnosticEvent) -> Result<(), String> {
+        match event {
+            DiagnosticEvent::Started(identity) => {
+                tracing::info!(
+                    target: "codeg::window",
+                    event = "window_create_started",
+                    attempt_id = identity.attempt_id,
+                    window_kind = identity.window_kind.as_str(),
+                    window_label = identity.window_label,
+                    caller_label = ?identity.caller_label.as_deref(),
+                    operation_id = ?identity.operation_id.as_deref(),
+                    app_pid = identity.app_pid,
+                    app_uptime_ms = identity.app_uptime_ms,
+                    registered_window_count = identity.registered_window_count,
+                    registered_window_labels = ?identity.registered_window_labels,
+                    registered_window_labels_truncated = identity.registered_window_labels_truncated,
+                );
+            }
+            DiagnosticEvent::Succeeded {
+                attempt_id,
+                window_kind,
+                window_label,
+                elapsed_ms,
+            } => {
+                tracing::info!(
+                    target: "codeg::window",
+                    event = "window_create_succeeded",
+                    attempt_id,
+                    window_kind = window_kind.as_str(),
+                    window_label,
+                    elapsed_ms,
+                );
+            }
+            DiagnosticEvent::Failed {
+                identity,
+                elapsed_ms,
+                error,
+                webview_version,
+                safe_switches,
+            } => {
+                tracing::error!(
+                    target: "codeg::window",
+                    event = "window_create_failed",
+                    attempt_id = identity.attempt_id,
+                    window_kind = identity.window_kind.as_str(),
+                    window_label = identity.window_label,
+                    caller_label = ?identity.caller_label.as_deref(),
+                    operation_id = ?identity.operation_id.as_deref(),
+                    app_pid = identity.app_pid,
+                    app_uptime_ms = identity.app_uptime_ms,
+                    registered_window_count = identity.registered_window_count,
+                    registered_window_labels = ?identity.registered_window_labels,
+                    registered_window_labels_truncated = identity.registered_window_labels_truncated,
+                    elapsed_ms,
+                    failure_kind = error.failure_kind,
+                    error_hresult = ?error.error_hresult.as_deref(),
+                    error_message = error.error_message,
+                    webview_version = ?webview_version.as_deref(),
+                    disable_gpu = safe_switches.disable_gpu,
+                    enable_logging = safe_switches.enable_logging,
+                    verbosity = ?safe_switches.verbosity,
+                    log_file_present = safe_switches.log_file_present,
+                );
+            }
+            DiagnosticEvent::Abandoned {
+                identity,
+                elapsed_ms,
+            } => {
+                tracing::warn!(
+                    target: "codeg::window",
+                    event = "window_create_abandoned",
+                    attempt_id = identity.attempt_id,
+                    window_kind = identity.window_kind.as_str(),
+                    window_label = identity.window_label,
+                    caller_label = ?identity.caller_label.as_deref(),
+                    operation_id = ?identity.operation_id.as_deref(),
+                    app_pid = identity.app_pid,
+                    app_uptime_ms = identity.app_uptime_ms,
+                    registered_window_count = identity.registered_window_count,
+                    registered_window_labels = ?identity.registered_window_labels,
+                    registered_window_labels_truncated = identity.registered_window_labels_truncated,
+                    elapsed_ms,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+static TRACING_DIAGNOSTIC_SINK: TracingDiagnosticSink = TracingDiagnosticSink;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredWindowSnapshot {
+    count: usize,
+    labels: Vec<String>,
+    truncated: bool,
+}
+
+fn snapshot_registered_window_labels(
+    labels: impl IntoIterator<Item = String>,
+) -> RegisteredWindowSnapshot {
+    let mut labels: Vec<_> = labels.into_iter().collect();
+    labels.sort();
+    let count = labels.len();
+    labels.truncate(REGISTERED_WINDOW_LABELS_MAX);
+    RegisteredWindowSnapshot {
+        count,
+        labels,
+        truncated: count > REGISTERED_WINDOW_LABELS_MAX,
+    }
+}
+
+fn format_attempt_id(pid: u32, sequence: u64) -> String {
+    format!("window-{pid}-{sequence}")
+}
+
+fn next_attempt_id(pid: u32) -> String {
+    let sequence = WINDOW_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    format_attempt_id(pid, sequence)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureRuntimeContext {
+    webview_version: Option<String>,
+    safe_switches: SafeSwitchState,
+}
+
+fn failure_runtime_context(snapshot: &RuntimeSnapshot) -> FailureRuntimeContext {
+    FailureRuntimeContext {
+        webview_version: snapshot.webview_version.clone(),
+        safe_switches: snapshot.safe_switches.clone(),
+    }
+}
+
+#[derive(Clone)]
+struct AttemptContext<'a> {
+    sink: &'a dyn DiagnosticSink,
+    window_kind: WindowKind,
+    window_label: String,
+    caller_label: Option<String>,
+    operation_id: Option<String>,
+    app_pid: u32,
+    app_uptime_ms: u128,
+    registered_window_labels: Vec<String>,
+    failure_runtime: FailureRuntimeContext,
+}
+
+struct WindowCreationAttempt<'a> {
+    identity: WindowIdentity,
+    started_at: Instant,
+    sink: &'a dyn DiagnosticSink,
+    terminal_emitted: bool,
+    failure_runtime: FailureRuntimeContext,
+}
+
+impl WindowCreationAttempt<'static> {
+    fn begin(
+        app: &tauri::AppHandle,
+        kind: WindowKind,
+        window_label: &str,
+        caller_label: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Self {
+        let process = current_process_state();
+        let registered_window_labels = app.webview_windows().into_keys().collect();
+        Self::begin_with_context(AttemptContext {
+            sink: &TRACING_DIAGNOSTIC_SINK,
+            window_kind: kind,
+            window_label: window_label.to_string(),
+            caller_label: caller_label.map(str::to_string),
+            operation_id: operation_id.map(str::to_string),
+            app_pid: process.snapshot.app_pid,
+            app_uptime_ms: process.started_at.elapsed().as_millis(),
+            registered_window_labels,
+            failure_runtime: failure_runtime_context(&process.snapshot),
+        })
+    }
+}
+
+impl<'a> WindowCreationAttempt<'a> {
+    fn begin_with_context(context: AttemptContext<'a>) -> Self {
+        let registered = snapshot_registered_window_labels(context.registered_window_labels);
+        let identity = WindowIdentity {
+            attempt_id: next_attempt_id(context.app_pid),
+            window_kind: context.window_kind,
+            window_label: context.window_label,
+            caller_label: context.caller_label,
+            operation_id: context.operation_id,
+            app_pid: context.app_pid,
+            app_uptime_ms: context.app_uptime_ms,
+            registered_window_count: registered.count,
+            registered_window_labels: registered.labels,
+            registered_window_labels_truncated: registered.truncated,
+        };
+        let attempt = Self {
+            identity,
+            started_at: Instant::now(),
+            sink: context.sink,
+            terminal_emitted: false,
+            failure_runtime: context.failure_runtime,
+        };
+        attempt.emit_nonfatal(
+            "window_create_started_sink",
+            DiagnosticEvent::Started(attempt.identity.clone()),
+        );
+        attempt
+    }
+
+    #[cfg(test)]
+    fn begin_for_test(context: AttemptContext<'a>) -> Self {
+        Self::begin_with_context(context)
+    }
+
+    fn finish_success(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.terminal_emitted = true;
+        self.emit_nonfatal(
+            "window_create_succeeded_sink",
+            DiagnosticEvent::Succeeded {
+                attempt_id: self.identity.attempt_id.clone(),
+                window_kind: self.identity.window_kind,
+                window_label: self.identity.window_label.clone(),
+                elapsed_ms: self.started_at.elapsed().as_millis(),
+            },
+        );
+    }
+
+    fn finish_failure(&mut self, error: &(dyn std::error::Error + 'static)) {
+        if self.terminal_emitted {
+            return;
+        }
+        let event = DiagnosticEvent::Failed {
+            identity: self.identity.clone(),
+            elapsed_ms: self.started_at.elapsed().as_millis(),
+            error: project_error(error),
+            webview_version: self.failure_runtime.webview_version.clone(),
+            safe_switches: self.failure_runtime.safe_switches.clone(),
+        };
+        self.terminal_emitted = true;
+        self.emit_nonfatal("window_create_failed_sink", event);
+    }
+
+    fn emit_nonfatal(&self, stage: &'static str, event: DiagnosticEvent) {
+        if let Err(error) = self.sink.emit(event) {
+            diagnostics_warn_once(stage, &error);
+        }
+    }
+}
+
+impl Drop for WindowCreationAttempt<'_> {
+    fn drop(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.terminal_emitted = true;
+        self.emit_nonfatal(
+            "window_create_abandoned_sink",
+            DiagnosticEvent::Abandoned {
+                identity: self.identity.clone(),
+                elapsed_ms: self.started_at.elapsed().as_millis(),
+            },
+        );
+    }
+}
+
+fn run_build_with_attempt<T, E, F>(mut attempt: WindowCreationAttempt<'_>, build: F) -> Result<T, E>
+where
+    E: std::error::Error + 'static,
+    F: FnOnce() -> Result<T, E>,
+{
+    match build() {
+        Ok(value) => {
+            attempt.finish_success();
+            Ok(value)
+        }
+        Err(error) => {
+            attempt.finish_failure(&error);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn build_with_diagnostics<T, E, F>(
+    app: &tauri::AppHandle,
+    kind: WindowKind,
+    window_label: &str,
+    caller_label: Option<&str>,
+    operation_id: Option<&str>,
+    build: F,
+) -> Result<T, E>
+where
+    E: std::error::Error + 'static,
+    F: FnOnce() -> Result<T, E>,
+{
+    let attempt = WindowCreationAttempt::begin(app, kind, window_label, caller_label, operation_id);
+    run_build_with_attempt(attempt, build)
+}
+
+#[cfg(test)]
+fn run_build_for_test<T, E, F>(context: AttemptContext<'_>, build: F) -> Result<T, E>
+where
+    E: std::error::Error + 'static,
+    F: FnOnce() -> Result<T, E>,
+{
+    run_build_with_attempt(WindowCreationAttempt::begin_for_test(context), build)
 }
 
 struct RuntimeSnapshotInputs<'a> {
@@ -598,7 +1046,459 @@ fn pid_is_live(pid: u32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
+    use std::fmt;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct SyntheticError {
+        message: String,
+        source: Option<Box<SyntheticError>>,
+    }
+
+    impl fmt::Display for SyntheticError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
+
+    impl Error for SyntheticError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static))
+        }
+    }
+
+    fn synthetic_error_with_source(
+        message: &str,
+        source_message: &str,
+        suffix: String,
+    ) -> SyntheticError {
+        SyntheticError {
+            message: format!("{message} {suffix}"),
+            source: Some(Box::new(SyntheticError {
+                message: source_message.to_string(),
+                source: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn error_projection_is_bounded_redacted_and_classified() {
+        let error = synthetic_error_with_source(
+            "open \"C:\\Users\\Alice\\Secret Folder\\token.txt\" and /home/alice/token.txt\nhttps://example.test/private?token=secret ?credential=hunter2\t",
+            "WebView2 error: WindowsError(Error { code: HRESULT(0x80010108) })",
+            "payload".repeat(100),
+        );
+        let projected = project_error(&error);
+
+        assert_eq!(projected.failure_kind, "rpc_disconnected");
+        assert_eq!(projected.error_hresult.as_deref(), Some("0x80010108"));
+        assert!(projected.error_message.chars().count() <= 240);
+        assert!(!projected.error_message.chars().any(char::is_control));
+        for secret in ["Alice", "token.txt", "example.test", "secret", "hunter2"] {
+            assert!(!projected.error_message.contains(secret), "leaked {secret}");
+        }
+        assert!(projected.error_message.contains("<path>"));
+        assert!(projected.error_message.contains("<url>"));
+        assert!(projected.error_message.contains("<query>"));
+    }
+
+    #[test]
+    fn error_projection_extracts_labeled_hresult_forms_from_source_chain() {
+        let cases = [
+            "HRESULT(0X80010108)",
+            "HRESULT 0x80010108",
+            "HRESULT ( 0x80010108 )",
+        ];
+
+        for source_message in cases {
+            let error = synthetic_error_with_source("outer", source_message, String::new());
+            assert_eq!(extract_hresult(&error), Some(0x80010108));
+            let projected = project_error(&error);
+            assert_eq!(projected.failure_kind, "rpc_disconnected");
+            assert_eq!(projected.error_hresult.as_deref(), Some("0x80010108"));
+        }
+    }
+
+    #[test]
+    fn error_projection_normalizes_unknown_hresult_and_ignores_unlabeled_hex() {
+        for labeled in ["HRESULT(0xDEADBEEF)", "HRESULT 0xdeadbeef"] {
+            let error = SyntheticError {
+                message: labeled.to_string(),
+                source: None,
+            };
+            let projected = project_error(&error);
+            assert_eq!(projected.failure_kind, "unknown");
+            assert_eq!(projected.error_hresult.as_deref(), Some("0xdeadbeef"));
+        }
+
+        for message in ["raw 0x80010108", "no HRESULT here"] {
+            let error = SyntheticError {
+                message: message.to_string(),
+                source: None,
+            };
+            let projected = project_error(&error);
+            assert_eq!(projected.failure_kind, "unknown");
+            assert_eq!(projected.error_hresult, None);
+        }
+        assert_eq!(classify_hresult(None), "unknown");
+        assert_eq!(classify_hresult(Some(0xdeadbeef)), "unknown");
+    }
+
+    #[test]
+    fn error_projection_redacts_path_and_url_variants() {
+        let message = "\"C:\\Users\\Alice\\Secret Folder\\quoted.txt\" C:\\Users\\Bob\\plain.txt '\\\\server\\private share\\quoted.txt' \\\\server\\share\\plain.txt /home/carol/private.txt file:///C:/Users/Dan/token.txt http://example.test/private?key=value ?credential=hunter2";
+        let error = SyntheticError {
+            message: message.to_string(),
+            source: None,
+        };
+        let projected = project_error(&error);
+
+        assert_eq!(projected.failure_kind, "unknown");
+        assert_eq!(projected.error_hresult, None);
+        assert!(projected.error_message.chars().count() <= 240);
+        assert!(!projected.error_message.chars().any(char::is_control));
+        assert!(projected.error_message.contains("<path>"));
+        assert!(projected.error_message.contains("<url>"));
+        assert!(projected.error_message.contains("<query>"));
+        for secret in [
+            "Alice",
+            "Bob",
+            "server",
+            "carol",
+            "Dan",
+            "example.test",
+            "hunter2",
+            "quoted.txt",
+            "plain.txt",
+            "private.txt",
+            "token.txt",
+        ] {
+            assert!(!projected.error_message.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn error_projection_replaces_adjacent_controls_and_caps_multibyte_unicode() {
+        let error = SyntheticError {
+            message: format!("before\u{0001}\u{0002}after {}", "界".repeat(300)),
+            source: None,
+        };
+        let projected = project_error(&error);
+
+        assert_eq!(projected.error_message.chars().count(), 240);
+        assert!(projected.error_message.contains("before  after"));
+        assert!(!projected.error_message.chars().any(char::is_control));
+    }
+
+    #[derive(Debug)]
+    struct MarkedSyntheticError {
+        marker: Arc<&'static str>,
+    }
+
+    impl MarkedSyntheticError {
+        fn new(marker: Arc<&'static str>) -> Self {
+            Self { marker }
+        }
+
+        fn marker(&self) -> &Arc<&'static str> {
+            &self.marker
+        }
+    }
+
+    impl fmt::Display for MarkedSyntheticError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("marked error HRESULT(0x80010108)")
+        }
+    }
+
+    impl Error for MarkedSyntheticError {}
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<DiagnosticEvent>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<DiagnosticEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn terminal_names(&self) -> Vec<&'static str> {
+            self.events()
+                .into_iter()
+                .filter(|event| event.is_terminal())
+                .map(|event| event.event_name())
+                .collect()
+        }
+
+        fn clear(&self) {
+            self.events.lock().unwrap().clear();
+        }
+    }
+
+    impl DiagnosticSink for RecordingSink {
+        fn emit(&self, event: DiagnosticEvent) -> Result<(), String> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingSink {
+        event_names: Mutex<Vec<&'static str>>,
+    }
+
+    impl FailingSink {
+        fn terminal_names(&self) -> Vec<&'static str> {
+            self.event_names
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|name| *name != "window_create_started")
+                .collect()
+        }
+    }
+
+    impl DiagnosticSink for FailingSink {
+        fn emit(&self, event: DiagnosticEvent) -> Result<(), String> {
+            self.event_names.lock().unwrap().push(event.event_name());
+            Err("synthetic sink failure".to_string())
+        }
+    }
+
+    fn test_attempt_context<'a>(sink: &'a dyn DiagnosticSink) -> AttemptContext<'a> {
+        AttemptContext {
+            sink,
+            window_kind: WindowKind::Settings,
+            window_label: "settings".to_string(),
+            caller_label: Some("main".to_string()),
+            operation_id: Some("operation-42".to_string()),
+            app_pid: 4242,
+            app_uptime_ms: 9_001,
+            registered_window_labels: vec!["settings".to_string(), "main".to_string()],
+            failure_runtime: FailureRuntimeContext {
+                webview_version: Some("151.0.4129.59".to_string()),
+                safe_switches: SafeSwitchState {
+                    disable_gpu: true,
+                    enable_logging: true,
+                    verbosity: Some(1),
+                    log_file_present: true,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn window_kind_uses_the_exact_allowlisted_serialized_values() {
+        let cases = [
+            (WindowKind::Main, "main"),
+            (WindowKind::ConversationPopout, "conversation_popout"),
+            (WindowKind::Settings, "settings"),
+            (WindowKind::ImportSessions, "import_sessions"),
+            (WindowKind::Commit, "commit"),
+            (WindowKind::Merge, "merge"),
+            (WindowKind::Stash, "stash"),
+            (WindowKind::Push, "push"),
+            (WindowKind::ProjectBoot, "project_boot"),
+            (WindowKind::Pet, "pet"),
+            (WindowKind::PetPanel, "pet_panel"),
+            (WindowKind::RemoteWorkspace, "remote_workspace"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn attempt_ids_are_formatted_and_increase_monotonically() {
+        assert_eq!(format_attempt_id(4242, 1), "window-4242-1");
+        let first = next_attempt_id(4242);
+        let second = next_attempt_id(4242);
+        let sequence = |attempt_id: &str| {
+            attempt_id
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        assert!(sequence(&second) > sequence(&first));
+    }
+
+    #[test]
+    fn registered_window_labels_are_sorted_counted_and_capped() {
+        let labels = (0..20)
+            .rev()
+            .map(|index| format!("window-{index:02}"))
+            .collect::<Vec<_>>();
+        let snapshot = snapshot_registered_window_labels(labels);
+
+        assert_eq!(snapshot.count, 20);
+        assert_eq!(
+            snapshot.labels,
+            (0..16)
+                .map(|index| format!("window-{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(snapshot.truncated);
+
+        let exactly_sixteen = snapshot_registered_window_labels(
+            (0..16).rev().map(|index| format!("window-{index:02}")),
+        );
+        assert_eq!(exactly_sixteen.count, 16);
+        assert_eq!(exactly_sixteen.labels.len(), 16);
+        assert!(!exactly_sixteen.truncated);
+    }
+
+    #[test]
+    fn attempt_returns_original_results_and_one_terminal_event() {
+        let sink = RecordingSink::default();
+        let context = test_attempt_context(&sink);
+        let value =
+            run_build_for_test(context.clone(), || Ok::<_, MarkedSyntheticError>(37)).unwrap();
+        assert_eq!(value, 37);
+        assert_eq!(sink.terminal_names(), vec!["window_create_succeeded"]);
+
+        sink.clear();
+        let marker = Arc::new("original-error");
+        let returned = run_build_for_test(context, || {
+            Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
+        })
+        .unwrap_err();
+        assert!(Arc::ptr_eq(returned.marker(), &marker));
+        assert_eq!(sink.terminal_names(), vec!["window_create_failed"]);
+    }
+
+    #[test]
+    fn dropping_unfinished_attempt_emits_abandoned_once() {
+        let sink = RecordingSink::default();
+        {
+            let _attempt = WindowCreationAttempt::begin_for_test(test_attempt_context(&sink));
+        }
+        assert_eq!(sink.terminal_names(), vec!["window_create_abandoned"]);
+    }
+
+    #[test]
+    fn explicitly_completed_attempt_does_not_emit_abandoned_on_drop() {
+        let sink = RecordingSink::default();
+        {
+            let mut attempt = WindowCreationAttempt::begin_for_test(test_attempt_context(&sink));
+            attempt.finish_success();
+            attempt.finish_success();
+        }
+        assert_eq!(sink.terminal_names(), vec!["window_create_succeeded"]);
+    }
+
+    #[test]
+    fn failing_sink_cannot_change_results_or_add_an_abandoned_terminal() {
+        let sink = FailingSink::default();
+        let context = test_attempt_context(&sink);
+        let value =
+            run_build_for_test(context.clone(), || Ok::<_, MarkedSyntheticError>(37)).unwrap();
+        assert_eq!(value, 37);
+
+        let marker = Arc::new("original-error");
+        let returned = run_build_for_test(context, || {
+            Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
+        })
+        .unwrap_err();
+        assert!(Arc::ptr_eq(returned.marker(), &marker));
+        assert_eq!(
+            sink.terminal_names(),
+            vec!["window_create_succeeded", "window_create_failed"]
+        );
+    }
+
+    #[test]
+    fn started_and_failed_events_share_identity_and_safe_runtime_context() {
+        let sink = RecordingSink::default();
+        let snapshot = runtime_snapshot_from_inputs(RuntimeSnapshotInputs {
+            app_version: "0.22.2-test",
+            app_pid: 4242,
+            webview_version: Ok("151.0.4129.59".to_string()),
+            disable_hardware_acceleration: true,
+            webview_debug_enabled: true,
+            browser_args: r#"--disable-gpu --enable-logging --v=1 --log-file="C:\Secret Logs\owned.log" --unrelated=browser-secret"#,
+            browser_executable_override: None,
+            user_data_override: None,
+            release_channel_override: None,
+            webview_log_path: Some(PathBuf::from(r"C:\Secret Logs\webview2-internal\owned.log")),
+        });
+        let mut context = test_attempt_context(&sink);
+        context.failure_runtime = failure_runtime_context(&snapshot);
+
+        let marker = Arc::new("original-error");
+        let returned = run_build_for_test(context, || {
+            Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
+        })
+        .unwrap_err();
+        assert!(Arc::ptr_eq(returned.marker(), &marker));
+
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        let DiagnosticEvent::Started(started) = &events[0] else {
+            panic!("expected started event")
+        };
+        let DiagnosticEvent::Failed {
+            identity,
+            error,
+            webview_version,
+            safe_switches,
+            ..
+        } = &events[1]
+        else {
+            panic!("expected failed event")
+        };
+        assert_eq!(identity, started);
+        assert_eq!(error.failure_kind, "rpc_disconnected");
+        assert_eq!(webview_version.as_deref(), Some("151.0.4129.59"));
+        assert_eq!(
+            safe_switches,
+            &SafeSwitchState {
+                disable_gpu: true,
+                enable_logging: true,
+                verbosity: Some(1),
+                log_file_present: true,
+            }
+        );
+        let rendered = format!("{:?}", &events[1]);
+        for secret in ["Secret Logs", "webview2-internal", "browser-secret"] {
+            assert!(!rendered.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn success_event_contains_only_the_minimal_correlation_fields() {
+        let sink = RecordingSink::default();
+        run_build_for_test(test_attempt_context(&sink), || {
+            Ok::<_, MarkedSyntheticError>(())
+        })
+        .unwrap();
+
+        let events = sink.events();
+        let DiagnosticEvent::Started(started) = &events[0] else {
+            panic!("expected started event")
+        };
+        let DiagnosticEvent::Succeeded {
+            attempt_id,
+            window_kind,
+            window_label,
+            elapsed_ms,
+        } = &events[1]
+        else {
+            panic!("expected succeeded event")
+        };
+        assert_eq!(attempt_id, &started.attempt_id);
+        assert_eq!(*window_kind, started.window_kind);
+        assert_eq!(window_label, &started.window_label);
+        assert!(*elapsed_ms < 60_000);
+    }
 
     #[test]
     fn debug_env_accepts_only_one_and_true() {
