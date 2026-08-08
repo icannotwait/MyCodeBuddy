@@ -866,6 +866,8 @@ describe("popOutConversation compensation", () => {
   it("background recovery reclaims late Reversed after terminal wait timeout", async () => {
     // R7 Important: reverse outlives the fixed foreground wait. Keep fence,
     // schedule durable recovery; when Reversed lands, reclaim and clear fence.
+    // Gate the terminal outcome so background recovery cannot race past the
+    // post-timeout fence assertion on fast CI runners.
     __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
     const reclaim = vi.fn(async () => {})
     registerPopoutAcpBridge({
@@ -876,12 +878,10 @@ describe("popOutConversation compensation", () => {
       new Error("cannot abort while forward rebind is in flight")
     )
 
-    let statusPolls = 0
+    let allowTerminal = false
     vi.mocked(api.getConversationPopoutOperation).mockImplementation(
       async () => {
-        statusPolls += 1
-        // Stay non-terminal long enough for foreground timeout, then reverse.
-        if (statusPolls < 12) {
+        if (!allowTerminal) {
           return {
             phase: "ready_pending",
             conversationId: 1,
@@ -930,7 +930,9 @@ describe("popOutConversation compensation", () => {
 
     // Foreground ended with fence retained; reclaim not yet (still pending).
     expect(isTransferringOut(1)).toBe(true)
+    expect(reclaim).not.toHaveBeenCalled()
 
+    allowTerminal = true
     await __flushPendingTerminalRecoveriesForTests()
 
     expect(reclaim).toHaveBeenCalledWith(
@@ -1121,6 +1123,7 @@ describe("popOutConversation compensation", () => {
   it("refuses second pop-out while fence/recovery active; late O1 Reversed still reclaims", async () => {
     // R8 Important barrier: O1 timeout schedules recovery + fence; O2 must not
     // overwrite fence or cancel O1 recovery; late O1 Reversed still reclaims.
+    // Gate the terminal outcome so O2 assertions cannot race recovery on CI.
     __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
     const reclaim = vi.fn(async () => {})
     let o1OperationId: string | null = null
@@ -1132,12 +1135,10 @@ describe("popOutConversation compensation", () => {
       new Error("cannot abort while forward rebind is in flight")
     )
 
-    let statusPolls = 0
+    let allowTerminal = false
     vi.mocked(api.getConversationPopoutOperation).mockImplementation(
       async (opId) => {
-        statusPolls += 1
-        // Stay non-terminal through O1 foreground timeout and O2 attempt.
-        if (statusPolls < 20) {
+        if (!allowTerminal) {
           return {
             phase: "ready_pending",
             conversationId: 1,
@@ -1202,7 +1203,9 @@ describe("popOutConversation compensation", () => {
 
     expect(api.openConversationWindow).not.toHaveBeenCalled()
     expect(isTransferringOut(1)).toBe(true)
+    expect(reclaim).not.toHaveBeenCalled()
 
+    allowTerminal = true
     await __flushPendingTerminalRecoveriesForTests()
 
     expect(reclaim).toHaveBeenCalledWith(
