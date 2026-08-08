@@ -6,10 +6,9 @@
  *   in-flight fetch cannot overwrite a newer nudge result.
  * - Cold detail installs via `applyFromDetail`; live clock via graph-changed
  *   + snapshot refetch; compatibility_nudge triggers the same refetch path.
- * - 10-minute fallback refresh: always armed for expanded-graph interest;
- *   also armed for overlay-only interest while the graph is still undiscovered
- *   (`appliedGraphRevision == null`) so a missed first-publish event cannot
- *   leave the sessions chip stuck forever (e.g. b2d / writing-plans handoff).
+ * - Authority refresh: active workflow state uses 15 seconds; expanded-graph
+ *   and undiscovered overlay interest use a 10-minute fallback. A settled,
+ *   discovered overlay relies on graph-changed / nudge events without a timer.
  */
 
 import { create } from "zustand"
@@ -142,6 +141,7 @@ type WorkflowGraphState = {
 
 const FIXED_PHASES: PhaseRailKind[] = ["design", "plan", "tasks", "final"]
 const EVENT_READINESS_TIMEOUT_MS = 5_000
+const ACTIVE_AUTHORITY_REFRESH_MS = 15_000
 const FALLBACK_REFRESH_MS = 10 * 60 * 1_000
 const SOFT_ABSENCE_ERROR = "Workflow graph snapshot unavailable"
 
@@ -466,30 +466,49 @@ async function runRefresh(
   if (!currentActive || !isActiveEpoch(conversationId, activationEpoch)) {
     return
   }
-  // Expanded interest always converges on a 10-minute timer. Overlay interest
-  // only needs the same safety net while the graph is still undiscovered —
-  // once a revision is known, overlay relies on graph-changed / nudge events.
-  if (!needsFallbackRefresh(conversationId, activationEpoch, get)) {
-    return
-  }
+  // Active authority uses 15 seconds. Expanded or undiscovered interest uses
+  // 10 minutes; a settled, discovered overlay does not own a refresh timer.
+  const delay = nextAuthorityRefreshDelay(conversationId, activationEpoch, get)
+  if (delay == null) return
+
   currentActive.fallbackTimer = setTimeout(() => {
-    if (!needsFallbackRefresh(conversationId, activationEpoch, get)) return
+    if (
+      nextAuthorityRefreshDelay(conversationId, activationEpoch, get) == null
+    ) {
+      return
+    }
     void get().refresh(conversationId)
-  }, FALLBACK_REFRESH_MS)
+  }, delay)
 }
 
-/**
- * Whether the active lease still warrants a 10-minute fallback poll.
- * Expanded interest always does; overlay-only only while graph is unknown.
- */
-function needsFallbackRefresh(
+function hasActiveWorkflowState(
+  snapshot: WorkflowGraphSnapshot | null
+): boolean {
+  if (!snapshot) return false
+  if (snapshot.overall_state === "in_progress") return true
+  return snapshot.nodes.some(
+    (node) =>
+      node.status === "reserving" ||
+      node.status === "running" ||
+      node.status === "waiting_review" ||
+      node.status === "waiting_adjudication"
+  )
+}
+
+function nextAuthorityRefreshDelay(
   conversationId: number,
   epoch: number,
   get: () => WorkflowGraphState
-): boolean {
-  if (!isActiveEpoch(conversationId, epoch)) return false
-  if (hasExpandedInterestEpoch(conversationId, epoch)) return true
-  return get().getEntry(conversationId)?.appliedGraphRevision == null
+): number | null {
+  if (!isActiveEpoch(conversationId, epoch)) return null
+  const entry = get().getEntry(conversationId)
+  if (hasActiveWorkflowState(entry?.snapshot ?? null)) {
+    return ACTIVE_AUTHORITY_REFRESH_MS
+  }
+  if (hasExpandedInterestEpoch(conversationId, epoch)) {
+    return FALLBACK_REFRESH_MS
+  }
+  return entry?.appliedGraphRevision == null ? FALLBACK_REFRESH_MS : null
 }
 
 export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({

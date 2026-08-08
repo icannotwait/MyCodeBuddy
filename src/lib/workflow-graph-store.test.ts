@@ -151,6 +151,50 @@ function node(
   }
 }
 
+function activeSnapshot(
+  overrides: Partial<WorkflowGraphSnapshot> = {}
+): WorkflowGraphSnapshot {
+  return baseSnapshot({
+    overall_state: "in_progress",
+    current_phase_id: "tasks",
+    current_node_ids: ["n-task-active"],
+    nodes: [
+      node({
+        node_id: "n-task-active",
+        phase_id: "tasks",
+        role: "implementer",
+        status: "running",
+        is_observed: true,
+        latest_child_conversation_id: 42,
+      }),
+    ],
+    gates: [],
+    ...overrides,
+  })
+}
+
+function settledSnapshot(
+  overrides: Partial<WorkflowGraphSnapshot> = {}
+): WorkflowGraphSnapshot {
+  return baseSnapshot({
+    overall_state: "completed",
+    current_phase_id: "final",
+    current_node_ids: [],
+    nodes: [
+      node({
+        node_id: "n-final-complete",
+        phase_id: "final",
+        role: "reviewer",
+        status: "completed",
+        is_observed: true,
+        latest_child_conversation_id: 42,
+      }),
+    ],
+    gates: [],
+    ...overrides,
+  })
+}
+
 type Deferred<T> = {
   promise: Promise<T>
   resolve: (value: T) => void
@@ -939,12 +983,103 @@ describe("active workflow refresh scheduling", () => {
     vi.useRealTimers()
   })
 
-  it("overlay-only interest handles newer events without a fallback timer", async () => {
+  it("active numbered overlay converges after 15 seconds and stops when settled", async () => {
+    const active = activeSnapshot({ graph_revision: 2 })
+    const settled = settledSnapshot({ graph_revision: 3 })
+    useWorkflowGraphStore.getState().applyFromDetail(201, active)
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(active)
+      .mockResolvedValueOnce(settled)
+
+    const release = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(201)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(201)?.graph_revision
+    ).toBe(3)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(201)?.overall_state
+    ).toBe("completed")
+
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
+  })
+
+  it.each([
+    [
+      "reserving node",
+      settledSnapshot({
+        graph_revision: 4,
+        overall_state: "approved",
+        nodes: [node({ node_id: "active", status: "reserving" })],
+      }),
+    ],
+    [
+      "running node",
+      settledSnapshot({
+        graph_revision: 4,
+        overall_state: "approved",
+        nodes: [node({ node_id: "active", status: "running" })],
+      }),
+    ],
+    [
+      "waiting_review node",
+      settledSnapshot({
+        graph_revision: 4,
+        overall_state: "approved",
+        nodes: [node({ node_id: "active", status: "waiting_review" })],
+      }),
+    ],
+    [
+      "waiting_adjudication node",
+      settledSnapshot({
+        graph_revision: 4,
+        overall_state: "approved",
+        nodes: [node({ node_id: "active", status: "waiting_adjudication" })],
+      }),
+    ],
+    [
+      "in_progress graph without active rows",
+      settledSnapshot({
+        graph_revision: 4,
+        overall_state: "in_progress",
+        nodes: [],
+      }),
+    ],
+  ])("uses the 15-second authority timer for %s", async (_label, snapshot) => {
+    getWorkflowGraphSnapshot.mockResolvedValue(snapshot)
+
+    const release = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(202)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    release()
+  })
+
+  it("settled numbered overlay handles newer events without a timer", async () => {
     useWorkflowGraphStore
       .getState()
-      .applyFromDetail(92, baseSnapshot({ graph_revision: 2 }))
+      .applyFromDetail(92, settledSnapshot({ graph_revision: 2 }))
     getWorkflowGraphSnapshot.mockResolvedValue(
-      baseSnapshot({ graph_revision: 3 })
+      settledSnapshot({ graph_revision: 3 })
     )
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(92)
     await flushMicrotasks()
@@ -972,7 +1107,7 @@ describe("active workflow refresh scheduling", () => {
     getWorkflowGraphSnapshot
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
 
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(94)
     await flushMicrotasks()
@@ -1005,7 +1140,7 @@ describe("active workflow refresh scheduling", () => {
     subscribeWorkflowCompatibilityNudge.mockResolvedValue(nudgeDispose)
     getWorkflowGraphSnapshot
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
 
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(98)
     await flushMicrotasks()
@@ -1047,9 +1182,9 @@ describe("active workflow refresh scheduling", () => {
   it("releasing expanded interest keeps overlay events but stops fallback", async () => {
     useWorkflowGraphStore
       .getState()
-      .applyFromDetail(93, baseSnapshot({ graph_revision: 5 }))
+      .applyFromDetail(93, settledSnapshot({ graph_revision: 5 }))
     getWorkflowGraphSnapshot.mockResolvedValue(
-      baseSnapshot({ graph_revision: 6 })
+      settledSnapshot({ graph_revision: 6 })
     )
 
     const releaseOverlay = useWorkflowGraphStore
@@ -1086,7 +1221,7 @@ describe("active workflow refresh scheduling", () => {
   it("late expanded completion updates cache but cannot arm an overlay timer", async () => {
     useWorkflowGraphStore
       .getState()
-      .applyFromDetail(97, baseSnapshot({ graph_revision: 1 }))
+      .applyFromDetail(97, settledSnapshot({ graph_revision: 1 }))
     const pending = deferred<WorkflowGraphSnapshot | null>()
     getWorkflowGraphSnapshot.mockReturnValue(pending.promise)
     const releaseOverlay = useWorkflowGraphStore
@@ -1098,7 +1233,7 @@ describe("active workflow refresh scheduling", () => {
       .activateConversation(97)
     await flushMicrotasks()
     releaseExpanded()
-    pending.resolve(baseSnapshot({ graph_revision: 2 }))
+    pending.resolve(settledSnapshot({ graph_revision: 2 }))
     await flushMicrotasks()
     expect(
       useWorkflowGraphStore.getState().getSnapshot(97)?.graph_revision
@@ -1110,9 +1245,9 @@ describe("active workflow refresh scheduling", () => {
 
   it("refreshes every ten minutes and resets the clock after event convergence", async () => {
     getWorkflowGraphSnapshot
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 4 }))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 5 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 2 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 4 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 5 }))
 
     const release = useWorkflowGraphStore.getState().activateConversation(71)
     await flushMicrotasks()
@@ -1158,7 +1293,7 @@ describe("active workflow refresh scheduling", () => {
 
   it("equal and lower graph revisions neither fetch nor reset the timer", async () => {
     getWorkflowGraphSnapshot.mockResolvedValue(
-      baseSnapshot({ graph_revision: 5 })
+      settledSnapshot({ graph_revision: 5 })
     )
 
     const release = useWorkflowGraphStore.getState().activateConversation(73)
@@ -1187,9 +1322,9 @@ describe("active workflow refresh scheduling", () => {
 
   it("a compatibility nudge fetches only while active and resets fallback from completion", async () => {
     getWorkflowGraphSnapshot
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 3 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 2 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 3 }))
 
     const release = useWorkflowGraphStore.getState().activateConversation(74)
     await flushMicrotasks()
@@ -1216,7 +1351,7 @@ describe("active workflow refresh scheduling", () => {
   })
 
   it("one of two leases keeps event and fallback eligibility", async () => {
-    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+    getWorkflowGraphSnapshot.mockResolvedValue(settledSnapshot())
 
     const firstRelease = useWorkflowGraphStore
       .getState()
@@ -1252,7 +1387,7 @@ describe("active workflow refresh scheduling", () => {
     const nudge = deferred<() => void>()
     subscribeWorkflowGraphChanged.mockReturnValue(changed.promise)
     subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
-    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+    getWorkflowGraphSnapshot.mockResolvedValue(settledSnapshot())
 
     const creatorRelease = useWorkflowGraphStore
       .getState()
@@ -1281,7 +1416,7 @@ describe("active workflow refresh scheduling", () => {
     const initial = deferred<WorkflowGraphSnapshot | null>()
     getWorkflowGraphSnapshot
       .mockReturnValueOnce(initial.promise)
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 10 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 10 }))
 
     const release = useWorkflowGraphStore.getState().activateConversation(77)
     await flushMicrotasks()
@@ -1289,8 +1424,8 @@ describe("active workflow refresh scheduling", () => {
 
     useWorkflowGraphStore
       .getState()
-      .applyFromDetail(77, baseSnapshot({ graph_revision: 9 }))
-    initial.resolve(baseSnapshot({ graph_revision: 8 }))
+      .applyFromDetail(77, settledSnapshot({ graph_revision: 9 }))
+    initial.resolve(settledSnapshot({ graph_revision: 8 }))
     await flushMicrotasks()
     expect(
       useWorkflowGraphStore.getState().getSnapshot(77)?.graph_revision
@@ -1337,7 +1472,7 @@ describe("active workflow refresh scheduling", () => {
     getWorkflowGraphSnapshot
       .mockReturnValueOnce(oldRequest.promise)
       .mockReturnValueOnce(newRequest.promise)
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 3 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 3 }))
 
     const oldRelease = useWorkflowGraphStore.getState().activateConversation(79)
     await flushMicrotasks()
@@ -1350,7 +1485,7 @@ describe("active workflow refresh scheduling", () => {
     subscribeWorkflowCompatibilityNudge.mockReturnValue(nudge.promise)
     const newRelease = useWorkflowGraphStore.getState().activateConversation(79)
 
-    oldRequest.resolve(baseSnapshot({ graph_revision: 1 }))
+    oldRequest.resolve(settledSnapshot({ graph_revision: 1 }))
     await flushMicrotasks()
     expect(
       useWorkflowGraphStore.getState().getSnapshot(79)?.graph_revision
@@ -1369,7 +1504,7 @@ describe("active workflow refresh scheduling", () => {
     await vi.advanceTimersByTimeAsync(9 * 60 * 1_000 + 55 * 1_000)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
-    newRequest.resolve(baseSnapshot({ graph_revision: 2 }))
+    newRequest.resolve(settledSnapshot({ graph_revision: 2 }))
     await flushMicrotasks()
 
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
@@ -1401,10 +1536,11 @@ describe("active workflow refresh scheduling", () => {
   it("null preserves an existing graph but remains empty without a cache", async () => {
     useWorkflowGraphStore.getState().applyFromDetail(
       81,
-      baseSnapshot({
+      settledSnapshot({
         graph_revision: null,
         compatibility: "observed_only",
         overall_state: "observed_only",
+        workflow_id: null,
       })
     )
     getWorkflowGraphSnapshot.mockResolvedValue(null)
@@ -1436,10 +1572,10 @@ describe("active workflow refresh scheduling", () => {
   it("failed refresh retains the graph and retries only at the next interval", async () => {
     useWorkflowGraphStore
       .getState()
-      .applyFromDetail(83, baseSnapshot({ graph_revision: 3 }))
+      .applyFromDetail(83, settledSnapshot({ graph_revision: 3 }))
     getWorkflowGraphSnapshot
       .mockRejectedValueOnce(new Error("offline"))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 4 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 4 }))
 
     const release = useWorkflowGraphStore.getState().activateConversation(83)
     await flushMicrotasks()
@@ -1503,9 +1639,9 @@ describe("active workflow refresh scheduling", () => {
     const current = deferred<WorkflowGraphSnapshot | null>()
     const postRelease = deferred<WorkflowGraphSnapshot | null>()
     getWorkflowGraphSnapshot
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 1 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
       .mockRejectedValueOnce(new Error("nudge offline"))
-      .mockResolvedValueOnce(baseSnapshot({ graph_revision: 2 }))
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 2 }))
       .mockReturnValueOnce(stale.promise)
       .mockReturnValueOnce(current.promise)
       .mockReturnValueOnce(postRelease.promise)
@@ -1530,20 +1666,20 @@ describe("active workflow refresh scheduling", () => {
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 84,
     })
-    stale.resolve(baseSnapshot({ graph_revision: 99 }))
+    stale.resolve(settledSnapshot({ graph_revision: 99 }))
     await flushMicrotasks()
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(5)
 
-    current.resolve(baseSnapshot({ graph_revision: 3 }))
+    current.resolve(settledSnapshot({ graph_revision: 3 }))
     await flushMicrotasks()
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
       parent_conversation_id: 84,
     })
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(6)
     release()
-    postRelease.resolve(baseSnapshot({ graph_revision: 4 }))
+    postRelease.resolve(settledSnapshot({ graph_revision: 4 }))
     await flushMicrotasks()
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
     await flushMicrotasks()
@@ -1557,7 +1693,7 @@ describe("active workflow refresh scheduling", () => {
     subscribeWorkflowCompatibilityNudge.mockRejectedValue(
       new Error("nudge events unavailable")
     )
-    getWorkflowGraphSnapshot.mockResolvedValue(baseSnapshot())
+    getWorkflowGraphSnapshot.mockResolvedValue(settledSnapshot())
 
     const release = useWorkflowGraphStore.getState().activateConversation(85)
     await flushMicrotasks()
