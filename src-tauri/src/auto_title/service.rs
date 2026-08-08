@@ -1723,8 +1723,12 @@ mod tests {
         first_user_text: Option<&str>,
         locale: Option<&str>,
     ) {
+        // Prefer exec_without_returning over ActiveModel::insert: the latter
+        // uses INSERT RETURNING and has flaked under parallel CI load with
+        // RecordNotFound("Failed to find inserted item") even though the row
+        // write itself succeeds. Non-autoincrement PK needs no RETURNING.
         let now = Utc::now();
-        auto_title_job::ActiveModel {
+        let active = auto_title_job::ActiveModel {
             conversation_id: Set(conversation_id),
             state: Set(state),
             attempts: Set(0),
@@ -1737,10 +1741,11 @@ mod tests {
             last_usable_turn_token: Set(None),
             config_gen: Set(0),
             updated_at: Set(now),
-        }
-        .insert(conn)
-        .await
-        .expect("seed job");
+        };
+        auto_title_job::Entity::insert(active)
+            .exec_without_returning(conn)
+            .await
+            .expect("seed job");
     }
 
     #[tokio::test]
