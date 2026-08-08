@@ -146,7 +146,14 @@ fn workflow_socket_path() -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn workflow_socket_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("codeg-task-18-final-{}.sock", uuid::Uuid::new_v4()))
+    // AF_UNIX sun_path is typically 104–108 bytes. macOS TMPDIR is often long
+    // enough that `temp_dir()/codeg-task-18-final-{uuid}.sock` exceeds SUN_LEN
+    // and bind/connect fail with InvalidInput. Keep a short absolute path under
+    // /tmp (same approach as other delegation e2e fixtures).
+    std::path::PathBuf::from(format!(
+        "/tmp/cg18-{}.sock",
+        &uuid::Uuid::new_v4().simple().to_string()[..16]
+    ))
 }
 
 async fn wait_for_workflow_listener(socket_path: &Path, token: &str, workflow_id: &str) -> Value {
@@ -167,6 +174,55 @@ async fn wait_for_workflow_listener(socket_path: &Path, token: &str, workflow_id
         }
     }
     panic!("workflow listener did not start: {last_error:?}");
+}
+
+fn is_listener_not_ready(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+async fn client_status_when_ready(
+    socket_path: &str,
+    request: &BrokerStatusRequest,
+) -> std::io::Result<codeg_lib::acp::delegation::transport::BrokerResponse> {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match client_status_round_trip(socket_path, request).await {
+            Ok(response) => return Ok(response),
+            Err(error) if is_listener_not_ready(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "listener never accepted status")
+    }))
+}
+
+async fn client_cancel_task_when_ready(
+    socket_path: &str,
+    request: &BrokerCancelTaskRequest,
+) -> std::io::Result<codeg_lib::acp::delegation::transport::BrokerResponse> {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match client_cancel_task_round_trip(socket_path, request).await {
+            Ok(response) => return Ok(response),
+            Err(error) if is_listener_not_ready(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "listener never accepted cancel")
+    }))
 }
 
 async fn companion_tool_names(context: &CompanionContext) -> Vec<String> {
@@ -2314,9 +2370,12 @@ async fn run_final_delivery_fixture(
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(listener.run(socket_path.clone()));
+    // Retry only transport readiness (NotFound / ConnectionRefused). Do not
+    // pre-probe with get_workflow_state: that path mutates delivery state and
+    // can change the first enrichment error_code under test.
     let response = match surface {
         FinalEnrichmentSurface::Report => {
-            client_cancel_task_round_trip(
+            client_cancel_task_when_ready(
                 socket_path.to_string_lossy().as_ref(),
                 &BrokerCancelTaskRequest {
                     token: root_token.into(),
@@ -2325,11 +2384,11 @@ async fn run_final_delivery_fixture(
                 },
             )
             .await
-            .unwrap()
+            .expect("cancel after listener bind")
             .outcome
         }
         FinalEnrichmentSurface::Status => {
-            client_status_round_trip(
+            client_status_when_ready(
                 socket_path.to_string_lossy().as_ref(),
                 &BrokerStatusRequest {
                     token: root_token.into(),
@@ -2340,7 +2399,7 @@ async fn run_final_delivery_fixture(
                 },
             )
             .await
-            .unwrap()
+            .expect("status after listener bind")
             .outcome
         }
     };
