@@ -2927,13 +2927,22 @@ pub async fn set_auto_title_api_config(
             webview: &impl AsRef<Webview<MockRuntime>>,
             body: serde_json::Value,
         ) -> Result<serde_json::Value, serde_json::Value> {
+            // Local origin is platform-specific: Windows/Android use
+            // http://tauri.localhost; others use tauri://localhost. Using the
+            // wrong scheme makes Tauri treat the request as remote and ACL
+            // rejects custom commands with "Plugin not found".
+            let local_url = if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            };
             get_ipc_response(
                 webview,
                 InvokeRequest {
                     cmd: "set_auto_title_api_config_ipc_wire_probe".into(),
                     callback: CallbackFn(0),
                     error: CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: local_url.parse().unwrap(),
                     body: InvokeBody::from(body),
                     headers: Default::default(),
                     invoke_key: INVOKE_KEY.to_string(),
