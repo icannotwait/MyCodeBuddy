@@ -201,7 +201,10 @@ async fn client_status_when_ready(
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "listener never accepted status")
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "listener never accepted status",
+        )
     }))
 }
 
@@ -221,7 +224,10 @@ async fn client_cancel_task_when_ready(
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "listener never accepted cancel")
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "listener never accepted cancel",
+        )
     }))
 }
 
