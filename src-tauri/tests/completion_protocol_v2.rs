@@ -1082,9 +1082,10 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
     .await;
     // Production listener/root paths go through preflight request construction
     // (`current_final_delivery_request`), not a hand-built guard request.
-    let ready_after_add_task = guard_task_final_delivery_core(&db, &EventEmitter::Noop, extra_task_id)
-        .await
-        .expect("production task delivery path must not fail after roster add");
+    let ready_after_add_task =
+        guard_task_final_delivery_core(&db, &EventEmitter::Noop, extra_task_id)
+            .await
+            .expect("production task delivery path must not fail after roster add");
     assert!(
         matches!(
             ready_after_add_task,

@@ -38,8 +38,6 @@ pub mod pet_state_mapper;
 pub mod pets;
 #[cfg(feature = "tauri-runtime")]
 pub mod preferences;
-#[cfg(feature = "tauri-runtime")]
-pub(crate) mod window_diagnostics;
 pub mod process;
 pub mod reference_search;
 pub mod supervise;
@@ -47,6 +45,8 @@ mod terminal;
 pub mod turn_timings;
 pub mod update;
 pub mod web;
+#[cfg(feature = "tauri-runtime")]
+pub(crate) mod window_diagnostics;
 pub mod workspace_state;
 pub mod workspace_transfer;
 

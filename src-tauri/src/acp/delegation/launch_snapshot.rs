@@ -290,15 +290,12 @@ mod tests {
         assert_eq!(filtered.get("model").map(String::as_str), Some("grok-4.5"));
         assert!(!filtered.contains_key("api_key"));
 
-        let built = build_live_launch_config(
-            AgentType::Grok,
-            None,
-            "/tmp/ws",
-            None,
-            raw,
-        );
+        let built = build_live_launch_config(AgentType::Grok, None, "/tmp/ws", None, raw);
         assert!(
-            built.snapshot.config_values_json.contains("reasoning_effort"),
+            built
+                .snapshot
+                .config_values_json
+                .contains("reasoning_effort"),
             "durable snapshot must keep Grok effort key: {}",
             built.snapshot.config_values_json
         );

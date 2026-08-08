@@ -869,11 +869,12 @@ async fn current_final_delivery_request(
     // Align with selection-aware `guard_final_delivery_txn`: selected nodes
     // must cover the current review round, while retained unselected siblings
     // may keep earlier same-lineage rounds after roster-only add/remove.
-    let selected_node_ids =
-        match serde_json::from_str::<BTreeSet<String>>(&current_final_gate.selected_node_ids_json) {
-            Ok(ids) => ids,
-            Err(_) => return Ok(None),
-        };
+    let selected_node_ids = match serde_json::from_str::<BTreeSet<String>>(
+        &current_final_gate.selected_node_ids_json,
+    ) {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
     let required_reviewer_node_ids = required_final_reviewers
         .iter()
         .map(|node| node.id.clone())
@@ -881,18 +882,17 @@ async fn current_final_delivery_request(
     if !selected_node_ids.is_subset(&required_reviewer_node_ids) {
         return Ok(None);
     }
-    let binding_covers_current_selection =
-        |candidate: &delegation_workflow_run_binding::Model| {
-            candidate.gate_id.as_deref() == Some(current_final_gate.gate_id.as_str())
-                && candidate.gate_lineage.as_deref() == Some(current_final_gate.gate_lineage.as_str())
-                && if selected_node_ids.contains(&candidate.node_id) {
-                    candidate.review_round == Some(current_final_gate.current_review_round)
-                } else {
-                    candidate.review_round.is_some_and(|review_round| {
-                        review_round > 0 && review_round < current_final_gate.current_review_round
-                    })
-                }
-        };
+    let binding_covers_current_selection = |candidate: &delegation_workflow_run_binding::Model| {
+        candidate.gate_id.as_deref() == Some(current_final_gate.gate_id.as_str())
+            && candidate.gate_lineage.as_deref() == Some(current_final_gate.gate_lineage.as_str())
+            && if selected_node_ids.contains(&candidate.node_id) {
+                candidate.review_round == Some(current_final_gate.current_review_round)
+            } else {
+                candidate.review_round.is_some_and(|review_round| {
+                    review_round > 0 && review_round < current_final_gate.current_review_round
+                })
+            }
+    };
     let mut delivery_anchor = None;
     let mut preferred_selected_anchor = None;
     let mut required_task_anchor = None;

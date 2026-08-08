@@ -69,6 +69,8 @@ jobs:
     runs-on: \${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Build server
         run: |
           cargo build --release --bin codeg-server --no-default-features --features server --target \${{ matrix.target }}

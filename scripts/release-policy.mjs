@@ -201,6 +201,16 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
     throw new Error("checkout step must contain exactly one with block")
   }
+  const serverRecursiveCheckout = workflowStepBlocks(serverJob).find(
+    (stepText) =>
+      /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
+      /submodules\s*:\s*recursive/i.test(stepText)
+  )
+  if (!serverRecursiveCheckout) {
+    throw new Error(
+      "build-server must checkout submodules recursively (licenses:generate needs vendor/codex-acp)"
+    )
+  }
 
   // Standalone server archives must ship with the desktop release so
   // self-update / install scripts can fetch signed platform bundles.

@@ -262,6 +262,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # licenses:generate walks vendor/codex-acp (git submodule). Without
+          # recursive checkout the job fails at pnpm licenses:generate with
+          # ENOENT on vendor/codex-acp/package.json — same requirement as
+          # build-desktop.
+          submodules: recursive
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

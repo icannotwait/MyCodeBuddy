@@ -1249,9 +1249,11 @@ mod tests {
         request.cwd = Some(PathBuf::from("/codeg-nonexistent-cwd/does/not/exist"));
 
         let result = runtime.create_terminal(request).await;
+        // Missing explicit cwd fails at OS spawn and is reported as
+        // `TerminalRuntimeError::Spawn` (not Internal / not silent fallback).
         assert!(
-            matches!(result, Err(TerminalRuntimeError::Internal(_))),
-            "expected a spawn failure for a missing explicit cwd"
+            matches!(result, Err(TerminalRuntimeError::Spawn { .. })),
+            "expected a spawn failure for a missing explicit cwd, got {result:?}"
         );
     }
 

@@ -1980,10 +1980,8 @@ mod tests {
         }
 
         fn parse_event_fields(line: &str) -> serde_json::Map<String, serde_json::Value> {
-            let root: serde_json::Value =
-                serde_json::from_str(line).unwrap_or_else(|error| {
-                    panic!("expected JSON log line, got {line:?}: {error}")
-                });
+            let root: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("expected JSON log line, got {line:?}: {error}"));
             root.get("fields")
                 .and_then(|value| value.as_object())
                 .cloned()
