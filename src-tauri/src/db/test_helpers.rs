@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
 use crate::db::error::DbError;
@@ -40,7 +40,14 @@ pub async fn fresh_disk_db(dir: &Path) -> AppDatabase {
 }
 
 pub async fn fresh_in_memory_db() -> AppDatabase {
-    let conn = Database::connect("sqlite::memory:")
+    // Each connection to bare `sqlite::memory:` is a *separate* empty database.
+    // With the default pool size (>1), concurrent queries (or INSERT RETURNING
+    // followed by a find on another pool connection) silently miss rows and
+    // flake under parallel CI. Cap the pool at 1 so the whole test shares one
+    // in-memory DB — same approach as the migrate step in `init_database`.
+    let mut opts = ConnectOptions::new("sqlite::memory:".to_owned());
+    opts.max_connections(1).min_connections(1);
+    let conn = Database::connect(opts)
         .await
         .expect("open in-memory sqlite");
     // Match the production pragma set as closely as needed for migrations.
