@@ -92,22 +92,41 @@ jobs:
             });
             const releaseBody =
               commit.commit.message?.trim() || "_No commit message._";
+
+            // getReleaseByTag only returns *published* releases. Force-moving a
+            // tag across cancelled runs leaves multiple orphan drafts that all
+            // claim the same tag_name; `gh release upload <tag>` then lands on
+            // an arbitrary draft while tauri-action uses release_id. List and
+            // collapse drafts so desktop + server share one release.
+            const allReleases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 },
+            );
+            const matching = allReleases.filter((r) => r.tag_name === tag);
+            const published = matching.find((r) => !r.draft);
+            if (published) {
+              core.setFailed(
+                `Release for tag ${tag} already exists and is not a draft (#${published.id}).`,
+              );
+              return;
+            }
+            const drafts = matching
+              .filter((r) => r.draft)
+              .sort((a, b) => b.id - a.id);
+
             let release;
-
-            try {
-              const existing = await github.rest.repos.getReleaseByTag({
-                owner,
-                repo,
-                tag,
-              });
-              if (!existing.data.draft) {
-                core.setFailed(
-                  `Release for tag ${tag} already exists and is not a draft.`,
+            if (drafts.length > 0) {
+              release = drafts[0];
+              for (const orphan of drafts.slice(1)) {
+                core.info(
+                  `Deleting orphan draft release #${orphan.id} for tag ${tag}`,
                 );
-                return;
+                await github.rest.repos.deleteRelease({
+                  owner,
+                  repo,
+                  release_id: orphan.id,
+                });
               }
-
-              release = existing.data;
               if (
                 release.prerelease !== prerelease ||
                 release.name !== releaseName ||
@@ -123,12 +142,8 @@ jobs:
                 });
                 release = updated.data;
               }
-              core.info(`Reusing existing draft release #${release.id}`);
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
-              }
-
+              core.info(`Reusing draft release #${release.id}`);
+            } else {
               const created = await github.rest.repos.createRelease({
                 owner,
                 repo,
@@ -463,12 +478,29 @@ jobs:
         if: runner.os != 'Windows'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-draft-release.outputs.release_id }}
         run: |
-          gh release upload "${{ github.ref_name }}" \
+          set -euo pipefail
+          # Upload by release id so orphan same-tag drafts cannot steal assets.
+          # Asset uploads must hit uploads.github.com (api.github.com returns 404).
+          for f in \
             "dist/${{ matrix.artifact }}.tar.gz" \
             "dist/${{ matrix.artifact }}.tar.gz.sig" \
-            "dist/${{ matrix.artifact }}.tar.gz.sha256" \
-            --clobber
+            "dist/${{ matrix.artifact }}.tar.gz.sha256"
+          do
+            name=$(basename "$f")
+            existing=$(gh api "repos/${{ github.repository }}/releases/${RELEASE_ID}/assets" \
+              --jq ".[] | select(.name==\"$name\") | .id" | head -n1 || true)
+            if [ -n "${existing:-}" ]; then
+              gh api --method DELETE "repos/${{ github.repository }}/releases/assets/${existing}"
+            fi
+            curl -fsSL -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=${name}" \
+              | jq '{name,size,state}'
+          done
 
       - name: Upload to release (Windows)
         if: runner.os == 'Windows'
@@ -478,12 +510,27 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-draft-release.outputs.release_id }}
         run: |
-          gh release upload "${{ github.ref_name }}" \
+          set -euo pipefail
+          for f in \
             "dist/${{ matrix.artifact }}.zip" \
             "dist/${{ matrix.artifact }}.zip.sig" \
-            "dist/${{ matrix.artifact }}.zip.sha256" \
-            --clobber
+            "dist/${{ matrix.artifact }}.zip.sha256"
+          do
+            name=$(basename "$f")
+            existing=$(gh api "repos/${{ github.repository }}/releases/${RELEASE_ID}/assets" \
+              --jq ".[] | select(.name==\"$name\") | .id" | head -n1 || true)
+            if [ -n "${existing:-}" ]; then
+              gh api --method DELETE "repos/${{ github.repository }}/releases/assets/${existing}"
+            fi
+            curl -fsSL -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=${name}" \
+              | jq '{name,size,state}'
+          done
 
   publish-release:
     needs:
