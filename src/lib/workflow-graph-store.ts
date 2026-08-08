@@ -210,7 +210,6 @@ const REQUIRED_LISTENER_KEYS = ["graphChanged", "compatibilityNudge"] as const
 type RequiredListenerKey = (typeof REQUIRED_LISTENER_KEYS)[number]
 
 type RequiredListenerSlot = {
-  channel: string
   subscribed: boolean
   subscribing: boolean
   warningEmitted: boolean
@@ -220,14 +219,12 @@ type RequiredListenerSlot = {
 const requiredListenerSlots: Record<RequiredListenerKey, RequiredListenerSlot> =
   {
     graphChanged: {
-      channel: WORKFLOW_GRAPH_CHANGED_EVENT,
       subscribed: false,
       subscribing: false,
       warningEmitted: false,
       unsubscribe: null,
     },
     compatibilityNudge: {
-      channel: WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
       subscribed: false,
       subscribing: false,
       warningEmitted: false,
@@ -279,6 +276,12 @@ function subscribeRequiredListener(
   return subscribeWorkflowCompatibilityNudge((payload) => {
     get().handleCompatibilityNudge(payload)
   })
+}
+
+function requiredListenerChannel(key: RequiredListenerKey): string {
+  return key === "graphChanged"
+    ? WORKFLOW_GRAPH_CHANGED_EVENT
+    : WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT
 }
 
 function scheduleRequiredListenerRetry(
@@ -342,7 +345,7 @@ function attemptRequiredListener(
         console.warn(
           "[workflow-graph-store] required event subscription failed",
           {
-            channel: slot.channel,
+            channel: requiredListenerChannel(key),
             error: toErrorMessage(error),
           }
         )
