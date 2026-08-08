@@ -2013,6 +2013,7 @@ mod fork_contract_tests {
         )
     }
 
+    #[allow(dead_code)] // helper kept for terminal capture fixtures
     async fn run_and_capture(
         runtime: &TerminalRuntime,
         session_id: &SessionId,
