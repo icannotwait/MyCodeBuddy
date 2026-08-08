@@ -216,9 +216,7 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   // self-update / install scripts can fetch signed platform bundles.
   for (const artifact of REQUIRED_SERVER_ARTIFACTS) {
     if (!serverJob.includes(artifact)) {
-      throw new Error(
-        `build-server must publish required artifact ${artifact}`
-      )
+      throw new Error(`build-server must publish required artifact ${artifact}`)
     }
   }
   if (
@@ -277,9 +275,7 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   // Docker Hub publishing stays out of this fork's release workflow.
   for (const forbidden of ["APPLE_CERTIFICATE", "DOCKERHUB_", "build-docker"]) {
     if (policyText.includes(forbidden)) {
-      throw new Error(
-        `release workflow contains forbidden entry ${forbidden}`
-      )
+      throw new Error(`release workflow contains forbidden entry ${forbidden}`)
     }
   }
 
