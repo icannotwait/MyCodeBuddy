@@ -40,12 +40,15 @@ pub async fn fresh_disk_db(dir: &Path) -> AppDatabase {
 }
 
 pub async fn fresh_in_memory_db() -> AppDatabase {
-    // Each connection to bare `sqlite::memory:` is a *separate* empty database.
-    // With the default pool size (>1), concurrent queries (or INSERT RETURNING
-    // followed by a find on another pool connection) silently miss rows and
-    // flake under parallel CI. Cap the pool at 1 so the whole test shares one
-    // in-memory DB — same approach as the migrate step in `init_database`.
-    let mut opts = ConnectOptions::new("sqlite::memory:".to_owned());
+    // Bare `sqlite::memory:` is a *private* DB per connection. Even with a
+    // pool of 1, some SeaORM/sqlx paths can open a second handle and see an
+    // empty schema. Use a unique shared-cache name so every pool connection
+    // for this fixture shares one in-memory database, and keep the pool small.
+    let name = format!(
+        "sqlite:file:codeg-test-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let mut opts = ConnectOptions::new(name);
     opts.max_connections(1).min_connections(1);
     let conn = Database::connect(opts)
         .await
