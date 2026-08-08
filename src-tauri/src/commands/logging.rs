@@ -404,6 +404,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn webview2_internal_logs_are_excluded_from_ordinary_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        temp_env::with_vars(
+            [
+                ("CODEG_HOME", None::<&str>),
+                ("CODEG_DATA_DIR", Some(tmp.path().to_str().unwrap())),
+            ],
+            || {
+                let logs = crate::paths::codeg_logs_root();
+                let internal = logs.join("webview2-internal");
+                std::fs::create_dir_all(&internal).unwrap();
+                std::fs::write(logs.join("codeg.2026-08-08.log"), b"ordinary").unwrap();
+                std::fs::write(
+                    internal.join("webview2-42-20260808T010203Z.log"),
+                    b"internal",
+                )
+                .unwrap();
+
+                let listed = list_log_files_core();
+                assert_eq!(
+                    listed
+                        .iter()
+                        .map(|file| file.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["codeg.2026-08-08.log"]
+                );
+                assert_eq!(
+                    read_log_file_core("codeg.2026-08-08.log", None).unwrap(),
+                    "ordinary"
+                );
+                assert!(read_log_file_core(
+                    "webview2-internal/webview2-42-20260808T010203Z.log",
+                    None,
+                )
+                .is_err());
+            },
+        );
+    }
+
     #[tokio::test]
     async fn log_settings_round_trip_persists_json() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
