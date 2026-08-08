@@ -1115,6 +1115,77 @@ describe("mergeDelegationWorkUnitModel", () => {
   const continuedAt = "2026-07-27T00:05:00.000Z"
   const nowMs = Date.parse("2026-07-27T00:06:00.000Z")
 
+  it("does not restore stale current-run stats after snapshot reconciliation", () => {
+    const staleStats: DelegationRuntimeStats = {
+      ...RUNNING_SUMMARY_STATS,
+      touched_files: [
+        {
+          path: "src/stale.ts",
+          outside_workspace: false,
+          additions: 100,
+          deletions: 50,
+        },
+      ],
+      line_counts_complete: true,
+      additions: 100,
+      deletions: 50,
+    }
+    const source: DelegationCardSource = {
+      parentToolUseId: "pt-1",
+      parentConversationId: 10,
+      input: JSON.stringify({
+        agent_type: "codex",
+        task: "stale current task",
+        work_unit_key: "unit-a",
+      }),
+      meta: {
+        "codeg.delegation": {
+          status: "running",
+          task_id: "task-1",
+          child_conversation_id: 99,
+          started_at: STARTED_AT,
+          runtime_stats: staleStats,
+        },
+      },
+    }
+    const current = build({
+      parsedInput: parseInput(null),
+      parsedMeta: meta({
+        taskId: "task-1",
+        status: "running",
+        runtimeStats: staleStats,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        status: "completed",
+        runtime_stats: LIVE_STATS,
+        finished_at: FINISHED_AT,
+      }),
+      nowMs,
+    })
+
+    const merged = mergeDelegationWorkUnitModel({
+      model: current,
+      sources: [source],
+      stickyKey: "unit-a",
+      nowMs,
+      hasLiveBinding: false,
+      explicitUserCancel: false,
+    })
+
+    expect(current.runtimeStats).toEqual(LIVE_STATS)
+    expect(merged.runtimeStats).toEqual(LIVE_STATS)
+    expect(merged.toolCallCount).toBe(12)
+    expect(merged.editRollup).toEqual({
+      mode: "files",
+      fileCount: 1,
+      fileCountTruncated: false,
+      additions: 3,
+      deletions: 1,
+      showLineTotals: true,
+    })
+  })
+
   it("sums per-run peaks and preserves the work-unit elapsed anchor", () => {
     const sources = [
       sourceWithStats({

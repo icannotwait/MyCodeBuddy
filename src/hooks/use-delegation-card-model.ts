@@ -823,7 +823,19 @@ export function mergeDelegationWorkUnitModel(input: {
     input.sources[input.sources.length - 1]?.parentToolUseId ??
     input.stickyKey ??
     "current"
-  const runs = input.sources.map(sourceObservation)
+  const runs = input.sources.map(sourceObservation).map((observation) => {
+    if (currentTaskId == null || observation.taskId !== currentTaskId) {
+      return observation
+    }
+    return {
+      ...observation,
+      lifecycleStatus: input.model.lifecycleStatus,
+      errorCode: input.model.errorCode ?? null,
+      startedAt: input.model.startedAt,
+      finishedAt: input.model.finishedAt,
+      runtimeStats: input.model.runtimeStats,
+    }
+  })
   runs.push({
     identity: currentIdentity,
     taskId: currentTaskId,
