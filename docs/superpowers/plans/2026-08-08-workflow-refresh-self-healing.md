@@ -78,7 +78,7 @@ Policy version: `b2d_task_risk_v1`.
 **Files:**
 
 - Modify: `src/hooks/use-delegation-card-model.ts` (`effectiveDelegationMeta`, `buildDelegationCardModel`, `useDelegationCardModel`)
-- Test: `src/hooks/use-delegation-card-model.test.ts` (`buildDelegationCardModel - merge precedence`)
+- Test: `src/hooks/use-delegation-card-model.test.ts` (`buildDelegationCardModel — merge precedence`)
 
 **Interfaces:**
 
@@ -126,7 +126,7 @@ function runSnapshot(
 
 - [ ] **Step 2: Write the delegation precedence regressions before production edits**
 
-Add these tests inside `describe("buildDelegationCardModel - merge precedence", ...)`:
+Add these tests inside `describe("buildDelegationCardModel — merge precedence", ...)` at the existing block beginning near line 178:
 
 ```ts
 it("matching completed snapshot replaces every stale running binding field", () => {
@@ -973,7 +973,41 @@ Expected package: one commit containing only the graph store and tests, with no 
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 3 | Recover required workflow event subscriptions | listener lifecycle and fake-timer tests | `concurrency_lifecycle`: retry/pending/install-generation races | `cross_runtime_or_process=2`, `broad_production_surface=1`, `shared_interface=1`; total `4` | `high`: hard trigger and soft threshold | `codex` | `codex + grok` | `b2d_task_risk_v1` |
 
-- [ ] **Step 1: Write warning, retry, sibling, and final-release regressions**
+- [ ] **Step 1: Export production event names from the explicit API mock**
+
+Replace the hoisted mock setup and `vi.mock("@/lib/api", ...)` factory at the top of `src/lib/workflow-graph-store.test.ts` with this complete block before changing the store imports. The store and warning assertions then consume the same hoisted production strings:
+
+```ts
+const {
+  WORKFLOW_GRAPH_CHANGED_EVENT,
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+  getWorkflowGraphSnapshot,
+  subscribeCompletionDecisionResolved,
+  subscribeWorkflowGraphChanged,
+  subscribeWorkflowCompatibilityNudge,
+} = vi.hoisted(() => ({
+  WORKFLOW_GRAPH_CHANGED_EVENT: "workflow_graph://changed",
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT:
+    "workflow_graph://compatibility_nudge",
+  getWorkflowGraphSnapshot: vi.fn(),
+  subscribeCompletionDecisionResolved: vi.fn(async () => () => {}),
+  subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
+  subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
+}))
+
+// Pass hoisted mocks through directly — do not re-wrap with `...args: unknown[]`
+// spreads (TS2556: spread of unknown[] is not a rest tuple).
+vi.mock("@/lib/api", () => ({
+  WORKFLOW_GRAPH_CHANGED_EVENT,
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+  getWorkflowGraphSnapshot,
+  subscribeCompletionDecisionResolved,
+  subscribeWorkflowGraphChanged,
+  subscribeWorkflowCompatibilityNudge,
+}))
+```
+
+- [ ] **Step 2: Write warning, retry, sibling, and final-release regressions**
 
 Add these tests inside `describe("workflow activation lifecycle", ...)`:
 
@@ -1000,14 +1034,14 @@ it("warns once per required channel and shares one five-second retry timer", asy
     expect(warn).toHaveBeenCalledWith(
       "[workflow-graph-store] required event subscription failed",
       {
-        channel: "workflow_graph://changed",
+        channel: WORKFLOW_GRAPH_CHANGED_EVENT,
         error: "changed unavailable",
       }
     )
     expect(warn).toHaveBeenCalledWith(
       "[workflow-graph-store] required event subscription failed",
       {
-        channel: "workflow_graph://compatibility_nudge",
+        channel: WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
         error: "nudge unavailable",
       }
     )
@@ -1105,7 +1139,7 @@ it("final lease release clears retry, refresh, and warning generation state", as
 
 Keep the existing pending-listener, late-success, stale-lease, and install-generation tests. They continue to prove that a late successful subscription from an old generation calls its returned disposer instead of overwriting the active generation.
 
-- [ ] **Step 2: Bound the existing durable-polling failure regression**
+- [ ] **Step 3: Bound the existing durable-polling failure regression**
 
 Replace the existing `subscription failures still allow initial and periodic refresh` test with this version. The first retry becomes pending so advancing ten minutes does not manufacture 120 immediate retry failures:
 
@@ -1136,7 +1170,7 @@ it("subscription failures still allow initial and periodic refresh", async () =>
 })
 ```
 
-- [ ] **Step 3: Record the deferred red checkpoint without executing it**
+- [ ] **Step 4: Record the deferred red checkpoint without executing it**
 
 Deferred until Task 5:
 
@@ -1146,7 +1180,7 @@ pnpm test -- src/lib/workflow-graph-store.test.ts
 
 Expected red result before production edits: failed subscriptions never retry, warnings are absent, and retry timer assertions fail.
 
-- [ ] **Step 4: Import channel names and normalized error formatting**
+- [ ] **Step 5: Import channel names and normalized error formatting**
 
 Replace the API import with:
 
@@ -1163,7 +1197,7 @@ import type { CompletionDecisionResolvedEventPayload } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 ```
 
-- [ ] **Step 5: Add required listener slot and retry state**
+- [ ] **Step 6: Add required listener slot and retry state**
 
 Replace `graphChangedUnsub` and `nudgeUnsub` with this state next to the existing install-generation globals:
 
@@ -1210,7 +1244,7 @@ let eventReadinessDeadline: ReturnType<typeof setTimeout> | null = null
 let requiredListenerRetryTimer: ReturnType<typeof setTimeout> | null = null
 ```
 
-- [ ] **Step 6: Implement missing-only attempts and one shared retry loop**
+- [ ] **Step 7: Implement missing-only attempts and one shared retry loop**
 
 Add these functions before `installEventListeners(...)`:
 
@@ -1311,7 +1345,7 @@ function attemptMissingRequiredListeners(
 }
 ```
 
-- [ ] **Step 7: Install required attempts with readiness, leaving completion optional**
+- [ ] **Step 8: Install required attempts with readiness, leaving completion optional**
 
 Replace `installEventListeners(...)` with:
 
@@ -1358,7 +1392,7 @@ function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
 }
 ```
 
-- [ ] **Step 8: Dispose retry state, latches, pending flags, and listeners together**
+- [ ] **Step 9: Dispose retry state, latches, pending flags, and listeners together**
 
 Replace `disposeEventListeners()` with:
 
@@ -1391,7 +1425,7 @@ function disposeEventListeners(): void {
 
 Do not reset monotonic `eventInstallGeneration`. Keep final lease release and store reset calling this disposer exactly once when global interest reaches zero.
 
-- [ ] **Step 9: Record the deferred green checkpoint without executing it**
+- [ ] **Step 10: Record the deferred green checkpoint without executing it**
 
 Deferred until Task 5:
 
@@ -1401,7 +1435,7 @@ pnpm test -- src/lib/workflow-graph-store.test.ts
 
 Expected green result at final verification: failed channels retry every 5 seconds, successful siblings stay single, warnings latch per generation, durable refresh continues, and final release leaves zero timers.
 
-- [ ] **Step 10: Commit the producer task and prepare its review package**
+- [ ] **Step 11: Commit the producer task and prepare its review package**
 
 ```powershell
 git add src/lib/workflow-graph-store.ts src/lib/workflow-graph-store.test.ts
