@@ -411,6 +411,7 @@ enum DiagnosticEvent {
 }
 
 impl DiagnosticEvent {
+    #[cfg(test)]
     fn event_name(&self) -> &'static str {
         match self {
             Self::Started(_) => "window_create_started",
@@ -420,6 +421,7 @@ impl DiagnosticEvent {
         }
     }
 
+    #[cfg(test)]
     fn is_terminal(&self) -> bool {
         !matches!(self, Self::Started(_))
     }
@@ -441,8 +443,8 @@ impl DiagnosticSink for TracingDiagnosticSink {
                     attempt_id = identity.attempt_id,
                     window_kind = identity.window_kind.as_str(),
                     window_label = identity.window_label,
-                    caller_label = ?identity.caller_label.as_deref(),
-                    operation_id = ?identity.operation_id.as_deref(),
+                    caller_label = identity.caller_label.as_deref(),
+                    operation_id = identity.operation_id.as_deref(),
                     app_pid = identity.app_pid,
                     app_uptime_ms = identity.app_uptime_ms,
                     registered_window_count = identity.registered_window_count,
@@ -478,8 +480,8 @@ impl DiagnosticSink for TracingDiagnosticSink {
                     attempt_id = identity.attempt_id,
                     window_kind = identity.window_kind.as_str(),
                     window_label = identity.window_label,
-                    caller_label = ?identity.caller_label.as_deref(),
-                    operation_id = ?identity.operation_id.as_deref(),
+                    caller_label = identity.caller_label.as_deref(),
+                    operation_id = identity.operation_id.as_deref(),
                     app_pid = identity.app_pid,
                     app_uptime_ms = identity.app_uptime_ms,
                     registered_window_count = identity.registered_window_count,
@@ -487,12 +489,12 @@ impl DiagnosticSink for TracingDiagnosticSink {
                     registered_window_labels_truncated = identity.registered_window_labels_truncated,
                     elapsed_ms,
                     failure_kind = error.failure_kind,
-                    error_hresult = ?error.error_hresult.as_deref(),
+                    error_hresult = error.error_hresult.as_deref(),
                     error_message = error.error_message,
-                    webview_version = ?webview_version.as_deref(),
+                    webview_version = webview_version.as_deref(),
                     disable_gpu = safe_switches.disable_gpu,
                     enable_logging = safe_switches.enable_logging,
-                    verbosity = ?safe_switches.verbosity,
+                    verbosity = safe_switches.verbosity,
                     log_file_present = safe_switches.log_file_present,
                 );
             }
@@ -506,8 +508,8 @@ impl DiagnosticSink for TracingDiagnosticSink {
                     attempt_id = identity.attempt_id,
                     window_kind = identity.window_kind.as_str(),
                     window_label = identity.window_label,
-                    caller_label = ?identity.caller_label.as_deref(),
-                    operation_id = ?identity.operation_id.as_deref(),
+                    caller_label = identity.caller_label.as_deref(),
+                    operation_id = identity.operation_id.as_deref(),
                     app_pid = identity.app_pid,
                     app_uptime_ms = identity.app_uptime_ms,
                     registered_window_count = identity.registered_window_count,
@@ -855,18 +857,18 @@ fn emit_runtime_snapshot(snapshot: &RuntimeSnapshot) {
         event = "webview_runtime_snapshot",
         app_version = snapshot.app_version,
         app_pid = snapshot.app_pid,
-        webview_version = ?snapshot.webview_version.as_deref(),
-        webview_version_error = ?snapshot.webview_version_error.as_deref(),
+        webview_version = snapshot.webview_version.as_deref(),
+        webview_version_error = snapshot.webview_version_error.as_deref(),
         disable_hardware_acceleration = snapshot.disable_hardware_acceleration,
         webview_debug_enabled = snapshot.webview_debug_enabled,
         disable_gpu = snapshot.safe_switches.disable_gpu,
         enable_logging = snapshot.safe_switches.enable_logging,
-        verbosity = ?snapshot.safe_switches.verbosity,
+        verbosity = snapshot.safe_switches.verbosity,
         log_file_present = snapshot.safe_switches.log_file_present,
         browser_executable_override_present = snapshot.browser_executable_override_present,
         user_data_override_present = snapshot.user_data_override_present,
         release_channel_override_present = snapshot.release_channel_override_present,
-        webview_log_path = ?webview_log_path.as_deref(),
+        webview_log_path = webview_log_path.as_deref(),
     );
 }
 
@@ -1196,15 +1198,15 @@ mod tests {
 
     #[derive(Debug)]
     struct MarkedSyntheticError {
-        marker: Arc<&'static str>,
+        marker: Arc<str>,
     }
 
     impl MarkedSyntheticError {
-        fn new(marker: Arc<&'static str>) -> Self {
+        fn new(marker: Arc<str>) -> Self {
             Self { marker }
         }
 
-        fn marker(&self) -> &Arc<&'static str> {
+        fn marker(&self) -> &Arc<str> {
             &self.marker
         }
     }
@@ -1366,7 +1368,7 @@ mod tests {
         assert_eq!(sink.terminal_names(), vec!["window_create_succeeded"]);
 
         sink.clear();
-        let marker = Arc::new("original-error");
+        let marker: Arc<str> = Arc::from("original-error");
         let returned = run_build_for_test(context, || {
             Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
         })
@@ -1403,7 +1405,7 @@ mod tests {
             run_build_for_test(context.clone(), || Ok::<_, MarkedSyntheticError>(37)).unwrap();
         assert_eq!(value, 37);
 
-        let marker = Arc::new("original-error");
+        let marker: Arc<str> = Arc::from("original-error");
         let returned = run_build_for_test(context, || {
             Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
         })
@@ -1433,7 +1435,7 @@ mod tests {
         let mut context = test_attempt_context(&sink);
         context.failure_runtime = failure_runtime_context(&snapshot);
 
-        let marker = Arc::new("original-error");
+        let marker: Arc<str> = Arc::from("original-error");
         let returned = run_build_for_test(context, || {
             Err::<(), _>(MarkedSyntheticError::new(marker.clone()))
         })
@@ -1467,7 +1469,7 @@ mod tests {
                 log_file_present: true,
             }
         );
-        let rendered = format!("{:?}", &events[1]);
+        let rendered = format!("{:?}", events[1]);
         for secret in ["Secret Logs", "webview2-internal", "browser-secret"] {
             assert!(!rendered.contains(secret), "leaked {secret}");
         }
@@ -1948,5 +1950,250 @@ mod tests {
             }
         }
         unrelated
+    }
+
+    #[test]
+    fn durable_json_omits_absent_optionals_and_records_typed_present_values() {
+        use std::io::{self, Write};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        fn parse_event_fields(line: &str) -> serde_json::Map<String, serde_json::Value> {
+            let root: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("expected JSON log line, got {line:?}: {error}")
+                });
+            root.get("fields")
+                .and_then(|value| value.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("expected fields object in {line}"))
+        }
+
+        fn assert_absent(fields: &serde_json::Map<String, serde_json::Value>, key: &str) {
+            assert!(
+                !fields.contains_key(key),
+                "expected {key} absent, got {fields:?}"
+            );
+        }
+
+        fn assert_string(
+            fields: &serde_json::Map<String, serde_json::Value>,
+            key: &str,
+            expected: &str,
+        ) {
+            match fields.get(key) {
+                Some(serde_json::Value::String(value)) => {
+                    assert_eq!(value, expected, "field {key}");
+                }
+                other => panic!("expected string {key}={expected:?}, got {other:?}"),
+            }
+        }
+
+        fn assert_u64(
+            fields: &serde_json::Map<String, serde_json::Value>,
+            key: &str,
+            expected: u64,
+        ) {
+            match fields.get(key) {
+                Some(serde_json::Value::Number(value)) => {
+                    assert_eq!(value.as_u64(), Some(expected), "field {key}");
+                }
+                other => panic!("expected number {key}={expected}, got {other:?}"),
+            }
+        }
+
+        let identity_absent = WindowIdentity {
+            attempt_id: "wca-1".to_string(),
+            window_kind: WindowKind::Main,
+            window_label: "main".to_string(),
+            caller_label: None,
+            operation_id: None,
+            app_pid: 11,
+            app_uptime_ms: 22,
+            registered_window_count: 0,
+            registered_window_labels: Vec::new(),
+            registered_window_labels_truncated: false,
+        };
+        let identity_present = WindowIdentity {
+            attempt_id: "wca-2".to_string(),
+            window_kind: WindowKind::ConversationPopout,
+            window_label: "conversation-popout-7".to_string(),
+            caller_label: Some("main".to_string()),
+            operation_id: Some("operation-7".to_string()),
+            app_pid: 11,
+            app_uptime_ms: 33,
+            registered_window_count: 1,
+            registered_window_labels: vec!["main".to_string()],
+            registered_window_labels_truncated: false,
+        };
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Buf(buf.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        TracingDiagnosticSink
+            .emit(DiagnosticEvent::Started(identity_absent.clone()))
+            .unwrap();
+        TracingDiagnosticSink
+            .emit(DiagnosticEvent::Started(identity_present.clone()))
+            .unwrap();
+        TracingDiagnosticSink
+            .emit(DiagnosticEvent::Failed {
+                identity: identity_present.clone(),
+                elapsed_ms: 12,
+                error: ErrorProjection {
+                    failure_kind: "rpc_disconnected",
+                    error_hresult: Some("0x80010108".to_string()),
+                    error_message: "rpc disconnected".to_string(),
+                },
+                webview_version: Some("151.0.4129.59".to_string()),
+                safe_switches: SafeSwitchState {
+                    disable_gpu: true,
+                    enable_logging: true,
+                    verbosity: Some(1),
+                    log_file_present: true,
+                },
+            })
+            .unwrap();
+        TracingDiagnosticSink
+            .emit(DiagnosticEvent::Failed {
+                identity: identity_absent.clone(),
+                elapsed_ms: 8,
+                error: ErrorProjection {
+                    failure_kind: "unknown",
+                    error_hresult: None,
+                    error_message: "generic failure".to_string(),
+                },
+                webview_version: None,
+                safe_switches: SafeSwitchState {
+                    disable_gpu: false,
+                    enable_logging: false,
+                    verbosity: None,
+                    log_file_present: false,
+                },
+            })
+            .unwrap();
+        emit_runtime_snapshot(&runtime_snapshot_from_inputs(RuntimeSnapshotInputs {
+            app_version: "0.22.2-test",
+            app_pid: 42,
+            webview_version: Ok("151.0.4129.59".to_string()),
+            disable_hardware_acceleration: true,
+            webview_debug_enabled: true,
+            browser_args: "--disable-gpu --enable-logging --v=1",
+            browser_executable_override: None,
+            user_data_override: None,
+            release_channel_override: None,
+            webview_log_path: Some(PathBuf::from(
+                r"C:\DrawCode Logs\webview2-internal\owned.log",
+            )),
+        }));
+        emit_runtime_snapshot(&runtime_snapshot_from_inputs(RuntimeSnapshotInputs {
+            app_version: "0.22.2-test",
+            app_pid: 42,
+            webview_version: Err("unavailable".to_string()),
+            disable_hardware_acceleration: false,
+            webview_debug_enabled: false,
+            browser_args: "",
+            browser_executable_override: None,
+            user_data_override: None,
+            release_channel_override: None,
+            webview_log_path: None,
+        }));
+        drop(_guard);
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 6, "unexpected capture: {output}");
+
+        let started_absent = parse_event_fields(lines[0]);
+        assert_eq!(
+            started_absent.get("event").and_then(|v| v.as_str()),
+            Some("window_create_started")
+        );
+        assert_absent(&started_absent, "caller_label");
+        assert_absent(&started_absent, "operation_id");
+
+        let started_present = parse_event_fields(lines[1]);
+        assert_string(&started_present, "caller_label", "main");
+        assert_string(&started_present, "operation_id", "operation-7");
+        assert!(
+            !matches!(
+                started_present.get("caller_label"),
+                Some(serde_json::Value::String(value)) if value.starts_with("Some(")
+            ),
+            "caller_label must not be Debug-wrapped: {started_present:?}"
+        );
+
+        let failed_present = parse_event_fields(lines[2]);
+        assert_eq!(
+            failed_present.get("event").and_then(|v| v.as_str()),
+            Some("window_create_failed")
+        );
+        assert_string(&failed_present, "caller_label", "main");
+        assert_string(&failed_present, "operation_id", "operation-7");
+        assert_string(&failed_present, "error_hresult", "0x80010108");
+        assert_string(&failed_present, "webview_version", "151.0.4129.59");
+        assert_u64(&failed_present, "verbosity", 1);
+
+        let failed_absent = parse_event_fields(lines[3]);
+        assert_absent(&failed_absent, "caller_label");
+        assert_absent(&failed_absent, "operation_id");
+        assert_absent(&failed_absent, "error_hresult");
+        assert_absent(&failed_absent, "webview_version");
+        assert_absent(&failed_absent, "verbosity");
+
+        let enabled_snapshot = parse_event_fields(lines[4]);
+        assert_eq!(
+            enabled_snapshot.get("event").and_then(|v| v.as_str()),
+            Some("webview_runtime_snapshot")
+        );
+        assert_string(&enabled_snapshot, "webview_version", "151.0.4129.59");
+        assert_absent(&enabled_snapshot, "webview_version_error");
+        assert_u64(&enabled_snapshot, "verbosity", 1);
+        assert_string(
+            &enabled_snapshot,
+            "webview_log_path",
+            r"C:\DrawCode Logs\webview2-internal\owned.log",
+        );
+
+        let disabled_snapshot = parse_event_fields(lines[5]);
+        assert_eq!(
+            disabled_snapshot.get("event").and_then(|v| v.as_str()),
+            Some("webview_runtime_snapshot")
+        );
+        assert_absent(&disabled_snapshot, "webview_version");
+        assert_string(&disabled_snapshot, "webview_version_error", "unavailable");
+        assert_absent(&disabled_snapshot, "verbosity");
+        assert_absent(&disabled_snapshot, "webview_log_path");
     }
 }
