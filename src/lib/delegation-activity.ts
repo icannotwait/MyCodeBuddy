@@ -231,10 +231,7 @@ function extractDocumentedId(
 }
 
 /** Collapse whitespace and cap length for overlay one-line/two-line display. */
-function normalizeDisplayText(
-  raw: string,
-  maxLen = 160
-): string | undefined {
+function normalizeDisplayText(raw: string, maxLen = 160): string | undefined {
   const collapsed = raw.replace(/\s+/g, " ").trim()
   if (!collapsed) return undefined
   if (collapsed.length <= maxLen) return collapsed
@@ -331,19 +328,18 @@ function withDisplayEnrichment(
 function mergeDisplayFields(
   view: DelegationActivityView,
   previous: DelegationActivityView
-): Pick<
-  DelegationActivityView,
-  "summary" | "role" | "model" | "tool_call_id"
-> {
+): Pick<DelegationActivityView, "summary" | "role" | "model" | "tool_call_id"> {
   // Prefer the earliest spawn tool_call_id so later wait/status frames still
   // point at the launch card in the parent transcript.
   const tool_call_id = previous.tool_call_id ?? view.tool_call_id
   return {
-    ...(view.summary ?? previous.summary
+    ...((view.summary ?? previous.summary)
       ? { summary: view.summary ?? previous.summary }
       : {}),
-    ...(view.role ?? previous.role ? { role: view.role ?? previous.role } : {}),
-    ...(view.model ?? previous.model
+    ...((view.role ?? previous.role)
+      ? { role: view.role ?? previous.role }
+      : {}),
+    ...((view.model ?? previous.model)
       ? { model: view.model ?? previous.model }
       : {}),
     ...(tool_call_id ? { tool_call_id } : {}),

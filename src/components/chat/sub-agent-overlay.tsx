@@ -1207,8 +1207,7 @@ const NativeActivityRow = memo(function NativeActivityRow({
     [activity, tickerVersion]
   )
 
-  const platformLabel =
-    getAgentLabel(activity.platform) ?? tDel("unknownAgent")
+  const platformLabel = getAgentLabel(activity.platform) ?? tDel("unknownAgent")
   const title = activity.summary
     ? activity.role
       ? `${activity.role}: ${activity.summary}`
