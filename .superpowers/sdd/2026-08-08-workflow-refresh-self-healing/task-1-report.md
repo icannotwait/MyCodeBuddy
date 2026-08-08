@@ -53,3 +53,32 @@ Read-only/static checks completed:
 ## Concerns
 
 None. Automated correctness evidence remains intentionally deferred to Task 5.
+
+## Fix Round 1: Work-Unit Reconciliation
+
+**Review:** Codex requested one important change; Grok approved.
+
+The final work-unit merge reparsed the raw current source after
+`buildDelegationCardModel` had selected a matching terminal snapshot. Because
+the runtime projection keeps per-run peaks, stale running meta counters and
+file rollups could replace the coherent terminal snapshot fields for the same
+task.
+
+Same-task source observations now take lifecycle, error, timestamps, and
+runtime stats from the already-reconciled current model before aggregation.
+The raw activity anchor remains available for sticky orphan handling, and
+observations with distinct task IDs continue to aggregate across continuation
+runs.
+
+A final-merge regression supplies stale running meta with 99 tool calls and
+larger file totals, then asserts that the rendered work-unit model retains the
+terminal snapshot's 12 tool calls, runtime stats, and edit rollup.
+
+| SHA | Subject |
+| --- | --- |
+| `526c73b7` | `fix: keep terminal delegation stats through work-unit merge` |
+
+**Tests: NOT RUN (deferred).** The focused suite remains deferred to Task 5 per
+the user constraint. Prettier reported both modified files unchanged, and
+`git diff --cached --check` reported no whitespace errors before the fix
+commit.
