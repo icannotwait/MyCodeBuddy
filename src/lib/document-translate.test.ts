@@ -5,9 +5,12 @@ import {
   formatFromTranslatablePath,
   hashDocumentContent,
   intlLocaleToWire,
+  isCurrentTranslateRequestGen,
   isTranslatablePath,
   isTranslationEligible,
   MAX_INPUT_SCALARS,
+  nextTranslateRequestGen,
+  resetTranslateRequestGensForTests,
   type TranslationEligibilityTab,
 } from "./document-translate"
 
@@ -164,6 +167,21 @@ describe("intlLocaleToWire", () => {
 
   it("accepts already-wire AppLocale ids", () => {
     expect(intlLocaleToWire("zh_cn")).toBe("zh_cn")
+  })
+})
+
+describe("translate request generation", () => {
+  it("bumps per source and tracks currency", () => {
+    resetTranslateRequestGensForTests()
+    const g1 = nextTranslateRequestGen("tab-a")
+    const g2 = nextTranslateRequestGen("tab-a")
+    const other = nextTranslateRequestGen("tab-b")
+    expect(g1).toBe(1)
+    expect(g2).toBe(2)
+    expect(other).toBe(1)
+    expect(isCurrentTranslateRequestGen("tab-a", g1)).toBe(false)
+    expect(isCurrentTranslateRequestGen("tab-a", g2)).toBe(true)
+    expect(isCurrentTranslateRequestGen("tab-b", other)).toBe(true)
   })
 })
 

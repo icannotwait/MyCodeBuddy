@@ -879,6 +879,11 @@ Declared license: MIT
 Homepage: https://github.com/fizyk20/generic-array.git
 License text SHA-256: ad4fcfaf8d5b12b97409c137a03d4a4e4b21024c65c54f976cc3b609c1bd5b0f
 
+cargo:getopts@0.2.24
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/rust-lang/getopts
+License text SHA-256: none
+
 cargo:getrandom@0.2.17
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-random/getrandom
@@ -1728,6 +1733,16 @@ cargo:ptr_meta_derive@0.1.4
 Declared license: MIT
 Homepage: https://github.com/djkoloski/ptr_meta
 License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
+
+cargo:pulldown-cmark@0.13.4
+Declared license: MIT
+Homepage: https://github.com/raphlinus/pulldown-cmark
+License text SHA-256: bef062f5b1d5daaed70df06859eca2a556109195fc6f97fdb95a769875fabfef
+
+cargo:pulldown-cmark-escape@0.11.0
+Declared license: MIT
+Homepage: https://github.com/raphlinus/pulldown-cmark
+License text SHA-256: bef062f5b1d5daaed70df06859eca2a556109195fc6f97fdb95a769875fabfef
 
 cargo:pxfm@0.1.30
 Declared license: BSD-3-Clause OR Apache-2.0
@@ -2812,6 +2827,11 @@ License text SHA-256: none
 cargo:unicode-segmentation@1.13.3
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/unicode-rs/unicode-segmentation
+License text SHA-256: none
+
+cargo:unicode-width@0.2.2
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/unicode-rs/unicode-width
 License text SHA-256: none
 
 cargo:unicode-xid@0.2.6
@@ -21106,6 +21126,33 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+SHA-256: bef062f5b1d5daaed70df06859eca2a556109195fc6f97fdb95a769875fabfef
+Packages:
+- cargo:pulldown-cmark-escape@0.11.0
+- cargo:pulldown-cmark@0.13.4
+
+The MIT License
+
+Copyright 2015 Google Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 SHA-256: bfe1e5d7dd50372dc9a580b1e31ce9bdaa5541a39b1ccf4874fdad2bfb92c89e
 Packages:

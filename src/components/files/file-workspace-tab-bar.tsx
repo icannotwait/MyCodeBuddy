@@ -139,16 +139,32 @@ export function FileWorkspaceTabBar() {
         locale,
         displayName: snapshotTitle,
       })
-      openTranslationResultTab({
+      const translated =
+        typeof result?.translatedContent === "string"
+          ? result.translatedContent
+          : ""
+      if (!translated.trim()) {
+        // Backend EmptyOutput should already reject; guard malformed IPC too.
+        toast.error(t("translateFailed"))
+        return
+      }
+      const tabId = openTranslationResultTab({
         sourceTabId: snapshotId,
         requestGen,
-        content: result.translatedContent,
+        content: translated,
         locale: result.locale,
         format: result.format,
         sourcePath: snapshotPath,
         sourceContentHash,
         sourceTitle: snapshotTitle,
       })
+      // Success used to open a tab with zero toast. If the workspace dropped
+      // the result (stale gen / unmounted provider), the spinner just stopped
+      // and it looked like "translate did nothing".
+      if (!tabId) {
+        toast.error(t("translateResultNotShown"))
+        return
+      }
     } catch (error) {
       const appError = extractAppCommandError(error)
       const message = appError?.i18n_key

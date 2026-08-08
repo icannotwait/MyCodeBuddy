@@ -147,3 +147,33 @@ export function buildTranslationTabId(
 ): string {
   return `translate:${sourceTabId}:${locale}:${requestGen}`
 }
+
+/**
+ * Process-lifetime request generation for document translation.
+ *
+ * Kept at module scope (not a React ref) so a late `translate_document`
+ * response is not silently dropped when `WorkspaceProvider` remounts mid-run
+ * — the old ref map would be empty and gen checks would fail closed with no
+ * toast/tab.
+ */
+const translateRequestGenBySource = new Map<string, number>()
+
+/** Bump and return the next gen for `sourceTabId`. */
+export function nextTranslateRequestGen(sourceTabId: string): number {
+  const next = (translateRequestGenBySource.get(sourceTabId) ?? 0) + 1
+  translateRequestGenBySource.set(sourceTabId, next)
+  return next
+}
+
+/** True when `requestGen` is still the latest gen for `sourceTabId`. */
+export function isCurrentTranslateRequestGen(
+  sourceTabId: string,
+  requestGen: number
+): boolean {
+  return translateRequestGenBySource.get(sourceTabId) === requestGen
+}
+
+/** Test-only: clear gens between cases. */
+export function resetTranslateRequestGensForTests(): void {
+  translateRequestGenBySource.clear()
+}

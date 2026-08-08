@@ -61,6 +61,8 @@ import { toErrorMessage } from "@/lib/app-error"
 import {
   buildSuggestedTranslationName,
   buildTranslationTabId,
+  isCurrentTranslateRequestGen,
+  nextTranslateRequestGen,
   type DocumentTranslateFormat,
   type TranslationTransientMeta,
 } from "@/lib/document-translate"
@@ -506,9 +508,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // Most-recently-active tab ids, most recent first. Drives the memory
   // guardrail's least-recently-active eviction order.
   const tabRecencyRef = useRef<string[]>([])
-  // Per source-tab request generation for document translation. Late API
-  // results whose gen no longer matches are dropped (no result tab).
-  const translateRequestGenRef = useRef(new Map<string, number>())
   // Drop late translation results after provider unmount.
   const providerAliveRef = useRef(true)
 
@@ -2865,9 +2864,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   }, [])
 
   const beginTranslateRequest = useCallback((sourceTabId: string) => {
-    const next = (translateRequestGenRef.current.get(sourceTabId) ?? 0) + 1
-    translateRequestGenRef.current.set(sourceTabId, next)
-    return next
+    // Module-scoped gens survive WorkspaceProvider remounts so a completed
+    // translate_document is not discarded solely because the React tree
+    // rebuilt while the long-running IPC was in flight.
+    return nextTranslateRequestGen(sourceTabId)
   }, [])
 
   const openTranslationResultTab = useCallback(
@@ -2882,8 +2882,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       sourceTitle: string
     }): string | null => {
       if (!providerAliveRef.current) return null
-      const current = translateRequestGenRef.current.get(input.sourceTabId)
-      if (current !== input.requestGen) return null
+      if (!isCurrentTranslateRequestGen(input.sourceTabId, input.requestGen)) {
+        return null
+      }
+      if (typeof input.content !== "string" || !input.content.trim()) {
+        return null
+      }
 
       const sourceName =
         input.sourceTitle ||

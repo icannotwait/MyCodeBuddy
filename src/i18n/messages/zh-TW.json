@@ -1782,6 +1782,7 @@
       "translateBusy": "已有翻譯正在進行。",
       "translateTimeout": "翻譯逾時。",
       "translateFailed": "翻譯失敗。",
+      "translateResultNotShown": "翻譯已完成，但無法顯示結果分頁。請重試。",
       "translatePlaceholderIntegrityFailed": "翻譯失敗：無法安全保留程式碼區塊。",
       "translateSavePathRejected": "不允許該儲存路徑。請使用資料夾下的相對路徑，且不要包含 “..”。",
       "translateSaveAlreadyExists": "該路徑已存在檔案。請選擇其他名稱。",

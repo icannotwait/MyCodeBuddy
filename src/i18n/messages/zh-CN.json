@@ -1782,6 +1782,7 @@
       "translateBusy": "已有翻译正在进行。",
       "translateTimeout": "翻译超时。",
       "translateFailed": "翻译失败。",
+      "translateResultNotShown": "翻译已完成，但无法显示结果标签页。请重试。",
       "translatePlaceholderIntegrityFailed": "翻译失败：无法安全保留代码块。",
       "translateSavePathRejected": "不允许该保存路径。请使用文件夹下的相对路径，且不要包含 “..”。",
       "translateSaveAlreadyExists": "该路径已存在文件。请选择其他名称。",

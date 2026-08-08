@@ -1782,6 +1782,7 @@
       "translateBusy": "Já há uma tradução em andamento.",
       "translateTimeout": "A tradução expirou.",
       "translateFailed": "A tradução falhou.",
+      "translateResultNotShown": "A tradução terminou, mas a aba de resultado não pôde ser exibida. Tente novamente.",
       "translatePlaceholderIntegrityFailed": "A tradução falhou: os blocos de código não puderam ser preservados com segurança.",
       "translateSavePathRejected": "Esse caminho de salvamento não é permitido. Use um caminho relativo na pasta sem “..”.",
       "translateSaveAlreadyExists": "Já existe um arquivo nesse caminho. Escolha outro nome.",

@@ -337,6 +337,34 @@ describe("FileWorkspaceTabBar Translate", () => {
       })
     })
   })
+
+  it("toasts when the result tab is not opened (stale gen / unmounted)", async () => {
+    openTranslationResultTab.mockReturnValueOnce(null)
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("translate-document").click()
+    })
+    expect(openTranslationResultTab).toHaveBeenCalled()
+    expect(toastMock.error).toHaveBeenCalledWith(
+      enMessages.Folder.fileWorkspace.translateResultNotShown
+    )
+  })
+
+  it("toasts when the API returns empty translated content", async () => {
+    translateDocument.mockResolvedValueOnce({
+      translatedContent: "   ",
+      locale: "zh_cn",
+      format: "markdown",
+    })
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("translate-document").click()
+    })
+    expect(openTranslationResultTab).not.toHaveBeenCalled()
+    expect(toastMock.error).toHaveBeenCalledWith(
+      enMessages.Folder.fileWorkspace.translateFailed
+    )
+  })
 })
 
 describe("FileWorkspaceTabBar Save as translation", () => {

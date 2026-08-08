@@ -1782,6 +1782,7 @@
       "translateBusy": "Eine Übersetzung läuft bereits.",
       "translateTimeout": "Zeitüberschreitung bei der Übersetzung.",
       "translateFailed": "Übersetzung fehlgeschlagen.",
+      "translateResultNotShown": "Übersetzung abgeschlossen, aber der Ergebnis-Tab konnte nicht angezeigt werden. Bitte erneut versuchen.",
       "translatePlaceholderIntegrityFailed": "Übersetzung fehlgeschlagen: Codeblöcke konnten nicht sicher erhalten werden.",
       "translateSavePathRejected": "Dieser Speicherpfad ist nicht erlaubt. Verwenden Sie einen relativen Pfad im Ordner ohne „..“.",
       "translateSaveAlreadyExists": "Unter diesem Pfad existiert bereits eine Datei. Wählen Sie einen anderen Namen.",

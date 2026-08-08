@@ -1782,6 +1782,7 @@
       "translateBusy": "هناك ترجمة قيد التنفيذ بالفعل.",
       "translateTimeout": "انتهت مهلة الترجمة.",
       "translateFailed": "فشلت الترجمة.",
+      "translateResultNotShown": "انتهت الترجمة، لكن تعذر عرض علامة تبويب النتيجة. حاول مرة أخرى.",
       "translatePlaceholderIntegrityFailed": "فشلت الترجمة: تعذر الحفاظ على كتل التعليمات البرمجية بأمان.",
       "translateSavePathRejected": "مسار الحفظ هذا غير مسموح. استخدم مسارًا نسبيًا داخل المجلد دون «..».",
       "translateSaveAlreadyExists": "يوجد ملف بالفعل في هذا المسار. اختر اسمًا آخر.",

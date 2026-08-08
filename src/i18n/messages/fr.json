@@ -1782,6 +1782,7 @@
       "translateBusy": "Une traduction est déjà en cours.",
       "translateTimeout": "La traduction a expiré.",
       "translateFailed": "Échec de la traduction.",
+      "translateResultNotShown": "La traduction est terminée, mais l'onglet de résultat n'a pas pu s'afficher. Réessayez.",
       "translatePlaceholderIntegrityFailed": "Échec de la traduction : les blocs de code n’ont pas pu être conservés en toute sécurité.",
       "translateSavePathRejected": "Ce chemin d’enregistrement n’est pas autorisé. Utilisez un chemin relatif dans le dossier sans « .. ».",
       "translateSaveAlreadyExists": "Un fichier existe déjà à ce chemin. Choisissez un autre nom.",

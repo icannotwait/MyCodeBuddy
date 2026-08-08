@@ -1782,6 +1782,7 @@
       "translateBusy": "A translation is already in progress.",
       "translateTimeout": "Translation timed out.",
       "translateFailed": "Translation failed.",
+      "translateResultNotShown": "Translation finished, but the result tab could not be shown. Try again.",
       "translatePlaceholderIntegrityFailed": "Translation failed: code blocks could not be preserved safely.",
       "translateSavePathRejected": "That save path is not allowed. Use a relative path under the folder without “..”.",
       "translateSaveAlreadyExists": "A file already exists at that path. Choose a different name.",

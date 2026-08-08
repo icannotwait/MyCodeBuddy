@@ -108,6 +108,14 @@ impl DocumentTranslationService {
             Err(_) => return Err(DocumentTranslateError::Busy),
         };
 
+        tracing::info!(
+            agent = %agent,
+            locale = ?locale,
+            format = ?format,
+            body_chars = body_for_agent.chars().count(),
+            "[document_translate] admitted run"
+        );
+
         let runner = Arc::clone(&self.runner);
         let (tx, rx) = oneshot::channel();
 
@@ -139,10 +147,30 @@ impl DocumentTranslationService {
         });
 
         match rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(DocumentTranslateError::Failed(
-                "translation task ended without result".into(),
-            )),
+            Ok(Ok(result)) => {
+                tracing::info!(
+                    locale = %result.locale,
+                    format = ?result.format,
+                    chars = result.translated_content.chars().count(),
+                    "[document_translate] completed successfully"
+                );
+                Ok(result)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "[document_translate] run failed after admission"
+                );
+                Err(err)
+            }
+            Err(_) => {
+                tracing::error!(
+                    "[document_translate] owned task ended without result"
+                );
+                Err(DocumentTranslateError::Failed(
+                    "translation task ended without result".into(),
+                ))
+            }
         }
     }
 }
