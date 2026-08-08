@@ -196,9 +196,15 @@ pub async fn open_remote_workspace(
     let builder = builder.traffic_light_position(
         crate::commands::windows::workspace_window_traffic_light_position(),
     );
-    let window = builder
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open remote workspace", e.to_string()))?;
+    let window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::RemoteWorkspace,
+        &label,
+        None,
+        None,
+        || builder.build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open remote workspace", e.to_string()))?;
     if let Some(proxy) =
         app.try_state::<std::sync::Arc<crate::commands::remote_proxy::RemoteProxyState>>()
     {

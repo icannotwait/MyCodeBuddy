@@ -643,9 +643,15 @@ pub async fn open_commit_window(
     let builder = builder.parent(&window).map_err(|e| {
         AppCommandError::window("Failed to attach commit window to parent", e.to_string())
     })?;
-    let commit_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open commit window", e.to_string()))?;
+    let commit_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Commit,
+        &label,
+        Some(&owner_label),
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open commit window", e.to_string()))?;
     register_remote_window_cleanup(&app, &commit_window, remote_window_id.as_deref());
     post_window_setup(&commit_window);
     state.set_owner(label, owner_label);
@@ -727,9 +733,15 @@ pub async fn open_settings_window(
     // window; focus returns to the owner on close via
     // `restore_windows_after_settings` (the SettingsWindowState owner tracking
     // is independent of any parent/child relationship).
-    let settings_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open settings window", e.to_string()))?;
+    let settings_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Settings,
+        &settings_label,
+        Some(&owner_label),
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open settings window", e.to_string()))?;
     register_remote_window_cleanup(&app, &settings_window, remote_window_id.as_deref());
     post_window_setup(&settings_window);
     state.set_owner(settings_label, owner_label);
@@ -811,9 +823,15 @@ pub async fn open_import_sessions_window(
         .center();
     // Independent top-level window — same rationale as settings: `.parent()`
     // on macOS would make it move/minimize together with the opener.
-    let import_window = apply_platform_window_style(builder).build().map_err(|e| {
-        AppCommandError::window("Failed to open import sessions window", e.to_string())
-    })?;
+    let import_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::ImportSessions,
+        &label,
+        None,
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open import sessions window", e.to_string()))?;
     register_remote_window_cleanup(&app, &import_window, remote_window_id.as_deref());
     post_window_setup(&import_window);
     import_window.set_focus().map_err(|e| {
@@ -933,9 +951,15 @@ pub async fn open_merge_window(
     let builder = builder.parent(&window).map_err(|e| {
         AppCommandError::window("Failed to attach merge window to parent", e.to_string())
     })?;
-    let merge_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open merge window", e.to_string()))?;
+    let merge_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Merge,
+        &label,
+        Some(&owner_label),
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open merge window", e.to_string()))?;
     register_remote_window_cleanup(&app, &merge_window, remote_window_id.as_deref());
     post_window_setup(&merge_window);
     state.set_owner(label, owner_label);
@@ -1049,9 +1073,15 @@ pub async fn open_stash_window(
         .inner_size(1100.0, 700.0)
         .min_inner_size(800.0, 500.0)
         .center();
-    let stash_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open stash window", e.to_string()))?;
+    let stash_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Stash,
+        &label,
+        None,
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open stash window", e.to_string()))?;
     register_remote_window_cleanup(&app, &stash_window, remote_window_id.as_deref());
     post_window_setup(&stash_window);
 
@@ -1068,6 +1098,7 @@ pub async fn open_push_window(
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
 ) -> Result<(), AppCommandError> {
+    let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(remote_id) => format!("remote-push-{remote_id}-{folder_id}"),
         None => format!("push-{folder_id}"),
@@ -1106,9 +1137,15 @@ pub async fn open_push_window(
     let builder = builder.parent(&window).map_err(|e| {
         AppCommandError::window("Failed to attach push window to parent", e.to_string())
     })?;
-    let push_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open push window", e.to_string()))?;
+    let push_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Push,
+        &label,
+        Some(&owner_label),
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open push window", e.to_string()))?;
     register_remote_window_cleanup(&app, &push_window, remote_window_id.as_deref());
     post_window_setup(&push_window);
 
@@ -1147,9 +1184,15 @@ pub async fn open_project_boot_window(
         .inner_size(1400.0, 900.0)
         .min_inner_size(1100.0, 700.0)
         .center();
-    let window = apply_platform_window_style(builder).build().map_err(|e| {
-        AppCommandError::window("Failed to open project boot window", e.to_string())
-    })?;
+    let window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::ProjectBoot,
+        &label,
+        None,
+        None,
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open project boot window", e.to_string()))?;
     register_remote_window_cleanup(&app, &window, remote_window_id.as_deref());
     post_window_setup(&window);
 
@@ -1269,9 +1312,15 @@ pub async fn open_pet_window(
 
     builder = builder.center();
 
-    apply_pet_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open pet window", e.to_string()))?;
+    crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::Pet,
+        PET_WINDOW_LABEL,
+        None,
+        None,
+        || apply_pet_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open pet window", e.to_string()))?;
 
     spawn_pet_hover_watcher(app.clone());
 
@@ -1603,9 +1652,15 @@ fn open_pet_panel_window(app: &AppHandle) -> Result<(), AppCommandError> {
         .focused(true)
         .accept_first_mouse(true);
 
-    apply_pet_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open pet panel", e.to_string()))?;
+    crate::window_diagnostics::build_with_diagnostics(
+        app,
+        crate::window_diagnostics::WindowKind::PetPanel,
+        PET_PANEL_LABEL,
+        Some(PET_WINDOW_LABEL),
+        None,
+        || apply_pet_window_style(builder).build(),
+    )
+    .map_err(|e| AppCommandError::window("Failed to open pet panel", e.to_string()))?;
 
     Ok(())
 }

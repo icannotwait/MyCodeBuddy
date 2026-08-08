@@ -122,54 +122,16 @@ mod tauri_app {
         });
     }
 
-    /// On Windows, opt-out users can disable WebView2 hardware acceleration to
-    /// work around AMD/Intel GPU driver bugs that produce a black-screen
-    /// webview. The flag is stored in a tiny sidecar file at
-    /// `~/.codeg/preferences.json` so it can be read **before** the Tauri
-    /// builder, plugins, or tokio runtime start — once a tokio worker is alive,
-    /// `std::env::set_var` would race with concurrent `getenv` calls from
-    /// libraries like reqwest/rustls that read `HTTP_PROXY` etc.
-    #[cfg(target_os = "windows")]
-    fn apply_webview2_rendering_override() {
-        // Matches the dominant pattern across the Tauri 2 ecosystem (Dorion,
-        // Seelen-UI, and most production Tauri 2 apps that ship a "disable
-        // hardware acceleration" toggle all use `--disable-gpu`).
-        const DISABLE_GPU_ARGS: [&str; 1] = ["--disable-gpu"];
-        const ENV_KEY: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
-
-        let prefs = crate::preferences::load();
-        if !prefs.disable_hardware_acceleration {
-            return;
-        }
-
-        let mut tokens: Vec<String> = match std::env::var(ENV_KEY) {
-            Ok(prev) => prev.split_whitespace().map(str::to_string).collect(),
-            Err(_) => Vec::new(),
-        };
-        for arg in DISABLE_GPU_ARGS {
-            if !tokens.iter().any(|t| t == arg) {
-                tokens.push(arg.to_string());
-            }
-        }
-        // SAFETY: called before any tokio worker or plugin thread spawns, so
-        // no concurrent `getenv` can race. `set_var` is `unsafe` since Rust 1.82.
-        unsafe {
-            std::env::set_var(ENV_KEY, tokens.join(" "));
-        }
-    }
-
     #[cfg_attr(mobile, tauri::mobile_entry_point)]
     pub fn run() {
+        let process_start = crate::window_diagnostics::ProcessStart::now();
         // Install the logging subscriber first so it captures everything from
         // here on. The file appender's logs dir is resolved from env (no DB
         // needed); hold the guard for the whole process so buffered file lines
         // flush on a graceful exit.
         let _log_guard = crate::logging::init::init_desktop();
-
-        // Apply the WebView2 rendering override before *any* tokio worker
-        // exists or any plugin reads the env. See doc comment above.
-        #[cfg(target_os = "windows")]
-        apply_webview2_rendering_override();
+        let preferences = crate::preferences::load();
+        crate::window_diagnostics::initialize(process_start, &preferences);
 
         if let Err(err) = fix_path_env::fix() {
             tracing::error!("[PATH] fix_path_env failed: {err}");
@@ -970,7 +932,14 @@ mod tauri_app {
                     let builder = builder.traffic_light_position(
                         windows::workspace_window_traffic_light_position(),
                     );
-                    if let Ok(w) = builder.build() {
+                    if let Ok(w) = crate::window_diagnostics::build_with_diagnostics(
+                        app.handle(),
+                        crate::window_diagnostics::WindowKind::Main,
+                        "main",
+                        None,
+                        None,
+                        || builder.build(),
+                    ) {
                         windows::post_window_setup(&w);
                     }
                 }
