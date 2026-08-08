@@ -9217,15 +9217,30 @@ mod tests {
             r"\\.\pipe\codeg-workflow-v2-test-{}",
             uuid::Uuid::new_v4()
         ));
+        // AF_UNIX sun_path is typically 104–108 bytes. macOS TMPDIR is often
+        // long enough that `temp_dir()/codeg-workflow-v2-test-{uuid}.sock`
+        // exceeds SUN_LEN and bind fails with InvalidInput, leaving the
+        // readiness loop spinning forever. Keep a short absolute path under
+        // /tmp (same approach as completion_protocol_v2 fixtures).
         #[cfg(unix)]
-        let socket_path = std::env::temp_dir().join(format!(
-            "codeg-workflow-v2-test-{}.sock",
-            uuid::Uuid::new_v4()
+        let socket_path = PathBuf::from(format!(
+            "/tmp/cg-wv2-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
         ));
         let listener_task = tokio::spawn(Arc::clone(&listener).run(socket_path.clone()));
         #[cfg(unix)]
-        while !socket_path.try_exists().expect("check listener socket") {
-            tokio::task::yield_now().await;
+        {
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !socket_path.try_exists().expect("check listener socket") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                ready.is_ok(),
+                "listener socket never appeared at {} (likely AF_UNIX path bind failure)",
+                socket_path.display()
+            );
         }
 
         let companion = CompanionContext {
