@@ -2,8 +2,8 @@
 
 ## Status
 
-Direction approved in the 2026-08-08 design discussion; this written spec is
-pending user review.
+Direction approved in the 2026-08-08 design discussion. Amended 2026-08-08 for
+Design review cycle 1 (Important I1–I3 and Minor M1–M3 contracts).
 
 ## Incident
 
@@ -198,8 +198,12 @@ Fields:
 - `operation_id` for a conversation pop-out;
 - `app_pid`;
 - `app_uptime_ms`;
-- `registered_window_count`; and
-- sorted `registered_window_labels`.
+- `registered_window_count`;
+- up to `REGISTERED_WINDOW_LABELS_MAX` (16) sorted `registered_window_labels`;
+  and
+- `registered_window_labels_truncated` (`true` when the registry exceeded the
+  cap). Labels beyond the cap are omitted; the total count always reflects the
+  full registry.
 
 Window labels are application-generated identifiers. Titles and URLs are not
 logged.
@@ -217,16 +221,17 @@ Fields:
 
 Fields:
 
-- all stable identity fields from `window_create_started`;
+- all stable identity fields from `window_create_started` (including the
+  capped label list and truncation flag);
 - `elapsed_ms`;
 - `failure_kind`;
-- the error's display representation;
-- its debug representation only when it differs from the display form;
+- a **bounded privacy-safe error projection** (see Error Projection below);
 - `webview_version` from the current snapshot; and
 - current safe WebView2 switch state.
 
-Known HRESULTs are classified without changing the original error. At minimum,
-`0x80010108` maps to `rpc_disconnected`; unknown failures map to `unknown`.
+Known HRESULTs are classified without changing the original error returned to
+callers. At minimum, `0x80010108` maps to `rpc_disconnected`; unknown
+failures map to `unknown`.
 
 The attempt object records exactly one terminal event. Dropping an unfinished
 attempt emits `window_create_abandoned`, which protects against future early
@@ -239,6 +244,29 @@ Fields:
 - the stable identity fields captured by `window_create_started`; and
 - `elapsed_ms`.
 
+### Error Projection (structured logs only)
+
+The original Tauri/Wry error object is preserved unchanged for the application
+return path. Structured diagnostic events **must not** emit arbitrary
+`Display` or `Debug` of that error. Instead, the failure event emits only:
+
+- `failure_kind` (allowlisted classifier result);
+- `error_hresult` when an HRESULT can be extracted from the error chain
+  (hex string such as `0x80010108`); otherwise omitted;
+- `error_message` — a single sanitized, truncated string derived from the
+  error's display form with the following rules:
+  - maximum length 240 Unicode scalars;
+  - newlines and other control characters replaced with a single space;
+  - substrings that look like absolute filesystem paths, `file://` or
+    `http(s)://` URLs, or `?…=` query fragments are replaced with fixed
+    placeholders (`<path>`, `<url>`, `<query>`);
+  - no raw `Debug` form is ever logged.
+
+Unit tests must include synthetic errors that contain a filesystem path, a
+query token, embedded newlines, and an oversized payload, and must prove that
+the projected fields never retain those raw values while `failure_kind` /
+`error_hresult` remain correct for known HRESULT cases.
+
 ## WebView2 Internal Logging
 
 On Windows, `CODEG_WEBVIEW_DEBUG` enables diagnostics when its trimmed value is
@@ -250,32 +278,103 @@ When enabled, DrawCode configures the existing
 --enable-logging --v=1 --log-file=<application log path>
 ```
 
-The options are merged before any Tauri plugin or async worker starts, using
-the same ordering constraint as the existing `--disable-gpu` preference. When
-debugging is enabled, DrawCode owns the three logging switches: it keeps one
-`--enable-logging`, normalizes verbosity to `--v=1`, and replaces any existing
-`--log-file` with the current process's app-owned path. It preserves every
-unrelated caller-provided argument value, avoids duplicate recognized
-switches, and quotes/escapes the generated log path according to Chromium
-command-line rules so spaces in the logs directory remain valid. When the
-debug option is disabled, existing caller-provided logging switches are not
-modified.
+### Browser-argument merge contract
 
-Each application process writes to a unique file:
+The options are merged before any Tauri plugin or async worker starts, using
+the same ordering constraint as the existing `--disable-gpu` preference.
+
+Tokenizer/serializer (explicit, table-tested):
+
+- Split the existing `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` value with a
+  Chromium-compatible argv tokenizer that respects double-quoted segments and
+  backslash escapes (not `split_whitespace` alone).
+- Recognized switch *names* (case-sensitive, Chromium style):
+  `--enable-logging`, `--v`, `--log-file`.
+- Recognized value attachment forms for `--v` and `--log-file`:
+  `--name=value` and `--name value` (separate token). Bare `--enable-logging`
+  takes no value.
+- When debugging is enabled, DrawCode **owns** the three logging switches: it
+  keeps exactly one `--enable-logging`, normalizes verbosity to `--v=1`
+  (replacing any prior `--v` / `--v=…`), and replaces any existing
+  `--log-file` / `--log-file=…` with the current process's app-owned path.
+- Every unrelated token (including quoted values with spaces, trailing
+  backslashes, and non-recognized switches) is preserved in relative order.
+- The generated `--log-file` path is quoted/escaped with the same Chromium
+  argv rules so spaces and backslashes in the path remain valid.
+- When the debug option is disabled, existing caller-provided logging switches
+  are not modified.
+
+### Storage location and access exclusion (I1)
+
+WebView2 internal logs **must not** live as ordinary files directly under
+`codeg_logs_root()`. They are stored in a dedicated subdirectory that ordinary
+log list/read/export paths do not traverse:
 
 ```text
-<codeg logs root>/webview2-<pid>.log
+<codeg logs root>/webview2-internal/webview2-<pid>-<utc_stamp>[-<n>].log
 ```
 
-Startup prunes only files strictly matching DrawCode's own
-`webview2-<pid>.log` naming pattern. After reserving the current target it
-retains at most five matching files in total, ordered by last modification
-time, and never deletes the current target. Failure to create, configure, or
-prune these files is logged but never blocks startup.
+Where:
+
+- `<codeg logs root>` is the existing application logs root;
+- `webview2-internal/` is application-owned and is **excluded** from
+  `list_log_files_core`, `read_log_file_core`, and any ordinary export/upload
+  surface that walks the logs root for `*.log` files;
+- deliberate operator retrieval is **not** supported through those ordinary
+  surfaces in this design. Operators locate the path from the structured
+  startup event field `webview_log_path` (emitted only when opt-in logging is
+  enabled) and open the file outside the app. A future explicit diagnostic
+  export action would require a separate design.
+
+Required tests: create a fixture file under `webview2-internal/` matching the
+strict pattern and prove that list/read/export helpers never return it;
+prove that an ordinary app log beside it remains listable/readable.
+
+### Unique per-launch filename and retention (I3)
+
+Each application **launch** reserves a unique file with create-new semantics:
+
+```text
+webview2-<pid>-<utc_stamp>.log
+```
+
+- `<pid>` is the process id;
+- `<utc_stamp>` is the process start time in compact UTC form
+  `YYYYMMDDTHHMMSSZ` (second resolution is sufficient with the collision
+  suffix below);
+- if that exact name already exists (PID reuse within the same second, or a
+  leftover file), append a numeric collision suffix `-1`, `-2`, … and retry
+  create-new until success or a small cap (32) is hit. On cap exhaustion, log
+  a non-fatal diagnostics warning and leave WebView2 file logging disabled for
+  that launch (structured events still work).
+- Open with create-new + exclusive write (truncate is forbidden; never append
+  to another launch's file).
+
+Strict filename matcher for retention:
+
+```text
+^webview2-[0-9]+-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?\.log$
+```
+
+Retention runs only inside `webview2-internal/`, only on files matching that
+pattern:
+
+1. Reserve the current target first (so it is never pruned).
+2. Never delete a file whose owning PID (parsed from the name) is still a live
+   process on this host when that check is cheaply available; if the live-PID
+   check is unavailable on a platform build, skip pruning entirely rather than
+   risk deleting an active log.
+3. Among remaining eligible (not current, not live-owned) matches, retain the
+   newest by mtime such that the **total** matching file count is at most
+   five, including the current target and any retained live-owned files. If
+   live-owned files already exceed five, do not delete any live-owned file;
+   the count limit temporarily yields to the live-file safety rule.
+4. Failure to create, configure, or prune is logged once and never blocks
+   startup.
 
 WebView2 internal logs may contain local navigation URLs and runtime details.
-They are therefore opt-in, local-only, and never included in ordinary export
-or upload behavior automatically.
+They are therefore opt-in, stored outside ordinary log retrieval, and never
+included in ordinary export or upload behavior automatically.
 
 ## Rendering Argument Handling
 
@@ -300,10 +399,14 @@ caller-provided argument values are not copied into durable logs.
   identifiers or future sensitive fields.
 - Window titles are excluded because they can contain conversation titles or
   repository names.
-- Error fields contain only the original Tauri/Wry build error; application
-  URLs, titles, and paths are never appended as diagnostic context.
+- Structured failure events use the bounded Error Projection above; they never
+  emit raw `Debug`, uncapped `Display`, application URLs, titles, or paths as
+  diagnostic context. The original error object still flows unchanged to the
+  existing caller return path.
 - Environment variables are allowlisted and summarized; raw environment dumps
   are forbidden.
+- WebView2 internal log files are excluded from ordinary list/read/export
+  surfaces as specified under Storage location and access exclusion.
 
 ## Testing
 
@@ -314,9 +417,19 @@ Pure unit tests cover:
 - monotonic attempt ID formatting;
 - stable HRESULT classification, including `0x80010108`;
 - safe environment snapshot redaction;
-- WebView2 argument merging with existing arguments;
+- WebView2 argument merging with existing arguments, including table-driven
+  cases for quoted unrelated values, `--v=2` vs `--v 2`, `--log-file=…` vs
+  separate value token, duplicate recognized switches, trailing backslashes,
+  and paths containing spaces;
 - duplicate-switch prevention;
-- debug log-path construction and strict retention filename matching; and
+- debug log-path construction (PID + UTC stamp + collision suffix) and strict
+  retention filename matching, including PID reuse and pre-existing targets;
+- live-file retention safety (do not delete live-owned files even if count
+  exceeds five);
+- ordinary log list/read exclusion of `webview2-internal/` files;
+- error projection redaction (path, URL/query token, newline, oversized
+  payload);
+- registered-window label cap and truncation flag; and
 - success, failure, and abandoned attempt terminal-state selection through a
   recording diagnostic sink.
 
@@ -330,14 +443,20 @@ Targeted verification includes:
 cargo test --lib --features test-utils window_diagnostics
 cargo check
 cargo clippy --all-targets --features test-utils -- -D warnings
+cargo check --no-default-features --features server --bin codeg-server
 ```
+
+The server check confirms the new module remains fully gated behind desktop
+features and does not regress the server binary.
 
 Manual verification on Windows uses two launches:
 
 1. normal launch: open Settings and a conversation pop-out, then verify the
    correlated default events and absence of a WebView2 internal log;
 2. `CODEG_WEBVIEW_DEBUG=1`: repeat the operations and verify the startup event,
-   correlated attempts, and the reported WebView2 log file.
+   correlated attempts, and the reported WebView2 log file under
+   `webview2-internal/`, and confirm ordinary log list UI/API does not show
+   that file.
 
 An actual `RPC_E_DISCONNECTED` failure is not required for automated tests.
 The next natural occurrence should provide the evidence needed for a separate

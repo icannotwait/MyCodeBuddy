@@ -1123,7 +1123,15 @@ pub async fn open_conversation_window(
         .min_inner_size(480.0, 400.0)
         .center();
     // Intentionally no .parent — independent top-level (like settings).
-    let conv_window = apply_platform_window_style(builder).build().map_err(|e| {
+    let conv_window = crate::window_diagnostics::build_with_diagnostics(
+        &app,
+        crate::window_diagnostics::WindowKind::ConversationPopout,
+        &label,
+        Some(&caller),
+        Some(&operation_id),
+        || apply_platform_window_style(builder).build(),
+    )
+    .map_err(|e| {
         // Roll back op record on build failure
         popout.tombstone_on_close(&label, &operation_id);
         AppCommandError::window("Failed to open conversation window", e.to_string())
