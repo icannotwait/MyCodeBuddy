@@ -7,11 +7,16 @@ import type {
 } from "@/lib/types"
 
 const {
+  WORKFLOW_GRAPH_CHANGED_EVENT,
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
   getWorkflowGraphSnapshot,
   subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
   subscribeWorkflowCompatibilityNudge,
 } = vi.hoisted(() => ({
+  WORKFLOW_GRAPH_CHANGED_EVENT: "workflow_graph://changed",
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT:
+    "workflow_graph://compatibility_nudge",
   getWorkflowGraphSnapshot: vi.fn(),
   subscribeCompletionDecisionResolved: vi.fn(async () => () => {}),
   subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
@@ -21,6 +26,8 @@ const {
 // Pass hoisted mocks through directly — do not re-wrap with `...args: unknown[]`
 // spreads (TS2556: spread of unknown[] is not a rest tuple).
 vi.mock("@/lib/api", () => ({
+  WORKFLOW_GRAPH_CHANGED_EVENT,
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
   getWorkflowGraphSnapshot,
   subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
@@ -839,6 +846,130 @@ describe("workflow activation lifecycle", () => {
     expect(nudgeDispose).toHaveBeenCalledTimes(1)
     release()
     expect(nudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("warns once per required channel and shares one five-second retry timer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    subscribeWorkflowGraphChanged.mockRejectedValue(
+      new Error("changed unavailable")
+    )
+    subscribeWorkflowCompatibilityNudge.mockRejectedValue(
+      new Error("nudge unavailable")
+    )
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      settledSnapshot({ graph_revision: 2 })
+    )
+
+    const release = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(301)
+    try {
+      await flushMicrotasks()
+      expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
+      expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        "[workflow-graph-store] required event subscription failed",
+        {
+          channel: WORKFLOW_GRAPH_CHANGED_EVENT,
+          error: "changed unavailable",
+        }
+      )
+      expect(warn).toHaveBeenCalledWith(
+        "[workflow-graph-store] required event subscription failed",
+        {
+          channel: WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+          error: "nudge unavailable",
+        }
+      )
+      expect(warn).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
+      expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      await flushMicrotasks()
+
+      expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(2)
+      expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(2)
+      expect(warn).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(1)
+    } finally {
+      release()
+      warn.mockRestore()
+    }
+  })
+
+  it("retries only the missing required listener and retains its sibling", async () => {
+    const changedDispose = vi.fn()
+    const nudgeDispose = vi.fn()
+    subscribeWorkflowGraphChanged
+      .mockRejectedValueOnce(new Error("changed unavailable"))
+      .mockResolvedValueOnce(changedDispose)
+    subscribeWorkflowCompatibilityNudge.mockResolvedValue(nudgeDispose)
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      settledSnapshot({ graph_revision: 2 })
+    )
+
+    const release = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(302)
+    await flushMicrotasks()
+    expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
+    expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await flushMicrotasks()
+    expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(2)
+    expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+    expect(changedDispose).not.toHaveBeenCalled()
+    expect(nudgeDispose).not.toHaveBeenCalled()
+
+    release()
+    expect(changedDispose).toHaveBeenCalledTimes(1)
+    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("final lease release clears retry, refresh, and warning generation state", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    subscribeWorkflowGraphChanged.mockRejectedValue(
+      new Error("changed unavailable")
+    )
+    subscribeWorkflowCompatibilityNudge.mockRejectedValue(
+      new Error("nudge unavailable")
+    )
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      activeSnapshot({ graph_revision: 2 })
+    )
+
+    const firstRelease = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(303)
+    try {
+      await flushMicrotasks()
+      expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(2)
+
+      firstRelease()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(15_000)
+      await flushMicrotasks()
+      expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+      expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
+      expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(1)
+
+      const secondRelease = useWorkflowGraphStore
+        .getState()
+        .activateOverlayInterest(303)
+      await flushMicrotasks()
+      expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(2)
+      expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(2)
+      expect(warn).toHaveBeenCalledTimes(4)
+      secondRelease()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it("starts refresh-only mode at the five-second readiness deadline", async () => {
@@ -1687,13 +1818,17 @@ describe("active workflow refresh scheduling", () => {
   })
 
   it("subscription failures still allow initial and periodic refresh", async () => {
-    subscribeWorkflowGraphChanged.mockRejectedValue(
-      new Error("graph events unavailable")
+    const pendingChanged = deferred<() => void>()
+    const pendingNudge = deferred<() => void>()
+    subscribeWorkflowGraphChanged
+      .mockRejectedValueOnce(new Error("graph events unavailable"))
+      .mockReturnValueOnce(pendingChanged.promise)
+    subscribeWorkflowCompatibilityNudge
+      .mockRejectedValueOnce(new Error("nudge events unavailable"))
+      .mockReturnValueOnce(pendingNudge.promise)
+    getWorkflowGraphSnapshot.mockResolvedValue(
+      settledSnapshot({ graph_revision: 2 })
     )
-    subscribeWorkflowCompatibilityNudge.mockRejectedValue(
-      new Error("nudge events unavailable")
-    )
-    getWorkflowGraphSnapshot.mockResolvedValue(settledSnapshot())
 
     const release = useWorkflowGraphStore.getState().activateConversation(85)
     await flushMicrotasks()
@@ -1702,6 +1837,8 @@ describe("active workflow refresh scheduling", () => {
     await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(2)
+    expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(2)
     release()
   })
 })

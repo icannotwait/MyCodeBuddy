@@ -13,12 +13,15 @@
 
 import { create } from "zustand"
 import {
+  WORKFLOW_GRAPH_CHANGED_EVENT,
+  WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
   getWorkflowGraphSnapshot,
   subscribeCompletionDecisionResolved,
   subscribeWorkflowCompatibilityNudge,
   subscribeWorkflowGraphChanged,
 } from "@/lib/api"
 import type { CompletionDecisionResolvedEventPayload } from "@/lib/api"
+import { toErrorMessage } from "@/lib/app-error"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
   DelegationRuntimeStats,
@@ -194,19 +197,48 @@ function mapSetEntry(
  * React Strict Mode (mount → unmount → remount) can leave in-flight
  * `subscribe().then(dispose => …)` callbacks from the first install. A shared
  * boolean `eventDisposed` that remount flips back to false lets those stale
- * callbacks overwrite `graphChangedUnsub` / `nudgeUnsub` with the wrong
- * dispose handle. Each install captures its generation; dispose bumps the
- * counter so stale `.then` handlers always dispose-and-drop instead of
- * assigning into the live slots.
+ * callbacks overwrite the active listener slots with the wrong dispose
+ * handles. Each install captures its generation; stale `.then` handlers
+ * always dispose-and-drop instead of assigning into the live slots.
  */
 let eventInstallGeneration = 0
 /** Non-zero while an install is active (matches that install's generation). */
 let activeEventInstallGeneration = 0
-let graphChangedUnsub: (() => void) | null = null
-let nudgeUnsub: (() => void) | null = null
+const REQUIRED_LISTENER_RETRY_MS = 5_000
+const REQUIRED_LISTENER_KEYS = ["graphChanged", "compatibilityNudge"] as const
+
+type RequiredListenerKey = (typeof REQUIRED_LISTENER_KEYS)[number]
+
+type RequiredListenerSlot = {
+  channel: string
+  subscribed: boolean
+  subscribing: boolean
+  warningEmitted: boolean
+  unsubscribe: (() => void) | null
+}
+
+const requiredListenerSlots: Record<RequiredListenerKey, RequiredListenerSlot> =
+  {
+    graphChanged: {
+      channel: WORKFLOW_GRAPH_CHANGED_EVENT,
+      subscribed: false,
+      subscribing: false,
+      warningEmitted: false,
+      unsubscribe: null,
+    },
+    compatibilityNudge: {
+      channel: WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+      subscribed: false,
+      subscribing: false,
+      warningEmitted: false,
+      unsubscribe: null,
+    },
+  }
+
 let completionUnsub: (() => void) | null = null
 let eventReadinessPromise: Promise<void> | null = null
 let eventReadinessDeadline: ReturnType<typeof setTimeout> | null = null
+let requiredListenerRetryTimer: ReturnType<typeof setTimeout> | null = null
 const activeConversations = new Map<number, ActiveConversationRecord>()
 const seenCompletionEvents = new Set<string>()
 let activationEpochCounter = 0
@@ -235,6 +267,101 @@ function clearFallbackTimer(active: ActiveConversationRecord): void {
   }
 }
 
+function subscribeRequiredListener(
+  key: RequiredListenerKey,
+  get: () => WorkflowGraphState
+): Promise<() => void> {
+  if (key === "graphChanged") {
+    return subscribeWorkflowGraphChanged((payload) => {
+      get().handleGraphChanged(payload)
+    })
+  }
+  return subscribeWorkflowCompatibilityNudge((payload) => {
+    get().handleCompatibilityNudge(payload)
+  })
+}
+
+function scheduleRequiredListenerRetry(
+  get: () => WorkflowGraphState,
+  generation: number
+): void {
+  if (
+    requiredListenerRetryTimer != null ||
+    activeEventInstallGeneration !== generation ||
+    activeConversations.size === 0 ||
+    !REQUIRED_LISTENER_KEYS.some((key) => {
+      const slot = requiredListenerSlots[key]
+      return !slot.subscribed && !slot.subscribing
+    })
+  ) {
+    return
+  }
+
+  requiredListenerRetryTimer = setTimeout(() => {
+    requiredListenerRetryTimer = null
+    if (
+      activeEventInstallGeneration !== generation ||
+      activeConversations.size === 0
+    ) {
+      return
+    }
+    for (const attempt of attemptMissingRequiredListeners(get, generation)) {
+      void attempt
+    }
+  }, REQUIRED_LISTENER_RETRY_MS)
+}
+
+function attemptRequiredListener(
+  key: RequiredListenerKey,
+  get: () => WorkflowGraphState,
+  generation: number
+): Promise<void> {
+  const slot = requiredListenerSlots[key]
+  if (slot.subscribed || slot.subscribing) return Promise.resolve()
+  slot.subscribing = true
+
+  return subscribeRequiredListener(key, get)
+    .then((dispose) => {
+      if (activeEventInstallGeneration !== generation) {
+        dispose()
+        return
+      }
+      slot.subscribing = false
+      if (slot.subscribed || slot.unsubscribe) {
+        dispose()
+        return
+      }
+      slot.subscribed = true
+      slot.warningEmitted = false
+      slot.unsubscribe = dispose
+    })
+    .catch((error: unknown) => {
+      if (activeEventInstallGeneration !== generation) return
+      slot.subscribing = false
+      if (!slot.warningEmitted) {
+        console.warn(
+          "[workflow-graph-store] required event subscription failed",
+          {
+            channel: slot.channel,
+            error: toErrorMessage(error),
+          }
+        )
+        slot.warningEmitted = true
+      }
+      scheduleRequiredListenerRetry(get, generation)
+    })
+}
+
+function attemptMissingRequiredListeners(
+  get: () => WorkflowGraphState,
+  generation: number
+): Promise<void>[] {
+  return REQUIRED_LISTENER_KEYS.filter((key) => {
+    const slot = requiredListenerSlots[key]
+    return !slot.subscribed && !slot.subscribing
+  }).map((key) => attemptRequiredListener(key, get, generation))
+}
+
 function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
   if (activeEventInstallGeneration !== 0 && eventReadinessPromise != null) {
     return eventReadinessPromise
@@ -242,30 +369,7 @@ function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
   const generation = ++eventInstallGeneration
   activeEventInstallGeneration = generation
 
-  const changedAttempt = subscribeWorkflowGraphChanged((payload) => {
-    get().handleGraphChanged(payload)
-  })
-    .then((dispose) => {
-      if (activeEventInstallGeneration !== generation) {
-        dispose()
-        return
-      }
-      graphChangedUnsub = dispose
-    })
-    .catch(() => {
-      // Transport without subscribe — refresh-only path.
-    })
-
-  const nudgeAttempt = subscribeWorkflowCompatibilityNudge((payload) => {
-    get().handleCompatibilityNudge(payload)
-  }).then((dispose) => {
-    if (activeEventInstallGeneration !== generation) {
-      dispose()
-      return
-    }
-    nudgeUnsub = dispose
-  })
-
+  const requiredAttempts = attemptMissingRequiredListeners(get, generation)
   const completionAttempt = subscribeCompletionDecisionResolved((payload) => {
     get().handleCompletionDecisionResolved(payload)
   })
@@ -281,8 +385,7 @@ function installEventListeners(get: () => WorkflowGraphState): Promise<void> {
     })
 
   const attemptsSettled = Promise.allSettled([
-    changedAttempt,
-    nudgeAttempt,
+    ...requiredAttempts,
     completionAttempt,
   ]).then(() => undefined)
   const deadline = new Promise<void>((resolve) => {
@@ -309,12 +412,22 @@ function disposeEventListeners(): void {
     clearTimeout(eventReadinessDeadline)
     eventReadinessDeadline = null
   }
+  if (requiredListenerRetryTimer != null) {
+    clearTimeout(requiredListenerRetryTimer)
+    requiredListenerRetryTimer = null
+  }
   eventReadinessPromise = null
-  graphChangedUnsub?.()
-  nudgeUnsub?.()
+
+  for (const key of REQUIRED_LISTENER_KEYS) {
+    const slot = requiredListenerSlots[key]
+    slot.unsubscribe?.()
+    slot.unsubscribe = null
+    slot.subscribed = false
+    slot.subscribing = false
+    slot.warningEmitted = false
+  }
+
   completionUnsub?.()
-  graphChangedUnsub = null
-  nudgeUnsub = null
   completionUnsub = null
 }
 
