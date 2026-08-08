@@ -295,9 +295,10 @@ O Codeg pode ser executado como um servidor web standalone sem ambiente desktop.
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-GitHub Releases for this fork ship **desktop only**. They do **not** attach
-`codeg-server-windows-x64.zip`. Self-host with Docker or source build
-(`--features server`). `install.ps1` only works with a legacy or self-packaged zip:
+GitHub Releases ship desktop DrawCode (NSIS) plus signed standalone server
+archives such as `codeg-server-linux-x64.tar.gz` (and darwin/windows siblings).
+Self-host with the release archive, Docker, or a source build (`--features server`).
+Windows install:
 
 ```powershell
 .\install.ps1 -Version v0.22.2-mycodebuddy.1

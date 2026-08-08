@@ -57,6 +57,27 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+  build-server:
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: codeg-server-linux-x64
+    runs-on: \${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build server
+        run: |
+          cargo build --release --bin codeg-server --no-default-features --features server --target \${{ matrix.target }}
+          cargo build --release --bin codeg-mcp --no-default-features --target \${{ matrix.target }}
+      - name: Sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri signer sign dist/codeg-server-linux-x64.tar.gz
 `
 
 test("reads the package version from Cargo.toml", () => {
@@ -146,23 +167,33 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
   assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
 })
 
-test("release workflow publishes only Windows MyCodeBuddy desktop artifacts", () => {
+test("release workflow publishes Windows desktop plus signed server archives", () => {
   const workflowText = readRepositoryFile(".github/workflows/release.yml")
   const desktopJob = workflowText.match(
     /^  build-desktop:\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:)/m
+  )?.[1]
+  const serverJob = workflowText.match(
+    /^  build-server:\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:)/m
   )?.[1]
 
   assertWindowsReleaseWorkflow(workflowText)
   assert.match(workflowText, /MyCodeBuddy \$\{tag\}/)
   assert.match(workflowText, /prerelease:\s*false/)
-  assert.doesNotMatch(workflowText, /^  build-server:/m)
-  assert.doesNotMatch(workflowText, /codeg-server-windows-x64/)
+  assert.match(workflowText, /^  build-server:/m)
+  assert.match(workflowText, /codeg-server-linux-x64/)
+  assert.match(workflowText, /codeg-server-windows-x64/)
   assert.doesNotMatch(workflowText, /includeUpdaterJson:\s*false/)
   assert.ok(desktopJob, "build-desktop job is missing")
+  assert.ok(serverJob, "build-server job is missing")
   assert.doesNotMatch(desktopJob, /Windows ARM64/)
   assert.doesNotMatch(desktopJob, /aarch64-pc-windows-msvc/)
   assert.doesNotMatch(desktopJob, /^      max-parallel:/m)
   assert.match(desktopJob, /^          includeUpdaterJson:\s*true\s*$/m)
+  assert.match(
+    serverJob,
+    /cargo build --release --bin codeg-server --no-default-features --features server/
+  )
+  assert.match(serverJob, /--bin codeg-mcp/)
 })
 
 test("uses updater artifacts only through the release Tauri config", () => {
@@ -322,7 +353,7 @@ test("server installer validates and copies compliance files before install writ
   )
 })
 
-test("documents desktop-only releases and opt-in server self-host", () => {
+test("documents release server archives and source-built self-host options", () => {
   const paths = [
     "README.md",
     "docs/readme/README.ar.md",
@@ -360,11 +391,10 @@ test("documents desktop-only releases and opt-in server self-host", () => {
       `${path} must describe Linux/macOS source-built upgrades`
     )
     assert.match(text, /GitHub\s+Releases/)
-    // Must not present prebuilt server zips as a current consumer download.
-    assert.doesNotMatch(
+    assert.match(
       text,
-      /\| Windows x64 \| `codeg-server-windows-x64\.zip` \|/,
-      `${path} must not list codeg-server-windows-x64.zip as a release artifact`
+      /codeg-server-linux-x64/,
+      `${path} must document the Linux x64 server release artifact`
     )
     assert.doesNotMatch(
       text,
@@ -404,53 +434,55 @@ test("requires recursive checkout in the desktop job itself", () => {
   )
 })
 
-test("rejects publishing the standalone codeg-server binary from release", () => {
-  const withServerJob = `${validWindowsWorkflow}
-  build-server:
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - run: cargo build --release --bin codeg-server --no-default-features --features server
-`
-
-  assert.throws(
-    () => assertWindowsReleaseWorkflow(withServerJob),
-    /must not include a build-server job/
+test("requires build-server with linux-x64 and --features server", () => {
+  const withoutServerJob = validWindowsWorkflow.replace(
+    /\n  build-server:[\s\S]*$/,
+    "\n"
   )
   assert.throws(
-    () =>
-      assertWindowsReleaseWorkflow(
-        `${validWindowsWorkflow}\nrun: echo codeg-server-windows-x64.zip\n`
-      ),
-    /must not publish codeg-server-windows-x64/
+    () => assertWindowsReleaseWorkflow(withoutServerJob),
+    /missing the build-server job/
+  )
+
+  const withoutLinuxArtifact = validWindowsWorkflow.replaceAll(
+    "codeg-server-linux-x64",
+    "codeg-server-other"
+  )
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(withoutLinuxArtifact),
+    /codeg-server-linux-x64/
+  )
+
+  const withoutServerFeature = validWindowsWorkflow.replace(
+    "--features server",
+    "--features test-utils"
+  )
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(withoutServerFeature),
+    /--features server/
   )
 })
 
-test("rejects every release target except Windows x64 MSVC", () => {
-  for (const target of [
-    "aarch64-pc-windows-msvc",
-    "x86_64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "i686-pc-windows-msvc",
-  ]) {
-    assert.throws(
-      () =>
-        assertWindowsReleaseWorkflow(
-          `${validWindowsWorkflow}\n  target: ${target}\n`
-        ),
-      /unsupported release target/
-    )
-  }
+test("rejects unsupported desktop and server release targets", () => {
   assert.throws(
     () =>
       assertWindowsReleaseWorkflow(
-        `${validWindowsWorkflow}
-run: rustup target add wasm32-unknown-unknown
-`
+        validWindowsWorkflow.replace(
+          "target: x86_64-pc-windows-msvc",
+          "target: aarch64-pc-windows-msvc"
+        )
       ),
-    /unsupported release target/
+    /unsupported desktop release target|missing Windows desktop target/
+  )
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        validWindowsWorkflow.replace(
+          "target: x86_64-unknown-linux-gnu",
+          "target: wasm32-unknown-unknown"
+        )
+      ),
+    /unsupported server release target|Linux x64/
   )
 })
 
@@ -459,7 +491,7 @@ test("requires both Tauri updater signing secret references", () => {
     "TAURI_SIGNING_PRIVATE_KEY",
     "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
   ]) {
-    const withoutSecret = validWindowsWorkflow.replace(
+    const withoutSecret = validWindowsWorkflow.replaceAll(
       `\${{ secrets.${secret} }}`,
       "missing"
     )
@@ -484,9 +516,9 @@ test("requires direct updater signing secret env mappings", () => {
     assert.throws(
       () =>
         assertWindowsReleaseWorkflow(
-          validWindowsWorkflow.replace(directMapping, aliasMapping)
+          validWindowsWorkflow.replaceAll(directMapping, aliasMapping)
         ),
-      /direct env mapping/
+      /direct env mapping|env alias/
     )
     assert.throws(
       () =>
@@ -498,17 +530,35 @@ test("requires direct updater signing secret env mappings", () => {
   }
 })
 
-test("rejects macOS runners but allows Ubuntu release management", () => {
+test("allows macOS runners for server builds and forbids Docker Hub release", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
+  assert.doesNotThrow(() =>
+    assertWindowsReleaseWorkflow(
+      validWindowsWorkflow.replace(
+        "runner: ubuntu-22.04",
+        "runner: macos-latest"
+      )
+    )
+  )
   assert.throws(
     () =>
       assertWindowsReleaseWorkflow(
         `${validWindowsWorkflow}
-  build-macos:
-    runs-on: macos-14
+  build-docker:
+    runs-on: ubuntu-22.04
 `
       ),
-    /macOS runner/
+    /forbidden entry build-docker/
+  )
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow}
+env:
+  DOCKERHUB_USERNAME: example
+`
+      ),
+    /forbidden entry DOCKERHUB_/
   )
 })
 
