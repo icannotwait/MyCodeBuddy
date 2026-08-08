@@ -197,6 +197,10 @@ enum CompleteWorkAttemptError {
     Contract(CompleteWorkError),
     Database {
         error: sea_orm::DbErr,
+        /// True when the attempt left no durable partial write (begin/body).
+        /// Commit-time SQLITE_BUSY is also retried when [`completion_write_race`]
+        /// matches, regardless of this flag.
+        #[allow(dead_code)]
         retry_safe: bool,
     },
 }
@@ -220,7 +224,10 @@ fn completion_write_race(error: &sea_orm::DbErr) -> bool {
 }
 
 fn completion_retry_delay(attempt: u8) -> std::time::Duration {
-    std::time::Duration::from_millis(u64::from(attempt) * 2)
+    // Floor + linear backoff: concurrent complete_work writers under CI load
+    // need more than a few milliseconds between snapshot retries, especially
+    // after SQLITE_BUSY on commit (busy_timeout does not cover every path).
+    std::time::Duration::from_millis(5 + u64::from(attempt) * 10)
 }
 
 #[cfg(test)]
@@ -450,10 +457,13 @@ async fn accept_complete_work_txn_inner(
         {
             Ok(intent) => return Ok(intent),
             Err(CompleteWorkAttemptError::Contract(error)) => return Err(error),
-            Err(CompleteWorkAttemptError::Database {
-                error,
-                retry_safe: true,
-            }) if completion_write_race(&error) && attempt < COMPLETE_WORK_TXN_MAX_ATTEMPTS => {
+            // Retry any SQLite write-race (busy / locked / unique) including
+            // commit-time SQLITE_BUSY. Previously only `retry_safe: true` body
+            // errors retried, so concurrent writers that locked on commit
+            // surfaced Persistence("database is locked") after a single try.
+            Err(CompleteWorkAttemptError::Database { error, .. })
+                if completion_write_race(&error) && attempt < COMPLETE_WORK_TXN_MAX_ATTEMPTS =>
+            {
                 #[cfg(test)]
                 if let Some(control) = control {
                     control.record_retry();
@@ -634,7 +644,10 @@ async fn accept_complete_work_once(
                 .await
                 .map_err(|error| CompleteWorkAttemptError::Database {
                     error,
-                    retry_safe: false,
+                    // Commit is atomic: SQLITE_BUSY / unique races are safe to
+                    // retry with a fresh transaction. Forced-commit inject uses
+                    // a non-race Custom error so the no-retry test still holds.
+                    retry_safe: true,
                 })?;
             Ok(intent)
         }
