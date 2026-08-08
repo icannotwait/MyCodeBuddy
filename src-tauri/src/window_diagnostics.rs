@@ -277,11 +277,12 @@ pub(crate) fn sanitize_diagnostic_text(value: &str) -> String {
     let without_quoted_paths = quoted_path_pattern.replace_all(&without_urls, "<path>");
 
     let windows_path_pattern =
-        Regex::new(r#"(?i)(?:[A-Z]:[\\/]|\\\\)[^\s\"'<>]+"#).expect("valid Windows path regex");
-    let without_windows_paths = windows_path_pattern.replace_all(&without_quoted_paths, "<path>");
-    let posix_path_pattern =
-        Regex::new(r#"(?:^|([\s(]))/[^\s\"'<>]+"#).expect("valid POSIX path regex");
-    let without_paths = posix_path_pattern.replace_all(&without_windows_paths, "${1}<path>");
+        Regex::new(r#"(?i)(?:^|([^A-Za-z0-9]))(?:[A-Z]:[\\/]|\\\\)[^\s\"'<>]+"#)
+            .expect("valid Windows path regex");
+    let without_windows_paths =
+        windows_path_pattern.replace_all(&without_quoted_paths, "${1}<path>");
+    let posix_path_pattern = Regex::new(r#"/[^\s\"'<>]+"#).expect("valid POSIX path regex");
+    let without_paths = posix_path_pattern.replace_all(&without_windows_paths, "<path>");
 
     let query_pattern =
         Regex::new(r#"\?[^\s\"'<>]*=[^\s\"'<>]*"#).expect("valid query-fragment regex");
@@ -741,6 +742,26 @@ mod tests {
         assert!(sanitized.contains("<path>"));
         assert!(sanitized.contains("<url>"));
         assert!(sanitized.contains("<query>"));
+    }
+
+    #[test]
+    fn startup_error_sanitizer_redacts_punctuation_prefixed_posix_paths() {
+        let sanitized = sanitize_diagnostic_text(
+            r"path=/home/alice/private-repository/token.txt runtime:/srv/codeg/private/runtime.db windows=C:\Users\Bob\Secret\token.txt",
+        );
+
+        assert!(sanitized.contains("path=<path>"), "sanitized={sanitized}");
+        assert!(
+            sanitized.contains("runtime:<path>"),
+            "sanitized={sanitized}"
+        );
+        assert!(
+            sanitized.contains("windows=<path>"),
+            "sanitized={sanitized}"
+        );
+        for secret in ["alice", "private-repository", "codeg", "runtime.db", "Bob"] {
+            assert!(!sanitized.contains(secret), "leaked {secret}");
+        }
     }
 
     #[test]
