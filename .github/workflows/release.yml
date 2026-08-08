@@ -472,6 +472,10 @@ jobs:
 
       - name: Upload to release (Windows)
         if: runner.os == 'Windows'
+        # Default Windows shell is pwsh, which rejects bash-style `\` line
+        # continuations (ParserError on the first backslash). Use bash so the
+        # upload command matches the Unix step.
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
