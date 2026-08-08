@@ -18,6 +18,7 @@ import {
   emptyRuntimeStats,
   type AttentionRequestSummary,
   type CardSummary,
+  type DelegationRunSnapshot,
   type DelegationRuntimeStats,
 } from "@/lib/types"
 
@@ -115,6 +116,32 @@ function projection(
   }
 }
 
+function runSnapshot(
+  overrides: Partial<DelegationRunSnapshot> = {}
+): DelegationRunSnapshot {
+  return {
+    task_id: "task-1",
+    root_task_id: "task-1",
+    previous_task_id: null,
+    generation: 1,
+    parent_tool_use_id: "pt-1",
+    child_conversation_id: 123,
+    agent_type: "grok",
+    profile_id: null,
+    task_preview: "durable task",
+    status: "running",
+    error_code: null,
+    started_at: STARTED_AT,
+    finished_at: null,
+    runtime_stats: RUNNING_SUMMARY_STATS,
+    card_summary: null,
+    child_turn_anchor: null,
+    replaced_task_id: null,
+    replacement_reason: null,
+    ...overrides,
+  }
+}
+
 const PARSED_INPUT = parseInput(
   JSON.stringify({
     agent_type: "codex",
@@ -176,6 +203,239 @@ function sourceWithStats(input: {
 }
 
 describe("buildDelegationCardModel — merge precedence", () => {
+  it("matching completed snapshot replaces every stale running binding field", () => {
+    const terminalSummary: CardSummary = {
+      kind: "implementation",
+      phase: "implementation",
+      status: "done",
+      summary: "Durable run completed.",
+    }
+    const model = build({
+      parsedInput: parseInput(null),
+      binding: binding({
+        taskId: "task-1",
+        status: "running",
+        agentType: "codex",
+        task: "stale live task",
+        childConnectionId: "stale-connection",
+        childConversationId: 99,
+        runtimeStats: RUNNING_SUMMARY_STATS,
+        attentionRequest: ATTENTION,
+        errorCode: "stale-running-error",
+        completedDurationMs: 45_000,
+        cardSummary: null,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        generation: 4,
+        status: "completed",
+        agent_type: "grok",
+        task_preview: "durable task",
+        child_conversation_id: 123,
+        runtime_stats: LIVE_STATS,
+        finished_at: FINISHED_AT,
+        card_summary: terminalSummary,
+      }),
+    })
+
+    expect(model).toMatchObject({
+      lifecycleStatus: "ok",
+      status: "ok",
+      brokerTaskId: "task-1",
+      generation: 4,
+      agentType: "grok",
+      task: "durable task",
+      childConversationId: 123,
+      childConnectionId: null,
+      runtimeStats: LIVE_STATS,
+      finishedAt: FINISHED_AT,
+      attentionRequest: null,
+      completedDurationMs: null,
+      errorCode: undefined,
+      cardSummary: terminalSummary,
+    })
+    expect(model.toolCallCount).toBe(12)
+    expect(isTickerEligible(model)).toBe(false)
+  })
+
+  it("matching failed snapshot replaces stale running live meta as an error", () => {
+    const model = build({
+      parsedInput: parseInput(null),
+      parsedMeta: meta({
+        taskId: "task-1",
+        status: "running",
+        task: "stale meta task",
+        childConnectionId: "stale-meta-connection",
+        childConversationId: 42,
+        runtimeStats: RUNNING_SUMMARY_STATS,
+        attentionRequest: ATTENTION,
+        errorCode: "stale-meta-error",
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        generation: 2,
+        status: "failed",
+        error_code: "durable_child_failed",
+        task_preview: "durable failed task",
+        child_conversation_id: 123,
+        runtime_stats: LIVE_STATS,
+        finished_at: FINISHED_AT,
+      }),
+    })
+
+    expect(model).toMatchObject({
+      lifecycleStatus: "err",
+      status: "err",
+      brokerTaskId: "task-1",
+      generation: 2,
+      task: "durable failed task",
+      childConversationId: 123,
+      childConnectionId: null,
+      runtimeStats: LIVE_STATS,
+      finishedAt: FINISHED_AT,
+      attentionRequest: null,
+      errorCode: "durable_child_failed",
+    })
+    expect(isTickerEligible(model)).toBe(false)
+  })
+
+  it("mismatched terminal snapshot cannot change a running binding", () => {
+    const model = build({
+      parsedInput: parseInput(null),
+      binding: binding({
+        taskId: "task-1",
+        status: "running",
+        task: "live task",
+        runtimeStats: RUNNING_SUMMARY_STATS,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-other",
+        generation: 9,
+        status: "completed",
+        runtime_stats: LIVE_STATS,
+        finished_at: FINISHED_AT,
+        card_summary: {
+          kind: "implementation",
+          phase: "implementation",
+          status: "done",
+          summary: "Wrong run.",
+        },
+      }),
+    })
+
+    expect(model.lifecycleStatus).toBe("running")
+    expect(model.status).toBe("active")
+    expect(model.brokerTaskId).toBe("task-1")
+    expect(model.generation).toBeNull()
+    expect(model.task).toBe("live task")
+    expect(model.agentType).toBe("codex")
+    expect(model.childConnectionId).toBe("c1")
+    expect(model.runtimeStats).toEqual(RUNNING_SUMMARY_STATS)
+    expect(model.finishedAt).toBeNull()
+    expect(model.cardSummary).toBeNull()
+  })
+
+  it("terminal snapshot fails closed when live meta has no task id", () => {
+    const model = build({
+      parsedInput: parseInput(null),
+      parsedMeta: meta({
+        taskId: null,
+        status: "running",
+        task: "identity-less meta task",
+        runtimeStats: RUNNING_SUMMARY_STATS,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        status: "completed",
+        runtime_stats: LIVE_STATS,
+        finished_at: FINISHED_AT,
+      }),
+    })
+
+    expect(model.lifecycleStatus).toBe("running")
+    expect(model.brokerTaskId).toBeNull()
+    expect(model.task).toBe("identity-less meta task")
+    expect(model.childConnectionId).toBe("c-meta")
+    expect(model.runtimeStats).toEqual(RUNNING_SUMMARY_STATS)
+    expect(model.finishedAt).toBeNull()
+  })
+
+  it("terminal live meta outranks a running binding and running snapshot", () => {
+    const model = build({
+      parsedInput: parseInput(null),
+      binding: binding({
+        taskId: "task-1",
+        status: "running",
+        task: "stale binding task",
+        runtimeStats: RUNNING_SUMMARY_STATS,
+      }),
+      parsedMeta: meta({
+        taskId: "task-1",
+        status: "err",
+        task: "terminal meta task",
+        errorCode: "live_meta_failed",
+        finishedAt: FINISHED_AT,
+        runtimeStats: LIVE_STATS,
+        attentionRequest: null,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        status: "running",
+        runtime_stats: RUNNING_SUMMARY_STATS,
+      }),
+    })
+
+    expect(model.lifecycleStatus).toBe("err")
+    expect(model.status).toBe("err")
+    expect(model.task).toBe("terminal meta task")
+    expect(model.errorCode).toBe("live_meta_failed")
+    expect(model.childConnectionId).toBe("c-meta")
+    expect(model.runtimeStats).toEqual(LIVE_STATS)
+    expect(model.finishedAt).toBe(FINISHED_AT)
+  })
+
+  it("terminal live binding outranks a lower running snapshot", () => {
+    const liveSummary: CardSummary = {
+      kind: "review",
+      verdict: "approve",
+      critical: 0,
+      important: 0,
+      minor: 0,
+      summary: "Live completion wins.",
+    }
+    const model = build({
+      parsedInput: parseInput(null),
+      binding: binding({
+        taskId: "task-1",
+        status: "ok",
+        runtimeStats: LIVE_STATS,
+        finishedAt: FINISHED_AT,
+        attentionRequest: null,
+        cardSummary: liveSummary,
+      }),
+      runSnapshot: runSnapshot({
+        task_id: "task-1",
+        status: "running",
+        error_code: null,
+        runtime_stats: RUNNING_SUMMARY_STATS,
+        card_summary: {
+          kind: "review",
+          verdict: "block",
+          critical: 1,
+          important: 0,
+          minor: 0,
+          summary: "Lower running data.",
+        },
+      }),
+    })
+
+    expect(model.lifecycleStatus).toBe("ok")
+    expect(model.status).toBe("ok")
+    expect(model.errorCode).toBeUndefined()
+    expect(model.runtimeStats).toEqual(LIVE_STATS)
+    expect(model.cardSummary).toEqual(liveSummary)
+  })
+
   it("terminal live locks lifecycle and stats over a running summary", () => {
     const model = build({
       binding: binding({

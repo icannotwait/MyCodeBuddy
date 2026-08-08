@@ -464,6 +464,71 @@ function effectiveDelegationMeta(
   return parsedMeta?.syntheticHistorical && runSnapshot ? null : parsedMeta
 }
 
+type EffectiveDelegationSources = {
+  binding: DelegationBinding | undefined
+  parsedMeta: ParsedMeta | null
+  runSnapshot: DelegationRunSnapshot | null
+}
+
+function isTerminalRunSnapshot(snapshot: DelegationRunSnapshot): boolean {
+  return (
+    snapshot.status === "completed" ||
+    snapshot.status === "failed" ||
+    snapshot.status === "canceled"
+  )
+}
+
+function effectiveDelegationSources(
+  binding: DelegationBinding | undefined,
+  parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null
+): EffectiveDelegationSources {
+  const availableTaskIds = [
+    ...(binding ? [binding.taskId] : []),
+    ...(parsedMeta ? [parsedMeta.taskId] : []),
+  ]
+  const snapshotMatches =
+    runSnapshot == null ||
+    availableTaskIds.every(
+      (taskId) => taskId != null && taskId === runSnapshot.task_id
+    )
+  const effectiveRunSnapshot = snapshotMatches ? runSnapshot : null
+  const effectiveMeta = effectiveDelegationMeta(
+    parsedMeta,
+    effectiveRunSnapshot
+  )
+
+  if (binding && binding.status !== "running") {
+    return {
+      binding,
+      parsedMeta: effectiveMeta,
+      runSnapshot: effectiveRunSnapshot,
+    }
+  }
+
+  if (effectiveMeta && effectiveMeta.status !== "running") {
+    return {
+      binding: undefined,
+      parsedMeta: effectiveMeta,
+      runSnapshot: effectiveRunSnapshot,
+    }
+  }
+
+  if (effectiveRunSnapshot && isTerminalRunSnapshot(effectiveRunSnapshot)) {
+    return {
+      binding: undefined,
+      parsedMeta: null,
+      runSnapshot: effectiveRunSnapshot,
+    }
+  }
+
+  return {
+    binding,
+    parsedMeta: effectiveMeta,
+    runSnapshot: effectiveRunSnapshot,
+  }
+}
+
 /**
  * Pure field-level merge for a delegation card. See plan locked contracts:
  * live binding > live ToolUse meta > immutable run snapshot > synthetic
@@ -499,17 +564,18 @@ export function buildDelegationCardModel(input: {
     displayTaskId = null,
   } = input
 
-  // Cold reconstruction injects correlation metadata before the immutable run
-  // DTO is fetched. Once that DTO arrives it is the fresher durable lifecycle
-  // source; live broker metadata remains higher priority as before.
-  const effectiveMeta = effectiveDelegationMeta(parsedMeta, runSnapshot)
+  const {
+    binding: effectiveBinding,
+    parsedMeta: effectiveMeta,
+    runSnapshot: effectiveRunSnapshot,
+  } = effectiveDelegationSources(binding, parsedMeta, runSnapshot)
 
   // Known before projection merge so a later run on the same child cannot
   // overwrite this card's lifecycle/stats while the snapshot is still cold.
   const knownTaskId =
-    binding?.taskId ??
+    effectiveBinding?.taskId ??
     effectiveMeta?.taskId ??
-    runSnapshot?.task_id ??
+    effectiveRunSnapshot?.task_id ??
     displayTaskId ??
     null
   const uncorrelatedFailure = isUncorrelatedDelegationFailure(
@@ -523,9 +589,9 @@ export function buildDelegationCardModel(input: {
   )
 
   const lifecycleStatus = resolveLifecycleStatus({
-    binding,
+    binding: effectiveBinding,
     parsedMeta: effectiveMeta,
-    runSnapshot,
+    runSnapshot: effectiveRunSnapshot,
     childProjection: runScopedProjection,
     toolOutput,
     state,
@@ -533,10 +599,10 @@ export function buildDelegationCardModel(input: {
   })
 
   const status =
-    !binding && !effectiveMeta && runSnapshot
+    !effectiveBinding && !effectiveMeta && effectiveRunSnapshot
       ? cardStatusFromLifecycle(lifecycleStatus)
       : resolveDelegationStatus({
-          binding,
+          binding: effectiveBinding,
           parsedMeta: effectiveMeta,
           toolOutput,
           state,
@@ -547,68 +613,73 @@ export function buildDelegationCardModel(input: {
         })
 
   const runtimeStats = pickRuntimeStats(
-    binding,
+    effectiveBinding,
     effectiveMeta,
-    runSnapshot,
+    effectiveRunSnapshot,
     runScopedProjection
   )
   const attentionRequest = pickAttentionRequest(
-    binding,
+    effectiveBinding,
     effectiveMeta,
-    runSnapshot,
+    effectiveRunSnapshot,
     runScopedProjection
   )
   const startedAt = pickStartedAt(
-    binding,
+    effectiveBinding,
     effectiveMeta,
-    runSnapshot,
+    effectiveRunSnapshot,
     runScopedProjection,
     runtimeStats
   )
   const finishedAt = pickFinishedAt(
-    binding,
+    effectiveBinding,
     effectiveMeta,
-    runSnapshot,
+    effectiveRunSnapshot,
     runScopedProjection,
     runtimeStats,
     lifecycleStatus
   )
-  const completedDurationMs = pickCompletedDurationMs(binding, toolOutput)
+  const completedDurationMs = pickCompletedDurationMs(
+    effectiveBinding,
+    toolOutput
+  )
 
   const brokerTaskId =
-    binding?.taskId ??
+    effectiveBinding?.taskId ??
     effectiveMeta?.taskId ??
-    runSnapshot?.task_id ??
+    effectiveRunSnapshot?.task_id ??
     runScopedProjection?.taskId ??
     null
 
   const childConnectionId = uncorrelatedFailure
     ? null
-    : (binding?.childConnectionId ?? effectiveMeta?.childConnectionId ?? null)
+    : (effectiveBinding?.childConnectionId ??
+      effectiveMeta?.childConnectionId ??
+      null)
   // Child conversation identity is shared across runs; title/id may come from
   // the latest projection even when run-scoped fields are suppressed.
   const childConversationId = uncorrelatedFailure
     ? null
-    : (binding?.childConversationId ??
+    : (effectiveBinding?.childConversationId ??
       effectiveMeta?.childConversationId ??
-      runSnapshot?.child_conversation_id ??
+      effectiveRunSnapshot?.child_conversation_id ??
       toolOutput?.childConversationId ??
       scopedChildProjection?.childConversationId ??
       null)
 
   const agentType: AgentType | null =
-    binding?.agentType ??
+    effectiveBinding?.agentType ??
     parsedInput.agentType ??
-    agentTypeFromRunSnapshot(runSnapshot)
+    agentTypeFromRunSnapshot(effectiveRunSnapshot)
   // Cold recovery may only have summary error_code — fold projection last.
   // Correlation failures never mint a run snapshot; surface the wire code from
   // the parent tool outcome so the badge is not mislabeled as spawn/unresumable.
   const toolErrorCode =
     toolOutput?.kind === "outcome" ? toolOutput.errorCode : null
   const errorCode =
-    binding?.errorCode ??
+    effectiveBinding?.errorCode ??
     effectiveMeta?.errorCode ??
-    runSnapshot?.error_code ??
+    effectiveRunSnapshot?.error_code ??
     runScopedProjection?.errorCode ??
     toolErrorCode ??
     undefined
@@ -616,9 +687,9 @@ export function buildDelegationCardModel(input: {
   const conversationTitle = scopedChildProjection?.title ?? null
   const task =
     parsedInput.task ??
-    binding?.task ??
+    effectiveBinding?.task ??
     effectiveMeta?.task ??
-    runSnapshot?.task_preview ??
+    effectiveRunSnapshot?.task_preview ??
     null
   const displaySecondary = formatDelegationDisplaySecondary(
     conversationTitle,
@@ -651,7 +722,8 @@ export function buildDelegationCardModel(input: {
     task,
     taskId: displayTaskId ?? brokerTaskId,
     brokerTaskId,
-    generation: runSnapshot?.generation ?? parsedMeta?.generation ?? null,
+    generation:
+      effectiveRunSnapshot?.generation ?? effectiveMeta?.generation ?? null,
     status,
     lifecycleStatus,
     errorCode,
@@ -668,9 +740,12 @@ export function buildDelegationCardModel(input: {
     elapsedMs,
     toolCallCount,
     editRollup,
-    cardSummary: binding?.cardSummary ?? runSnapshot?.card_summary ?? null,
-    isReplacement: Boolean(runSnapshot?.replaced_task_id),
-    childTurnAnchor: runSnapshot?.child_turn_anchor ?? null,
+    cardSummary:
+      effectiveBinding?.cardSummary ??
+      effectiveRunSnapshot?.card_summary ??
+      null,
+    isReplacement: Boolean(effectiveRunSnapshot?.replaced_task_id),
+    childTurnAnchor: effectiveRunSnapshot?.child_turn_anchor ?? null,
     showGeneratingSegment: false,
     stickyKey: null,
   }
@@ -935,6 +1010,12 @@ export function useDelegationCardModel(
     parentConversationId,
     snapshotTaskId
   )
+  const hasEffectiveLiveBinding = useMemo(
+    () =>
+      effectiveDelegationSources(binding, parsedMeta, runSnapshot).binding !=
+      null,
+    [binding, parsedMeta, runSnapshot]
+  )
 
   const currentTaskId =
     binding?.taskId ??
@@ -1008,7 +1089,7 @@ export function useDelegationCardModel(
     sources: workUnitSources,
     stickyKey,
     nowMs: previewNowMs,
-    hasLiveBinding: binding != null,
+    hasLiveBinding: hasEffectiveLiveBinding,
     explicitUserCancel,
   })
   const tickerEligible = isTickerEligible(previewModel)
@@ -1051,7 +1132,7 @@ export function useDelegationCardModel(
         sources: workUnitSources,
         stickyKey,
         nowMs,
-        hasLiveBinding: binding != null,
+        hasLiveBinding: hasEffectiveLiveBinding,
         explicitUserCancel,
       })
     },
@@ -1071,6 +1152,7 @@ export function useDelegationCardModel(
       workUnitSources,
       stickyKey,
       explicitUserCancel,
+      hasEffectiveLiveBinding,
       tickerVersion,
     ]
   )
