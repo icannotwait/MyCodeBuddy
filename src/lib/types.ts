@@ -69,6 +69,16 @@ export interface DelegationActivityView {
   started_at?: string
   updated_at?: string
   finished_at?: string
+  /**
+   * Read-only display enrichment for native (and sparse Codeg activity) rows.
+   * Populated only from known tool input/output string fields — never invented.
+   */
+  summary?: string
+  /** Sub-agent role label (`subagent_type` / `agent_type`), when present. */
+  role?: string
+  model?: string
+  /** Source ACP tool call id; display/debug only, not a Broker handle. */
+  tool_call_id?: string
 }
 
 export type AppErrorCode =

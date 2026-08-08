@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "Redimensionner la largeur et la hauteur max. du panneau des sous-agents",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "Lancement",
+        "operationWait": "Attente",
+        "operationStatus": "État",
+        "operationCancel": "Annulation",
+        "operationUnknown": "Inconnu"
       },
       "workflowGraph": {
         "title": "Flux de travail",

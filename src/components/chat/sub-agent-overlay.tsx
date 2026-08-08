@@ -15,8 +15,9 @@
  * the child's full conversation in a main tab via `openDelegatedChildSession`
  * ("查看会话").
  *
- * Native rows are informational only (`authoritative=false`): origin label +
- * timestamps, no Broker cancel action, no open-session control unless
+ * Native rows are informational only (`authoritative=false`): platform, role,
+ * task summary, operation, elapsed, and timestamps when projected from tool
+ * input — no Broker cancel action, no open-session control unless
  * Codeg-backed.
  *
  * Defaults to expanded so historical sub-agents are visible without an extra
@@ -70,8 +71,15 @@ import {
 } from "@/lib/overlay-size-storage"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import { getAgentLabel } from "@/lib/custom-agents"
+import { formatElapsedLabel } from "@/lib/format-elapsed"
+import {
+  getRunningTickerVersion,
+  retainRunningTicker,
+  subscribeRunningTicker,
+} from "@/lib/delegation-running-ticker"
 import {
   type AgentType,
+  type DelegationActivityOperation,
   type DelegationActivityView,
   type WorkflowGraphSnapshot,
 } from "@/lib/types"
@@ -1108,6 +1116,55 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   )
 })
 
+type NativeOperationTranslator = (
+  key:
+    | "operationSpawn"
+    | "operationWait"
+    | "operationStatus"
+    | "operationCancel"
+    | "operationUnknown"
+) => string
+
+function nativeOperationLabel(
+  t: NativeOperationTranslator,
+  operation: DelegationActivityOperation
+): string {
+  switch (operation) {
+    case "spawn":
+      return t("operationSpawn")
+    case "wait":
+      return t("operationWait")
+    case "status":
+      return t("operationStatus")
+    case "cancel":
+      return t("operationCancel")
+    default:
+      return t("operationUnknown")
+  }
+}
+
+function computeNativeElapsedMs(
+  activity: DelegationActivityView,
+  nowMs: number
+): number | null {
+  if (!activity.started_at) return null
+  const start = Date.parse(activity.started_at)
+  if (Number.isNaN(start)) return null
+
+  let endMs: number | null = null
+  if (activity.finished_at) {
+    const finished = Date.parse(activity.finished_at)
+    if (!Number.isNaN(finished)) endMs = finished
+  } else if (activity.observed_status === "running") {
+    endMs = nowMs
+  } else if (activity.updated_at) {
+    const updated = Date.parse(activity.updated_at)
+    if (!Number.isNaN(updated)) endMs = updated
+  }
+  if (endMs == null) return null
+  return Math.max(0, endMs - start)
+}
+
 /**
  * Informational activity row (native always; Codeg when only activity views
  * are supplied). Never renders a cancel button — native has no Broker action;
@@ -1120,15 +1177,52 @@ const NativeActivityRow = memo(function NativeActivityRow({
 }) {
   const t = useTranslations("Folder.chat.subAgentOverlay")
   const tDel = useTranslations("Folder.chat.delegation")
+  const tLive = useTranslations("Folder.chat.liveTurnStats")
   const time =
     formatActivityTime(activity.updated_at) ??
     formatActivityTime(activity.started_at)
+
+  const tickerEligible = activity.observed_status === "running"
+  useEffect(() => {
+    if (!tickerEligible) return
+    return retainRunningTicker()
+  }, [tickerEligible])
+
+  const subscribeTicker = useCallback(
+    (cb: () => void) => {
+      if (!tickerEligible) return () => {}
+      return subscribeRunningTicker(cb)
+    },
+    [tickerEligible]
+  )
+  const tickerVersion = useSyncExternalStore(
+    subscribeTicker,
+    getRunningTickerVersion,
+    () => 0
+  )
+  const elapsedMs = useMemo(
+    () => computeNativeElapsedMs(activity, Date.now()),
+    // tickerVersion forces live recompute while running.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional
+    [activity, tickerVersion]
+  )
+
+  const platformLabel =
+    getAgentLabel(activity.platform) ?? tDel("unknownAgent")
+  const title = activity.summary
+    ? activity.role
+      ? `${activity.role}: ${activity.summary}`
+      : activity.summary
+    : activity.role
+      ? activity.role
+      : platformLabel
 
   return (
     <div
       data-testid="sub-agent-row"
       data-origin={activity.origin}
       data-authoritative={activity.authoritative ? "true" : "false"}
+      data-tool-call-id={activity.tool_call_id ?? undefined}
       className="flex w-full min-w-0 items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
     >
       <div className="min-w-0 flex-1 space-y-1">
@@ -1136,8 +1230,11 @@ const NativeActivityRow = memo(function NativeActivityRow({
           <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
             <AgentIcon agentType={activity.platform} className="h-3.5 w-3.5" />
           </span>
-          <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-            {getAgentLabel(activity.platform) ?? tDel("unknownAgent")}
+          <span
+            className="min-w-0 break-words text-xs font-semibold text-foreground"
+            title={title}
+          >
+            {title}
           </span>
           {activity.task_id && (
             <span
@@ -1151,10 +1248,28 @@ const NativeActivityRow = memo(function NativeActivityRow({
             status={observedToBadgeStatus(activity.observed_status)}
           />
         </div>
+        {(activity.summary || activity.role) && (
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+            <span className="break-words">{platformLabel}</span>
+            {activity.model && (
+              <span className="min-w-0 break-all" title={activity.model}>
+                {activity.model}
+              </span>
+            )}
+          </div>
+        )}
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
           <span className="break-words">
-            {t("operation", { op: activity.operation })}
+            {nativeOperationLabel(t, activity.operation)}
           </span>
+          {elapsedMs != null && (
+            <span
+              className="shrink-0 tabular-nums"
+              data-testid="sub-agent-native-elapsed"
+            >
+              {formatElapsedLabel(elapsedMs, tLive)}
+            </span>
+          )}
           {time && (
             <span
               className="shrink-0 tabular-nums"

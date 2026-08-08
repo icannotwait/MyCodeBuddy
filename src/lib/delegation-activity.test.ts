@@ -90,6 +90,75 @@ describe("projectNativeDelegationActivity", () => {
     expect(native).not.toHaveProperty("brokerTaskId")
   })
 
+  it("extracts summary, role, model, and tool_call_id for native display", () => {
+    const view = projectNativeDelegationActivity({
+      platform: "grok",
+      toolName: "spawn_subagent",
+      toolCallId: "call-display-1",
+      input: JSON.stringify({
+        description: "Audit LOD cold path",
+        subagent_type: "explore",
+        model: "grok-build",
+        prompt: "long body that should not win over description",
+      }),
+      output: JSON.stringify({ agentId: "ag-display-1" }),
+      at: "2026-07-16T10:00:00Z",
+    })
+    expect(view).toMatchObject({
+      origin: "native",
+      authoritative: false,
+      task_id: "ag-display-1",
+      summary: "Audit LOD cold path",
+      role: "explore",
+      model: "grok-build",
+      tool_call_id: "call-display-1",
+    })
+  })
+
+  it("prefers Codex agent_type and message when description is absent", () => {
+    const view = projectNativeDelegationActivity(nativeSpawnSignal())
+    expect(view).toMatchObject({
+      role: "worker",
+      summary: "do work",
+      tool_call_id: "call-1",
+      task_id: "agent-abc",
+    })
+  })
+
+  it("preserves display fields across wait merges", () => {
+    const spawn = projectNativeDelegationActivity({
+      platform: "claude_code",
+      toolName: "Agent",
+      toolCallId: "call-spawn",
+      input: JSON.stringify({
+        subagent_type: "Explore",
+        description: "map the repo",
+      }),
+      output: JSON.stringify({ task_id: "task-keep" }),
+      toolCallStatus: "completed",
+      at: "2026-07-16T10:00:00Z",
+    })
+    const wait = projectNativeDelegationActivity(
+      {
+        platform: "claude_code",
+        toolName: "TaskOutput",
+        toolCallId: "call-wait",
+        input: JSON.stringify({ task_id: "task-keep" }),
+        output: JSON.stringify({ status: "completed" }),
+        at: "2026-07-16T10:01:00Z",
+      },
+      spawn
+    )
+    expect(wait).toMatchObject({
+      task_id: "task-keep",
+      operation: "wait",
+      observed_status: "completed",
+      summary: "map the repo",
+      role: "Explore",
+      tool_call_id: "call-spawn",
+    })
+  })
+
   it("extracts documented agent_id / task_id fields only", () => {
     const withAgentId = projectNativeDelegationActivity({
       platform: "codex",

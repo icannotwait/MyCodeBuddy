@@ -230,6 +230,126 @@ function extractDocumentedId(
   return undefined
 }
 
+/** Collapse whitespace and cap length for overlay one-line/two-line display. */
+function normalizeDisplayText(
+  raw: string,
+  maxLen = 160
+): string | undefined {
+  const collapsed = raw.replace(/\s+/g, " ").trim()
+  if (!collapsed) return undefined
+  if (collapsed.length <= maxLen) return collapsed
+  return `${collapsed.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/**
+ * Task summary for native overlay rows. Prefers short labels (description)
+ * over long prompts; never fabricates text from unknown keys.
+ */
+function extractDisplaySummary(
+  ...sources: Array<Record<string, unknown> | null>
+): string | undefined {
+  const preferredKeys = [
+    "description",
+    "title",
+    "task",
+    "prompt",
+    "message",
+    "summary",
+  ] as const
+  for (const obj of sources) {
+    if (!obj) continue
+    for (const key of preferredKeys) {
+      const text = asNonEmptyString(obj[key])
+      if (!text) continue
+      // Prefer first line of multi-line prompts for the compact row.
+      const firstLine = text.split(/\r?\n/, 1)[0] ?? text
+      const normalized = normalizeDisplayText(firstLine)
+      if (normalized) return normalized
+    }
+  }
+  return undefined
+}
+
+/**
+ * Role / type label: subagent_type (Claude/Grok/CodeBuddy) or agent_type (Codex).
+ */
+function extractDisplayRole(
+  ...sources: Array<Record<string, unknown> | null>
+): string | undefined {
+  for (const obj of sources) {
+    if (!obj) continue
+    for (const key of [
+      "subagent_type",
+      "subagentType",
+      "agent_type",
+      "agentType",
+    ] as const) {
+      const text = asNonEmptyString(obj[key])
+      if (text) return normalizeDisplayText(text, 64)
+    }
+  }
+  return undefined
+}
+
+function extractDisplayModel(
+  ...sources: Array<Record<string, unknown> | null>
+): string | undefined {
+  for (const obj of sources) {
+    if (!obj) continue
+    for (const key of ["model", "model_id", "modelId"] as const) {
+      const text = asNonEmptyString(obj[key])
+      if (text) return normalizeDisplayText(text, 80)
+    }
+  }
+  return undefined
+}
+
+function withDisplayEnrichment(
+  view: DelegationActivityView,
+  fields: {
+    summary?: string
+    role?: string
+    model?: string
+    tool_call_id?: string
+  }
+): DelegationActivityView {
+  return {
+    ...view,
+    ...(fields.summary ? { summary: fields.summary } : {}),
+    ...(fields.role ? { role: fields.role } : {}),
+    ...(fields.model ? { model: fields.model } : {}),
+    ...(fields.tool_call_id ? { tool_call_id: fields.tool_call_id } : {}),
+  }
+}
+
+function mergeDisplayFields(
+  view: DelegationActivityView,
+  previous: DelegationActivityView
+): Pick<
+  DelegationActivityView,
+  "summary" | "role" | "model" | "tool_call_id"
+> {
+  // Prefer the earliest spawn tool_call_id so later wait/status frames still
+  // point at the launch card in the parent transcript.
+  const tool_call_id = previous.tool_call_id ?? view.tool_call_id
+  return {
+    ...(view.summary ?? previous.summary
+      ? { summary: view.summary ?? previous.summary }
+      : {}),
+    ...(view.role ?? previous.role ? { role: view.role ?? previous.role } : {}),
+    ...(view.model ?? previous.model
+      ? { model: view.model ?? previous.model }
+      : {}),
+    ...(tool_call_id ? { tool_call_id } : {}),
+  }
+}
+
 function isWaitTimeout(
   input: Record<string, unknown> | null,
   output: Record<string, unknown> | null
@@ -357,6 +477,7 @@ function mergeWithPrevious(
     started_at,
     updated_at,
     ...(finished_at ? { finished_at } : {}),
+    ...mergeDisplayFields(view, previous),
   }
 }
 
@@ -370,6 +491,13 @@ function projectToolCallSignal(
   const inputObj = parseObject(signal.input)
   const outputObj = parseObject(signal.output)
   const task_id = extractDocumentedId(outputObj, inputObj)
+  const summary = extractDisplaySummary(inputObj, outputObj)
+  const role = extractDisplayRole(inputObj, outputObj)
+  const model = extractDisplayModel(inputObj, outputObj)
+  const tool_call_id =
+    typeof signal.toolCallId === "string" && signal.toolCallId.trim().length > 0
+      ? signal.toolCallId.trim()
+      : undefined
 
   let observed_status: DelegationObservedStatus = "unknown"
 
@@ -404,17 +532,20 @@ function projectToolCallSignal(
   // (explicit platform body status may still be failed above.)
 
   const at = signal.at
-  const view: DelegationActivityView = {
-    origin: "native",
-    authoritative: false,
-    platform: signal.platform,
-    ...(task_id ? { task_id } : {}),
-    operation,
-    observed_status,
-    started_at: at,
-    updated_at: at,
-    ...(isTerminal(observed_status) ? { finished_at: at } : {}),
-  }
+  const view = withDisplayEnrichment(
+    {
+      origin: "native",
+      authoritative: false,
+      platform: signal.platform,
+      ...(task_id ? { task_id } : {}),
+      operation,
+      observed_status,
+      started_at: at,
+      updated_at: at,
+      ...(isTerminal(observed_status) ? { finished_at: at } : {}),
+    },
+    { summary, role, model, tool_call_id }
+  )
 
   return mergeWithPrevious(view, previous)
 }
@@ -729,6 +860,7 @@ export function mergeActivityViews(
             : undefined,
           operation:
             view.operation !== "unknown" ? view.operation : prev.operation,
+          ...mergeDisplayFields(view, prev),
         }
       }
     } else {
@@ -768,13 +900,23 @@ export function dedupeDelegationActivities(
     }
     // Prefer authoritative; else prefer more recent updated_at.
     if (view.authoritative && !existing.authoritative) {
-      byKey.set(key, view)
+      byKey.set(key, {
+        ...view,
+        started_at: existing.started_at ?? view.started_at,
+        ...mergeDisplayFields(view, existing),
+      })
       return
     }
     if (existing.authoritative && !view.authoritative) return
     const a = Date.parse(view.updated_at ?? view.started_at ?? "") || 0
     const b = Date.parse(existing.updated_at ?? existing.started_at ?? "") || 0
-    if (a >= b) byKey.set(key, view)
+    if (a >= b) {
+      byKey.set(key, {
+        ...view,
+        started_at: existing.started_at ?? view.started_at,
+        ...mergeDisplayFields(view, existing),
+      })
+    }
   }
 
   for (const v of primary) consider(v)

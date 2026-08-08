@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "서브 에이전트 패널 너비와 최대 높이 조절",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "시작",
+        "operationWait": "대기",
+        "operationStatus": "상태",
+        "operationCancel": "취소",
+        "operationUnknown": "알 수 없음"
       },
       "workflowGraph": {
         "title": "워크플로",

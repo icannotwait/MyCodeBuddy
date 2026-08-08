@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "Breite und maximale Höhe des Subagenten-Panels ändern",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "Start",
+        "operationWait": "Warten",
+        "operationStatus": "Status",
+        "operationCancel": "Abbruch",
+        "operationUnknown": "Unbekannt"
       },
       "workflowGraph": {
         "title": "Workflow",

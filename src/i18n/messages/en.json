@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "Resize sub-agents panel width and max height",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "Spawn",
+        "operationWait": "Wait",
+        "operationStatus": "Status",
+        "operationCancel": "Cancel",
+        "operationUnknown": "Unknown"
       },
       "workflowGraph": {
         "title": "Workflow",

@@ -790,6 +790,43 @@ describe("SubAgentOverlay", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
   })
 
+  it("renders native role, summary, model, elapsed, and localized operation", () => {
+    const native: import("@/lib/types").DelegationActivityView = {
+      origin: "native",
+      authoritative: false,
+      platform: "grok",
+      operation: "spawn",
+      observed_status: "completed",
+      task_id: "agent-native-rich",
+      summary: "Audit LOD cold path",
+      role: "explore",
+      model: "grok-build",
+      tool_call_id: "call-rich-1",
+      started_at: "2026-07-16T10:00:00Z",
+      updated_at: "2026-07-16T10:00:45Z",
+      finished_at: "2026-07-16T10:00:45Z",
+    }
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[native]}
+        overlayKey="k-native-rich"
+        defaultExpanded
+      />
+    )
+    const row = screen.getByTestId("sub-agent-row")
+    expect(row).toHaveAttribute("data-tool-call-id", "call-rich-1")
+    expect(screen.getByText("explore: Audit LOD cold path")).toBeInTheDocument()
+    expect(screen.getByText("grok-build")).toBeInTheDocument()
+    expect(screen.getByText("Spawn")).toBeInTheDocument()
+    expect(screen.getByTestId("sub-agent-native-elapsed")).toHaveTextContent(
+      /45s|0m 45s|45/
+    )
+    expect(
+      screen.queryByRole("button", { name: /cancel/i })
+    ).not.toBeInTheDocument()
+  })
+
   it("groups Codeg and native activity with origin labels", () => {
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Codeg child work" }),

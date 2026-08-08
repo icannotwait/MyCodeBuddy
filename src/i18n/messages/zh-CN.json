@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "调整子智能体面板宽度与最大高度",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "启动",
+        "operationWait": "等待",
+        "operationStatus": "状态",
+        "operationCancel": "取消",
+        "operationUnknown": "未知"
       },
       "workflowGraph": {
         "title": "工作流",

@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "サブエージェントパネルの幅と最大高さを変更",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "起動",
+        "operationWait": "待機",
+        "operationStatus": "状態",
+        "operationCancel": "取消",
+        "operationUnknown": "不明"
       },
       "workflowGraph": {
         "title": "ワークフロー",

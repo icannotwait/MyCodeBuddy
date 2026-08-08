@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "تغيير عرض وأقصى ارتفاع للوحة الوكلاء الفرعيين",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "تشغيل",
+        "operationWait": "انتظار",
+        "operationStatus": "حالة",
+        "operationCancel": "إلغاء",
+        "operationUnknown": "غير معروف"
       },
       "workflowGraph": {
         "title": "سير العمل",

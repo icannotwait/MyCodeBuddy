@@ -2683,7 +2683,12 @@
         "resizeCornerAria": "Cambiar el ancho y la altura máxima del panel de subagentes",
         "originCodeg": "Codeg",
         "originNative": "Native",
-        "operation": "{op}"
+        "operation": "{op}",
+        "operationSpawn": "Inicio",
+        "operationWait": "Espera",
+        "operationStatus": "Estado",
+        "operationCancel": "Cancelar",
+        "operationUnknown": "Desconocido"
       },
       "workflowGraph": {
         "title": "Flujo de trabajo",
