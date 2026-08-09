@@ -11,9 +11,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
-import { getWorkflowGraphSnapshot, restartLegacyWorkflow } from "@/lib/api"
+import { getWorkflowGraphSnapshot, resolveCompletionDecision } from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
-import type { WorkflowGraphSnapshot, WorkflowNodeSnapshot } from "@/lib/types"
+import type {
+  CompletionProjectionV2,
+  WorkflowGraphSnapshot,
+  WorkflowNodeSnapshot,
+} from "@/lib/types"
 import {
   __resetWorkflowGraphStoreForTests,
   useWorkflowGraphStore,
@@ -52,7 +56,7 @@ vi.mock("@/lib/api", async () => {
   return {
     ...actual,
     getWorkflowGraphSnapshot: vi.fn(async () => null),
-    restartLegacyWorkflow: vi.fn(),
+    resolveCompletionDecision: vi.fn(),
     subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
     subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
   }
@@ -370,12 +374,41 @@ function renderWithIntl(ui: React.ReactElement) {
   )
 }
 
+const completionCas = {
+  attention_id: "attention-task-9",
+  task_id: "task-9",
+  kind: "completion_decision" as const,
+  captured_scope_digest: `sha256:${"a".repeat(64)}`,
+  latest_run_id: "task-9",
+  node_id: "task-implementer",
+}
+
+function completionProjection(
+  overrides: Partial<CompletionProjectionV2> = {}
+): CompletionProjectionV2 {
+  return {
+    protocol_version: 2,
+    graph_revision: 1,
+    card: {
+      state: "needs_decision",
+      role: "implementer",
+      outcome: null,
+      summary: "Choose the implementation outcome.",
+      report_file: null,
+      source: null,
+      evidence_validated: false,
+      attention: completionCas,
+    },
+    ...overrides,
+  }
+}
+
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   vi.mocked(openDelegatedChildSession).mockClear()
   vi.mocked(getWorkflowGraphSnapshot).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
-  vi.mocked(restartLegacyWorkflow).mockReset()
+  vi.mocked(resolveCompletionDecision).mockReset()
 })
 
 afterEach(() => {
@@ -383,16 +416,26 @@ afterEach(() => {
 })
 
 describe("SubAgentOverlay A13 workflow mount", () => {
-  it("renders legacy backlinks and resumes only through durable root controls", async () => {
-    const calls: string[] = []
-    const onOpenRootConversation = vi.fn(async (conversationId: number) => {
-      calls.push(`open:${conversationId}`)
-    })
-    const onResumeRoot = vi.fn(async () => {
-      calls.push("resume")
+  it("renders legacy history as strictly read-only", async () => {
+    const onOpenRootConversation = vi.fn()
+    const onResumeRoot = vi.fn()
+    const graph = skeletonGraph()
+    const recovery = completionProjection({
+      card: {
+        ...completionProjection().card,
+        state: "blocked",
+        attention: {
+          ...completionCas,
+          kind: "completion_artifact_recovery",
+        },
+      },
     })
     const legacy = {
-      ...skeletonGraph(),
+      ...graph,
+      completion: completionProjection(),
+      nodes: graph.nodes.map((item, index) =>
+        index === 0 ? { ...item, completion: recovery } : item
+      ),
       completion_protocol: {
         version: 1,
         mode: "v1" as const,
@@ -408,36 +451,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         read_only_reason: "legacy_completion_protocol_restart_required",
         automatic_root_wake: false,
       },
-    }
-    vi.mocked(restartLegacyWorkflow).mockResolvedValue({
-      source_workflow_id: "wf-test",
-      source_conversation_id: 42,
-      successor_workflow_id: "wf-successor",
-      successor_conversation_id: 99,
-      open_gate: "design",
-      completion_protocol: {
-        ...legacy.completion_protocol,
-        version: 2,
-        mode: "v2_enforce",
-        creation_mode: "v2_enforce",
-        legacy_source: { workflow_id: "wf-test", conversation_id: 42 },
-        v2_successor: null,
-        read_only_reason: null,
-      },
-      restart_context: {
-        original_conversation_id: 42,
-        original_request_id: "request-1",
-        original_request_text: "Build the workflow",
-        original_request_digest: `sha256:${"d".repeat(64)}`,
-        agent_type: "codex",
-        profile_id: null,
-      },
-      idempotent_replay: false,
-    })
-    vi.mocked(getWorkflowGraphSnapshot).mockImplementation(async () => {
-      calls.push("refresh")
-      return legacy
-    })
+    } satisfies WorkflowGraphSnapshot
 
     renderWithIntl(
       <SubAgentOverlay
@@ -464,28 +478,28 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(onOpenRootConversation).toHaveBeenNthCalledWith(1, 41)
     expect(onOpenRootConversation).toHaveBeenNthCalledWith(2, 99)
     expect(openDelegatedChildSession).not.toHaveBeenCalled()
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "Restart with completion v2" })
-    )
-    expect(restartLegacyWorkflow).toHaveBeenCalledWith({
-      source_conversation_id: 42,
-    })
-
-    calls.length = 0
-    await userEvent.click(
-      screen.getByRole("button", { name: "Resume root orchestration" })
-    )
-    await waitFor(() => expect(onResumeRoot).toHaveBeenCalledTimes(1))
-    expect(getWorkflowGraphSnapshot).toHaveBeenLastCalledWith(42)
-    expect(calls).toEqual(["refresh", "resume"])
-    expect(openDelegatedChildSession).not.toHaveBeenCalled()
+    expect(
+      screen.queryByText("Restart with completion v2")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Resume root orchestration")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Done" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Retry artifact" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryAllByTestId("completion-decision-card")).toHaveLength(0)
+    expect(onResumeRoot).not.toHaveBeenCalled()
+    expect(resolveCompletionDecision).not.toHaveBeenCalled()
   })
 
-  it("does not resume after the durable snapshot enables automatic root wake", async () => {
-    const onResumeRoot = vi.fn()
-    const manual = {
+  it("keeps valid v2 completion decisions and automatic wake status", async () => {
+    const completion = completionProjection()
+    const snapshot = {
       ...skeletonGraph(),
+      completion,
       completion_protocol: {
         version: 2,
         mode: "v2_enforce" as const,
@@ -493,87 +507,55 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         legacy_source: null,
         v2_successor: null,
         read_only_reason: null,
-        automatic_root_wake: false,
-      },
-    }
-    const automatic = {
-      ...manual,
-      graph_revision: 2,
-      completion_protocol: {
-        ...manual.completion_protocol,
         automatic_root_wake: true,
       },
-    }
-    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(manual)
-
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        activities={[]}
-        conversationId={42}
-        workflowGraph={manual}
-        defaultExpanded
-        onResumeRoot={onResumeRoot}
-      />
-    )
-    await userEvent.click(
-      screen.getByRole("button", { name: "Expand workflow graph" })
-    )
-    const resume = screen.getByRole("button", {
-      name: "Resume root orchestration",
-    })
-    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(automatic)
-    await userEvent.click(resume)
-
-    await waitFor(() =>
-      expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
-    )
-    expect(onResumeRoot).not.toHaveBeenCalled()
-  })
-
-  it("does not resume when the durable snapshot omits completion protocol", async () => {
-    const onResumeRoot = vi.fn()
-    const manual = {
-      ...skeletonGraph(),
-      completion_protocol: {
-        version: 2,
-        mode: "v2_enforce" as const,
-        creation_mode: "v2_enforce" as const,
-        legacy_source: null,
-        v2_successor: null,
-        read_only_reason: null,
-        automatic_root_wake: false,
-      },
-    }
-    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(manual)
-
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        activities={[]}
-        conversationId={42}
-        workflowGraph={manual}
-        defaultExpanded
-        onResumeRoot={onResumeRoot}
-      />
-    )
-    await userEvent.click(
-      screen.getByRole("button", { name: "Expand workflow graph" })
-    )
-    const resume = screen.getByRole("button", {
-      name: "Resume root orchestration",
-    })
-    vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue({
-      ...manual,
+    } satisfies WorkflowGraphSnapshot
+    vi.mocked(resolveCompletionDecision).mockResolvedValue({
+      workflow_id: "wf-test",
+      task_id: completionCas.task_id,
+      node_id: completionCas.node_id,
+      kind: completionCas.kind,
+      outcome: "done",
+      evidence_scope_digest: `sha256:${"b".repeat(64)}`,
       graph_revision: 2,
-      completion_protocol: null,
+      idempotent_replay: false,
+      completion: completionProjection({
+        graph_revision: 2,
+        card: {
+          ...completion.card,
+          state: "resolved",
+          outcome: "done",
+          evidence_validated: true,
+          attention: null,
+        },
+      }),
     })
-    await userEvent.click(resume)
 
-    await waitFor(() =>
-      expect(getWorkflowGraphSnapshot).toHaveBeenCalledWith(42)
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={snapshot}
+        defaultExpanded
+      />
     )
-    expect(onResumeRoot).not.toHaveBeenCalled()
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    )
+    expect(
+      screen.getByText("Root orchestration resumed automatically")
+    ).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Done" }))
+
+    expect(resolveCompletionDecision).toHaveBeenCalledWith({
+      cas: completionCas,
+      outcome: "done",
+    })
+    expect(await screen.findByText("Resolved")).toBeInTheDocument()
+    expect(
+      screen.queryByText("Resume root orchestration")
+    ).not.toBeInTheDocument()
   })
 
   it("first-seeds a graphless open overlay without expanding the full graph", async () => {

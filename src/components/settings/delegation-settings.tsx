@@ -32,8 +32,6 @@ import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   type DelegationSettings,
-  type CompletionProtocolSettingsSnapshot,
-  getCompletionProtocolSettings,
   getDelegationSettings,
   getDelegationProfileCatalog,
   setDelegationBundle,
@@ -87,8 +85,6 @@ export function DelegationSettingsSection() {
   >({})
   const [profiles, setProfiles] = useState<DelegationProfile[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [completionProtocol, setCompletionProtocol] =
-    useState<CompletionProtocolSettingsSnapshot | null>(null)
 
   const applySettings = useCallback((s: DelegationSettings) => {
     setEnabled(s.enabled)
@@ -101,16 +97,11 @@ export function DelegationSettingsSection() {
 
   useEffect(() => {
     let cancelled = false
-    void Promise.all([
-      getDelegationSettings(),
-      getDelegationProfileCatalog(),
-      getCompletionProtocolSettings(),
-    ])
-      .then(([s, catalog, protocol]) => {
+    void Promise.all([getDelegationSettings(), getDelegationProfileCatalog()])
+      .then(([s, catalog]) => {
         if (cancelled) return
         applySettings(s)
         setProfiles(catalog.profiles)
-        setCompletionProtocol(protocol)
         setLoadError(null)
       })
       .catch((err: unknown) => {
@@ -190,10 +181,6 @@ export function DelegationSettingsSection() {
       <p className="text-xs text-muted-foreground leading-5">
         {t("description")}
       </p>
-
-      {completionProtocol && (
-        <CompletionProtocolStatus snapshot={completionProtocol} />
-      )}
 
       {loadError && (
         <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -356,78 +343,4 @@ export function DelegationSettingsSection() {
       </div>
     </section>
   )
-}
-
-function CompletionProtocolStatus({
-  snapshot,
-}: {
-  snapshot: CompletionProtocolSettingsSnapshot
-}) {
-  const t = useTranslations("AcpAgentSettings.multiAgent")
-  const windows = Object.entries(snapshot.rollout_windows)
-
-  return (
-    <div
-      className="space-y-1 border-y py-2 text-xs"
-      data-testid="completion-protocol-status"
-    >
-      <div className="flex flex-wrap gap-x-4 gap-y-1">
-        <span>
-          {t("completionDefaultMode")}:{" "}
-          <span>{formatProtocolMode(snapshot.default_mode)}</span>
-        </span>
-      </div>
-      {Object.entries(snapshot.creation_modes).map(([mode, count]) => (
-        <p key={mode} className="text-muted-foreground">
-          {t("completionCreations", {
-            mode: formatProtocolMode(mode),
-            count,
-          })}
-        </p>
-      ))}
-      {Object.entries(snapshot.profile_overrides).map(([key, mode]) => (
-        <p key={key} className="text-muted-foreground">
-          {t("completionOverride", {
-            profile: key,
-            mode: formatProtocolMode(mode),
-          })}
-        </p>
-      ))}
-      {windows.map(([profile, window]) => {
-        const decision = snapshot.rollout_decisions[profile]
-        return (
-          <div key={profile} className="flex flex-wrap gap-x-4 gap-y-1">
-            <span className="text-muted-foreground">{profile}</span>
-            <span>{t("completionSamples", { count: window.samples })}</span>
-            <span>
-              {t("completionMinimumProgress", {
-                count: Math.min(window.samples, snapshot.minimum_samples),
-                minimum: snapshot.minimum_samples,
-              })}
-            </span>
-            {decision && (
-              <span
-                className={
-                  decision.startsWith("stop_")
-                    ? "font-medium text-destructive"
-                    : "text-muted-foreground"
-                }
-              >
-                {t(`completionRolloutDecision.${decision}`)}
-              </span>
-            )}
-          </div>
-        )
-      })}
-      {Object.entries(snapshot.shadow_differences).map(([kind, count]) => (
-        <p key={kind} className="text-muted-foreground">
-          {t("completionShadowDifference", { kind, count })}
-        </p>
-      ))}
-    </div>
-  )
-}
-
-function formatProtocolMode(mode: string): string {
-  return mode.replace(/_/g, " ")
 }

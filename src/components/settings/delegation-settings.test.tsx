@@ -7,7 +7,6 @@ vi.mock("@/lib/api", () => ({
   getDelegationSettings: vi.fn(),
   setDelegationSettings: vi.fn(),
   getDelegationProfileCatalog: vi.fn(),
-  getCompletionProtocolSettings: vi.fn(),
   setDelegationProfiles: vi.fn(),
   setDelegationBundle: vi.fn(),
   describeAgentOptions: vi.fn(),
@@ -26,16 +25,12 @@ import {
   getDelegationSettings,
   setDelegationBundle,
   getDelegationProfileCatalog,
-  getCompletionProtocolSettings,
   type DelegationSettings,
 } from "@/lib/api"
 
 const mockGetDelegationSettings = vi.mocked(getDelegationSettings)
 const mockSetDelegationBundle = vi.mocked(setDelegationBundle)
 const mockGetDelegationProfileCatalog = vi.mocked(getDelegationProfileCatalog)
-const mockGetCompletionProtocolSettings = vi.mocked(
-  getCompletionProtocolSettings
-)
 const mockToastError = vi.mocked(toast.error)
 
 function renderWithIntl() {
@@ -75,59 +70,20 @@ beforeEach(() => {
     delegation_enabled: false,
     revision: 0,
   })
-  mockGetCompletionProtocolSettings.mockReset().mockResolvedValue({
-    default_mode: "v1",
-    profile_overrides: {},
-    minimum_samples: 100,
-    creation_modes: {},
-    shadow_differences: {},
-    rollout_windows: {},
-    rollout_decisions: {},
-  })
   mockToastError.mockReset()
 })
 
 describe("DelegationSettingsSection", () => {
-  it("shows the frozen creation mode and strict rollout stop reason", async () => {
+  it("loads only delegation settings and the profile catalog", async () => {
     mockGetDelegationSettings.mockResolvedValue(settings())
-    mockGetCompletionProtocolSettings.mockResolvedValue({
-      default_mode: "v2_shadow",
-      profile_overrides: { "codex|reviewer": "v2_enforce" },
-      minimum_samples: 100,
-      creation_modes: { v2_shadow: 100, v2_enforce: 7 },
-      shadow_differences: { role_mismatch: 2, needs_decision: 3 },
-      rollout_windows: {
-        "codex|reviewer": {
-          samples: 100,
-          role_mismatch: 2,
-          needs_decision: 0,
-        },
-        "claude|author": {
-          samples: 40,
-          role_mismatch: 0,
-          needs_decision: 3,
-        },
-      },
-      rollout_decisions: {
-        "codex|reviewer": "stop_role_mismatch",
-        "claude|author": "stop_needs_decision",
-      },
-    })
 
     renderWithIntl()
 
-    expect(await screen.findByText("v2 shadow")).toBeInTheDocument()
     expect(
-      screen.getByText("Rollout paused: role mismatch above 1%")
+      await screen.findByLabelText("Maximum delegation depth")
     ).toBeInTheDocument()
-    expect(screen.getByText("100 terminal samples")).toBeInTheDocument()
-    expect(screen.getByText("40 terminal samples")).toBeInTheDocument()
-    expect(screen.queryByText("140 terminal samples")).not.toBeInTheDocument()
-    expect(screen.getByText("v2 shadow: 100 creations")).toBeInTheDocument()
-    expect(screen.getByText("v2 enforce: 7 creations")).toBeInTheDocument()
-    expect(
-      screen.getByText("Rollout paused: decisions required above 5%")
-    ).toBeInTheDocument()
+    expect(mockGetDelegationSettings).toHaveBeenCalledTimes(1)
+    expect(mockGetDelegationProfileCatalog).toHaveBeenCalledTimes(1)
   })
 
   it("renders the enable switch and depth input", async () => {

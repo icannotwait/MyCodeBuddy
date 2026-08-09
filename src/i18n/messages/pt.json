@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog suave (segundos)",
-      "softWatchdogHint": "Limite de inatividade somente observacao ({min}–{max}). 0 desativa a marcacao de parada. Nao cancela nem altera a rota.",
-      "completionDefaultMode": "Modo de criação de conclusões",
-      "completionCreations": "{mode}: {count} criações",
-      "completionSamples": "{count} amostras terminais",
-      "completionMinimumProgress": "{count} / {minimum} amostras mínimas",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "A implantação aguarda o número mínimo de amostras",
-        "may_expand": "A implantação pode ser ampliada",
-        "stop_role_mismatch": "Implantação pausada: divergência de função acima de 1%",
-        "stop_needs_decision": "Implantação pausada: decisões necessárias acima de 5%"
-      }
+      "softWatchdogHint": "Limite de inatividade somente observacao ({min}–{max}). 0 desativa a marcacao de parada. Nao cancela nem altera a rota."
     },
     "actions": {
       "dragSort": "Arraste para reordenar",
@@ -2790,11 +2778,9 @@
         "completionStale": "Esta decisão está desatualizada. Recarregue o fluxo de trabalho.",
         "completionConflict": "Um resultado diferente já foi confirmado.",
         "completionLegacyReadOnly": "O fluxo de trabalho legado é somente leitura",
-        "completionLegacyRestart": "Reiniciar com o protocolo de conclusão v2",
         "completionLegacySource": "Fluxo de origem legado nº {conversation}",
         "completionLegacySuccessor": "Fluxo sucessor nº {conversation}",
         "completionAutomaticWake": "A orquestração raiz foi retomada automaticamente",
-        "completionManualRootResume": "Retomar a orquestração raiz",
         "completionOutcome": {
           "approve": "Aprovar",
           "approve_with_minors": "Aprovar com ajustes menores",

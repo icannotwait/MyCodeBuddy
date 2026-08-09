@@ -61,7 +61,6 @@ const COMPLETION_MUTATION_COMMANDS = new Set([
   "resolve_completion_decision",
   "retry_completion_artifact",
   "resolve_design_self_review",
-  "restart_legacy_workflow",
 ])
 
 const SNAPSHOT_COMMAND = "get_workflow_graph_snapshot"
@@ -112,7 +111,6 @@ export class WebTransport implements Transport {
   // Root-scoped completion capabilities issued by
   // `get_workflow_graph_snapshot`. Mutations must replay the matching root
   // token; bearer-only maps to GlobalOperator and is rejected server-side.
-  private completionContextByRoot = new Map<number, string>()
   private completionContextByAttention = new Map<string, string>()
 
   constructor(baseUrl: string) {
@@ -237,27 +235,19 @@ export class WebTransport implements Transport {
       throw error
     }
     const body = (await res.json()) as T
-    this.captureCompletionContext(command, args, res, body)
+    this.captureCompletionContext(command, res, body)
     return body
   }
 
   /**
-   * Resolve the root-scoped capability for a completion mutation. CAS-based
-   * mutations look up the attention_id indexed from the last snapshot for
-   * that root; legacy restart uses sourceConversationId.
+   * Resolve the root-scoped capability for a completion mutation using the
+   * attention_id indexed from the last snapshot for that root.
    */
   private completionContextForCall(
     command: string,
     args?: Record<string, unknown>
   ): string | undefined {
     if (!COMPLETION_MUTATION_COMMANDS.has(command)) {
-      return undefined
-    }
-    if (command === "restart_legacy_workflow") {
-      const sourceConversationId = args?.sourceConversationId
-      if (typeof sourceConversationId === "number") {
-        return this.completionContextByRoot.get(sourceConversationId)
-      }
       return undefined
     }
     const cas = args?.cas
@@ -272,11 +262,10 @@ export class WebTransport implements Transport {
 
   /**
    * Capture `x-codeg-completion-context` from snapshot responses and index
-   * it by root conversation id and every attention_id projected in the body.
+   * it by every attention_id projected in the body.
    */
   private captureCompletionContext(
     command: string,
-    args: Record<string, unknown> | undefined,
     res: Response,
     body: unknown
   ): void {
@@ -286,10 +275,6 @@ export class WebTransport implements Transport {
     const context = res.headers.get(COMPLETION_CONTEXT_HEADER)
     if (!context) {
       return
-    }
-    const conversationId = args?.conversationId
-    if (typeof conversationId === "number") {
-      this.completionContextByRoot.set(conversationId, context)
     }
     this.indexAttentionsFromSnapshot(body, context)
   }
@@ -695,7 +680,6 @@ export class WebTransport implements Transport {
     this.reconnectCallbacks.clear()
     this.wsReadyCallbacks.clear()
     this.connListeners.clear()
-    this.completionContextByRoot.clear()
     this.completionContextByAttention.clear()
     this.eventStreamInstance?.destroy()
     this.eventStreamInstance = null

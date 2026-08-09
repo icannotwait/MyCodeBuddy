@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "軟看門狗（秒）",
-      "softWatchdogHint": "僅觀察的停滯閾值（{min}–{max}）。0 表示關閉停滯標記。不會取消或切換路由。",
-      "completionDefaultMode": "完成建立模式",
-      "completionCreations": "{mode}：建立 {count} 次",
-      "completionSamples": "{count} 個終態樣本",
-      "completionMinimumProgress": "{count} / {minimum} 個最小樣本",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "漸進發布正在等待達到最小樣本數",
-        "may_expand": "可擴大漸進發布範圍",
-        "stop_role_mismatch": "漸進發布已暫停：角色不符率超過 1%",
-        "stop_needs_decision": "漸進發布已暫停：需要決策的比例超過 5%"
-      }
+      "softWatchdogHint": "僅觀察的停滯閾值（{min}–{max}）。0 表示關閉停滯標記。不會取消或切換路由。"
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -2790,11 +2778,9 @@
         "completionStale": "此決策已過期。請重新載入工作流程。",
         "completionConflict": "已提交其他結果。",
         "completionLegacyReadOnly": "舊版工作流程為唯讀",
-        "completionLegacyRestart": "使用完成協定 v2 重新啟動",
         "completionLegacySource": "舊版來源工作流程 #{conversation}",
         "completionLegacySuccessor": "後繼工作流程 #{conversation}",
         "completionAutomaticWake": "根編排已自動恢復",
-        "completionManualRootResume": "恢復根編排",
         "completionOutcome": {
           "approve": "核准",
           "approve_with_minors": "附帶小幅修改核准",

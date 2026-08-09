@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "مراقب مرن (ثوان)",
-      "softWatchdogHint": "عتبة توقف للمراقبة فقط ({min}–{max}). 0 يعطل تعليم التوقف. لا تلغي ولا تغير المسار.",
-      "completionDefaultMode": "وضع إنشاء الإكمال",
-      "completionCreations": "{mode}: {count} عمليات إنشاء",
-      "completionSamples": "{count} عينات نهائية",
-      "completionMinimumProgress": "{count} / {minimum} عينات كحد أدنى",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "ينتظر الطرح بلوغ الحد الأدنى لعدد العينات",
-        "may_expand": "يمكن توسيع نطاق الطرح",
-        "stop_role_mismatch": "تم إيقاف الطرح مؤقتًا: عدم تطابق الدور أعلى من 1%",
-        "stop_needs_decision": "تم إيقاف الطرح مؤقتًا: القرارات المطلوبة أعلى من 5%"
-      }
+      "softWatchdogHint": "عتبة توقف للمراقبة فقط ({min}–{max}). 0 يعطل تعليم التوقف. لا تلغي ولا تغير المسار."
     },
     "actions": {
       "dragSort": "اسحب لإعادة الترتيب",
@@ -2790,11 +2778,9 @@
         "completionStale": "هذا القرار قديم. أعد تحميل سير العمل.",
         "completionConflict": "تم اعتماد نتيجة مختلفة بالفعل.",
         "completionLegacyReadOnly": "سير العمل القديم للقراءة فقط",
-        "completionLegacyRestart": "إعادة التشغيل باستخدام بروتوكول الإكمال v2",
         "completionLegacySource": "سير العمل المصدر القديم رقم {conversation}",
         "completionLegacySuccessor": "سير العمل اللاحق رقم {conversation}",
         "completionAutomaticWake": "تم استئناف تنسيق الجذر تلقائيًا",
-        "completionManualRootResume": "استئناف تنسيق الجذر",
         "completionOutcome": {
           "approve": "موافقة",
           "approve_with_minors": "موافقة مع تعديلات طفيفة",

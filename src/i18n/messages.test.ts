@@ -48,7 +48,7 @@ describe("i18n locale key parity vs en.json", () => {
     expect({ missing, extra }).toEqual({ missing: [], extra: [] })
   })
 
-  it("defines workflow overlay controls with stable ICU placeholders", () => {
+  it("defines v2 workflow controls and historical links", () => {
     for (const messages of locales) {
       const workflow = (
         messages as unknown as {
@@ -68,8 +68,10 @@ describe("i18n locale key parity vs en.json", () => {
         "completionNeedsDecision",
         "completionBlocked",
         "completionRetryArtifact",
-        "completionLegacyRestart",
-        "completionManualRootResume",
+        "completionLegacyReadOnly",
+        "completionLegacySource",
+        "completionLegacySuccessor",
+        "completionAutomaticWake",
         "completionStale",
         "completionConflict",
       ]) {
