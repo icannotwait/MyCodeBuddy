@@ -1,14 +1,10 @@
 #
 # Codeg Server installer for Windows (OPT-IN / SELF-HOST ONLY)
 #
-# Consumer GitHub Releases ship the DrawCode DESKTOP app only. They no longer
-# publish codeg-server-windows-x64.zip — the standalone process listens on the
-# network and is frequently misclassified by antivirus as remote-control/"claw"
-# software. Prefer the desktop NSIS installer for day-to-day use.
-#
-# This script is for operators who deliberately host the optional server:
-#   - download a zip you built yourself, or an older release that still has one
-#   - or re-package after `pnpm server:build` (requires --features server)
+# GitHub Releases ship DrawCode DESKTOP (NSIS) and signed standalone server
+# archives, including codeg-server-windows-x64.zip. Prefer the desktop NSIS
+# installer for day-to-day use; this script is for operators who deliberately
+# host the optional long-lived HTTP server (Cargo feature `server`).
 #
 # To REMOVE a leftover install (process + files):
 #   .\uninstall-server.ps1
@@ -30,8 +26,8 @@ $Repo = "icannotwait/MyCodeBuddy"
 $Artifact = "codeg-server-windows-x64"
 
 Write-Host "NOTE: codeg-server is opt-in self-host only."
-Write-Host "GitHub Releases for this fork no longer attach prebuilt server zips."
-Write-Host "Desktop users should install DrawCode (NSIS), not this script."
+Write-Host "Desktop users should install DrawCode (NSIS) for day-to-day use."
+Write-Host "This script installs the standalone server zip from GitHub Releases."
 Write-Host "To remove an existing server install: .\uninstall-server.ps1"
 Write-Host ""
 
@@ -268,12 +264,11 @@ try {
 } catch {
     Write-Host ""
     Write-Host "Download failed for $Url"
-    Write-Host "Consumer GitHub Releases no longer publish $Artifact.zip (desktop-only)."
-    Write-Host "Self-host options:"
+    Write-Host "Self-host options if the release asset is missing:"
     Write-Host "  - Docker: docker compose up -d"
     Write-Host "  - Source: pnpm server:build  (cargo --features server)"
     Write-Host "  - Remove a leftover install: .\uninstall-server.ps1"
-    Write-Error "Download failed. Prebuilt server zips are not attached to current releases."
+    Write-Error "Download failed for $Artifact.zip."
     exit 1
 }
 

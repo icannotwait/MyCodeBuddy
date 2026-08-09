@@ -1,24 +1,35 @@
+#[cfg(any(windows, test))]
 use std::fs::OpenOptions;
+#[cfg(any(windows, test))]
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(any(windows, test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[cfg(any(windows, test))]
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use tauri::Manager;
 
 pub(crate) const REGISTERED_WINDOW_LABELS_MAX: usize = 16;
+#[cfg(windows)]
 const WEBVIEW2_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+#[cfg(windows)]
 const WEBVIEW_DEBUG_ENV: &str = "CODEG_WEBVIEW_DEBUG";
+#[cfg(windows)]
 const INTERNAL_LOG_DIR: &str = "webview2-internal";
+#[cfg(any(windows, test))]
 const LOG_RESERVATION_ATTEMPTS: u32 = 32;
+#[cfg(any(windows, test))]
 const RETAINED_INTERNAL_LOGS_MAX: usize = 5;
 const DIAGNOSTIC_TEXT_MAX_CHARS: usize = 240;
 
 pub(crate) struct ProcessStart {
     instant: Instant,
+    #[cfg(windows)]
     utc: DateTime<Utc>,
 }
 
@@ -26,6 +37,7 @@ impl ProcessStart {
     pub(crate) fn now() -> Self {
         Self {
             instant: Instant::now(),
+            #[cfg(windows)]
             utc: Utc::now(),
         }
     }
@@ -69,6 +81,7 @@ pub(crate) fn current_process_state() -> &'static ProcessState {
         .expect("window diagnostics must be initialized before window creation")
 }
 
+#[cfg(any(windows, test))]
 fn debug_requested(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         let value = value.trim();
@@ -131,6 +144,7 @@ fn tokenize_chromium_args(input: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(any(windows, test))]
 fn serialize_chromium_args(tokens: &[String]) -> String {
     tokens
         .iter()
@@ -139,6 +153,7 @@ fn serialize_chromium_args(tokens: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(any(windows, test))]
 fn serialize_chromium_token(token: &str) -> String {
     if !token.is_empty()
         && !token
@@ -185,6 +200,7 @@ fn serialize_chromium_token(token: &str) -> String {
     serialized
 }
 
+#[cfg(any(windows, test))]
 fn merge_browser_args(
     existing: &str,
     disable_hardware_acceleration: bool,
@@ -885,6 +901,7 @@ fn diagnostics_warn_once(stage: &'static str, error: &str) {
     );
 }
 
+#[cfg(any(windows, test))]
 fn reserve_internal_log(dir: &Path, pid: u32, stamp: DateTime<Utc>) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let timestamp = stamp.format("%Y%m%dT%H%M%SZ");
@@ -917,18 +934,21 @@ fn reserve_internal_log(dir: &Path, pid: u32, stamp: DateTime<Utc>) -> io::Resul
     }))
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InternalLogName {
     name: String,
     pid: u32,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone)]
 struct RetentionCandidate {
     name: InternalLogName,
     modified_ms: u128,
 }
 
+#[cfg(any(windows, test))]
 fn parse_internal_log_name(name: &str) -> Option<InternalLogName> {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
@@ -942,6 +962,7 @@ fn parse_internal_log_name(name: &str) -> Option<InternalLogName> {
     })
 }
 
+#[cfg(any(windows, test))]
 fn retention_deletions(
     candidates: Vec<RetentionCandidate>,
     current_name: &str,
@@ -1007,11 +1028,6 @@ fn prune_internal_logs(dir: &Path, current_path: &Path) -> io::Result<()> {
     for name in retention_deletions(candidates, current_name, &pid_is_live) {
         std::fs::remove_file(dir.join(name))?;
     }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn prune_internal_logs(_dir: &Path, _current_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -1980,10 +1996,8 @@ mod tests {
         }
 
         fn parse_event_fields(line: &str) -> serde_json::Map<String, serde_json::Value> {
-            let root: serde_json::Value =
-                serde_json::from_str(line).unwrap_or_else(|error| {
-                    panic!("expected JSON log line, got {line:?}: {error}")
-                });
+            let root: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("expected JSON log line, got {line:?}: {error}"));
             root.get("fields")
                 .and_then(|value| value.as_object())
                 .cloned()

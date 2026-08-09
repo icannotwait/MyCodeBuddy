@@ -3382,6 +3382,12 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{duplex, AsyncRead, AsyncWrite, ReadBuf};
 
+    /// Real directory that exists on every CI OS. Tests used to hardcode `/tmp`,
+    /// which fails `resolve_workspace_path` canonicalize on Windows.
+    fn test_working_dir() -> PathBuf {
+        std::env::temp_dir()
+    }
+
     struct AlwaysRootLookup;
     #[async_trait]
     impl ConversationDepthLookup for AlwaysRootLookup {
@@ -4021,7 +4027,7 @@ mod tests {
     fn continuation_token_entry(enabled: bool) -> TokenEntry {
         TokenEntry {
             parent_connection_id: "parent-conn".into(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: test_working_dir(),
             coordination_v1: true,
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
@@ -4854,7 +4860,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("other-parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("other-parent", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -4875,7 +4881,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         // parent_conversation = None: parent has no live conversation.
@@ -4897,7 +4903,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -4951,7 +4957,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -4992,7 +4998,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -5037,7 +5043,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -5083,7 +5089,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
@@ -5118,7 +5124,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -5174,7 +5180,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(broker, tokens, Some(1));
@@ -5222,7 +5228,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -5306,7 +5312,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(
@@ -5342,7 +5348,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
 
@@ -5415,7 +5421,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let ack = broker
@@ -7084,7 +7090,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let start = |tool_use: &'static str| {
@@ -7195,7 +7201,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         // Start a task directly so we hold its id.
@@ -7246,7 +7252,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let ack = broker
@@ -7318,7 +7324,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
 
@@ -7430,7 +7436,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
@@ -7490,13 +7496,13 @@ mod tests {
     async fn token_registry_revoke_and_revoke_by_parent() {
         let registry = TokenRegistry::default();
         registry
-            .register("t1".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
+            .register("t1".into(), TokenEntry::legacy("p1", test_working_dir()))
             .await;
         registry
-            .register("t2".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
+            .register("t2".into(), TokenEntry::legacy("p1", test_working_dir()))
             .await;
         registry
-            .register("t3".into(), TokenEntry::legacy("p2", PathBuf::from("/tmp")))
+            .register("t3".into(), TokenEntry::legacy("p2", test_working_dir()))
             .await;
 
         registry.revoke("t1").await;
@@ -7530,7 +7536,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_listener(broker, tokens, Some(1));
@@ -7604,7 +7610,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -7652,7 +7658,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -7690,7 +7696,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -7754,7 +7760,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -7865,7 +7871,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -7919,7 +7925,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -7999,7 +8005,7 @@ mod tests {
         tokens
             .register(
                 "ready-tok".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
         let mut waiter = leases.register("ready-tok").await;
@@ -8053,7 +8059,7 @@ mod tests {
         tokens
             .register(
                 "dup-tok".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
         let mut waiter = leases.register("dup-tok").await;
@@ -8133,7 +8139,7 @@ mod tests {
         tokens
             .register(
                 "revoke-tok".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
         let mut waiter = leases.register("revoke-tok").await;
@@ -8180,7 +8186,7 @@ mod tests {
         tokens
             .register(
                 "good-tok".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
 
@@ -8306,7 +8312,7 @@ mod tests {
         tokens
             .register(
                 "fail-ack".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
         let mut waiter = leases.register("fail-ack").await;
@@ -8363,7 +8369,7 @@ mod tests {
     fn child_token_entry(conn: &str) -> TokenEntry {
         TokenEntry {
             parent_connection_id: conn.to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: test_working_dir(),
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
@@ -8376,7 +8382,7 @@ mod tests {
     fn root_token_entry(conn: &str) -> TokenEntry {
         TokenEntry {
             parent_connection_id: conn.to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: test_working_dir(),
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
@@ -8389,7 +8395,7 @@ mod tests {
     fn child_workflow_token_entry(conn: &str) -> TokenEntry {
         TokenEntry {
             parent_connection_id: conn.to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: test_working_dir(),
             coordination_v1: false,
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
@@ -8668,7 +8674,7 @@ mod tests {
                         token.into(),
                         TokenEntry {
                             parent_connection_id: connection_id.into(),
-                            working_dir: PathBuf::from("/tmp/completion-tool-contract"),
+                            working_dir: test_working_dir(),
                             coordination_v1: true,
                             delegation_continuation_v1: false,
                             role,
@@ -9195,7 +9201,7 @@ mod tests {
                 "workflow-v2-token".into(),
                 TokenEntry {
                     parent_connection_id: "parent-v2".into(),
-                    working_dir: PathBuf::from("/tmp"),
+                    working_dir: test_working_dir(),
                     coordination_v1: false,
                     delegation_continuation_v1: false,
                     role: CompanionRole::Root,
@@ -9211,15 +9217,30 @@ mod tests {
             r"\\.\pipe\codeg-workflow-v2-test-{}",
             uuid::Uuid::new_v4()
         ));
+        // AF_UNIX sun_path is typically 104–108 bytes. macOS TMPDIR is often
+        // long enough that `temp_dir()/codeg-workflow-v2-test-{uuid}.sock`
+        // exceeds SUN_LEN and bind fails with InvalidInput, leaving the
+        // readiness loop spinning forever. Keep a short absolute path under
+        // /tmp (same approach as completion_protocol_v2 fixtures).
         #[cfg(unix)]
-        let socket_path = std::env::temp_dir().join(format!(
-            "codeg-workflow-v2-test-{}.sock",
-            uuid::Uuid::new_v4()
+        let socket_path = PathBuf::from(format!(
+            "/tmp/cg-wv2-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
         ));
         let listener_task = tokio::spawn(Arc::clone(&listener).run(socket_path.clone()));
         #[cfg(unix)]
-        while !socket_path.try_exists().expect("check listener socket") {
-            tokio::task::yield_now().await;
+        {
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !socket_path.try_exists().expect("check listener socket") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                ready.is_ok(),
+                "listener socket never appeared at {} (likely AF_UNIX path bind failure)",
+                socket_path.display()
+            );
         }
 
         let companion = CompanionContext {
@@ -9562,7 +9583,7 @@ mod tests {
         tokens
             .register(
                 "legacy-tok".into(),
-                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+                TokenEntry::legacy("parent", test_working_dir()),
             )
             .await;
 
@@ -10192,7 +10213,7 @@ mod tests {
                     "recovery-child-token".into(),
                     TokenEntry {
                         parent_connection_id: "recovery-parent-conn".into(),
-                        working_dir: PathBuf::from("/tmp"),
+                        working_dir: test_working_dir(),
                         coordination_v1: true,
                         delegation_continuation_v1: false,
                         role: CompanionRole::DelegationChild,
@@ -10756,7 +10777,7 @@ mod tests {
                     "recovery-reconnect-token".into(),
                     TokenEntry {
                         parent_connection_id: "recovery-reconnected-parent".into(),
-                        working_dir: PathBuf::from("/tmp"),
+                        working_dir: test_working_dir(),
                         coordination_v1: true,
                         delegation_continuation_v1: true,
                         role: CompanionRole::DelegationChild,

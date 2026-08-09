@@ -317,12 +317,20 @@ pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_
 
 ### Server Deployment (opt-in self-host)
 
-GitHub Releases for this fork ship **desktop DrawCode (NSIS) only**. They do
-**not** attach `codeg-server-windows-x64.zip`. The standalone process is a
-long-lived network listener plus agent control surface; shipping it to every
-desktop user caused antivirus false positives (remote-control / “claw” class).
+GitHub Releases ship **desktop DrawCode (NSIS)** plus signed standalone
+`codeg-server` archives (same layout as upstream):
 
-Use the standalone server only when you deliberately self-host.
+| Platform   | Asset |
+| ---------- | ----- |
+| Linux x64  | `codeg-server-linux-x64.tar.gz` (+ `.sig` / `.sha256`) |
+| Linux arm64 | `codeg-server-linux-arm64.tar.gz` |
+| macOS x64  | `codeg-server-darwin-x64.tar.gz` |
+| macOS arm64 | `codeg-server-darwin-arm64.tar.gz` |
+| Windows x64 | `codeg-server-windows-x64.zip` |
+
+Each archive contains `codeg-server`, the `codeg-mcp` companion, `web/` static
+assets, and license files. The binary is still gated by Cargo feature `server`
+and is intended for deliberate self-hosting (long-lived HTTP listener).
 
 #### Remove a leftover Windows install
 
@@ -332,12 +340,9 @@ Use the standalone server only when you deliberately self-host.
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 ```
 
-`install.ps1` remains for operators who already have a server zip (older
-release or a zip you packaged yourself). Current releases no longer provide
-that asset; if download fails, use Docker or source build instead.
+Windows operators can install from the release zip:
 
 ```powershell
-# Only works when a matching zip still exists (legacy / self-packaged):
 .\install.ps1 -Version v0.22.2-mycodebuddy.1
 ```
 
@@ -376,10 +381,11 @@ cargo build --release --bin codeg-mcp --no-default-features
 # Stop the service, redeploy both binaries and the web assets, then restart it.
 ```
 
-Source-built Linux/macOS deployments upgrade by pulling the desired source,
-rebuilding, and redeploying the server, companion, and static web output. The
-standalone server endpoints do not download or apply GitHub Release assets in
-place.
+Source-built Linux/macOS deployments can upgrade by pulling source, rebuilding,
+and redeploying the server, companion, and static web output. Prebuilt release
+archives (`codeg-server-linux-x64.tar.gz` and siblings) are also available for
+operators who prefer not to compile locally; signed self-update uses the same
+assets when enabled on a running server.
 
 Docker deployments upgrade by pulling source and rebuilding/recreating the
 container, for example

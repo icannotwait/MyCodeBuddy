@@ -164,9 +164,7 @@ impl DocumentTranslationService {
                 Err(err)
             }
             Err(_) => {
-                tracing::error!(
-                    "[document_translate] owned task ended without result"
-                );
+                tracing::error!("[document_translate] owned task ended without result");
                 Err(DocumentTranslateError::Failed(
                     "translation task ended without result".into(),
                 ))

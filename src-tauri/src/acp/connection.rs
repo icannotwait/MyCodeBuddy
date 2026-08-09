@@ -15848,7 +15848,7 @@ mod tests {
             assert_eq!(map["ask_user_question"], 1_800_000); // 30 min
             assert_eq!(map["request_parent_decision"], 1_800_000); // 30 min
             assert_eq!(map["get_delegation_status"], 5_400_000); // 90 min
-            // Terminal + route profiles must survive the merge.
+                                                                 // Terminal + route profiles must survive the merge.
             assert!(
                 meta.contains_key("codeg.dev/terminal"),
                 "{label} terminal meta preserved"
@@ -15863,7 +15863,11 @@ mod tests {
     #[test]
     fn session_request_meta_non_grok_omits_codeg_mcp_timeouts() {
         let spec = test_posix_spec();
-        for agent in [AgentType::ClaudeCode, AgentType::Codex, AgentType::CodeBuddy] {
+        for agent in [
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::CodeBuddy,
+        ] {
             let meta = session_request_meta(
                 agent,
                 &codeg_plan(agent),
@@ -15889,7 +15893,10 @@ mod tests {
                 "codeg-mcp": { "toolTimeoutMs": 1 } // should be replaced
             }),
         );
-        existing.insert("agentProfile".to_string(), serde_json::json!({"name": "keep-me"}));
+        existing.insert(
+            "agentProfile".to_string(),
+            serde_json::json!({"name": "keep-me"}),
+        );
         let merged = merge_grok_codeg_mcp_timeout_config(existing, AgentType::Grok);
         assert_eq!(merged["agentProfile"]["name"], "keep-me");
         assert_eq!(merged["mcpConfig"]["github"]["toolTimeoutMs"], 60_000);

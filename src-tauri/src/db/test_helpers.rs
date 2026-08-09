@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
 use crate::db::error::DbError;
@@ -40,7 +40,17 @@ pub async fn fresh_disk_db(dir: &Path) -> AppDatabase {
 }
 
 pub async fn fresh_in_memory_db() -> AppDatabase {
-    let conn = Database::connect("sqlite::memory:")
+    // Bare `sqlite::memory:` is a *private* DB per connection. Even with a
+    // pool of 1, some SeaORM/sqlx paths can open a second handle and see an
+    // empty schema. Use a unique shared-cache name so every pool connection
+    // for this fixture shares one in-memory database, and keep the pool small.
+    let name = format!(
+        "sqlite:file:codeg-test-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let mut opts = ConnectOptions::new(name);
+    opts.max_connections(1).min_connections(1);
+    let conn = Database::connect(opts)
         .await
         .expect("open in-memory sqlite");
     // Match the production pragma set as closely as needed for migrations.

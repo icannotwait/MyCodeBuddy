@@ -948,6 +948,12 @@ mod tests {
     #[test]
     fn test_credential_helper_e2e_server_mode() {
         let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Serialize against keyring_store tests that also flip CODEG_DATA_DIR
+        // (process-global env); otherwise set_token can rename into a path
+        // another test already deleted.
+        let _env_guard = crate::keyring_store::codeg_data_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let data_dir =
             std::env::temp_dir().join(format!("codeg-helper-e2e-{}", uuid::Uuid::new_v4()));

@@ -3,6 +3,15 @@ const UPSTREAM_REPO_RE =
   /https:\/\/(?:github\.com|raw\.githubusercontent\.com)\/xintaofei\/codeg/gi
 const ALLOWED_UPSTREAM_FILES = new Set(["NOTICE", "docs/UPSTREAM_SYNC.md"])
 const WINDOWS_RELEASE_TARGETS = new Set(["x86_64-pc-windows-msvc"])
+// Standalone codeg-server archive triples (mirrors upstream build-server matrix).
+const SERVER_RELEASE_TARGETS = new Set([
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+])
+const REQUIRED_SERVER_ARTIFACTS = ["codeg-server-linux-x64"]
 const UPDATER_SIGNING_SECRETS = [
   "TAURI_SIGNING_PRIVATE_KEY",
   "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
@@ -19,16 +28,30 @@ function uncommentedWorkflowText(workflowText) {
     .join("\n")
 }
 
+function workflowJob(policyText, jobName) {
+  return policyText.match(
+    new RegExp(
+      String.raw`^  ${jobName}:\s*\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:\s*$|(?![\s\S]))`,
+      "m"
+    )
+  )?.[0]
+}
+
 function releaseTargets(workflowText) {
   const targets = new Set()
+  // Only parse explicit Cargo/Tauri target declarations. Free-text triples
+  // (e.g. `aarch64-linux-gnu-gcc` cross-linker names) must not count as
+  // release targets.
   const targetPropertyRe =
     /^\s*(?:-\s*)?target\s*:\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))/gm
   const targetArgumentRe =
     /--target(?:=|\s+)(?:"([a-z0-9_.-]+)"|'([a-z0-9_.-]+)'|([a-z0-9_.-]+))/gi
-  const targetTripleRe =
-    /\b(?:aarch64|arm(?:64)?|armv[4-9][a-z0-9_]*|i[3-6]86|loongarch64|mips(?:64)?(?:el)?|powerpc(?:64(?:le)?)?|riscv(?:32|64)[a-z0-9_]*|s390x|sparc64|thumbv[0-9a-z_]+|wasm(?:32|64)|x86_64)-[a-z0-9_]+-[a-z0-9_]+(?:-[a-z0-9_]+)?\b/gi
   const addTarget = (target) => {
-    if (/^[a-z0-9_]+(?:-[a-z0-9_]+){2,}$/i.test(target)) {
+    if (
+      target &&
+      !/\$\{\{/.test(target) &&
+      /^[a-z0-9_]+(?:-[a-z0-9_]+){2,}$/i.test(target)
+    ) {
       targets.add(target)
     }
   }
@@ -38,9 +61,6 @@ function releaseTargets(workflowText) {
   }
   for (const match of workflowText.matchAll(targetArgumentRe)) {
     addTarget(match[1] ?? match[2] ?? match[3])
-  }
-  for (const match of workflowText.matchAll(targetTripleRe)) {
-    targets.add(match[0])
   }
   return targets
 }
@@ -162,11 +182,13 @@ export function findForbiddenRuntimeUrls(files) {
 
 export function assertWindowsReleaseWorkflow(workflowText) {
   const policyText = uncommentedWorkflowText(workflowText)
-  const desktopJob = policyText.match(
-    /^  build-desktop:\s*\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:\s*$|(?![\s\S]))/m
-  )?.[0]
+  const desktopJob = workflowJob(policyText, "build-desktop")
   if (!desktopJob) {
     throw new Error("release workflow is missing the desktop build job")
+  }
+  const serverJob = workflowJob(policyText, "build-server")
+  if (!serverJob) {
+    throw new Error("release workflow is missing the build-server job")
   }
   const recursiveCheckout = workflowStepBlocks(desktopJob).find(
     (stepText) =>
@@ -179,24 +201,36 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
     throw new Error("checkout step must contain exactly one with block")
   }
-  // Desktop-only consumer releases: never publish the standalone codeg-server
-  // binary (antivirus false-positive surface for remote-control-like listeners).
-  if (/^  build-server:\s*$/m.test(policyText)) {
+  const serverRecursiveCheckout = workflowStepBlocks(serverJob).find(
+    (stepText) =>
+      /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
+      /submodules\s*:\s*recursive/i.test(stepText)
+  )
+  if (!serverRecursiveCheckout) {
     throw new Error(
-      "release workflow must not include a build-server job (desktop-only releases)"
+      "build-server must checkout submodules recursively (licenses:generate needs vendor/codex-acp)"
     )
   }
-  if (/codeg-server-windows-x64/i.test(policyText)) {
-    throw new Error(
-      "release workflow must not publish codeg-server-windows-x64 artifacts"
-    )
+
+  // Standalone server archives must ship with the desktop release so
+  // self-update / install scripts can fetch signed platform bundles.
+  for (const artifact of REQUIRED_SERVER_ARTIFACTS) {
+    if (!serverJob.includes(artifact)) {
+      throw new Error(`build-server must publish required artifact ${artifact}`)
+    }
   }
   if (
-    /--bin\s+codeg-server\b/i.test(policyText) ||
-    /cargo\s+build[^\n]*codeg-server/i.test(policyText)
+    !/--bin\s+codeg-server\b/.test(serverJob) ||
+    !/--features\s+server\b/.test(serverJob)
   ) {
-    throw new Error("release workflow must not build the codeg-server binary")
+    throw new Error(
+      "build-server must cargo-build codeg-server with --features server"
+    )
   }
+  if (!/--bin\s+codeg-mcp\b/.test(serverJob)) {
+    throw new Error("build-server must also build the codeg-mcp companion")
+  }
+
   // Codex ACP ships via npm (`@agentclientprotocol/codex-acp`); desktop
   // release must not re-introduce a Windows sidecar or its Bun compile pin.
   if (/oven-sh\/setup-bun@/i.test(desktopJob)) {
@@ -214,36 +248,35 @@ export function assertWindowsReleaseWorkflow(workflowText) {
       "desktop release must not reference CODEG_SKIP_CODEX_ACP_SIDECAR"
     )
   }
-  const targets = releaseTargets(policyText)
+
+  const desktopTargets = releaseTargets(desktopJob)
   for (const target of WINDOWS_RELEASE_TARGETS) {
-    if (!targets.has(target)) {
-      throw new Error(`missing Windows target ${target}`)
+    if (!desktopTargets.has(target)) {
+      throw new Error(`missing Windows desktop target ${target}`)
     }
   }
-  for (const target of targets) {
+  for (const target of desktopTargets) {
     if (!WINDOWS_RELEASE_TARGETS.has(target)) {
-      throw new Error(`unsupported release target ${target}`)
+      throw new Error(`unsupported desktop release target ${target}`)
     }
   }
 
-  for (const forbidden of [
-    "apple-darwin",
-    "unknown-linux",
-    "APPLE_CERTIFICATE",
-    "DOCKERHUB_",
-    "build-docker",
-  ]) {
+  const serverTargets = releaseTargets(serverJob)
+  if (!serverTargets.has("x86_64-unknown-linux-gnu")) {
+    throw new Error("build-server must include Linux x64 target")
+  }
+  for (const target of serverTargets) {
+    if (!SERVER_RELEASE_TARGETS.has(target)) {
+      throw new Error(`unsupported server release target ${target}`)
+    }
+  }
+
+  // Desktop stays Windows NSIS-only; server may use Linux/macOS runners.
+  // Docker Hub publishing stays out of this fork's release workflow.
+  for (const forbidden of ["APPLE_CERTIFICATE", "DOCKERHUB_", "build-docker"]) {
     if (policyText.includes(forbidden)) {
-      throw new Error(
-        `release workflow contains non-Windows entry ${forbidden}`
-      )
+      throw new Error(`release workflow contains forbidden entry ${forbidden}`)
     }
-  }
-
-  if (
-    /^\s*(?:runs-on|runner|os)\s*:[^\n]*\bmacos-[^\s"'#]+/im.test(policyText)
-  ) {
-    throw new Error("release workflow contains a macOS runner")
   }
 
   assertDirectUpdaterSigningEnvMappings(policyText)
@@ -266,7 +299,7 @@ export function assertWindowsReleaseWorkflow(workflowText) {
       TAURI_BUILD_COMMAND_RE.test(stepText)
     if (
       isTauriReleaseInvocation &&
-      !hasExplicitWindowsMatrixTarget(stepText, targets)
+      !hasExplicitWindowsMatrixTarget(stepText, WINDOWS_RELEASE_TARGETS)
     ) {
       throw new Error(
         "release Tauri build must use an allowed Windows matrix target"

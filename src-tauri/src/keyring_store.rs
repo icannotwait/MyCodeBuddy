@@ -548,11 +548,28 @@ pub fn delete_channel_token(channel_id: i32) -> Result<(), String> {
     write_tokens_map(&tokens)
 }
 
+/// Process-wide lock for tests that mutate `CODEG_DATA_DIR` (or delete the
+/// directory it names). `std::env::set_var` / `temp_env` are process-global;
+/// concurrent tests that flip the var mid-flight otherwise race on
+/// `tokens.json` publish (ENOENT rename) and lookup.
+#[cfg(all(test, not(feature = "tauri-runtime")))]
+pub fn codeg_data_dir_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(all(test, not(feature = "tauri-runtime")))]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    fn with_codeg_data_dir<T>(data_dir: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = codeg_data_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir), f)
+    }
 
     #[test]
     fn test_tokens_file_path_absolutizes_relative_env() {
@@ -601,7 +618,7 @@ mod tests {
     fn corrupt_tokens_json_is_unavailable_not_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             std::fs::write(dir.path().join("tokens.json"), "{\"github-token:x\":")
                 .expect("write truncated json");
             let state = get_token_state("x");
@@ -618,7 +635,7 @@ mod tests {
     fn empty_tokens_json_is_unavailable_not_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             std::fs::write(dir.path().join("tokens.json"), "").expect("write empty");
             let state = get_token_state("x");
             assert!(
@@ -633,7 +650,7 @@ mod tests {
     fn whitespace_only_tokens_json_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             std::fs::write(dir.path().join("tokens.json"), "  \n\t  \n").expect("write whitespace");
             let state = get_token_state("any");
             assert!(
@@ -647,7 +664,7 @@ mod tests {
     fn set_token_fails_when_store_unreadable_without_wiping() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             let path = dir.path().join("tokens.json");
             let corrupt = "{\"github-token:keep-me\":\"original-secret\""; // truncated
             std::fs::write(&path, corrupt).expect("write corrupt");
@@ -677,7 +694,7 @@ mod tests {
     fn missing_file_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             assert!(matches!(get_token_state("nobody"), CredentialState::Absent));
         });
     }
@@ -686,7 +703,7 @@ mod tests {
     fn atomic_publish_leaves_valid_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             set_token("acct-a", "secret-a").expect("set a");
             set_token("acct-b", "secret-b").expect("set b");
             let raw = std::fs::read_to_string(dir.path().join("tokens.json")).expect("read");
@@ -738,7 +755,7 @@ mod tests {
 
         // And the public API still sees Present, not Absent/Unavailable wipe.
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             match get_token_state("keep") {
                 CredentialState::Present(s) => assert_eq!(s, "live-secret"),
                 other => panic!("expected Present(live-secret), got {other:?}"),
@@ -759,7 +776,7 @@ mod tests {
         std::fs::write(&bak, r#"{"github-token:survived":"from-backup"}"#).expect("write bak");
         assert!(!path.exists());
 
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             match get_token_state("survived") {
                 CredentialState::Present(s) => {
                     // Read-time recovery renamed .bak → live.
@@ -784,7 +801,7 @@ mod tests {
     fn concurrent_reads_never_see_truncated_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
-        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+        with_codeg_data_dir(data_dir.as_str(), || {
             set_token("seed", "initial").expect("seed");
 
             let threads = 8usize;

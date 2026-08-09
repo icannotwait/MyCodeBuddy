@@ -280,9 +280,17 @@ async fn load_claim_config_snapshot(
 
     match key_state {
         TitleKeyState::Unavailable => {
-            // Unprovable key identity — fail-closed barrier; no HTTP.
-            tracing::warn!("auto-title claim: title key Unavailable; fail-closed");
-            Err(AutoTitleRunError::Unavailable)
+            // Unprovable key identity: fail-closed only when any title field is
+            // configured (url/model/fp). Fully blank config is quiet Off so a
+            // transient keyring/tokens blip cannot wipe AwaitingTurn enrollments
+            // that never depended on a secret (parallel tests and production
+            // both hit this path when titles are disabled).
+            if url.trim().is_empty() && model.trim().is_empty() && stored_fp.is_empty() {
+                Ok(None)
+            } else {
+                tracing::warn!("auto-title claim: title key Unavailable; fail-closed");
+                Err(AutoTitleRunError::Unavailable)
+            }
         }
         TitleKeyState::Absent => {
             // Fail-closed only when a key was expected: non-empty stored
@@ -1450,6 +1458,14 @@ mod tests {
     async fn recover_and_start_purge_then_second_start_ok() {
         use crate::auto_title::coordinator::AutoTitleCoordinator;
 
+        // recover_and_start spawns a notification_loop that claims on notify.
+        // Hold the title-key suite so background claim never hits a process-global
+        // keyring blip (Unavailable) and fail-closed-wipes post-purge enrolls.
+        let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
+        for _ in 0..64 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        }
+
         let db = fresh_in_memory_db().await;
         clear_api_v1_purge_flag(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-purge-recover").await;
@@ -1479,6 +1495,17 @@ mod tests {
                 .expect("q")
                 .is_none(),
             "purge must run before recover so running job is not transitioned"
+        );
+        let flag = app_metadata_service::get_value(
+            &db.conn,
+            crate::auto_title::KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
+        )
+        .await
+        .expect("flag after first start");
+        assert_eq!(
+            flag.as_deref(),
+            Some("1"),
+            "first start must set the one-shot purge flag"
         );
 
         // Second start must not fail and must not wipe post-purge enrolls.
@@ -1723,8 +1750,12 @@ mod tests {
         first_user_text: Option<&str>,
         locale: Option<&str>,
     ) {
+        // Prefer exec_without_returning over ActiveModel::insert: the latter
+        // uses INSERT RETURNING and has flaked under parallel CI load with
+        // RecordNotFound("Failed to find inserted item") even though the row
+        // write itself succeeds. Non-autoincrement PK needs no RETURNING.
         let now = Utc::now();
-        auto_title_job::ActiveModel {
+        let active = auto_title_job::ActiveModel {
             conversation_id: Set(conversation_id),
             state: Set(state),
             attempts: Set(0),
@@ -1737,10 +1768,11 @@ mod tests {
             last_usable_turn_token: Set(None),
             config_gen: Set(0),
             updated_at: Set(now),
-        }
-        .insert(conn)
-        .await
-        .expect("seed job");
+        };
+        auto_title_job::Entity::insert(active)
+            .exec_without_returning(conn)
+            .await
+            .expect("seed job");
     }
 
     #[tokio::test]
@@ -3812,6 +3844,52 @@ mod tests {
             .await
             .expect("quiet Off");
         assert!(claim.is_none());
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_ne!(
+            barrier.as_deref(),
+            Some("1"),
+            "quiet Off must not raise barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_key_with_empty_config_quiet_off() {
+        // Blank title config + keyring Unavailable must not fail-closed wipe.
+        // Background coordinator drains hit this when tokens.json is racing.
+        let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
+        title_key::test_hooks::push_override_get(TitleKeyState::Unavailable);
+        let db = fresh_in_memory_db().await;
+        disable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-unavail-off").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_job_in_state(
+            &db.conn,
+            conversation.id,
+            AutoTitleJobState::AwaitingTurn,
+            Some("keep me"),
+            Some("en"),
+        )
+        .await;
+
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("Unavailable + blank config is quiet Off");
+        assert!(claim.is_none());
+        assert!(
+            auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .expect("q")
+                .is_some(),
+            "AwaitingTurn must survive Unavailable when title is unconfigured"
+        );
         let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
             .await
             .expect("barrier");
