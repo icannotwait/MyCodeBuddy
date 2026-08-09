@@ -49,7 +49,12 @@
 - Grok: request_changes (I1 protocol freeze WHEN NEW/OLD) — 32592543
 - Author continue: revision 1 in progress
 
+## Gates
+- design: approved
+- plan: approved (cycle 1, digest e59e9063)
+- workflow_state: approved
+- workspace_baseline_HEAD: bb24a884 (clean porcelain)
+
 ## Intent (current)
-- Wait for Plan Author revision 1
-- Republish estimated with new plan digest
-- Re-dispatch Plan reviewers on platform lineage
+- Dispatch Task 1 high implementer (codex)
+- Dual review codex+grok after producer commit
