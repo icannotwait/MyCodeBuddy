@@ -24,6 +24,7 @@ pub(crate) enum CommandPayload {
         agent: Vec<u8>,
         json: Vec<u8>,
     },
+    #[cfg(feature = "ffi-test-hooks")]
     Blocked,
     #[cfg(test)]
     Error(String),

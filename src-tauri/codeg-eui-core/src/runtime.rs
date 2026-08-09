@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(feature = "ffi-test-hooks")]
 use std::future::pending;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -236,6 +237,7 @@ fn terminalize_task(
 
 async fn execute_command(payload: CommandPayload) -> Result<Vec<u8>, String> {
     match payload {
+        #[cfg(feature = "ffi-test-hooks")]
         CommandPayload::Blocked => pending().await,
         #[cfg(test)]
         CommandPayload::Error(error) => Err(error),

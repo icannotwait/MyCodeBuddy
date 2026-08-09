@@ -1,3 +1,5 @@
+#![cfg(feature = "ffi-test-hooks")]
+
 use std::process::Command;
 use std::time::Duration;
 

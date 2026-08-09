@@ -114,3 +114,38 @@ compile. This is an authorized host limitation, not an open Task 3 defect.
 <!-- codeg-card-summary-v1
 {"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Implemented EUI ABI v1 async lifecycle, bounded request/completion ledger, immutable frames, shutdown drain, and C++ deep-copy boundary.","commits":[{"subject":"feat(eui): implement async bridge lifecycle"}],"tests":{"status":"pass","passed":14,"failed":0,"summary":"14 focused Rust tests plus 3 contracts-only and 4 ABI-linked CTest cases pass; full Cargo tests skipped by parent instruction and shared-core Cargo check SIGKILLed on the 4GiB/no-swap host."},"concerns":["Dependency-complete Cargo verification requires a host with more memory or usable swap; the parent explicitly authorized skipping full Cargo tests for this spike."],"report_file":".superpowers/sdd/2026-08-09-eui-neo-frontend-spike/task-3-report.md"}
 -->
+
+## High-Gate Fix Round 1/5
+
+Status: DONE_WITH_CONCERNS
+
+Codex I1 is resolved. The synthetic blocked-request stimulus is now present
+only under `ffi-test-hooks`:
+
+- `enqueue_blocked_for_test` is feature-gated and is absent from the normal
+  Rust rlib API surface.
+- `CommandPayload::Blocked`, the forever-pending executor branch, and the C
+  export remain available only with `ffi-test-hooks`.
+- `shutdown_contract.rs` is an opt-in feature test, while the C header/export
+  remains conditionally declared under `CODEG_EUI_TEST_HOOKS`.
+- Added `assert_rust_hook_absent.sh`, which compiles a normal-feature rlib
+  probe and requires the expected unresolved-symbol/API diagnostic.
+
+Focused fix verification passed:
+
+- Normal-feature direct rlib compile with `-D warnings`.
+- Normal-feature rlib API probe: compile fails on
+  `enqueue_blocked_for_test` as required.
+- Normal static archive exports zero `codeg_eui_test_*` symbols; the opt-in
+  archive exports exactly `codeg_eui_test_enqueue_blocked`.
+- Normal focused unit/bridge/ABI probes: **13 passed, 0 failed**.
+- Opt-in focused unit/shutdown probes: **7 passed, 0 failed**.
+- ABI-linked CTest after rebuilding against the gated archive: **4/4 passed**.
+- C11 header syntax, shell syntax, CTest registration, formatting, and diff
+  checks passed.
+
+The parent instruction remains in force: no full Cargo test was run.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns","summary":"High-gate I1 fixed: blocked shutdown stimulus, payload, and forever-pending executor are now opt-in under ffi-test-hooks; normal rlib API is proven unusable.","commits":[{"subject":"fix(eui): gate blocked shutdown test hook"}],"tests":{"status":"pass","passed":20,"failed":0,"summary":"13 normal-feature focused probes + 7 opt-in focused probes pass; 4/4 ABI-linked CTest pass; full Cargo tests skipped by parent."},"concerns":["Full Cargo tests remain skipped per parent instruction."],"report_file":".superpowers/sdd/2026-08-09-eui-neo-frontend-spike/task-3-report.md"}
+-->

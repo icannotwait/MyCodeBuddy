@@ -429,6 +429,7 @@ pub extern "C" fn codeg_eui_probe_agent(
     )
 }
 
+#[cfg(feature = "ffi-test-hooks")]
 #[doc(hidden)]
 pub fn enqueue_blocked_for_test() -> Result<u64, i32> {
     let mut request_id = 0;
