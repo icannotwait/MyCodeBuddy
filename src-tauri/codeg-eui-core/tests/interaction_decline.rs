@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +29,109 @@ enum Action {
 struct RecordingBackend {
     actions: Arc<Mutex<Vec<Action>>>,
     state: Option<Arc<RwLock<SessionState>>>,
+}
+
+#[derive(Clone)]
+struct FailingBackend {
+    state: Arc<RwLock<SessionState>>,
+    cancel_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct ParkedBackend {
+    expected: ParkedAction,
+    responder: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParkedAction {
+    Permission,
+    CancelTurn,
+    Question,
+    Plan,
+}
+
+impl ParkedBackend {
+    fn release(&self, action: ParkedAction) -> ActionFuture<'_> {
+        if action != self.expected {
+            return Box::pin(async { Err("wrong decline path".to_string()) });
+        }
+        let responder = self.responder.lock().unwrap().take();
+        Box::pin(async move {
+            responder
+                .ok_or_else(|| "responder already released".to_string())?
+                .send(())
+                .map_err(|_| "parked receiver closed".to_string())
+        })
+    }
+}
+
+impl InteractionBackend for ParkedBackend {
+    fn respond_permission<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _request_id: &'a str,
+        _option_id: &'a str,
+    ) -> ActionFuture<'a> {
+        self.release(ParkedAction::Permission)
+    }
+
+    fn cancel_active_turn<'a>(&'a self, _connection_id: &'a str) -> ActionFuture<'a> {
+        self.release(ParkedAction::CancelTurn)
+    }
+
+    fn cancel_question<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _question_id: &'a str,
+    ) -> ActionFuture<'a> {
+        self.release(ParkedAction::Question)
+    }
+
+    fn cancel_plan_approvals_by_parent<'a>(&'a self, _connection_id: &'a str) -> ActionFuture<'a> {
+        self.release(ParkedAction::Plan)
+    }
+}
+
+impl LiveBackend for FailingBackend {
+    fn get_state<'a>(
+        &'a self,
+        connection_id: &'a str,
+    ) -> LiveFuture<'a, Option<Arc<RwLock<SessionState>>>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let matches = state.read().await.connection_id == connection_id;
+            matches.then_some(state)
+        })
+    }
+}
+
+impl InteractionBackend for FailingBackend {
+    fn respond_permission<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _request_id: &'a str,
+        _option_id: &'a str,
+    ) -> ActionFuture<'a> {
+        Box::pin(async { Err("permission responder closed".to_string()) })
+    }
+
+    fn cancel_active_turn<'a>(&'a self, _connection_id: &'a str) -> ActionFuture<'a> {
+        self.cancel_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_question<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _question_id: &'a str,
+    ) -> ActionFuture<'a> {
+        Box::pin(async { Err("question responder closed".to_string()) })
+    }
+
+    fn cancel_plan_approvals_by_parent<'a>(&'a self, _connection_id: &'a str) -> ActionFuture<'a> {
+        Box::pin(async { Err("plan responder closed".to_string()) })
+    }
 }
 
 impl RecordingBackend {
@@ -160,6 +264,59 @@ async fn permission_uses_kind_then_name_then_id_or_cancels_turn() {
             Action::CancelTurn,
         ]
     );
+}
+
+#[tokio::test]
+async fn all_decline_paths_release_a_parked_responder() {
+    #[derive(Clone, Copy)]
+    enum ParkedCase {
+        Permission,
+        PermissionCancel,
+        Question,
+        Plan,
+    }
+
+    for case in [
+        ParkedCase::Permission,
+        ParkedCase::PermissionCancel,
+        ParkedCase::Question,
+        ParkedCase::Plan,
+    ] {
+        let (released, parked) = tokio::sync::oneshot::channel();
+        let backend = ParkedBackend {
+            expected: match case {
+                ParkedCase::Permission => ParkedAction::Permission,
+                ParkedCase::PermissionCancel => ParkedAction::CancelTurn,
+                ParkedCase::Question => ParkedAction::Question,
+                ParkedCase::Plan => ParkedAction::Plan,
+            },
+            responder: Arc::new(Mutex::new(Some(released))),
+        };
+        let interaction = match case {
+            ParkedCase::Permission => PendingInteraction::Permission {
+                request_id: "permission".to_string(),
+                options: vec![option("deny", "Deny", "reject_once")],
+            },
+            ParkedCase::PermissionCancel => PendingInteraction::Permission {
+                request_id: "permission-cancel".to_string(),
+                options: Vec::new(),
+            },
+            ParkedCase::Question => PendingInteraction::Question {
+                question_id: "question".to_string(),
+            },
+            ParkedCase::Plan => PendingInteraction::Plan {
+                approval_id: "plan".to_string(),
+            },
+        };
+
+        decline_interaction(&backend, "parked", interaction)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -326,4 +483,47 @@ async fn live_interactions_decline_and_turn_reaches_terminal_marker() {
     assert_eq!(attachment.snapshot().error_strip, INTERACTIVE_PROMPT_NOTICE);
     assert!(attachment.snapshot().t_end_ns > 0);
     assert!(!attachment.snapshot().stream_active);
+}
+
+#[tokio::test]
+async fn decline_failure_cancels_terminalizes_and_stops_receiving() {
+    let state = session_state("decline-failure");
+    let cancel_count = Arc::new(AtomicUsize::new(0));
+    let backend = FailingBackend {
+        state: Arc::clone(&state),
+        cancel_count: Arc::clone(&cancel_count),
+    };
+    let projector = LiveProjector::new(Arc::new(backend), SharedModel::new());
+    let mut attachment = projector.attach("decline-failure", 0).await.unwrap();
+
+    emit(
+        &state,
+        AcpEvent::PermissionRequest {
+            request_id: "permission".to_string(),
+            tool_call: serde_json::json!({}),
+            options: vec![option("deny", "Deny", "reject_once")],
+        },
+    )
+    .await;
+    let error = attachment.receive_next().await.unwrap_err();
+
+    assert!(error.to_string().contains("permission responder closed"));
+    assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+    assert!(!attachment.snapshot().stream_active);
+    assert!(attachment.snapshot().t_end_ns > 0);
+    assert!(attachment
+        .snapshot()
+        .error_strip
+        .contains("permission responder closed"));
+
+    emit(
+        &state,
+        AcpEvent::ContentDelta {
+            text: "must not resume".to_string(),
+            parent_tool_use_id: None,
+        },
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert_eq!(attachment.queued_control_events(), 0);
 }

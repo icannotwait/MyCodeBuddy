@@ -376,9 +376,12 @@ impl SharedModel {
                 .clone_from(&projection.transcript_json);
             state.transcript_generation = projection.transcript_generation;
         }
-        if state.t0_ns != 0 && state.t_first_token_ns == 0 && !projection.live_assistant.is_empty()
-        {
-            state.t_first_token_ns = observed_at_ns;
+        if state.t0_ns != 0 && state.t_first_token_ns == 0 {
+            if projection.t_first_token_ns != 0 {
+                state.t_first_token_ns = projection.t_first_token_ns.max(state.t0_ns);
+            } else if !projection.live_assistant.is_empty() {
+                state.t_first_token_ns = observed_at_ns;
+            }
         }
         if projection.t_end_ns >= state.t0_ns && projection.t_end_ns != 0 {
             state.t_end_ns = projection.t_end_ns;

@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 use codeg_eui_core::{
     snapshot_and_subscribe_observed, InteractionBackend, InteractionFuture, LiveBackend,
     LiveFuture, LiveProjector, Projection, ReceiveOutcome, SharedModel,
 };
-use codeg_lib::acp::types::PermissionOptionInfo;
+use codeg_lib::acp::types::{ConnectionStatus, PermissionOptionInfo, UserMessageBlock};
 use codeg_lib::acp::{AcpEvent, EventEnvelope, SessionState};
 use codeg_lib::models::AgentType;
 use tokio::sync::RwLock;
@@ -39,6 +39,67 @@ async fn emit(state: &Arc<RwLock<SessionState>>, payload: AcpEvent) {
 struct StateBackend {
     state: Arc<RwLock<SessionState>>,
     declines: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct RemovableStateBackend {
+    state: Arc<Mutex<Option<Arc<RwLock<SessionState>>>>>,
+}
+
+impl RemovableStateBackend {
+    fn new(state: Arc<RwLock<SessionState>>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(Some(state))),
+        }
+    }
+
+    fn remove(&self) {
+        self.state.lock().unwrap().take();
+    }
+}
+
+impl InteractionBackend for RemovableStateBackend {
+    fn respond_permission<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _request_id: &'a str,
+        _option_id: &'a str,
+    ) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_active_turn<'a>(&'a self, _connection_id: &'a str) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_question<'a>(
+        &'a self,
+        _connection_id: &'a str,
+        _question_id: &'a str,
+    ) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_plan_approvals_by_parent<'a>(
+        &'a self,
+        _connection_id: &'a str,
+    ) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl LiveBackend for RemovableStateBackend {
+    fn get_state<'a>(
+        &'a self,
+        connection_id: &'a str,
+    ) -> LiveFuture<'a, Option<Arc<RwLock<SessionState>>>> {
+        let state = self.state.lock().unwrap().clone();
+        Box::pin(async move {
+            let state = state?;
+            let matches = state.read().await.connection_id == connection_id;
+            matches.then_some(state)
+        })
+    }
 }
 
 impl InteractionBackend for StateBackend {
@@ -187,6 +248,108 @@ fn user_message_starts_a_new_assistant_generation_and_marker_window() {
 }
 
 #[test]
+fn transcript_payload_tracks_user_and_completed_assistant_turns() {
+    let mut projection = Projection {
+        connection_id: "transcript".to_string(),
+        transcript_json: b"[]".to_vec(),
+        ..Projection::default()
+    };
+
+    projection.apply_envelope(
+        &EventEnvelope {
+            seq: 1,
+            connection_id: "transcript".to_string(),
+            payload: AcpEvent::UserMessage {
+                message_id: "user-1".to_string(),
+                blocks: vec![UserMessageBlock::Text {
+                    text: "question".to_string(),
+                }],
+            },
+        },
+        10,
+    );
+    projection.apply_envelope(
+        &EventEnvelope {
+            seq: 2,
+            connection_id: "transcript".to_string(),
+            payload: AcpEvent::ContentDelta {
+                text: "answer".to_string(),
+                parent_tool_use_id: None,
+            },
+        },
+        20,
+    );
+    projection.apply_envelope(
+        &EventEnvelope {
+            seq: 3,
+            connection_id: "transcript".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "session".to_string(),
+                stop_reason: "end_turn".to_string(),
+                agent_type: "codex".to_string(),
+                mark_awaiting_reply: true,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        },
+        30,
+    );
+
+    let transcript: serde_json::Value =
+        serde_json::from_slice(&projection.transcript_json).unwrap();
+    assert_eq!(transcript[0]["id"], "user-1");
+    assert_eq!(transcript[0]["role"], "user");
+    assert_eq!(transcript[0]["blocks"][0]["text"], "question");
+    assert_eq!(transcript[1]["role"], "assistant");
+    assert_eq!(transcript[1]["blocks"][0]["text"], "answer");
+    assert!(projection.live_assistant.is_empty());
+    assert_eq!(projection.t_end_ns, 30);
+}
+
+#[test]
+fn prompting_and_pending_user_message_keep_turn_active_and_clear_stale_error() {
+    let mut state = SessionState::new(
+        "prompting".to_string(),
+        AgentType::Codex,
+        None,
+        "eui-test".to_string(),
+        None,
+    );
+    let _ = state.apply_event(&AcpEvent::Error {
+        message: "previous turn failed".to_string(),
+        agent_type: "codex".to_string(),
+        code: None,
+        terminal: false,
+    });
+    let _ = state.apply_event(&AcpEvent::UserMessage {
+        message_id: "next-turn".to_string(),
+        blocks: Vec::new(),
+    });
+    state.event_seq = 2;
+    let mut projection = Projection::default();
+    projection.replace_from_snapshot(&state.to_snapshot(), 10);
+
+    assert!(projection.stream_active);
+    assert_eq!(projection.error_strip, "previous turn failed");
+    assert_eq!(projection.t_end_ns, 0);
+
+    projection.apply_envelope(
+        &EventEnvelope {
+            seq: 3,
+            connection_id: "prompting".to_string(),
+            payload: AcpEvent::StatusChanged {
+                status: ConnectionStatus::Prompting,
+            },
+        },
+        20,
+    );
+
+    assert!(projection.stream_active);
+    assert!(projection.error_strip.is_empty());
+    assert_eq!(projection.t_end_ns, 0);
+}
+
+#[test]
 fn turn_attempt_rollback_forces_authoritative_recovery() {
     let mut projection = Projection {
         connection_id: "rollback".to_string(),
@@ -274,14 +437,60 @@ async fn snapshot_replacement_coalesces_text_and_reduces_tool_summaries() {
     let snapshot = state.read().await.to_snapshot();
     let mut projection = Projection::default();
     projection.replace_from_snapshot(&snapshot, 50);
+    let mut streamed = Projection {
+        connection_id: "snapshot".to_string(),
+        ..Projection::default()
+    };
+    streamed.apply_envelope(
+        &EventEnvelope {
+            seq: 1,
+            connection_id: "snapshot".to_string(),
+            payload: AcpEvent::ContentDelta {
+                text: "hel".to_string(),
+                parent_tool_use_id: None,
+            },
+        },
+        10,
+    );
+    streamed.apply_envelope(
+        &EventEnvelope {
+            seq: 2,
+            connection_id: "snapshot".to_string(),
+            payload: AcpEvent::ContentDelta {
+                text: "lo".to_string(),
+                parent_tool_use_id: None,
+            },
+        },
+        20,
+    );
+    streamed.apply_envelope(
+        &EventEnvelope {
+            seq: 3,
+            connection_id: "snapshot".to_string(),
+            payload: AcpEvent::ToolCall {
+                tool_call_id: "tool-1".to_string(),
+                title: "Read file".to_string(),
+                kind: "read".to_string(),
+                status: "in_progress".to_string(),
+                content: None,
+                raw_input: None,
+                raw_output: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        },
+        30,
+    );
 
-    assert_eq!(projection.live_assistant, "hello");
+    assert!(projection.live_assistant.is_empty());
+    assert_eq!(streamed.live_assistant, projection.live_assistant);
     assert_eq!(projection.tools.len(), 1);
     assert_eq!(projection.tools[0].name, "Read file");
     assert_eq!(projection.tools[0].status, "in_progress");
     assert_eq!(projection.event_seq, 3);
     assert_eq!(projection.assistant_generation, 1);
-    assert_eq!(projection.transcript_generation, 1);
+    assert_eq!(projection.transcript_generation, 0);
 }
 
 #[tokio::test]
@@ -403,6 +612,67 @@ async fn sequence_gap_replaces_projection_from_authoritative_snapshot() {
 }
 
 #[tokio::test]
+async fn sequence_gap_retains_interaction_evidence_cleared_by_completion() {
+    let state = state("gap-interaction");
+    let declines = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn LiveBackend> = Arc::new(StateBackend {
+        state: Arc::clone(&state),
+        declines: Arc::clone(&declines),
+    });
+    let projector = LiveProjector::new(backend, SharedModel::new());
+    let mut attachment = projector.attach("gap-interaction", 0).await.unwrap();
+
+    let permission = {
+        let mut guard = state.write().await;
+        let _ = guard.apply_event(&AcpEvent::UserMessage {
+            message_id: "gap-user".to_string(),
+            blocks: Vec::new(),
+        });
+        guard.event_seq = 1;
+        let _ = guard.apply_event(&AcpEvent::ContentDelta {
+            text: "gap answer".to_string(),
+            parent_tool_use_id: None,
+        });
+        guard.event_seq = 2;
+        let payload = AcpEvent::PermissionRequest {
+            request_id: "gap-permission".to_string(),
+            tool_call: serde_json::json!({}),
+            options: vec![PermissionOptionInfo {
+                option_id: "deny".to_string(),
+                name: "Deny".to_string(),
+                kind: "reject_once".to_string(),
+            }],
+        };
+        let _ = guard.apply_event(&payload);
+        guard.event_seq = 3;
+        let envelope = Arc::new(EventEnvelope {
+            seq: 3,
+            connection_id: "gap-interaction".to_string(),
+            payload,
+        });
+        let _ = guard.apply_event(&AcpEvent::TurnComplete {
+            session_id: "session".to_string(),
+            stop_reason: "end_turn".to_string(),
+            agent_type: "codex".to_string(),
+            mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
+        });
+        guard.event_seq = 4;
+        (guard.event_stream(), envelope)
+    };
+    permission.0.send(permission.1);
+
+    assert_eq!(
+        attachment.receive_next().await.unwrap(),
+        ReceiveOutcome::Recovered
+    );
+    assert_eq!(declines.load(Ordering::SeqCst), 1);
+    assert_eq!(attachment.snapshot().event_seq, 4);
+    assert!(attachment.snapshot().t_end_ns > 0);
+}
+
+#[tokio::test]
 async fn control_overflow_resyncs_and_declines_snapshot_permission_once() {
     let state = state("overflow");
     let declines = Arc::new(AtomicUsize::new(0));
@@ -488,6 +758,150 @@ async fn control_overflow_resyncs_and_declines_snapshot_permission_once() {
     assert_eq!(attachment.snapshot().tools, expected.tools);
     assert_eq!(attachment.snapshot().stream_active, expected.stream_active);
     assert_eq!(declines.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
+    let state = state("terminal-overflow");
+    let declines = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn LiveBackend> = Arc::new(StateBackend {
+        state: Arc::clone(&state),
+        declines: Arc::clone(&declines),
+    });
+    let projector = LiveProjector::with_control_capacity(backend, SharedModel::new(), 128);
+    let mut attachment = projector.attach("terminal-overflow", 0).await.unwrap();
+
+    emit(
+        &state,
+        AcpEvent::UserMessage {
+            message_id: "overflow-user".to_string(),
+            blocks: vec![UserMessageBlock::Text {
+                text: "question".to_string(),
+            }],
+        },
+    )
+    .await;
+    emit(
+        &state,
+        AcpEvent::ContentDelta {
+            text: "final answer".to_string(),
+            parent_tool_use_id: None,
+        },
+    )
+    .await;
+    for _ in 2..128 {
+        emit(
+            &state,
+            AcpEvent::ContentDelta {
+                text: String::new(),
+                parent_tool_use_id: None,
+            },
+        )
+        .await;
+    }
+    for _ in 0..1_000 {
+        if attachment.queued_control_events() == 128 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attachment.queued_control_events(), 128);
+
+    emit(
+        &state,
+        AcpEvent::PermissionRequest {
+            request_id: "dropped-permission".to_string(),
+            tool_call: serde_json::json!({}),
+            options: vec![PermissionOptionInfo {
+                option_id: "deny".to_string(),
+                name: "Deny".to_string(),
+                kind: "reject_once".to_string(),
+            }],
+        },
+    )
+    .await;
+    for _ in 0..1_000 {
+        if attachment.recovery_pending() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(attachment.recovery_pending());
+    emit(
+        &state,
+        AcpEvent::TurnComplete {
+            session_id: "session".to_string(),
+            stop_reason: "end_turn".to_string(),
+            agent_type: "codex".to_string(),
+            mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        attachment.receive_next().await.unwrap(),
+        ReceiveOutcome::Recovered
+    );
+    assert_eq!(declines.load(Ordering::SeqCst), 1);
+    assert_eq!(attachment.snapshot().event_seq, 130);
+    assert!(!attachment.snapshot().stream_active);
+    assert!(attachment.snapshot().t_first_token_ns > 0);
+    assert!(attachment.snapshot().t_end_ns > 0);
+    let transcript: serde_json::Value =
+        serde_json::from_slice(&attachment.snapshot().transcript_json).unwrap();
+    assert_eq!(transcript[0]["id"], "overflow-user");
+    assert_eq!(transcript[1]["blocks"][0]["text"], "final answer");
+}
+
+#[tokio::test]
+async fn closed_stream_terminalizes_the_projection() {
+    let state = state("closed");
+    let backend = RemovableStateBackend::new(Arc::clone(&state));
+    let projector = LiveProjector::new(Arc::new(backend.clone()), SharedModel::new());
+    let mut attachment = projector.attach("closed", 0).await.unwrap();
+    drop(state);
+    backend.remove();
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), attachment.receive_next())
+            .await
+            .unwrap()
+            .unwrap(),
+        ReceiveOutcome::Closed
+    );
+    assert!(!attachment.snapshot().stream_active);
+    assert!(attachment.snapshot().t_end_ns > 0);
+    assert!(attachment.snapshot().error_strip.contains("closed"));
+}
+
+#[tokio::test]
+async fn missing_connection_during_recovery_terminalizes_the_projection() {
+    let state = state("removed");
+    let backend = RemovableStateBackend::new(Arc::clone(&state));
+    let projector = LiveProjector::new(Arc::new(backend.clone()), SharedModel::new());
+    let mut attachment = projector.attach("removed", 0).await.unwrap();
+    let stream = state.read().await.event_stream();
+    stream.send(Arc::new(EventEnvelope {
+        seq: 2,
+        connection_id: "removed".to_string(),
+        payload: AcpEvent::ContentDelta {
+            text: "gap".to_string(),
+            parent_tool_use_id: None,
+        },
+    }));
+    backend.remove();
+
+    let error = attachment.receive_next().await.unwrap_err();
+    assert!(error.to_string().contains("ACP connection not found"));
+    assert!(!attachment.snapshot().stream_active);
+    assert!(!attachment.snapshot().needs_resync);
+    assert!(attachment.snapshot().t_end_ns > 0);
+    assert!(attachment
+        .snapshot()
+        .error_strip
+        .contains("ACP connection not found"));
 }
 
 #[tokio::test]

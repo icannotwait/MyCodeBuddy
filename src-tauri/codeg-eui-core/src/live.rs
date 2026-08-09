@@ -2,17 +2,17 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use codeg_lib::acp::session_state::visible_assistant_text;
-use codeg_lib::acp::types::PermissionOptionInfo;
+use codeg_lib::acp::types::{ConnectionStatus, PermissionOptionInfo};
 use codeg_lib::acp::{AcpEvent, EventEnvelope, LiveSessionSnapshot, SessionState};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::model::SharedModel;
-use crate::perf::native_timestamp_ns;
+use crate::perf::{native_timestamp_ns, wall_timestamp_rfc3339};
 
 pub const LIVE_CONTROL_CAPACITY: usize = 128;
 pub const INTERACTIVE_PROMPT_NOTICE: &str = "Interactive prompts require the main app";
@@ -279,6 +279,8 @@ fn is_reject_or_deny(value: &str) -> bool {
 pub struct AttachPoint {
     pub snapshot: LiveSessionSnapshot,
     pub receiver: broadcast::Receiver<Arc<EventEnvelope>>,
+    pub last_assistant_text: Option<String>,
+    pub parent_turn_generation: u64,
 }
 
 pub async fn snapshot_and_subscribe(state: &Arc<RwLock<SessionState>>) -> AttachPoint {
@@ -296,6 +298,8 @@ pub async fn snapshot_and_subscribe_observed(
     AttachPoint {
         snapshot,
         receiver: guard.event_stream().subscribe(),
+        last_assistant_text: guard.last_assistant_text.clone(),
+        parent_turn_generation: guard.parent_turn_generation,
     }
 }
 
@@ -405,6 +409,8 @@ impl LiveProjector {
             seen,
             selection_rx: self.model.selection_receiver(),
             control_capacity: self.control_capacity,
+            parent_turn_generation: attach.parent_turn_generation,
+            recovery_envelope: None,
             pump,
         })
     }
@@ -419,6 +425,8 @@ pub struct LiveAttachment {
     seen: HashSet<InteractionKey>,
     selection_rx: watch::Receiver<u64>,
     control_capacity: usize,
+    parent_turn_generation: u64,
+    recovery_envelope: Option<Arc<EventEnvelope>>,
     pump: ControlPump,
 }
 
@@ -459,6 +467,7 @@ impl LiveAttachment {
             if self.pump.needs_resync() {
                 return self.resync().await;
             }
+            self.terminalize_stream_error("Live event stream closed");
             return Ok(ReceiveOutcome::Closed);
         };
         if self.pump.needs_resync() {
@@ -468,6 +477,7 @@ impl LiveAttachment {
         let now_ns = native_timestamp_ns();
         match self.projection.apply_envelope(&envelope, now_ns) {
             ApplyOutcome::NeedsResync => {
+                self.recovery_envelope = Some(envelope);
                 let _ = self.model.apply_live_projection(
                     self.selection_epoch,
                     &self.projection,
@@ -522,18 +532,79 @@ impl LiveAttachment {
             self.pump.abort();
             return Ok(ReceiveOutcome::SelectionChanged);
         }
-        self.pump.abort();
+        self.pump.stop().await;
 
-        let state = self
-            .backend
-            .get_state(&self.connection_id)
-            .await
-            .ok_or_else(|| LiveError::ConnectionNotFound(self.connection_id.clone()))?;
+        let mut recovery_evidence = self.pump.take_recovery_evidence();
+        if let Some(envelope) = self.recovery_envelope.take() {
+            recovery_evidence.observe(&envelope.payload);
+        }
+
+        let Some(state) = self.backend.get_state(&self.connection_id).await else {
+            self.terminalize_stream_error(&format!(
+                "ACP connection not found: {}",
+                self.connection_id
+            ));
+            return Err(LiveError::ConnectionNotFound(self.connection_id.clone()));
+        };
         let attach = snapshot_and_subscribe(&state).await;
+        let was_active = self.projection.stream_active
+            || self.projection.turn_message_id.is_some()
+            || recovery_evidence.saw_turn_activity
+            || attach.parent_turn_generation > self.parent_turn_generation;
+        let completed_turn_id = self
+            .projection
+            .turn_message_id
+            .clone()
+            .or_else(|| {
+                recovery_evidence
+                    .user_turns
+                    .last()
+                    .map(|turn| turn.message_id.clone())
+            })
+            .or_else(|| {
+                (attach.parent_turn_generation > 0)
+                    .then(|| format!("turn-{}", attach.parent_turn_generation))
+            });
         self.projection
             .replace_from_snapshot(&attach.snapshot, native_timestamp_ns());
-        if snapshot_has_interaction(&attach.snapshot) {
+        for turn in &recovery_evidence.user_turns {
+            self.projection
+                .append_user_turn(&turn.message_id, &turn.blocks);
+        }
+        if was_active
+            && attach.snapshot.pending_user_message.is_none()
+            && attach.snapshot.live_message.is_none()
+        {
+            self.projection.complete_recovered_turn(
+                completed_turn_id,
+                attach.last_assistant_text.as_deref().unwrap_or_default(),
+                native_timestamp_ns(),
+            );
+        }
+        if !recovery_evidence.interactions.is_empty() || snapshot_has_interaction(&attach.snapshot)
+        {
             self.projection.error_strip = INTERACTIVE_PROMPT_NOTICE.to_string();
+        }
+        for interaction in recovery_evidence.interactions {
+            if let Err(error) = decline_once(
+                self.backend.as_ref(),
+                &self.connection_id,
+                interaction,
+                &mut self.seen,
+            )
+            .await
+            {
+                terminalize_decline_failure(
+                    self.backend.as_ref(),
+                    &self.model,
+                    self.selection_epoch,
+                    &self.connection_id,
+                    &mut self.projection,
+                    error.clone(),
+                )
+                .await;
+                return Err(LiveError::Interaction(error));
+            }
         }
         if let Err(error) = reconcile_snapshot_interactions(
             self.backend.as_ref(),
@@ -561,8 +632,21 @@ impl LiveAttachment {
         ) {
             return Ok(ReceiveOutcome::SelectionChanged);
         }
+        self.parent_turn_generation = attach.parent_turn_generation;
         self.pump = ControlPump::start(attach.receiver, self.control_capacity);
         Ok(ReceiveOutcome::Recovered)
+    }
+
+    fn terminalize_stream_error(&mut self, message: &str) {
+        let now_ns = native_timestamp_ns();
+        self.projection.error_strip = message.to_string();
+        self.projection.stream_active = false;
+        self.projection.needs_resync = false;
+        self.projection.t_end_ns = now_ns;
+        let _ = self
+            .model
+            .apply_live_projection(self.selection_epoch, &self.projection, now_ns);
+        self.pump.abort();
     }
 
     pub async fn run(mut self) {
@@ -589,7 +673,20 @@ const PUMP_CLOSED: u8 = 3;
 struct ControlPump {
     receiver: mpsc::Receiver<Arc<EventEnvelope>>,
     status: Arc<AtomicU8>,
+    overflow: Arc<Mutex<Option<Arc<EventEnvelope>>>>,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct RecoveryEvidence {
+    interactions: Vec<PendingInteraction>,
+    user_turns: Vec<RecoveredUserTurn>,
+    saw_turn_activity: bool,
+}
+
+struct RecoveredUserTurn {
+    message_id: String,
+    blocks: serde_json::Value,
 }
 
 impl ControlPump {
@@ -597,12 +694,17 @@ impl ControlPump {
         let (sender, receiver) = mpsc::channel(capacity);
         let status = Arc::new(AtomicU8::new(PUMP_RUNNING));
         let pump_status = Arc::clone(&status);
+        let overflow = Arc::new(Mutex::new(None));
+        let pump_overflow = Arc::clone(&overflow);
         let task = tokio::spawn(async move {
             loop {
                 match source.recv().await {
                     Ok(envelope) => match sender.try_send(envelope) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                        Err(mpsc::error::TrySendError::Full(envelope)) => {
+                            *pump_overflow
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(envelope);
                             pump_status.store(PUMP_OVERFLOW, Ordering::Release);
                             break;
                         }
@@ -622,6 +724,7 @@ impl ControlPump {
         Self {
             receiver,
             status,
+            overflow,
             task,
         }
     }
@@ -636,6 +739,56 @@ impl ControlPump {
     fn abort(&self) {
         self.task.abort();
     }
+
+    async fn stop(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+
+    fn take_recovery_evidence(&mut self) -> RecoveryEvidence {
+        let mut evidence = RecoveryEvidence::default();
+        while let Ok(envelope) = self.receiver.try_recv() {
+            evidence.observe(&envelope.payload);
+        }
+        if let Some(envelope) = self
+            .overflow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            evidence.observe(&envelope.payload);
+        }
+        evidence
+    }
+}
+
+impl RecoveryEvidence {
+    fn observe(&mut self, event: &AcpEvent) {
+        if let Some(interaction) = pending_interaction(event) {
+            self.interactions.push(interaction);
+        }
+        if let AcpEvent::UserMessage { message_id, blocks } = event {
+            if let Ok(blocks) = serde_json::to_value(blocks) {
+                self.user_turns.push(RecoveredUserTurn {
+                    message_id: message_id.clone(),
+                    blocks,
+                });
+            }
+        }
+        self.saw_turn_activity |= is_turn_activity(event);
+    }
+}
+
+fn is_turn_activity(event: &AcpEvent) -> bool {
+    matches!(
+        event,
+        AcpEvent::UserMessage { .. }
+            | AcpEvent::ContentDelta { .. }
+            | AcpEvent::Thinking { .. }
+            | AcpEvent::ToolCall { .. }
+            | AcpEvent::ToolCallUpdate { .. }
+            | AcpEvent::TurnComplete { .. }
+    )
 }
 
 fn snapshot_has_interaction(snapshot: &LiveSessionSnapshot) -> bool {
@@ -704,6 +857,8 @@ impl Projection {
             .as_ref()
             .map(|message| message.message_id.clone());
         let starts_new_turn = turn_message_id.is_some() && turn_message_id != self.turn_message_id;
+        let previous_assistant = self.live_assistant.clone();
+        let previous_tools = self.tools.clone();
         self.connection_id.clone_from(&snapshot.connection_id);
         self.event_seq = snapshot.event_seq;
         self.live_assistant = visible_assistant_text(snapshot.live_message.as_ref());
@@ -716,7 +871,9 @@ impl Projection {
                 status: serialized_name(&tool.status),
             })
             .collect();
-        self.stream_active = snapshot.live_message.is_some();
+        self.stream_active = snapshot.live_message.is_some()
+            || snapshot.pending_user_message.is_some()
+            || snapshot.status == ConnectionStatus::Prompting;
         self.needs_resync = false;
         self.error_strip = snapshot
             .last_error
@@ -734,8 +891,12 @@ impl Projection {
             }
         }
         self.turn_message_id = turn_message_id;
-        self.assistant_generation = self.assistant_generation.saturating_add(1);
-        self.transcript_generation = self.transcript_generation.saturating_add(1);
+        if let Some(message) = &snapshot.pending_user_message {
+            self.append_user_turn(&message.message_id, &message.blocks);
+        }
+        if previous_assistant != self.live_assistant || previous_tools != self.tools {
+            self.assistant_generation = self.assistant_generation.saturating_add(1);
+        }
         self.record_first_token(now_ns);
     }
 
@@ -754,13 +915,13 @@ impl Projection {
 
         self.event_seq = envelope.seq;
         match &envelope.payload {
-            AcpEvent::UserMessage { message_id, .. } => {
+            AcpEvent::UserMessage { message_id, blocks } => {
                 self.live_assistant.clear();
                 self.tools.clear();
                 self.stream_active = true;
                 self.error_strip.clear();
                 self.assistant_generation = self.assistant_generation.saturating_add(1);
-                self.transcript_generation = self.transcript_generation.saturating_add(1);
+                self.append_user_turn(message_id, blocks);
                 self.turn_message_id = Some(message_id.clone());
                 self.t_first_token_ns = 0;
                 self.t_end_ns = 0;
@@ -786,7 +947,9 @@ impl Projection {
                 status,
                 ..
             } => {
-                upsert_tool(&mut self.tools, tool_call_id, Some(title), Some(status));
+                if upsert_tool(&mut self.tools, tool_call_id, Some(title), Some(status)) {
+                    self.live_assistant.clear();
+                }
                 self.assistant_generation = self.assistant_generation.saturating_add(1);
                 self.stream_active = true;
             }
@@ -796,20 +959,20 @@ impl Projection {
                 status,
                 ..
             } => {
-                upsert_tool(
+                if upsert_tool(
                     &mut self.tools,
                     tool_call_id,
                     title.as_ref(),
                     status.as_ref(),
-                );
+                ) {
+                    self.live_assistant.clear();
+                }
                 self.assistant_generation = self.assistant_generation.saturating_add(1);
             }
             AcpEvent::TurnComplete { .. } => {
-                self.stream_active = false;
-                self.tools.clear();
-                self.turn_message_id = None;
-                self.transcript_generation = self.transcript_generation.saturating_add(1);
-                self.t_end_ns = now_ns;
+                let turn_message_id = self.turn_message_id.clone();
+                let final_text = self.live_assistant.clone();
+                self.complete_recovered_turn(turn_message_id, &final_text, now_ns);
             }
             AcpEvent::Error {
                 message, terminal, ..
@@ -825,6 +988,13 @@ impl Projection {
                 self.stream_active = false;
                 self.t_end_ns = now_ns;
             }
+            AcpEvent::StatusChanged {
+                status: ConnectionStatus::Prompting,
+            } => {
+                self.error_strip.clear();
+                self.stream_active = true;
+                self.t_end_ns = 0;
+            }
             _ => {}
         }
         ApplyOutcome::Applied
@@ -833,6 +1003,71 @@ impl Projection {
     fn record_first_token(&mut self, now_ns: u64) {
         if self.t_first_token_ns == 0 && !self.live_assistant.is_empty() {
             self.t_first_token_ns = now_ns;
+        }
+    }
+
+    fn append_user_turn<T: Serialize>(&mut self, message_id: &str, blocks: &T) {
+        self.append_transcript_turn(serde_json::json!({
+            "id": message_id,
+            "role": "user",
+            "blocks": blocks,
+            "timestamp": wall_timestamp_rfc3339(),
+        }));
+    }
+
+    fn complete_recovered_turn(
+        &mut self,
+        turn_message_id: Option<String>,
+        final_text: &str,
+        now_ns: u64,
+    ) {
+        if self.t_first_token_ns == 0 && !final_text.is_empty() {
+            self.t_first_token_ns = now_ns;
+        }
+        if !final_text.is_empty() {
+            let assistant_id = format!(
+                "{}-assistant",
+                turn_message_id.as_deref().unwrap_or("recovered-live-turn")
+            );
+            self.append_transcript_turn(serde_json::json!({
+                "id": assistant_id,
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": final_text}],
+                "timestamp": wall_timestamp_rfc3339(),
+            }));
+        }
+        if !self.live_assistant.is_empty() || !self.tools.is_empty() {
+            self.assistant_generation = self.assistant_generation.saturating_add(1);
+        }
+        self.live_assistant.clear();
+        self.tools.clear();
+        self.stream_active = false;
+        self.turn_message_id = None;
+        self.t_end_ns = now_ns;
+    }
+
+    fn append_transcript_turn(&mut self, turn: serde_json::Value) {
+        let turn_id = turn.get("id").and_then(serde_json::Value::as_str);
+        let mut transcript = if self.transcript_json.is_empty() {
+            Vec::new()
+        } else if let Ok(transcript) =
+            serde_json::from_slice::<Vec<serde_json::Value>>(&self.transcript_json)
+        {
+            transcript
+        } else {
+            return;
+        };
+        if turn_id.is_some_and(|turn_id| {
+            transcript.iter().any(|existing| {
+                existing.get("id").and_then(serde_json::Value::as_str) == Some(turn_id)
+            })
+        }) {
+            return;
+        }
+        transcript.push(turn);
+        if let Ok(bytes) = serde_json::to_vec(&transcript) {
+            self.transcript_json = bytes;
+            self.transcript_generation = self.transcript_generation.saturating_add(1);
         }
     }
 }
@@ -849,7 +1084,7 @@ fn upsert_tool(
     id: &str,
     name: Option<&String>,
     status: Option<&String>,
-) {
+) -> bool {
     if let Some(tool) = tools.iter_mut().find(|tool| tool.id == id) {
         if let Some(name) = name {
             tool.name.clone_from(name);
@@ -857,11 +1092,12 @@ fn upsert_tool(
         if let Some(status) = status {
             tool.status.clone_from(status);
         }
-        return;
+        return false;
     }
     tools.push(ToolSummary {
         id: id.to_string(),
         name: name.cloned().unwrap_or_default(),
         status: status.cloned().unwrap_or_default(),
     });
+    true
 }
