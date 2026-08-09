@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use codeg_lib::app_state::AppState;
 use codeg_lib::logging::init::LogGuard;
@@ -45,7 +46,7 @@ pub enum BootstrapError {
 }
 
 pub struct EuiBootstrap {
-    pub state: AppState,
+    pub state: Arc<AppState>,
     pub started_services: StartedServices,
     runtime: Option<Runtime>,
     _log_guard: Option<LogGuard>,
@@ -65,7 +66,7 @@ impl EuiBootstrap {
         let runtime = build_runtime()?;
         let state = runtime.block_on(initialize_state(root))?;
 
-        Ok(Self::new(state, runtime, log_guard))
+        Ok(Self::new(Arc::new(state), runtime, log_guard))
     }
 
     pub async fn start_for_test(root: impl AsRef<Path>) -> Result<Self, BootstrapError> {
@@ -79,7 +80,7 @@ impl EuiBootstrap {
             .await
             .map_err(|error| BootstrapError::RuntimeTask(error.to_string()))??;
 
-        Ok(Self::new(state, runtime, log_guard))
+        Ok(Self::new(Arc::new(state), runtime, log_guard))
     }
 
     /// Join the owned runtime before releasing the shared application state.
@@ -97,7 +98,7 @@ impl EuiBootstrap {
             .clone()
     }
 
-    fn new(state: AppState, runtime: Runtime, log_guard: LogGuard) -> Self {
+    fn new(state: Arc<AppState>, runtime: Runtime, log_guard: LogGuard) -> Self {
         Self {
             state,
             started_services: StartedServices::default(),

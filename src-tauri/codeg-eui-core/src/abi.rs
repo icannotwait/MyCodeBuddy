@@ -405,6 +405,11 @@ pub extern "C" fn codeg_eui_set_agent_settings(
             Ok(json) => json,
             Err(error) => return error,
         };
+        if serde_json::from_slice::<codeg_lib::commands::eui_facade::EuiAgentSettingsPatch>(&json)
+            .is_err()
+        {
+            return CODEG_EUI_ERR_INVALID_STATE;
+        }
         accept_and_write(
             &mut slot,
             out_request_id,

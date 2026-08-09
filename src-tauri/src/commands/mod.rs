@@ -14,6 +14,7 @@ pub mod custom_skills;
 pub mod delegate_access;
 pub mod delegation;
 pub mod document_translate;
+pub mod eui_facade;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]

@@ -115,6 +115,8 @@ int codeg_eui_cancel_active_turn(uint64_t* out_request_id);
 int codeg_eui_get_agent_settings(const uint8_t* agent_utf8,
                                  size_t agent_len,
                                  uint64_t* out_request_id);
+/* Settings/probe work is asynchronous; consume the terminal JSON completion
+ * from CodegEuiFrame::completions on a later successful poll. */
 int codeg_eui_set_agent_settings(const uint8_t* agent_utf8,
                                  size_t agent_len,
                                  const uint8_t* json_utf8,
