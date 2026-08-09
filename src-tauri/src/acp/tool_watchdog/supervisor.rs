@@ -603,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn lease_gone_and_turn_idle_is_already_terminal() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         // Claim then settle (simulates completion race winner before escalate).
         let claim = register_cancelling(
@@ -650,7 +650,7 @@ mod tests {
         // lease as TimedOut before the spawned escalate task runs, but the
         // stamped turn is still Prompting → must generation-guarded CancelTurn.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -713,7 +713,7 @@ mod tests {
         // Specific cancel "succeeds" at capability level but lease stays live
         // (Cancelling) while turn remains Prompting → escalate after budget.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -838,7 +838,7 @@ mod tests {
         // stamped turn is still Prompting → specific stage must NOT converge;
         // escalate to generation-guarded turn cancel.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -977,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn turn_then_disconnect_at_convergence_boundaries() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim =
             register_cancelling(&reg, CancellationCapability::Turn, CancelCause::AutoTimeout).await;
@@ -1076,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn user_stop_emits_user_cancelled_code() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim =
             register_cancelling(&reg, CancellationCapability::Turn, CancelCause::UserStop).await;
@@ -1104,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn host_only_delegation_cancel_invokes_broker_path() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -1153,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn delegation_wait_cancel_does_not_call_task_cancel() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -1204,7 +1204,7 @@ mod tests {
         use tokio::time::Instant;
 
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let t0 = WatchdogInstant {
             mono: Instant::now(),
@@ -1334,7 +1334,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_terminal_turn_only_skips_specific() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim =
             register_cancelling(&reg, CancellationCapability::Turn, CancelCause::AutoTimeout).await;
@@ -1364,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn saturated_control_lane_admit_failure_continues_escalation() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -1401,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_cancel_invoked_under_capability() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -1448,7 +1448,7 @@ mod tests {
         // lease as Cancelling — after the specific budget, escalate to
         // generation-guarded CancelTurn.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,
@@ -1505,7 +1505,7 @@ mod tests {
         // Important R3: UserStop on a delegation must plumb user_cancelled,
         // never hard-coded tool_stalled_timeout.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         ));
         let claim = register_cancelling(
             &reg,

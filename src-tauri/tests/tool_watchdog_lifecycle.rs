@@ -95,7 +95,7 @@ async fn advance_to_grace(
 /// silent terminal: 600s warning + 600s grace -> process tree kill claim -> settle
 #[tokio::test]
 async fn silent_terminal_600_600_claims_terminal_then_settles() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;
@@ -148,7 +148,7 @@ async fn silent_terminal_600_600_claims_terminal_then_settles() {
 /// Truncation-cap offsets still renew without unbounded registry growth.
 #[tokio::test]
 async fn truncation_cap_offset_renews_without_registry_growth() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;
@@ -184,7 +184,7 @@ async fn truncation_cap_offset_renews_without_registry_growth() {
 #[tokio::test]
 async fn cancellable_mcp_settles_without_turn_cancel() {
     let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-        ToolWatchdogSettings::default(),
+        ToolWatchdogSettings::enabled_defaults(),
     ));
     let turn = sample_turn(1);
     let t0 = clock_base();
@@ -234,7 +234,7 @@ async fn cancellable_mcp_settles_without_turn_cancel() {
 #[tokio::test]
 async fn uncancellable_mcp_escalates_turn_then_optionally_disconnect() {
     let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-        ToolWatchdogSettings::default(),
+        ToolWatchdogSettings::enabled_defaults(),
     ));
     let turn = sample_turn(1);
     let t0 = clock_base();
@@ -284,7 +284,7 @@ async fn uncancellable_mcp_escalates_turn_then_optionally_disconnect() {
 /// Broker child activity renews the exact parent wait lease only.
 #[tokio::test]
 async fn broker_child_activity_renews_parent_delegation_lease() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;
@@ -321,7 +321,7 @@ async fn broker_child_activity_renews_parent_delegation_lease() {
 /// Ambiguous parallel terminals never bind a guessed kill — turn fallback only.
 #[tokio::test]
 async fn ambiguous_parallel_terminals_keep_turn_capability() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;
@@ -341,7 +341,7 @@ async fn ambiguous_parallel_terminals_keep_turn_capability() {
 async fn single_terminal_outcome_across_settlement_paths() {
     // Path A: automatic timeout
     {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn(1);
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -375,7 +375,7 @@ async fn single_terminal_outcome_across_settlement_paths() {
 
     // Path B: user stop
     {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn(1);
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -400,7 +400,7 @@ async fn single_terminal_outcome_across_settlement_paths() {
 
     // Path C: completion clears without timeout
     {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn(1);
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -414,7 +414,7 @@ async fn single_terminal_outcome_across_settlement_paths() {
 
     // Path D: disconnect clears leases
     {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn(1);
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -430,7 +430,7 @@ async fn single_terminal_outcome_across_settlement_paths() {
 /// After specific cancel of one turn, the same external session can accept another prompt.
 #[tokio::test]
 async fn same_session_accepts_next_prompt_after_specific_cancel() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn1 = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn1.clone(), t0).await;
@@ -465,7 +465,7 @@ async fn desktop_and_server_settings_cores_equivalent() {
     let manager = ConnectionManager::new();
 
     let defaults = acp_get_tool_watchdog_settings_core(&db.conn).await;
-    assert!(defaults.enabled);
+    assert!(!defaults.enabled);
     assert_eq!(defaults.warning_after_seconds, 600);
     assert_eq!(defaults.grace_seconds, 600);
 
@@ -645,7 +645,7 @@ impl CancelHost for ScriptedHost {
 fn _assert_probe() {
     let _: &dyn ConvergenceProbe = &RegistryProbe {
         registry: Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         )),
         force_prompting: Some(true),
     };
@@ -656,7 +656,7 @@ fn _assert_probe() {
 #[tokio::test]
 async fn parent_agent_output_renews_only_the_active_turn_fallback() {
     let reg = Arc::new(ToolExecutionLeaseRegistry::new(
-        ToolWatchdogSettings::default(),
+        ToolWatchdogSettings::enabled_defaults(),
     ));
     let attr = LeaseAttribution::new(reg.clone());
     let turn = sample_turn(1);
@@ -713,7 +713,7 @@ async fn parent_agent_output_renews_only_the_active_turn_fallback() {
 /// a sibling delegation lease continues to cancel at the grace deadline.
 #[tokio::test]
 async fn exact_child_activity_clears_grace_without_renewing_a_sibling() {
-    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;

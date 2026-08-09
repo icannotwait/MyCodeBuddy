@@ -27,7 +27,8 @@ function settings(
   overrides: Partial<ToolWatchdogSettings> = {}
 ): ToolWatchdogSettings {
   return {
-    enabled: true,
+    // Product default: off (matches ToolWatchdogSettings::default in Rust).
+    enabled: false,
     warning_after_seconds: 600,
     grace_seconds: 600,
     ...overrides,
@@ -64,21 +65,21 @@ describe("clampToolWatchdogDuration", () => {
 })
 
 describe("ToolWatchdogSettingsSection", () => {
-  it("reflects backend defaults (enabled, 600/600)", async () => {
+  it("reflects backend defaults (disabled, 600/600)", async () => {
     mockGet.mockResolvedValue(settings())
     renderWithIntl()
 
     const sw = (await screen.findByLabelText(
       "Enable tool execution watchdog"
     )) as HTMLButtonElement
-    expect(sw).toHaveAttribute("data-state", "checked")
+    expect(sw).toHaveAttribute("data-state", "unchecked")
     expect(screen.getByLabelText("Warning after (seconds)")).toHaveValue(600)
     expect(screen.getByLabelText("Grace period (seconds)")).toHaveValue(600)
     expect(screen.getByText("Tool execution watchdog")).toBeInTheDocument()
   })
 
   it("saves disable and reloads applied values", async () => {
-    mockGet.mockResolvedValue(settings())
+    mockGet.mockResolvedValue(settings({ enabled: true }))
     renderWithIntl()
 
     const sw = await screen.findByLabelText("Enable tool execution watchdog")
@@ -97,7 +98,7 @@ describe("ToolWatchdogSettingsSection", () => {
   })
 
   it("clamps out-of-range durations on save", async () => {
-    mockGet.mockResolvedValue(settings())
+    mockGet.mockResolvedValue(settings({ enabled: true }))
     renderWithIntl()
 
     const warning = await screen.findByLabelText("Warning after (seconds)")
@@ -142,7 +143,7 @@ describe("ToolWatchdogSettingsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     await waitFor(() => {
       expect(mockSet).toHaveBeenCalledWith({
-        enabled: true,
+        enabled: false,
         warning_after_seconds: 120,
         grace_seconds: 600,
       })

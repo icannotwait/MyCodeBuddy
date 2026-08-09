@@ -46,7 +46,10 @@ pub struct ToolWatchdogSettings {
 impl Default for ToolWatchdogSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Product default: off. Quiet long-running tools (especially
+            // delegation waits) must not warn/cancel unless the user opts in.
+            // Duration windows remain 600/600 so re-enabling keeps prior UX.
+            enabled: false,
             warning_after_seconds: DEFAULT_WARNING_AFTER_SECS,
             grace_seconds: DEFAULT_GRACE_SECS,
         }
@@ -54,6 +57,18 @@ impl Default for ToolWatchdogSettings {
 }
 
 impl ToolWatchdogSettings {
+    /// Watchdog on with product duration windows (600/600).
+    ///
+    /// Prefer this over [`Default`] in unit/integration tests that exercise
+    /// scan, warn, grace, and cancel paths. Product [`Default`] is disabled.
+    pub const fn enabled_defaults() -> Self {
+        Self {
+            enabled: true,
+            warning_after_seconds: DEFAULT_WARNING_AFTER_SECS,
+            grace_seconds: DEFAULT_GRACE_SECS,
+        }
+    }
+
     /// Clamp both duration fields into `MIN_DURATION_SECS..=MAX_DURATION_SECS`.
     pub fn clamp(self) -> Self {
         Self {
@@ -390,9 +405,16 @@ mod tests {
     #[test]
     fn defaults_match_product_constants() {
         let settings = ToolWatchdogSettings::default();
-        assert!(settings.enabled);
+        assert!(
+            !settings.enabled,
+            "product default must leave the tool-execution watchdog off"
+        );
         assert_eq!(settings.warning_after_seconds, DEFAULT_WARNING_AFTER_SECS);
         assert_eq!(settings.grace_seconds, DEFAULT_GRACE_SECS);
+        let on = ToolWatchdogSettings::enabled_defaults();
+        assert!(on.enabled);
+        assert_eq!(on.warning_after_seconds, DEFAULT_WARNING_AFTER_SECS);
+        assert_eq!(on.grace_seconds, DEFAULT_GRACE_SECS);
         assert_eq!(DEFAULT_WARNING_AFTER_SECS, 600);
         assert_eq!(DEFAULT_GRACE_SECS, 600);
         assert_eq!(UNTRACKED_WARNING_AFTER_SECS, 1_800);

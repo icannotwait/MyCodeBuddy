@@ -1656,7 +1656,7 @@ mod tests {
     async fn same_second_projections_order_by_transition_millis() {
         use crate::acp::tool_watchdog::is_newer_diagnostic;
 
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1714,7 +1714,7 @@ mod tests {
     async fn equal_millis_scan_assigns_monotonic_transition_seq() {
         use crate::acp::tool_watchdog::is_newer_diagnostic;
 
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1807,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn running_599s_no_warning_600s_warning_only() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1841,7 +1841,7 @@ mod tests {
 
     #[tokio::test]
     async fn warning_publication_starts_new_600s_grace() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1883,7 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_changes_version_and_deadline_not_last_progress() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_in_warning_and_grace_returns_to_running() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -1999,7 +1999,7 @@ mod tests {
     /// Running progress renews without a Cleared projection (nothing to drop).
     #[tokio::test]
     async fn progress_from_running_does_not_emit_cleared() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2025,7 +2025,7 @@ mod tests {
     /// Cleared so the production event-emitter path can clear the attach map.
     #[tokio::test]
     async fn delegation_activity_in_grace_returns_cleared() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2065,7 +2065,7 @@ mod tests {
     /// backward (or when two activities share the same wall instant).
     #[tokio::test]
     async fn delegation_activity_renews_despite_wall_clock_rollback() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2100,7 +2100,7 @@ mod tests {
     /// Settings disable demotes Warning/Grace and returns Cleared projections.
     #[tokio::test]
     async fn apply_settings_disable_returns_cleared_for_grace() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2135,7 +2135,7 @@ mod tests {
     /// pause_turn demotes Grace to Paused and returns Cleared for the attach map.
     #[tokio::test]
     async fn pause_turn_returns_cleared_for_grace_leases() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2167,7 +2167,7 @@ mod tests {
     /// (complete_turn cannot clear a lease that was already removed).
     #[tokio::test]
     async fn register_tool_retires_grace_fallback_with_cleared() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2212,7 +2212,7 @@ mod tests {
     /// complete_tool Cleared + progress Cleared both reconcile SessionState map.
     #[tokio::test]
     async fn grace_progress_and_complete_clear_projections_for_replay_map() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2265,7 +2265,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_terminal_snapshot_and_unchanged_offset_do_not_renew() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2330,7 +2330,7 @@ mod tests {
 
     #[tokio::test]
     async fn permission_pause_and_resume_fresh_progress_window() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2367,7 +2367,7 @@ mod tests {
 
     #[tokio::test]
     async fn disable_clears_warning_grace_without_inventing_progress() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2400,7 +2400,7 @@ mod tests {
         assert!(reg.scan(t0.advanced(10_000)).await.is_empty());
 
         // last_progress not invented: still original wall time after re-enable path check.
-        reg.apply_settings(ToolWatchdogSettings::default()).await;
+        reg.apply_settings(ToolWatchdogSettings::enabled_defaults()).await;
         // Immediately overdue under original last_progress_at = t0.
         let re_warn = reg.scan(t0.advanced(10_000)).await;
         assert_eq!(re_warn.len(), 1);
@@ -2420,7 +2420,7 @@ mod tests {
     #[tokio::test]
     async fn completion_progress_user_stop_timeout_single_winner() {
         // Case A: completion wins before cancel.
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2435,7 +2435,7 @@ mod tests {
 
         // Case B: user stop wins; late completion settles as user_cancelled
         // (never Cleared) and removes the lease so convergence succeeds.
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         reg.start_turn(turn.clone(), t0).await;
         let stamp = register_running_tool(&reg, &turn, "tool-b", t0).await;
         let (claim, claim_projection) = reg
@@ -2478,7 +2478,7 @@ mod tests {
         assert_eq!(reg.lease_phase(&stamp.lease_id).await, None);
 
         // Case C: timeout claim is the single auto winner.
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         reg.start_turn(turn.clone(), t0).await;
         let stamp = register_running_tool(&reg, &turn, "tool-c", t0).await;
         let actions = reg.scan(t0.advanced(600)).await;
@@ -2505,7 +2505,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_lease_version_incarnation_turn_generation_rejected() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2543,7 +2543,7 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_terminal_binding_retains_only_turn_capability() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2566,7 +2566,7 @@ mod tests {
         assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
 
         // Explicit unambiguous bind upgrades capability.
-        let reg2 = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg2 = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         reg2.start_turn(turn.clone(), t0).await;
         let stamp2 = register_running_tool(&reg2, &turn, "tool-2", t0).await;
         let bound = reg2
@@ -2641,7 +2641,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_tool_retires_fallback_complete_rearms_when_eligible() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2694,7 +2694,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_projection_uses_tool_category_not_free_form_title() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2721,7 +2721,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_renews_fallback_only() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2799,7 +2799,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_turn_settles_cancelling_lease_as_user_cancelled() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2831,7 +2831,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_tracked_lease_blocks_fallback_rearm() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2873,7 +2873,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_agent_activity_hash_does_not_postpone_fallback_rearm() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2913,7 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn actionable_projections_exclude_warning_until_grace() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -2950,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_start_turn_keeps_single_fallback_warning_path() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3009,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_turn_after_complete_does_not_revive_generation() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3042,7 +3042,7 @@ mod tests {
     /// `start_turn` merges the admission timestamp so fallback re-arm uses it.
     #[tokio::test]
     async fn tool_first_start_turn_merges_admission_turn_start_at() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base(); // genuine Prompting admission time
         let t1 = t0.advanced(30); // tool registration arrives first
@@ -3110,7 +3110,7 @@ mod tests {
     /// Only the fallback warning path remains at the fixed 1,800s threshold.
     #[tokio::test]
     async fn completed_tool_key_replay_does_not_resurrect_or_retire_fallback() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3190,7 +3190,7 @@ mod tests {
     /// lease or invent a warning/cancellation path for that generation.
     #[tokio::test]
     async fn register_tool_after_complete_turn_is_rejected() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3236,7 +3236,7 @@ mod tests {
     /// are reclaimed, and re-register remains rejected via is_prompting=false.
     #[tokio::test]
     async fn complete_turn_reclaims_generation_tombstones_while_still_rejecting_register() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3309,7 +3309,7 @@ mod tests {
     /// leases after disconnect clear (even while the map entry may still exist).
     #[tokio::test]
     async fn fence_connection_rejects_register_and_start_turn_after_clear() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let turn = sample_turn();
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
@@ -3365,7 +3365,7 @@ mod tests {
     /// New incarnation is independent of a fenced prior incarnation.
     #[tokio::test]
     async fn fence_does_not_block_new_incarnation() {
-        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::enabled_defaults());
         let t0 = clock_base();
         let old = sample_turn();
         reg.fence_connection(&old.connection_id, &old.connection_incarnation)

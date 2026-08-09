@@ -35,7 +35,7 @@ fn map_stale(err: StaleLease) -> AppCommandError {
 }
 
 /// Read + clamp settings. Missing or malformed values use product defaults
-/// (enabled=true, 600/600); out-of-range durations clamp to 60..=3600.
+/// (enabled=false, 600/600); out-of-range durations clamp to 60..=3600.
 ///
 /// All three keys are loaded in one query so concurrent saves cannot yield a
 /// mixed pre-/post-commit snapshot.
@@ -309,7 +309,7 @@ mod tests {
         let (db, manager) = setup().await;
 
         let defaults = acp_get_tool_watchdog_settings_core(&db.conn).await;
-        assert!(defaults.enabled);
+        assert!(!defaults.enabled);
         assert_eq!(defaults.warning_after_seconds, 600);
         assert_eq!(defaults.grace_seconds, 600);
 
@@ -324,7 +324,7 @@ mod tests {
             .await
             .unwrap();
         let soft = load_tool_watchdog_settings(&db.conn).await;
-        assert!(soft.enabled);
+        assert!(!soft.enabled);
         assert_eq!(soft.warning_after_seconds, 600);
         assert_eq!(soft.grace_seconds, 600);
 
@@ -367,8 +367,8 @@ mod tests {
     async fn settings_update_live_registry_only_after_successful_persist() {
         let (db, manager) = setup().await;
 
-        // Baseline defaults on live registry.
-        assert!(manager.tool_lease_registry().settings().await.enabled);
+        // Baseline product defaults on live registry (watchdog off).
+        assert!(!manager.tool_lease_registry().settings().await.enabled);
 
         // Successful set disables and applies live.
         let set = acp_set_tool_watchdog_settings_core(
@@ -393,7 +393,7 @@ mod tests {
         // apply_persisted at startup path reloads into registry.
         manager
             .tool_lease_registry()
-            .apply_settings(ToolWatchdogSettings::default())
+            .apply_settings(ToolWatchdogSettings::enabled_defaults())
             .await;
         assert!(manager.tool_lease_registry().settings().await.enabled);
         apply_persisted_tool_watchdog_settings(&db.conn, &manager).await;

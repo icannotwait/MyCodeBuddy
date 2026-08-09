@@ -36,7 +36,7 @@ export function ToolWatchdogSettingsSection() {
   const t = useTranslations("ToolWatchdogSettings")
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [enabled, setEnabled] = useState(true)
+  const [enabled, setEnabled] = useState(false)
   const [warningAfter, setWarningAfter] = useState(
     TOOL_WATCHDOG_DEFAULT_WARNING
   )

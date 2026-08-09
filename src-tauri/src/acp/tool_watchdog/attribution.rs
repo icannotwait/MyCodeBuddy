@@ -526,7 +526,7 @@ mod tool_watchdog_attribution_tests {
 
     fn attribution() -> LeaseAttribution {
         LeaseAttribution::new(Arc::new(ToolExecutionLeaseRegistry::new(
-            ToolWatchdogSettings::default(),
+            ToolWatchdogSettings::enabled_defaults(),
         )))
     }
 
