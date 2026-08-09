@@ -2,7 +2,7 @@
 
 ## Status
 
-**IMPLEMENTATION AND REVIEW FIX ROUND COMPLETE; CODEX/GROK RE-REVIEW PENDING**
+**IMPLEMENTATION COMPLETE; CODEX RE-REVIEW APPROVED; GROK REVIEW PENDING**
 
 - Work unit: `task|7|implementer|codex|none`
 - Scope: Completion Protocol V2-Only plan Task 7 only
@@ -103,6 +103,14 @@ Full `cargo fmt --check` also reports existing differences in untouched files;
 the scoped check is clean. Cargo continues to emit the existing zero-byte
 `codeg-mcp` sidecar warning. Neither concern is part of the producer diff.
 
+## Independent Re-Review
+
+The independent Codex re-review reported zero Critical, Important, or Minor
+findings and `Ready to merge: Yes`. It confirmed both prior Important findings
+closed, all 14 Task 7 library regressions removed, raw corrupt-mode coverage
+restored, and ordinary fresh-database and migration/down invariants preserved.
+Independent Grok review remains pending before Task 8.
+
 ## Producer Commit
 
 - `9cfd617f2491138b228fb38e6d80dee51610a1b4` -
@@ -115,5 +123,5 @@ the scoped check is clean. Cargo continues to emit the existing zero-byte
 done_with_concerns
 
 <!-- codeg-card-summary-v1
-{"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Added SQLite v2-only insert/freeze triggers and predecessor-stage typed/raw historical fixtures; fixed library fixture regressions while preserving corrupt-protocol classification, cascades, links, and rollback scope.","commits":[{"sha":"9cfd617f2491138b228fb38e6d80dee51610a1b4","subject":"feat(db): enforce completion protocol v2-only triggers"},{"sha":"8056433ae455065f25d7bc04a28585ff2f4a8081","subject":"fix(db): seed historical protocol fixtures before freeze"}],"tests":{"status":"passed","passed":58,"failed":0,"summary":"The 12 migration, 29 completion_protocol_v2, and 17 focused library regressions passed with desktop cargo check, scoped Rustfmt, diff checks, and invariant searches."},"concerns":["The full library run has 103 existing Task 2/3 evidence-fixture failures outside Task 7; all 14 Task 7 trigger-fixture regressions were eliminated.","Full cargo fmt --check finds unrelated existing differences; scoped Rustfmt passes.","The existing zero-byte codeg-mcp sidecar packaging warning remains outside this diff.","Independent Codex and Grok re-review is pending before Task 8."],"report_file":".superpowers/sdd/task-7-report.md"}
+{"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Added SQLite v2-only insert/freeze triggers and predecessor-stage typed/raw historical fixtures; fixed library fixture regressions while preserving corrupt-protocol classification, cascades, links, and rollback scope.","commits":[{"sha":"9cfd617f2491138b228fb38e6d80dee51610a1b4","subject":"feat(db): enforce completion protocol v2-only triggers"},{"sha":"8056433ae455065f25d7bc04a28585ff2f4a8081","subject":"fix(db): seed historical protocol fixtures before freeze"}],"tests":{"status":"passed","passed":58,"failed":0,"summary":"The 12 migration, 29 completion_protocol_v2, and 17 focused library regressions passed with desktop cargo check, scoped Rustfmt, diff checks, and invariant searches."},"concerns":["The full library run has 103 existing Task 2/3 evidence-fixture failures outside Task 7; all 14 Task 7 trigger-fixture regressions were eliminated.","Full cargo fmt --check finds unrelated existing differences; scoped Rustfmt passes.","The existing zero-byte codeg-mcp sidecar packaging warning remains outside this diff.","Independent Grok review remains pending before Task 8; Codex re-review approved with no findings."],"report_file":".superpowers/sdd/task-7-report.md"}
 -->
