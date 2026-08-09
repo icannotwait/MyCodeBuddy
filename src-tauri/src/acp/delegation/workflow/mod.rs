@@ -130,12 +130,16 @@ pub use store::{
     estimated_plan_publication_material_decision, get_workflow_state_core,
     guard_current_final_delivery_core, guard_final_delivery_core, guard_task_final_delivery_core,
     load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, recover_workflow_core,
-    settle_workflow_gate_core, settle_workflow_gate_v2_core, FinalDeliveryGuardRequest,
-    FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
-    RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence, SettleResult,
-    SettleWorkflowRequest, SettleWorkflowV2Request, StateOnlyRevisionRequest,
+    settle_workflow_gate_v2_core, FinalDeliveryGuardRequest, FinalDeliveryGuardResult,
+    FinalReviewReopened, PublishResult, PublishWorkflowRequest, RecoverWorkflowRequest,
+    RecoverWorkflowResult, SettleResult, SettleWorkflowV2Request, StateOnlyRevisionRequest,
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
+};
+#[cfg(test)]
+use store::{
+    settle_workflow_gate_from_derived_test_input as settle_workflow_gate_core, SettleGateEvidence,
+    SettleWorkflowRequest,
 };
 pub use types::*;
 pub use validate::validate_manifest_document;

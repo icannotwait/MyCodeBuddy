@@ -56,10 +56,9 @@ use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
     publish_workflow_manifest_core, recover_workflow_core, restart_legacy_workflow_if_enforced,
-    settle_workflow_gate_core, settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig,
-    FinalDeliveryGuardResult, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
-    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
-    WorkflowRecoveryDisposition, WorkflowStoreError,
+    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, FinalDeliveryGuardResult,
+    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
+    SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -1708,154 +1707,37 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        let header = match delegation_workflow::Entity::find_by_id(&req.workflow_id)
-            .one(&runs.db().conn)
-            .await
-        {
-            Ok(Some(header)) => header,
-            Ok(None) => {
-                return workflow_store_error_value(WorkflowStoreError::NotFound(req.workflow_id))
-            }
-            Err(error) => {
-                return WorkflowWireError::Internal(format!(
-                    "load workflow settlement protocol: {error}"
-                ))
+        let expected_review_round = match (req.expected_review_round, req.expected_gate_cycle) {
+            (Some(round), Some(cycle)) if round != cycle => {
+                return WorkflowWireError::InvalidArguments(
+                    "expected_review_round and expected_gate_cycle disagree".into(),
+                )
                 .to_value()
             }
+            (round, cycle) => round.or(cycle),
         };
-        if header.parent_conversation_id != parent_conversation_id {
-            return workflow_store_error_value(WorkflowStoreError::CrossParent {
-                workflow_id: header.workflow_id,
-                expected_parent: parent_conversation_id,
-                actual_parent: header.parent_conversation_id,
-            });
-        }
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
-
-        let result = if header.completion_protocol_version == 2 {
-            if req.manifest_revision.is_some()
-                || req.gate_cycle.is_some()
-                || req.outcome.is_some()
-                || req.evidence.is_some()
-            {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v2 settlement rejects legacy manifest, cycle, outcome, and evidence fields"
-                        .into(),
-                )
-                .to_value();
-            }
-            let expected_review_round = match (req.expected_review_round, req.expected_gate_cycle) {
-                (Some(round), Some(cycle)) if round != cycle => {
-                    return WorkflowWireError::InvalidArguments(
-                        "expected_review_round and expected_gate_cycle disagree".into(),
-                    )
-                    .to_value()
-                }
-                (round, cycle) => round.or(cycle),
-            };
-            let expected_outcome = match req.expected_outcome.as_deref() {
-                Some(value) => match parse_gate_settlement_outcome(value) {
-                    Ok(outcome) => Some(outcome),
-                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
-                },
-                None => None,
-            };
-            settle_workflow_gate_v2_core(
-                runs.db(),
-                &self.workflow_emitter,
-                parent_conversation_id,
-                SettleWorkflowV2Request {
-                    workflow_id: req.workflow_id,
-                    gate_id: req.gate_id,
-                    expected_graph_revision: req.expected_graph_revision,
-                    expected_review_round,
-                    expected_outcome,
-                    summary: req.summary,
-                    recovery_authorization_id: req.recovery_authorization_id,
-                },
-            )
-            .await
-        } else {
-            if req.expected_review_round.is_some()
-                || req.expected_gate_cycle.is_some()
-                || req.expected_outcome.is_some()
-            {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires the legacy request shape".into(),
-                )
-                .to_value();
-            }
-            let outcome = match req.outcome.as_deref() {
-                Some(value) => match parse_gate_settlement_outcome(value) {
-                    Ok(outcome) => outcome,
-                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
-                },
-                None => {
-                    return WorkflowWireError::InvalidArguments(
-                        "protocol-v1 settlement requires outcome".into(),
-                    )
-                    .to_value()
-                }
-            };
-            let evidence = match req.evidence {
-                Some(value) => match serde_json::from_value(value) {
-                    Ok(evidence) => evidence,
-                    Err(error) => {
-                        return WorkflowWireError::InvalidArguments(format!(
-                            "settle_workflow_gate evidence: {error}"
-                        ))
-                        .to_value()
-                    }
-                },
-                None => {
-                    return WorkflowWireError::InvalidArguments(
-                        "protocol-v1 settlement requires evidence".into(),
-                    )
-                    .to_value()
-                }
-            };
-            let Some(manifest_revision) = req.manifest_revision else {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires manifest_revision".into(),
-                )
-                .to_value();
-            };
-            let Some(gate_cycle) = req.gate_cycle else {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires gate_cycle".into(),
-                )
-                .to_value();
-            };
-            settle_workflow_gate_core(
-                runs.db(),
-                &self.workflow_emitter,
-                parent_conversation_id,
-                SettleWorkflowRequest {
-                    workflow_id: req.workflow_id,
-                    manifest_revision,
-                    gate_id: req.gate_id,
-                    expected_graph_revision: req.expected_graph_revision,
-                    gate_cycle,
-                    outcome,
-                    evidence,
-                    summary: req.summary,
-                    recovery_authorization_id: req.recovery_authorization_id,
-                },
-            )
-            .await
+        let expected_outcome = match req.expected_outcome.as_deref() {
+            Some(value) => match parse_gate_settlement_outcome(value) {
+                Ok(outcome) => Some(outcome),
+                Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
+            },
+            None => None,
         };
+        let result = settle_workflow_gate_v2_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            SettleWorkflowV2Request {
+                workflow_id: req.workflow_id,
+                gate_id: req.gate_id,
+                expected_graph_revision: req.expected_graph_revision,
+                expected_review_round,
+                expected_outcome,
+                summary: req.summary,
+                recovery_authorization_id: req.recovery_authorization_id,
+            },
+        )
+        .await;
         match result {
             Ok(r) => {
                 if let Some(action) = r.plan_next_action {
@@ -9574,38 +9456,30 @@ mod tests {
             "gate_not_ready"
         );
 
-        let plan_evidence = json!({
-            "kind": "plan",
-            "scope": "full",
-            "revision_kind": "initial",
-            "scope_reason": "initial independent review",
-            "covered_author_task_id": "author-task-1",
-            "covered_plan_digest": "sha256:contradictory-plan",
-            "required_reviewer_node_ids": ["plan-reviewer-codex"],
-            "finding_updates": [],
-            "lineage_reset_reason": null
-        });
-        let legacy_result = call_companion_workflow(
-            &companion,
-            inflight,
-            4,
-            "settle_workflow_gate",
-            json!({
-                "workflow_id": workflow_id,
-                "manifest_revision": 1,
-                "gate_id": "plan-gate",
-                "expected_graph_revision": 1,
-                "gate_cycle": 1,
-                "outcome": "changes_requested",
-                "evidence": plan_evidence,
-                "summary": "framed contradictory Plan evidence"
-            }),
-        )
-        .await;
-        assert_eq!(
-            legacy_result["structuredContent"]["error"]["code"],
-            "invalid_arguments"
-        );
+        let legacy_line = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "settle_workflow_gate",
+                "arguments": {
+                    "workflow_id": workflow_id,
+                    "manifest_revision": 1,
+                    "gate_id": "plan-gate",
+                    "expected_graph_revision": 1,
+                    "summary": "framed contradictory Plan evidence"
+                }
+            }
+        })
+        .to_string();
+        let LineAction::Respond(legacy_result) =
+            dispatch_line(&companion, inflight, &legacy_line).await
+        else {
+            panic!("legacy settlement fields must fail before transport")
+        };
+        let legacy_error = legacy_result.error.expect("legacy settlement error");
+        assert_eq!(legacy_error.code, -32602);
+        assert!(legacy_error.message.contains("manifest_revision"));
         listener_task.abort();
         let _ = listener_task.await;
         #[cfg(unix)]

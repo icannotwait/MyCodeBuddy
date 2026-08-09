@@ -563,6 +563,126 @@ fn complete_gate_state_skeleton(token: &str) -> ManifestDocument {
 }
 
 #[tokio::test]
+async fn v2_settlement_requires_gate_kind_cas_fields_and_guards_legacy_before_writes() {
+    const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-capability-design.md";
+    const PLAN_REL_PATH: &str = "docs/superpowers/plans/restarted-plan.md";
+    const DESIGN_BYTES: &[u8] = b"# Design\n\nTask 3 settlement contract.\n";
+    const PLAN_BYTES: &[u8] = b"# Plan\n\nTask 3 settlement contract.\n";
+
+    let workspace = tempfile::tempdir().unwrap();
+    for (rel_path, bytes) in [(DESIGN_REL_PATH, DESIGN_BYTES), (PLAN_REL_PATH, PLAN_BYTES)] {
+        let path = workspace.path().join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let mut document = complete_gate_state_skeleton("task-3-v2-settlement-contract");
+    document.workflow_state = ManifestWorkflowState::Estimated;
+    document.design = Some(DocumentRef {
+        rel_path: DESIGN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
+    });
+    document.plan = Some(DocumentRef {
+        rel_path: PLAN_REL_PATH.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
+    });
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest { document },
+    )
+    .await
+    .unwrap();
+
+    let design_error = settle_workflow_gate_v2_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "design".into(),
+            expected_graph_revision: published.graph_revision,
+            expected_review_round: Some(1),
+            expected_outcome: None,
+            summary: "missing Design outcome CAS".into(),
+            recovery_authorization_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(design_error, WorkflowStoreError::GateNotReady(ref reason) if reason.contains("Design settlement requires expected_outcome")),
+        "unexpected Design validation error: {design_error:?}"
+    );
+
+    let plan_error = settle_workflow_gate_v2_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "plan".into(),
+            expected_graph_revision: published.graph_revision,
+            expected_review_round: None,
+            expected_outcome: Some(GateSettlementOutcome::Approved),
+            summary: "missing Plan round CAS".into(),
+            recovery_authorization_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(plan_error, WorkflowStoreError::GateNotReady(ref reason) if reason.contains("Plan settlement requires expected_review_round")),
+        "unexpected Plan validation error: {plan_error:?}"
+    );
+
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
+    let settlements_before = delegation_workflow_gate_settlement::Entity::find()
+        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(&published.workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let legacy_error = settle_workflow_gate_v2_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "design".into(),
+            expected_graph_revision: published.graph_revision,
+            expected_review_round: Some(1),
+            expected_outcome: Some(GateSettlementOutcome::Approved),
+            summary: "historical workflow stays read-only".into(),
+            recovery_authorization_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        legacy_error,
+        WorkflowStoreError::LegacyCompletionProtocolReadOnly
+    );
+    assert_eq!(
+        delegation_workflow_gate_settlement::Entity::find()
+            .filter(
+                delegation_workflow_gate_settlement::Column::WorkflowId.eq(&published.workflow_id),
+            )
+            .count(&db.conn)
+            .await
+            .unwrap(),
+        settlements_before
+    );
+}
+
+#[tokio::test]
 async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
     const DESIGN_REL_PATH: &str = "docs/superpowers/specs/task-18-capability-design.md";
     const PLAN_REL_PATH: &str = "docs/superpowers/plans/restarted-plan.md";

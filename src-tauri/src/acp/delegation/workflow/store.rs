@@ -385,7 +385,7 @@ pub struct PublishWorkflowRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SettleGateEvidence {
+pub(super) enum SettleGateEvidence {
     Design {
         critical_count: i64,
         important_count: i64,
@@ -490,7 +490,7 @@ fn publish_result(
 }
 
 #[derive(Debug, Clone)]
-pub struct SettleWorkflowRequest {
+pub(super) struct SettleWorkflowRequest {
     pub workflow_id: String,
     pub manifest_revision: u64,
     pub gate_id: String,
@@ -1930,17 +1930,13 @@ async fn emit_plan_lineage_reset_rejection_if_designated(
     }
 }
 
-/// Settle a **document** gate (Design/Plan) for one cycle. Never evaluates
-/// Task/Final execution gates.
-pub async fn settle_workflow_gate_core(
+#[cfg(test)]
+pub(super) async fn settle_workflow_gate_from_derived_test_input(
     db: &AppDatabase,
     emitter: &EventEmitter,
     parent_conversation_id: i32,
     req: SettleWorkflowRequest,
 ) -> Result<SettleResult, WorkflowStoreError> {
-    if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
-        return Err(WorkflowStoreError::SummaryTooLarge);
-    }
     let protocol_is_v2 = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
         .one(&db.conn)
         .await
@@ -1964,8 +1960,54 @@ pub async fn settle_workflow_gate_v2_core(
     parent_conversation_id: i32,
     req: SettleWorkflowV2Request,
 ) -> Result<SettleResult, WorkflowStoreError> {
+    let guard_header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
+    if guard_header.parent_conversation_id != parent_conversation_id {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id: guard_header.workflow_id,
+            expected_parent: parent_conversation_id,
+            actual_parent: guard_header.parent_conversation_id,
+        });
+    }
+    require_v2_mutation(
+        guard_header.completion_protocol_version,
+        &guard_header.completion_protocol_mode,
+    )?;
     if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
         return Err(WorkflowStoreError::SummaryTooLarge);
+    }
+    let document = load_active_manifest_document_txn(
+        &db.conn,
+        &guard_header.workflow_id,
+        guard_header.active_manifest_revision,
+    )
+    .await?;
+    let normalized = validate_manifest_document(&document)?;
+    let gate = normalized
+        .gates
+        .iter()
+        .find(|gate| gate.id == req.gate_id)
+        .ok_or_else(|| {
+            WorkflowStoreError::ExecutionGateSettleRejected(format!(
+                "gate_id {} is not a document gate on the active manifest",
+                req.gate_id
+            ))
+        })?;
+    match gate.gate_kind {
+        DocumentGateKind::Design if req.expected_outcome.is_none() => {
+            return Err(WorkflowStoreError::GateNotReady(
+                "Design settlement requires expected_outcome".into(),
+            ))
+        }
+        DocumentGateKind::Plan if req.expected_review_round.is_none() => {
+            return Err(WorkflowStoreError::GateNotReady(
+                "Plan settlement requires expected_review_round".into(),
+            ))
+        }
+        DocumentGateKind::Design | DocumentGateKind::Plan => {}
     }
     let preflight = SettleWorkflowRequest {
         workflow_id: req.workflow_id.clone(),
@@ -2007,34 +2049,16 @@ pub async fn settle_workflow_gate_v2_core(
             actual_parent: header.parent_conversation_id,
         });
     }
-    if header.completion_protocol_version != 2 {
-        return Err(WorkflowStoreError::GateNotReady(
-            "protocol-v2 settlement requires a protocol-v2 workflow".into(),
-        ));
-    }
+    require_v2_mutation(
+        header.completion_protocol_version,
+        &header.completion_protocol_mode,
+    )?;
     if req.expected_graph_revision != header.graph_revision as u64 {
         return Err(WorkflowStoreError::StaleGraphRevision {
             expected: req.expected_graph_revision,
             current: header.graph_revision as u64,
         });
     }
-    let document = load_active_manifest_document_txn(
-        &db.conn,
-        &header.workflow_id,
-        header.active_manifest_revision,
-    )
-    .await?;
-    let normalized = validate_manifest_document(&document)?;
-    let gate = normalized
-        .gates
-        .iter()
-        .find(|gate| gate.id == req.gate_id)
-        .ok_or_else(|| {
-            WorkflowStoreError::ExecutionGateSettleRejected(format!(
-                "gate_id {} is not a document gate on the active manifest",
-                req.gate_id
-            ))
-        })?;
     let evidence_payload = match gate.gate_kind {
         DocumentGateKind::Design => SettleGateEvidence::Design {
             critical_count: 0,
@@ -2186,10 +2210,11 @@ async fn settle_workflow_gate_derived_core(
                         });
                     }
 
-                    if v2_expectation.is_some() && header.completion_protocol_version != 2 {
-                        return Err(WorkflowStoreError::GateNotReady(
-                            "protocol-v2 settlement requires a protocol-v2 workflow".into(),
-                        ));
+                    if v2_expectation.is_some() {
+                        require_v2_mutation(
+                            header.completion_protocol_version,
+                            &header.completion_protocol_mode,
+                        )?;
                     }
 
                     // v1 preserves cycle-addressed replay before graph CAS. v2
@@ -8291,6 +8316,7 @@ fn review_verdict_str(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::settle_workflow_gate_from_derived_test_input as settle_workflow_gate_core;
     use super::*;
     use crate::acp::delegation::workflow::events::WORKFLOW_GRAPH_CHANGED_EVENT as CHANGED;
     use crate::acp::delegation::workflow::key::build_work_unit_key;
@@ -10983,7 +11009,7 @@ mod tests {
                 gate_id: "design".into(),
                 expected_graph_revision: settled.graph_revision,
                 expected_review_round: Some(1),
-                expected_outcome: None,
+                expected_outcome: Some(GateSettlementOutcome::Approved),
                 summary: "caller fields are not authority".into(),
                 recovery_authorization_id: None,
             },
@@ -11222,7 +11248,7 @@ mod tests {
                     gate_id: "design".into(),
                     expected_graph_revision: current.graph_revision as u64,
                     expected_review_round: Some(1),
-                    expected_outcome: None,
+                    expected_outcome: Some(expected.clone()),
                     summary: "platform-reduced external Design".into(),
                     recovery_authorization_id: None,
                 },

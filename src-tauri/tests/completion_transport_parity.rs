@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use axum_test::TestServer;
 use chrono::Utc;
+use codeg_lib::acp::delegation::companion::TOOL_SCHEMA_JSON;
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+use codeg_lib::acp::delegation::transport::BrokerSettleWorkflowRequest;
 use codeg_lib::acp::delegation::types::{
     CompletionMutationResult, DelegationReplyResult, ResolveCompletionDecisionRequest,
     ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
@@ -265,6 +267,69 @@ fn attention_six_field_cas_rejects_every_missing_field() {
         assert!(
             serde_json::from_value::<CompletionAttentionCas>(missing).is_err(),
             "missing CAS field {field} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn settle_workflow_gate_v2_only_schema() {
+    let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+    let settle = catalog
+        .as_array()
+        .expect("tool catalog array")
+        .iter()
+        .find(|tool| tool["name"] == "settle_workflow_gate")
+        .expect("settle_workflow_gate tool");
+    let properties = settle["inputSchema"]["properties"]
+        .as_object()
+        .expect("settlement properties");
+
+    for removed in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
+        assert!(
+            properties.get(removed).is_none(),
+            "legacy field {removed} remains"
+        );
+    }
+    for retained in [
+        "workflow_id",
+        "gate_id",
+        "expected_graph_revision",
+        "expected_review_round",
+        "expected_gate_cycle",
+        "expected_outcome",
+        "recovery_authorization_id",
+        "summary",
+    ] {
+        assert!(
+            properties.get(retained).is_some(),
+            "v2 field {retained} missing"
+        );
+    }
+
+    let request = json!({
+        "token": "secret",
+        "workflow_id": "workflow-1",
+        "gate_id": "design",
+        "expected_graph_revision": 4,
+        "expected_gate_cycle": 1,
+        "expected_outcome": "approved",
+        "summary": "settled from platform evidence"
+    });
+    serde_json::from_value::<BrokerSettleWorkflowRequest>(request.clone())
+        .expect("v2 settlement request decodes");
+    for (removed, value) in [
+        ("manifest_revision", json!(2)),
+        ("gate_cycle", json!(1)),
+        ("outcome", json!("approved")),
+        ("evidence", json!({ "kind": "design" })),
+    ] {
+        let mut legacy = request.clone();
+        legacy[removed] = value;
+        let error = serde_json::from_value::<BrokerSettleWorkflowRequest>(legacy)
+            .expect_err("legacy settlement property must be rejected");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "legacy field {removed} was not rejected as unknown: {error}"
         );
     }
 }

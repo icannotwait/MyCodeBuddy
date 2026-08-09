@@ -276,6 +276,7 @@ pub struct BrokerPublishWorkflowRequest {
 /// Settle a Design/Plan document gate for one cycle. Backs
 /// `settle_workflow_gate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrokerSettleWorkflowRequest {
     pub token: String,
     pub workflow_id: String,
@@ -289,16 +290,6 @@ pub struct BrokerSettleWorkflowRequest {
     pub expected_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate_cycle: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
-    /// Tagged `design` or `plan` evidence. Listener deserializes this into the
-    /// canonical store evidence type so nested validation stays in Rust.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<Value>,
     pub summary: String,
 }
 
