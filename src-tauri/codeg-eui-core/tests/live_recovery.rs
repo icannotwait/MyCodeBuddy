@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 use codeg_eui_core::{
-    snapshot_and_subscribe, snapshot_and_subscribe_observed, InteractionBackend, InteractionFuture,
-    LiveBackend, LiveFuture, LiveProjector, Projection, ReceiveOutcome, SharedModel,
+    snapshot_and_subscribe_observed, InteractionBackend, InteractionFuture, LiveBackend,
+    LiveFuture, LiveProjector, Projection, ReceiveOutcome, SharedModel,
 };
 use codeg_lib::acp::types::PermissionOptionInfo;
 use codeg_lib::acp::{AcpEvent, EventEnvelope, SessionState};
@@ -162,6 +162,7 @@ fn user_message_starts_a_new_assistant_generation_and_marker_window() {
         transcript_generation: 3,
         t_first_token_ns: 10,
         t_end_ns: 20,
+        error_strip: "old error".to_string(),
         ..Projection::default()
     };
 
@@ -182,6 +183,29 @@ fn user_message_starts_a_new_assistant_generation_and_marker_window() {
     assert_eq!(projection.t_end_ns, 0);
     assert_eq!(projection.assistant_generation, 9);
     assert_eq!(projection.transcript_generation, 4);
+    assert!(projection.error_strip.is_empty());
+}
+
+#[test]
+fn turn_attempt_rollback_forces_authoritative_recovery() {
+    let mut projection = Projection {
+        connection_id: "rollback".to_string(),
+        live_assistant: "speculative".to_string(),
+        stream_active: true,
+        ..Projection::default()
+    };
+
+    let outcome = projection.apply_envelope(
+        &EventEnvelope {
+            seq: 1,
+            connection_id: "rollback".to_string(),
+            payload: AcpEvent::TurnAttemptRollback { attempt: 2 },
+        },
+        30,
+    );
+
+    assert!(outcome.needs_resync());
+    assert!(projection.needs_resync);
 }
 
 #[test]
@@ -265,6 +289,14 @@ async fn snapshot_hard_error_sets_terminal_marker_after_dropped_event() {
     let state = state("snapshot-error");
     emit(
         &state,
+        AcpEvent::UserMessage {
+            message_id: "failed-message".to_string(),
+            blocks: Vec::new(),
+        },
+    )
+    .await;
+    emit(
+        &state,
         AcpEvent::ContentDelta {
             text: "partial".to_string(),
             parent_tool_use_id: None,
@@ -289,6 +321,44 @@ async fn snapshot_hard_error_sets_terminal_marker_after_dropped_event() {
     assert_eq!(projection.error_strip, "hard failure");
     assert_eq!(projection.t_end_ns, 55);
     assert!(!projection.stream_active);
+}
+
+#[tokio::test]
+async fn snapshot_new_user_message_resets_prior_turn_markers() {
+    let state = state("snapshot-turn");
+    emit(
+        &state,
+        AcpEvent::UserMessage {
+            message_id: "old-message".to_string(),
+            blocks: Vec::new(),
+        },
+    )
+    .await;
+    emit(
+        &state,
+        AcpEvent::ContentDelta {
+            text: "old answer".to_string(),
+            parent_tool_use_id: None,
+        },
+    )
+    .await;
+    let mut projection = Projection::default();
+    projection.replace_from_snapshot(&state.read().await.to_snapshot(), 10);
+    projection.t_end_ns = 15;
+
+    emit(
+        &state,
+        AcpEvent::UserMessage {
+            message_id: "new-message".to_string(),
+            blocks: Vec::new(),
+        },
+    )
+    .await;
+    projection.replace_from_snapshot(&state.read().await.to_snapshot(), 20);
+
+    assert!(projection.live_assistant.is_empty());
+    assert_eq!(projection.t_first_token_ns, 0);
+    assert_eq!(projection.t_end_ns, 0);
 }
 
 #[tokio::test]
@@ -421,24 +491,42 @@ async fn control_overflow_resyncs_and_declines_snapshot_permission_once() {
 }
 
 #[tokio::test]
-async fn broadcast_lag_is_reported_without_blocking_the_producer() {
+async fn broadcast_lag_recovers_without_blocking_the_producer() {
     let state = state("lag");
-    let mut attach = snapshot_and_subscribe(&state).await;
-    let stream = state.read().await.event_stream();
+    let backend: Arc<dyn LiveBackend> = Arc::new(StateBackend {
+        state: Arc::clone(&state),
+        declines: Arc::new(AtomicUsize::new(0)),
+    });
+    let projector = LiveProjector::with_control_capacity(backend, SharedModel::new(), 5_000);
+    let mut attachment = projector.attach("lag", 0).await.unwrap();
 
-    for seq in 1..=4_097 {
-        stream.send(Arc::new(EventEnvelope {
-            seq,
-            connection_id: "lag".to_string(),
-            payload: AcpEvent::ContentDelta {
-                text: String::new(),
+    {
+        let mut guard = state.write().await;
+        let stream = guard.event_stream();
+        for seq in 1..=4_097 {
+            let payload = AcpEvent::ContentDelta {
+                text: if seq == 4_097 {
+                    "final".to_string()
+                } else {
+                    String::new()
+                },
                 parent_tool_use_id: None,
-            },
-        }));
+            };
+            let _ = guard.apply_event(&payload);
+            guard.event_seq = seq;
+            stream.send(Arc::new(EventEnvelope {
+                seq,
+                connection_id: "lag".to_string(),
+                payload,
+            }));
+        }
     }
 
-    assert!(matches!(
-        attach.receiver.recv().await,
-        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
-    ));
+    assert_eq!(
+        attachment.receive_next().await.unwrap(),
+        ReceiveOutcome::Recovered
+    );
+    assert_eq!(attachment.snapshot().event_seq, 4_097);
+    assert_eq!(attachment.snapshot().live_assistant, "final");
+    assert!(!attachment.snapshot().needs_resync);
 }

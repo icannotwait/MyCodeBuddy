@@ -692,12 +692,18 @@ pub struct Projection {
     pub error_strip: String,
     pub assistant_generation: u64,
     pub transcript_generation: u64,
+    pub turn_message_id: Option<String>,
     pub t_first_token_ns: u64,
     pub t_end_ns: u64,
 }
 
 impl Projection {
     pub fn replace_from_snapshot(&mut self, snapshot: &LiveSessionSnapshot, now_ns: u64) {
+        let turn_message_id = snapshot
+            .pending_user_message
+            .as_ref()
+            .map(|message| message.message_id.clone());
+        let starts_new_turn = turn_message_id.is_some() && turn_message_id != self.turn_message_id;
         self.connection_id.clone_from(&snapshot.connection_id);
         self.event_seq = snapshot.event_seq;
         self.live_assistant = visible_assistant_text(snapshot.live_message.as_ref());
@@ -717,10 +723,17 @@ impl Projection {
             .as_ref()
             .map(|error| error.message.clone())
             .unwrap_or_default();
+        if starts_new_turn {
+            self.t_first_token_ns = 0;
+            self.t_end_ns = 0;
+        }
         if snapshot.last_error.is_some() && snapshot.live_message.is_some() {
             self.stream_active = false;
-            self.t_end_ns = now_ns;
+            if self.t_end_ns == 0 {
+                self.t_end_ns = now_ns;
+            }
         }
+        self.turn_message_id = turn_message_id;
         self.assistant_generation = self.assistant_generation.saturating_add(1);
         self.transcript_generation = self.transcript_generation.saturating_add(1);
         self.record_first_token(now_ns);
@@ -741,14 +754,20 @@ impl Projection {
 
         self.event_seq = envelope.seq;
         match &envelope.payload {
-            AcpEvent::UserMessage { .. } => {
+            AcpEvent::UserMessage { message_id, .. } => {
                 self.live_assistant.clear();
                 self.tools.clear();
                 self.stream_active = true;
+                self.error_strip.clear();
                 self.assistant_generation = self.assistant_generation.saturating_add(1);
                 self.transcript_generation = self.transcript_generation.saturating_add(1);
+                self.turn_message_id = Some(message_id.clone());
                 self.t_first_token_ns = 0;
                 self.t_end_ns = 0;
+            }
+            AcpEvent::TurnAttemptRollback { .. } => {
+                self.needs_resync = true;
+                return ApplyOutcome::NeedsResync;
             }
             AcpEvent::ContentDelta {
                 text,
@@ -788,6 +807,7 @@ impl Projection {
             AcpEvent::TurnComplete { .. } => {
                 self.stream_active = false;
                 self.tools.clear();
+                self.turn_message_id = None;
                 self.transcript_generation = self.transcript_generation.saturating_add(1);
                 self.t_end_ns = now_ns;
             }
