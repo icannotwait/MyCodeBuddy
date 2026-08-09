@@ -14,7 +14,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{Id, JoinHandle, JoinSet};
 
 use crate::commands::{CommandPayload, Operation, RuntimeCommand};
+use crate::live::{AppLiveBackend, LiveBackend, LiveError, LiveProjector};
 use crate::model::{ModelUpdate, OwnedCompletion, OwnedSessionSummary, SharedModel};
+use crate::perf::native_timestamp_ns;
 use crate::{
     EuiBootstrap, CODEG_EUI_COMMAND_QUEUE_CAPACITY, CODEG_EUI_ERR_INTERNAL,
     CODEG_EUI_ERR_INVALID_STATE, CODEG_EUI_ERR_QUEUE_FULL,
@@ -25,6 +27,7 @@ pub(crate) type CoreFuture = Pin<Box<dyn Future<Output = Result<CoreResult, Stri
 pub(crate) struct CoreResult {
     payload: Vec<u8>,
     update: Option<ModelUpdate>,
+    live_connection_id: Option<String>,
 }
 
 impl CoreResult {
@@ -32,6 +35,7 @@ impl CoreResult {
         Self {
             payload,
             update: None,
+            live_connection_id: None,
         }
     }
 }
@@ -152,6 +156,7 @@ impl CoreOps for AppCoreOps {
             Ok(CoreResult {
                 payload,
                 update: Some(ModelUpdate::Workspace { sessions }),
+                live_connection_id: None,
             })
         })
     }
@@ -290,6 +295,7 @@ fn selection_result(
         serde_json::to_vec(&selection.transcript).map_err(|error| error.to_string())?;
     let sessions = owned_sessions(&workspace.sessions);
     let connection_id = selection.connection_id.as_bytes().to_vec();
+    let live_connection_id = selection.connection_id.clone();
     let mut current = context.lock().unwrap_or_else(|error| error.into_inner());
     if selection_epoch == current.selection_epoch {
         current.selection_epoch = selection_epoch;
@@ -303,6 +309,7 @@ fn selection_result(
             connection_id,
             transcript_json,
         }),
+        live_connection_id: Some(live_connection_id),
     })
 }
 
@@ -368,6 +375,8 @@ impl RuntimeOwner {
             state: Arc::clone(&bootstrap.state),
             context: Arc::new(Mutex::new(AppCommandContext::default())),
         });
+        let live_backend: Arc<dyn LiveBackend> =
+            Arc::new(AppLiveBackend::new(Arc::clone(&bootstrap.state)));
         let worker = bootstrap.runtime_handle().spawn(run_worker(
             command_rx,
             shutdown_rx,
@@ -376,6 +385,7 @@ impl RuntimeOwner {
             Arc::clone(&admission),
             Arc::clone(&quiesced),
             Arc::clone(&core_ops),
+            Some(live_backend),
         ));
 
         Self {
@@ -460,14 +470,6 @@ impl RuntimeOwner {
     }
 }
 
-fn native_timestamp_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
-}
-
 fn next_request_id() -> Result<NonZeroU64, i32> {
     let value = NEXT_REQUEST_ID
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -485,6 +487,7 @@ async fn run_worker(
     admission: Arc<Mutex<()>>,
     quiesced: Arc<AtomicBool>,
     core_ops: Arc<dyn CoreOps>,
+    live_backend: Option<Arc<dyn LiveBackend>>,
 ) {
     let _exit_guard = WorkerExitGuard {
         model: model.clone(),
@@ -493,6 +496,7 @@ async fn run_worker(
     };
     let mut tasks = JoinSet::new();
     let mut metadata = HashMap::<Id, CommandMetadata>::new();
+    let mut live_task: Option<JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
@@ -503,7 +507,33 @@ async fn run_worker(
                 }
             }
             completed = tasks.join_next_with_id(), if !tasks.is_empty() => {
-                terminalize_task(&model, &mut metadata, completed);
+                if let Some(selection) = terminalize_task(&model, &mut metadata, completed) {
+                    if let Some(task) = live_task.take() {
+                        task.abort();
+                    }
+                    if let Some(backend) = live_backend.as_ref() {
+                        let backend = Arc::clone(backend);
+                        let live_model = model.clone();
+                        live_task = Some(tokio::spawn(async move {
+                            let projector = LiveProjector::new(backend, live_model.clone());
+                            match projector
+                                .attach(&selection.connection_id, selection.selection_epoch)
+                                .await
+                            {
+                                Ok(attachment) => attachment.run().await,
+                                Err(LiveError::SelectionChanged) => {}
+                                Err(error) => {
+                                    let _ = live_model.set_live_error(
+                                        selection.selection_epoch,
+                                        &selection.connection_id,
+                                        error.to_string(),
+                                        native_timestamp_ns(),
+                                    );
+                                }
+                            }
+                        }));
+                    }
+                }
             }
             command = commands.recv() => {
                 let Some(command) = command else {
@@ -527,6 +557,10 @@ async fn run_worker(
     }
 
     commands.close();
+    if let Some(task) = live_task {
+        task.abort();
+        let _ = task.await;
+    }
     tasks.abort_all();
     while let Some(completed) = tasks.join_next_with_id().await {
         if let Ok((id, _)) = &completed {
@@ -543,13 +577,18 @@ async fn run_worker(
         .await;
 }
 
+struct LiveSelection {
+    connection_id: String,
+    selection_epoch: u64,
+}
+
 fn terminalize_task(
     model: &SharedModel,
     metadata: &mut HashMap<Id, CommandMetadata>,
     completed: Option<Result<(Id, Result<CoreResult, String>), tokio::task::JoinError>>,
-) {
+) -> Option<LiveSelection> {
     let Some(completed) = completed else {
-        return;
+        return None;
     };
     let (task_id, result) = match completed {
         Ok((task_id, result)) => (task_id, result),
@@ -562,15 +601,29 @@ fn terminalize_task(
         .remove(&task_id)
         .expect("metadata exists for every worker task");
     match result {
-        Ok(result) => model.terminalize_with_update(
-            command.selection_epoch,
-            OwnedCompletion::ok(command.request_id, command.op, result.payload),
-            result.update,
-        ),
-        Err(error) => model.terminalize(
-            command.selection_epoch,
-            OwnedCompletion::error(command.request_id, command.op, error),
-        ),
+        Ok(result) => {
+            let live_connection_id = result.live_connection_id;
+            let is_current = model.terminalize_with_update(
+                command.selection_epoch,
+                OwnedCompletion::ok(command.request_id, command.op, result.payload),
+                result.update,
+            );
+            if is_current {
+                live_connection_id.map(|connection_id| LiveSelection {
+                    connection_id,
+                    selection_epoch: command.selection_epoch,
+                })
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            model.terminalize(
+                command.selection_epoch,
+                OwnedCompletion::error(command.request_id, command.op, error),
+            );
+            None
+        }
     }
 }
 
@@ -641,8 +694,8 @@ mod tests {
     use tokio::task::JoinSet;
 
     use super::{
-        capture_command_context, execute_command, run_worker, terminalize_task, AppCommandContext,
-        CommandContext, CommandMetadata, CoreFuture, CoreOps, CoreResult,
+        capture_command_context, execute_command, run_worker, selection_result, terminalize_task,
+        AppCommandContext, CommandContext, CommandMetadata, CoreFuture, CoreOps, CoreResult,
     };
     use crate::commands::{CommandPayload, Operation, RuntimeCommand};
     use crate::model::{ModelUpdate, OwnedCompletion, OwnedSessionSummary};
@@ -675,6 +728,24 @@ mod tests {
             connection_id: connection_id.to_string(),
             transcript: Vec::new(),
         }
+    }
+
+    #[test]
+    fn successful_selection_requests_live_attachment_for_its_connection() {
+        let workspace = test_workspace(11, "/workspace");
+        let selection = test_selection(&workspace, 101, "connection-live");
+        let context = Arc::new(Mutex::new(AppCommandContext {
+            selection_epoch: 7,
+            workspace: Some(workspace.clone()),
+            selection: None,
+        }));
+
+        let result = selection_result(context, 7, workspace, selection).unwrap();
+
+        assert_eq!(
+            result.live_connection_id.as_deref(),
+            Some("connection-live")
+        );
     }
 
     #[test]
@@ -908,6 +979,7 @@ mod tests {
             Arc::new(SlowProbeOps {
                 gate: Arc::clone(&gate),
             }),
+            None,
         ));
         command_tx
             .send(RuntimeCommand {
@@ -979,6 +1051,7 @@ mod tests {
                         connection_id: b"old".to_vec(),
                         transcript_json: b"[]".to_vec(),
                     }),
+                    live_connection_id: Some("old".to_string()),
                 })
             })
         }
@@ -1033,6 +1106,7 @@ mod tests {
                 started: Arc::clone(&started),
                 gate: Arc::clone(&gate),
             }),
+            None,
         ));
         command_tx
             .send(RuntimeCommand {
@@ -1179,6 +1253,7 @@ mod tests {
                 gate: Arc::clone(&gate),
                 linked: Arc::clone(&linked),
             }),
+            None,
         ));
         command_tx
             .send(RuntimeCommand {

@@ -3,8 +3,11 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::sync::watch;
+
 use crate::abi::{CodegEuiFrame, LifecycleState, CODEG_EUI_API_VERSION};
 use crate::commands::Operation;
+use crate::live::Projection;
 use crate::{CODEG_EUI_COMPLETION_CAPACITY, CODEG_EUI_ERR_INTERNAL, CODEG_EUI_ERR_QUEUE_FULL};
 
 pub const CODEG_EUI_COMPLETION_OK: u32 = CompletionStatus::Ok as u32;
@@ -194,6 +197,8 @@ struct ModelState {
     event_seq: u64,
     transcript_json: Vec<u8>,
     live_assistant: Vec<u8>,
+    assistant_generation: u64,
+    transcript_generation: u64,
     stream_active: bool,
     needs_resync: bool,
     error_strip: Vec<u8>,
@@ -203,8 +208,21 @@ struct ModelState {
     ledger: CompletionLedger,
 }
 
-#[derive(Clone, Default)]
-pub struct SharedModel(Arc<Mutex<ModelState>>);
+#[derive(Clone)]
+pub struct SharedModel {
+    state: Arc<Mutex<ModelState>>,
+    selection_tx: watch::Sender<u64>,
+}
+
+impl Default for SharedModel {
+    fn default() -> Self {
+        let (selection_tx, _) = watch::channel(0);
+        Self {
+            state: Arc::new(Mutex::new(ModelState::default())),
+            selection_tx,
+        }
+    }
+}
 
 impl SharedModel {
     pub fn new() -> Self {
@@ -212,7 +230,7 @@ impl SharedModel {
     }
 
     fn lock(&self) -> MutexGuard<'_, ModelState> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner())
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     pub(crate) fn selection_epoch(&self) -> u64 {
@@ -245,17 +263,20 @@ impl SharedModel {
             state.event_seq = 0;
             state.transcript_json.clear();
             state.live_assistant.clear();
+            state.assistant_generation = 0;
+            state.transcript_generation = 0;
             state.stream_active = false;
             state.needs_resync = false;
             state.t0_ns = 0;
             state.t_first_token_ns = 0;
             state.t_end_ns = 0;
+            self.selection_tx.send_replace(captured_epoch);
         }
         Ok(())
     }
 
     pub(crate) fn terminalize(&self, captured_selection_epoch: u64, completion: OwnedCompletion) {
-        self.terminalize_with_update(captured_selection_epoch, completion, None);
+        let _ = self.terminalize_with_update(captured_selection_epoch, completion, None);
     }
 
     pub(crate) fn terminalize_with_update(
@@ -263,10 +284,11 @@ impl SharedModel {
         captured_selection_epoch: u64,
         completion: OwnedCompletion,
         update: Option<ModelUpdate>,
-    ) {
+    ) -> bool {
         let mut state = self.lock();
         let current_selection_epoch = state.selection_epoch;
-        if captured_selection_epoch == current_selection_epoch {
+        let is_current = captured_selection_epoch == current_selection_epoch;
+        if is_current {
             match update {
                 Some(ModelUpdate::Workspace { sessions }) => {
                     state.sessions = sessions;
@@ -279,6 +301,7 @@ impl SharedModel {
                     state.sessions = sessions;
                     state.connection_id = connection_id;
                     state.transcript_json = transcript_json;
+                    state.transcript_generation = state.transcript_generation.saturating_add(1);
                 }
                 None => {}
             }
@@ -288,6 +311,7 @@ impl SharedModel {
             captured_selection_epoch,
             completion,
         );
+        is_current
     }
 
     pub(crate) fn cancel_all(&self) {
@@ -299,6 +323,86 @@ impl SharedModel {
         state.t0_ns = t0_ns;
         state.t_first_token_ns = 0;
         state.t_end_ns = 0;
+    }
+
+    pub(crate) fn selection_receiver(&self) -> watch::Receiver<u64> {
+        self.selection_tx.subscribe()
+    }
+
+    pub(crate) fn seed_projection(
+        &self,
+        selection_epoch: u64,
+        connection_id: &str,
+        projection: &mut Projection,
+    ) -> bool {
+        let mut state = self.lock();
+        if state.selection_epoch != selection_epoch {
+            return false;
+        }
+        if state.connection_id.is_empty() {
+            state.connection_id = connection_id.as_bytes().to_vec();
+        } else if state.connection_id.as_slice() != connection_id.as_bytes() {
+            return false;
+        }
+        projection
+            .transcript_json
+            .clone_from(&state.transcript_json);
+        projection.assistant_generation = state.assistant_generation;
+        projection.transcript_generation = state.transcript_generation;
+        true
+    }
+
+    pub(crate) fn apply_live_projection(
+        &self,
+        selection_epoch: u64,
+        projection: &Projection,
+        observed_at_ns: u64,
+    ) -> bool {
+        let mut state = self.lock();
+        if state.selection_epoch != selection_epoch
+            || state.connection_id.as_slice() != projection.connection_id.as_bytes()
+        {
+            return false;
+        }
+        state.event_seq = projection.event_seq;
+        state.live_assistant = projection.live_assistant.as_bytes().to_vec();
+        state.stream_active = projection.stream_active;
+        state.needs_resync = projection.needs_resync;
+        state.error_strip = projection.error_strip.as_bytes().to_vec();
+        state.assistant_generation = projection.assistant_generation;
+        if projection.transcript_generation >= state.transcript_generation {
+            state
+                .transcript_json
+                .clone_from(&projection.transcript_json);
+            state.transcript_generation = projection.transcript_generation;
+        }
+        if state.t0_ns != 0 && state.t_first_token_ns == 0 && !projection.live_assistant.is_empty()
+        {
+            state.t_first_token_ns = observed_at_ns;
+        }
+        if projection.t_end_ns >= state.t0_ns && projection.t_end_ns != 0 {
+            state.t_end_ns = projection.t_end_ns;
+        }
+        true
+    }
+
+    pub(crate) fn set_live_error(
+        &self,
+        selection_epoch: u64,
+        connection_id: &str,
+        message: String,
+        ended_at_ns: u64,
+    ) -> bool {
+        let mut state = self.lock();
+        if state.selection_epoch != selection_epoch
+            || state.connection_id.as_slice() != connection_id.as_bytes()
+        {
+            return false;
+        }
+        state.error_strip = message.into_bytes();
+        state.stream_active = false;
+        state.t_end_ns = ended_at_ns;
+        true
     }
 
     pub fn set_error_strip(&self, message: Vec<u8>) {
@@ -471,9 +575,12 @@ fn ptr_or_null<T>(values: &[T]) -> *const T {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicBool;
 
     use super::{CompletionStatus, OwnedCompletion, SharedModel};
+    use crate::abi::LifecycleState;
     use crate::commands::Operation;
+    use crate::live::Projection;
 
     #[test]
     fn accepted_workspace_and_session_changes_advance_the_selection_epoch() {
@@ -542,5 +649,68 @@ mod tests {
             0,
             OwnedCompletion::ok(request_id, Operation::SendUserMessage, Vec::new()),
         );
+    }
+
+    #[test]
+    fn live_markers_and_resync_visibility_are_frame_backed() {
+        let model = SharedModel::new();
+        model.lock().connection_id = b"c1".to_vec();
+        model.record_send_accepted(100);
+        let mut projection = Projection {
+            connection_id: "c1".to_string(),
+            event_seq: 1,
+            live_assistant: "hello".to_string(),
+            assistant_generation: 1,
+            stream_active: true,
+            ..Projection::default()
+        };
+
+        assert!(model.apply_live_projection(0, &projection, 150));
+        let (first, _) = model.build_frame(false, &AtomicBool::new(false));
+        let first = first.as_abi(LifecycleState::Running, 1, false);
+        assert_eq!(first.t_first_token_ns, 150);
+        assert_eq!(first.t_end_ns, 0);
+
+        projection.needs_resync = true;
+        assert!(model.apply_live_projection(0, &projection, 160));
+        let (resyncing, _) = model.build_frame(false, &AtomicBool::new(false));
+        let resyncing = resyncing.as_abi(LifecycleState::Running, 2, false);
+        assert_eq!(resyncing.needs_resync, 1);
+        assert_eq!(resyncing.t_first_token_ns, 150);
+
+        projection.needs_resync = false;
+        projection.event_seq = 2;
+        projection.t_end_ns = 200;
+        projection.stream_active = false;
+        assert!(model.apply_live_projection(0, &projection, 200));
+        let (complete, _) = model.build_frame(false, &AtomicBool::new(false));
+        let complete = complete.as_abi(LifecycleState::Running, 3, false);
+        assert_eq!(complete.needs_resync, 0);
+        assert_eq!(complete.t_first_token_ns, 150);
+        assert_eq!(complete.t_end_ns, 200);
+    }
+
+    #[test]
+    fn old_live_projection_cannot_overwrite_a_new_selection() {
+        let model = SharedModel::new();
+        model.lock().connection_id = b"old".to_vec();
+        let projection = Projection {
+            connection_id: "old".to_string(),
+            event_seq: 9,
+            live_assistant: "stale".to_string(),
+            assistant_generation: 1,
+            ..Projection::default()
+        };
+        let selection_request = NonZeroU64::new(91).unwrap();
+
+        model
+            .reserve(selection_request, Operation::SetWorkspace, 0)
+            .unwrap();
+
+        assert!(!model.apply_live_projection(0, &projection, 50));
+        let (frame, _) = model.build_frame(false, &AtomicBool::new(false));
+        let frame = frame.as_abi(LifecycleState::Running, 1, false);
+        assert_eq!(frame.event_seq, 0);
+        assert_eq!(frame.live_assistant.len, 0);
     }
 }
