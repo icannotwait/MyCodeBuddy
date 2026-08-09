@@ -1,184 +1,188 @@
-# Task 4 Report — Migration no-bump, unbound id, dual-path envelope/surface
+# Task 4 Report: Mutation, Recovery, Delivery, and Root Fences
 
-**Status:** `DONE` (fix round 1/5 applied)  
-**Date:** 2026-07-27  
-**Branch:** `feature/b2d-user-stop-transcript-reconciliation`  
-**Implementer:** Grok (Task 4 only — Tasks 5–7 not implemented)
+## Status
 
-## Commits
+**IMPLEMENTATION COMPLETE; INDEPENDENT CODEX/GROK REVIEW PENDING**
 
-| SHA | Message |
-| --- | --- |
-| `35a44b9a02ff03be27e3ba3d38c3ec9c9e6f99d8` | `feat(runtime): migration no-bump, unbound id, dual-path ownerPreserve` |
-| `27bab555c4e89dd8f1b181d5f4d8b4f1e08dde75` | `fix(runtime): preserve cancel attempt budget and terminal unbound accept` |
-| `fde1ba8d898e32b560138b94e822a0d7442703ea` | `fix(runtime): keep destination-only cancel coordinator across migrate` |
+- Work unit: `task|4|implementer|codex|none`
+- Scope: Plan Task 4 only
+- Task 5: not started
 
-## Scope
+Task 4 now rejects every covered semantic mutation unless the durable workflow
+header is exactly `(2, v2_enforce)`. Historical version-1 workflows return
+`legacy_completion_protocol_read_only`; inconsistent and corrupt headers return
+`unsupported_completion_protocol`; caller ownership errors remain
+`unauthorized` without exposing the target protocol.
 
-**Files changed (task-owned):**
+## Implementation
 
-| File | Change |
-| --- | --- |
-| `src/stores/conversation-runtime-store.ts` | `MIGRATE_CONVERSATION` migrates pending/soft/owner; action no-bump gen; migrate ownership + `recordedTurnOutcomeKeys`; re-arm soft fence + restart coordinator under post-migration id |
-| `src/stores/cancel-reconcile.test.ts` | Invert HEAD migrate-stale tests; Task 4 suite (migrate, identity replace, unbound store gate, late envelope, suppress) |
-| `src/contexts/acp-connections-context.tsx` | `acceptUserStopTurnComplete`: missing provider / unbound detail id → `enterOwnerPreserve`; positive id + provider → coordinator |
-| `src/contexts/user-stop-dual-path.test.ts` | Unbound, ownerPreserve on missing provider, late envelope after age-out, migrate-then-envelope, panel audit retained |
+- Added typed `load_completion_protocol_header` and
+  `load_completion_protocol_for_conversation` loaders.
+- Added `UnsupportedCompletionProtocolHeader` and narrowly mapped only
+  SeaORM `DbErr::Type` / `DbErr::TryIntoErr` header-decode failures to
+  `unsupported_completion_protocol`. Connection, query, execution, and other
+  infrastructure failures retain persistence classification and existing
+  retry behavior.
+- Applied `require_v2_mutation` before and inside publication, v2 settlement,
+  state-only revisions, workflow recovery, completion decisions, Design
+  self-review, artifact retry/resolution, Final delivery, and `complete_work`.
+- Resolved completion authority from durable attention/task bindings rather
+  than caller-provided CAS task fields.
+- Fenced recovery-authorization preparation for workflow subjects and
+  workflow-bound task subjects before authorization/question/attention writes;
+  standalone task behavior remains unchanged.
+- Replaced linked-root legacy restart admission with one manager-owned,
+  read-only protocol preflight before hydration, transcript/status/route
+  writes, events, process launch, or prompt enqueue. Foreground, background,
+  automation, and chat paths converge on this manager boundary.
+- Preserved historical MCP workflow-state projection while preventing the
+  Final-delivery mutation that normally accompanies current v2 reads.
+- Added stable-code-preserving completion, command, ACP, and listener error
+  mappings.
+- Added five-pair negative matrices, corrupt-header fixtures, no-side-effect
+  snapshots, cross-parent checks, root prompt checks, recovery authorization,
+  completion, Final delivery, and replay regressions.
 
-**Spot-check:** `conversation-detail-panel.tsx` — still promote-only (no `startCancelReconcile` / `recordTurnOutcome` / `acceptUserStopTurnComplete`). Covered by dual-path wiring audit.
+Automation, chat-channel, Tauri, and Axum files did not require separate
+production changes: they already delegate to the manager or shared command
+cores fenced above.
 
-**Consumes Tasks 2–3:** soft fence / `ownerPreserve` / Branch A/B already in store.
+## TDD Evidence
 
-**Not touched:** AC3 vendor (5*), presentation (6), full verification (7).
+RED was observed before the corresponding production changes:
 
-## Design contract implemented
+- Historical recovery returned generic `workflow_invalid`.
+- Historical and inconsistent completion/final-delivery mutations reached
+  legacy paths or returned the wrong stable code.
+- Linked root prompts returned the retired restart-required error and could
+  reach the previous admission path.
+- Corrupt header decoding escaped as generic `workflow_invalid`.
+- Typed error variants and loaders initially failed to compile.
+- Cross-parent historical mutation exposed protocol classification instead of
+  returning `unauthorized`.
+- Historical MCP state reads were incorrectly rejected instead of projected.
 
-### Runtime-key migration (no-bump)
+GREEN was then observed for the five-pair mutation matrices, corrupt-header
+fences, typed DB classification, recovery authorization, root prompt
+foreground/background paths, historical read projection, stable command codes,
+and recovery replay/conflict behavior.
 
-| Item | Behavior |
-| --- | --- |
-| `cancelGeneration` | **Moved** to destination (no `+1`) |
-| `pendingCancel` | Migrated; `conversationId` rewritten to `to` |
-| `softFence` / `ownerPreserve` | Migrated (OR of from/to) |
-| Ownership snapshot | Copied to `to`; `from` tombstone retained |
-| `recordedTurnOutcomeKeys` | Migrated to **both** ids (no second footer) |
-| Soft-fence timer | Re-armed on `to` when soft fence still active |
-| Coordinator timers | Stopped then **restarted** under post-migration id (same completion / gen) |
-| Late envelope after migrate | **Not** stale (`isStaleUserStopEnvelope(to) === false`) |
+## Verification
 
-### Identity replacement (still bump + clear)
+- `rustfmt --edition 2021 --check` over all ten touched Rust files: pass.
+- `git diff --check`: pass before staging.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_v2 --features test-utils`
+  - Pass: 30 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-utils historical_protocol_mutation_matrix`
+  - Pass: 2 passed, 0 failed.
+- Focused library filters for `recovery_authorization_protocol_fence`,
+  `header_db_error_classification`,
+  `completion_protocol_mutations_preserve_stable_app_error_codes`,
+  `typed_completion_attention_artifact_retry_is_typed_and_records_scope_invalidation`,
+  `publish_workflow_reaches_v2_store_guard_without_rollout_selection`,
+  `same_direct_parent_reply_replay_is_idempotent_and_conflict_is_already_resolved`,
+  and `exact_replay_returns_original_revision_and_different_correlation_conflicts`
+  all passed: 7 selected, 0 failed.
+- `cargo check --manifest-path src-tauri/Cargo.toml`: pass.
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features test-utils -- -D warnings`: pass.
+- `git diff --cached --check`: pass before the producer commit.
 
-| Path | Behavior |
-| --- | --- |
-| `setExternalId` rebind (external id change) | Bump gen; clear pending/soft/owner; stop timers |
-| `setDbConversationId` replace (existing ≠ new) | Same |
+The broader library run made during implementation reported `4171 passed; 100
+failed; 1 ignored`. The failures are existing Task 2/3 fixture debt: v2
+workflows sent through the test-only legacy settlement adapter, duplicate
+Design gate-state rows now created automatically by fixed-v2 publication, and
+their downstream cascades. The known touched test
+`typed_completion_attention_design_self_review_is_typed_and_replayable` fails
+at that pre-existing duplicate-key fixture before reaching Task 4 behavior.
+This task did not broaden into fixture migration work.
 
-### Unbound detail id + missing provider (envelope)
+Cargo also emitted the existing local packaging warning that the ignored
+`codeg-mcp` sidecar is a zero-byte placeholder. It did not affect compilation
+or tests and is not part of the producer diff.
 
-| Case | Outcome | Coordinator | Suppress |
-| --- | --- | --- | --- |
-| `user_stop` + empty/null `provider_turn_id` | Recorded | No | `ownerPreserve` |
-| `user_stop` + provider + persisted id ≤ 0 | Recorded | No | `ownerPreserve` |
-| `user_stop` + provider + positive persisted id | Recorded | Yes (`startCancelReconcile`) | `pendingCancel` |
+## Producer Commit
 
-### Late envelope after soft-fence age-out
+- `7b826557fe38fca115dfadd65c10b2eb0da54abf` -
+  `fix: fence legacy workflow mutations`
 
-- Age-out → `ownerPreserve` still suppresses.
-- If Stop ownership gen is **still current**, accepted envelope **may** start coordinator.
-- If gen advanced (next prompt), envelope is stale → no-op.
+## Conclusion
 
-### Dual-path / surface / panel
+done
 
-- Envelope path remains sole starter for outcome + coordinator.
-- Status-edge / surface / panel remain promotion-only (source audits).
-- Destructive under suppress still no-ops (store + dual-path coverage).
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done","summary":"Fenced all Task 4 workflow mutation, recovery-authorization, Final-delivery, complete_work, and linked-root prompt paths with the exact protocol-v2 guard; added narrow typed corrupt-header mapping and no-side-effect negative matrices.","commits":[{"sha":"7b826557fe38fca115dfadd65c10b2eb0da54abf","subject":"fix: fence legacy workflow mutations"}],"tests":{"status":"passed","passed":39,"failed":0,"summary":"Thirty integration tests, two completion/complete_work matrices, seven focused regressions, rustfmt, cargo check, strict all-target Clippy, and cached diff checks passed."},"concerns":["A broader library run remains non-green because of 100 pre-existing Task 2/3 fixture failures involving the test-only legacy settlement adapter and duplicate fixed-v2 Design gate-state inserts; scoped Task 4 verification is green.","Independent Codex and Grok review is still pending."],"report_file":".superpowers/sdd/task-4-report.md"}
+-->
 
-## HEAD invert
+## Fix Round 1
 
-Previously `MIGRATE_CONVERSATION` nulled `pendingCancel`, cleared soft/owner, and bumped gens so late envelopes were stale.
+Both independent reviewers requested changes on producer `7b826557`. Fix round
+1 closes all three Important findings in a new producer commit:
 
-**Inverted tests:**
+- `T4-GROK-I1`: removed the automatic legacy restart from MCP
+  `process_recover_workflow`. Recovery now enters the fenced store core,
+  returns `legacy_completion_protocol_read_only` for a historical workflow,
+  and creates no successor. A listener-level regression covers this production
+  boundary.
+- `T4-CODEX-I1`: changed
+  `load_completion_protocol_for_conversation` to resolve the
+  conversation-owned workflow plus every workflow referenced by every durable
+  child-run binding across generations. Distinct workflow ids are loaded in
+  stable order; any missing or corrupt authoritative header fails closed, and
+  rejection precedence is deterministic (`unsupported` before `legacy` before
+  allowed). Regressions cover a latest unbound generation masking an older v1
+  binding and an owned v2 workflow conflicting with a bound v1 workflow.
+- `T4-CODEX-I2`: made the Design self-review preflight transaction load and
+  validate the typed protocol header before decoding the full workflow model.
+  Direct and nested completion protocol errors preserve their stable,
+  non-retryable classification; unrelated completion errors remain persistence
+  failures. The corrupt-mode race regression asserts
+  `unsupported_completion_protocol` and zero graph, gate, binding, attention,
+  or other semantic writes.
 
-- `migrates userStop ownership without bumping cancelGeneration`
-- `migrate after appendOptimisticTurn keeps cancelGeneration and ownership current`
+### Fix-Round TDD Evidence
 
-## Tests run
+RED was observed before each fix:
 
-```powershell
-pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-dual-path.test.ts
-# 80 passed (66 + 14)
+- MCP recovery returned a successor projection instead of the read-only error.
+- The multi-generation loader returned `None` when a latest unbound run masked
+  an older binding, and returned `(2, v2_enforce)` when an owned v2 association
+  masked a bound v1 association.
+- Concurrent corrupt-mode Design preflight returned retryable
+  `workflow_persistence_failure`.
+- The nested completion-error mapping regression initially failed to compile
+  because no structural mapper existed.
 
-pnpm exec vitest run src/stores/ src/contexts/user-stop-dual-path.test.ts
-# 280 passed (19 files)
+GREEN was then observed for the MCP recovery boundary, both multi-association
+loader cases, the corrupt-mode Design race, and the structural nested-error
+mapping.
 
-pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reconcile.test.ts src/contexts/acp-connections-context.tsx src/contexts/user-stop-dual-path.test.ts
-# 0 errors (pre-existing react-hooks warnings only in acp-connections-context)
-```
+### Fix-Round Verification
 
-## Self-review
+- Full `completion_protocol_v2` integration target: 32 passed, 0 failed.
+- MCP recovery listener regression: 1 passed, 0 failed.
+- Multi-association loader regressions: 2 passed, 0 failed.
+- Design preflight regressions and nested protocol mapper: passed.
+- Historical completion and `complete_work` matrices: 2 passed, 0 failed.
+- Recovery-authorization fence: 1 passed, 0 failed.
+- Header database-error classification: 1 passed, 0 failed.
+- `cargo check`: passed.
+- Strict all-target Clippy: passed.
+- Rustfmt over the three fix-round Rust files and cached/working diff checks:
+  passed.
 
-- Migration does **not** bump `cancelGeneration`; identity rebind still does.
-- In-flight coordinator is restarted after migrate (clear + `startCancelReconcile`) so deferred reconcile uses post-migration id without gen bump.
-- Soft-fence age-out helper extracted (`scheduleSoftFenceAgeOut`) and shared with Stop ownership + migrate re-arm.
-- Envelope path calls `enterOwnerPreserve` for both missing-provider and unbound-id paths.
-- Panel/surface dual-path sole-starter audits unchanged and green.
+The optional reviewer minors were deferred. Root companion auto-restart belongs
+to the later admission/restart-removal work; automation, chat, Tauri, Axum, and
+expanded snapshot coverage were not broadened into this focused Important-fix
+round. The existing broader Task 2/3 fixture debt remains unchanged. Task 5 was
+not started.
 
-## Concerns
+### Fix-Round Producer Commit
 
-1. ~~**Coordinator restart after migrate** resets attempt budget~~ — **fixed** in `27bab555` (rekey preserves attempt index + remaining delay).
-2. ~~**Soft-fence re-arm** full 30s~~ — **fixed** in `27bab555` (deadline carried across migrate).
-3. **`cancelGeneration` on FROM** is left at the pre-migrate value (not deleted); session-map absence already makes `isStaleUserStopEnvelope(FROM)` true.
-4. **Prettier/CRLF** on Windows: working tree may rewrite LF→CRLF on touch; no functional impact.
-5. **AC3 / Tasks 5–7** still pending per plan DAG.
-6. **Mid-flight raw promise** started before rekey still uses the fetch id resolved at attempt start (persisted id); apply uses rekeyed runtime id. Transport cannot be aborted mid-flight; response is applied or ignored via gates.
+- `3f0fb8f43c162e207f04d0813f7c1a6f84a3ca2c` -
+  `fix: close workflow mutation fence gaps`
 
-## Out of scope (confirmed not done)
+Independent Codex and Grok re-review is pending.
 
-- Task 5a/5b/5c AC3 vendor pin / managed install
-- Task 6 presentation RETAIN audit
-- Task 7 full AGENTS verification sweep
-- Push / PR
-
----
-
-## FIX round 1/5 (review `task-4-review.md`)
-
-**Reviewed FAIL:** 2 Important, 1 Minor on `35a44b9a`.
-
-### Important 1 — coordinator attempt budget across migrate
-
-**Bug:** `migrateConversation` cancelled coordinator and called `startCancelReconcile` → `attempt(0)` with a fresh 3-read budget.
-
-**Fix:** Mutable `CancelReconcileRuntime` (`nextAttemptIndex`, `timerDueAt`) rekeyed via `rekeyCancelReconcileRuntime` — no cancel+restart. Remaining delay rescheduled; apply path uses post-migration `runtime.conversationId`.
-
-**Regression:** `migrates coordinator remaining attempts: ≤3 total reads after missing-fence then migrate` — first missing-fence read, migrate, then apply; `mockGet` calls ≤ 3.
-
-### Important 2 — unbound accept terminal for coordinator start
-
-**Bug:** Redelivered same `(connectionId, completionSeq)` after migrate to positive id could start coordinator because only footer idempotency was tracked.
-
-**Fix:**
-- `userStopNoCoordinatorCompletions` set (`connectionId\0seq`) via `markUserStopNoCoordinatorCompletion` / `isUserStopNoCoordinatorCompletion`
-- `recordTurnOutcome` returns `"recorded" | "duplicate" | "skipped"` and detects same completion under any runtime id
-- `acceptUserStopTurnComplete` skips coordinator on no-coordinator identity or duplicate outcome status
-
-**Regression:** `unbound accept then migrate to positive id: redelivered envelope never starts coordinator` — `pendingCancel` null, no transport.
-
-### Minor 3 — soft-fence remaining time
-
-**Fix:** `softFenceDeadlineById` + `scheduleSoftFenceAgeOut(runtimeId, deadlineAt?)`; migrate carries deadline.
-
-### Verification (FIX round 1)
-
-```powershell
-pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-dual-path.test.ts
-# 82 passed (67 + 15)
-
-pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reconcile.test.ts src/contexts/acp-connections-context.tsx src/contexts/user-stop-dual-path.test.ts
-# 0 errors (pre-existing react-hooks warnings only)
-```
-
----
-
-## FIX round 2/5 (review re-review New Important)
-
-**Reviewed FAIL:** destination-only coordinator orphaned on migrate (`27bab555`).
-
-### Important — destination-only coordinator orphan
-
-**Bug:** When source had no `pendingCancel`/runtime but destination did, migrate cancelled the destination worker, reducer kept destination `pendingCancel`, and no worker was restarted → permanent suppress without apply/exhaust.
-
-**Fix (`fde1ba8d`):**
-- Source runtime present → rekey to destination (replaces dest worker) + move gen
-- Source absent, destination present → **keep** destination runtime + gen (do not cancel)
-- Neither → move gen only (ownership no-bump)
-- Post-merge safety: if `pendingCancel` exists without a live runtime, clear the orphan key
-- Soft-fence deadline falls back to destination when source has none
-
-**Regression:** `destination-only coordinator survives migrate when source has no pending (no orphan)` — after migrate, pending remains with a live worker that still applies fenced detail.
-
-### Verification (FIX round 2)
-
-```powershell
-pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-dual-path.test.ts
-# 83 passed (68 + 15)
-```
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done","summary":"Closed the three Task 4 Important review findings: MCP recovery no longer auto-restarts legacy workflows, root protocol lookup scans every durable association deterministically and fails closed, and Design preflight preserves typed corrupt-header classification before full-model decoding or writes.","commits":[{"sha":"3f0fb8f43c162e207f04d0813f7c1a6f84a3ca2c","subject":"fix: close workflow mutation fence gaps"}],"tests":{"status":"passed","passed":40,"failed":0,"summary":"The 32-test completion_protocol_v2 target and eight focused listener/store/completion regressions passed, followed by cargo check, strict all-target Clippy, rustfmt, and diff checks."},"concerns":["The broader library suite still has pre-existing Task 2/3 fixture debt outside this fix-round scope.","Independent Codex and Grok re-review is pending.","Optional root companion, cross-entry harness, and expanded snapshot minors are deferred to their owning later work or a dedicated test expansion."],"report_file":".superpowers/sdd/task-4-report.md"}
+-->
