@@ -6,6 +6,9 @@ use thiserror::Error;
 
 static STARTUP_WORKING_DIRECTORY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 static PINNED_EUI_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(test)]
+static ENVIRONMENT_WRITE_PHASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EuiRootInputs {
@@ -68,12 +71,16 @@ pub fn pin_eui_data_root(root: PathBuf) -> Result<(), DataRootError> {
     if absolute.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(DataRootError::EmbeddedNul);
     }
-    verify_or_set_process_pin(&absolute)?;
+    if !verify_or_set_process_pin(&absolute)? {
+        return Ok(());
+    }
 
     // This function is a startup-only trust-boundary operation. Callers must
     // invoke it before starting worker threads or environment-reading helpers.
     env::remove_var("CODEG_HOME");
     env::set_var("CODEG_DATA_DIR", &absolute);
+    #[cfg(test)]
+    ENVIRONMENT_WRITE_PHASES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -97,19 +104,23 @@ fn absolutize_without_requiring_existence(root: &Path) -> Result<PathBuf, DataRo
     Ok(absolutize_from(root, &startup_working_directory()?))
 }
 
-fn verify_or_set_process_pin(requested: &PathBuf) -> Result<(), DataRootError> {
+fn verify_or_set_process_pin(requested: &PathBuf) -> Result<bool, DataRootError> {
     if let Some(pinned) = PINNED_EUI_DATA_ROOT.get() {
-        return roots_match(pinned, requested);
+        roots_match(pinned, requested)?;
+        return Ok(false);
     }
 
     match PINNED_EUI_DATA_ROOT.set(requested.clone()) {
-        Ok(()) => Ok(()),
-        Err(_) => roots_match(
-            PINNED_EUI_DATA_ROOT
-                .get()
-                .expect("EUI data root is set after a failed OnceLock set"),
-            requested,
-        ),
+        Ok(()) => Ok(true),
+        Err(_) => {
+            roots_match(
+                PINNED_EUI_DATA_ROOT
+                    .get()
+                    .expect("EUI data root is set after a failed OnceLock set"),
+                requested,
+            )?;
+            Ok(false)
+        }
     }
 }
 
@@ -138,4 +149,41 @@ fn lexically_normalize(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ENVIRONMENT_WRITE_PHASES;
+    use crate::{
+        codeg_eui_begin_shutdown, codeg_eui_init, codeg_eui_poll, codeg_eui_shutdown,
+        CodegEuiFrame, CODEG_EUI_OK,
+    };
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn same_root_abi_restart_does_not_repeat_environment_write_phase() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_str().expect("UTF-8 temp path").as_bytes();
+
+        assert_eq!(ENVIRONMENT_WRITE_PHASES.load(Ordering::SeqCst), 0);
+        assert_eq!(codeg_eui_init(root.as_ptr(), root.len()), CODEG_EUI_OK);
+        assert_eq!(ENVIRONMENT_WRITE_PHASES.load(Ordering::SeqCst), 1);
+        complete_shutdown();
+
+        assert_eq!(codeg_eui_init(root.as_ptr(), root.len()), CODEG_EUI_OK);
+        assert_eq!(
+            ENVIRONMENT_WRITE_PHASES.load(Ordering::SeqCst),
+            1,
+            "same-root restart must verify the pin without rewriting process env"
+        );
+        complete_shutdown();
+    }
+
+    fn complete_shutdown() {
+        assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
+        let mut frame = CodegEuiFrame::default();
+        assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+        assert_eq!(frame.shutdown_ready, 1);
+        assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+    }
 }
