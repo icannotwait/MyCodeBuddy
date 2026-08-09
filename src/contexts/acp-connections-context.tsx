@@ -64,6 +64,7 @@ import {
   streamingPerfRecorder,
   type PerfRateProfile,
 } from "@/lib/perf/streaming-perf-recorder"
+import { getActiveComparisonRecorder } from "@/lib/perf/eui-comparison-recorder"
 import {
   downloadStreamingPerfReport,
   extractWebviewVersion,
@@ -7555,6 +7556,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           opts?.conversationId ?? null,
           opts?.clientMessageId ?? null,
           promptContext
+        )
+        // Opt-in EUI comparison protocol: t0 immediately after send resolves.
+        getActiveComparisonRecorder()?.markT0(
+          typeof performance !== "undefined"
+            ? Math.round(performance.now() * 1e6)
+            : Date.now() * 1e6,
         )
       } catch (e) {
         rollbackRootConversationActivity(activity)

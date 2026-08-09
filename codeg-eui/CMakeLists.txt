@@ -19,6 +19,18 @@ endfunction()
 codeg_eui_add_contract_test(codeg_eui_harness_self tests/harness_self_test.cpp)
 codeg_eui_add_contract_test(codeg_eui_abi_layout tests/abi_layout_test.cpp)
 codeg_eui_add_contract_test(codeg_eui_ui_snapshot tests/ui_snapshot_test.cpp)
+codeg_eui_add_contract_test(
+  codeg_eui_client_completion tests/client_completion_test.cpp)
+codeg_eui_add_contract_test(
+  codeg_eui_app_lifecycle tests/app_lifecycle_test.cpp)
+codeg_eui_add_contract_test(codeg_eui_shell_page tests/shell_page_test.cpp)
+codeg_eui_add_contract_test(codeg_eui_chat_page tests/chat_page_test.cpp)
+codeg_eui_add_contract_test(
+  codeg_eui_settings_page tests/settings_page_test.cpp)
+codeg_eui_add_contract_test(
+  codeg_eui_m5_controls tests/m5_controls_test.cpp)
+codeg_eui_add_contract_test(
+  codeg_eui_perf_metrics tests/perf_metrics_test.cpp)
 
 if(CODEG_EUI_ABI_LINK_TESTS OR NOT CODEG_EUI_CONTRACTS_ONLY)
   if(NOT IS_ABSOLUTE "${CODEG_EUI_RUST_LIB}" OR
@@ -46,7 +58,7 @@ if(NOT CODEG_EUI_CONTRACTS_ONLY)
   add_executable(codeg-eui
     third_party/EUI-NEO/core/app/glfw_app_main.cpp
     app/app.cpp)
-  target_include_directories(codeg-eui PRIVATE app/bridge)
+  target_include_directories(codeg-eui PRIVATE app app/bridge)
   target_link_libraries(codeg-eui PRIVATE
     codeg_eui_core Threads::Threads ${CMAKE_DL_LIBS} m)
   eui_neo_configure_app(codeg-eui)

@@ -68,6 +68,12 @@ pub(crate) trait CoreOps: Send + Sync {
     fn get_agent_settings(&self, agent: Vec<u8>) -> CoreFuture;
     fn set_agent_settings(&self, agent: Vec<u8>, json: Vec<u8>) -> CoreFuture;
     fn probe_agent(&self, agent: Vec<u8>) -> CoreFuture;
+    fn cancel_active_turn(&self, connection_id: String) -> CoreFuture {
+        Box::pin(async move {
+            let _ = connection_id;
+            Err("cancel is not implemented in this test double".to_string())
+        })
+    }
 }
 
 struct AppCoreOps {
@@ -86,6 +92,10 @@ pub(crate) enum CommandContext {
     None,
     Workspace(codeg_lib::commands::eui_facade::EuiWorkspace),
     Selection(codeg_lib::commands::eui_facade::EuiSessionSelection),
+    Cancel {
+        connection_id: String,
+        selection_epoch: u64,
+    },
     Unavailable(String),
 }
 
@@ -114,6 +124,16 @@ fn capture_command_context(
             .map(CommandContext::Selection)
             .unwrap_or_else(|| {
                 CommandContext::Unavailable("no EUI session is selected".to_string())
+            }),
+        Operation::CancelActiveTurn => current
+            .selection
+            .as_ref()
+            .map(|selection| CommandContext::Cancel {
+                connection_id: selection.connection_id.clone(),
+                selection_epoch,
+            })
+            .unwrap_or_else(|| {
+                CommandContext::Unavailable("no EUI session is selected for cancel".to_string())
             }),
         _ => CommandContext::None,
     }
@@ -266,6 +286,21 @@ impl CoreOps for AppCoreOps {
             serde_json::to_vec(&probe)
                 .map(CoreResult::json)
                 .map_err(|error| error.to_string())
+        })
+    }
+
+    fn cancel_active_turn(&self, connection_id: String) -> CoreFuture {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            if connection_id.is_empty() {
+                return Err("cancel requires a selected connection".to_string());
+            }
+            state
+                .connection_manager
+                .cancel(&state.db.conn, &connection_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(CoreResult::json(Vec::new()))
         })
     }
 }
@@ -653,7 +688,22 @@ async fn execute_command(
         CommandPayload::Error(error) => Err(error),
         #[cfg(test)]
         CommandPayload::Panic => panic!("test worker panic"),
-        CommandPayload::Empty => Err("operation is not implemented in Task 5".to_string()),
+        CommandPayload::Empty => match op {
+            Operation::CancelActiveTurn => {
+                let CommandContext::Cancel {
+                    connection_id,
+                    selection_epoch: captured_epoch,
+                } = context
+                else {
+                    return Err("cancel is missing its admitted connection".to_string());
+                };
+                // Epoch fencing is applied at terminalize time against the
+                // current model epoch; still cancel the captured connection.
+                let _ = captured_epoch;
+                core_ops.cancel_active_turn(connection_id).await
+            }
+            _ => Err("operation is not implemented".to_string()),
+        },
         CommandPayload::Utf8(value) => match op {
             Operation::SetWorkspace => core_ops.set_workspace(selection_epoch, value).await,
             Operation::CreateSession => {

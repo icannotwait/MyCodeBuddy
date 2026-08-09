@@ -1,6 +1,7 @@
 "use client"
 
 import { memo, useLayoutEffect, useMemo, useState } from "react"
+import { getActiveComparisonRecorder } from "@/lib/perf/eui-comparison-recorder"
 import {
   Message,
   MessageContent,
@@ -199,10 +200,13 @@ function imageDisplayFromTool(info: ToolCallInfo): UserImageDisplay | null {
 }
 
 /** Drain delivery→paint samples after live-footer React commits (P2 path). */
-function useLiveFooterPerfCommit() {
+function useLiveFooterPerfCommit(assistantText?: string) {
   useLayoutEffect(() => {
     streamingPerfRecorder.markReactCommit()
-  })
+    if (assistantText && assistantText.length > 0) {
+      getActiveComparisonRecorder()?.assistantCommitted(assistantText)
+    }
+  }, [assistantText])
 }
 
 const LiveTextSegment = memo(function LiveTextSegment({
@@ -211,7 +215,7 @@ const LiveTextSegment = memo(function LiveTextSegment({
   text: string
 }) {
   streamingPerfRecorder.countRender("liveRow")
-  useLiveFooterPerfCommit()
+  useLiveFooterPerfCommit(text)
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
       <MessageResponse>{text}</MessageResponse>

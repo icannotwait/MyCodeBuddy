@@ -469,6 +469,35 @@ impl SharedModel {
         self.lock().error_strip = message;
     }
 
+    /// Terminal agent error: stop stream, retain partial assistant text, allow new session.
+    pub(crate) fn apply_terminal_error(&self, message: impl Into<String>) {
+        let mut state = self.lock();
+        state.stream_active = false;
+        state.needs_resync = false;
+        state.error_strip = message.into().into_bytes();
+        if state.t0_ns != 0 && state.t_end_ns == 0 {
+            state.t_end_ns = crate::perf::native_timestamp_ns();
+        }
+    }
+
+    pub(crate) fn live_assistant(&self) -> String {
+        String::from_utf8_lossy(&self.lock().live_assistant).into_owned()
+    }
+
+    pub(crate) fn stream_active(&self) -> bool {
+        self.lock().stream_active
+    }
+
+    pub(crate) fn error_strip(&self) -> String {
+        String::from_utf8_lossy(&self.lock().error_strip).into_owned()
+    }
+
+    pub(crate) fn can_create_session(&self) -> bool {
+        // New Session is always allowed at the model layer after hard error;
+        // the UI still requires a workspace path.
+        true
+    }
+
     pub(crate) fn build_frame(
         &self,
         stopping: bool,
