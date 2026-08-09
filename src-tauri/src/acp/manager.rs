@@ -24,14 +24,14 @@ use crate::acp::delegation::continuation::store::{
     ContinuationPatch, ContinuationStore, FieldPatch,
 };
 use crate::acp::delegation::continuation::types::ContinuationState;
-use crate::acp::delegation::metrics::{DelegationMetrics, PromptAdmissionSource};
+use crate::acp::delegation::metrics::PromptAdmissionSource;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::delegation::workflow::{
-    load_completion_protocol_for_conversation, require_v2_mutation, CompletionProtocolRolloutConfig,
+    load_completion_protocol_for_conversation, require_v2_mutation,
 };
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
@@ -480,7 +480,6 @@ pub struct ConnectionManager {
     /// Durable continuation ownership store installed once with the shared
     /// delegation runtime. The outer Arc keeps `clone_ref` clones on one slot.
     continuation_store: Arc<std::sync::OnceLock<Arc<dyn ContinuationStore>>>,
-    completion_protocol_runtime: Arc<std::sync::OnceLock<CompletionProtocolRuntime>>,
     /// Per-agent-type serialization for `probe_agent_options`. Without
     /// this, rapid agent-tab clicks in the settings UI would fan out one
     /// real CLI process per click — each one running up to 60s. The
@@ -509,13 +508,6 @@ pub struct ConnectionManager {
     >,
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct CompletionProtocolRuntime {
-    rollout: Arc<CompletionProtocolRolloutConfig>,
-    metrics: Arc<DelegationMetrics>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -587,7 +579,6 @@ impl ConnectionManager {
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
-            completion_protocol_runtime: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
@@ -611,7 +602,6 @@ impl ConnectionManager {
             mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
             continuation_store: self.continuation_store.clone(),
-            completion_protocol_runtime: self.completion_protocol_runtime.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
@@ -674,16 +664,6 @@ impl ConnectionManager {
 
     pub(crate) fn install_continuation_store(&self, store: Arc<dyn ContinuationStore>) {
         let _ = self.continuation_store.set(store);
-    }
-
-    pub fn install_completion_protocol_runtime(
-        &self,
-        rollout: Arc<CompletionProtocolRolloutConfig>,
-        metrics: Arc<DelegationMetrics>,
-    ) {
-        let _ = self
-            .completion_protocol_runtime
-            .set(CompletionProtocolRuntime { rollout, metrics });
     }
 
     #[allow(dead_code)]

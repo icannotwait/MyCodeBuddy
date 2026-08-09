@@ -65,10 +65,6 @@ pub struct AppState {
     /// Process-local delegation reliability metrics (route/accepted/terminal/
     /// wait/cancel). Shared with broker, supervisor, listener, and route launch.
     pub delegation_metrics: Arc<DelegationMetrics>,
-    /// Transitional read-only rollout state retained until the settings and
-    /// restart surfaces are removed. Workflow creation does not consult it.
-    pub completion_protocol_rollout:
-        Arc<crate::acp::delegation::workflow::CompletionProtocolRolloutConfig>,
     /// Durable completion events are dispatched after commit and replayed on
     /// startup/periodic scans. Shared by Tauri and Axum mutation surfaces.
     pub completion_outbox_dispatcher: Arc<CompletionOutboxDispatcher>,
@@ -519,13 +515,6 @@ impl AppState {
                 db: db.conn.clone(),
             }),
         );
-        let completion_protocol_rollout =
-            Arc::new(crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::fixed_v2());
-        connection_manager.install_completion_protocol_runtime(
-            completion_protocol_rollout.clone(),
-            stack.metrics.clone(),
-        );
-
         Self {
             db,
             connection_manager,
@@ -550,7 +539,6 @@ impl AppState {
             delegation_broker: stack.broker,
             continuation_coordinator: stack.continuation_coordinator,
             delegation_metrics: stack.metrics,
-            completion_protocol_rollout,
             completion_outbox_dispatcher,
             delegation_runtime_settings: stack.runtime_settings,
             delegation_tokens: stack.tokens,

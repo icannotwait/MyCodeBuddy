@@ -11,24 +11,14 @@ use crate::acp::delegation::types::{
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::workflow_completion::{
-    completion_attention_parent_conversation_id, get_completion_protocol_settings_core,
-    resolve_completion_decision_core, resolve_design_self_review_core,
-    retry_completion_artifact_core, CompletionProtocolSettingsSnapshot,
+    completion_attention_parent_conversation_id, resolve_completion_decision_core,
+    resolve_design_self_review_core, retry_completion_artifact_core,
 };
 use crate::web::auth::AuthenticatedApplication;
 
 fn unauthorized_context_error() -> AppCommandError {
     AppCommandError::permission_denied("completion attention is owned by another root conversation")
         .with_detail("unauthorized")
-}
-
-pub async fn get_completion_protocol_settings(
-    Extension(state): Extension<Arc<AppState>>,
-) -> Result<Json<CompletionProtocolSettingsSnapshot>, AppCommandError> {
-    Ok(Json(get_completion_protocol_settings_core(
-        state.delegation_metrics.as_ref(),
-        state.completion_protocol_rollout.as_ref(),
-    )))
 }
 
 pub async fn resolve_completion_decision(

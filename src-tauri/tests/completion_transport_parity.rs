@@ -357,6 +357,27 @@ fn attention_mutation_routes_and_desktop_commands_are_registered() {
     }
 }
 
+#[tokio::test]
+async fn completion_rollout_surface_is_absent() {
+    let fixture = completion_http_fixture().await;
+    let operation = ["get", "completion", "protocol", "settings"].join("_");
+    let response = fixture
+        .server
+        .post(&format!("/api/{operation}"))
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(response.status_code(), 501);
+    let body: Value = response.json();
+    assert_eq!(body["code"], "not_implemented");
+
+    let lib = include_str!("../src/lib.rs");
+    assert!(
+        !lib.contains(&format!("workflow_completion::{operation}")),
+        "removed completion settings command remains registered"
+    );
+}
+
 fn error_detail(response: &axum_test::TestResponse) -> String {
     response.json::<Value>()["detail"]
         .as_str()

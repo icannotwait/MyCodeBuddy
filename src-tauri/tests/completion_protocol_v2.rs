@@ -7,19 +7,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum_test::TestServer;
 use codeg_lib::acp::delegation::broker::{
-    compare_completion_shadow_outcome, is_completion_format_repair_prompt,
-    pre_read_completion_reports_for_test, ConversationDepthLookup, DelegationBroker,
+    is_completion_format_repair_prompt, pre_read_completion_reports_for_test,
+    ConversationDepthLookup, DelegationBroker,
 };
 use codeg_lib::acp::delegation::companion::{
     dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
+};
+use codeg_lib::acp::delegation::event_emitter::{
+    CompletionOutboxDispatcher, CompletionRootWakeQueue,
 };
 use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
     DelegationListener, ParentSessionLookup, TokenEntry, TokenRegistry,
 };
 use codeg_lib::acp::delegation::metrics::{
-    CompletionContinuationReason, CompletionFinalMetricState, CompletionRestartOutcome,
-    CompletionShadowDifference, DelegationMetrics,
+    CompletionContinuationReason, CompletionFinalMetricState, DelegationMetrics,
 };
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
 use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
@@ -33,21 +35,20 @@ use codeg_lib::acp::delegation::types::{
     ContinueDelegationRequest, DelegationError, ResolveCompletionDecisionRequest,
 };
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, evaluate_rollout_window, guard_current_final_delivery_core,
-    guard_final_delivery_core, guard_task_final_delivery_core,
-    load_completion_protocol_for_conversation, load_historical_workflow_context,
-    materialize_terminal_completion_txn, project_workflow_graph_core,
-    publish_workflow_manifest_core, recover_workflow_core, select_completion_protocol,
-    settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
-    CompletionOutcome, CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
-    CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentGateKind,
-    DocumentRef, FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument,
-    ManifestGate, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
-    ManifestWorkflowState, PlanReviewChangeV2, PlanReviewNextAction, ProfileCompletionWindow,
-    PublishWorkflowRequest, RecoverWorkflowRequest, ResolutionMode, RolloutDecision,
+    build_work_unit_key, guard_current_final_delivery_core, guard_final_delivery_core,
+    guard_task_final_delivery_core, load_completion_protocol_for_conversation,
+    load_historical_workflow_context, materialize_terminal_completion_txn,
+    project_workflow_graph_core, publish_workflow_manifest_core, recover_workflow_core,
+    settle_workflow_gate_v2_core, CompletionCardV2, CompletionDecisionResolvedPayloadV1,
+    CompletionIntentSource, CompletionOutcome, CompletionProtocolConfigurationRemoved,
+    CompletionRole, DocumentGateKind, DocumentRef, FinalDeliveryGuardRequest,
+    FinalDeliveryGuardResult, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
+    ManifestNodeRole, ManifestPhase, ManifestWorkflowState, PlanReviewChangeV2,
+    PlanReviewNextAction, PublishWorkflowRequest, RecoverWorkflowRequest, ResolutionMode,
     SettleWorkflowV2Request, TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
-    CURRENT_COMPLETION_PROTOCOL_VERSION, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL,
-    PHASE_PLAN, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    COMPLETION_DECISION_RESOLVED_EVENT, CURRENT_COMPLETION_PROTOCOL_VERSION,
+    MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
+    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::ConnectionManager;
@@ -59,8 +60,8 @@ use codeg_lib::db::entities::{
     auto_title_job, delegation_attention_request, delegation_completion_tool_intent,
     delegation_task_run, delegation_workflow, delegation_workflow_gate_settlement,
     delegation_workflow_gate_state, delegation_workflow_manifest_revision,
-    delegation_workflow_node_binding, delegation_workflow_restart_context,
-    delegation_workflow_run_binding, recovery_authorization,
+    delegation_workflow_node_binding, delegation_workflow_outbox_event,
+    delegation_workflow_restart_context, delegation_workflow_run_binding, recovery_authorization,
 };
 use codeg_lib::db::test_helpers::{
     complete_historical_completion_protocol_migrations, fresh_in_memory_db,
@@ -78,6 +79,22 @@ use sea_orm::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+#[derive(Default)]
+struct RecordingCompletionRootWake {
+    event_ids: tokio::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl CompletionRootWakeQueue for RecordingCompletionRootWake {
+    async fn enqueue_completion_resolution(
+        &self,
+        event: &CompletionDecisionResolvedPayloadV1,
+    ) -> Result<(), String> {
+        self.event_ids.lock().await.push(event.event_id.clone());
+        Ok(())
+    }
+}
 
 #[test]
 fn stable_protocol_error_codes() {
@@ -1303,13 +1320,6 @@ async fn corrupt_header_nonterminal_fences() {
         assert_eq!(recover_error.code(), "unsupported_completion_protocol");
 
         let manager = ConnectionManager::new();
-        manager.install_completion_protocol_runtime(
-            Arc::new(CompletionProtocolRolloutConfig {
-                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-                ..Default::default()
-            }),
-            Arc::new(DelegationMetrics::default()),
-        );
         let connection_id = format!("task-4-corrupt-root-{index}");
         manager
             .insert_test_connection(&connection_id, AgentType::Codex, None, EventEmitter::Noop)
@@ -3781,13 +3791,6 @@ async fn root_prompt_protocol_fence() {
         let before = mutation_snapshot(&db, parent, &published.workflow_id).await;
 
         let manager = ConnectionManager::new();
-        manager.install_completion_protocol_runtime(
-            Arc::new(CompletionProtocolRolloutConfig {
-                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-                ..Default::default()
-            }),
-            Arc::new(DelegationMetrics::default()),
-        );
         let connection_id = format!("task-4-root-{index}");
         manager
             .insert_test_connection(
@@ -4001,13 +4004,7 @@ async fn historical_root_resume_is_rejected_before_side_effects() {
     );
     let before = source_fingerprint(&db, parent, &published.workflow_id).await;
 
-    let metrics = std::sync::Arc::new(DelegationMetrics::default());
-    let rollout = CompletionProtocolRolloutConfig {
-        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-        ..Default::default()
-    };
     let manager = ConnectionManager::new();
-    manager.install_completion_protocol_runtime(std::sync::Arc::new(rollout), metrics);
     manager
         .insert_test_connection(
             "upgraded-legacy-root",
@@ -4060,86 +4057,76 @@ async fn historical_root_resume_is_rejected_before_side_effects() {
 }
 
 #[tokio::test]
-async fn fixed_v2_creation_is_not_affected_by_rollout_configuration() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-frozen-rollout").await;
+async fn valid_v2_attention_outbox_replay_wakes_root_once_and_acknowledges_delivery() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/task-8-root-wake").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let mut config = CompletionProtocolRolloutConfig {
-        default_mode: delegation_workflow::CompletionProtocolMode::V2Shadow,
-        ..Default::default()
-    };
-    let selection = select_completion_protocol("codex", Some("canary"), &config);
-    assert_eq!(
-        selection.mode,
-        delegation_workflow::CompletionProtocolMode::V2Shadow
-    );
     let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
-            document: skeleton("task-15-shadow"),
+            document: skeleton("task-8-root-wake"),
         },
     )
     .await
     .unwrap();
-
-    config.default_mode = delegation_workflow::CompletionProtocolMode::V1;
-    let row = delegation_workflow::Entity::find_by_id(published.workflow_id)
+    let workflow = delegation_workflow::Entity::find_by_id(&published.workflow_id)
         .one(&db.conn)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.completion_protocol_version, 2);
+    assert_eq!(workflow.completion_protocol_version, 2);
     assert_eq!(
-        row.completion_protocol_mode,
+        workflow.completion_protocol_mode,
         delegation_workflow::CompletionProtocolMode::V2Enforce
     );
-    assert_eq!(
-        select_completion_protocol("codex", Some("canary"), &config),
-        CompletionProtocolSelection::v1_default()
-    );
-}
 
-#[test]
-fn rollout_stops_only_after_minimum_sample_and_strict_thresholds() {
-    let decision = |samples, role_mismatch, needs_decision| {
-        evaluate_rollout_window(&ProfileCompletionWindow {
-            samples,
-            role_mismatch,
-            needs_decision,
-        })
+    let event_id = format!("task-8-root-wake-{}", uuid::Uuid::new_v4());
+    let payload = CompletionDecisionResolvedPayloadV1 {
+        version: 1,
+        event_id: event_id.clone(),
+        workflow_id: published.workflow_id.clone(),
+        task_id: "task-8-completed-child".into(),
+        node_id: "plan-author".into(),
+        kind: delegation_attention_request::AttentionKind::CompletionDecision,
+        outcome: CompletionOutcome::Done,
+        evidence_scope_digest: format!("sha256:{}", "a".repeat(64)),
+        graph_revision: published.graph_revision,
     };
-    assert_eq!(decision(99, 50, 50), RolloutDecision::InsufficientSamples);
-    assert_eq!(decision(100, 1, 5), RolloutDecision::MayExpand);
-    assert_eq!(decision(100, 2, 5), RolloutDecision::StopRoleMismatch);
-    assert_eq!(decision(100, 1, 6), RolloutDecision::StopNeedsDecision);
+    delegation_workflow_outbox_event::ActiveModel {
+        event_id: Set(event_id.clone()),
+        workflow_id: Set(published.workflow_id),
+        graph_revision: Set(i64::try_from(published.graph_revision).unwrap()),
+        event_kind: Set(COMPLETION_DECISION_RESOLVED_EVENT.into()),
+        subject_key: Set(payload.task_id.clone()),
+        payload_json: Set(serde_json::to_string(&payload).unwrap()),
+        dispatch_attempts: Set(0),
+        created_at: Set(chrono::Utc::now()),
+        delivered_at: Set(None),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+
+    let wake = Arc::new(RecordingCompletionRootWake::default());
+    let dispatcher = CompletionOutboxDispatcher::new(db.clone(), EventEmitter::Noop)
+        .with_root_wake(wake.clone());
+    dispatcher.dispatch_pending().await.unwrap();
+
+    assert_eq!(wake.event_ids.lock().await.as_slice(), [event_id.as_str()]);
+    let delivered = delegation_workflow_outbox_event::Entity::find_by_id(event_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.dispatch_attempts, 1);
+    assert!(delivered.delivered_at.is_some());
 }
 
 #[test]
-fn rollout_config_rejects_unknown_modes_and_malformed_override_keys() {
-    assert!(CompletionProtocolRolloutConfig::from_serialized_values(
-        Some("v2_enforce"),
-        Some(r#"{"codex|canary":"v2_shadow"}"#),
-    )
-    .is_ok());
-    assert!(
-        CompletionProtocolRolloutConfig::from_serialized_values(Some("best_effort"), None).is_err()
-    );
-    assert!(CompletionProtocolRolloutConfig::from_serialized_values(
-        Some("v1"),
-        Some(r#"{"missing-profile-separator":"v2_enforce"}"#),
-    )
-    .is_err());
-}
-
-#[test]
-fn completion_protocol_metrics_are_bounded_and_v2_format_repair_stays_zero() {
+fn completion_protocol_metrics_retain_v2_intent_and_outcome_fields() {
     let metrics = DelegationMetrics::default();
-    metrics
-        .record_completion_protocol_creation(delegation_workflow::CompletionProtocolMode::V2Shadow);
-    metrics.record_completion_restart(CompletionRestartOutcome::Created);
-    metrics.record_completion_shadow_difference(CompletionShadowDifference::NeedsDecision);
     metrics.record_completion_resolution(
         CompletionIntentSource::UserAdjudication,
         CompletionRole::Reviewer,
@@ -4156,9 +4143,8 @@ fn completion_protocol_metrics_are_bounded_and_v2_format_repair_stays_zero() {
         CompletionRole::Reviewer,
     );
     let snapshot = metrics.snapshot().completion_protocol;
-    assert_eq!(snapshot.creation_modes["v2_shadow"], 1);
-    assert_eq!(snapshot.restart_outcomes["created"], 1);
-    assert_eq!(snapshot.shadow_differences["needs_decision"], 1);
+    assert_eq!(snapshot.resolutions["user_adjudication:reviewer"], 1);
+    assert_eq!(snapshot.resolutions["assistant_conclusion:reviewer"], 1);
     assert_eq!(snapshot.format_only_child_runs, 0);
     assert_eq!(snapshot.card_reemit_prompts, 0);
     assert_eq!(snapshot.natural_language_fallback_count, 1);
@@ -4179,47 +4165,6 @@ fn completion_protocol_v2_rejects_and_counts_card_only_repair_attempts() {
     let snapshot = metrics.snapshot().completion_protocol;
     assert_eq!(snapshot.format_only_child_runs, 1);
     assert_eq!(snapshot.card_reemit_prompts, 1);
-}
-
-#[test]
-fn completion_protocol_metrics_compare_authorities_and_bound_profile_rollout_window() {
-    let resolved = CompletionResolution::Resolved(CompletionIntent {
-        outcome: CompletionOutcome::Approve,
-        summary: None,
-        report_file: None,
-        source: CompletionIntentSource::AssistantConclusion,
-    });
-    assert_eq!(
-        compare_completion_shadow_outcome(Some(CompletionOutcome::Approve), &resolved),
-        CompletionShadowDifference::Match
-    );
-    assert_eq!(
-        compare_completion_shadow_outcome(Some(CompletionOutcome::RequestChanges), &resolved),
-        CompletionShadowDifference::Outcome
-    );
-
-    let metrics = DelegationMetrics::default();
-    for _ in 0..98 {
-        metrics.record_completion_shadow_sample(
-            "grok",
-            Some("canary"),
-            CompletionShadowDifference::Match,
-        );
-    }
-    for _ in 0..2 {
-        metrics.record_completion_shadow_sample(
-            "grok",
-            Some("canary"),
-            CompletionShadowDifference::RoleMismatch,
-        );
-    }
-    let snapshot = metrics.snapshot().completion_protocol;
-    let window = &snapshot.rollout_windows["grok|canary"];
-    assert_eq!((window.samples, window.role_mismatch), (100, 2));
-    assert_eq!(
-        snapshot.rollout_decisions["grok|canary"],
-        RolloutDecision::StopRoleMismatch
-    );
 }
 
 #[test]

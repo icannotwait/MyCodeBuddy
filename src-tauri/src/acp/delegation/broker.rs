@@ -84,8 +84,8 @@ use crate::acp::delegation::meta_writer::{
 #[cfg(test)]
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::delegation::metrics::{
-    CompletionMetricPhase, CompletionShadowDifference, DelegationRecoveryMetricEvent,
-    RecoveryMetricEventKind, RuntimeProjectionErrorKind,
+    CompletionMetricPhase, DelegationRecoveryMetricEvent, RecoveryMetricEventKind,
+    RuntimeProjectionErrorKind,
 };
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
@@ -113,10 +113,10 @@ use crate::acp::delegation::types::{
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
+use crate::acp::delegation::workflow::CompletionResolution;
+#[cfg(test)]
 use crate::acp::delegation::workflow::CompletionRole;
-use crate::acp::delegation::workflow::{
-    CompletionOutcome, CompletionResolution, TerminalCompletionInput, ValidatedReportCandidate,
-};
+use crate::acp::delegation::workflow::{TerminalCompletionInput, ValidatedReportCandidate};
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
     AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
@@ -2242,25 +2242,6 @@ fn record_completion_resolver_metrics(
         CompletionResolution::NeedsDecision { reason_code, .. } => {
             metrics.record_completion_decision(*reason_code);
         }
-    }
-}
-
-pub fn compare_completion_shadow_outcome(
-    legacy_outcome: Option<CompletionOutcome>,
-    v2: &CompletionResolution,
-) -> CompletionShadowDifference {
-    match v2 {
-        CompletionResolution::Resolved(intent) => match legacy_outcome {
-            Some(outcome) if outcome == intent.outcome => CompletionShadowDifference::Match,
-            Some(_) | None => CompletionShadowDifference::Outcome,
-        },
-        CompletionResolution::NeedsDecision { reason_code, .. }
-            if *reason_code
-                == crate::acp::delegation::workflow::CompletionIntentReason::RoleMismatch =>
-        {
-            CompletionShadowDifference::RoleMismatch
-        }
-        CompletionResolution::NeedsDecision { .. } => CompletionShadowDifference::NeedsDecision,
     }
 }
 
@@ -31432,12 +31413,6 @@ mod tests {
             other => panic!("expected typed terminal failure event, got {other:?}"),
         }
         assert!(broker.task_store.get_retry(task_id).await.is_none());
-        assert!(broker
-            .metrics()
-            .snapshot()
-            .completion_protocol
-            .shadow_differences
-            .is_empty());
         assert_eq!(
             broker
                 .run_store()

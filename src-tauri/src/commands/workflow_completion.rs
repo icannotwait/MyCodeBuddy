@@ -3,9 +3,6 @@
 #[cfg(feature = "tauri-runtime")]
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
 use crate::acp::delegation::event_emitter::CompletionOutboxDispatcher;
 use crate::acp::delegation::types::{
     CompletionMutationContext, CompletionMutationResult, ResolveCompletionDecisionRequest,
@@ -14,66 +11,12 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     resolve_completion_decision_txn, resolve_design_self_review_txn,
     retry_completion_artifact_for_user_txn, CompletionMutationError,
-    CompletionProtocolRolloutConfig,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::delegation_attention_request;
 use crate::db::AppDatabase;
 use chrono::Utc;
 use sea_orm::EntityTrait;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionProtocolSettingsSnapshot {
-    pub default_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    pub profile_overrides:
-        BTreeMap<String, crate::db::entities::delegation_workflow::CompletionProtocolMode>,
-    pub minimum_samples: u64,
-    pub creation_modes: BTreeMap<String, u64>,
-    pub shadow_differences: BTreeMap<String, u64>,
-    pub rollout_windows:
-        BTreeMap<String, crate::acp::delegation::workflow::ProfileCompletionWindow>,
-    pub rollout_decisions: BTreeMap<String, crate::acp::delegation::workflow::RolloutDecision>,
-}
-
-pub fn get_completion_protocol_settings_core(
-    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
-    rollout: &CompletionProtocolRolloutConfig,
-) -> CompletionProtocolSettingsSnapshot {
-    let completion = metrics.snapshot().completion_protocol;
-    CompletionProtocolSettingsSnapshot {
-        default_mode: rollout.default_mode.clone(),
-        profile_overrides: rollout.profile_overrides.clone(),
-        minimum_samples: crate::acp::delegation::workflow::COMPLETION_ROLLOUT_MINIMUM_SAMPLES,
-        creation_modes: completion.creation_modes,
-        shadow_differences: completion.shadow_differences,
-        rollout_windows: completion.rollout_windows,
-        rollout_decisions: completion.rollout_decisions,
-    }
-}
-
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub fn get_completion_protocol_settings(
-    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
-        '_,
-        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
-    >,
-    #[cfg(feature = "tauri-runtime")] rollout: tauri::State<
-        '_,
-        Arc<CompletionProtocolRolloutConfig>,
-    >,
-) -> Result<CompletionProtocolSettingsSnapshot, AppCommandError> {
-    #[cfg(feature = "tauri-runtime")]
-    {
-        Ok(get_completion_protocol_settings_core(
-            metrics.inner(),
-            rollout.inner(),
-        ))
-    }
-    #[cfg(not(feature = "tauri-runtime"))]
-    {
-        Err(AppCommandError::configuration_invalid("tauri-only command"))
-    }
-}
 
 pub async fn completion_attention_parent_conversation_id(
     db: &AppDatabase,

@@ -55,10 +55,9 @@ use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
     load_completion_protocol_header, publish_workflow_manifest_core, recover_workflow_core,
-    require_v2_mutation, settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig,
-    FinalDeliveryGuardResult, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
-    RecoverWorkflowRequest, SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition,
-    WorkflowStoreError,
+    require_v2_mutation, settle_workflow_gate_v2_core, FinalDeliveryGuardResult, ManifestDocument,
+    PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowV2Request,
+    WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -358,7 +357,6 @@ pub struct DelegationListener {
     pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     /// Shared `EventEmitter` for workflow graph live events (publish/settle).
     pub workflow_emitter: EventEmitter,
-    pub completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
     recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
     #[cfg(any(test, feature = "test-utils"))]
     status_release_decision_gate: Arc<StatusReleaseDecisionGate>,
@@ -425,33 +423,6 @@ impl DelegationListener {
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
         workflow_emitter: EventEmitter,
     ) -> Arc<Self> {
-        Self::new_with_workflow_runtime(
-            broker,
-            tokens,
-            leases,
-            parent_lookup,
-            feedback,
-            questions,
-            session_info,
-            wait_cancel,
-            workflow_emitter,
-            Arc::new(CompletionProtocolRolloutConfig::default()),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_workflow_runtime(
-        broker: Arc<DelegationBroker>,
-        tokens: Arc<TokenRegistry>,
-        leases: Arc<CompanionLeaseRegistry>,
-        parent_lookup: Arc<dyn ParentSessionLookup>,
-        feedback: Arc<dyn SessionFeedbackAccess>,
-        questions: Arc<dyn SessionQuestionAccess>,
-        session_info: Arc<dyn SessionInfoAccess>,
-        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
-        workflow_emitter: EventEmitter,
-        completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
-    ) -> Arc<Self> {
         let metrics = broker.metrics();
         let recovery_authorizations = broker
             .run_store()
@@ -467,7 +438,6 @@ impl DelegationListener {
             wait_cancel,
             metrics,
             workflow_emitter,
-            completion_protocol_rollout,
             recovery_authorizations,
             #[cfg(any(test, feature = "test-utils"))]
             status_release_decision_gate: Arc::new(StatusReleaseDecisionGate::default()),
@@ -1649,16 +1619,9 @@ impl DelegationListener {
         )
         .await
         {
-            Ok(r) => {
-                if r.manifest_revision == 1 && !r.idempotent_replay {
-                    self.metrics.record_completion_protocol_creation(
-                        crate::acp::delegation::workflow::current_completion_protocol_mode(),
-                    );
-                }
-                serde_json::to_value(r).unwrap_or_else(|e| {
-                    WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
-                })
-            }
+            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
+                WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
+            }),
             Err(e) => workflow_store_error_value(e),
         }
     }
@@ -8999,7 +8962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_mutations_reach_v2_store_guards_without_rollout_restart() {
+    async fn workflow_mutations_reach_v2_store_guards() {
         use crate::acp::delegation::run_store::RunStore;
         use crate::db::test_helpers::{
             complete_historical_completion_protocol_migrations,
@@ -9082,12 +9045,7 @@ mod tests {
                 },
             )
             .await;
-        let mut profile_overrides = std::collections::BTreeMap::new();
-        profile_overrides.insert(
-            "codex|selection-canary".into(),
-            delegation_workflow::CompletionProtocolMode::V2Enforce,
-        );
-        let listener = DelegationListener::new_with_workflow_runtime(
+        let listener = DelegationListener::new_with_workflow_emitter(
             broker,
             tokens,
             Arc::new(CompanionLeaseRegistry::default()),
@@ -9097,10 +9055,6 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
-            Arc::new(CompletionProtocolRolloutConfig {
-                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-                profile_overrides,
-            }),
         );
 
         let outcome = listener
