@@ -22,7 +22,7 @@ use crate::acp::delegation::card_summary::{
 };
 use crate::acp::delegation::runtime_stats::DelegationTouchedFile;
 use crate::acp::delegation::store::{
-    classify_sqlite_transient, extract_sqlite_codes, is_transient_sqlite, TaskStoreError,
+    classify_sqlite_transient, extract_sqlite_codes, is_transient_db_error, TaskStoreError,
 };
 use crate::db::entities::delegation_completion_tool_intent;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
@@ -349,26 +349,34 @@ impl CompleteWorkTestControl {
 pub async fn load_workflow_child_mcp_binding(
     db: &AppDatabase,
     task_id: &str,
-) -> Result<Option<WorkflowChildMcpBinding>, CompleteWorkError> {
+) -> Result<Option<WorkflowChildMcpBinding>, TaskStoreError> {
     let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
         .one(&db.conn)
         .await
-        .map_err(|error| CompleteWorkError::Persistence(error.to_string()))?
+        .map_err(|error| {
+            let message = error.to_string();
+            if is_transient_db_error(&error) {
+                TaskStoreError::Transient(message)
+            } else {
+                TaskStoreError::Permanent(message)
+            }
+        })?
     else {
         return Ok(None);
     };
     let (protocol_version, protocol_mode) =
         load_completion_protocol_header(&db.conn, &binding.workflow_id)
             .await
-            .map_err(complete_work_store_error)?
-            .ok_or_else(|| CompleteWorkError::Protocol {
-                code: "unsupported_completion_protocol",
+            .map_err(workflow_protocol_admission_err)?
+            .ok_or_else(|| TaskStoreError::WorkflowAdmission {
+                code: "unsupported_completion_protocol".into(),
                 message: format!(
                     "workflow {} referenced by task {task_id} is missing",
                     binding.workflow_id
                 ),
             })?;
-    require_v2_mutation(protocol_version, &protocol_mode).map_err(complete_work_store_error)?;
+    require_v2_mutation(protocol_version, &protocol_mode)
+        .map_err(workflow_protocol_admission_err)?;
     Ok(Some(WorkflowChildMcpBinding {
         task_id: task_id.to_string(),
         workflow_id: binding.workflow_id,
@@ -705,13 +713,7 @@ fn admission_err(code: &str, msg: impl Into<String>) -> TaskStoreError {
 
 fn workflow_protocol_admission_err(error: WorkflowStoreError) -> TaskStoreError {
     match error {
-        WorkflowStoreError::Persistence(message) => {
-            if is_transient_sqlite(&message) {
-                TaskStoreError::Transient(message)
-            } else {
-                TaskStoreError::Permanent(message)
-            }
-        }
+        WorkflowStoreError::Persistence(message) => TaskStoreError::Transient(message),
         other => admission_err(other.code(), other.to_string()),
     }
 }

@@ -2503,17 +2503,37 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
 }
 
 enum WorkflowLaunchLoadError {
-    WorkflowBinding(String),
+    WorkflowBinding(TaskStoreError),
     CompletionInstruction(TaskStoreError),
 }
 
 impl WorkflowLaunchLoadError {
     fn durable_error_code<'a>(&'a self, binding_fallback: &'a str) -> &'a str {
         match self {
-            Self::WorkflowBinding(_) => binding_fallback,
-            Self::CompletionInstruction(error) => error
-                .workflow_admission_code()
-                .unwrap_or("completion_instruction_binding_failed"),
+            Self::WorkflowBinding(error) => error.workflow_admission_code().unwrap_or_else(|| {
+                if error.is_transient() {
+                    "persistence_error"
+                } else {
+                    binding_fallback
+                }
+            }),
+            Self::CompletionInstruction(error) => {
+                error.workflow_admission_code().unwrap_or_else(|| {
+                    if error.is_transient() {
+                        "persistence_error"
+                    } else {
+                        "completion_instruction_binding_failed"
+                    }
+                })
+            }
+        }
+    }
+
+    fn workflow_admission_code(&self) -> Option<&str> {
+        match self {
+            Self::WorkflowBinding(error) | Self::CompletionInstruction(error) => {
+                error.workflow_admission_code()
+            }
         }
     }
 }
@@ -2521,7 +2541,7 @@ impl WorkflowLaunchLoadError {
 impl std::fmt::Display for WorkflowLaunchLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WorkflowBinding(message) => formatter.write_str(message),
+            Self::WorkflowBinding(error) => std::fmt::Display::fmt(error, formatter),
             Self::CompletionInstruction(error) => std::fmt::Display::fmt(error, formatter),
         }
     }
@@ -4433,6 +4453,59 @@ impl DelegationBroker {
     ) -> DelegationTaskReport {
         let error_code = error.durable_error_code("spawn_failed");
         let error_message = error.to_string();
+        if error.workflow_admission_code().is_some() {
+            let settlement = runs
+                .settle_pre_admission_failure_if_owned(
+                    task_id,
+                    "",
+                    failed_terminal(
+                        error_code,
+                        DelegationRunStatus::Reserving,
+                        false,
+                        AcpTerminationSource::Admission,
+                        AcpTerminationReason::AdmissionFailed,
+                        AcpTerminationClassification::Unexpected,
+                    ),
+                )
+                .await;
+            self.drop_inflight(inflight_id).await;
+            return match settlement {
+                Ok(Some(Settlement::Won(report) | Settlement::Existing(report))) => {
+                    normalize_gen1_pre_spawn_report(
+                        report,
+                        task_id,
+                        child_conversation_id,
+                        agent_type,
+                    )
+                }
+                Ok(None) => match runs.load_by_task_id(task_id).await {
+                    Ok(Some(run)) => normalize_gen1_pre_spawn_report(
+                        run.to_persisted_task().to_report(None),
+                        task_id,
+                        child_conversation_id,
+                        agent_type,
+                    ),
+                    Ok(None) => report_err(
+                        agent_type,
+                        DelegationError::WorkflowAdmission {
+                            code: error_code.to_string(),
+                            message: error_message,
+                        },
+                        Some(child_conversation_id),
+                    ),
+                    Err(error) => report_err(
+                        agent_type,
+                        store_err_to_delegation_error(error),
+                        Some(child_conversation_id),
+                    ),
+                },
+                Err(error) => report_err(
+                    agent_type,
+                    store_err_to_delegation_error(error),
+                    Some(child_conversation_id),
+                ),
+            };
+        }
         match runs.abandon_unbound_reserving_claim(task_id).await {
             Ok(true) => {
                 let cleanup = self
@@ -8037,6 +8110,12 @@ impl DelegationBroker {
                 } else if let Some(msg) = ctx.message.clone() {
                     report.message = Some(msg);
                 }
+                let conversation_status = match report.status {
+                    TaskStatus::Failed | TaskStatus::Canceled => ConversationStatus::Cancelled,
+                    TaskStatus::Unknown | TaskStatus::Running | TaskStatus::Completed => {
+                        conversation_status
+                    }
+                };
                 // Attention closure + coordination release before completed
                 // cache / Join notify / meta / event / disconnect. Attention
                 // write errors are logged inside the helper and never undo the
@@ -19373,7 +19452,9 @@ mod tests {
             "completion_instruction_binding_failed"
         );
 
-        let binding_error = WorkflowLaunchLoadError::WorkflowBinding("binding read failed".into());
+        let binding_error = WorkflowLaunchLoadError::WorkflowBinding(TaskStoreError::Permanent(
+            "binding read failed".into(),
+        ));
         assert_eq!(
             binding_error.durable_error_code("spawn_failed"),
             "spawn_failed"
@@ -19382,6 +19463,30 @@ mod tests {
             binding_error
                 .durable_error_code(crate::acp::delegation::metrics::ADMISSION_FAILED_CODE),
             crate::acp::delegation::metrics::ADMISSION_FAILED_CODE
+        );
+
+        let binding_protocol =
+            WorkflowLaunchLoadError::WorkflowBinding(TaskStoreError::WorkflowAdmission {
+                code: "unsupported_completion_protocol".into(),
+                message: "workflow header disappeared".into(),
+            });
+        assert_eq!(
+            binding_protocol.durable_error_code("spawn_failed"),
+            "unsupported_completion_protocol"
+        );
+        let binding_transient = WorkflowLaunchLoadError::WorkflowBinding(
+            TaskStoreError::Transient("connection pool timed out".into()),
+        );
+        assert_eq!(
+            binding_transient.durable_error_code("spawn_failed"),
+            "persistence_error"
+        );
+        let instruction_transient = WorkflowLaunchLoadError::CompletionInstruction(
+            TaskStoreError::Transient("connection closed".into()),
+        );
+        assert_eq!(
+            instruction_transient.durable_error_code("spawn_failed"),
+            "persistence_error"
         );
     }
 
@@ -31133,6 +31238,372 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_protocol_race_publishes_transaction_authoritative_conversation_status() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run;
+        use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let (db, runs, _mock, events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let report = broker
+            .start_delegation(v2_plan_author_request(
+                parent_id,
+                "terminal-protocol-status-race",
+            ))
+            .await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let task_id = report.task_id.unwrap();
+        let child_id = report.child_conversation_id.unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        runs.install_settle_gate(entered_tx, release_rx).await;
+        let driver = {
+            let broker = Arc::clone(&broker);
+            let task_id = task_id.clone();
+            tokio::spawn(async move {
+                broker
+                    .complete_call(&task_id, completed_outcome("Conclusion: done"))
+                    .await;
+            })
+        };
+        entered_rx
+            .await
+            .expect("settlement gate entered after protocol pre-read");
+
+        let workflow = delegation_workflow::Entity::find_by_id("launch-binding-workflow")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut workflow = workflow.into_active_model();
+        workflow.completion_protocol_version = Set(1);
+        workflow.completion_protocol_mode = Set(CompletionProtocolMode::V1);
+        workflow.update(&db.conn).await.unwrap();
+        release_tx.send(()).unwrap();
+        driver.await.unwrap();
+
+        let stored = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DelegationRunStatus::Failed);
+        assert_eq!(
+            stored.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        let conversation = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.status, ConversationStatus::Cancelled);
+        assert_eq!(
+            conversation.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            conversation.delegation_error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+
+        let wait_report = broker
+            .get_task_status(
+                "parent-conn",
+                Some(parent_id),
+                &task_id,
+                StatusWait::Snapshot,
+            )
+            .await;
+        assert_eq!(wait_report.status, TaskStatus::Failed);
+        assert_eq!(
+            wait_report.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+
+        let status_events = events.status_changed_snapshot().await;
+        let status_event = status_events
+            .iter()
+            .find(|event| event.conversation_id == child_id)
+            .expect("conversation status event");
+        assert_eq!(status_event.status, ConversationStatus::Cancelled);
+        let terminal_events = events.snapshot().await;
+        let terminal_event = terminal_events
+            .iter()
+            .find(|event| event.task_id == task_id)
+            .expect("terminal event");
+        match &terminal_event.result {
+            DelegationResultSummary::Err { error_code, .. } => {
+                assert_eq!(error_code, "legacy_completion_protocol_read_only")
+            }
+            other => panic!("expected typed terminal failure event, got {other:?}"),
+        }
+    }
+
+    async fn assert_terminal_protocol_host_failure(
+        db: &crate::db::AppDatabase,
+        events: &crate::acp::delegation::event_emitter::mock::MockEventEmitter,
+        broker: &DelegationBroker,
+        parent_id: i32,
+        child_id: i32,
+        task_id: &str,
+        expected_code: &str,
+    ) {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::{delegation_attention_request, delegation_task_run};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        broker
+            .complete_call(
+                task_id,
+                completed_outcome(
+                    "Conclusion: done\n<!-- codeg-card-summary-v1\n{\"kind\":\"author\",\"status\":\"done\",\"plan_digest\":\"sha256:must-not-parse\"}\n-->",
+                ),
+            )
+            .await;
+
+        let stored = delegation_task_run::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DelegationRunStatus::Failed);
+        assert_eq!(stored.error_code.as_deref(), Some(expected_code));
+        assert_eq!(stored.card_summary_json, None);
+        assert_eq!(stored.completion_state, None);
+        assert_eq!(stored.completion_outcome, None);
+        assert_eq!(stored.completion_evidence_json, None);
+        assert!(delegation_attention_request::Entity::find()
+            .filter(delegation_attention_request::Column::TaskId.eq(task_id))
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let conversation = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.status, ConversationStatus::Cancelled);
+        assert_eq!(
+            conversation.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            conversation.delegation_error_code.as_deref(),
+            Some(expected_code)
+        );
+        let wait_report = broker
+            .get_task_status(
+                "parent-conn",
+                Some(parent_id),
+                task_id,
+                StatusWait::Snapshot,
+            )
+            .await;
+        assert_eq!(wait_report.status, TaskStatus::Failed);
+        assert_eq!(wait_report.error_code.as_deref(), Some(expected_code));
+
+        let status_events = events.status_changed_snapshot().await;
+        assert_eq!(
+            status_events
+                .iter()
+                .find(|event| event.conversation_id == child_id)
+                .expect("conversation status event")
+                .status,
+            ConversationStatus::Cancelled
+        );
+        let terminal_events = events.snapshot().await;
+        let terminal_event = terminal_events
+            .iter()
+            .find(|event| event.task_id == task_id)
+            .expect("terminal event");
+        assert_eq!(terminal_event.card_summary, None);
+        match &terminal_event.result {
+            DelegationResultSummary::Err { error_code, .. } => {
+                assert_eq!(error_code, expected_code)
+            }
+            other => panic!("expected typed terminal failure event, got {other:?}"),
+        }
+        assert!(broker.task_store.get_retry(task_id).await.is_none());
+        assert!(broker
+            .metrics()
+            .snapshot()
+            .completion_protocol
+            .shadow_differences
+            .is_empty());
+        assert_eq!(
+            broker
+                .run_store()
+                .expect("run store")
+                .terminal_completion_protocol(task_id)
+                .await
+                .unwrap_err()
+                .workflow_admission_code(),
+            Some(expected_code)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_protocol_permanent_host_matrix_preserves_all_surface_parity() {
+        use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, Set};
+
+        for (index, version, mode, expected_code) in [
+            (
+                0,
+                1,
+                CompletionProtocolMode::V1,
+                "legacy_completion_protocol_read_only",
+            ),
+            (
+                1,
+                1,
+                CompletionProtocolMode::V2Shadow,
+                "legacy_completion_protocol_read_only",
+            ),
+            (
+                2,
+                1,
+                CompletionProtocolMode::V2Enforce,
+                "legacy_completion_protocol_read_only",
+            ),
+            (
+                3,
+                2,
+                CompletionProtocolMode::V1,
+                "unsupported_completion_protocol",
+            ),
+            (
+                4,
+                2,
+                CompletionProtocolMode::V2Shadow,
+                "unsupported_completion_protocol",
+            ),
+        ] {
+            let (db, _runs, _mock, events, broker, parent_id) =
+                v2_plan_author_launch_fixture().await;
+            let report = broker
+                .start_delegation(v2_plan_author_request(
+                    parent_id,
+                    &format!("terminal-host-matrix-{index}"),
+                ))
+                .await;
+            let task_id = report.task_id.unwrap();
+            let child_id = report.child_conversation_id.unwrap();
+            let workflow = delegation_workflow::Entity::find_by_id("launch-binding-workflow")
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut workflow = workflow.into_active_model();
+            workflow.completion_protocol_version = Set(version);
+            workflow.completion_protocol_mode = Set(mode);
+            workflow.update(&db.conn).await.unwrap();
+
+            assert_terminal_protocol_host_failure(
+                db.as_ref(),
+                events.as_ref(),
+                broker.as_ref(),
+                parent_id,
+                child_id,
+                &task_id,
+                expected_code,
+            )
+            .await;
+        }
+
+        for (name, update) in [
+            (
+                "unknown-version",
+                "UPDATE delegation_workflows SET completion_protocol_version = 99 \
+                 WHERE workflow_id = 'launch-binding-workflow'",
+            ),
+            (
+                "corrupt-mode",
+                "UPDATE delegation_workflows SET completion_protocol_mode = 'future_mode' \
+                 WHERE workflow_id = 'launch-binding-workflow'",
+            ),
+        ] {
+            let (db, _runs, _mock, events, broker, parent_id) =
+                v2_plan_author_launch_fixture().await;
+            let report = broker
+                .start_delegation(v2_plan_author_request(
+                    parent_id,
+                    &format!("terminal-host-{name}"),
+                ))
+                .await;
+            let task_id = report.task_id.unwrap();
+            let child_id = report.child_conversation_id.unwrap();
+            db.conn
+                .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+                .await
+                .unwrap();
+            db.conn.execute_unprepared(update).await.unwrap();
+            db.conn
+                .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+                .await
+                .unwrap();
+            assert_terminal_protocol_host_failure(
+                db.as_ref(),
+                events.as_ref(),
+                broker.as_ref(),
+                parent_id,
+                child_id,
+                &task_id,
+                "unsupported_completion_protocol",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_protocol_transient_then_v2_success_settles_without_card_authority() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::EntityTrait;
+
+        let (db, runs, _mock, events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let report = broker
+            .start_delegation(v2_plan_author_request(
+                parent_id,
+                "terminal-transient-v2-success",
+            ))
+            .await;
+        let task_id = report.task_id.unwrap();
+        runs.fail_next_terminal_completion_protocol_load();
+        broker
+            .complete_call(&task_id, completed_outcome("Conclusion: done"))
+            .await;
+
+        let stored = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DelegationRunStatus::Completed);
+        assert_eq!(stored.error_code, None);
+        assert_eq!(stored.card_summary_json, None);
+        assert_eq!(
+            stored.completion_state,
+            Some(delegation_task_run::CompletionState::Resolved)
+        );
+        assert!(broker.task_store.get_retry(&task_id).await.is_none());
+        let terminal_event = events
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|event| event.task_id == task_id)
+            .expect("successful terminal event");
+        assert!(matches!(
+            terminal_event.result,
+            DelegationResultSummary::Ok { .. }
+        ));
+        assert_eq!(terminal_event.card_summary, None);
+    }
+
+    #[tokio::test]
     async fn dangling_terminal_header_preserves_code_across_host_surfaces() {
         use crate::db::entities::delegation_task_run;
         use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement};
@@ -35124,6 +35595,374 @@ mod tests {
         assert_eq!(persisted.error_code.as_deref(), Some("admission_failed"));
     }
 
+    async fn make_launch_workflow_historical(db: &crate::db::AppDatabase) {
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
+        set_launch_workflow_protocol_pair(db, 1, CompletionProtocolMode::V1).await;
+    }
+
+    async fn set_launch_workflow_protocol_pair(
+        db: &crate::db::AppDatabase,
+        version: i64,
+        mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
+    ) {
+        use crate::db::entities::delegation_workflow;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let workflow = delegation_workflow::Entity::find_by_id("launch-binding-workflow")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut workflow = workflow.into_active_model();
+        workflow.completion_protocol_version = Set(version);
+        workflow.completion_protocol_mode = Set(mode);
+        workflow.update(&db.conn).await.unwrap();
+    }
+
+    async fn delete_launch_workflow_header(db: &crate::db::AppDatabase) {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys = OFF".to_string(),
+            ))
+            .await
+            .unwrap();
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM delegation_workflows WHERE workflow_id = ?",
+                vec!["launch-binding-workflow".into()],
+            ))
+            .await
+            .unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys = ON".to_string(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gen1_pre_spawn_protocol_race_preserves_legacy_code_and_zero_launch_side_effects() {
+        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_before_spawn_checkpoint_gate(entered_tx, release_rx)
+            .await;
+
+        let driver = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move {
+                broker
+                    .start_delegation(v2_plan_author_request(parent_id, "binding-race-first"))
+                    .await
+            })
+        };
+        entered_rx.await.expect("gen-1 admitted before spawn");
+        assert!(runs
+            .load_by_parent_tool_use(parent_id, "binding-race-first")
+            .await
+            .unwrap()
+            .is_some());
+        make_launch_workflow_historical(&db).await;
+        release_tx.send(()).unwrap();
+
+        let report = driver.await.unwrap();
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        let persisted = runs
+            .load_by_parent_tool_use(parent_id, "binding-race-first")
+            .await
+            .unwrap()
+            .expect("protocol rejection must remain durably observable");
+        assert_eq!(persisted.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert_eq!(mock.spawn_results.lock().await.len(), 1);
+        assert_eq!(mock.send_results.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuation_pre_spawn_protocol_race_preserves_legacy_code_and_zero_launch_side_effects(
+    ) {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+
+        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (root_task_id, _child_id) = prepare_v2_bound_root_for_continue(
+            db.as_ref(),
+            broker.as_ref(),
+            parent_id,
+            "binding-race-continue-root",
+        )
+        .await;
+        let spawn_count = mock.spawn_args.lock().await.len();
+        mock.queue_spawn(Ok("must-not-spawn-continue".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_post_reserve_gate(entered_tx, release_rx)
+            .await;
+
+        let driver = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move {
+                broker
+                    .continue_delegation(ContinueDelegationRequest {
+                        parent_connection_id: "parent-conn".into(),
+                        parent_conversation_id: parent_id,
+                        parent_tool_use_id: "binding-race-continue".into(),
+                        target_task_id: root_task_id,
+                        task: "continue after exact-v2 admission".into(),
+                        work_unit_key: Some(v2_plan_author_work_unit_key()),
+                        external_handle: None,
+                        correlation_id: None,
+                        recovery_authorization_id: None,
+                    })
+                    .await
+            })
+        };
+        entered_rx
+            .await
+            .expect("continuation admitted before spawn");
+        let admitted = runs
+            .load_by_parent_tool_use(parent_id, "binding-race-continue")
+            .await
+            .unwrap()
+            .expect("continued run admitted");
+        make_launch_workflow_historical(&db).await;
+        release_tx.send(()).unwrap();
+
+        let report = driver.await.unwrap();
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        let persisted = runs
+            .load_by_task_id(&admitted.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+        assert!(mock.resume_args.lock().await.is_empty());
+        assert_eq!(mock.spawn_results.lock().await.len(), 1);
+        assert_eq!(mock.send_results.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_pre_spawn_protocol_race_preserves_dangling_code_and_zero_launch_side_effects(
+    ) {
+        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let source = broker
+            .start_delegation(v2_plan_author_request(
+                parent_id,
+                "binding-race-replace-root",
+            ))
+            .await;
+        let source_task_id = source.task_id.unwrap();
+        broker
+            .complete_call(
+                &source_task_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable("source session is unavailable".into()),
+                    source.child_conversation_id,
+                ),
+            )
+            .await;
+        let spawn_count = mock.spawn_args.lock().await.len();
+        mock.queue_spawn(Ok("must-not-spawn-replacement".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_before_spawn_checkpoint_gate(entered_tx, release_rx)
+            .await;
+
+        let driver = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move {
+                let mut request = v2_plan_author_request(parent_id, "binding-race-replacement");
+                request.replaces_task_id = Some(source_task_id);
+                request.replacement_reason = Some("unresumable".into());
+                broker.start_delegation(request).await
+            })
+        };
+        entered_rx.await.expect("replacement admitted before spawn");
+        assert!(runs
+            .load_by_parent_tool_use(parent_id, "binding-race-replacement")
+            .await
+            .unwrap()
+            .is_some());
+        delete_launch_workflow_header(&db).await;
+        release_tx.send(()).unwrap();
+
+        let report = driver.await.unwrap();
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
+        let persisted = runs
+            .load_by_parent_tool_use(parent_id, "binding-race-replacement")
+            .await
+            .unwrap()
+            .expect("dangling protocol rejection must remain durably observable");
+        assert_eq!(persisted.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+        assert_eq!(mock.spawn_results.lock().await.len(), 1);
+        assert_eq!(mock.send_results.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_launch_protocol_pair_matrix_rejects_first_continue_and_replacement() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
+        fn rejected_pairs() -> Vec<(i64, CompletionProtocolMode, &'static str)> {
+            vec![
+                (
+                    1,
+                    CompletionProtocolMode::V1,
+                    "legacy_completion_protocol_read_only",
+                ),
+                (
+                    1,
+                    CompletionProtocolMode::V2Shadow,
+                    "legacy_completion_protocol_read_only",
+                ),
+                (
+                    1,
+                    CompletionProtocolMode::V2Enforce,
+                    "legacy_completion_protocol_read_only",
+                ),
+                (
+                    2,
+                    CompletionProtocolMode::V1,
+                    "unsupported_completion_protocol",
+                ),
+                (
+                    2,
+                    CompletionProtocolMode::V2Shadow,
+                    "unsupported_completion_protocol",
+                ),
+            ]
+        }
+
+        for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
+            let (db, runs, mock, _events, broker, parent_id) =
+                v2_plan_author_launch_fixture().await;
+            set_launch_workflow_protocol_pair(&db, version, mode).await;
+            let tool_use_id = format!("protocol-pair-first-{index}");
+            let report = broker
+                .start_delegation(v2_plan_author_request(parent_id, &tool_use_id))
+                .await;
+            assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            assert!(mock.spawn_args.lock().await.is_empty());
+            assert!(runs
+                .load_by_parent_tool_use(parent_id, &tool_use_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
+            let (db, runs, mock, _events, broker, parent_id) =
+                v2_plan_author_launch_fixture().await;
+            let (root_task_id, _child_id) = prepare_v2_bound_root_for_continue(
+                db.as_ref(),
+                broker.as_ref(),
+                parent_id,
+                &format!("protocol-pair-continue-root-{index}"),
+            )
+            .await;
+            let spawn_count = mock.spawn_args.lock().await.len();
+            set_launch_workflow_protocol_pair(&db, version, mode).await;
+            let tool_use_id = format!("protocol-pair-continue-{index}");
+            let report = broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent_id,
+                    parent_tool_use_id: tool_use_id.clone(),
+                    target_task_id: root_task_id,
+                    task: "continue rejected protocol pair".into(),
+                    work_unit_key: Some(v2_plan_author_work_unit_key()),
+                    external_handle: None,
+                    correlation_id: None,
+                    recovery_authorization_id: None,
+                })
+                .await;
+            assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+            assert!(mock.resume_args.lock().await.is_empty());
+            assert!(runs
+                .load_by_parent_tool_use(parent_id, &tool_use_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
+            let (db, runs, mock, _events, broker, parent_id) =
+                v2_plan_author_launch_fixture().await;
+            let source = broker
+                .start_delegation(v2_plan_author_request(
+                    parent_id,
+                    &format!("protocol-pair-replacement-root-{index}"),
+                ))
+                .await;
+            let source_task_id = source.task_id.unwrap();
+            broker
+                .complete_call(
+                    &source_task_id,
+                    DelegationOutcome::from_err(
+                        DelegationError::Unresumable("source session is unavailable".into()),
+                        source.child_conversation_id,
+                    ),
+                )
+                .await;
+            let spawn_count = mock.spawn_args.lock().await.len();
+            set_launch_workflow_protocol_pair(&db, version, mode).await;
+            let tool_use_id = format!("protocol-pair-replacement-{index}");
+            let mut request = v2_plan_author_request(parent_id, &tool_use_id);
+            request.replaces_task_id = Some(source_task_id);
+            request.replacement_reason = Some("unresumable".into());
+            let report = broker.start_delegation(request).await;
+            assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+            assert!(runs
+                .load_by_parent_tool_use(parent_id, &tool_use_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
     #[tokio::test]
     async fn workflow_launch_variants_reject_historical_protocol_before_process_spawn() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
@@ -35290,6 +36129,46 @@ mod tests {
         assert!(mock.resume_args.lock().await.is_empty());
         assert!(runs
             .load_by_parent_tool_use(parent_id, "dangling-admission-continue")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dangling_workflow_admission_aborts_replacement_before_process_spawn() {
+        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let source = broker
+            .start_delegation(v2_plan_author_request(
+                parent_id,
+                "dangling-replacement-source",
+            ))
+            .await;
+        let source_task_id = source.task_id.unwrap();
+        broker
+            .complete_call(
+                &source_task_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable("source session is unavailable".into()),
+                    source.child_conversation_id,
+                ),
+            )
+            .await;
+        let spawn_count = mock.spawn_args.lock().await.len();
+        delete_launch_workflow_header(&db).await;
+
+        let mut request = v2_plan_author_request(parent_id, "dangling-replacement-admission");
+        request.replaces_task_id = Some(source_task_id);
+        request.replacement_reason = Some("unresumable".into());
+        let replacement = broker.start_delegation(request).await;
+
+        assert_eq!(replacement.status, TaskStatus::Failed, "{replacement:?}");
+        assert_eq!(
+            replacement.error_code.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+        assert!(runs
+            .load_by_parent_tool_use(parent_id, "dangling-replacement-admission")
             .await
             .unwrap()
             .is_none());

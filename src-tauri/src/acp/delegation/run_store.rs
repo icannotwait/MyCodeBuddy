@@ -32,8 +32,9 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::store::{
-    classify_sqlite_transient, is_transient_sqlite, PersistedTask, PromoteRetryPolicy, Settlement,
-    SqliteTransientClass, TaskStoreError, TerminalCompletionProtocol, TerminalTaskWrite,
+    classify_sqlite_transient, is_transient_db_error, is_transient_sqlite, PersistedTask,
+    PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
+    TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{DelegationRecoveryProjection, TaskStatus};
 use crate::acp::delegation::workflow::admission::{
@@ -950,6 +951,9 @@ fn is_unique_violation(msg: &str) -> bool {
 }
 
 fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
+    if is_transient_db_error(&err) {
+        return TaskStoreError::Transient(err.to_string());
+    }
     let msg = err.to_string();
     if is_transient_sqlite(&msg) {
         TaskStoreError::Transient(msg)
@@ -974,11 +978,7 @@ fn terminal_protocol_store_error(
 ) -> TaskStoreError {
     match error {
         crate::acp::delegation::workflow::WorkflowStoreError::Persistence(message) => {
-            if is_transient_sqlite(&message) {
-                TaskStoreError::Transient(message)
-            } else {
-                TaskStoreError::Permanent(message)
-            }
+            TaskStoreError::Transient(message)
         }
         other => TaskStoreError::WorkflowAdmission {
             code: other.code().into(),
@@ -2224,17 +2224,17 @@ impl RunStore {
     pub async fn workflow_child_mcp_binding(
         &self,
         task_id: &str,
-    ) -> Result<Option<WorkflowChildMcpBinding>, String> {
+    ) -> Result<Option<WorkflowChildMcpBinding>, TaskStoreError> {
         #[cfg(any(test, feature = "test-utils"))]
         if self
             .workflow_binding_load_fail
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err("injected workflow binding load failure".into());
+            return Err(TaskStoreError::Permanent(
+                "injected workflow binding load failure".into(),
+            ));
         }
-        crate::acp::delegation::workflow::load_workflow_child_mcp_binding(&self.db, task_id)
-            .await
-            .map_err(|error| error.to_string())
+        crate::acp::delegation::workflow::load_workflow_child_mcp_binding(&self.db, task_id).await
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -3465,6 +3465,10 @@ impl RunStore {
         let proj_status = task_status_to_delegation_task_status(terminal.status)?;
         let finished_at = terminal.finished_at;
         let error_code = terminal.error_code.clone();
+        let protocol_failure = matches!(
+            error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only" | "unsupported_completion_protocol")
+        );
         let conversation_status = terminal.conversation_status.clone();
         let card_summary_json = terminal.card_summary_json.clone();
         let termination_evidence = terminal.termination_evidence().cloned();
@@ -3594,15 +3598,19 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
 
-                    let effect = on_terminal_settle_txn(
-                        txn,
-                        &task_id,
-                        won.parent_conversation_id,
-                        card_summary_json.as_deref(),
-                        &won.status,
-                        won.workspace_path.as_deref(),
-                    )
-                    .await?;
+                    let effect = if protocol_failure {
+                        WorkflowTxnSideEffect::None
+                    } else {
+                        on_terminal_settle_txn(
+                            txn,
+                            &task_id,
+                            won.parent_conversation_id,
+                            card_summary_json.as_deref(),
+                            &won.status,
+                            won.workspace_path.as_deref(),
+                        )
+                        .await?
+                    };
 
                     let persisted = model_to_persisted_run(won).ok_or_else(|| {
                         TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
@@ -5567,6 +5575,50 @@ mod tests {
             classify_sqlite_transient(&err),
             Some(SqliteTransientClass::Busy)
         );
+    }
+
+    #[test]
+    fn terminal_protocol_db_errors_preserve_connection_availability_and_decode_classes() {
+        use crate::acp::delegation::workflow::WorkflowStoreError;
+        use sea_orm::sqlx::error::Error as SqlxError;
+        use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+
+        for error in [
+            DbErr::ConnectionAcquire(ConnAcquireErr::Timeout),
+            DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed),
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::PoolTimedOut)),
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::PoolClosed)),
+            DbErr::Conn(RuntimeErr::Internal("closed connection".into())),
+            DbErr::Exec(RuntimeErr::Internal("database is busy".into())),
+            DbErr::Exec(RuntimeErr::Internal("database is locked".into())),
+        ] {
+            assert!(
+                matches!(map_db_err(error), TaskStoreError::Transient(_)),
+                "connection availability and SQLite contention must be retryable"
+            );
+        }
+
+        assert!(matches!(
+            map_db_err(DbErr::Query(RuntimeErr::Internal(
+                "permanent query failure".into()
+            ))),
+            TaskStoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            terminal_protocol_store_error(WorkflowStoreError::Persistence(
+                "temporarily unavailable header store".into()
+            )),
+            TaskStoreError::Transient(_)
+        ));
+        assert!(matches!(
+            terminal_protocol_store_error(
+                WorkflowStoreError::UnsupportedCompletionProtocolHeader(
+                    "invalid completion_protocol_mode".into()
+                )
+            ),
+            TaskStoreError::WorkflowAdmission { ref code, .. }
+                if code == "unsupported_completion_protocol"
+        ));
     }
 
     #[test]

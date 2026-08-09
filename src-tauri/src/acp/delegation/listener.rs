@@ -8311,6 +8311,7 @@ mod tests {
     mod complete_work_contract {
         use super::*;
         use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::store::TaskStoreError;
         use crate::acp::delegation::transport::BrokerCompleteWorkRequest;
         use crate::acp::delegation::workflow::{
             accept_complete_work_txn_with_test_control, load_completion_projection,
@@ -9068,10 +9069,8 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                CompleteWorkError::Protocol {
-                    code: "unsupported_completion_protocol",
-                    ..
-                }
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "unsupported_completion_protocol"
             ));
             fixture
                 .db
