@@ -1157,7 +1157,6 @@ mod tauri_app {
                 crate::commands::workflow_completion::resolve_completion_decision,
                 crate::commands::workflow_completion::retry_completion_artifact,
                 crate::commands::workflow_completion::resolve_design_self_review,
-                crate::commands::workflow_completion::restart_legacy_workflow,
                 crate::commands::workflow_completion::get_completion_protocol_settings,
                 conversations::list_folders,
                 conversations::get_stats,

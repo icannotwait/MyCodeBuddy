@@ -53,14 +53,13 @@ use crate::acp::delegation::transport::{
     client_get_workflow_state_round_trip, client_parent_decision_round_trip,
     client_publish_workflow_round_trip, client_recover_workflow_round_trip,
     client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
-    client_restart_legacy_workflow_round_trip, client_round_trip, client_session_round_trip,
-    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
-    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
-    BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest, BrokerRequest,
-    BrokerResponse, BrokerRestartLegacyWorkflowRequest, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
+    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
+    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
@@ -200,7 +199,7 @@ pub struct CompanionFeatures {
     pub ask: bool,
     pub sessions: bool,
     /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
-    /// enables all six B9 tools together (structural catalog agreement).
+    /// enables all five B9 tools together (structural catalog agreement).
     pub workflow_v2: bool,
     /// Child-only workflow completion-intent transport.
     pub completion_v2: bool,
@@ -213,15 +212,14 @@ pub const WORKFLOW_V2_TOOLS: &[&str] = &[
     "recover_workflow",
     "publish_workflow_manifest",
     "settle_workflow_gate",
-    "restart_legacy_workflow",
 ];
 
 /// Capability catalog classification (B9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowCapabilityMode {
-    /// None of the six workflow tools present; workflow is unavailable.
+    /// None of the five workflow tools present; workflow is unavailable.
     Unavailable,
-    /// All six present → v2 mode (capability must also report true).
+    /// All five present → v2 mode (capability must also report true).
     WorkflowManifestV2,
     /// Partial tool set → inconsistent hard-block.
     Inconsistent,
@@ -371,10 +369,7 @@ impl CompanionContext {
             | "get_workflow_state"
             | "publish_workflow_manifest"
             | "settle_workflow_gate"
-            | "recover_workflow"
-            | "restart_legacy_workflow" => {
-                self.features.workflow_v2 && self.role == CompanionRole::Root
-            }
+            | "recover_workflow" => self.features.workflow_v2 && self.role == CompanionRole::Root,
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -1001,28 +996,6 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_recover_workflow_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
-        }
-        "restart_legacy_workflow" => {
-            let request: crate::acp::delegation::types::RestartLegacyWorkflowRequest =
-                match serde_json::from_value(arguments) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return LineAction::Respond(err(
-                            id,
-                            -32602,
-                            format!("invalid restart_legacy_workflow arguments: {error}"),
-                        ));
-                    }
-                };
-            let req = BrokerRestartLegacyWorkflowRequest {
-                token: ctx.token.clone(),
-                source_conversation_id: request.source_conversation_id,
-            };
-            let round_trip =
-                Box::pin(
-                    async move { client_restart_legacy_workflow_round_trip(&socket, &req).await },
-                );
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
@@ -4512,6 +4485,17 @@ mod tests {
     #[tokio::test]
     async fn workflow_v2_root_catalog_agrees_with_local_capabilities() {
         let names = list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
+        assert_eq!(
+            WORKFLOW_V2_TOOLS,
+            &[
+                "get_workflow_capabilities",
+                "get_workflow_state",
+                "recover_workflow",
+                "publish_workflow_manifest",
+                "settle_workflow_gate",
+            ]
+        );
+        assert!(names.contains(&"request_recovery_authorization".to_string()));
         for tool in WORKFLOW_V2_TOOLS {
             assert!(
                 names.iter().any(|n| n == *tool),
@@ -5349,7 +5333,7 @@ mod tests {
             "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
             line.len(),
         );
-        // Root + coordination_v1 + workflow_v2: reply + authorization + six workflow tools.
+        // Root + coordination_v1 + workflow_v2: reply + authorization + five workflow tools.
         assert_eq!(
             names,
             vec![
@@ -5366,7 +5350,6 @@ mod tests {
                 "recover_workflow",
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
-                "restart_legacy_workflow",
             ]
         );
     }

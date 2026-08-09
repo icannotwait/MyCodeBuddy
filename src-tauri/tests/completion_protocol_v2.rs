@@ -11,7 +11,7 @@ use codeg_lib::acp::delegation::broker::{
     pre_read_completion_reports_for_test, ConversationDepthLookup, DelegationBroker,
 };
 use codeg_lib::acp::delegation::companion::{
-    dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction, TOOL_SCHEMA_JSON,
+    dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
 };
 use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
@@ -30,16 +30,14 @@ use codeg_lib::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use codeg_lib::acp::delegation::types::{
-    CompletionMutationContext, ContinueDelegationRequest, DelegationError,
-    ResolveCompletionDecisionRequest, RestartLegacyWorkflowRequest,
+    ContinueDelegationRequest, DelegationError, ResolveCompletionDecisionRequest,
 };
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, capture_original_request_context, evaluate_rollout_window,
-    get_workflow_state_core, guard_current_final_delivery_core, guard_final_delivery_core,
-    guard_task_final_delivery_core, inject_legacy_restart_header_failure_once,
-    load_completion_protocol_for_conversation, materialize_terminal_completion_txn,
-    project_workflow_graph_core, publish_workflow_manifest_core, recover_workflow_core,
-    restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
+    build_work_unit_key, evaluate_rollout_window, guard_current_final_delivery_core,
+    guard_final_delivery_core, guard_task_final_delivery_core,
+    load_completion_protocol_for_conversation, load_historical_workflow_context,
+    materialize_terminal_completion_txn, project_workflow_graph_core,
+    publish_workflow_manifest_core, recover_workflow_core, select_completion_protocol,
     settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
     CompletionOutcome, CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
     CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentGateKind,
@@ -56,14 +54,12 @@ use codeg_lib::acp::manager::ConnectionManager;
 use codeg_lib::acp::question::{QuestionSpec, RegisteredQuestion, SessionQuestionAccess};
 use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::app_state::AppState;
-use codeg_lib::commands::workflow_completion::restart_legacy_workflow_authenticated_core;
 use codeg_lib::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 use codeg_lib::db::entities::{
     auto_title_job, delegation_attention_request, delegation_completion_tool_intent,
     delegation_task_run, delegation_workflow, delegation_workflow_gate_settlement,
     delegation_workflow_gate_state, delegation_workflow_manifest_revision,
-    delegation_workflow_node_binding, delegation_workflow_restart_context,
-    delegation_workflow_run_binding, recovery_authorization,
+    delegation_workflow_restart_context, delegation_workflow_run_binding, recovery_authorization,
 };
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
@@ -2339,17 +2335,6 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
     let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
     let child = seed_conversation(&db, folder, AgentType::Codex).await;
-    capture_original_request_context(
-        &db.conn,
-        parent,
-        "task-18-capability-request",
-        &[PromptInputBlock::Text {
-            text: "Prove the platform completion capability matrix.".into(),
-        }],
-        "codex",
-    )
-    .await
-    .unwrap();
     let token = format!("task-18-capability-{}", uuid::Uuid::new_v4());
     let mut document = skeleton(&token);
     document.design = Some(DocumentRef {
@@ -3518,131 +3503,146 @@ async fn final_status_enrichment_preserves_artifact_unavailable_diagnostic() {
     assert!(unavailable.reopened.is_null());
 }
 
-async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-legacy-restart").await;
-    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    capture_original_request_context(
-        &db.conn,
-        parent,
-        "original-turn-1",
-        &[PromptInputBlock::Text {
-            text: "implement the original Task 15 request".into(),
-        }],
-        "codex",
-    )
-    .await
-    .unwrap();
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-15-legacy-source"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
-        delegation_workflow::CompletionProtocolMode::V1,
-    )
-    .await;
-    (db, parent, published.workflow_id)
-}
-
 #[tokio::test]
-async fn legacy_restart_preserves_non_default_context_but_routes_codex_plan_author() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-request-context").await;
-    let parent = seed_conversation(&db, folder, AgentType::Grok).await;
-    assert!(
-        codeg_lib::db::entities::auto_title_job::Entity::find_by_id(parent)
+async fn historical_protocol_projection() {
+    use delegation_workflow::CompletionProtocolMode::{V2Shadow, V1};
+
+    const CARD_JSON: &str = r#"{ "kind":"implementation", "phase":"implementation", "status":"done", "summary":"historical card bytes", "commits":[], "concerns":[] }"#;
+
+    for (index, persisted_mode) in [V1, V2Shadow].into_iter().enumerate() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, &format!("/tmp/task-6-historical-{index}")).await;
+        let source_parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let successor_parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let source = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            source_parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-6-historical-source-{index}")),
+            },
+        )
+        .await
+        .unwrap();
+        let successor = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            successor_parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-6-historical-successor-{index}")),
+            },
+        )
+        .await
+        .unwrap();
+
+        mark_historical_completion_protocol(&db, &source.workflow_id, persisted_mode.clone()).await;
+        let context_request_id = format!("historical-request-{index}");
+        delegation_workflow_restart_context::ActiveModel {
+            conversation_id: Set(source_parent),
+            original_conversation_id: Set(source_parent),
+            original_request_id: Set(context_request_id.clone()),
+            original_request_text: Set("preserved historical request".into()),
+            original_request_digest: Set(format!("sha256:{}", "a".repeat(64))),
+            agent_type: Set("codex".into()),
+            profile_id: Set(Some("historical-profile".into())),
+            created_at: Set(chrono::Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let successor_row = delegation_workflow::Entity::find_by_id(&successor.workflow_id)
             .one(&db.conn)
             .await
             .unwrap()
-            .is_none()
-    );
-    let original_request = "diagnose the rollout and preserve this exact job request";
-    capture_original_request_context(
-        &db.conn,
-        parent,
-        "grok-user-turn-77",
-        &[PromptInputBlock::Text {
-            text: original_request.into(),
-        }],
-        "grok",
-    )
-    .await
-    .unwrap();
+            .unwrap();
+        let mut successor_row: delegation_workflow::ActiveModel = successor_row.into();
+        successor_row.legacy_source_workflow_id = Set(Some(source.workflow_id.clone()));
+        successor_row.update(&db.conn).await.unwrap();
 
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-15-grok-profile-source"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
-        delegation_workflow::CompletionProtocolMode::V1,
-    )
-    .await;
-    let source_author = delegation_workflow_node_binding::Entity::find()
-        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(&published.workflow_id))
-        .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut source_author: delegation_workflow_node_binding::ActiveModel = source_author.into();
-    source_author.agent_type = Set("grok".into());
-    source_author.profile_id = Set(Some("review-canary".into()));
-    source_author.work_unit_key = Set(build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
-        rel_plan_path: "docs/superpowers/plans/restarted-plan.md",
-        agent_type: "grok",
-        profile_id: Some("review-canary"),
-    })
-    .unwrap());
-    source_author.update(&db.conn).await.unwrap();
-
-    let restarted = restart_legacy_workflow_core(&db, i64::from(parent))
-        .await
-        .unwrap();
-    assert_eq!(
-        restarted.restart_context.original_request_id,
-        "grok-user-turn-77"
-    );
-    assert_eq!(
-        restarted.restart_context.original_request_text,
-        original_request
-    );
-    assert!(restarted
-        .restart_context
-        .original_request_digest
-        .starts_with("sha256:"));
-    assert_eq!(restarted.restart_context.agent_type, "grok");
-    assert_eq!(
-        restarted.restart_context.profile_id.as_deref(),
-        Some("review-canary")
-    );
-    let successor_author = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId
-                .eq(&restarted.successor_workflow_id),
+        let task_id = format!("task-6-historical-card-{index}");
+        seed_conversation_workflow_association(
+            &db,
+            source_parent,
+            child,
+            &task_id,
+            1,
+            chrono::Utc::now(),
+            Some(&source.workflow_id),
         )
-        .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(successor_author.agent_type, "codex");
-    assert_eq!(successor_author.profile_id, None);
+        .await;
+        let run = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.card_summary_json = Set(Some(CARD_JSON.to_string()));
+        run.update(&db.conn).await.unwrap();
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+        binding.summary_validated = Set(true);
+        binding.update(&db.conn).await.unwrap();
+
+        let source_graph = project_workflow_graph_core(&db, source_parent)
+            .await
+            .unwrap();
+        let projection = source_graph.completion_protocol.unwrap();
+        assert_eq!(projection.version, 1);
+        assert_eq!(projection.mode, persisted_mode);
+        assert_eq!(projection.creation_mode, persisted_mode);
+        assert_eq!(
+            projection.read_only_reason.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+        assert!(!projection.automatic_root_wake);
+        assert!(projection.legacy_source.is_none());
+        let successor_link = projection.v2_successor.expect("historical successor link");
+        assert_eq!(successor_link.workflow_id, successor.workflow_id);
+        assert_eq!(successor_link.conversation_id, successor_parent);
+
+        let card_node = source_graph
+            .nodes
+            .iter()
+            .find(|node| node.latest_task_id.as_deref() == Some(task_id.as_str()))
+            .expect("historical Card node");
+        assert_eq!(card_node.summary.as_deref(), Some("historical card bytes"));
+        let stored_card = delegation_task_run::Entity::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .card_summary_json;
+        assert_eq!(stored_card.as_deref(), Some(CARD_JSON));
+        let stored_context = load_historical_workflow_context(&db.conn, source_parent)
+            .await
+            .unwrap()
+            .expect("historical context row");
+        assert_eq!(stored_context.original_request_id, context_request_id);
+        assert_eq!(
+            stored_context.original_request_text,
+            "preserved historical request"
+        );
+
+        let successor_graph = project_workflow_graph_core(&db, successor_parent)
+            .await
+            .unwrap();
+        let successor_projection = successor_graph.completion_protocol.unwrap();
+        let source_link = successor_projection
+            .legacy_source
+            .expect("historical source link");
+        assert_eq!(source_link.workflow_id, source.workflow_id);
+        assert_eq!(source_link.conversation_id, source_parent);
+        assert!(successor_projection.v2_successor.is_none());
+        assert_eq!(
+            successor_projection.creation_mode,
+            successor_projection.mode
+        );
+    }
 }
 
 async fn source_fingerprint(
@@ -3669,143 +3669,6 @@ async fn source_fingerprint(
 }
 
 #[tokio::test]
-async fn legacy_restart_enforce_resume_creates_one_empty_v2_successor_and_never_mutates_source() {
-    let (db, parent, source_workflow_id) = legacy_source().await;
-    let before = source_fingerprint(&db, parent, &source_workflow_id).await;
-
-    let first = restart_legacy_workflow_core(&db, i64::from(parent))
-        .await
-        .unwrap();
-    let replay = restart_legacy_workflow_core(&db, i64::from(parent))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        first.successor_conversation_id,
-        replay.successor_conversation_id
-    );
-    assert_eq!(
-        source_fingerprint(&db, parent, &source_workflow_id).await,
-        before
-    );
-    let successors = delegation_workflow::Entity::find()
-        .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&source_workflow_id))
-        .all(&db.conn)
-        .await
-        .unwrap();
-    assert_eq!(successors.len(), 1);
-    assert_eq!(successors[0].completion_protocol_version, 2);
-    assert_eq!(
-        successors[0].completion_protocol_mode,
-        delegation_workflow::CompletionProtocolMode::V2Enforce
-    );
-    assert_eq!(first.open_gate.as_str(), "design");
-    let source_graph = project_workflow_graph_core(&db, parent).await.unwrap();
-    let source_protocol = source_graph.completion_protocol.unwrap();
-    assert_eq!(
-        source_protocol
-            .v2_successor
-            .as_ref()
-            .map(|link| link.conversation_id),
-        Some(first.successor_conversation_id)
-    );
-    assert_eq!(
-        source_protocol.read_only_reason.as_deref(),
-        Some("legacy_completion_protocol_restart_required")
-    );
-    assert!(!source_protocol.automatic_root_wake);
-    let source_state = get_workflow_state_core(&db, parent, Some(&source_workflow_id))
-        .await
-        .unwrap();
-    assert_eq!(
-        source_state
-            .completion_protocol
-            .v2_successor
-            .as_ref()
-            .map(|link| link.conversation_id),
-        Some(first.successor_conversation_id)
-    );
-    let successor_graph = project_workflow_graph_core(&db, first.successor_conversation_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        successor_graph
-            .completion_protocol
-            .unwrap()
-            .legacy_source
-            .as_ref()
-            .map(|link| link.conversation_id),
-        Some(parent)
-    );
-    assert_eq!(
-        delegation_task_run::Entity::find()
-            .filter(
-                delegation_task_run::Column::ParentConversationId
-                    .eq(first.successor_conversation_id)
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        0
-    );
-    for count in [
-        delegation_workflow_run_binding::Entity::find()
-            .filter(
-                delegation_workflow_run_binding::Column::WorkflowId.eq(&successors[0].workflow_id),
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        delegation_workflow_gate_settlement::Entity::find()
-            .filter(
-                delegation_workflow_gate_settlement::Column::WorkflowId
-                    .eq(&successors[0].workflow_id),
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        delegation_attention_request::Entity::find()
-            .filter(
-                delegation_attention_request::Column::ParentConversationId
-                    .eq(first.successor_conversation_id),
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-    ] {
-        assert_eq!(count, 0);
-    }
-}
-
-#[tokio::test]
-async fn legacy_restart_failed_creation_leaves_source_unchanged_and_is_retryable() {
-    let (db, parent, source_workflow_id) = legacy_source().await;
-    let before = source_fingerprint(&db, parent, &source_workflow_id).await;
-    inject_legacy_restart_header_failure_once();
-
-    let error = restart_legacy_workflow_core(&db, i64::from(parent))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), "legacy_completion_protocol_restart_required");
-    assert!(error.is_retryable());
-    assert_eq!(
-        source_fingerprint(&db, parent, &source_workflow_id).await,
-        before
-    );
-    assert_eq!(
-        delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&source_workflow_id))
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        0
-    );
-    assert!(restart_legacy_workflow_core(&db, i64::from(parent))
-        .await
-        .is_ok());
-}
-
-#[tokio::test]
 async fn root_prompt_protocol_fence() {
     use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
 
@@ -3819,17 +3682,6 @@ async fn root_prompt_protocol_fence() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, &format!("/tmp/task-4-root-fence-{index}")).await;
         let parent = seed_conversation(&db, folder_id, AgentType::Codex).await;
-        capture_original_request_context(
-            &db.conn,
-            parent,
-            &format!("task-4-root-original-{index}"),
-            &[PromptInputBlock::Text {
-                text: "original request must remain immutable".into(),
-            }],
-            "codex",
-        )
-        .await
-        .unwrap();
         let published = publish_workflow_manifest_core(
             &db,
             &EventEmitter::Noop,
@@ -4032,7 +3884,7 @@ async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
 }
 
 #[tokio::test]
-async fn legacy_restart_upgrade_is_rejected_before_resume_side_effects() {
+async fn historical_root_resume_is_rejected_before_side_effects() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -4139,53 +3991,6 @@ async fn legacy_restart_upgrade_is_rejected_before_resume_side_effects() {
 }
 
 #[tokio::test]
-async fn legacy_restart_upgrade_without_durable_request_remains_fail_closed() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade-no-context").await;
-    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-15-pre-migration-no-context"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
-        delegation_workflow::CompletionProtocolMode::V1,
-    )
-    .await;
-    let before = source_fingerprint(&db, parent, &published.workflow_id).await;
-    let enforce = CompletionProtocolRolloutConfig {
-        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-        ..Default::default()
-    };
-
-    let error = restart_legacy_workflow_if_enforced(&db, parent, None, &enforce)
-        .await
-        .expect_err("missing historical request bytes must remain fail-closed");
-
-    assert_eq!(error.code(), "legacy_completion_protocol_restart_required");
-    assert!(error.to_string().contains("context is unavailable"));
-    assert_eq!(
-        source_fingerprint(&db, parent, &published.workflow_id).await,
-        before
-    );
-    assert_eq!(
-        delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&published.workflow_id),)
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        0
-    );
-}
-
-#[tokio::test]
 async fn fixed_v2_creation_is_not_affected_by_rollout_configuration() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-frozen-rollout").await;
@@ -4227,81 +4032,6 @@ async fn fixed_v2_creation_is_not_affected_by_rollout_configuration() {
     );
 }
 
-#[tokio::test]
-async fn rollout_restart_accepts_stored_shadow_only_when_current_policy_is_enforce() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-shadow-restart").await;
-    let parent = seed_conversation(&db, folder, AgentType::Grok).await;
-    capture_original_request_context(
-        &db.conn,
-        parent,
-        "stored-shadow-original-request",
-        &[PromptInputBlock::Text {
-            text: "restart the original shadow workflow under enforce".into(),
-        }],
-        "grok",
-    )
-    .await
-    .unwrap();
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-15-stored-shadow-source"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
-        delegation_workflow::CompletionProtocolMode::V2Shadow,
-    )
-    .await;
-
-    let enforce = CompletionProtocolRolloutConfig {
-        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-        ..Default::default()
-    };
-    assert!(restart_legacy_workflow_if_enforced(
-        &db,
-        parent,
-        Some(("grok".into(), Some("review-canary".into()))),
-        &enforce,
-    )
-    .await
-    .unwrap()
-    .is_some());
-
-    let (db, parent, source_workflow_id) = legacy_source().await;
-    let metrics = DelegationMetrics::default();
-    let current_v1 = CompletionProtocolRolloutConfig::default();
-    let error = restart_legacy_workflow_authenticated_core(
-        &db,
-        &metrics,
-        &current_v1,
-        &CompletionMutationContext::authenticated_for_test(parent, "rollout-test"),
-        RestartLegacyWorkflowRequest {
-            source_conversation_id: i64::from(parent),
-        },
-    )
-    .await
-    .expect_err("explicit restart must not bypass current v1 rollout");
-    assert_eq!(
-        error.detail.as_deref(),
-        Some("legacy_completion_protocol_restart_not_required")
-    );
-    assert_eq!(
-        delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(source_workflow_id))
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        0
-    );
-}
-
 #[test]
 fn rollout_stops_only_after_minimum_sample_and_strict_thresholds() {
     let decision = |samples, role_mismatch, needs_decision| {
@@ -4332,33 +4062,6 @@ fn rollout_config_rejects_unknown_modes_and_malformed_override_keys() {
         Some(r#"{"missing-profile-separator":"v2_enforce"}"#),
     )
     .is_err());
-}
-
-#[test]
-fn restart_tool_schema_is_registered_for_root_only() {
-    let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
-    let restart = schema
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "restart_legacy_workflow")
-        .unwrap();
-    assert_eq!(restart["inputSchema"]["additionalProperties"], false);
-    assert_eq!(
-        restart["inputSchema"]["required"],
-        serde_json::json!(["source_conversation_id"])
-    );
-    let context = |role| CompanionContext {
-        parent_connection_id: "parent".into(),
-        socket_path: "socket".into(),
-        token: "token".into(),
-        features: CompanionFeatures::parse(Some("workflow_v2")),
-        role,
-        connection_incarnation_id: "incarnation".into(),
-        disabled_agents: Vec::new(),
-    };
-    assert!(context(CompanionRole::Root).allows_tool("restart_legacy_workflow"));
-    assert!(!context(CompanionRole::DelegationChild).allows_tool("restart_legacy_workflow"));
 }
 
 #[test]

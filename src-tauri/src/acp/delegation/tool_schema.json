@@ -363,17 +363,5 @@
         "summary": { "type": "string" }
       }
     }
-  },
-  {
-    "name": "restart_legacy_workflow",
-    "description": "Return one empty v2 successor; legacy source stays read-only.",
-    "inputSchema": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source_conversation_id"],
-      "properties": {
-        "source_conversation_id": { "type": "integer" }
-      }
-    }
   }
 ]

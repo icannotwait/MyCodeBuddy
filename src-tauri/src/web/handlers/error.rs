@@ -23,7 +23,6 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::LegacyCompletionProtocolReadOnly
         | AppErrorCode::UnsupportedCompletionProtocol
         | AppErrorCode::CompletionInstructionBindingFailed
-        | AppErrorCode::LegacyCompletionProtocolRestartRequired
         | AppErrorCode::SessionRouteConflict
         | AppErrorCode::Cancelled
         | AppErrorCode::StaleStart

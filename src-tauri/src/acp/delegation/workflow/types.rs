@@ -168,7 +168,6 @@ fn validate_completion_protocol_profile_key(key: &str) -> Result<(), String> {
 pub enum CompletionProtocolSelectionSource {
     Default,
     ProfileOverride,
-    LegacyRestart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,14 +183,6 @@ impl CompletionProtocolSelection {
             version: 1,
             mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V1,
             source: CompletionProtocolSelectionSource::Default,
-        }
-    }
-
-    pub fn legacy_restart() -> Self {
-        Self {
-            version: 2,
-            mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source: CompletionProtocolSelectionSource::LegacyRestart,
         }
     }
 }
@@ -272,29 +263,6 @@ pub struct CompletionProtocolWorkflowProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only_reason: Option<String>,
     pub automatic_root_wake: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyWorkflowRestartProjection {
-    pub source_workflow_id: String,
-    pub source_conversation_id: i32,
-    pub successor_workflow_id: String,
-    pub successor_conversation_id: i32,
-    pub open_gate: DocumentGateKind,
-    pub completion_protocol: CompletionProtocolWorkflowProjection,
-    pub restart_context: LegacyWorkflowRestartContext,
-    pub idempotent_replay: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyWorkflowRestartContext {
-    pub original_conversation_id: i32,
-    pub original_request_id: String,
-    pub original_request_text: String,
-    pub original_request_digest: String,
-    pub agent_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -201,12 +201,6 @@ pub enum WorkflowStoreError {
     #[error("unsupported completion protocol header: {0}")]
     UnsupportedCompletionProtocolHeader(String),
 
-    #[error("legacy workflow restart is required: {0}")]
-    LegacyCompletionProtocolRestartRequired(String),
-
-    #[error("legacy workflow restart source is invalid: {0}")]
-    LegacyCompletionProtocolRestartInvalid(String),
-
     /// Transient contention (e.g. publication_token race winner not yet visible).
     /// Callers may safely retry the same publish request.
     #[error("busy (retryable): {0}")]
@@ -237,12 +231,6 @@ impl WorkflowStoreError {
             Self::LegacyCompletionProtocolReadOnly => "legacy_completion_protocol_read_only",
             Self::UnsupportedCompletionProtocol { .. }
             | Self::UnsupportedCompletionProtocolHeader(_) => "unsupported_completion_protocol",
-            Self::LegacyCompletionProtocolRestartRequired(_) => {
-                "legacy_completion_protocol_restart_required"
-            }
-            Self::LegacyCompletionProtocolRestartInvalid(_) => {
-                "legacy_completion_protocol_restart_invalid"
-            }
             Self::CrossParent { .. } => "unauthorized",
             Self::NotFound(_) | Self::ParentNotFound(_) => "workflow_not_found",
             Self::StaleManifestRevision { .. } => "stale_manifest_revision",
@@ -263,10 +251,7 @@ impl WorkflowStoreError {
 
     /// True when the client may retry the same operation after a short delay.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Busy(_) | Self::Persistence(_) | Self::LegacyCompletionProtocolRestartRequired(_)
-        )
+        matches!(self, Self::Busy(_) | Self::Persistence(_))
     }
 }
 

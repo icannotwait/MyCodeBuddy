@@ -191,10 +191,6 @@ pub fn build_router(
             post(handlers::workflow_completion::resolve_design_self_review),
         )
         .route(
-            "/restart_legacy_workflow",
-            post(handlers::workflow_completion::restart_legacy_workflow),
-        )
-        .route(
             "/list_opened_tabs",
             post(handlers::conversations::list_opened_tabs),
         )

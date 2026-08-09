@@ -144,12 +144,7 @@ use store::{
 };
 pub use types::*;
 pub use validate::validate_manifest_document;
-#[cfg(any(test, feature = "test-utils"))]
-pub use workflow_restart::inject_legacy_restart_header_failure_once;
-pub use workflow_restart::{
-    capture_original_request_context, restart_legacy_workflow_core,
-    restart_legacy_workflow_if_enforced,
-};
+pub use workflow_restart::load_historical_workflow_context;
 
 #[cfg(test)]
 mod recovery_tests;

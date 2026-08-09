@@ -107,9 +107,6 @@ pub enum AppErrorCode {
     /// User-entry mutation rejected because a delegated child is viewer-only.
     /// Maps to HTTP 409. `detail` carries the lock reason string.
     DelegateViewerOnly,
-    /// A legacy protocol-v1 root was restarted before prompt admission.
-    /// Maps to HTTP 409. `detail` carries the successor conversation id.
-    LegacyCompletionProtocolRestartRequired,
     /// A mutation targeted a historical protocol-v1 workflow.
     LegacyCompletionProtocolReadOnly,
     /// A persisted workflow protocol pair is unknown or inconsistent.
@@ -268,9 +265,6 @@ impl AppCommandError {
             AppErrorCode::NotFound => "Resource not found",
             AppErrorCode::PermissionDenied => "Permission denied",
             AppErrorCode::AlreadyExists => "Resource already exists",
-            AppErrorCode::LegacyCompletionProtocolRestartRequired => {
-                "Legacy workflow restart required"
-            }
             _ => "I/O operation failed",
         };
 

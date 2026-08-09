@@ -31,8 +31,7 @@ use crate::acp::delegation::route::DelegationRoutePlan;
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::delegation::workflow::{
-    capture_original_request_context, load_completion_protocol_for_conversation,
-    require_v2_mutation, CompletionProtocolRolloutConfig,
+    load_completion_protocol_for_conversation, require_v2_mutation, CompletionProtocolRolloutConfig,
 };
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
@@ -2064,19 +2063,6 @@ impl ConnectionManager {
         // Unlinked and internal-purpose sends bypass capture entirely.
         if let (Some(db), Some(conversation_id)) = (db, state.conversation_id) {
             if !is_internal {
-                if register_mandatory_routes {
-                    if let Some((request_id, _)) = user_message.as_ref() {
-                        capture_original_request_context(
-                            &db.conn,
-                            conversation_id,
-                            request_id,
-                            &blocks,
-                            state.agent_type.as_wire().as_ref(),
-                        )
-                        .await
-                        .map_err(|error| AcpError::protocol(error.to_string()))?;
-                    }
-                }
                 let captured = capture_prompt_context(
                     &db.conn,
                     conversation_id,

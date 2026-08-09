@@ -83,8 +83,6 @@ pub enum AcpError {
     DelegateViewerOnly {
         reason: crate::models::DelegateAccessReason,
     },
-    #[error("legacy completion protocol restart required; successor conversation {successor_conversation_id}")]
-    LegacyCompletionProtocolRestart { successor_conversation_id: i32 },
     #[error("legacy completion protocol is read-only")]
     LegacyCompletionProtocolReadOnly,
     #[error("unsupported completion protocol: {0}")]
@@ -136,9 +134,6 @@ impl AcpError {
             Self::RouteUnavailable { .. } => Some("route_unavailable"),
             Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
-            Self::LegacyCompletionProtocolRestart { .. } => {
-                Some("legacy_completion_protocol_restart_required")
-            }
             Self::LegacyCompletionProtocolReadOnly => Some("legacy_completion_protocol_read_only"),
             Self::UnsupportedCompletionProtocol(_) => Some("unsupported_completion_protocol"),
             Self::CompletionInstructionBindingFailed(_) => {
@@ -231,15 +226,6 @@ impl AcpError {
                     "backendErrors.delegateViewerOnly",
                     BTreeMap::from([("reason".into(), reason.as_str().into())]),
                 ),
-            ),
-            AcpError::LegacyCompletionProtocolRestart {
-                successor_conversation_id,
-            } => Some(
-                AppCommandError::new(
-                    AppErrorCode::LegacyCompletionProtocolRestartRequired,
-                    "Legacy workflow restarted in a fresh conversation",
-                )
-                .with_detail(successor_conversation_id.to_string()),
             ),
             AcpError::LegacyCompletionProtocolReadOnly => Some(AppCommandError::new(
                 AppErrorCode::LegacyCompletionProtocolReadOnly,

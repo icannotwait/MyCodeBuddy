@@ -35283,17 +35283,6 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::acp::delegation::workflow::capture_original_request_context(
-            &db.conn,
-            parent.id,
-            "launch-binding-request",
-            &[crate::acp::types::PromptInputBlock::Text {
-                text: "Author the bound Plan.".into(),
-            }],
-            "codex",
-        )
-        .await
-        .unwrap();
         seed_v2_plan_author_workflow(&db, parent.id).await;
         let runs = Arc::new(RunStore::new(db.clone()));
         let mock = Arc::new(MockSpawner::new());
