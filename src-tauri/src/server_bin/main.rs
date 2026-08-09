@@ -9,6 +9,15 @@ use codeg_lib::web::{
     WebServerState,
 };
 
+fn completion_protocol_configuration_failure(
+    error: codeg_lib::acp::delegation::workflow::CompletionProtocolConfigurationRemoved,
+) -> (u8, String) {
+    (
+        2,
+        format!("[delegation][FATAL] {}: {}", error.code(), error),
+    )
+}
+
 fn main() -> ExitCode {
     // Capture our own executable path before anything can rename it (an
     // in-place upgrade swaps the binary mid-run; `current_exe()` would then
@@ -90,6 +99,14 @@ fn main() -> ExitCode {
     // abort. Hold the guard for the whole process so buffered file lines flush
     // on a graceful exit.
     let _log_guard = codeg_lib::logging::init::init_server();
+
+    if let Err(error) =
+        codeg_lib::acp::delegation::workflow::reject_removed_completion_protocol_configuration()
+    {
+        let (exit_code, message) = completion_protocol_configuration_failure(error);
+        tracing::error!("{message}");
+        return ExitCode::from(exit_code);
+    }
 
     // `CODEG_HOME` overrides `CODEG_DATA_DIR` for uploads/pets inside
     // `paths::codeg_*_root` (legacy `~/.codeg/` layout). If both are set
@@ -346,13 +363,7 @@ async fn async_main() -> ExitCode {
         .with_metrics(stack.metrics.clone()),
     );
     let completion_protocol_rollout =
-        match codeg_lib::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env() {
-            Ok(config) => Arc::new(config),
-            Err(error) => {
-                tracing::error!("[delegation][FATAL] invalid completion protocol rollout: {error}");
-                return ExitCode::from(2);
-            }
-        };
+        Arc::new(codeg_lib::acp::delegation::workflow::CompletionProtocolRolloutConfig::fixed_v2());
     connection_manager.install_completion_protocol_runtime(
         completion_protocol_rollout.clone(),
         stack.metrics.clone(),
@@ -690,4 +701,34 @@ fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .map(|d| d.join("codeg"))
         .unwrap_or_else(|| PathBuf::from(".codeg-data"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_completion_protocol_environment_exits_with_code_two() {
+        for variable in [
+            "CODEG_COMPLETION_PROTOCOL_MODE",
+            "CODEG_COMPLETION_PROTOCOL_OVERRIDES",
+        ] {
+            for value in ["v1", "v2_shadow", "v2_enforce"] {
+                let other = if variable == "CODEG_COMPLETION_PROTOCOL_MODE" {
+                    "CODEG_COMPLETION_PROTOCOL_OVERRIDES"
+                } else {
+                    "CODEG_COMPLETION_PROTOCOL_MODE"
+                };
+                temp_env::with_vars([(variable, Some(value)), (other, None::<&str>)], || {
+                    let error = codeg_lib::acp::delegation::workflow::reject_removed_completion_protocol_configuration()
+                            .expect_err("removed configuration must fail server startup");
+                    let (exit_code, message) = completion_protocol_configuration_failure(error);
+                    assert_eq!(exit_code, 2);
+                    assert!(message.contains("completion_protocol_configuration_removed"));
+                    assert!(message.contains(variable));
+                    assert!(message.contains("remove"));
+                });
+            }
+        }
+    }
 }

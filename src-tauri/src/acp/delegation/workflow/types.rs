@@ -39,6 +39,19 @@ pub fn current_completion_protocol_mode() -> CompletionProtocolMode {
     CompletionProtocolMode::V2Enforce
 }
 
+pub fn reject_removed_completion_protocol_configuration(
+) -> Result<(), super::error::CompletionProtocolConfigurationRemoved> {
+    for variable in [
+        "CODEG_COMPLETION_PROTOCOL_MODE",
+        "CODEG_COMPLETION_PROTOCOL_OVERRIDES",
+    ] {
+        if std::env::var_os(variable).is_some() {
+            return Err(super::error::CompletionProtocolConfigurationRemoved { variable });
+        }
+    }
+    Ok(())
+}
+
 /// Server-owned rollout policy. Overrides use the exact stable key returned by
 /// [`completion_protocol_profile_key`]; unknown or malformed modes never reach
 /// this typed structure.
@@ -61,6 +74,13 @@ impl Default for CompletionProtocolRolloutConfig {
 }
 
 impl CompletionProtocolRolloutConfig {
+    pub fn fixed_v2() -> Self {
+        Self {
+            default_mode: CompletionProtocolMode::V2Enforce,
+            profile_overrides: BTreeMap::new(),
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let default_value = match std::env::var("CODEG_COMPLETION_PROTOCOL_MODE") {
             Ok(value) => Some(value),
@@ -1109,4 +1129,29 @@ pub struct NormalizedManifest {
     pub task_policies: Vec<ManifestTaskPolicy>,
     /// Distinct Task indices present on work units (1-based).
     pub task_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn removed_completion_protocol_environment_rejects_every_historical_value() {
+        for variable in [
+            "CODEG_COMPLETION_PROTOCOL_MODE",
+            "CODEG_COMPLETION_PROTOCOL_OVERRIDES",
+        ] {
+            for value in ["v1", "v2_shadow", "v2_enforce"] {
+                let other = if variable == "CODEG_COMPLETION_PROTOCOL_MODE" {
+                    "CODEG_COMPLETION_PROTOCOL_OVERRIDES"
+                } else {
+                    "CODEG_COMPLETION_PROTOCOL_MODE"
+                };
+                temp_env::with_vars([(variable, Some(value)), (other, None::<&str>)], || {
+                    let error = super::reject_removed_completion_protocol_configuration()
+                        .expect_err("removed configuration must fail startup");
+                    assert_eq!(error.code(), "completion_protocol_configuration_removed");
+                    assert_eq!(error.variable, variable);
+                });
+            }
+        }
+    }
 }

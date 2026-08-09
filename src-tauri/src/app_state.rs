@@ -65,8 +65,8 @@ pub struct AppState {
     /// Process-local delegation reliability metrics (route/accepted/terminal/
     /// wait/cancel). Shared with broker, supervisor, listener, and route launch.
     pub delegation_metrics: Arc<DelegationMetrics>,
-    /// Server-owned completion protocol selection for workflows created by
-    /// this process. Existing workflows retain their persisted mode.
+    /// Transitional read-only rollout state retained until the settings and
+    /// restart surfaces are removed. Workflow creation does not consult it.
     pub completion_protocol_rollout:
         Arc<crate::acp::delegation::workflow::CompletionProtocolRolloutConfig>,
     /// Durable completion events are dispatched after commit and replayed on
@@ -520,7 +520,7 @@ impl AppState {
             }),
         );
         let completion_protocol_rollout =
-            Arc::new(crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::default());
+            Arc::new(crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::fixed_v2());
         connection_manager.install_completion_protocol_runtime(
             completion_protocol_rollout.clone(),
             stack.metrics.clone(),

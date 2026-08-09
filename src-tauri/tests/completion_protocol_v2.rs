@@ -37,10 +37,10 @@ use codeg_lib::acp::delegation::workflow::{
     get_workflow_state_core, guard_current_final_delivery_core, guard_final_delivery_core,
     guard_task_final_delivery_core, inject_legacy_restart_header_failure_once,
     materialize_terminal_completion_txn, project_workflow_graph_core,
-    publish_workflow_manifest_core, publish_workflow_manifest_with_selection_core,
-    restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
-    settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
-    CompletionOutcome, CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
+    publish_workflow_manifest_core, restart_legacy_workflow_core,
+    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_v2_core,
+    CompletionCardV2, CompletionIntent, CompletionIntentSource, CompletionOutcome,
+    CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
     CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentGateKind,
     DocumentRef, FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument,
     ManifestGate, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
@@ -123,6 +123,125 @@ fn stable_protocol_error_codes() {
         assert_eq!(error.code(), Some(expected));
         assert_eq!(serde_json::to_value(error).unwrap()["code"], expected);
     }
+}
+
+#[tokio::test]
+async fn fixed_v2_creation_persists_across_agent_profiles_and_revisions() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-2-fixed-v2-creation").await;
+
+    for (index, (conversation_agent, profile_id)) in [
+        (AgentType::Codex, None),
+        (AgentType::Grok, Some("review-canary")),
+        (AgentType::Gemini, Some("reasoning")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = seed_conversation(&db, folder, conversation_agent).await;
+        let token = format!("task-2-fixed-v2-{index}");
+        let mut document = skeleton(&token);
+        let author = document.nodes.first_mut().expect("plan author");
+        author.profile_id = profile_id.map(str::to_string);
+        author.work_unit_key = Some(
+            build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+                rel_plan_path: &document.plan_target_rel_path,
+                agent_type: "codex",
+                profile_id,
+            })
+            .unwrap(),
+        );
+
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let row = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.completion_protocol_version, 2);
+        assert_eq!(
+            row.completion_protocol_mode,
+            delegation_workflow::CompletionProtocolMode::V2Enforce
+        );
+
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(published.manifest_revision);
+        document.nodes[0].title = Some("revised display title".into());
+        let revised = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
+        assert_eq!(revised.manifest_revision, published.manifest_revision + 1);
+
+        let revised_row = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revised_row.completion_protocol_version, 2);
+        assert_eq!(
+            revised_row.completion_protocol_mode,
+            delegation_workflow::CompletionProtocolMode::V2Enforce
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_v2_creation_rejects_revision_after_header_becomes_historical() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-2-fixed-v2-historical-revision").await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let mut document = skeleton("task-2-fixed-v2-historical-revision");
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: document.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
+
+    document.workflow_id = Some(published.workflow_id.clone());
+    document.expected_manifest_revision = Some(published.manifest_revision);
+    document.nodes[0].title = Some("must remain read only".into());
+    let error = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest { document },
+    )
+    .await
+    .expect_err("historical workflow revision must be rejected");
+    assert_eq!(error.code(), "legacy_completion_protocol_read_only");
+
+    let row = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.active_manifest_revision, 1);
+    assert_eq!(row.completion_protocol_version, 1);
 }
 
 struct RootDepth;
@@ -317,6 +436,22 @@ fn skeleton(token: &str) -> ManifestDocument {
     }
 }
 
+async fn mark_historical_completion_protocol(
+    db: &codeg_lib::db::AppDatabase,
+    workflow_id: &str,
+    mode: delegation_workflow::CompletionProtocolMode,
+) {
+    let row = delegation_workflow::Entity::find_by_id(workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row: delegation_workflow::ActiveModel = row.into();
+    row.completion_protocol_version = Set(1);
+    row.completion_protocol_mode = Set(mode);
+    row.update(&db.conn).await.unwrap();
+}
+
 fn complete_gate_state_skeleton(token: &str) -> ManifestDocument {
     let mut document = skeleton(token);
     document.phases.push(ManifestPhase {
@@ -458,20 +593,9 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
 
     let enforce_parent = seed_conversation(&db, folder, AgentType::Codex).await;
     let (parent, request) = publish(enforce_parent, "task-18-enforce-gate-state");
-    let enforced = publish_workflow_manifest_with_selection_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        request,
-        CompletionProtocolSelection {
-            version: 2,
-            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source:
-                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
-        },
-    )
-    .await
-    .unwrap();
+    let enforced = publish_workflow_manifest_core(&db, &EventEmitter::Noop, parent, request)
+        .await
+        .unwrap();
     let states = delegation_workflow_gate_state::Entity::find()
         .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&enforced.workflow_id))
         .all(&db.conn)
@@ -550,14 +674,13 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
         .find(|node| node.id == "plan-reviewer")
         .unwrap()
         .title = Some("Display-only reviewer title".into());
-    let title_result = publish_workflow_manifest_with_selection_core(
+    let title_result = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         enforce_parent,
         PublishWorkflowRequest {
             document: title_only.clone(),
         },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -580,14 +703,13 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES_V2)),
     });
-    publish_workflow_manifest_with_selection_core(
+    publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         enforce_parent,
         PublishWorkflowRequest {
             document: title_only,
         },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -648,43 +770,6 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
         Some(design_state.gate_lineage.as_str())
     );
     assert_eq!(reviewer_binding.review_round, Some(1));
-
-    for (mode, version, token) in [
-        (
-            delegation_workflow::CompletionProtocolMode::V1,
-            1,
-            "task-18-v1-no-gate-state",
-        ),
-        (
-            delegation_workflow::CompletionProtocolMode::V2Shadow,
-            1,
-            "task-18-shadow-no-gate-state",
-        ),
-    ] {
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let (parent, request) = publish(parent, token);
-        let result = publish_workflow_manifest_with_selection_core(
-            &db,
-            &EventEmitter::Noop,
-            parent,
-            request,
-            CompletionProtocolSelection {
-                version,
-                mode,
-                source: codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            delegation_workflow_gate_state::Entity::find()
-                .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(result.workflow_id))
-                .count(&db.conn)
-                .await
-                .unwrap(),
-            0
-        );
-    }
 }
 
 #[tokio::test]
@@ -713,18 +798,12 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_with_selection_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: document.clone(),
-        },
-        CompletionProtocolSelection {
-            version: 2,
-            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source:
-                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
         },
     )
     .await
@@ -800,14 +879,13 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
     plan_gate
         .required_reviewer_node_ids
         .push("plan-reviewer-grok".into());
-    let added = publish_workflow_manifest_with_selection_core(
+    let added = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: document.clone(),
         },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -848,12 +926,11 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
     plan_gate
         .required_reviewer_node_ids
         .retain(|node_id| node_id != "plan-reviewer-grok");
-    publish_workflow_manifest_with_selection_core(
+    publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest { document },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -915,18 +992,12 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_with_selection_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: document.clone(),
-        },
-        CompletionProtocolSelection {
-            version: 2,
-            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source:
-                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
         },
     )
     .await
@@ -1074,14 +1145,13 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
         node_outcome: None,
         title: None,
     });
-    let added = publish_workflow_manifest_with_selection_core(
+    let added = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: document.clone(),
         },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -1169,12 +1239,11 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
     removed_reviewer.required = Some(false);
     removed_reviewer.node_outcome =
         Some(codeg_lib::acp::delegation::workflow::ManifestNodeOutcome::Canceled);
-    publish_workflow_manifest_with_selection_core(
+    publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest { document },
-        CompletionProtocolSelection::v1_default(),
     )
     .await
     .unwrap();
@@ -1893,20 +1962,11 @@ async fn run_session_2889_fixture() -> Session2889Result {
         .await
         .unwrap()
         .unwrap();
-    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
-    workflow.completion_protocol_version = Set(2);
-    workflow.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V2Enforce);
-    workflow.update(&db.conn).await.unwrap();
-    delegation_workflow_gate_state::ActiveModel {
-        workflow_id: Set(published.workflow_id.clone()),
-        gate_id: Set("plan".into()),
-        gate_lineage: Set(format!("sha256:{}", "2".repeat(64))),
-        current_review_round: Set(1),
-        selected_node_ids_json: Set("[\"plan-reviewer-codex\",\"plan-reviewer-grok\"]".into()),
-    }
-    .insert(&db.conn)
-    .await
-    .unwrap();
+    assert_eq!(workflow.completion_protocol_version, 2);
+    assert_eq!(
+        workflow.completion_protocol_mode,
+        delegation_workflow::CompletionProtocolMode::V2Enforce
+    );
 
     let author_task_id = "session-2889-plan-author";
     admit_v2_fixture_run(
@@ -2128,17 +2188,11 @@ async fn run_final_delivery_fixture(
         rel_path: "docs/superpowers/plans/restarted-plan.md".into(),
         digest: format!("sha256:{:x}", Sha256::digest(plan_bytes)),
     });
-    let published = publish_workflow_manifest_with_selection_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest { document },
-        CompletionProtocolSelection {
-            version: 2,
-            mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source:
-                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
-        },
     )
     .await
     .unwrap();
@@ -2547,6 +2601,12 @@ async fn legacy_source() -> (codeg_lib::db::AppDatabase, i32, String) {
     )
     .await
     .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
     (db, parent, published.workflow_id)
 }
 
@@ -2585,6 +2645,12 @@ async fn legacy_restart_preserves_non_default_context_but_routes_codex_plan_auth
     )
     .await
     .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
     let source_author = delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(&published.workflow_id))
         .filter(delegation_workflow_node_binding::Column::Role.eq("author"))
@@ -2901,6 +2967,12 @@ async fn legacy_restart_upgrade_recovers_first_request_before_enforce_resume() {
     )
     .await
     .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
     assert!(
         delegation_workflow_restart_context::Entity::find_by_id(parent)
             .one(&db.conn)
@@ -3018,6 +3090,12 @@ async fn legacy_restart_upgrade_without_durable_request_remains_fail_closed() {
     )
     .await
     .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
     let before = source_fingerprint(&db, parent, &published.workflow_id).await;
     let enforce = CompletionProtocolRolloutConfig {
         default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
@@ -3045,7 +3123,7 @@ async fn legacy_restart_upgrade_without_durable_request_remains_fail_closed() {
 }
 
 #[tokio::test]
-async fn rollout_mode_is_frozen_per_workflow() {
+async fn fixed_v2_creation_is_not_affected_by_rollout_configuration() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-frozen-rollout").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -3054,14 +3132,17 @@ async fn rollout_mode_is_frozen_per_workflow() {
         ..Default::default()
     };
     let selection = select_completion_protocol("codex", Some("canary"), &config);
-    let published = publish_workflow_manifest_with_selection_core(
+    assert_eq!(
+        selection.mode,
+        delegation_workflow::CompletionProtocolMode::V2Shadow
+    );
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: skeleton("task-15-shadow"),
         },
-        selection,
     )
     .await
     .unwrap();
@@ -3072,10 +3153,10 @@ async fn rollout_mode_is_frozen_per_workflow() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.completion_protocol_version, 1);
+    assert_eq!(row.completion_protocol_version, 2);
     assert_eq!(
         row.completion_protocol_mode,
-        delegation_workflow::CompletionProtocolMode::V2Shadow
+        delegation_workflow::CompletionProtocolMode::V2Enforce
     );
     assert_eq!(
         select_completion_protocol("codex", Some("canary"), &config),
@@ -3099,22 +3180,22 @@ async fn rollout_restart_accepts_stored_shadow_only_when_current_policy_is_enfor
     )
     .await
     .unwrap();
-    publish_workflow_manifest_with_selection_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         parent,
         PublishWorkflowRequest {
             document: skeleton("task-15-stored-shadow-source"),
         },
-        CompletionProtocolSelection {
-            version: 1,
-            mode: delegation_workflow::CompletionProtocolMode::V2Shadow,
-            source:
-                codeg_lib::acp::delegation::workflow::CompletionProtocolSelectionSource::Default,
-        },
     )
     .await
     .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V2Shadow,
+    )
+    .await;
 
     let enforce = CompletionProtocolRolloutConfig {
         default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,

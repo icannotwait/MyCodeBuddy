@@ -87,10 +87,11 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
         .await
         .unwrap()
         .unwrap();
-    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
-    workflow.completion_protocol_version = Set(2);
-    workflow.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
-    workflow.update(&db.conn).await.unwrap();
+    assert_eq!(workflow.completion_protocol_version, 2);
+    assert_eq!(
+        workflow.completion_protocol_mode,
+        CompletionProtocolMode::V2Enforce
+    );
 
     let task_id = format!("http-attention-{}", uuid::Uuid::new_v4());
     let db_arc = Arc::new(codeg_lib::db::AppDatabase {
@@ -652,7 +653,7 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
         profile_id: None,
     })
     .unwrap();
-    publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_core(
         &db,
         &EventEmitter::Noop,
         source_conversation_id,
@@ -662,6 +663,15 @@ async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
     )
     .await
     .unwrap();
+    let source = delegation_workflow::Entity::find_by_id(published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut source: delegation_workflow::ActiveModel = source.into();
+    source.completion_protocol_version = Set(1);
+    source.completion_protocol_mode = Set(CompletionProtocolMode::V1);
+    source.update(&db.conn).await.unwrap();
 
     let mut state = AppState::new_for_test(db, workspace.path().to_path_buf());
     let rollout = CompletionProtocolRolloutConfig {

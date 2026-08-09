@@ -130,6 +130,12 @@ mod tauri_app {
         // needed); hold the guard for the whole process so buffered file lines
         // flush on a graceful exit.
         let _log_guard = crate::logging::init::init_desktop();
+        if let Err(error) =
+            crate::acp::delegation::workflow::reject_removed_completion_protocol_configuration()
+        {
+            tracing::error!("[delegation][FATAL] {}: {}", error.code(), error);
+            return;
+        }
         let preferences = crate::preferences::load();
         crate::window_diagnostics::initialize(process_start, &preferences);
 
@@ -561,8 +567,7 @@ mod tauri_app {
                         effective_data_dir.clone(),
                     );
                     let completion_protocol_rollout = std::sync::Arc::new(
-                        crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env()
-                            .map_err(std::io::Error::other)?,
+                        crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::fixed_v2(),
                     );
                     cm_state.install_completion_protocol_runtime(
                         completion_protocol_rollout.clone(),

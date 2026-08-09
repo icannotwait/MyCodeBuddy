@@ -55,12 +55,11 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
-    publish_workflow_manifest_with_selection_core, recover_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_core,
-    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, FinalDeliveryGuardResult,
-    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
-    SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition,
-    WorkflowStoreError,
+    publish_workflow_manifest_core, recover_workflow_core, restart_legacy_workflow_if_enforced,
+    settle_workflow_gate_core, settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig,
+    FinalDeliveryGuardResult, ManifestDocument, PlanReviewError, PublishWorkflowRequest,
+    RecoverWorkflowRequest, SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
+    WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -1705,27 +1704,19 @@ impl DelegationListener {
             Ok(None) => {}
             Err(error) => return workflow_store_error_value(error),
         }
-        let selection = select_completion_protocol(
-            rollout_subject
-                .and_then(|node| node.agent_type.as_deref())
-                .unwrap_or("unknown"),
-            rollout_subject.and_then(|node| node.profile_id.as_deref()),
-            &self.completion_protocol_rollout,
-        );
-        let creation_mode = selection.mode.clone();
-        match publish_workflow_manifest_with_selection_core(
+        match publish_workflow_manifest_core(
             runs.db(),
             &self.workflow_emitter,
             parent_conversation_id,
             PublishWorkflowRequest { document },
-            selection,
         )
         .await
         {
             Ok(r) => {
                 if r.manifest_revision == 1 && !r.idempotent_replay {
-                    self.metrics
-                        .record_completion_protocol_creation(creation_mode);
+                    self.metrics.record_completion_protocol_creation(
+                        crate::acp::delegation::workflow::current_completion_protocol_mode(),
+                    );
                 }
                 serde_json::to_value(r).unwrap_or_else(|e| {
                     WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
@@ -9174,9 +9165,7 @@ mod tests {
             dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
         };
         use crate::acp::delegation::run_store::RunStore;
-        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
-        use sea_orm::{ActiveModelTrait, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/workflow-v2-listener").await;
@@ -9386,10 +9375,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut header: delegation_workflow::ActiveModel = header.into();
-        header.completion_protocol_version = Set(2);
-        header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
-        header.update(&db.conn).await.unwrap();
+        assert_eq!(header.completion_protocol_version, 2);
+        assert_eq!(
+            header.completion_protocol_mode,
+            delegation_workflow::CompletionProtocolMode::V2Enforce
+        );
 
         let outcome = listener
             .process_get_workflow_state(BrokerGetWorkflowStateRequest {

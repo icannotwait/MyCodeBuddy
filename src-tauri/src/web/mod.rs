@@ -843,6 +843,7 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::acp::delegation::metrics::DelegationMetrics>>()
             .inner()
             .clone(),
+        // Transitional rollout state is read-only; publication itself is fixed v2.
         completion_protocol_rollout: app
             .state::<Arc<crate::acp::delegation::workflow::CompletionProtocolRolloutConfig>>()
             .inner()

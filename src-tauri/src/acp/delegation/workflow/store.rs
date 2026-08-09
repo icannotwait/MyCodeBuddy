@@ -53,7 +53,7 @@ use super::completion_projection::{
     load_completion_projection, load_workflow_completion_projection_batch,
     validated_design_self_review_outcome, DesignSelfReviewDecisionError,
 };
-use super::error::WorkflowStoreError;
+use super::error::{require_v2_mutation, WorkflowStoreError};
 use super::events::{
     emit_workflow_graph_changed, emit_workflow_recovery_event, WorkflowRecoveryEvent,
 };
@@ -94,7 +94,8 @@ use super::types::{
     DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
     ManifestNodeOutcome, ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
     NormalizedGate, NormalizedManifest, NormalizedNode, PlanChangeClassification, ResolutionMode,
-    WorkflowBlockCause, MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    WorkflowBlockCause, CURRENT_COMPLETION_PROTOCOL_VERSION, MAX_ADJUDICATION_SUMMARY_BYTES,
+    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -629,25 +630,6 @@ pub async fn publish_workflow_manifest_core(
     parent_conversation_id: i32,
     req: PublishWorkflowRequest,
 ) -> Result<PublishResult, WorkflowStoreError> {
-    publish_workflow_manifest_with_selection_core(
-        db,
-        emitter,
-        parent_conversation_id,
-        req,
-        super::types::CompletionProtocolSelection::v1_default(),
-    )
-    .await
-}
-
-/// Publish with a server-selected protocol for a new workflow. Existing
-/// workflow rows ignore `selection` and retain their frozen stored mode.
-pub async fn publish_workflow_manifest_with_selection_core(
-    db: &AppDatabase,
-    emitter: &EventEmitter,
-    parent_conversation_id: i32,
-    req: PublishWorkflowRequest,
-    selection: super::types::CompletionProtocolSelection,
-) -> Result<PublishResult, WorkflowStoreError> {
     ensure_parent_exists(db, parent_conversation_id).await?;
 
     let normalized = validate_manifest_document(&req.document)?;
@@ -657,6 +639,8 @@ pub async fn publish_workflow_manifest_with_selection_core(
     let document_digest = sha256_hex(document_json.as_bytes());
 
     let now = Utc::now();
+    let protocol_version = CURRENT_COMPLETION_PROTOCOL_VERSION;
+    let protocol_mode = super::types::current_completion_protocol_mode();
     let publication_token = normalized.publication_token.clone();
     let document_digest_for_race = document_digest.clone();
 
@@ -673,7 +657,8 @@ pub async fn publish_workflow_manifest_with_selection_core(
                     &normalized,
                     &document_digest,
                     now,
-                    &selection,
+                    protocol_version,
+                    protocol_mode,
                 )
                 .await
             })
@@ -5081,12 +5066,17 @@ async fn publish_in_txn(
     normalized: &NormalizedManifest,
     document_digest: &str,
     now: chrono::DateTime<Utc>,
-    selection: &super::types::CompletionProtocolSelection,
+    protocol_version: i64,
+    protocol_mode: delegation_workflow::CompletionProtocolMode,
 ) -> Result<PublishResult, WorkflowStoreError> {
     // --- re-read by publication_token (inside write txn) -------------------
     if let Some(by_token) =
         load_by_publication_token_txn(txn, &normalized.publication_token).await?
     {
+        require_v2_mutation(
+            by_token.completion_protocol_version,
+            &by_token.completion_protocol_mode,
+        )?;
         if by_token.parent_conversation_id != parent_conversation_id {
             return Err(WorkflowStoreError::CrossParent {
                 workflow_id: by_token.workflow_id.clone(),
@@ -5147,6 +5137,12 @@ async fn publish_in_txn(
     }
 
     let by_parent = load_by_parent_kind_txn(txn, parent_conversation_id).await?;
+    if let Some(existing) = by_parent.as_ref() {
+        require_v2_mutation(
+            existing.completion_protocol_version,
+            &existing.completion_protocol_mode,
+        )?;
+    }
 
     let (workflow_id, next_manifest_rev, next_graph_rev, prior_header) =
         match (&normalized.workflow_id, by_parent) {
@@ -5378,7 +5374,8 @@ async fn publish_in_txn(
             workflow_state,
             &effective_document_digest,
             now,
-            selection,
+            protocol_version,
+            protocol_mode.clone(),
         )
         .await?
         {
@@ -5390,8 +5387,8 @@ async fn publish_in_txn(
 
     let v2_enforce = prior_header.as_ref().map_or_else(
         || {
-            selection.version == 2
-                && selection.mode
+            protocol_version == 2
+                && protocol_mode
                     == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
         },
         |header| {
@@ -5727,7 +5724,8 @@ async fn insert_header_create_or_reclassify(
     workflow_state: WorkflowState,
     document_digest: &str,
     now: chrono::DateTime<Utc>,
-    selection: &super::types::CompletionProtocolSelection,
+    protocol_version: i64,
+    protocol_mode: delegation_workflow::CompletionProtocolMode,
 ) -> Result<Option<PublishResult>, WorkflowStoreError> {
     use sea_orm::ConnectionTrait;
 
@@ -5772,8 +5770,8 @@ async fn insert_header_create_or_reclassify(
         block_source_manifest_revision: Set(
             (workflow_state == WorkflowState::Blocked).then_some(next_manifest_rev)
         ),
-        completion_protocol_version: Set(selection.version),
-        completion_protocol_mode: Set(selection.mode.clone()),
+        completion_protocol_version: Set(protocol_version),
+        completion_protocol_mode: Set(protocol_mode),
         legacy_source_workflow_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -5848,6 +5846,10 @@ async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
     }
     // Parent row may be visible before token unique index under rare timings.
     if let Some(by_parent) = load_by_parent_kind_txn(conn, parent_conversation_id).await? {
+        require_v2_mutation(
+            by_parent.completion_protocol_version,
+            &by_parent.completion_protocol_mode,
+        )?;
         if by_parent.publication_token == token {
             return Ok(Some(
                 classify_existing_header(
@@ -5874,6 +5876,10 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     token: &str,
     document_digest: &str,
 ) -> Result<PublishResult, WorkflowStoreError> {
+    require_v2_mutation(
+        header.completion_protocol_version,
+        &header.completion_protocol_mode,
+    )?;
     let active_digest =
         load_active_manifest_digest_txn(conn, &header.workflow_id, header.active_manifest_revision)
             .await?;
@@ -6005,6 +6011,10 @@ async fn classify_token_race_fresh(
             if let Some(by_parent) =
                 load_by_parent_kind_txn(&db.conn, parent_conversation_id).await?
             {
+                require_v2_mutation(
+                    by_parent.completion_protocol_version,
+                    &by_parent.completion_protocol_mode,
+                )?;
                 if by_parent.publication_token == token {
                     // Token-equal parent without digest load earlier: classify now.
                     return classify_existing_header(
