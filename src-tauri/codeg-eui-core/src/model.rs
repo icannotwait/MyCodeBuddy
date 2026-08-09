@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use crate::abi::{CodegEuiFrame, LifecycleState, CODEG_EUI_API_VERSION};
 use crate::commands::Operation;
 use crate::live::Projection;
+use crate::perf::wall_timestamp_rfc3339;
 use crate::{CODEG_EUI_COMPLETION_CAPACITY, CODEG_EUI_ERR_INTERNAL, CODEG_EUI_ERR_QUEUE_FULL};
 
 pub const CODEG_EUI_COMPLETION_OK: u32 = CompletionStatus::Ok as u32;
@@ -325,6 +326,41 @@ impl SharedModel {
         state.t_end_ns = 0;
     }
 
+    pub(crate) fn record_sent_user_turn(
+        &self,
+        selection_epoch: u64,
+        request_id: NonZeroU64,
+        text: Vec<u8>,
+    ) -> bool {
+        let Ok(text) = String::from_utf8(text) else {
+            return false;
+        };
+        let mut state = self.lock();
+        if state.selection_epoch != selection_epoch || state.connection_id.is_empty() {
+            return false;
+        }
+        let mut transcript = parse_transcript(&state.transcript_json);
+        let blocks = serde_json::json!([{"type": "text", "text": text}]);
+        if transcript.iter().rev().any(|turn| {
+            turn.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                && turn.get("blocks") == Some(&blocks)
+        }) {
+            return true;
+        }
+        transcript.push(serde_json::json!({
+            "id": format!("eui-request-{request_id}"),
+            "role": "user",
+            "blocks": blocks,
+            "timestamp": wall_timestamp_rfc3339(),
+        }));
+        let Ok(bytes) = serde_json::to_vec(&transcript) else {
+            return false;
+        };
+        state.transcript_json = bytes;
+        state.transcript_generation = state.transcript_generation.saturating_add(1);
+        true
+    }
+
     pub(crate) fn selection_receiver(&self) -> watch::Receiver<u64> {
         self.selection_tx.subscribe()
     }
@@ -349,6 +385,27 @@ impl SharedModel {
             .clone_from(&state.transcript_json);
         projection.assistant_generation = state.assistant_generation;
         projection.transcript_generation = state.transcript_generation;
+        true
+    }
+
+    pub(crate) fn sync_projection_transcript(
+        &self,
+        selection_epoch: u64,
+        connection_id: &str,
+        projection: &mut Projection,
+    ) -> bool {
+        let state = self.lock();
+        if state.selection_epoch != selection_epoch
+            || state.connection_id.as_slice() != connection_id.as_bytes()
+        {
+            return false;
+        }
+        if state.transcript_generation > projection.transcript_generation {
+            projection
+                .transcript_json
+                .clone_from(&state.transcript_json);
+            projection.transcript_generation = state.transcript_generation;
+        }
         true
     }
 
@@ -439,6 +496,14 @@ impl SharedModel {
         let frame = OwnedFrame::new(snapshot);
         state.ledger.commit_ready(completion_count);
         (frame, shutdown_ready)
+    }
+}
+
+fn parse_transcript(bytes: &[u8]) -> Vec<serde_json::Value> {
+    if bytes.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice(bytes).unwrap_or_default()
     }
 }
 

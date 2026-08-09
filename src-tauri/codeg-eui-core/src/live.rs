@@ -281,6 +281,8 @@ pub struct AttachPoint {
     pub receiver: broadcast::Receiver<Arc<EventEnvelope>>,
     pub last_assistant_text: Option<String>,
     pub parent_turn_generation: u64,
+    pub active_turn_generation: Option<u64>,
+    pub turn_in_flight: bool,
 }
 
 pub async fn snapshot_and_subscribe(state: &Arc<RwLock<SessionState>>) -> AttachPoint {
@@ -300,6 +302,8 @@ pub async fn snapshot_and_subscribe_observed(
         receiver: guard.event_stream().subscribe(),
         last_assistant_text: guard.last_assistant_text.clone(),
         parent_turn_generation: guard.parent_turn_generation,
+        active_turn_generation: guard.active_turn_generation,
+        turn_in_flight: guard.turn_in_flight,
     }
 }
 
@@ -370,6 +374,16 @@ impl LiveProjector {
         }
         let now_ns = native_timestamp_ns();
         projection.replace_from_snapshot(&attach.snapshot, now_ns);
+        if attach.turn_in_flight {
+            projection.stream_active = true;
+        } else if let Some(final_text) = attach.last_assistant_text.as_deref() {
+            if !projection.transcript_contains_assistant_text(final_text) {
+                projection.append_assistant_turn(
+                    Some(format!("turn-{}", attach.parent_turn_generation)),
+                    final_text,
+                );
+            }
+        }
         let mut seen = HashSet::new();
         if snapshot_has_interaction(&attach.snapshot) {
             projection.error_strip = INTERACTIVE_PROMPT_NOTICE.to_string();
@@ -475,6 +489,12 @@ impl LiveAttachment {
         }
 
         let now_ns = native_timestamp_ns();
+        let starts_observed_turn = matches!(&envelope.payload, AcpEvent::UserMessage { .. })
+            && self.projection.turn_message_id.as_deref()
+                != match &envelope.payload {
+                    AcpEvent::UserMessage { message_id, .. } => Some(message_id.as_str()),
+                    _ => None,
+                };
         match self.projection.apply_envelope(&envelope, now_ns) {
             ApplyOutcome::NeedsResync => {
                 self.recovery_envelope = Some(envelope);
@@ -487,6 +507,9 @@ impl LiveAttachment {
             }
             ApplyOutcome::Ignored => Ok(ReceiveOutcome::Ignored),
             ApplyOutcome::Applied => {
+                if starts_observed_turn {
+                    self.parent_turn_generation = self.parent_turn_generation.saturating_add(1);
+                }
                 if let Some(interaction) = pending_interaction(&envelope.payload) {
                     self.projection.error_strip = INTERACTIVE_PROMPT_NOTICE.to_string();
                     if let Err(error) = decline_once(
@@ -547,10 +570,18 @@ impl LiveAttachment {
             return Err(LiveError::ConnectionNotFound(self.connection_id.clone()));
         };
         let attach = snapshot_and_subscribe(&state).await;
-        let was_active = self.projection.stream_active
+        if !self.model.sync_projection_transcript(
+            self.selection_epoch,
+            &self.connection_id,
+            &mut self.projection,
+        ) {
+            return Ok(ReceiveOutcome::SelectionChanged);
+        }
+        let tracked_turn_was_active = self.projection.stream_active
             || self.projection.turn_message_id.is_some()
-            || recovery_evidence.saw_turn_activity
-            || attach.parent_turn_generation > self.parent_turn_generation;
+            || recovery_evidence.saw_turn_activity;
+        let missed_generation_completed =
+            attach.parent_turn_generation > self.parent_turn_generation && !attach.turn_in_flight;
         let completed_turn_id = self
             .projection
             .turn_message_id
@@ -565,16 +596,28 @@ impl LiveAttachment {
                 (attach.parent_turn_generation > 0)
                     .then(|| format!("turn-{}", attach.parent_turn_generation))
             });
+        let completed_is_new_turn = completed_turn_id.is_some()
+            && completed_turn_id.as_deref() != self.projection.turn_message_id.as_deref();
         self.projection
             .replace_from_snapshot(&attach.snapshot, native_timestamp_ns());
+        if attach.turn_in_flight {
+            self.projection.stream_active = true;
+        }
         for turn in &recovery_evidence.user_turns {
             self.projection
                 .append_user_turn(&turn.message_id, &turn.blocks);
         }
-        if was_active
+        if !attach.turn_in_flight
+            && (tracked_turn_was_active
+                || missed_generation_completed
+                || recovery_evidence.saw_turn_complete)
             && attach.snapshot.pending_user_message.is_none()
             && attach.snapshot.live_message.is_none()
         {
+            if completed_is_new_turn {
+                self.projection.t_first_token_ns = 0;
+                self.projection.t_end_ns = 0;
+            }
             self.projection.complete_recovered_turn(
                 completed_turn_id,
                 attach.last_assistant_text.as_deref().unwrap_or_default(),
@@ -682,6 +725,7 @@ struct RecoveryEvidence {
     interactions: Vec<PendingInteraction>,
     user_turns: Vec<RecoveredUserTurn>,
     saw_turn_activity: bool,
+    saw_turn_complete: bool,
 }
 
 struct RecoveredUserTurn {
@@ -776,6 +820,7 @@ impl RecoveryEvidence {
             }
         }
         self.saw_turn_activity |= is_turn_activity(event);
+        self.saw_turn_complete |= matches!(event, AcpEvent::TurnComplete { .. });
     }
 }
 
@@ -1024,18 +1069,7 @@ impl Projection {
         if self.t_first_token_ns == 0 && !final_text.is_empty() {
             self.t_first_token_ns = now_ns;
         }
-        if !final_text.is_empty() {
-            let assistant_id = format!(
-                "{}-assistant",
-                turn_message_id.as_deref().unwrap_or("recovered-live-turn")
-            );
-            self.append_transcript_turn(serde_json::json!({
-                "id": assistant_id,
-                "role": "assistant",
-                "blocks": [{"type": "text", "text": final_text}],
-                "timestamp": wall_timestamp_rfc3339(),
-            }));
-        }
+        self.append_assistant_turn(turn_message_id, final_text);
         if !self.live_assistant.is_empty() || !self.tools.is_empty() {
             self.assistant_generation = self.assistant_generation.saturating_add(1);
         }
@@ -1064,11 +1098,64 @@ impl Projection {
         }) {
             return;
         }
+        if turn.get("role").and_then(serde_json::Value::as_str) == Some("user") {
+            let incoming_blocks = turn.get("blocks");
+            if let Some(provisional) = transcript.iter_mut().find(|existing| {
+                existing
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.starts_with("eui-request-"))
+                    && existing.get("blocks") == incoming_blocks
+            }) {
+                *provisional = turn;
+                if let Ok(bytes) = serde_json::to_vec(&transcript) {
+                    self.transcript_json = bytes;
+                    self.transcript_generation = self.transcript_generation.saturating_add(1);
+                }
+                return;
+            }
+        }
         transcript.push(turn);
         if let Ok(bytes) = serde_json::to_vec(&transcript) {
             self.transcript_json = bytes;
             self.transcript_generation = self.transcript_generation.saturating_add(1);
         }
+    }
+
+    fn append_assistant_turn(&mut self, turn_message_id: Option<String>, final_text: &str) {
+        if final_text.is_empty() {
+            return;
+        }
+        let assistant_id = format!(
+            "{}-assistant",
+            turn_message_id.as_deref().unwrap_or("recovered-live-turn")
+        );
+        self.append_transcript_turn(serde_json::json!({
+            "id": assistant_id,
+            "role": "assistant",
+            "blocks": [{"type": "text", "text": final_text}],
+            "timestamp": wall_timestamp_rfc3339(),
+        }));
+    }
+
+    fn transcript_contains_assistant_text(&self, final_text: &str) -> bool {
+        serde_json::from_slice::<Vec<serde_json::Value>>(&self.transcript_json)
+            .ok()
+            .and_then(|turns| {
+                turns
+                    .into_iter()
+                    .rev()
+                    .find(|turn| turn["role"] == "assistant")
+            })
+            .and_then(|turn| turn["blocks"].as_array().cloned())
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block["type"] == "text"
+                        && block["text"]
+                            .as_str()
+                            .is_some_and(|text| text == final_text)
+                })
+            })
     }
 }
 

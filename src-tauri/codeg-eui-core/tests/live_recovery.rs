@@ -612,6 +612,62 @@ async fn sequence_gap_replaces_projection_from_authoritative_snapshot() {
 }
 
 #[tokio::test]
+async fn prompt_admission_before_user_event_does_not_reuse_previous_answer() {
+    let state = state("admitted");
+    {
+        let mut guard = state.write().await;
+        guard.last_assistant_text = Some("previous answer".to_string());
+    }
+    let backend: Arc<dyn LiveBackend> = Arc::new(StateBackend {
+        state: Arc::clone(&state),
+        declines: Arc::new(AtomicUsize::new(0)),
+    });
+    let projector = LiveProjector::new(backend, SharedModel::new());
+    let mut attachment = projector.attach("admitted", 0).await.unwrap();
+    let transcript_before_admission = attachment.snapshot().transcript_json.clone();
+    {
+        let mut guard = state.write().await;
+        guard.parent_turn_generation = 1;
+        guard.active_turn_generation = Some(1);
+        guard.turn_in_flight = true;
+        guard.event_seq = 1;
+    }
+
+    attachment.resync().await.unwrap();
+
+    assert!(attachment.snapshot().stream_active);
+    assert_eq!(
+        attachment.snapshot().transcript_json,
+        transcript_before_admission
+    );
+    assert_eq!(attachment.snapshot().t_end_ns, 0);
+}
+
+#[tokio::test]
+async fn initial_attach_recovers_final_answer_missing_from_loaded_transcript() {
+    let state = state("attach-terminal");
+    {
+        let mut guard = state.write().await;
+        guard.parent_turn_generation = 4;
+        guard.last_assistant_text = Some("just completed".to_string());
+        guard.event_seq = 8;
+    }
+    let backend: Arc<dyn LiveBackend> = Arc::new(StateBackend {
+        state,
+        declines: Arc::new(AtomicUsize::new(0)),
+    });
+    let projector = LiveProjector::new(backend, SharedModel::new());
+
+    let attachment = projector.attach("attach-terminal", 0).await.unwrap();
+
+    let transcript: serde_json::Value =
+        serde_json::from_slice(&attachment.snapshot().transcript_json).unwrap();
+    assert_eq!(transcript[0]["role"], "assistant");
+    assert_eq!(transcript[0]["blocks"][0]["text"], "just completed");
+    assert!(!attachment.snapshot().stream_active);
+}
+
+#[tokio::test]
 async fn sequence_gap_retains_interaction_evidence_cleared_by_completion() {
     let state = state("gap-interaction");
     let declines = Arc::new(AtomicUsize::new(0));
@@ -774,6 +830,39 @@ async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
     emit(
         &state,
         AcpEvent::UserMessage {
+            message_id: "previous-user".to_string(),
+            blocks: Vec::new(),
+        },
+    )
+    .await;
+    attachment.receive_next().await.unwrap();
+    emit(
+        &state,
+        AcpEvent::ContentDelta {
+            text: "previous answer".to_string(),
+            parent_tool_use_id: None,
+        },
+    )
+    .await;
+    attachment.receive_next().await.unwrap();
+    emit(
+        &state,
+        AcpEvent::TurnComplete {
+            session_id: "session".to_string(),
+            stop_reason: "end_turn".to_string(),
+            agent_type: "codex".to_string(),
+            mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
+        },
+    )
+    .await;
+    attachment.receive_next().await.unwrap();
+    let previous_first_token = attachment.snapshot().t_first_token_ns;
+
+    emit(
+        &state,
+        AcpEvent::UserMessage {
             message_id: "overflow-user".to_string(),
             blocks: vec![UserMessageBlock::Text {
                 text: "question".to_string(),
@@ -789,7 +878,7 @@ async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
         },
     )
     .await;
-    for _ in 2..128 {
+    for _ in 2..126 {
         emit(
             &state,
             AcpEvent::ContentDelta {
@@ -800,12 +889,12 @@ async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
         .await;
     }
     for _ in 0..1_000 {
-        if attachment.queued_control_events() == 128 {
+        if attachment.queued_control_events() == 126 {
             break;
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(attachment.queued_control_events(), 128);
+    assert_eq!(attachment.queued_control_events(), 126);
 
     emit(
         &state,
@@ -820,13 +909,6 @@ async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
         },
     )
     .await;
-    for _ in 0..1_000 {
-        if attachment.recovery_pending() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(attachment.recovery_pending());
     emit(
         &state,
         AcpEvent::TurnComplete {
@@ -839,20 +921,41 @@ async fn full_control_queue_recovers_dropped_permission_and_turn_completion() {
         },
     )
     .await;
+    for _ in 0..1_000 {
+        if attachment.queued_control_events() == 128 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attachment.queued_control_events(), 128);
+    emit(
+        &state,
+        AcpEvent::StatusChanged {
+            status: ConnectionStatus::Connected,
+        },
+    )
+    .await;
+    for _ in 0..1_000 {
+        if attachment.recovery_pending() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(attachment.recovery_pending());
 
     assert_eq!(
         attachment.receive_next().await.unwrap(),
         ReceiveOutcome::Recovered
     );
     assert_eq!(declines.load(Ordering::SeqCst), 1);
-    assert_eq!(attachment.snapshot().event_seq, 130);
+    assert_eq!(attachment.snapshot().event_seq, 132);
     assert!(!attachment.snapshot().stream_active);
-    assert!(attachment.snapshot().t_first_token_ns > 0);
+    assert!(attachment.snapshot().t_first_token_ns > previous_first_token);
     assert!(attachment.snapshot().t_end_ns > 0);
     let transcript: serde_json::Value =
         serde_json::from_slice(&attachment.snapshot().transcript_json).unwrap();
-    assert_eq!(transcript[0]["id"], "overflow-user");
-    assert_eq!(transcript[1]["blocks"][0]["text"], "final answer");
+    assert_eq!(transcript[2]["id"], "overflow-user");
+    assert_eq!(transcript[3]["blocks"][0]["text"], "final answer");
 }
 
 #[tokio::test]

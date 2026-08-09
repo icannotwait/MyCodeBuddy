@@ -28,6 +28,7 @@ pub(crate) struct CoreResult {
     payload: Vec<u8>,
     update: Option<ModelUpdate>,
     live_connection_id: Option<String>,
+    sent_user_text: Option<Vec<u8>>,
 }
 
 impl CoreResult {
@@ -36,6 +37,7 @@ impl CoreResult {
             payload,
             update: None,
             live_connection_id: None,
+            sent_user_text: None,
         }
     }
 }
@@ -157,6 +159,7 @@ impl CoreOps for AppCoreOps {
                 payload,
                 update: Some(ModelUpdate::Workspace { sessions }),
                 live_connection_id: None,
+                sent_user_text: None,
             })
         })
     }
@@ -310,6 +313,7 @@ fn selection_result(
             transcript_json,
         }),
         live_connection_id: Some(live_connection_id),
+        sent_user_text: None,
     })
 }
 
@@ -602,6 +606,10 @@ fn terminalize_task(
         .expect("metadata exists for every worker task");
     match result {
         Ok(result) => {
+            if let Some(text) = result.sent_user_text.clone() {
+                let _ =
+                    model.record_sent_user_turn(command.selection_epoch, command.request_id, text);
+            }
             let live_connection_id = result.live_connection_id;
             let is_current = model.terminalize_with_update(
                 command.selection_epoch,
@@ -660,7 +668,10 @@ async fn execute_command(
                 let CommandContext::Selection(selection) = context else {
                     return Err("send is missing its admitted session".to_string());
                 };
-                core_ops.send_user_message(selection, value).await
+                let sent_user_text = value.clone();
+                let mut result = core_ops.send_user_message(selection, value).await?;
+                result.sent_user_text = Some(sent_user_text);
+                Ok(result)
             }
             Operation::GetAgentSettings => core_ops.get_agent_settings(value).await,
             Operation::ProbeAgent => core_ops.probe_agent(value).await,
@@ -830,6 +841,50 @@ mod tests {
         }
     }
 
+    struct SuccessSendOps;
+
+    impl CoreOps for SuccessSendOps {
+        fn begin_selection(&self, _selection_epoch: u64, _op: Operation) {}
+
+        fn set_workspace(&self, _selection_epoch: u64, _path: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected workspace".to_string()) })
+        }
+
+        fn create_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _agent: Vec<u8>,
+        ) -> CoreFuture {
+            Box::pin(async { Err("unexpected create".to_string()) })
+        }
+
+        fn select_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _conversation_id: i32,
+        ) -> CoreFuture {
+            Box::pin(async { Err("unexpected select".to_string()) })
+        }
+
+        fn send_user_message(&self, _selection: EuiSessionSelection, _text: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Ok(CoreResult::json(Vec::new())) })
+        }
+
+        fn get_agent_settings(&self, _agent: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected get".to_string()) })
+        }
+
+        fn set_agent_settings(&self, _agent: Vec<u8>, _json: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected set".to_string()) })
+        }
+
+        fn probe_agent(&self, _agent: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected probe".to_string()) })
+        }
+    }
+
     #[tokio::test]
     async fn worker_errors_are_terminal_results() {
         let error = execute_command(
@@ -842,6 +897,57 @@ mod tests {
         .await
         .err();
         assert_eq!(error.as_deref(), Some("expected"));
+    }
+
+    #[tokio::test]
+    async fn successful_send_projects_user_text_into_the_transcript() {
+        let model = SharedModel::new();
+        let select_id = NonZeroU64::new(90).unwrap();
+        model
+            .reserve(select_id, Operation::SelectSession, 0)
+            .unwrap();
+        let selection_epoch = model.selection_epoch();
+        model.terminalize_with_update(
+            selection_epoch,
+            OwnedCompletion::ok(select_id, Operation::SelectSession, Vec::new()),
+            Some(ModelUpdate::Selection {
+                sessions: Vec::new(),
+                connection_id: b"send-transcript".to_vec(),
+                transcript_json: b"[]".to_vec(),
+            }),
+        );
+        let send_id = NonZeroU64::new(91).unwrap();
+        model
+            .reserve(send_id, Operation::SendUserMessage, selection_epoch)
+            .unwrap();
+        let mut tasks = JoinSet::new();
+        let abort = tasks.spawn(execute_command(
+            selection_epoch,
+            Operation::SendUserMessage,
+            CommandPayload::Utf8(b"kept through lag".to_vec()),
+            CommandContext::Selection(test_selection(
+                &test_workspace(1, "/workspace"),
+                1,
+                "send-transcript",
+            )),
+            Arc::new(SuccessSendOps),
+        ));
+        let mut metadata = HashMap::from([(
+            abort.id(),
+            CommandMetadata {
+                request_id: send_id,
+                selection_epoch,
+                op: Operation::SendUserMessage,
+            },
+        )]);
+        terminalize_task(&model, &mut metadata, tasks.join_next_with_id().await);
+
+        let (frame, _) = model.build_frame(false, &AtomicBool::new(false));
+        let abi = frame.as_abi(LifecycleState::Running, 1, false);
+        let transcript =
+            unsafe { std::slice::from_raw_parts(abi.transcript_json.ptr, abi.transcript_json.len) };
+        let transcript: serde_json::Value = serde_json::from_slice(transcript).unwrap();
+        assert_eq!(transcript[0]["blocks"][0]["text"], "kept through lag");
     }
 
     #[tokio::test]
@@ -1052,6 +1158,7 @@ mod tests {
                         transcript_json: b"[]".to_vec(),
                     }),
                     live_connection_id: Some("old".to_string()),
+                    sent_user_text: None,
                 })
             })
         }
