@@ -1954,6 +1954,62 @@ struct V2SettlementExpectation {
     outcome: Option<GateSettlementOutcome>,
 }
 
+#[cfg(test)]
+struct SettleV2PreflightTestGate {
+    workflow_id: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static SETTLE_V2_PREFLIGHT_TEST_GATE: std::sync::Mutex<Option<SettleV2PreflightTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_settle_v2_preflight_test_gate(
+    workflow_id: String,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut slot = SETTLE_V2_PREFLIGHT_TEST_GATE
+        .lock()
+        .expect("settle v2 preflight test gate lock");
+    assert!(
+        slot.is_none(),
+        "settle v2 preflight test gate already installed"
+    );
+    *slot = Some(SettleV2PreflightTestGate {
+        workflow_id,
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn honor_settle_v2_preflight_test_gate(workflow_id: &str) {
+    let gate = {
+        let mut slot = SETTLE_V2_PREFLIGHT_TEST_GATE
+            .lock()
+            .expect("settle v2 preflight test gate lock");
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.workflow_id == workflow_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
 pub async fn settle_workflow_gate_v2_core(
     db: &AppDatabase,
     emitter: &EventEmitter,
@@ -1976,6 +2032,8 @@ pub async fn settle_workflow_gate_v2_core(
         guard_header.completion_protocol_version,
         &guard_header.completion_protocol_mode,
     )?;
+    #[cfg(test)]
+    honor_settle_v2_preflight_test_gate(&req.workflow_id).await;
     if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
         return Err(WorkflowStoreError::SummaryTooLarge);
     }
@@ -3274,9 +3332,10 @@ async fn prepare_v2_design_self_review(
                         actual_parent: header.parent_conversation_id,
                     });
                 }
-                if header.completion_protocol_version != 2 {
-                    return Ok(DesignSelfReviewReadiness::NotApplicable);
-                }
+                require_v2_mutation(
+                    header.completion_protocol_version,
+                    &header.completion_protocol_mode,
+                )?;
                 if req.expected_graph_revision != header.graph_revision as u64 {
                     return Err(WorkflowStoreError::StaleGraphRevision {
                         expected: req.expected_graph_revision,
@@ -10803,6 +10862,156 @@ mod tests {
         .await
         .expect("self_review settle");
         assert!(!s.idempotent_replay);
+    }
+
+    #[tokio::test]
+    async fn design_self_review_preflight_rechecks_exact_protocol_pair_before_writes() {
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/superpowers/specs")).unwrap();
+        let design_bytes = b"# Current Design\n";
+        std::fs::write(
+            workspace.path().join("docs/superpowers/specs/x.md"),
+            design_bytes,
+        )
+        .unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = zero_reviewer_design_doc("task3-preflight-pair-flip");
+        document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
+        let header_before = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header_before.completion_protocol_version, 2);
+        assert_eq!(
+            header_before.completion_protocol_mode,
+            CompletionProtocolMode::V2Enforce
+        );
+        let gate_states_before = delegation_workflow_gate_state::Entity::find()
+            .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(&published.workflow_id))
+            .order_by_asc(delegation_workflow_gate_state::Column::GateId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let design_bindings_before = delegation_workflow_design_root_binding::Entity::find()
+            .filter(
+                delegation_workflow_design_root_binding::Column::WorkflowId
+                    .eq(&published.workflow_id),
+            )
+            .order_by_asc(delegation_workflow_design_root_binding::Column::GateId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let attentions_before = delegation_attention_request::Entity::find()
+            .order_by_asc(delegation_attention_request::Column::RequestId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+
+        let (preflight_entered, release_preflight) =
+            install_settle_v2_preflight_test_gate(published.workflow_id.clone());
+        let settle_db = AppDatabase {
+            conn: db.conn.clone(),
+        };
+        let settle_emitter = emitter.clone();
+        let workflow_id = published.workflow_id.clone();
+        let expected_graph_revision = published.graph_revision;
+        let settle_task = tokio::spawn(async move {
+            settle_workflow_gate_v2_core(
+                &settle_db,
+                &settle_emitter,
+                parent,
+                SettleWorkflowV2Request {
+                    workflow_id,
+                    gate_id: "design".into(),
+                    expected_graph_revision,
+                    expected_review_round: Some(1),
+                    expected_outcome: Some(GateSettlementOutcome::Approved),
+                    summary: "pair changed before Design preflight".into(),
+                    recovery_authorization_id: None,
+                },
+            )
+            .await
+        });
+        preflight_entered
+            .await
+            .expect("outer exact-pair guard must complete before the test pair flip");
+
+        let mut flipped: delegation_workflow::ActiveModel =
+            delegation_workflow::Entity::find_by_id(&published.workflow_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        flipped.completion_protocol_mode = Set(CompletionProtocolMode::V2Shadow);
+        flipped.update(&db.conn).await.unwrap();
+        release_preflight.send(()).unwrap();
+
+        let error = settle_task.await.unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            WorkflowStoreError::UnsupportedCompletionProtocol {
+                version: 2,
+                mode: CompletionProtocolMode::V2Shadow,
+            }
+        );
+        let header_after = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            header_after.graph_revision, header_before.graph_revision,
+            "rejected preflight must not rotate graph revision"
+        );
+        assert_eq!(
+            delegation_workflow_gate_state::Entity::find()
+                .filter(
+                    delegation_workflow_gate_state::Column::WorkflowId.eq(&published.workflow_id),
+                )
+                .order_by_asc(delegation_workflow_gate_state::Column::GateId)
+                .all(&db.conn)
+                .await
+                .unwrap(),
+            gate_states_before,
+            "rejected preflight must not mutate gate states"
+        );
+        assert_eq!(
+            delegation_workflow_design_root_binding::Entity::find()
+                .filter(
+                    delegation_workflow_design_root_binding::Column::WorkflowId
+                        .eq(&published.workflow_id),
+                )
+                .order_by_asc(delegation_workflow_design_root_binding::Column::GateId)
+                .all(&db.conn)
+                .await
+                .unwrap(),
+            design_bindings_before,
+            "rejected preflight must not mutate Design-root bindings"
+        );
+        assert_eq!(
+            delegation_attention_request::Entity::find()
+                .order_by_asc(delegation_attention_request::Column::RequestId)
+                .all(&db.conn)
+                .await
+                .unwrap(),
+            attentions_before,
+            "rejected preflight must not mutate attention requests"
+        );
     }
 
     #[tokio::test]
