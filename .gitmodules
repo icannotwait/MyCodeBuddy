@@ -2,3 +2,6 @@
 	path = src-tauri/vendor/codex-acp
 	url = https://github.com/icannotwait/codex-acp.git
 	branch = codex/codex-acp-cli-runtime
+[submodule "codeg-eui/third_party/EUI-NEO"]
+	path = codeg-eui/third_party/EUI-NEO
+	url = https://github.com/sudoevolve/EUI-NEO.git

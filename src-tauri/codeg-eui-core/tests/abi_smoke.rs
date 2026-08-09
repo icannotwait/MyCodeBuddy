@@ -1,0 +1,25 @@
+use codeg_eui_core::{
+    codeg_eui_api_version, codeg_eui_begin_shutdown, codeg_eui_init, codeg_eui_poll,
+    codeg_eui_shutdown, CodegEuiFrame, CODEG_EUI_API_VERSION, CODEG_EUI_ERR_INVALID_STATE,
+    CODEG_EUI_ERR_NULL_POINTER, CODEG_EUI_OK,
+};
+
+#[test]
+fn abi_version_and_null_poll_are_stable() {
+    assert_eq!(codeg_eui_api_version(), CODEG_EUI_API_VERSION);
+    assert_eq!(CODEG_EUI_API_VERSION, 1);
+    assert_eq!(
+        codeg_eui_poll(std::ptr::null_mut::<CodegEuiFrame>()),
+        CODEG_EUI_ERR_NULL_POINTER
+    );
+
+    assert_eq!(codeg_eui_init(std::ptr::null(), 0), CODEG_EUI_OK);
+    assert_eq!(codeg_eui_shutdown(), CODEG_EUI_ERR_INVALID_STATE);
+    assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
+
+    let mut frame = CodegEuiFrame::default();
+    assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+    assert_eq!(frame.api_version, CODEG_EUI_API_VERSION);
+    assert_eq!(frame.shutdown_ready, 1);
+    assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+}
