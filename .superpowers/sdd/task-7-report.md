@@ -1,248 +1,92 @@
-# Task 7 Report — Per-generation timestamps (accept path) + metrics
-
-**Branch:** `feat/delegation-promote-reliability`
-**Worktree:** `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`
-**Date:** 2026-07-27
-**Implementer:** Grok
-**Base HEAD:** `d76dd7e7` (Tasks 1–6 complete)
+# Task 7 Report: SQLite V2-Only Insert And Freeze Triggers
 
 ## Status
 
-**COMPLETE** (fix rounds 1–4 applied) — accept path samples `prompt_accepted_at` without post-send conversation lookup; live runtime rebase + promote use the same timestamp; accepted metrics (count + by-agent) for all generations with exactly-once task_id dedupe; promote/admission/settlement counter maps with documented pairing; interned audit codes wired into production audit mappings; production structured promote logs (aggregate broker + per-attempt `run_store` retry) with **fail-closed** full identity (generation / agent_type / admission_class) and tracing-subscriber capture tests.
-
-## Summary
-
-### Accept-path timestamps
-
-| Before | After |
-| --- | --- |
-| `AcceptedDelegationPrompt.started_at` read from `conversation.delegation_started_at` after enqueue | `prompt_accepted_at` sampled at accept success (`Utc::now()`) |
-| Missing/unreadable row timestamp failed acceptance | No conversation timestamp lookup; stale gen-1 values ignored |
-| Gen-2 could inherit gen-1 projection start | Each generation carries its own accept sample into promote + rebase |
-
-Promote transaction (Task 1) still persists:
-- `run.started_at = prompt_accepted_at`
-- `run.reached_running_at = max(now, prompt_accepted_at)`
-- conversation `delegation_started_at = prompt_accepted_at` under generation fence
-
-Live runtime projector rebases to the same accept sample before running publication (gen-1 and continuation).
-
-### Metrics
-
-| Counter / map | Semantics |
-| --- | --- |
-| `accepted_count` + `accepted_by_agent` | Durable `reserving → running` generations (including continuation); exactly-once per `task_id` via process-local set |
-| `promote_retries` | `busy`, `locked`, `busy_snapshot` from attempt meta; `busy_snapshot` only when extended 517 classified |
-| `promote_failures` | `cas`, `budget`, `busy_exhausted`, `permanent` |
-| `admission_failed_by_agent` | On `admission_failed` settlement paths (not budget) |
-| `settlement_retry_enqueued` / `settlement_retry_exhausted` | New owner after exhaust (incl. reacquire/forced-put) → both; existing owner → exhausted only; immediate settle success fence clear → neither |
-
-Snapshot serde keeps existing fields; new maps/counters use `#[serde(default)]` empty defaults.
-
-### Audit constants
-
-Interned `&'static str` codes via `intern_terminal_error_code`: `ADMISSION_FAILED_CODE`, `BUDGET_EXHAUSTED_CODE`, `ADMISSION_UNKNOWN_CODE`, `SPAWN_FAILED_CODE` (+ existing terminal codes). Used by both terminal audit mappings in broker.
-
-### Structured logs
-
-| Surface | Emitter | Fields |
-| --- | --- | --- |
-| Aggregate promote outcome / failure / settlement exhaust | `metrics::emit_promote_structured_log` (broker) | task_id, generation, agent_type, admission_class, attempt, sqlite codes, failure_class |
-| **Per-attempt** promote retry (BUSY / LOCKED / BUSY_SNAPSHOT) | `run_store::emit_promote_retry_structured` | task_id, **generation**, **agent_type**, **admission_class**, attempt, failure_class, sqlite codes |
-
-Identity for per-retry logs is loaded **fail-closed** once from the durable reserving row at `promote_running_detailed` entry: load `DbErr` → `Permanent` (stable message, no raw err); missing row → `StateConflict::Missing`. Retry emission always has real identity — never fabricated `"unknown"`. No raw `DbErr` / free-form promote messages on either surface.
-
-## Named tests
-
-| Test | Result |
-| --- | --- |
-| `gen1_gen2_distinct_prompt_accepted_at` | PASS |
-| `run_projection_runtime_share_prompt_accepted_at` | PASS |
-| `reached_running_at_ge_started_at` | PASS |
-| `stale_gen1_conversation_timestamp_not_reread` | PASS |
-| `continuation_increments_accepted_count_and_by_agent` | PASS |
-| `idempotent_promote_no_double_accepted_metric` | PASS |
-| `commit_reread_success_emits_accepted_exactly_once` | PASS |
-| `promote_failures_labels_cas_budget_busy_exhausted_permanent` | PASS |
-| `admission_failed_by_agent_increments_on_admission_failed` | PASS |
-| `settlement_retry_counter_pairing_new_vs_existing_owner` | PASS |
-| `settlement_retry_reacquire_owner_pairs_enqueued_and_exhausted` | PASS |
-| `busy_snapshot_metric_only_on_extended_517` | PASS |
-| `metrics_snapshot_default_empty_maps_serde` | PASS |
-| `structured_promote_logs_include_required_fields_exclude_secrets` | PASS (tracing-subscriber capture of aggregate emitter) |
-| `intern_terminal_error_code_covers_admission_budget_spawn` | PASS |
-| `promote_retry_structured_log_no_raw_err_on_busy_snapshot` | PASS (real path; asserts generation/agent_type/admission_class) |
-| `promote_identity_load_failure_no_unknown_retry_logs` | PASS (identity DbErr → Permanent; no unknown retry logs) |
-
-## Verify commands
-
-```powershell
-Set-Location D:\MyCodeBuddy\.worktrees\delegation-promote-reliability\src-tauri
-cargo test --features test-utils --lib accepted_ -- --nocapture
-# 14 passed
-
-cargo test --features test-utils --lib metrics -- --nocapture
-# 34 passed
-
-cargo test --features test-utils --lib settlement_retry -- --nocapture
-# 3 passed (includes reacquire race)
-
-cargo test --features test-utils --lib structured_promote -- --nocapture
-# 1 passed
-
-cargo test --features test-utils --lib intern_terminal -- --nocapture
-# 1 passed
-
-cargo check
-# Finished ok
-```
-
-## Files
-
-| File | Change |
-| --- | --- |
-| `src-tauri/src/acp/delegation/spawner.rs` | `AcceptedDelegationPrompt.prompt_accepted_at`; docs — no post-send row lookup |
-| `src-tauri/src/acp/manager.rs` | Sample accept time immediately on Ok(Some(cid)); stale-gen1 test |
-| `src-tauri/src/acp/delegation/metrics.rs` | Maps/counters, emit helper, intern codes, tracing capture tests |
-| `src-tauri/src/acp/delegation/broker.rs` | Wire metrics/logs/audit; settlement ownership through reacquire; tests |
-| `src-tauri/src/acp/delegation/run_store.rs` | Per-retry structured logs (rounds 2–4); fail-closed identity load; sanitize raw DbErr |
-
-## Commits
-
-| Hash | Message |
-| --- | --- |
-| `01fe4032` | `feat(delegation): per-generation accept timestamps and admission metrics` |
-| `a91a7121` | `docs(delegation): Task 7 accept timestamps and admission metrics report` |
-| `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
-| `8b781d97` | `fix(delegation): sanitize promote retry structured logs` |
-| `ced1eda3` | `fix(delegation): attach promote identity to per-retry logs` |
-| `87a3e61f` | `fix(delegation): hard-fail promote identity load for retry logs` |
-
-## Concerns / residual
-
-- Accepted-metric dedupe is **process-local** (`HashSet` of task ids). Host restart clears the set.
-- Identity pre-read is fail-closed (no silent unknown); a durable load failure aborts promote before the retry loop.
-- Task 8 (full verification matrix) not started.
-
-## Out of scope (confirmed)
-
-- No Task 8 residual fixes
-- No frontend card redesign
-- No historic row migration
-- No automatic prompt replay
-
----
-
-## Fix round 1 (Codex review)
-
-**Review:** `.superpowers/sdd/task-7-review.md` — CHANGES REQUIRED on Issues 1–3; Issues 4–5 fixed while touching accept path / docs.
-
-### Issue 1 — Structured logs (Important)
-
-- Added production `emit_promote_structured_log` with full required field set; broker outcome/failure/settlement exhaust paths use it.
-- Removed free-form `error = %message` / raw `DbErr` from promote failure and settlement exhaust logs.
-- **Logging policy:** aggregate broker logs after the promote retry loop (file-map constrained). Per-attempt `run_store` logs not amended (would need plan amendment).
-- Replaced helper-only assertion with tracing-subscriber capture over the real emitter (`structured_promote_logs_include_required_fields_exclude_secrets`).
-
-### Issue 2 — Settlement retry enqueued undercount on reacquire (Important)
-
-- Carried `settlement_retry_owner` through initial put, reacquire claim, forced put, and freeze put.
-- Exhaust pairing uses the effective owner flag (new owner after reacquire → enqueued + exhausted).
-- Broker race test: `settlement_retry_reacquire_owner_pairs_enqueued_and_exhausted`.
-
-### Issue 3 — Audit codes not wired (Important)
-
-- `intern_terminal_error_code` maps admission/budget/unknown/spawn (+ prior terminal codes).
-- Both terminal audit construction sites (`settle_task` winner + `finalize_durable_settlement`) use it.
-- Test: `intern_terminal_error_code_covers_admission_budget_spawn` asserts production audit records for each new code.
-
-### Issue 4 — Sample timing (Minor)
-
-- `prompt_accepted_at` sampled immediately on `Ok(Some(cid))` before watchdog state lock await.
-
-### Issue 5 — Diff hygiene (Minor)
-
-- Removed Markdown trailing hard-break spaces from this report.
-
-### Verify (fix round 1)
-
-```powershell
-cargo test --features test-utils --lib accepted_ -- --nocapture   # 14
-cargo test --features test-utils --lib metrics -- --nocapture     # 34
-cargo test --features test-utils --lib settlement_retry -- --nocapture  # 3
-cargo test --features test-utils --lib structured_promote -- --nocapture # 1
-cargo test --features test-utils --lib intern_terminal -- --nocapture    # 1
-cargo check  # ok
-```
-
----
-
-## Fix round 2 (Important 1 residual — per-retry log)
-
-**Review:** `.superpowers/sdd/task-7-rereview.md` — Findings 2–5 FIXED; Important 1 still open on `run_store` per-retry emission.
-
-**Authorized residual scope:** minimal `run_store.rs` touch only.
-
-### Changes
-
-1. **Removed** raw `error = %err` log from `map_promote_db_err` (DbErr may contain paths/config). Classification still extracts sqlite primary/extended codes before stringification.
-2. **Added** `emit_promote_retry_structured` called from `promote_running_detailed` on **every** retry (BUSY, LOCKED, BUSY_SNAPSHOT) with:
-   - `task_id`, `attempt`, `failure_class` (`busy` / `locked` / `busy_snapshot`)
-   - `sqlite_primary` / `sqlite_extended` when extractable
-   - No free-form message / raw err
-3. **Documented omission:** `generation`, `agent_type`, `admission_class` are not on the promote stack without an extra durable load; not loaded in this residual (sanitize-only).
-4. **Test:** `promote_retry_structured_log_no_raw_err_on_busy_snapshot` — tracing-subscriber capture over real `AfterClaimTransient(BusySnapshot)` + `Busy` promote path.
-
-### Verify (fix round 2)
-
-```powershell
-cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
-cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
-cargo check  # ok
-```
-
----
-
-## Fix round 3 (required identity on per-retry logs)
-
-**Review:** `.superpowers/sdd/task-7-rereview2.md` — PARTIALLY FIXED: raw err + ordinary retries fixed; `generation` / `agent_type` / `admission_class` still missing on per-retry events.
-
-### Changes
-
-1. Load `PromoteRetryLogIdentity` once from the durable reserving row at `promote_running_detailed` entry (`generation`, `agent_type`, `admission_class`).
-2. Emit those three fields on every BUSY / LOCKED / BUSY_SNAPSHOT per-retry structured log (stable labels; no raw DbErr).
-3. Extend `promote_retry_structured_log_no_raw_err_on_busy_snapshot` to assert identity on both BUSY_SNAPSHOT and BUSY events.
-4. Correct report summary/concerns so they no longer claim per-attempt logging is outside the file map or “minimal only”.
-
-### Verify (fix round 3)
-
-```powershell
-cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
-cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
-cargo check  # ok
-```
-
----
-
-## Fix round 4 (identity load fail-closed)
-
-**Review:** `.superpowers/sdd/task-7-rereview3.md` — PARTIALLY FIXED: seeded-row path OK, but `.ok().flatten()` swallowed `TaskStoreError` into unknown identity.
-
-### Changes
-
-1. Replaced best-effort `.ok().flatten()` with `load_promote_retry_identity`:
-   - `Ok(Some(run))` → real identity for all retry emits
-   - `Ok(None)` → `StateConflict::Missing` (no retry loop)
-   - `Err(_)` / test inject → `Permanent` with stable message **only** (no raw DbErr)
-2. `emit_promote_retry_structured` requires `&PromoteRetryLogIdentity` (no Option / no `"unknown"`).
-3. Test: `promote_identity_load_failure_no_unknown_retry_logs` — inject load fail + queued BUSY fault; assert Permanent, zero attempts, no retry logs with fabricated unknown.
-4. Report wording corrected (no “miss-only” fallback claim).
-
-### Verify (fix round 4)
-
-```powershell
-cargo test --features test-utils --lib promote_identity_load -- --nocapture          # 1
-cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
-cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
-cargo check  # ok
-```
+**IMPLEMENTATION COMPLETE; INDEPENDENT CODEX/GROK REVIEW PENDING**
+
+- Work unit: `task|7|implementer|codex|none`
+- Scope: Completion Protocol V2-Only plan Task 7 only
+- Baseline HEAD: `498e7e052e2b9d163b9cdb9eb86bcb825dc85390`
+- Producer commit: `9cfd617f2491138b228fb38e6d80dee51610a1b4`
+- Task 8+: not started
+
+## Implementation
+
+- Added and registered `m20260809_000001_completion_protocol_v2_only`
+  immediately after `m20260806_000004_legacy_restart_context`.
+- Added `trg_delegation_workflows_v2_only_insert`, which permits only exact
+  `(2, v2_enforce)` rows with a null `legacy_source_workflow_id`.
+- Added null-safe value-change freeze triggers for the two completion protocol
+  fields and for `legacy_source_workflow_id`. Identical assignments remain
+  writable, including SeaORM-shaped updates that re-SET unchanged protocol
+  values while changing graph metadata.
+- Kept migration `up` data-preserving. `down` contains only the three matching
+  `DROP TRIGGER IF EXISTS` statements.
+- Added `HistoricalWorkflowSeed` and
+  `historical_completion_protocol_db`, which migrate through the predecessor,
+  seed historical headers and links, and then apply only remaining migrations
+  on the same in-memory connection.
+- Replaced post-latest v1/inconsistent header mutation in
+  `completion_protocol_v2.rs` with predecessor-seeded fixtures. Ordinary fresh
+  databases retain the triggers and no fully migrated shared fixture drops or
+  disables them.
+- Did not edit any 2026-08-04 migration and did not rewrite historical rows.
+
+## TDD Evidence
+
+Before registering the migration, the focused migration target failed for the
+expected reasons:
+
+- The registration test reported the v2-only migration missing.
+- The matrix reported that an insert omitting protocol columns succeeded.
+
+After registering the exact trigger SQL, both migration tests passed. The
+historical integration suite then failed because all five legacy fixtures
+attempted post-migration protocol updates and received
+`completion_protocol_frozen`. After moving those headers to predecessor
+seeding, all five passed.
+
+The migration matrix covers omitted and every non-exact supported protocol
+pair, exact-v2 success, non-null legacy-source rejection, historical/current
+protocol freezes, all legacy-source value transitions, identical protocol
+re-SETs, ordinary non-protocol updates, historical row/link preservation,
+conversation deletion with dependent cascades, and rollback scope with an
+unrelated sentinel trigger.
+
+## Verification
+
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_migrations --features test-utils v2_only_trigger`
+  - Pass: 2 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_v2 --features test-utils historical`
+  - Pass: 5 passed, 0 failed.
+- Full `completion_protocol_migrations` integration target
+  - Pass: 12 passed, 0 failed.
+- Full `completion_protocol_v2` integration target
+  - Pass: 29 passed, 0 failed.
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+  - Pass.
+- Scoped Rustfmt check over all five modified Rust files
+  - Pass.
+- `git diff --check` and staged diff check before the producer commit
+  - Pass.
+- Scope/invariant searches
+  - Pass: trigger drops exist only in the new migration `down`; no 2026-08-04
+    migration changed; no post-latest v1/inconsistent header update remains in
+    `completion_protocol_v2.rs`.
+
+Cargo emitted the existing warning that the ignored `codeg-mcp` sidecar is a
+zero-byte placeholder. It did not affect compilation or tests and is outside
+the producer diff.
+
+## Producer Commit
+
+- `9cfd617f2491138b228fb38e6d80dee51610a1b4` -
+  `feat(db): enforce completion protocol v2-only triggers`
+
+## Conclusion
+
+done_with_concerns
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Added SQLite v2-only insert/freeze triggers plus predecessor-seeded historical fixtures, with coverage for invalid inserts, frozen updates, identical re-SETs, cascade deletes, preserved links, and rollback scope.","commits":[{"sha":"9cfd617f2491138b228fb38e6d80dee51610a1b4","subject":"feat(db): enforce completion protocol v2-only triggers"}],"tests":{"status":"passed","passed":41,"failed":0,"summary":"The 12-test migration and 29-test completion_protocol_v2 integration targets passed, along with desktop cargo check, scoped Rustfmt, diff checks, and invariant searches."},"concerns":["The existing zero-byte codeg-mcp sidecar packaging warning remains outside this diff.","Independent Codex and Grok review is pending before Task 8."],"report_file":".superpowers/sdd/task-7-report.md"}
+-->
