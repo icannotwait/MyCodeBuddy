@@ -1678,32 +1678,6 @@ impl DelegationListener {
                 .to_value();
             }
         };
-        let rollout_subject = document
-            .nodes
-            .iter()
-            .find(|node| {
-                node.role == Some(crate::acp::delegation::workflow::ManifestNodeRole::Author)
-            })
-            .or_else(|| document.nodes.iter().find(|node| node.agent_type.is_some()));
-        let rollout_subject_owned = rollout_subject.map(|node| {
-            (
-                node.agent_type.clone().unwrap_or_else(|| "unknown".into()),
-                node.profile_id.clone(),
-            )
-        });
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, rollout_subject_owned)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
         match publish_workflow_manifest_core(
             runs.db(),
             &self.workflow_emitter,
@@ -9140,6 +9114,146 @@ mod tests {
             outcome["error"]["code"], "root_only",
             "child must not publish even when workflow_v2 token bit is set: {outcome}"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_workflow_reaches_v2_store_guard_without_rollout_selection() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::acp::delegation::workflow::capture_original_request_context;
+        use crate::acp::types::PromptInputBlock;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/workflow-v2-listener-selection-guard").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        capture_original_request_context(
+            &db.conn,
+            parent,
+            "listener-selection-guard-request",
+            &[PromptInputBlock::Text {
+                text: "keep historical publication read only".into(),
+            }],
+            "codex",
+        )
+        .await
+        .unwrap();
+        let document: ManifestDocument = serde_json::from_value(json!({
+            "schema_version": 2,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "listener-selection-guard",
+            "workflow_state": "skeleton",
+            "plan_target_rel_path": "docs/superpowers/plans/selection-guard.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "phases": [
+                {"id": "design", "kind": "design"},
+                {"id": "plan", "kind": "plan"}
+            ],
+            "nodes": [{
+                "id": "plan-author",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "author",
+                "agent_type": "codex",
+                "profile_id": "selection-canary",
+                "work_unit_key": "plan|docs/superpowers/plans/selection-guard.md|author|codex|selection-canary",
+                "deps": [],
+                "required": true
+            }],
+            "edges": [],
+            "gates": [],
+            "task_policies": []
+        }))
+        .unwrap();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let source = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source: delegation_workflow::ActiveModel = source.into();
+        source.completion_protocol_version = Set(1);
+        source.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V1);
+        source.update(&db.conn).await.unwrap();
+
+        let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "workflow-selection-guard".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-selection-guard".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                    coordination_v1: false,
+                    delegation_continuation_v1: false,
+                    role: CompanionRole::Root,
+                    workflow_v2: true,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let mut profile_overrides = std::collections::BTreeMap::new();
+        profile_overrides.insert(
+            "codex|selection-canary".into(),
+            delegation_workflow::CompletionProtocolMode::V2Enforce,
+        );
+        let listener = DelegationListener::new_with_workflow_runtime(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(Some(parent))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+            EventEmitter::Noop,
+            Arc::new(CompletionProtocolRolloutConfig {
+                default_mode: delegation_workflow::CompletionProtocolMode::V1,
+                profile_overrides,
+            }),
+        );
+
+        let outcome = listener
+            .process_publish_workflow(BrokerPublishWorkflowRequest {
+                token: "workflow-selection-guard".into(),
+                document: serde_json::to_value(document).unwrap(),
+            })
+            .await;
+
+        assert_eq!(
+            outcome["error"]["code"], "legacy_completion_protocol_read_only",
+            "publication must reach the fixed-v2 store guard directly: {outcome}"
+        );
+        let workflows = delegation_workflow::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            workflows.len(),
+            1,
+            "publication must not create a successor"
+        );
+        assert_eq!(workflows[0].workflow_id, published.workflow_id);
+        assert_eq!(workflows[0].completion_protocol_version, 1);
+        assert_eq!(workflows[0].active_manifest_revision, 1);
+        assert!(workflows[0].legacy_source_workflow_id.is_none());
     }
 
     #[tokio::test]
