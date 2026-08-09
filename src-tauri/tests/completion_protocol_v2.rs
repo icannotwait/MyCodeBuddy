@@ -6,34 +6,43 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum_test::TestServer;
+use chrono::Utc;
 use codeg_lib::acp::delegation::broker::{
     is_completion_format_repair_prompt, pre_read_completion_reports_for_test,
-    ConversationDepthLookup, DelegationBroker,
+    ConversationDepthLookup, DelegationBroker, DelegationConfig, StatusWait,
 };
 use codeg_lib::acp::delegation::companion::{
     dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
 };
+use codeg_lib::acp::delegation::event_emitter::mock::MockEventEmitter;
 use codeg_lib::acp::delegation::event_emitter::{
-    CompletionOutboxDispatcher, CompletionRootWakeQueue,
+    CompletionOutboxDispatcher, CompletionRootWakeQueue, DelegationEventEmitter,
 };
 use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
     DelegationListener, ParentSessionLookup, TokenEntry, TokenRegistry,
 };
+use codeg_lib::acp::delegation::meta_writer::{DelegationMetaWriter, NoopMetaWriter};
 use codeg_lib::acp::delegation::metrics::{
     CompletionContinuationReason, CompletionFinalMetricState, DelegationMetrics,
 };
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
-use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
-use codeg_lib::acp::delegation::store::TaskStoreError;
+use codeg_lib::acp::delegation::spawner::{
+    accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
+};
+use codeg_lib::acp::delegation::store::{
+    DbDelegationTaskStore, DelegationTaskStore, TaskStoreError,
+};
 use codeg_lib::acp::delegation::transport::{
     client_cancel_task_round_trip, client_get_workflow_state_round_trip, client_status_round_trip,
     BrokerCancelTaskRequest, BrokerGetWorkflowStateRequest, BrokerStatusRequest,
     CancelDelegationReason, CompanionRole,
 };
 use codeg_lib::acp::delegation::types::{
-    ContinueDelegationRequest, DelegationError, ResolveCompletionDecisionRequest,
+    ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
+    DelegationSuccess, ResolveCompletionDecisionRequest, TaskStatus,
 };
+use codeg_lib::acp::types::DelegationResultSummary;
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, guard_current_final_delivery_core, guard_final_delivery_core,
     guard_task_final_delivery_core, load_completion_protocol_for_conversation,
@@ -4205,4 +4214,436 @@ fn completion_protocol_metrics_record_owned_live_transitions() {
     assert_eq!(snapshot.final_context_states["package_persisted"], 1);
     assert_eq!(snapshot.continuation_reasons["decision_resolved"], 1);
     assert_eq!(snapshot.sibling_reruns, 2);
+}
+
+trait ProtocolPairExt {
+    fn protocol_pair(
+        &self,
+    ) -> (
+        i64,
+        codeg_lib::db::entities::delegation_workflow::CompletionProtocolMode,
+    );
+}
+
+impl ProtocolPairExt for delegation_workflow::Model {
+    fn protocol_pair(
+        &self,
+    ) -> (
+        i64,
+        codeg_lib::db::entities::delegation_workflow::CompletionProtocolMode,
+    ) {
+        (
+            self.completion_protocol_version,
+            self.completion_protocol_mode.clone(),
+        )
+    }
+}
+
+struct DanglingTerminalCodes {
+    row_code: String,
+    wait_code: String,
+    event_code: String,
+}
+
+async fn enable_delegation_for_aggregate(broker: &DelegationBroker) {
+    broker
+        .set_config(DelegationConfig {
+            enabled: true,
+            ..DelegationConfig::default()
+        })
+        .await;
+}
+
+async fn aggregate_broker(
+    db: Arc<codeg_lib::db::AppDatabase>,
+) -> (
+    Arc<RunStore>,
+    Arc<MockEventEmitter>,
+    Arc<DelegationBroker>,
+    Arc<MockSpawner>,
+) {
+    let runs = Arc::new(RunStore::new(db));
+    let mock = Arc::new(MockSpawner::new());
+    let events = Arc::new(MockEventEmitter::new());
+    let task_store =
+        Arc::new(DbDelegationTaskStore::from_run_store(runs.clone())) as Arc<dyn DelegationTaskStore>;
+    let broker = Arc::new(
+        DelegationBroker::with_writers(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>,
+            Arc::new(NoopMetaWriter) as Arc<dyn DelegationMetaWriter>,
+            events.clone() as Arc<dyn DelegationEventEmitter>,
+        )
+        .with_task_store(task_store)
+        .with_run_store(runs.clone()),
+    );
+    enable_delegation_for_aggregate(&broker).await;
+    (runs, events, broker, mock)
+}
+
+/// Pre-final aggregate acceptance: fixed v2 creation, child binding, one
+/// semantic completion, historical v1 projection, rejected v1 mutation,
+/// dangling terminal code parity, and standalone Card display.
+#[tokio::test]
+async fn v2_only_aggregate_acceptance() {
+    use delegation_workflow::CompletionProtocolMode;
+
+    let workspace = tempfile::tempdir().expect("aggregate workspace");
+    let plan_rel = "docs/superpowers/plans/restarted-plan.md";
+    let design_rel = "docs/superpowers/specs/task-10-aggregate-design.md";
+    let design_bytes = b"# Design\n\nAggregate v2-only acceptance requirements.\n";
+    let plan_path = workspace.path().join(plan_rel);
+    let design_path = workspace.path().join(design_rel);
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+    std::fs::write(&plan_path, b"# Plan\n\nAggregate v2-only acceptance.\n").unwrap();
+    std::fs::write(&design_path, design_bytes).unwrap();
+
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let mut live_document = skeleton("task-10-aggregate-v2");
+    live_document.design = Some(DocumentRef {
+        rel_path: design_rel.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(design_bytes)),
+    });
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        parent,
+        PublishWorkflowRequest {
+            document: live_document,
+        },
+    )
+    .await
+    .unwrap();
+    let new_workflow = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        new_workflow.protocol_pair(),
+        (2, CompletionProtocolMode::V2Enforce)
+    );
+
+    let work_unit_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+        rel_plan_path: plan_rel,
+        agent_type: "codex",
+        profile_id: None,
+    })
+    .unwrap();
+    let semantic_task_id = "task-10-aggregate-semantic";
+    let child = seed_conversation(&db, folder, AgentType::Codex).await;
+    admit_v2_fixture_run(
+        &db,
+        parent,
+        child,
+        workspace.path(),
+        semantic_task_id,
+        "codex",
+        work_unit_key.clone(),
+        "Task 10 aggregate semantic",
+    )
+    .await;
+    let binding = delegation_workflow_run_binding::Entity::find_by_id(semantic_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("v2 child binding must exist after admission");
+    assert_eq!(binding.workflow_id, published.workflow_id);
+    assert_eq!(binding.workflow_id, new_workflow.workflow_id);
+    let bound_run = delegation_task_run::Entity::find_by_id(semantic_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound_run.work_unit_key.as_deref(), Some(work_unit_key.as_str()));
+
+    materialize_v2_fixture_run(
+        &db,
+        semantic_task_id,
+        "Aggregate semantic channel.\n\nConclusion: done",
+    )
+    .await;
+    let semantic_run = delegation_task_run::Entity::find_by_id(semantic_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(semantic_run.completion_evidence_json.is_some());
+    assert!(semantic_run.card_summary_json.is_none());
+    assert_eq!(
+        semantic_run.status,
+        delegation_task_run::DelegationRunStatus::Completed
+    );
+
+    let historical_parent = 201;
+    let historical_workflow_id = "wf-task-10-aggregate-historical-v1";
+    let historical_db = historical_completion_protocol_db(&[historical_workflow_seed(
+        historical_workflow_id,
+        historical_parent,
+        1,
+        CompletionProtocolMode::V1,
+        None,
+    )])
+    .await;
+    let _historical_publication = seed_historical_manifest(
+        &historical_db,
+        historical_workflow_id,
+        &skeleton("task-10-aggregate-historical"),
+    )
+    .await;
+    let historical_graph = project_workflow_graph_core(&historical_db, historical_parent)
+        .await
+        .unwrap();
+    let historical = historical_graph
+        .completion_protocol
+        .expect("historical v1 projection must surface protocol header");
+    assert_eq!(historical.version, 1);
+    assert_eq!(historical.mode, CompletionProtocolMode::V1);
+    assert_eq!(historical.creation_mode, historical.mode);
+
+    let mut legacy_document = skeleton("task-10-aggregate-historical");
+    legacy_document.workflow_id = Some(historical_workflow_id.into());
+    legacy_document.expected_manifest_revision = Some(1);
+    legacy_document.nodes[0].title = Some("must remain read only".into());
+    let legacy_mutation = publish_workflow_manifest_core(
+        &historical_db,
+        &EventEmitter::Noop,
+        historical_parent,
+        PublishWorkflowRequest {
+            document: legacy_document,
+        },
+    )
+    .await;
+    assert_eq!(
+        legacy_mutation.unwrap_err().code(),
+        "legacy_completion_protocol_read_only"
+    );
+
+    // Dangling terminal: bind against a live v2 workflow, delete the header,
+    // then settle through broker so row/wait/event share one stable code.
+    let dangling_workspace = tempfile::tempdir().expect("dangling workspace");
+    let dangling_plan = dangling_workspace
+        .path()
+        .join("docs/superpowers/plans/restarted-plan.md");
+    let dangling_design = dangling_workspace.path().join(design_rel);
+    std::fs::create_dir_all(dangling_plan.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(dangling_design.parent().unwrap()).unwrap();
+    std::fs::write(&dangling_plan, b"# Plan\n\nDangling aggregate.\n").unwrap();
+    std::fs::write(&dangling_design, design_bytes).unwrap();
+    let dangling_db = Arc::new(fresh_in_memory_db().await);
+    let dangling_folder =
+        seed_folder(&dangling_db, dangling_workspace.path().to_str().unwrap()).await;
+    let dangling_parent = seed_conversation(&dangling_db, dangling_folder, AgentType::Codex).await;
+    let mut dangling_document = skeleton("task-10-aggregate-dangling");
+    dangling_document.design = Some(DocumentRef {
+        rel_path: design_rel.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(design_bytes)),
+    });
+    let dangling_published = publish_workflow_manifest_core(
+        &dangling_db,
+        &EventEmitter::Noop,
+        dangling_parent,
+        PublishWorkflowRequest {
+            document: dangling_document,
+        },
+    )
+    .await
+    .unwrap();
+    let (_runs, events, broker, mock) = aggregate_broker(dangling_db.clone()).await;
+    mock.queue_spawn(Ok("aggregate-dangling-child".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let dangling_request = DelegationRequest {
+        parent_connection_id: "aggregate-parent".into(),
+        parent_conversation_id: dangling_parent,
+        parent_tool_use_id: "task-10-aggregate-dangling".into(),
+        agent_type: AgentType::Codex,
+        profile_id: None,
+        task: "dangling terminal aggregate".into(),
+        working_dir: Some(dangling_workspace.path().to_string_lossy().into_owned()),
+        requested_working_dir: None,
+        external_handle: None,
+        work_unit_key: Some(work_unit_key.clone()),
+        replaces_task_id: None,
+        replacement_reason: None,
+        correlation_id: None,
+        recovery_authorization_id: None,
+    };
+    let dangling_report = broker.start_delegation(dangling_request).await;
+    assert_eq!(
+        dangling_report.status,
+        TaskStatus::Running,
+        "{dangling_report:?}"
+    );
+    let dangling_task_id = dangling_report.task_id.expect("running task id");
+    let dangling_binding = delegation_workflow_run_binding::Entity::find_by_id(&dangling_task_id)
+        .one(&dangling_db.conn)
+        .await
+        .unwrap()
+        .expect("workflow-bound run before dangling delete");
+    assert_eq!(dangling_binding.workflow_id, dangling_published.workflow_id);
+
+    dangling_db
+        .conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .unwrap();
+    dangling_db
+        .conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM delegation_workflows WHERE workflow_id = ?",
+            vec![dangling_published.workflow_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    dangling_db
+        .conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys = ON".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    broker
+        .complete_call(
+            &dangling_task_id,
+            DelegationOutcome::Ok(DelegationSuccess {
+                text: "Conclusion: done\n<!-- codeg-card-summary-v1\n{\"kind\":\"author\",\"status\":\"done\",\"plan_digest\":\"sha256:dangling\"}\n-->".into(),
+                child_conversation_id: 0,
+                child_agent_type: AgentType::Codex,
+                turn_count: 1,
+                duration_ms: 10,
+                token_usage: None,
+            }),
+        )
+        .await;
+
+    let dangling_row = delegation_task_run::Entity::find_by_id(&dangling_task_id)
+        .one(&dangling_db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let wait_report = broker
+        .get_task_status(
+            "aggregate-parent",
+            Some(dangling_parent),
+            &dangling_task_id,
+            StatusWait::Snapshot,
+        )
+        .await;
+    let emit_calls = events.snapshot().await;
+    let completed = emit_calls
+        .iter()
+        .find(|call| call.task_id == dangling_task_id)
+        .expect("dangling terminal event");
+    let event_code = match &completed.result {
+        DelegationResultSummary::Err { error_code, .. } => error_code.clone(),
+        other => panic!("expected typed dangling failure event, got {other:?}"),
+    };
+    let dangling = DanglingTerminalCodes {
+        row_code: dangling_row
+            .error_code
+            .clone()
+            .expect("dangling durable row code"),
+        wait_code: wait_report
+            .error_code
+            .clone()
+            .expect("dangling wait report code"),
+        event_code,
+    };
+    assert_eq!(dangling.row_code, "unsupported_completion_protocol");
+    assert_eq!(dangling.wait_code, dangling.row_code);
+    assert_eq!(dangling.event_code, dangling.row_code);
+    assert_eq!(
+        dangling_row.status,
+        delegation_task_run::DelegationRunStatus::Failed
+    );
+    assert!(dangling_row.card_summary_json.is_none());
+
+    // Standalone (no workflow binding) still materializes display Card JSON.
+    let standalone_workspace = tempfile::tempdir().expect("standalone workspace");
+    let standalone_db = Arc::new(fresh_in_memory_db().await);
+    let standalone_folder =
+        seed_folder(&standalone_db, standalone_workspace.path().to_str().unwrap()).await;
+    let standalone_parent =
+        seed_conversation(&standalone_db, standalone_folder, AgentType::Codex).await;
+    let (_runs, _events, standalone_broker, standalone_mock) =
+        aggregate_broker(standalone_db.clone()).await;
+    standalone_mock
+        .queue_spawn(Ok("aggregate-standalone-child".into()))
+        .await;
+    standalone_mock
+        .queue_send(Ok(accepted(0, Utc::now())))
+        .await;
+    let standalone_report = standalone_broker
+        .start_delegation(DelegationRequest {
+            parent_connection_id: "aggregate-standalone-parent".into(),
+            parent_conversation_id: standalone_parent,
+            parent_tool_use_id: "task-10-aggregate-standalone".into(),
+            agent_type: AgentType::Codex,
+            profile_id: None,
+            task: "standalone card aggregate".into(),
+            working_dir: Some(
+                standalone_workspace
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            requested_working_dir: None,
+            external_handle: None,
+            work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
+            correlation_id: None,
+            recovery_authorization_id: None,
+        })
+        .await;
+    assert_eq!(
+        standalone_report.status,
+        TaskStatus::Running,
+        "{standalone_report:?}"
+    );
+    let standalone_task_id = standalone_report.task_id.expect("standalone task id");
+    assert!(
+        delegation_workflow_run_binding::Entity::find_by_id(&standalone_task_id)
+            .one(&standalone_db.conn)
+            .await
+            .unwrap()
+            .is_none(),
+        "standalone run must not create a workflow binding"
+    );
+    standalone_broker
+        .complete_call(
+            &standalone_task_id,
+            DelegationOutcome::Ok(DelegationSuccess {
+                text: r#"review body
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"Standalone card retained."}
+-->"#
+                    .into(),
+                child_conversation_id: 0,
+                child_agent_type: AgentType::Codex,
+                turn_count: 1,
+                duration_ms: 12,
+                token_usage: None,
+            }),
+        )
+        .await;
+    let standalone = delegation_task_run::Entity::find_by_id(&standalone_task_id)
+        .one(&standalone_db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(standalone.card_summary_json.is_some());
+    assert_eq!(
+        standalone.status,
+        delegation_task_run::DelegationRunStatus::Completed
+    );
 }

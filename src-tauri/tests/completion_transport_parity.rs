@@ -771,3 +771,79 @@ fn legacy_restart_surface_is_absent() {
         }
     }
 }
+
+/// Cross-surface inventory of removed public v2-only symbols. Scans only
+/// repository-owned production sources under `src-tauri/src` (not tests).
+#[test]
+fn v2_only_removed_surface_inventory() {
+    use std::path::{Path, PathBuf};
+
+    fn collect_owned_sources(dir: &Path, out: &mut Vec<(String, String)>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_owned_sources(&path, out);
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "rs" | "json" | "sql" | "toml") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    out.push((path.display().to_string(), content));
+                }
+            }
+        }
+    }
+
+    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_owned_sources(&src_root, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "expected repository-owned production sources under {}",
+        src_root.display()
+    );
+    sources.push(("tool schema catalog".into(), TOOL_SCHEMA_JSON.to_string()));
+
+    let banned = [
+        "restart_legacy_workflow",
+        "CompletionProtocolRolloutConfig",
+        "CompletionProtocolSelection",
+        "select_completion_protocol",
+        "get_completion_protocol_settings",
+        "legacy_completion_protocol_restart_required",
+        "legacy_completion_protocol_restart_invalid",
+        "successor_conversation_id",
+    ];
+
+    for (surface, source) in &sources {
+        for removed in banned {
+            assert!(
+                !source.contains(removed),
+                "removed public symbol {removed} remains in {surface}"
+            );
+        }
+    }
+
+    // manifest_revision / gate_cycle remain valid in durable models; ban only
+    // the settle_workflow_gate tool object properties.
+    let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+    let settle = catalog
+        .as_array()
+        .expect("tool catalog array")
+        .iter()
+        .find(|tool| tool["name"] == "settle_workflow_gate")
+        .expect("settle_workflow_gate tool");
+    let properties = settle["inputSchema"]["properties"]
+        .as_object()
+        .expect("settlement properties");
+    for removed in ["manifest_revision", "gate_cycle"] {
+        assert!(
+            properties.get(removed).is_none(),
+            "legacy settle property {removed} remains on settle_workflow_gate"
+        );
+    }
+}
