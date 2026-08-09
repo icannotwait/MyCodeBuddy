@@ -18,6 +18,7 @@ endfunction()
 
 codeg_eui_add_contract_test(codeg_eui_harness_self tests/harness_self_test.cpp)
 codeg_eui_add_contract_test(codeg_eui_abi_layout tests/abi_layout_test.cpp)
+codeg_eui_add_contract_test(codeg_eui_ui_snapshot tests/ui_snapshot_test.cpp)
 
 if(CODEG_EUI_ABI_LINK_TESTS OR NOT CODEG_EUI_CONTRACTS_ONLY)
   if(NOT IS_ABSOLUTE "${CODEG_EUI_RUST_LIB}" OR

@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use codeg_eui_core::{
     codeg_eui_begin_shutdown, codeg_eui_init, codeg_eui_poll, codeg_eui_shutdown,
     pin_eui_data_root, resolve_eui_data_root, CodegEuiFrame, DataRootError, EuiBootstrap,
-    EuiRootInputs, CODEG_EUI_ERR_INVALID_STATE, CODEG_EUI_OK,
+    EuiRootInputs, CODEG_EUI_ERR_INVALID_STATE, CODEG_EUI_ERR_INVALID_UTF8,
+    CODEG_EUI_ERR_TOO_LARGE, CODEG_EUI_OK,
 };
 use tempfile::TempDir;
 
@@ -134,12 +135,12 @@ fn isolated_process_case() {
             let invalid_utf8 = [0xff];
             assert_eq!(
                 codeg_eui_init(invalid_utf8.as_ptr(), invalid_utf8.len()),
-                CODEG_EUI_ERR_INVALID_STATE
+                CODEG_EUI_ERR_INVALID_UTF8
             );
             let oversized = vec![b'x'; 32_769];
             assert_eq!(
                 codeg_eui_init(oversized.as_ptr(), oversized.len()),
-                CODEG_EUI_ERR_INVALID_STATE
+                CODEG_EUI_ERR_TOO_LARGE
             );
             let embedded_nul = b"invalid\0root";
             assert_eq!(
@@ -156,22 +157,14 @@ fn isolated_process_case() {
                 Some(argument_root.clone().into_os_string())
             );
             assert!(std::env::var_os("CODEG_HOME").is_none());
-            assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
-            let mut frame = CodegEuiFrame::default();
-            assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
-            assert_eq!(frame.shutdown_ready, 1);
-            assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+            complete_abi_shutdown();
 
             assert_eq!(
                 codeg_eui_init(argument.as_ptr(), argument.len()),
                 CODEG_EUI_OK,
                 "re-init with the same normalized root must remain legal"
             );
-            assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
-            let mut second_frame = CodegEuiFrame::default();
-            assert_eq!(codeg_eui_poll(&mut second_frame), CODEG_EUI_OK);
-            assert_eq!(second_frame.shutdown_ready, 1);
-            assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+            complete_abi_shutdown();
 
             let different = different_root.to_str().expect("UTF-8 temp path").as_bytes();
             assert_eq!(
@@ -224,4 +217,18 @@ fn run_child_case(case: &str, fixture: &IsolationFixture) {
 
 fn path_from_env(name: &str) -> PathBuf {
     Path::new(&std::env::var_os(name).unwrap_or_else(|| panic!("{name} is set"))).to_path_buf()
+}
+
+fn complete_abi_shutdown() {
+    assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
+    for _ in 0..200 {
+        let mut frame = CodegEuiFrame::default();
+        assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+        if frame.shutdown_ready == 1 {
+            assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("shutdown did not become ready");
 }

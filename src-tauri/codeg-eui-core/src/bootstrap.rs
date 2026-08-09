@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use codeg_lib::app_state::AppState;
 use codeg_lib::logging::init::LogGuard;
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::data_root::{absolutize_from, startup_working_directory};
@@ -86,6 +87,14 @@ impl EuiBootstrap {
         if let Some(runtime) = self.runtime.take() {
             drop(runtime);
         }
+    }
+
+    pub(crate) fn runtime_handle(&self) -> Handle {
+        self.runtime
+            .as_ref()
+            .expect("EUI runtime available before shutdown")
+            .handle()
+            .clone()
     }
 
     fn new(state: AppState, runtime: Runtime, log_guard: LogGuard) -> Self {

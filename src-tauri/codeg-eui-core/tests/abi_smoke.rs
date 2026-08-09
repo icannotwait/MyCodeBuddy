@@ -3,6 +3,7 @@ use codeg_eui_core::{
     codeg_eui_shutdown, CodegEuiFrame, CODEG_EUI_API_VERSION, CODEG_EUI_ERR_INVALID_STATE,
     CODEG_EUI_ERR_NULL_POINTER, CODEG_EUI_OK,
 };
+use std::time::Duration;
 
 #[test]
 fn abi_version_and_null_poll_are_stable() {
@@ -23,9 +24,20 @@ fn abi_version_and_null_poll_are_stable() {
     assert_eq!(codeg_eui_shutdown(), CODEG_EUI_ERR_INVALID_STATE);
     assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
 
-    let mut frame = CodegEuiFrame::default();
-    assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+    let frame = drain_until_ready();
     assert_eq!(frame.api_version, CODEG_EUI_API_VERSION);
     assert_eq!(frame.shutdown_ready, 1);
     assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+}
+
+fn drain_until_ready() -> CodegEuiFrame {
+    for _ in 0..200 {
+        let mut frame = CodegEuiFrame::default();
+        assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+        if frame.shutdown_ready == 1 {
+            return frame;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("shutdown did not become ready");
 }

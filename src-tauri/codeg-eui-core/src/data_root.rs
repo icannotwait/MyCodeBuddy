@@ -231,9 +231,15 @@ mod tests {
 
     fn complete_shutdown() {
         assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
-        let mut frame = CodegEuiFrame::default();
-        assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
-        assert_eq!(frame.shutdown_ready, 1);
-        assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+        for _ in 0..200 {
+            let mut frame = CodegEuiFrame::default();
+            assert_eq!(codeg_eui_poll(&mut frame), CODEG_EUI_OK);
+            if frame.shutdown_ready == 1 {
+                assert_eq!(codeg_eui_shutdown(), CODEG_EUI_OK);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("shutdown did not become ready");
     }
 }
