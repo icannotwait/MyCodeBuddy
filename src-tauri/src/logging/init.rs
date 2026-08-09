@@ -16,6 +16,7 @@
 //!    `logs://appended` delivery to the viewer.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::Rotation;
@@ -36,8 +37,10 @@ pub type ReloadHandle = reload::Handle<EnvFilter, Registry>;
 /// desktop `run()`); dropping it flushes and shuts down the writer thread.
 #[must_use = "hold the guard for the process lifetime so buffered logs flush on exit"]
 pub struct LogGuard {
-    _guard: Option<WorkerGuard>,
+    _guard: Option<Arc<WorkerGuard>>,
 }
+
+static EUI_LOG_GUARD: OnceLock<LogGuard> = OnceLock::new();
 
 /// Standing per-target backstops appended to EVERY constructed filter — the
 /// default/configured level, a persisted level, AND an explicit `RUST_LOG` /
@@ -240,11 +243,25 @@ pub fn init_server() -> LogGuard {
     init_with_file("codeg-server")
 }
 
+/// Phase 1 for the optional EUI native shell. The caller pins
+/// `CODEG_DATA_DIR` before invoking this function, so the file sink cannot
+/// inherit the main application's ambient root. Subscriber installation and
+/// its writer guard are process-wide because same-root EUI re-initialization
+/// is legal after an ABI shutdown.
+pub fn init_eui() -> LogGuard {
+    let process_guard = EUI_LOG_GUARD.get_or_init(|| init_with_file("codeg-eui"));
+    LogGuard {
+        _guard: process_guard._guard.clone(),
+    }
+}
+
 fn init_with_file(prefix: &str) -> LogGuard {
     let dir = crate::paths::codeg_logs_root();
     let (reload, guard) = build_subscriber(LogLevel::default(), Some(&dir), prefix);
     LogHub::install(reload);
-    LogGuard { _guard: guard }
+    LogGuard {
+        _guard: guard.map(Arc::new),
+    }
 }
 
 /// Install a **stderr-only** subscriber (no file / buffer / hub / emitter) for
@@ -259,7 +276,9 @@ fn init_with_file(prefix: &str) -> LogGuard {
 /// to buffer/emit, so `BufferEmitLayer` short-circuits.
 pub fn init_stderr_only() -> LogGuard {
     let (_reload, guard) = build_subscriber(LogLevel::default(), None, "");
-    LogGuard { _guard: guard }
+    LogGuard {
+        _guard: guard.map(Arc::new),
+    }
 }
 
 /// Phase 1 for `codeg-mcp`. See [`init_stderr_only`].

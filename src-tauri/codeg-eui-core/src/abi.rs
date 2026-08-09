@@ -1,5 +1,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use crate::EuiBootstrap;
 
 pub const CODEG_EUI_API_VERSION: u32 = 1;
 pub const CODEG_EUI_OK: i32 = 0;
@@ -12,10 +16,12 @@ const LIFECYCLE_STARTING: u32 = 1;
 const LIFECYCLE_RUNNING: u32 = 2;
 const LIFECYCLE_STOPPING: u32 = 3;
 const LIFECYCLE_STOPPED: u32 = 4;
+const CODEG_EUI_MAX_PATH_BYTES: usize = 32_768;
 
 static LIFECYCLE: AtomicU32 = AtomicU32::new(LIFECYCLE_UNINITIALIZED);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_READY: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP: OnceLock<Mutex<Option<EuiBootstrap>>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -38,7 +44,7 @@ pub extern "C" fn codeg_eui_api_version() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn codeg_eui_init(data_dir_utf8: *const u8, data_dir_len: usize) -> i32 {
-    ffi_status(|| {
+    let status = ffi_status(|| {
         if data_dir_utf8.is_null() && data_dir_len > 0 {
             return CODEG_EUI_ERR_NULL_POINTER;
         }
@@ -51,9 +57,26 @@ pub extern "C" fn codeg_eui_init(data_dir_utf8: *const u8, data_dir_len: usize) 
         LIFECYCLE.store(LIFECYCLE_STARTING, Ordering::Release);
         GENERATION.store(0, Ordering::Release);
         SHUTDOWN_READY.store(false, Ordering::Release);
+
+        let argument_root = match parse_data_root_argument(data_dir_utf8, data_dir_len) {
+            Ok(argument_root) => argument_root,
+            Err(error) => return error,
+        };
+        let bootstrap = match EuiBootstrap::start_with_data_root_argument(argument_root) {
+            Ok(bootstrap) => bootstrap,
+            Err(_) => return CODEG_EUI_ERR_INVALID_STATE,
+        };
+        *bootstrap_slot()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(bootstrap);
         LIFECYCLE.store(LIFECYCLE_RUNNING, Ordering::Release);
         CODEG_EUI_OK
-    })
+    });
+
+    if status != CODEG_EUI_OK && LIFECYCLE.load(Ordering::Acquire) == LIFECYCLE_STARTING {
+        LIFECYCLE.store(LIFECYCLE_STOPPED, Ordering::Release);
+    }
+    status
 }
 
 #[no_mangle]
@@ -114,8 +137,47 @@ pub extern "C" fn codeg_eui_shutdown() -> i32 {
             return CODEG_EUI_ERR_INVALID_STATE;
         }
 
+        let bootstrap = bootstrap_slot()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or(CODEG_EUI_ERR_INVALID_STATE);
+        let bootstrap = match bootstrap {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => return error,
+        };
+        bootstrap.shutdown();
+
         SHUTDOWN_READY.store(false, Ordering::Release);
         LIFECYCLE.store(LIFECYCLE_STOPPED, Ordering::Release);
         CODEG_EUI_OK
     })
+}
+
+fn bootstrap_slot() -> &'static Mutex<Option<EuiBootstrap>> {
+    BOOTSTRAP.get_or_init(|| Mutex::new(None))
+}
+
+fn parse_data_root_argument(
+    data_dir_utf8: *const u8,
+    data_dir_len: usize,
+) -> Result<Option<PathBuf>, i32> {
+    if data_dir_len == 0 {
+        return Ok(None);
+    }
+    if data_dir_utf8.is_null() {
+        return Err(CODEG_EUI_ERR_NULL_POINTER);
+    }
+    if data_dir_len > CODEG_EUI_MAX_PATH_BYTES {
+        return Err(CODEG_EUI_ERR_INVALID_STATE);
+    }
+
+    // The ABI contract guarantees `data_dir_utf8` is readable for exactly
+    // `data_dir_len` bytes. Bounds and nullness are checked before this read.
+    let bytes = unsafe { std::slice::from_raw_parts(data_dir_utf8, data_dir_len) };
+    if bytes.contains(&0) {
+        return Err(CODEG_EUI_ERR_INVALID_STATE);
+    }
+    let path = std::str::from_utf8(bytes).map_err(|_| CODEG_EUI_ERR_INVALID_STATE)?;
+    Ok(Some(PathBuf::from(path)))
 }

@@ -6,6 +6,9 @@ use codeg_eui_core::{
 
 #[test]
 fn abi_version_and_null_poll_are_stable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path().to_str().expect("UTF-8 temp path").as_bytes();
+
     assert_eq!(codeg_eui_api_version(), CODEG_EUI_API_VERSION);
     assert_eq!(CODEG_EUI_API_VERSION, 1);
     assert_eq!(
@@ -13,7 +16,10 @@ fn abi_version_and_null_poll_are_stable() {
         CODEG_EUI_ERR_NULL_POINTER
     );
 
-    assert_eq!(codeg_eui_init(std::ptr::null(), 0), CODEG_EUI_OK);
+    assert_eq!(
+        codeg_eui_init(data_dir.as_ptr(), data_dir.len()),
+        CODEG_EUI_OK
+    );
     assert_eq!(codeg_eui_shutdown(), CODEG_EUI_ERR_INVALID_STATE);
     assert_eq!(codeg_eui_begin_shutdown(), CODEG_EUI_OK);
 

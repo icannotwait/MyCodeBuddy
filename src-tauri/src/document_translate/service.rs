@@ -21,7 +21,6 @@ use crate::auto_title::parse_supported_app_locale;
 use crate::commands::conversation_experience::load_document_translate_agent_from;
 use crate::db::AppDatabase;
 use crate::document_translate::protect::{protect_markdown, restore_markdown};
-#[cfg(any(test, feature = "test-utils"))]
 use crate::document_translate::runner::InertDocumentTranslateAgent;
 use crate::document_translate::runner::{
     DocumentConnectionDriver, DocumentTranslateAgent, DocumentTranslateRunner,
@@ -49,10 +48,15 @@ impl DocumentTranslationService {
         })
     }
 
-    /// Inert service for test AppState constructors that never call translate.
+    /// Disabled service for runtime profiles that never start translation.
+    pub fn new_disabled(db: Arc<AppDatabase>) -> Arc<Self> {
+        Self::new(db, Arc::new(InertDocumentTranslateAgent))
+    }
+
+    /// Backwards-compatible test alias for [`Self::new_disabled`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_inert(db: Arc<AppDatabase>) -> Arc<Self> {
-        Self::new(db, Arc::new(InertDocumentTranslateAgent))
+        Self::new_disabled(db)
     }
 
     /// Translate a document: validate → admit → protect → run → restore.

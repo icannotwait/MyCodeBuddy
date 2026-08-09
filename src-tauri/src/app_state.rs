@@ -10,6 +10,7 @@ use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
+use crate::app_error::AppCommandError;
 use crate::auto_title::{AutoTitleCoordinator, InternalAgentSessionRegistry};
 use crate::chat_channel::manager::ChatChannelManager;
 use crate::commands::conversation_experience::ConversationExperienceMutationGate;
@@ -440,6 +441,85 @@ pub fn spawn_completion_outbox_dispatcher(dispatcher: Arc<CompletionOutboxDispat
 }
 
 impl AppState {
+    /// Build the shared-core profile used by the optional EUI native shell.
+    ///
+    /// Constructors required by shared command paths are present, but this
+    /// profile starts none of the auxiliary services excluded from the EUI
+    /// shell. The EUI bootstrap owns runtime startup and shutdown.
+    pub async fn new_eui(db: AppDatabase, data_dir: PathBuf) -> Result<Self, AppCommandError> {
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let metrics = Arc::new(crate::acp::EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let emitter = EventEmitter::web_only(broadcaster.clone(), bus.clone());
+        let manager = ConnectionManager::new();
+        let internal_sessions = InternalAgentSessionRegistry::load(db.conn.clone(), &data_dir)
+            .await
+            .map_err(AppCommandError::from)?;
+        let chat_channel_manager = default_chat_channel_manager();
+        let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
+        let db_handle = Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let auto_title_coordinator = crate::auto_title::build_production_coordinator(
+            Arc::clone(&db_handle),
+            manager.clone_ref(),
+            chat_channel_manager.clone_ref(),
+            EventEmitter::Noop,
+            Arc::clone(&conversation_experience_gate),
+        );
+        let document_translation = DocumentTranslationService::new_disabled(Arc::clone(&db_handle));
+        let reference_search_registry = ReferenceSearchRegistry::new(
+            crate::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+            Arc::new(crate::reference_search::ProductionReferenceSourceFactory {
+                db: db.conn.clone(),
+            }),
+        );
+        let stack = build_delegation_stack(&manager, db.conn.clone(), data_dir.clone());
+        let completion_protocol_rollout =
+            Arc::new(crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::default());
+        manager.install_completion_protocol_runtime(
+            Arc::clone(&completion_protocol_rollout),
+            Arc::clone(&stack.metrics),
+        );
+        let completion_outbox_dispatcher = Arc::new(
+            CompletionOutboxDispatcher::new(db_handle, emitter.clone())
+                .with_metrics(Arc::clone(&stack.metrics)),
+        );
+
+        Ok(Self {
+            db,
+            connection_manager: manager,
+            terminal_manager: default_terminal_manager(),
+            event_broadcaster: broadcaster,
+            acp_event_bus: bus,
+            emitter,
+            data_dir,
+            internal_sessions,
+            auto_title_coordinator,
+            document_translation,
+            conversation_experience_gate,
+            reference_search_registry,
+            web_server_state: WebServerState::new(),
+            chat_channel_manager,
+            workspace_transfer: Arc::new(WorkspaceTransferManager::new_from_env()),
+            pet_state: crate::pet_state_mapper::new_pet_state_handle(),
+            delegation_broker: stack.broker,
+            continuation_coordinator: stack.continuation_coordinator,
+            delegation_metrics: stack.metrics,
+            completion_protocol_rollout,
+            completion_outbox_dispatcher,
+            delegation_runtime_settings: stack.runtime_settings,
+            delegation_tokens: stack.tokens,
+            delegation_leases: stack.leases,
+            delegation_socket_path: stack.socket_path,
+            feedback_config: stack.feedback,
+            question_config: stack.ask,
+            session_info_config: stack.sessions,
+            system_op_lock: default_system_op_lock(),
+            update_state: default_update_state(),
+        })
+    }
+
     /// Test-only constructor: build an `AppState` wired to an in-memory
     /// database and a `WebOnly` event emitter. Suitable for axum-test driven
     /// HTTP integration tests where no Tauri runtime is available.
