@@ -2381,19 +2381,6 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
         match recover_workflow_core(
             runs.db(),
             &self.workflow_emitter,
@@ -9113,7 +9100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_workflow_reaches_v2_store_guard_without_rollout_selection() {
+    async fn workflow_mutations_reach_v2_store_guards_without_rollout_restart() {
         use crate::acp::delegation::run_store::RunStore;
         use crate::acp::delegation::workflow::capture_original_request_context;
         use crate::acp::types::PromptInputBlock;
@@ -9221,7 +9208,7 @@ mod tests {
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
             Arc::new(CompletionProtocolRolloutConfig {
-                default_mode: delegation_workflow::CompletionProtocolMode::V1,
+                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
                 profile_overrides,
             }),
         );
@@ -9251,10 +9238,33 @@ mod tests {
         assert_eq!(workflows[0].active_manifest_revision, 1);
         assert!(workflows[0].legacy_source_workflow_id.is_none());
 
+        let recovery = listener
+            .process_recover_workflow(BrokerRecoverWorkflowRequest {
+                token: "workflow-selection-guard".into(),
+                workflow_id: published.workflow_id.clone(),
+                recovery_authorization_id: "must-not-be-consumed".into(),
+                expected_manifest_revision: 1,
+                correlation_id: "listener-recover-guard".into(),
+            })
+            .await;
+        assert_eq!(
+            recovery["error"]["code"], "legacy_completion_protocol_read_only",
+            "MCP recovery must reach the fixed-v2 store guard directly: {recovery}"
+        );
+        assert_eq!(
+            delegation_workflow::Entity::find()
+                .all(&db.conn)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "MCP recovery must not create a successor workflow"
+        );
+
         let state = listener
             .process_get_workflow_state(BrokerGetWorkflowStateRequest {
                 token: "workflow-selection-guard".into(),
-                workflow_id: Some(published.workflow_id),
+                workflow_id: Some(published.workflow_id.clone()),
             })
             .await;
         assert!(

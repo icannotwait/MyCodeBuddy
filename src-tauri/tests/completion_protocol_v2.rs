@@ -36,11 +36,11 @@ use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, capture_original_request_context, evaluate_rollout_window,
     get_workflow_state_core, guard_current_final_delivery_core, guard_final_delivery_core,
     guard_task_final_delivery_core, inject_legacy_restart_header_failure_once,
-    materialize_terminal_completion_txn, project_workflow_graph_core,
-    publish_workflow_manifest_core, recover_workflow_core, restart_legacy_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_v2_core,
-    CompletionCardV2, CompletionIntent, CompletionIntentSource, CompletionOutcome,
-    CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
+    load_completion_protocol_for_conversation, materialize_terminal_completion_txn,
+    project_workflow_graph_core, publish_workflow_manifest_core, recover_workflow_core,
+    restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
+    settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
+    CompletionOutcome, CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
     CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentGateKind,
     DocumentRef, FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument,
     ManifestGate, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
@@ -585,6 +585,92 @@ async fn seed_final_guard_binding(
         reviewed_task_id: Set(None),
         reviewed_implementer_generation: Set(None),
         lineage_ordinal: Set(1),
+        summary_validated: Set(false),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+}
+
+async fn seed_conversation_workflow_association(
+    db: &codeg_lib::db::AppDatabase,
+    parent: i32,
+    child: i32,
+    task_id: &str,
+    generation: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    workflow_id: Option<&str>,
+) {
+    let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    }));
+    runs.insert_reserving(ReservingRunInsert {
+        task_id: task_id.into(),
+        root_task_id: format!("root-{child}"),
+        previous_task_id: None,
+        generation,
+        parent_conversation_id: parent,
+        parent_tool_use_id: Some(format!("tool-{task_id}")),
+        child_conversation_id: child,
+        agent_type: "codex".into(),
+        profile_id: None,
+        workspace_path: Some("/tmp/task-4-root-associations".into()),
+        route_fingerprint: Some(format!("route-{task_id}")),
+        launch_snapshot_version: Some("v1".into()),
+        mode_id: None,
+        config_values_json: Some("{}".into()),
+        task_preview: Some("Task 4 root association fence".into()),
+        request_fingerprint: Some(format!("fingerprint-{task_id}")),
+        admission_class: delegation_task_run::AdmissionClass::NormalRevision,
+        lineage_root_task_id: format!("root-{child}"),
+        work_unit_key: None,
+        history_only: false,
+        replaced_task_id: None,
+        replacement_reason: None,
+        started_at: Some(created_at),
+    })
+    .await
+    .unwrap();
+    let run = delegation_task_run::Entity::find_by_id(task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut run: delegation_task_run::ActiveModel = run.into();
+    run.status = Set(delegation_task_run::DelegationRunStatus::Completed);
+    run.finished_at = Set(Some(created_at));
+    run.created_at = Set(created_at);
+    run.updated_at = Set(created_at);
+    run.update(&db.conn).await.unwrap();
+
+    let Some(workflow_id) = workflow_id else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    delegation_workflow_run_binding::ActiveModel {
+        task_id: Set(task_id.into()),
+        workflow_id: Set(workflow_id.into()),
+        node_id: Set("plan-author".into()),
+        gate_id: Set(None),
+        gate_cycle: Set(None),
+        manifest_revision: Set(1),
+        content_fingerprint: Set(None),
+        evidence_scope_digest: Set(None),
+        gate_lineage: Set(None),
+        review_round: Set(None),
+        instruction_block_digest: Set(None),
+        material_selector_digest: Set(None),
+        subject_material_digest: Set(None),
+        requirements_identity: Set(None),
+        task_specification_identity: Set(None),
+        final_findings_identity: Set(None),
+        producer_baseline_head: Set(None),
+        artifact_digest: Set(None),
+        reviewed_task_id: Set(None),
+        reviewed_implementer_generation: Set(None),
+        lineage_ordinal: Set(generation),
         summary_validated: Set(false),
         created_at: Set(now),
         updated_at: Set(now),
@@ -3593,6 +3679,131 @@ async fn root_prompt_protocol_fence() {
             "root admission rejection must not create successors or mutate state"
         );
     }
+}
+
+#[tokio::test]
+async fn root_protocol_loader_scans_older_bound_generation_when_latest_is_unbound() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-4-root-multi-generation").await;
+    let workflow_parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let child = seed_conversation(&db, folder, AgentType::Codex).await;
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        workflow_parent,
+        PublishWorkflowRequest {
+            document: skeleton("task-4-root-multi-generation"),
+        },
+    )
+    .await
+    .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &published.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
+    let base = chrono::Utc::now();
+    seed_conversation_workflow_association(
+        &db,
+        workflow_parent,
+        child,
+        "task-4-root-bound-generation-1",
+        1,
+        base,
+        Some(&published.workflow_id),
+    )
+    .await;
+    seed_conversation_workflow_association(
+        &db,
+        workflow_parent,
+        child,
+        "task-4-root-unbound-generation-2",
+        2,
+        base + chrono::Duration::seconds(1),
+        None,
+    )
+    .await;
+    seed_conversation_workflow_association(
+        &db,
+        workflow_parent,
+        child,
+        "task-4-root-unbound-generation-3",
+        3,
+        base + chrono::Duration::seconds(2),
+        None,
+    )
+    .await;
+
+    let first = load_completion_protocol_for_conversation(&db, child)
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        Some((1, delegation_workflow::CompletionProtocolMode::V1,)),
+        "newer unbound generations must not mask an older durable workflow binding"
+    );
+}
+
+#[tokio::test]
+async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
+    let db = fresh_in_memory_db().await;
+    let folder = seed_folder(&db, "/tmp/task-4-root-owned-bound-conflict").await;
+    let legacy_parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let child = seed_conversation(&db, folder, AgentType::Codex).await;
+    let legacy = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        legacy_parent,
+        PublishWorkflowRequest {
+            document: skeleton("task-4-root-bound-legacy"),
+        },
+    )
+    .await
+    .unwrap();
+    mark_historical_completion_protocol(
+        &db,
+        &legacy.workflow_id,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
+    let owned = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        child,
+        PublishWorkflowRequest {
+            document: skeleton("task-4-root-owned-v2"),
+        },
+    )
+    .await
+    .unwrap();
+    seed_conversation_workflow_association(
+        &db,
+        legacy_parent,
+        child,
+        "task-4-root-owned-bound-task",
+        1,
+        chrono::Utc::now(),
+        Some(&legacy.workflow_id),
+    )
+    .await;
+
+    let first = load_completion_protocol_for_conversation(&db, child)
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        Some((1, delegation_workflow::CompletionProtocolMode::V1,)),
+        "owned v2 workflow must not mask a rejecting bound legacy workflow"
+    );
+    assert_eq!(
+        load_completion_protocol_for_conversation(&db, child)
+            .await
+            .unwrap(),
+        first,
+        "conflicting durable associations must resolve deterministically"
+    );
+    assert_ne!(legacy.workflow_id, owned.workflow_id);
 }
 
 #[tokio::test]

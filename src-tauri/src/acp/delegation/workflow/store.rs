@@ -1965,6 +1965,10 @@ static SETTLE_V2_PREFLIGHT_TEST_GATE: std::sync::Mutex<Option<SettleV2PreflightT
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static DESIGN_PREFLIGHT_HEADER_TEST_GATE: std::sync::Mutex<Option<SettleV2PreflightTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 fn install_settle_v2_preflight_test_gate(
     workflow_id: String,
 ) -> (
@@ -1994,6 +1998,51 @@ async fn honor_settle_v2_preflight_test_gate(workflow_id: &str) {
         let mut slot = SETTLE_V2_PREFLIGHT_TEST_GATE
             .lock()
             .expect("settle v2 preflight test gate lock");
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.workflow_id == workflow_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+fn install_design_preflight_header_test_gate(
+    workflow_id: String,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut slot = DESIGN_PREFLIGHT_HEADER_TEST_GATE
+        .lock()
+        .expect("Design preflight header test gate lock");
+    assert!(
+        slot.is_none(),
+        "Design preflight header test gate already installed"
+    );
+    *slot = Some(SettleV2PreflightTestGate {
+        workflow_id,
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn honor_design_preflight_header_test_gate(workflow_id: &str) {
+    let gate = {
+        let mut slot = DESIGN_PREFLIGHT_HEADER_TEST_GATE
+            .lock()
+            .expect("Design preflight header test gate lock");
         if slot
             .as_ref()
             .is_some_and(|gate| gate.workflow_id == workflow_id)
@@ -3320,16 +3369,44 @@ enum DesignSelfReviewReadiness {
     Superseded,
 }
 
+fn map_design_preflight_completion_error(
+    error: super::completion_evidence::CompletionMutationError,
+) -> WorkflowStoreError {
+    let (code, message) = match error {
+        super::completion_evidence::CompletionMutationError::Protocol { code, message }
+        | super::completion_evidence::CompletionMutationError::Evidence(
+            super::error::CompletionEvidenceError::Protocol { code, message },
+        ) => (code, message),
+        super::completion_evidence::CompletionMutationError::Evidence(
+            super::error::CompletionEvidenceError::Persistence(message),
+        ) => return WorkflowStoreError::Persistence(message),
+        other => return WorkflowStoreError::Persistence(other.to_string()),
+    };
+    match code {
+        "legacy_completion_protocol_read_only" => {
+            WorkflowStoreError::LegacyCompletionProtocolReadOnly
+        }
+        "unsupported_completion_protocol" => {
+            WorkflowStoreError::UnsupportedCompletionProtocolHeader(message)
+        }
+        _ => WorkflowStoreError::Persistence(message),
+    }
+}
+
 async fn prepare_v2_design_self_review(
     db: &AppDatabase,
     parent_conversation_id: i32,
     req: &SettleWorkflowRequest,
 ) -> Result<DesignSelfReviewReadiness, WorkflowStoreError> {
     let req = req.clone();
+    #[cfg(test)]
+    honor_design_preflight_header_test_gate(&req.workflow_id).await;
     let result = db
         .conn
         .transaction::<_, DesignSelfReviewReadiness, WorkflowStoreError>(|txn| {
             Box::pin(async move {
+                require_owned_stored_v2_header(txn, &req.workflow_id, parent_conversation_id)
+                    .await?;
                 let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
                     .one(txn)
                     .await
@@ -3549,7 +3626,7 @@ async fn prepare_v2_design_self_review(
                     Ok(None) => {
                         open_design_self_review_decision_txn(txn, &binding, parent_conversation_id)
                             .await
-                            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+                            .map_err(map_design_preflight_completion_error)?;
                         Ok(if rotated {
                             DesignSelfReviewReadiness::Superseded
                         } else {
@@ -4947,33 +5024,52 @@ pub async fn load_completion_protocol_for_conversation(
     db: &AppDatabase,
     conversation_id: i32,
 ) -> Result<Option<(i64, delegation_workflow::CompletionProtocolMode)>, WorkflowStoreError> {
+    let mut workflow_ids = BTreeSet::new();
     if let Some(workflow_id) = load_workflow_id_by_parent_kind(&db.conn, conversation_id).await? {
-        return load_completion_protocol_header(&db.conn, &workflow_id).await;
+        workflow_ids.insert(workflow_id);
     }
 
-    let task_id = delegation_task_run::Entity::find()
+    let task_ids = delegation_task_run::Entity::find()
         .select_only()
         .column(delegation_task_run::Column::TaskId)
         .filter(delegation_task_run::Column::ChildConversationId.eq(conversation_id))
-        .order_by_desc(delegation_task_run::Column::CreatedAt)
         .into_tuple::<String>()
-        .one(&db.conn)
+        .all(&db.conn)
         .await
         .map_err(db_err)?;
-    let Some(task_id) = task_id else {
-        return Ok(None);
-    };
-    let workflow_id = delegation_workflow_run_binding::Entity::find_by_id(task_id)
-        .select_only()
-        .column(delegation_workflow_run_binding::Column::WorkflowId)
-        .into_tuple::<String>()
-        .one(&db.conn)
-        .await
-        .map_err(db_err)?;
-    let Some(workflow_id) = workflow_id else {
-        return Ok(None);
-    };
-    load_completion_protocol_header(&db.conn, &workflow_id).await
+    if !task_ids.is_empty() {
+        workflow_ids.extend(
+            delegation_workflow_run_binding::Entity::find()
+                .select_only()
+                .column(delegation_workflow_run_binding::Column::WorkflowId)
+                .filter(delegation_workflow_run_binding::Column::TaskId.is_in(task_ids))
+                .into_tuple::<String>()
+                .all(&db.conn)
+                .await
+                .map_err(db_err)?,
+        );
+    }
+
+    let mut allowed = None;
+    let mut legacy = None;
+    let mut unsupported = None;
+    for workflow_id in workflow_ids {
+        let header = load_completion_protocol_header(&db.conn, &workflow_id)
+            .await?
+            .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.clone()))?;
+        match require_v2_mutation(header.0, &header.1) {
+            Ok(()) => allowed.get_or_insert(header),
+            Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly) => {
+                legacy.get_or_insert(header)
+            }
+            Err(WorkflowStoreError::UnsupportedCompletionProtocol { .. }) => {
+                unsupported.get_or_insert(header)
+            }
+            Err(error) => return Err(error),
+        };
+    }
+
+    Ok(unsupported.or(legacy).or(allowed))
 }
 
 async fn require_stored_v2_header<C: ConnectionTrait>(
@@ -8583,6 +8679,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn design_preflight_completion_protocol_errors_keep_stable_classification() {
+        let read_only = map_design_preflight_completion_error(
+            super::super::completion_evidence::CompletionMutationError::Protocol {
+                code: "legacy_completion_protocol_read_only",
+                message: "legacy workflow is read-only".into(),
+            },
+        );
+        assert_eq!(read_only.code(), "legacy_completion_protocol_read_only");
+        assert!(!read_only.is_retryable());
+
+        let unsupported = map_design_preflight_completion_error(
+            super::super::completion_evidence::CompletionMutationError::Evidence(
+                super::super::error::CompletionEvidenceError::Protocol {
+                    code: "unsupported_completion_protocol",
+                    message: "completion protocol header is corrupt".into(),
+                },
+            ),
+        );
+        assert_eq!(unsupported.code(), "unsupported_completion_protocol");
+        assert!(!unsupported.is_retryable());
+    }
+
     fn emitter_with_rx() -> (
         EventEmitter,
         tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>,
@@ -11197,6 +11316,131 @@ mod tests {
                 .unwrap(),
             attentions_before,
             "rejected preflight must not mutate attention requests"
+        );
+    }
+
+    async fn design_preflight_semantic_snapshot(db: &AppDatabase, workflow_id: &str) -> String {
+        let graph_revision = db
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT graph_revision FROM delegation_workflows WHERE workflow_id = ?",
+                vec![workflow_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "graph_revision")
+            .unwrap();
+        let gate_states = delegation_workflow_gate_state::Entity::find()
+            .filter(delegation_workflow_gate_state::Column::WorkflowId.eq(workflow_id))
+            .order_by_asc(delegation_workflow_gate_state::Column::GateId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let design_bindings = delegation_workflow_design_root_binding::Entity::find()
+            .filter(delegation_workflow_design_root_binding::Column::WorkflowId.eq(workflow_id))
+            .order_by_asc(delegation_workflow_design_root_binding::Column::GateId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let attentions = delegation_attention_request::Entity::find()
+            .order_by_asc(delegation_attention_request::Column::RequestId)
+            .all(&db.conn)
+            .await
+            .unwrap();
+        format!(
+            "graph={graph_revision}|gates={gate_states:?}|bindings={design_bindings:?}|attentions={attentions:?}"
+        )
+    }
+
+    #[tokio::test]
+    async fn design_self_review_preflight_maps_concurrent_corrupt_header_without_writes() {
+        use sea_orm::ConnectionTrait;
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/superpowers/specs")).unwrap();
+        let design_bytes = b"# Current Design\n";
+        std::fs::write(
+            workspace.path().join("docs/superpowers/specs/x.md"),
+            design_bytes,
+        )
+        .unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let (emitter, _) = emitter_with_rx();
+        let mut document = zero_reviewer_design_doc("task4-preflight-corrupt-mode");
+        document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
+        let before = design_preflight_semantic_snapshot(&db, &published.workflow_id).await;
+
+        let (preflight_entered, release_preflight) =
+            install_design_preflight_header_test_gate(published.workflow_id.clone());
+        let settle_db = AppDatabase {
+            conn: db.conn.clone(),
+        };
+        let settle_emitter = emitter.clone();
+        let workflow_id = published.workflow_id.clone();
+        let corrupt_workflow_id = workflow_id.clone();
+        let settle_task = tokio::spawn(async move {
+            settle_workflow_gate_v2_core(
+                &settle_db,
+                &settle_emitter,
+                parent,
+                SettleWorkflowV2Request {
+                    workflow_id,
+                    gate_id: "design".into(),
+                    expected_graph_revision: published.graph_revision,
+                    expected_review_round: Some(1),
+                    expected_outcome: Some(GateSettlementOutcome::Approved),
+                    summary: "corrupt header before Design preflight read".into(),
+                    recovery_authorization_id: None,
+                },
+            )
+            .await
+        });
+        preflight_entered
+            .await
+            .expect("all outer guards must complete before corrupting the preflight header");
+
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .unwrap();
+        let update = db
+            .conn
+            .execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE delegation_workflows SET completion_protocol_mode = ? WHERE workflow_id = ?",
+                vec!["corrupt_mode".into(), corrupt_workflow_id.into()],
+            ))
+            .await;
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .unwrap();
+        update.unwrap();
+        release_preflight.send(()).unwrap();
+
+        let error = settle_task.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "unsupported_completion_protocol");
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            error,
+            WorkflowStoreError::UnsupportedCompletionProtocolHeader(_)
+        ));
+        assert_eq!(
+            design_preflight_semantic_snapshot(&db, &published.workflow_id).await,
+            before,
+            "corrupt Design preflight rejection must not mutate semantic state"
         );
     }
 
