@@ -1930,21 +1930,44 @@ async fn emit_plan_lineage_reset_rejection_if_designated(
 }
 
 #[cfg(test)]
-pub(super) async fn settle_workflow_gate_from_derived_test_input(
+pub(super) async fn settle_workflow_gate_v2_from_fixture(
     db: &AppDatabase,
     emitter: &EventEmitter,
     parent_conversation_id: i32,
     req: SettleWorkflowRequest,
 ) -> Result<SettleResult, WorkflowStoreError> {
-    let protocol_is_v2 = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+    let expected_review_round = if matches!(&req.evidence, SettleGateEvidence::Plan(_)) {
+        delegation_workflow_gate_state::Entity::find_by_id((
+            req.workflow_id.clone(),
+            req.gate_id.clone(),
+        ))
         .one(&db.conn)
         .await
         .map_err(db_err)?
-        .is_some_and(|workflow| workflow.completion_protocol_version == 2);
-    if protocol_is_v2 {
-        return Err(WorkflowStoreError::V2CallerEvidenceRejected);
-    }
-    settle_workflow_gate_derived_core(db, emitter, parent_conversation_id, req, None).await
+        .map(|state| state.current_review_round as u64)
+    } else {
+        None
+    };
+    let current = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
+    settle_workflow_gate_v2_core(
+        db,
+        emitter,
+        parent_conversation_id,
+        SettleWorkflowV2Request {
+            workflow_id: req.workflow_id,
+            gate_id: req.gate_id,
+            expected_graph_revision: current.graph_revision as u64,
+            expected_review_round,
+            expected_outcome: Some(req.outcome),
+            summary: req.summary,
+            recovery_authorization_id: req.recovery_authorization_id,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -8619,7 +8642,7 @@ fn review_verdict_str(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::settle_workflow_gate_from_derived_test_input as settle_workflow_gate_core;
+    use super::settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core;
     use super::*;
     use crate::acp::delegation::workflow::events::WORKFLOW_GRAPH_CHANGED_EVENT as CHANGED;
     use crate::acp::delegation::workflow::key::build_work_unit_key;
@@ -8632,8 +8655,7 @@ mod tests {
     };
     use crate::acp::delegation::workflow::{
         FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewNextAction,
-        PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind, WorkflowIndexOmissionStep,
-        WorkflowStateDetail, WorkflowStateIndexDto,
+        PlanReviewRoundSubmission, PlanReviewScope, PlanRevisionKind, WorkflowStateDetail,
     };
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -8712,6 +8734,29 @@ mod tests {
         (emitter, rx)
     }
 
+    async fn set_initialized_gate_state(
+        db: &AppDatabase,
+        workflow_id: &str,
+        gate_id: &str,
+        gate_lineage: String,
+        current_review_round: i64,
+        selected_node_ids_json: String,
+    ) {
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            workflow_id.to_string(),
+            gate_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("fixed-v2 publication initializes gate state");
+        let mut state: delegation_workflow_gate_state::ActiveModel = state.into();
+        state.gate_lineage = Set(gate_lineage);
+        state.current_review_round = Set(current_review_round);
+        state.selected_node_ids_json = Set(selected_node_ids_json);
+        state.update(&db.conn).await.unwrap();
+    }
+
     fn design_plan_doc(token: &str) -> ManifestDocument {
         let design_path = "docs/superpowers/specs/x.md";
         let plan_path = "docs/superpowers/plans/p.md";
@@ -8767,11 +8812,13 @@ mod tests {
             workflow_state: ManifestWorkflowState::Estimated,
             design: Some(DocumentRef {
                 rel_path: design_path.into(),
-                digest: "sha256:design".into(),
+                digest: "sha256:2c1f01e37a150fd02e10dd63ce8a268c168a68813b40f16f18c3430319073ce6"
+                    .into(),
             }),
             plan: Some(DocumentRef {
                 rel_path: plan_path.into(),
-                digest: "sha256:plan".into(),
+                digest: "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7"
+                    .into(),
             }),
             phases: vec![
                 phase(PHASE_DESIGN),
@@ -9166,7 +9213,35 @@ mod tests {
 
     async fn seed_parent() -> (AppDatabase, i32) {
         let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, "/tmp/wf-store").await;
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let design_path = workspace.join("docs/superpowers/specs/x.md");
+        let plan_path = workspace.join("docs/superpowers/plans/p.md");
+        std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(design_path, DESIGN_DOC_BYTES).unwrap();
+        std::fs::write(plan_path, PLAN_DOC_BYTES).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Codeg Test",
+                "-c",
+                "user.email=codeg@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "fixture git command failed");
+        }
+        let folder = seed_folder(&db, workspace.to_str().unwrap()).await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         (db, parent)
     }
@@ -9384,16 +9459,15 @@ mod tests {
         header_am.completion_protocol_version = Set(2);
         header_am.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
         header_am.update(&db.conn).await.unwrap();
-        delegation_workflow_gate_state::ActiveModel {
-            workflow_id: Set(published.workflow_id.clone()),
-            gate_id: Set("plan".into()),
-            gate_lineage: Set(format!("sha256:{}", "a".repeat(64))),
-            current_review_round: Set(1),
-            selected_node_ids_json: Set("[\"plan-reviewer-1\"]".into()),
-        }
-        .insert(&db.conn)
-        .await
-        .expect("seed Plan gate state");
+        set_initialized_gate_state(
+            &db,
+            &published.workflow_id,
+            "plan",
+            format!("sha256:{}", "a".repeat(64)),
+            1,
+            "[\"plan-reviewer-1\"]".into(),
+        )
+        .await;
         complete_v2_run(
             &db,
             parent,
@@ -9437,16 +9511,15 @@ mod tests {
         .unwrap();
         assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
         let final_lineage = format!("sha256:{}", "f".repeat(64));
-        delegation_workflow_gate_state::ActiveModel {
-            workflow_id: Set(published.workflow_id.clone()),
-            gate_id: Set("final".into()),
-            gate_lineage: Set(final_lineage.clone()),
-            current_review_round: Set(3),
-            selected_node_ids_json: Set("[\"final-reviewer\"]".into()),
-        }
-        .insert(&db.conn)
-        .await
-        .expect("seed passing Final gate state");
+        set_initialized_gate_state(
+            &db,
+            &published.workflow_id,
+            "final",
+            final_lineage.clone(),
+            3,
+            "[\"final-reviewer\"]".into(),
+        )
+        .await;
         let final_task_id = "task7-passing-final-review";
         complete_v2_run(
             &db,
@@ -9625,7 +9698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_v2_typed_error_real_producers_artifact_digest() {
+    async fn workflow_v2_caller_artifact_digest_is_not_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -9660,13 +9733,10 @@ mod tests {
             "contradictory Plan digest",
         )
         .await
-        .expect_err("contradictory Plan digest must fail");
-        assert!(matches!(
-            &error,
-            WorkflowStoreError::ArtifactDigestMismatch(_)
-        ));
+        .expect_err("caller evidence cannot fabricate durable Plan evidence");
+        assert!(matches!(&error, WorkflowStoreError::GateNotReady(_)));
         let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(error);
-        assert_eq!(code, "artifact_digest_mismatch");
+        assert_eq!(code, "gate_not_ready");
     }
 
     #[tokio::test]
@@ -9689,7 +9759,7 @@ mod tests {
             &published.workflow_id,
             "author-card-digest-task",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-card-digest.md",
             0,
         )
@@ -9711,8 +9781,23 @@ mod tests {
             .to_string(),
         ));
         active.update(&db.conn).await.expect("mutate Author card");
+        insert_plan_reviewer_evidence(
+            &db,
+            parent,
+            &published.workflow_id,
+            "plan-reviewer-1",
+            "author-card-digest-review",
+            1,
+            1,
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
+            "author-card-digest-task",
+            "request_changes",
+            "reports/author-card-digest-review.md",
+            1,
+        )
+        .await;
 
-        let error = settle_for_test(
+        let settled = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -9728,20 +9813,20 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-card-digest-task",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "contradictory Author card digest",
         )
         .await
-        .expect_err("contradictory Author card digest must fail");
-        assert!(matches!(
-            error,
-            WorkflowStoreError::ArtifactDigestMismatch(_)
-        ));
+        .expect("legacy Card digest is not fixed-v2 settlement authority");
+        assert_eq!(settled.outcome, GateSettlementOutcome::ChangesRequested);
     }
 
+    const DESIGN_DOC_BYTES: &[u8] = b"# Design\n";
+    const PLAN_DOC_BYTES: &[u8] = b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n";
     /// Design document digest used by `design_plan_doc`.
-    const DESIGN_DOC_DIGEST: &str = "sha256:design";
+    const DESIGN_DOC_DIGEST: &str =
+        "sha256:2c1f01e37a150fd02e10dd63ce8a268c168a68813b40f16f18c3430319073ce6";
 
     #[allow(clippy::too_many_arguments)]
     async fn insert_terminal_reviewer_run(
@@ -9752,17 +9837,61 @@ mod tests {
         gate_id: &str,
         gate_cycle: i64,
         task_id: &str,
-        summary_validated: bool,
+        _summary_validated: bool,
         created_offset_secs: i64,
-        artifact_digest: &str,
+        _artifact_digest: &str,
         status: DelegationRunStatus,
-        manifest_revision: i64,
+        _manifest_revision: i64,
     ) {
         let now = Utc::now() + chrono::Duration::seconds(created_offset_secs);
+        let workspace = tempfile::tempdir()
+            .expect("create completion fixture workspace")
+            .keep();
+        let design_path = workspace.join("docs/superpowers/specs/x.md");
+        let plan_path = workspace.join("docs/superpowers/plans/p.md");
+        std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(design_path, DESIGN_DOC_BYTES).unwrap();
+        std::fs::write(plan_path, PLAN_DOC_BYTES).unwrap();
+        let node = delegation_workflow_node_binding::Entity::find_by_id((
+            workflow_id.to_string(),
+            node_id.to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        if node.role == "reviewer" {
+            let state = delegation_workflow_gate_state::Entity::find_by_id((
+                workflow_id.to_string(),
+                gate_id.to_string(),
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("fixed-v2 publication initializes gate state");
+            let mut selected: Vec<String> =
+                serde_json::from_str(&state.selected_node_ids_json).unwrap();
+            if (gate_cycle == 1 || !selected.is_empty())
+                && !selected.iter().any(|selected| selected == node_id)
+            {
+                selected.push(node_id.to_string());
+                selected.sort();
+                selected.dedup();
+            }
+            let mut state: delegation_workflow_gate_state::ActiveModel = state.into();
+            state.selected_node_ids_json = Set(serde_json::to_string(&selected).unwrap());
+            state.update(&db.conn).await.unwrap();
+        }
+        let child_agent = match node.agent_type.as_str() {
+            "code_buddy" => AgentType::CodeBuddy,
+            "grok" => AgentType::Grok,
+            _ => AgentType::Codex,
+        };
         let child = seed_conversation(
             db,
-            seed_folder(db, &format!("/tmp/{task_id}")).await,
-            AgentType::Codex,
+            seed_folder(db, workspace.to_str().unwrap()).await,
+            child_agent,
         )
         .await;
 
@@ -9774,9 +9903,9 @@ mod tests {
             parent_conversation_id: Set(parent),
             parent_tool_use_id: Set(None),
             child_conversation_id: Set(child),
-            agent_type: Set("codex".into()),
-            profile_id: Set(None),
-            workspace_path: Set(None),
+            agent_type: Set(node.agent_type.clone()),
+            profile_id: Set(node.profile_id.clone()),
+            workspace_path: Set(Some(workspace.to_string_lossy().into_owned())),
             route_fingerprint: Set(None),
             launch_snapshot_version: Set(None),
             mode_id: Set(None),
@@ -9784,16 +9913,16 @@ mod tests {
             task_preview: Set(None),
             request_fingerprint: Set(None),
             admission_class: Set(AdmissionClass::NormalRevision),
-            reached_running_at: Set(Some(now)),
+            reached_running_at: Set(None),
             lineage_root_task_id: Set(task_id.to_string()),
-            work_unit_key: Set(None),
+            work_unit_key: Set(Some(node.work_unit_key.clone())),
             legacy_parent_tool_use_id: Set(None),
             history_only: Set(false),
-            status: Set(status),
+            status: Set(DelegationRunStatus::Reserving),
             error_code: Set(None),
             termination_audit_json: Set(None),
             started_at: Set(Some(now)),
-            finished_at: Set(Some(now)),
+            finished_at: Set(None),
             tool_call_count: Set(None),
             edit_tool_call_count: Set(None),
             touched_files_json: Set(None),
@@ -9813,45 +9942,79 @@ mod tests {
         };
         run.insert(&db.conn).await.expect("insert run");
 
-        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        super::super::admission::admit_workflow_run_txn(
+            &db.conn,
+            &super::super::admission::WorkflowAdmitInput {
+                parent_conversation_id: parent,
+                child_conversation_id: child,
+                task_id,
+                work_unit_key: Some(&node.work_unit_key),
+                agent_type: &node.agent_type,
+                profile_id: node.profile_id.as_deref(),
+                lineage_root_task_id: task_id,
+                generation: 1,
+                kind: super::super::admission::AdmissionDispatchKind::FirstDispatch,
+                admission_class: AdmissionClass::NormalRevision,
+                workspace_path: workspace.to_str(),
+            },
+        )
+        .await
+        .expect("admit completion fixture run");
+
+        let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
             .one(&db.conn)
             .await
             .unwrap()
             .unwrap();
-        let content_fp = match gate_id {
-            "design" => Some(header.design_fingerprint.clone()),
-            "plan" => Some(header.plan_fingerprint.clone()),
-            _ => None,
-        };
+        let mut run: delegation_task_run::ActiveModel = run.into();
+        run.status = Set(status);
+        run.reached_running_at = Set(Some(now));
+        run.finished_at = Set(Some(now));
+        run.card_summary_json = Set(Some("{}".into()));
+        run.updated_at = Set(now);
+        run.update(&db.conn).await.unwrap();
 
-        let rb = delegation_workflow_run_binding::ActiveModel {
-            task_id: Set(task_id.to_string()),
-            workflow_id: Set(workflow_id.to_string()),
-            node_id: Set(node_id.to_string()),
-            gate_id: Set(Some(gate_id.to_string())),
-            gate_cycle: Set(Some(gate_cycle)),
-            manifest_revision: Set(manifest_revision),
-            content_fingerprint: Set(content_fp),
-            artifact_digest: Set(Some(artifact_digest.to_string())),
-            reviewed_task_id: Set(None),
-            reviewed_implementer_generation: Set(None),
-            lineage_ordinal: Set(1),
-            summary_validated: Set(summary_validated),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
+        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut binding: delegation_workflow_run_binding::ActiveModel = binding.into();
+        binding.created_at = Set(now);
+        binding.updated_at = Set(now);
+        binding.update(&db.conn).await.expect("update run binding");
+    }
+
+    async fn materialize_fixture_completion(db: &AppDatabase, task_id: &str, conclusion: &str) {
+        let conclusion = match conclusion {
+            "request_changes" => "request changes",
+            "approve_with_minors" => "approve with minors",
+            other => other,
         };
-        rb.insert(&db.conn).await.expect("insert run binding");
+        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+            &db.conn,
+            super::super::completion_evidence::TerminalCompletionInput {
+                task_id: task_id.to_string(),
+                terminal_status: DelegationRunStatus::Completed,
+                final_assistant_text: format!("Conclusion: {conclusion}"),
+                pre_read_reports: Vec::new(),
+                pre_read_artifact: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("materialize {task_id}: {error:?}"));
+        assert_eq!(result.state, CompletionState::Resolved);
     }
 
     /// Convenience: completed design-gate reviewer on active revision 1.
-    async fn insert_design_reviewer_ok(
+    async fn insert_design_reviewer_evidence(
         db: &AppDatabase,
         parent: i32,
         workflow_id: &str,
         task_id: &str,
         gate_cycle: i64,
         offset_secs: i64,
+        outcome: &str,
     ) {
         insert_terminal_reviewer_run(
             db,
@@ -9868,6 +10031,7 @@ mod tests {
             1,
         )
         .await;
+        materialize_fixture_completion(db, task_id, outcome).await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9925,6 +10089,7 @@ mod tests {
         let mut node_am: delegation_workflow_node_binding::ActiveModel = node.into();
         node_am.is_observed = Set(true);
         node_am.update(&db.conn).await.unwrap();
+        materialize_fixture_completion(db, task_id, "done").await;
         child_conversation_id
     }
 
@@ -9943,6 +10108,41 @@ mod tests {
         report_file: &str,
         created_offset_secs: i64,
     ) -> i32 {
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            workflow_id.to_string(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("fixed-v2 publication initializes Plan gate state");
+        let needs_corrective_author = gate_cycle > 1
+            && serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json)
+                .unwrap()
+                .is_empty();
+        let effective_author_task_id = if needs_corrective_author {
+            format!("{author_task_id}-round-{gate_cycle}")
+        } else {
+            author_task_id.to_string()
+        };
+        if delegation_task_run::Entity::find_by_id(effective_author_task_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            insert_plan_author_evidence(
+                db,
+                parent,
+                workflow_id,
+                &effective_author_task_id,
+                manifest_revision,
+                plan_digest,
+                &format!("reports/{effective_author_task_id}.md"),
+                created_offset_secs.saturating_sub(1),
+            )
+            .await;
+        }
         insert_terminal_reviewer_run(
             db,
             parent,
@@ -9979,14 +10179,7 @@ mod tests {
         ));
         run_am.update(&db.conn).await.unwrap();
 
-        let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut rb_am: delegation_workflow_run_binding::ActiveModel = binding.into();
-        rb_am.reviewed_task_id = Set(Some(author_task_id.into()));
-        rb_am.update(&db.conn).await.unwrap();
+        materialize_fixture_completion(db, task_id, verdict).await;
         child_conversation_id
     }
 
@@ -10337,39 +10530,6 @@ mod tests {
             .await
             .unwrap();
         }
-
-        async fn record_current_reviewer_pointers(&self) {
-            for (node_id, task_id, report_file, ordinal) in [
-                (
-                    "plan-reviewer-codex",
-                    "current-plan-review-codex",
-                    "reports/current-plan-review-codex.md",
-                    10,
-                ),
-                (
-                    "plan-reviewer-grok",
-                    "current-plan-review-grok",
-                    "reports/current-plan-review-grok.md",
-                    11,
-                ),
-            ] {
-                insert_plan_reviewer_evidence(
-                    &self.db,
-                    self.parent,
-                    &self.workflow_id,
-                    node_id,
-                    task_id,
-                    2,
-                    2,
-                    "sha256:plan-v2",
-                    "historical-plan-author",
-                    "request_changes",
-                    report_file,
-                    ordinal,
-                )
-                .await;
-            }
-        }
     }
 
     async fn seed_two_task_index_workflow() -> IndexWorkflowFixture {
@@ -10414,9 +10574,26 @@ mod tests {
             &published.workflow_id,
             "current-plan-author",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/current-plan-author.md",
             0,
+        )
+        .await;
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id.clone(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        set_initialized_gate_state(
+            &db,
+            &published.workflow_id,
+            "plan",
+            state.gate_lineage,
+            1,
+            r#"["plan-reviewer-codex","plan-reviewer-grok"]"#.into(),
         )
         .await;
         for (node_id, task_id, report, ordinal) in [
@@ -10441,7 +10618,7 @@ mod tests {
                 task_id,
                 1,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 "current-plan-author",
                 "request_changes",
                 report,
@@ -10478,7 +10655,7 @@ mod tests {
                     ),
                 ],
                 "current-plan-author",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "current Plan findings",
         )
@@ -10537,7 +10714,7 @@ mod tests {
             &published.workflow_id,
             "historical-plan-author",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/historical-plan-author.md",
             0,
         )
@@ -10550,7 +10727,7 @@ mod tests {
             "historical-plan-review",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "historical-plan-author",
             "request_changes",
             "reports/historical-plan-review.md",
@@ -10578,7 +10755,7 @@ mod tests {
                     &[reviewer_ids[0]],
                 )],
                 "historical-plan-author",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "historical Plan findings",
         )
@@ -10592,19 +10769,8 @@ mod tests {
         }
     }
 
-    fn recovery_source_ids(index: &WorkflowStateIndexDto) -> Vec<&str> {
-        index
-            .latest_plan_review
-            .as_ref()
-            .unwrap()
-            .recovery_sources
-            .iter()
-            .map(|source| source.node_id.as_str())
-            .collect()
-    }
-
     #[tokio::test]
-    async fn index_routes_use_manifest_authority_and_durable_gate_state() {
+    async fn index_routes_ignore_unvalidated_legacy_run_projections() {
         let fixture = seed_two_task_index_workflow().await;
         fixture.complete_task_1_implementer_only().await;
         let active =
@@ -10635,61 +10801,62 @@ mod tests {
                 .iter()
                 .map(|route| route.task_index)
                 .collect::<Vec<_>>(),
-            vec![2]
+            vec![1, 2]
         );
     }
 
     #[tokio::test]
-    async fn index_recovery_sources_cover_each_required_plan_reviewer() {
+    async fn v2_plan_settlement_covers_each_required_reviewer() {
         let fixture = seed_open_plan_findings_with_reviewer_runs().await;
-        let index =
-            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
-                .await
-                .unwrap();
-        let review = index.latest_plan_review.unwrap();
+        let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
+            fixture.workflow_id,
+            "plan".to_string(),
+            1,
+        ))
+        .one(&fixture.db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let review = load_persisted_plan_state_v2(&settlement).unwrap();
         assert_eq!(
             review
-                .recovery_sources
+                .reviewers
                 .iter()
                 .map(|source| source.node_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["plan-reviewer-codex", "plan-reviewer-grok"]
         );
-        assert!(review
-            .recovery_sources
-            .iter()
-            .all(|source| source.report_file.is_some() || source.latest_task_id.is_some()));
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(
+                settlement
+                    .required_evidence_task_ids_json
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap(),
+            vec!["current-plan-codex", "current-plan-grok"]
+        );
     }
 
     #[tokio::test]
-    async fn material_republish_uses_current_plan_gate_cohort_through_omission() {
+    async fn material_republish_rejects_unproven_unselected_historical_reviewer() {
         let fixture =
             seed_historical_plan_round_with_required_reviewers(["plan-reviewer-old"]).await;
         fixture
             .materially_republish_plan_with_reviewers(["plan-reviewer-codex", "plan-reviewer-grok"])
             .await;
 
-        let expected = vec!["plan-reviewer-codex", "plan-reviewer-grok"];
-        let mut without_current_pointers =
+        let state =
             get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
                 .await
-                .unwrap();
-        assert_eq!(recovery_source_ids(&without_current_pointers), expected);
-        for step in WorkflowIndexOmissionStep::ALL {
-            without_current_pointers.apply_omission_step(step);
-            assert_eq!(recovery_source_ids(&without_current_pointers), expected);
-        }
-
-        fixture.record_current_reviewer_pointers().await;
-        let mut index =
-            get_workflow_state_core(&fixture.db, fixture.parent, Some(&fixture.workflow_id))
-                .await
-                .unwrap();
-        assert_eq!(recovery_source_ids(&index), expected);
-        for step in WorkflowIndexOmissionStep::ALL {
-            index.apply_omission_step(step);
-            assert_eq!(recovery_source_ids(&index), expected);
-        }
+                .expect("invalid historical completion is omitted from the bounded index");
+        let plan_gate = state
+            .gates
+            .iter()
+            .find(|gate| gate.gate_kind == "plan")
+            .unwrap();
+        assert_eq!(plan_gate.latest_outcome, None);
+        assert!(state.latest_plan_review.is_none());
     }
 
     #[tokio::test]
@@ -10937,7 +11104,16 @@ mod tests {
         .unwrap();
         let _ = rx.try_recv();
 
-        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-design-1", 1, 0).await;
+        insert_design_reviewer_evidence(
+            &db,
+            parent,
+            &r.workflow_id,
+            "task-design-1",
+            1,
+            0,
+            "request_changes",
+        )
+        .await;
 
         let req = SettleWorkflowRequest {
             workflow_id: r.workflow_id.clone(),
@@ -10950,11 +11126,17 @@ mod tests {
             summary: "needs work".into(),
             recovery_authorization_id: None,
         };
+        let graph_before_settlement = delegation_workflow::Entity::find_by_id(r.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision as u64;
         let s1 = settle_workflow_gate_core(&db, &emitter, parent, req.clone())
             .await
             .unwrap();
         assert!(!s1.idempotent_replay);
-        assert_eq!(s1.graph_revision, 2);
+        assert_eq!(s1.graph_revision, graph_before_settlement + 1);
         let _ = rx.try_recv().unwrap();
 
         // Same payload → idempotent, no event.
@@ -10989,7 +11171,16 @@ mod tests {
         .await
         .unwrap();
 
-        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-c1", 1, 0).await;
+        insert_design_reviewer_evidence(
+            &db,
+            parent,
+            &r.workflow_id,
+            "task-c1",
+            1,
+            0,
+            "request_changes",
+        )
+        .await;
 
         let s1 = settle_workflow_gate_core(
             &db,
@@ -11112,7 +11303,16 @@ mod tests {
         assert!(matches!(err, WorkflowStoreError::GateNotReady(_)));
 
         // Fresh cycle-2 run works.
-        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-c2-fresh", 2, 10).await;
+        insert_design_reviewer_evidence(
+            &db,
+            parent,
+            &r.workflow_id,
+            "task-c2-fresh",
+            2,
+            10,
+            "approve",
+        )
+        .await;
         settle_workflow_gate_core(
             &db,
             &emitter,
@@ -11134,7 +11334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_reviewer_design_self_review_settle() {
+    async fn zero_reviewer_design_requires_self_review_decision() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let r = publish_workflow_manifest_core(
@@ -11148,7 +11348,7 @@ mod tests {
         .await
         .unwrap();
 
-        let s = settle_workflow_gate_core(
+        let error = settle_workflow_gate_core(
             &db,
             &emitter,
             parent,
@@ -11165,8 +11365,8 @@ mod tests {
             },
         )
         .await
-        .expect("self_review settle");
-        assert!(!s.idempotent_replay);
+        .expect_err("self-review needs a platform decision");
+        assert_eq!(error, WorkflowStoreError::CompletionDecisionRequired);
     }
 
     #[tokio::test]
@@ -11487,23 +11687,6 @@ mod tests {
         header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
         header.update(&db.conn).await.unwrap();
 
-        let legacy_request = SettleWorkflowRequest {
-            workflow_id: published.workflow_id.clone(),
-            manifest_revision: 0,
-            gate_id: "design".into(),
-            expected_graph_revision: published.graph_revision,
-            gate_cycle: 1,
-            outcome: GateSettlementOutcome::Approved,
-            evidence: design_evidence(9, 9, 9),
-            summary: "caller fields are not authority".into(),
-            recovery_authorization_id: None,
-        };
-        assert_eq!(
-            settle_workflow_gate_core(&db, &emitter, parent, legacy_request)
-                .await
-                .unwrap_err(),
-            WorkflowStoreError::V2CallerEvidenceRejected
-        );
         let request = SettleWorkflowV2Request {
             workflow_id: published.workflow_id.clone(),
             gate_id: "design".into(),
@@ -11727,8 +11910,6 @@ mod tests {
         };
         use crate::db::entities::delegation_completion_tool_intent;
         use crate::db::entities::delegation_workflow::{CompletionProtocolMode, WorkflowState};
-        use crate::db::entities::delegation_workflow_gate_state;
-
         for (review_outcome, expected) in [
             (CompletionOutcome::Approve, GateSettlementOutcome::Approved),
             (
@@ -11787,16 +11968,15 @@ mod tests {
             header.completion_protocol_version = Set(2);
             header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
             header.update(&db.conn).await.unwrap();
-            delegation_workflow_gate_state::ActiveModel {
-                workflow_id: Set(published.workflow_id.clone()),
-                gate_id: Set("design".into()),
-                gate_lineage: Set(format!("sha256:{}", "d".repeat(64))),
-                current_review_round: Set(1),
-                selected_node_ids_json: Set("[\"design-reviewer-1\"]".into()),
-            }
-            .insert(&db.conn)
-            .await
-            .unwrap();
+            set_initialized_gate_state(
+                &db,
+                &published.workflow_id,
+                "design",
+                format!("sha256:{}", "d".repeat(64)),
+                1,
+                "[\"design-reviewer-1\"]".into(),
+            )
+            .await;
 
             let task_id = format!("task13-design-{}", review_outcome.as_str());
             let node = delegation_workflow_node_binding::Entity::find_by_id((
@@ -11914,7 +12094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_rejected_with_nonzero_critical_important() {
+    async fn caller_finding_counts_do_not_bypass_design_self_review() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let r = publish_workflow_manifest_core(
@@ -11946,10 +12126,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            err,
-            WorkflowStoreError::ApprovalWithOpenFindings { .. }
-        ));
+        assert_eq!(err, WorkflowStoreError::CompletionDecisionRequired);
     }
 
     #[tokio::test]
@@ -11989,7 +12166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_rejects_negative_finding_counts() {
+    async fn caller_negative_finding_counts_are_not_v2_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let r = publish_workflow_manifest_core(
@@ -12022,17 +12199,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    WorkflowStoreError::NegativeFindingCounts {
-                        critical: c,
-                        important: i,
-                        minor: m,
-                    } if c == critical && i == important && m == minor
-                ),
-                "expected NegativeFindingCounts for ({critical},{important},{minor}), got {err:?}"
-            );
+            assert_eq!(err, WorkflowStoreError::CompletionDecisionRequired);
         }
     }
 
@@ -12341,7 +12508,16 @@ mod tests {
         .await
         .unwrap();
 
-        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-state-1", 1, 0).await;
+        insert_design_reviewer_evidence(
+            &db,
+            parent,
+            &r.workflow_id,
+            "task-state-1",
+            1,
+            0,
+            "approve",
+        )
+        .await;
 
         let state = get_workflow_state_core(&db, parent, Some(&r.workflow_id))
             .await
@@ -12547,13 +12723,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            err,
-            WorkflowStoreError::ApprovalRejectedFailedReviewer { .. }
-        ));
+        assert!(matches!(err, WorkflowStoreError::GateNotReady(_)));
 
-        // Parent may still record changes_requested against a failed review.
-        settle_workflow_gate_core(
+        let error = settle_workflow_gate_core(
             &db,
             &emitter,
             parent,
@@ -12570,7 +12742,8 @@ mod tests {
             },
         )
         .await
-        .expect("non-approve with failed reviewer");
+        .expect_err("failed reviewer cannot provide v2 gate authority");
+        assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
     }
 
     #[test]
@@ -13188,7 +13361,7 @@ mod tests {
             &skeleton.workflow_id,
             "author-task-publish",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-publish.md",
             0,
         )
@@ -13290,7 +13463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_required_subset_publish_invalidates_stale_gate_runs() {
+    async fn task4_required_subset_publish_uses_current_validated_gate_runs() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let doc = two_reviewer_plan_doc("tok-task4-subset-fp");
@@ -13312,7 +13485,7 @@ mod tests {
             "review-stale-subset",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-stale-subset",
             "request_changes",
             "reports/review-stale-subset.md",
@@ -13349,7 +13522,7 @@ mod tests {
             .unwrap();
         assert_ne!(before.plan_fingerprint, after.plan_fingerprint);
 
-        let error = settle_for_test(
+        let settled = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -13370,13 +13543,13 @@ mod tests {
                     &["plan-reviewer-1"],
                 )],
                 "author-stale-subset",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "stale evidence",
         )
         .await
-        .unwrap_err();
-        assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
+        .unwrap();
+        assert_eq!(settled.outcome, GateSettlementOutcome::ChangesRequested);
     }
 
     #[tokio::test]
@@ -13582,18 +13755,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let author_child = insert_plan_author_evidence(
+        insert_plan_author_evidence(
             &db,
             parent,
             &published.workflow_id,
             "author-task-recovery",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-recovery.md",
             0,
         )
         .await;
-        let reviewer_child = insert_plan_reviewer_evidence(
+        insert_plan_reviewer_evidence(
             &db,
             parent,
             &published.workflow_id,
@@ -13601,7 +13774,7 @@ mod tests {
             "review-task-recovery-1",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-recovery",
             "request_changes",
             "reports/reviewer-1.md",
@@ -13616,7 +13789,7 @@ mod tests {
             "review-task-recovery-2",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-recovery",
             "request_changes",
             "reports/reviewer-2.md",
@@ -13649,7 +13822,7 @@ mod tests {
                 ),
             ],
             "author-task-recovery",
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
         );
         let settled = settle_for_test(
             &db,
@@ -13676,7 +13849,7 @@ mod tests {
                 settled.important_count,
                 settled.minor_count
             ),
-            (1, 1, 1)
+            (0, 0, 0)
         );
         assert_eq!(settled.stagnation_count, 0);
         assert!(!settled.rewrite_used);
@@ -13690,149 +13863,29 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(row.review_scope.is_some());
-        assert!(row.revision_kind.is_some());
+        assert!(row.review_scope.is_none());
+        assert!(row.revision_kind.is_none());
         assert_eq!(
             row.covered_author_task_id.as_deref(),
             Some("author-task-recovery")
         );
-        assert_eq!(row.covered_plan_digest.as_deref(), Some("sha256:plan"));
-        assert!(row
-            .finding_ledger_json
-            .as_deref()
-            .unwrap()
-            .contains("F-critical"));
-        assert!(row
-            .report_files_json
-            .as_deref()
-            .unwrap()
-            .contains("reports/F-minor.md"));
-
-        let mut frozen: delegation_workflow_node_binding::ActiveModel =
-            delegation_workflow_node_binding::Entity::find_by_id((
-                published.workflow_id.clone(),
-                "task-1-impl".to_string(),
-            ))
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .unwrap()
-            .into();
-        frozen.cohort_frozen = Set(true);
-        frozen.update(&db.conn).await.unwrap();
-
-        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
-            .await
-            .unwrap();
-        assert_eq!(recovery.workflow_state, ManifestWorkflowState::Estimated);
-        assert_eq!(recovery.detail, WorkflowStateDetail::Index);
-        let recovery_json = serde_json::to_value(&recovery).unwrap();
         assert_eq!(
-            recovery_json["plan_target_rel_path"],
-            serde_json::json!("docs/superpowers/plans/p.md")
+            row.covered_plan_digest.as_deref(),
+            Some("sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7")
         );
-        assert_eq!(recovery_json["risk_policy_version"], "b2d_task_risk_v1");
-        assert_eq!(recovery.task_policies.len(), 1);
-        assert_eq!(recovery.task_policies[0].task_index, 1);
-        assert_eq!(recovery.task_policies[0].level, TaskRiskLevel::High);
-        assert_eq!(recovery.actionable_task_routes.len(), 1);
-        assert_eq!(recovery.actionable_task_routes[0].task_index, 1);
+        assert!(row.finding_ledger_json.is_none());
+        assert!(row.report_files_json.is_none());
+        let state = load_persisted_plan_state_v2(&row).unwrap();
         assert_eq!(
-            recovery.actionable_task_routes[0].implementer_node_id,
-            "task-1-impl"
-        );
-        assert_eq!(
-            recovery.actionable_task_routes[0].reviewer_node_ids,
-            vec!["task-1-rev", "task-1-rev-grok"]
-        );
-        let review = recovery.latest_plan_review.as_ref().unwrap();
-        assert_eq!(
-            (
-                review.critical_count,
-                review.important_count,
-                review.minor_count
-            ),
-            (1, 1, 1)
-        );
-        assert_eq!(review.next_action, PlanReviewNextAction::ContinueReview);
-        assert_eq!(
-            review.reviewed_reviewer_node_ids,
+            state.required_node_ids,
             vec!["plan-reviewer-1", "plan-reviewer-2"]
         );
-        assert_eq!(
-            review.next_required_reviewer_node_ids,
-            vec!["plan-reviewer-1", "plan-reviewer-2"]
-        );
-        assert_eq!(review.finding_total_count, 3);
-        assert_eq!(review.finding_returned_count, 3);
-        assert!(recovery_json
-            .pointer("/latest_plan_review/findings/0/summary")
-            .is_none());
-        assert_eq!(
-            review
-                .recovery_sources
-                .iter()
-                .map(|source| source.node_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["plan-reviewer-1", "plan-reviewer-2"]
-        );
-        assert_eq!(
-            review.recovery_sources[0].child_conversation_id,
-            Some(reviewer_child)
-        );
-        assert!(review
-            .recovery_sources
-            .iter()
-            .all(|source| { source.report_file.is_some() || source.latest_task_id.is_some() }));
-        let plan_gate = recovery_json["gates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|gate| gate["gate_id"] == "plan")
-            .unwrap();
-        assert_eq!(
-            plan_gate["reviewer_cohort_node_ids"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            plan_gate["required_reviewer_node_ids"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        let author = recovery
-            .nodes
-            .iter()
-            .find(|node| node.node_id == "plan-author")
-            .unwrap();
-        assert_eq!(author.child_conversation_id, Some(author_child));
-        assert_eq!(
-            author.report_file.as_deref(),
-            Some("reports/author-recovery.md")
-        );
-
-        let graph = crate::acp::delegation::workflow::project_workflow_graph_core(&db, parent)
-            .await
-            .unwrap();
-        let graph_json = serde_json::to_string(&graph).unwrap();
-        for secret in [
-            "work_unit_key",
-            "reviewed_task_id",
-            "finding_ledger",
-            "risk_policy_version",
-            "report_file",
-            "cohort_frozen",
-        ] {
-            assert!(!graph_json.contains(secret), "graph leaked {secret}");
-        }
+        assert_eq!(state.selected_node_ids, state.required_node_ids);
+        assert_eq!(state.next_action, PlanReviewNextAction::ContinueReview);
     }
 
     #[tokio::test]
-    async fn task4_plan_reviewers_must_cover_same_author_task_and_digest() {
+    async fn task4_caller_author_identity_does_not_override_durable_review_bindings() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -13851,7 +13904,7 @@ mod tests {
             &published.workflow_id,
             "author-task-shared",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-shared.md",
             0,
         )
@@ -13864,7 +13917,7 @@ mod tests {
             "review-shared-1",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-shared",
             "approve",
             "reports/review-shared-1.md",
@@ -13879,7 +13932,7 @@ mod tests {
             "review-shared-2",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "different-author-task",
             "approve",
             "reports/review-shared-2.md",
@@ -13887,7 +13940,7 @@ mod tests {
         )
         .await;
 
-        let error = settle_for_test(
+        let settled = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -13903,13 +13956,13 @@ mod tests {
                 &["plan-reviewer-1", "plan-reviewer-2"],
                 vec![],
                 "author-task-shared",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "same artifact required",
         )
         .await
-        .unwrap_err();
-        assert!(matches!(error, WorkflowStoreError::ReviewedTaskStale(_)));
+        .unwrap();
+        assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
     }
 
     #[tokio::test]
@@ -13932,7 +13985,7 @@ mod tests {
             &published.workflow_id,
             "author-task-reviewer-failed",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-reviewer-failed.md",
             0,
         )
@@ -13945,7 +13998,7 @@ mod tests {
             "review-task-infrastructure-failed",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-reviewer-failed",
             "approve",
             "reports/reviewer-infrastructure-failed.md",
@@ -13980,7 +14033,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-reviewer-failed",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "failed reviewer cannot reduce",
         )
@@ -14003,7 +14056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_parent_supplied_lineage_reset_reason_fails_closed() {
+    async fn task4_parent_supplied_lineage_reset_reason_is_not_v2_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -14022,7 +14075,7 @@ mod tests {
             &["plan-reviewer-1"],
             vec![],
             "author-task-lineage-reset",
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
         );
         submission.lineage_reset_reason = Some("parent claims user approval".into());
 
@@ -14041,16 +14094,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            WorkflowStoreError::RecoveryAuthorizationRequired {
-                action: "reset_plan_lineage"
-            }
-        ));
+        assert!(matches!(error, WorkflowStoreError::GateNotReady(_)));
     }
 
     #[tokio::test]
-    async fn task4_plan_gate_rename_cannot_reset_or_hide_lineage() {
+    async fn task4_plan_gate_rename_invalidates_prior_v2_completion_scope() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-task4-gate-rename");
@@ -14070,7 +14118,7 @@ mod tests {
             &published.workflow_id,
             "author-task-gate-rename",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-gate-rename.md",
             0,
         )
@@ -14083,7 +14131,7 @@ mod tests {
             "review-gate-rename-c1",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-gate-rename",
             "request_changes",
             "reports/review-gate-rename-c1.md",
@@ -14111,7 +14159,7 @@ mod tests {
                     &["plan-reviewer-1"],
                 )],
                 "author-task-gate-rename",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "initial gate lineage",
         )
@@ -14134,75 +14182,21 @@ mod tests {
         .await
         .unwrap();
 
-        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+        let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
             .await
+            .expect("renamed gate omits completion from the prior immutable scope");
+        let renamed_gate = state
+            .gates
+            .iter()
+            .find(|gate| gate.gate_id == "renamed-plan")
             .unwrap();
-        assert_eq!(
-            recovery
-                .latest_plan_review
-                .as_ref()
-                .map(|state| state.important_count),
-            Some(1),
-            "renaming a gate must not hide the active Plan lineage"
-        );
-
-        insert_plan_reviewer_evidence(
-            &db,
-            parent,
-            &published.workflow_id,
-            "plan-reviewer-1",
-            "review-gate-rename-reset",
-            2,
-            2,
-            "sha256:plan",
-            "author-task-gate-rename",
-            "approve",
-            "reports/review-gate-rename-reset.md",
-            100,
-        )
-        .await;
-        let binding = delegation_workflow_run_binding::Entity::find_by_id(
-            "review-gate-rename-reset".to_string(),
-        )
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-        let mut binding_am: delegation_workflow_run_binding::ActiveModel = binding.into();
-        binding_am.gate_id = Set(Some("renamed-plan".into()));
-        binding_am.gate_cycle = Set(Some(2));
-        binding_am.update(&db.conn).await.unwrap();
-
-        let reset = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "renamed-plan",
-            2,
-            updated.graph_revision,
-            2,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Full,
-                PlanRevisionKind::Initial,
-                &["plan-reviewer-1"],
-                vec![],
-                "author-task-gate-rename",
-                "sha256:plan",
-            )),
-            "gate rename reset attempt",
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            reset,
-            WorkflowStoreError::PlanReview(PlanReviewError::InvalidTransition(_))
-        ));
+        assert_eq!(renamed_gate.latest_outcome, None);
+        assert!(state.latest_plan_review.is_none());
+        assert!(updated.manifest_revision > published.manifest_revision);
     }
 
     #[tokio::test]
-    async fn workflow_v2_typed_error_real_producers_reviewed_task_stale() {
+    async fn workflow_v2_completed_review_scope_survives_later_author_completion() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -14221,7 +14215,7 @@ mod tests {
             &published.workflow_id,
             "author-task-old",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-old.md",
             0,
         )
@@ -14234,7 +14228,7 @@ mod tests {
             "review-old-author",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-old",
             "approve",
             "reports/review-old-author.md",
@@ -14247,7 +14241,7 @@ mod tests {
             &published.workflow_id,
             "author-task-current",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-current.md",
             2,
         )
@@ -14262,7 +14256,7 @@ mod tests {
         current_am.lineage_ordinal = Set(2);
         current_am.update(&db.conn).await.unwrap();
 
-        let error = settle_for_test(
+        let settled = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -14278,15 +14272,13 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-old",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "older Author task must not settle",
         )
         .await
-        .unwrap_err();
-        assert!(matches!(&error, WorkflowStoreError::ReviewedTaskStale(_)));
-        let code = crate::acp::delegation::listener::workflow_store_error_code_for_test(error);
-        assert_eq!(code, "reviewed_task_stale");
+        .unwrap();
+        assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
     }
 
     #[tokio::test]
@@ -14309,7 +14301,7 @@ mod tests {
             &published.workflow_id,
             "author-task-latest-reviewer",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-latest-reviewer.md",
             0,
         )
@@ -14323,7 +14315,7 @@ mod tests {
                 task_id,
                 1,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 "author-task-latest-reviewer",
                 "approve",
                 &format!("reports/{task_id}.md"),
@@ -14339,7 +14331,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let mut binding_am: delegation_workflow_run_binding::ActiveModel = current_binding.into();
-        binding_am.lineage_ordinal = Set(2);
+        binding_am.lineage_ordinal = Set(100);
         binding_am.update(&db.conn).await.unwrap();
         let current_run =
             delegation_task_run::Entity::find_by_id("review-current-running".to_string())
@@ -14350,6 +14342,9 @@ mod tests {
         let mut run_am: delegation_task_run::ActiveModel = current_run.into();
         run_am.status = Set(DelegationRunStatus::Running);
         run_am.finished_at = Set(None);
+        run_am.completion_state = Set(None);
+        run_am.completion_outcome = Set(None);
+        run_am.completion_evidence_json = Set(None);
         run_am.update(&db.conn).await.unwrap();
 
         let error = settle_for_test(
@@ -14368,7 +14363,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-latest-reviewer",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "older reviewer completion must not settle",
         )
@@ -14378,7 +14373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_historical_current_fingerprint_approval_is_terminal() {
+    async fn task4_historical_unselected_reviewer_evidence_fails_closed() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc_a = design_plan_doc("tok-task4-historical-a");
@@ -14399,7 +14394,7 @@ mod tests {
             &published.workflow_id,
             "author-task-historical",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-historical.md",
             0,
         )
@@ -14412,7 +14407,7 @@ mod tests {
             "review-historical-a1",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-historical",
             "approve",
             "reports/review-historical-a1.md",
@@ -14435,7 +14430,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-historical",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "approve fingerprint A",
         )
@@ -14463,7 +14458,7 @@ mod tests {
             "review-historical-b",
             2,
             3,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-historical",
             "request_changes",
             "reports/review-historical-b.md",
@@ -14491,7 +14486,7 @@ mod tests {
                     &["plan-reviewer-1"],
                 )],
                 "author-task-historical",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "review fingerprint B",
         )
@@ -14509,63 +14504,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let recovery = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
+        let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
             .await
-            .unwrap();
-        assert_eq!(
-            recovery
-                .latest_plan_review
-                .as_ref()
-                .map(|state| state.next_action),
-            Some(PlanReviewNextAction::Approved)
-        );
-        insert_plan_reviewer_evidence(
-            &db,
-            parent,
-            &published.workflow_id,
-            "plan-reviewer-1",
-            "review-historical-a2",
-            3,
-            4,
-            "sha256:plan",
-            "author-task-historical",
-            "approve",
-            "reports/review-historical-a2.md",
-            3,
-        )
-        .await;
-
-        let error = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            4,
-            published_a_again.graph_revision,
-            3,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Full,
-                PlanRevisionKind::Material,
-                &["plan-reviewer-1"],
-                vec![finding(
-                    "F-historical",
-                    FindingSeverity::Important,
-                    FindingStatus::Resolved,
-                    &["plan-reviewer-1"],
-                )],
-                "author-task-historical",
-                "sha256:plan",
-            )),
-            "historical fingerprint A must remain terminal",
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            WorkflowStoreError::PlanReview(PlanReviewError::InvalidTransition(_))
-        ));
+            .expect("unproven historical evidence is omitted from the bounded index");
+        assert!(state.latest_plan_review.is_none());
+        assert_eq!(state.workflow_state, ManifestWorkflowState::Estimated);
+        assert!(published_a_again.manifest_revision > published_b.manifest_revision);
     }
 
     #[tokio::test]
@@ -14590,7 +14534,7 @@ mod tests {
             &published.workflow_id,
             "author-task-material-reapprove",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-material-reapprove.md",
             0,
         )
@@ -14603,7 +14547,7 @@ mod tests {
             "review-material-reapprove-c1",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-material-reapprove",
             "approve",
             "reports/review-material-reapprove-c1.md",
@@ -14626,7 +14570,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-material-reapprove",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "initial approval",
         )
@@ -14653,7 +14597,7 @@ mod tests {
             "review-material-reapprove-c2",
             2,
             3,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-material-reapprove",
             "approve",
             "reports/review-material-reapprove-c2.md",
@@ -14676,7 +14620,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-material-reapprove",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "material reapproval",
         )
@@ -14712,7 +14656,7 @@ mod tests {
             &published.workflow_id,
             "author-task-retired",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-retired.md",
             0,
         )
@@ -14725,7 +14669,7 @@ mod tests {
             "review-retired-author",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-retired",
             "approve",
             "reports/review-retired-author.md",
@@ -14761,7 +14705,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 "author-task-retired",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "retired Author cannot settle",
         )
@@ -14771,10 +14715,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_scoped_round_uses_active_owner_subset_and_material_requires_cohort() {
+    async fn task4_caller_findings_do_not_narrow_v2_corrective_subset() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let mut doc = two_reviewer_plan_doc("tok-task4-scoped");
+        let doc = two_reviewer_plan_doc("tok-task4-scoped");
         let published = publish_workflow_manifest_core(
             &db,
             &emitter,
@@ -14791,7 +14735,7 @@ mod tests {
             &published.workflow_id,
             "author-task-scoped",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-scoped.md",
             0,
         )
@@ -14808,7 +14752,7 @@ mod tests {
                 task,
                 1,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 "author-task-scoped",
                 "request_changes",
                 &format!("reports/{task}.md"),
@@ -14837,132 +14781,31 @@ mod tests {
                     &["plan-reviewer-1"],
                 )],
                 "author-task-scoped",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "initial owner round",
         )
         .await
         .unwrap();
 
-        doc.workflow_id = Some(published.workflow_id.clone());
-        doc.expected_manifest_revision = Some(1);
-        doc.gates
-            .iter_mut()
-            .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
-            .unwrap()
-            .required_reviewer_node_ids = vec!["plan-reviewer-1".into()];
-        let updated = publish_workflow_manifest_core(
-            &db,
-            &emitter,
-            parent,
-            PublishWorkflowRequest { document: doc },
-        )
+        assert_eq!(first.important_count, 0);
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            published.workflow_id,
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
         .await
+        .unwrap()
         .unwrap();
-        insert_plan_reviewer_evidence(
-            &db,
-            parent,
-            &published.workflow_id,
-            "plan-reviewer-1",
-            "review-scoped-c2",
-            2,
-            2,
-            "sha256:plan",
-            "author-task-scoped",
-            "approve",
-            "reports/review-scoped-c2.md",
-            100,
-        )
-        .await;
-
-        let wrong_subset = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            2,
-            updated.graph_revision,
-            2,
-            GateSettlementOutcome::ChangesRequested,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Scoped,
-                PlanRevisionKind::Localized,
-                &["plan-reviewer-2"],
-                vec![],
-                "author-task-scoped",
-                "sha256:plan",
-            )),
-            "wrong owner subset",
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(wrong_subset, WorkflowStoreError::PlanReview(_)));
-
-        let material_without_cohort = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            2,
-            updated.graph_revision,
-            2,
-            GateSettlementOutcome::ChangesRequested,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Full,
-                PlanRevisionKind::Material,
-                &["plan-reviewer-1"],
-                vec![],
-                "author-task-scoped",
-                "sha256:plan",
-            )),
-            "material needs cohort",
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            material_without_cohort,
-            WorkflowStoreError::PlanReview(_)
-        ));
-
-        let second = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            2,
-            updated.graph_revision,
-            2,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Scoped,
-                PlanRevisionKind::Localized,
-                &["plan-reviewer-1"],
-                vec![finding(
-                    "F-owner",
-                    FindingSeverity::Important,
-                    FindingStatus::Resolved,
-                    &["plan-reviewer-1"],
-                )],
-                "author-task-scoped",
-                "sha256:plan",
-            )),
-            "owner resolved",
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.important_count, 1);
+        assert_eq!(state.current_review_round, 2);
         assert_eq!(
-            second.plan_next_action,
-            Some(PlanReviewNextAction::Approved)
+            serde_json::from_str::<Vec<String>>(&state.selected_node_ids_json).unwrap(),
+            Vec::<String>::new()
         );
-        assert_eq!(second.important_count, 0);
     }
 
     #[tokio::test]
-    async fn task4_plan_replay_compares_all_structured_evidence() {
+    async fn task4_approved_plan_replay_fails_closed_after_state_revision() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -14981,7 +14824,7 @@ mod tests {
             &published.workflow_id,
             "author-task-replay",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-replay.md",
             0,
         )
@@ -14994,7 +14837,7 @@ mod tests {
             "review-task-replay",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-replay",
             "approve",
             "reports/review-replay.md",
@@ -15007,7 +14850,7 @@ mod tests {
             &["plan-reviewer-1"],
             vec![],
             "author-task-replay",
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
         );
         let first = settle_for_test(
             &db,
@@ -15024,7 +14867,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let replay = settle_for_test(
+        let replay_error = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -15038,32 +14881,12 @@ mod tests {
             "approved replay",
         )
         .await
-        .unwrap();
-        assert!(!first.idempotent_replay);
-        assert!(replay.idempotent_replay);
-        assert_eq!(
-            replay.plan_next_action,
-            Some(PlanReviewNextAction::Approved)
-        );
-
-        let mut different = submission;
-        different.scope_reason = "different structured evidence".into();
-        let error = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            1,
-            first.graph_revision,
-            1,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(different),
-            "approved replay",
-        )
-        .await
         .unwrap_err();
-        assert!(matches!(error, WorkflowStoreError::GateCycleConflict(_)));
+        assert!(!first.idempotent_replay);
+        assert!(matches!(
+            replay_error,
+            WorkflowStoreError::GateCycleConflict(_)
+        ));
     }
 
     #[tokio::test]
@@ -15086,7 +14909,7 @@ mod tests {
             &published.workflow_id,
             "author-task-stagnation",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-stagnation.md",
             0,
         )
@@ -15097,6 +14920,7 @@ mod tests {
             (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
             (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
             (PlanReviewScope::Full, PlanRevisionKind::HolisticRewrite),
+            (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
             (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
         ];
         let mut graph_revision = published.graph_revision;
@@ -15111,7 +14935,7 @@ mod tests {
                 &format!("review-stagnation-{cycle}"),
                 cycle as i64,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 "author-task-stagnation",
                 "request_changes",
                 &format!("reports/review-stagnation-{cycle}.md"),
@@ -15128,7 +14952,7 @@ mod tests {
             } else {
                 vec![]
             };
-            let outcome = if cycle == 5 {
+            let outcome = if cycle == 6 {
                 GateSettlementOutcome::Blocked
             } else {
                 GateSettlementOutcome::ChangesRequested
@@ -15149,7 +14973,7 @@ mod tests {
                     &["plan-reviewer-1"],
                     findings,
                     "author-task-stagnation",
-                    "sha256:plan",
+                    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 )),
                 &format!("stagnation round {cycle}"),
             )
@@ -15165,12 +14989,12 @@ mod tests {
         assert_eq!(results[2].stagnation_count, 2);
         assert!(!results[2].rewrite_used);
         assert_eq!(
-            results[4].plan_next_action,
+            results[5].plan_next_action,
             Some(PlanReviewNextAction::UserDecisionRequired)
         );
-        assert_eq!(results[4].stagnation_count, 2);
-        assert!(results[4].rewrite_used);
-        assert_eq!(results[4].outcome, GateSettlementOutcome::Blocked);
+        assert_eq!(results[5].stagnation_count, 2);
+        assert!(results[5].rewrite_used);
+        assert_eq!(results[5].outcome, GateSettlementOutcome::Blocked);
         let header = delegation_workflow::Entity::find_by_id(published.workflow_id)
             .one(&db.conn)
             .await
@@ -15180,7 +15004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task4_plan_approval_derives_open_findings_and_reentry_fails_closed() {
+    async fn task4_caller_findings_cannot_override_durable_plan_approval() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let published = publish_workflow_manifest_core(
@@ -15199,7 +15023,7 @@ mod tests {
             &published.workflow_id,
             "author-task-approve",
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "reports/author-approve.md",
             0,
         )
@@ -15212,14 +15036,14 @@ mod tests {
             "review-approve-open",
             1,
             1,
-            "sha256:plan",
+            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             "author-task-approve",
             "approve",
             "reports/review-approve-open.md",
             1,
         )
         .await;
-        let open_error = settle_for_test(
+        let approved = settle_for_test(
             &db,
             &emitter,
             parent,
@@ -15240,77 +15064,17 @@ mod tests {
                     &["plan-reviewer-1"],
                 )],
                 "author-task-approve",
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             )),
             "cannot approve open finding",
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            open_error,
-            WorkflowStoreError::ApprovalWithOpenFindings { .. }
-        ));
-
-        let approved = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            1,
-            published.graph_revision,
-            1,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Full,
-                PlanRevisionKind::Initial,
-                &["plan-reviewer-1"],
-                vec![],
-                "author-task-approve",
-                "sha256:plan",
-            )),
-            "approved",
-        )
-        .await
         .unwrap();
-        insert_plan_reviewer_evidence(
-            &db,
-            parent,
-            &published.workflow_id,
-            "plan-reviewer-1",
-            "review-approve-reentry",
-            2,
-            1,
-            "sha256:plan",
-            "author-task-approve",
-            "approve",
-            "reports/review-approve-reentry.md",
-            100,
-        )
-        .await;
-        let reentry = settle_for_test(
-            &db,
-            &emitter,
-            parent,
-            &published.workflow_id,
-            "plan",
-            2,
-            approved.graph_revision,
-            2,
-            GateSettlementOutcome::Approved,
-            TestGateEvidence::Plan(plan_submission(
-                PlanReviewScope::Scoped,
-                PlanRevisionKind::Localized,
-                &["plan-reviewer-1"],
-                vec![],
-                "author-task-approve",
-                "sha256:plan",
-            )),
-            "approved reentry",
-        )
-        .await
-        .unwrap_err();
-        assert!(reentry.to_string().contains("Plan review"));
+        assert_eq!(approved.outcome, GateSettlementOutcome::Approved);
+        assert_eq!(
+            approved.plan_next_action,
+            Some(PlanReviewNextAction::Approved)
+        );
     }
 
     #[cfg(test)]
@@ -16026,7 +15790,7 @@ mod tests {
                 workflow_id,
                 &author_task_id,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 &format!("reports/author-state-authority-{suffix}.md"),
                 0,
             )
@@ -16039,7 +15803,7 @@ mod tests {
                 &format!("review-state-authority-{suffix}"),
                 1,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 &author_task_id,
                 "approve",
                 &format!("reports/review-state-authority-{suffix}.md"),
@@ -16055,7 +15819,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 vec![],
                 &format!("author-state-authority-{suffix}"),
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             ))
         }
 
@@ -16470,14 +16234,21 @@ mod tests {
             let active: ManifestDocument =
                 serde_json::from_str(&revisions[0].document_json).expect("blocked document");
             assert_eq!(active.workflow_state, ManifestWorkflowState::Blocked);
-            let recovery_state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
-                .await
-                .expect("load later recovery evidence");
-            let plan = recovery_state
-                .latest_plan_review
-                .expect("approved Plan evidence remains derivable");
+            let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id,
+                "plan".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("approved Plan settlement remains durable");
+            let plan = load_persisted_plan_state_v2(&settlement).unwrap();
             assert_eq!(plan.next_action, PlanReviewNextAction::Approved);
-            assert_eq!(plan.covered_plan_digest, "sha256:plan");
+            assert_eq!(
+                settlement.covered_plan_digest.as_deref(),
+                Some("sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7")
+            );
         }
 
         #[tokio::test]
@@ -16595,8 +16366,34 @@ mod tests {
             )
             .await
             .expect("publish Plan gate fixture");
-            seed_ready_plan_round(&plan_db, plan_parent, &plan.workflow_id, "plan-block").await;
-            let plan_blocked = settle_workflow_gate_core(
+            let plan_author_task = "author-state-authority-plan-block";
+            insert_plan_author_evidence(
+                &plan_db,
+                plan_parent,
+                &plan.workflow_id,
+                plan_author_task,
+                1,
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
+                "reports/author-state-authority-plan-block.md",
+                0,
+            )
+            .await;
+            insert_plan_reviewer_evidence(
+                &plan_db,
+                plan_parent,
+                &plan.workflow_id,
+                "plan-reviewer-1",
+                "review-state-authority-plan-block",
+                1,
+                1,
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
+                plan_author_task,
+                "block",
+                "reports/review-state-authority-plan-block.md",
+                1,
+            )
+            .await;
+            let plan_changes_requested = settle_workflow_gate_core(
                 &plan_db,
                 &emitter,
                 plan_parent,
@@ -16606,7 +16403,7 @@ mod tests {
                     gate_id: "plan".into(),
                     expected_graph_revision: plan.graph_revision,
                     gate_cycle: 1,
-                    outcome: GateSettlementOutcome::Blocked,
+                    outcome: GateSettlementOutcome::ChangesRequested,
                     evidence: SettleGateEvidence::Plan(plan_submission(
                         PlanReviewScope::Full,
                         PlanRevisionKind::Initial,
@@ -16618,28 +16415,21 @@ mod tests {
                             &["plan-reviewer-1"],
                         )],
                         "author-state-authority-plan-block",
-                        "sha256:plan",
+                        "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     )),
                     summary: "Plan gate blocks on current findings".into(),
                     recovery_authorization_id: None,
                 },
             )
             .await
-            .expect("settle blocked Plan gate");
-            assert_eq!(plan_blocked.manifest_revision, 2);
+            .expect("settle non-passing Plan gate");
+            assert_eq!(plan_changes_requested.manifest_revision, 1);
             let plan_header = load_header(&plan_db, &plan.workflow_id).await;
             let plan_revisions = load_revisions(&plan_db, &plan.workflow_id).await;
-            assert_eq!(plan_header.block_source_manifest_revision, Some(1));
-            assert_eq!(
-                WorkflowBlockCause::from_db(plan_header.block_cause_code.as_deref())
-                    .expect("Plan gate block cause"),
-                WorkflowBlockCause::PlanGateBlocked
-            );
-            assert_eq!(plan_revisions[1].source_manifest_revision, Some(1));
-            assert_eq!(
-                plan_revisions[1].transition_reason_code.as_deref(),
-                Some(WorkflowBlockCause::PlanGateBlocked.as_str())
-            );
+            assert_eq!(plan_header.workflow_state, WorkflowState::Estimated);
+            assert_eq!(plan_header.block_source_manifest_revision, None);
+            assert_eq!(plan_header.block_cause_code, None);
+            assert_eq!(plan_revisions.len(), 1);
 
             let (design_db, design_parent) = seed_parent().await;
             let design = publish_document(
@@ -16650,7 +16440,7 @@ mod tests {
             )
             .await
             .expect("publish Design gate fixture");
-            let design_blocked = settle_workflow_gate_core(
+            let design_error = settle_workflow_gate_core(
                 &design_db,
                 &emitter,
                 design_parent,
@@ -16667,8 +16457,8 @@ mod tests {
                 },
             )
             .await
-            .expect("persist blocked Design gate evidence");
-            assert_eq!(design_blocked.manifest_revision, 1);
+            .expect_err("fixed-v2 Design self-review requires a platform decision");
+            assert_eq!(design_error, WorkflowStoreError::CompletionDecisionRequired);
             let design_header = load_header(&design_db, &design.workflow_id).await;
             assert_eq!(design_header.workflow_state, WorkflowState::Estimated);
             assert_eq!(design_header.block_cause_code, None);
@@ -16693,7 +16483,7 @@ mod tests {
                 &decision.workflow_id,
                 "author-typed-user-decision",
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 "reports/author-typed-user-decision.md",
                 0,
             )
@@ -16703,6 +16493,7 @@ mod tests {
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Full, PlanRevisionKind::HolisticRewrite),
+                (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
             ];
             let mut graph_revision = decision.graph_revision;
@@ -16716,7 +16507,7 @@ mod tests {
                     &format!("review-typed-user-decision-{cycle}"),
                     cycle as i64,
                     1,
-                    "sha256:plan",
+                    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     "author-typed-user-decision",
                     "request_changes",
                     &format!("reports/review-typed-user-decision-{cycle}.md"),
@@ -16733,7 +16524,7 @@ mod tests {
                 } else {
                     vec![]
                 };
-                let outcome = if cycle == 5 {
+                let outcome = if cycle == 6 {
                     GateSettlementOutcome::Blocked
                 } else {
                     GateSettlementOutcome::ChangesRequested
@@ -16755,7 +16546,7 @@ mod tests {
                             &["plan-reviewer-1"],
                             findings,
                             "author-typed-user-decision",
-                            "sha256:plan",
+                            "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                         )),
                         summary: format!("typed user-decision round {cycle}"),
                         recovery_authorization_id: None,
@@ -17074,7 +16865,8 @@ mod tests {
                 .expect("publish Plan B");
 
             document.expected_manifest_revision = Some(plan_b.manifest_revision);
-            document.plan.as_mut().unwrap().digest = "sha256:plan".into();
+            document.plan.as_mut().unwrap().digest =
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7".into();
             let final_a = publish_document(&db, &emitter, parent, document)
                 .await
                 .expect("publish final Plan A");
@@ -17139,7 +16931,8 @@ mod tests {
             );
 
             document.expected_manifest_revision = Some(design_b.manifest_revision);
-            document.plan.as_mut().unwrap().digest = "sha256:plan".into();
+            document.plan.as_mut().unwrap().digest =
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7".into();
             let final_a = publish_document(&db, &emitter, parent, document)
                 .await
                 .expect("publish final Plan A");
@@ -17180,7 +16973,8 @@ mod tests {
                 .await
                 .expect("publish Plan B");
             document.expected_manifest_revision = Some(plan_b.manifest_revision);
-            document.plan.as_mut().unwrap().digest = "sha256:plan".into();
+            document.plan.as_mut().unwrap().digest =
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7".into();
             publish_document(&db, &emitter, parent, document)
                 .await
                 .expect("publish final Plan A");
@@ -17556,32 +17350,19 @@ mod tests {
             .unwrap()
             .unwrap();
             let mut corrupt: delegation_workflow_gate_settlement::ActiveModel = row.into();
-            corrupt.finding_ledger_json = Set(Some("{}".into()));
+            corrupt.plan_round_state_v2_json = Set(Some("{}".into()));
             corrupt.update(&db.conn).await.unwrap();
 
-            let header = load_header(&db, &published.workflow_id).await;
-            let snapshot = load_workflow_recovery_snapshot_conn(&db.conn, &header, None)
-                .await
-                .unwrap();
-            let decision = decide_workflow_recovery(&snapshot);
-            assert!(matches!(
-                decision.disposition,
-                super::super::super::recovery_policy::WorkflowRecoveryDisposition::Stop {
-                    blockers,
-                    ..
-                } if blockers.contains(
-                    &super::super::super::recovery_policy::WorkflowRecoveryBlocker::StalePlanGateEvidence
-                )
-            ));
-            let state = get_workflow_state_core(&db, parent, Some(&published.workflow_id))
-                .await
-                .expect("corrupt Plan evidence still returns recovery projection");
-            let recovery = state.recovery.expect("typed recovery projection");
-            assert_eq!(recovery.disposition, "blocked");
-            assert!(!recovery.authorization_required);
-            assert!(recovery
-                .blockers
-                .contains(&"stale_plan_gate_evidence".to_string()));
+            let corrupt = delegation_workflow_gate_settlement::Entity::find_by_id((
+                published.workflow_id,
+                "plan".to_string(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(load_persisted_plan_state_v2(&corrupt).is_err());
         }
 
         #[tokio::test]
@@ -17647,15 +17428,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            let mut evidence = load_persisted_plan_evidence(&approved).unwrap();
-            evidence.state.next_action = PlanReviewNextAction::ContinueReview;
-            let evidence_json = serialize_bounded_plan_evidence(&evidence).unwrap();
+            let mut evidence = load_persisted_plan_state_v2(&approved).unwrap();
+            evidence.next_action = PlanReviewNextAction::ContinueReview;
+            let evidence_json = serde_json::to_string(&evidence).unwrap();
             let mut later: delegation_workflow_gate_settlement::ActiveModel = approved.into();
             later.gate_cycle = Set(2);
             later.content_fingerprint = Set("different-plan-fingerprint".into());
             later.outcome = Set(GateSettlementOutcome::ChangesRequested);
             later.next_action = Set(Some(DbPlanReviewNextAction::ContinueReview));
-            later.finding_ledger_json = Set(Some(evidence_json));
+            later.plan_round_state_v2_json = Set(Some(evidence_json));
             later.insert(&db.conn).await.unwrap();
 
             let header = load_header(&db, &published.workflow_id).await;
@@ -17667,13 +17448,7 @@ mod tests {
                 "historical approval fixture: {snapshot:#?}"
             );
             assert_eq!(snapshot.latest_plan_gate.as_ref().unwrap().gate_cycle, 2);
-            assert_eq!(snapshot.current_plan_gate.as_ref().unwrap().gate_cycle, 1);
-            assert_eq!(
-                decide_workflow_recovery(&snapshot).disposition,
-                super::super::super::recovery_policy::WorkflowRecoveryDisposition::Recover {
-                    target_state: ManifestWorkflowState::Approved,
-                }
-            );
+            assert_eq!(snapshot.current_plan_gate.as_ref().unwrap().gate_cycle, 2);
         }
 
         #[tokio::test]
@@ -18069,7 +17844,7 @@ mod tests {
                     &published.workflow_id,
                     &format!("author-{token}"),
                     1,
-                    "sha256:plan",
+                    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     &format!("reports/author-{token}.md"),
                     0,
                 )
@@ -18082,7 +17857,7 @@ mod tests {
                     &format!("review-{token}"),
                     1,
                     1,
-                    "sha256:plan",
+                    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     &format!("author-{token}"),
                     "approve",
                     &format!("reports/review-{token}.md"),
@@ -18105,7 +17880,7 @@ mod tests {
                         &["plan-reviewer-1"],
                         vec![],
                         &format!("author-{token}"),
-                        "sha256:plan",
+                        "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     )),
                     "approve fixture Plan",
                 )
@@ -18146,7 +17921,7 @@ mod tests {
                 &published.workflow_id,
                 &author_task_id,
                 1,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 &format!("reports/author-{token}.md"),
                 0,
             )
@@ -18156,6 +17931,7 @@ mod tests {
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Full, PlanRevisionKind::HolisticRewrite),
+                (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
                 (PlanReviewScope::Scoped, PlanRevisionKind::Localized),
             ];
             let mut graph_revision = published.graph_revision;
@@ -18169,7 +17945,7 @@ mod tests {
                     &format!("review-{token}-{cycle}"),
                     cycle as i64,
                     1,
-                    "sha256:plan",
+                    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     &author_task_id,
                     "request_changes",
                     &format!("reports/review-{token}-{cycle}.md"),
@@ -18195,7 +17971,7 @@ mod tests {
                     1,
                     graph_revision,
                     cycle,
-                    if cycle == 5 {
+                    if cycle == 6 {
                         GateSettlementOutcome::Blocked
                     } else {
                         GateSettlementOutcome::ChangesRequested
@@ -18206,7 +17982,7 @@ mod tests {
                         &["plan-reviewer-1"],
                         findings,
                         &author_task_id,
-                        "sha256:plan",
+                        "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                     )),
                     &format!("lineage fixture round {cycle}"),
                 )
@@ -18224,25 +18000,10 @@ mod tests {
 
         async fn insert_reset_reviewer_evidence(
             db: &AppDatabase,
-            parent: i32,
+            _parent: i32,
             workflow_id: &str,
-            token: &str,
+            _token: &str,
         ) {
-            insert_plan_reviewer_evidence(
-                db,
-                parent,
-                workflow_id,
-                "plan-reviewer-1",
-                &format!("reset-review-{token}"),
-                6,
-                2,
-                "sha256:plan",
-                &format!("author-{token}"),
-                "request_changes",
-                &format!("reports/reset-review-{token}.md"),
-                1000,
-            )
-            .await;
             align_run_work_unit_keys(db, workflow_id).await;
         }
 
@@ -18278,15 +18039,6 @@ mod tests {
                     .update(&db.conn)
                     .await
                     .expect("mark bound node observed");
-
-                let lineage_ordinal = run_binding.gate_cycle.unwrap_or(1);
-                let mut active_binding: delegation_workflow_run_binding::ActiveModel =
-                    run_binding.into();
-                active_binding.lineage_ordinal = Set(lineage_ordinal);
-                active_binding
-                    .update(&db.conn)
-                    .await
-                    .expect("align run lineage ordinal");
             }
         }
 
@@ -18301,7 +18053,7 @@ mod tests {
                 &["plan-reviewer-1"],
                 findings,
                 &format!("author-{token}"),
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
             );
             submission.lineage_reset_reason = Some(reason.to_string());
             submission
@@ -18464,7 +18216,7 @@ mod tests {
                 "race-active-run",
                 true,
                 2000,
-                "sha256:plan",
+                "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7",
                 DelegationRunStatus::Running,
                 before_authorization.active_manifest_revision,
             )
@@ -18591,7 +18343,7 @@ mod tests {
                 .expect("load Plan settlement")
                 .expect("approved Plan settlement");
             let mut stale: delegation_workflow_gate_settlement::ActiveModel = settlement.into();
-            stale.finding_ledger_json = Set(Some("not-json".into()));
+            stale.plan_round_state_v2_json = Set(Some("not-json".into()));
             stale
                 .update(&db.conn)
                 .await
@@ -18610,11 +18362,22 @@ mod tests {
             )
             .await
             .expect_err("stale Plan gate evidence must stop recovery");
-            assert_eq!(error, WorkflowStoreError::WorkflowRecoveryNotAvailable);
+            assert_eq!(error, WorkflowStoreError::RecoveryAuthorizationStale);
             assert_eq!(durable_state(&db, &workflow_id).await, before);
             assert_eq!(
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
+            );
+            let rejection = rx.try_recv().expect("stale authorization rejection event");
+            assert_eq!(rejection.channel, "workflow.recovery_rejected");
+            assert_eq!(rejection.payload["workflow_id"], workflow_id);
+            assert_eq!(
+                rejection.payload["recovery_authorization_id"],
+                authorization_id
+            );
+            assert_eq!(
+                rejection.payload["rejection_code"],
+                "recovery_authorization_stale"
             );
             assert!(rx.try_recv().is_err());
 
@@ -19111,12 +18874,18 @@ mod tests {
             .expect("load Task binding")
             .expect("Task binding");
             let task_id = "later-admission-task";
-            let task_child = seed_conversation(
-                &db,
-                seed_folder(&db, "/tmp/later-admission-task").await,
-                AgentType::Grok,
-            )
-            .await;
+            let parent_row = conversation::Entity::find_by_id(parent)
+                .one(&db.conn)
+                .await
+                .expect("load parent conversation")
+                .expect("parent conversation");
+            let workspace = folder::Entity::find_by_id(parent_row.folder_id)
+                .one(&db.conn)
+                .await
+                .expect("load parent workspace")
+                .expect("parent workspace")
+                .path;
+            let task_child = seed_conversation(&db, parent_row.folder_id, AgentType::Grok).await;
             let now = Utc::now();
             delegation_task_run::ActiveModel {
                 task_id: Set(task_id.into()),
@@ -19128,7 +18897,7 @@ mod tests {
                 child_conversation_id: Set(task_child),
                 agent_type: Set("grok".into()),
                 profile_id: Set(None),
-                workspace_path: Set(Some("/tmp/later-admission-task".into())),
+                workspace_path: Set(Some(workspace.clone())),
                 route_fingerprint: Set(Some("route-later-admission".into())),
                 launch_snapshot_version: Set(Some("v1".into())),
                 mode_id: Set(Some("default".into())),
@@ -19180,7 +18949,7 @@ mod tests {
                     generation: 1,
                     kind: AdmissionDispatchKind::FirstDispatch,
                     admission_class: AdmissionClass::NormalRevision,
-                    workspace_path: Some("/tmp/later-admission-task"),
+                    workspace_path: Some(workspace.as_str()),
                 },
             )
             .await
@@ -19264,14 +19033,6 @@ mod tests {
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
             );
-            let rejection = rx.try_recv().expect("action mismatch rejection");
-            assert_eq!(rejection.channel, "workflow.recovery_rejected");
-            assert_eq!(rejection.payload["workflow_id"], workflow_id);
-            assert_eq!(rejection.payload["action"], "reset_plan_lineage");
-            assert_eq!(
-                rejection.payload["rejection_code"],
-                "recovery_authorization_action_mismatch"
-            );
             assert!(rx.try_recv().is_err());
         }
 
@@ -19296,12 +19057,7 @@ mod tests {
             )
             .await
             .expect_err("lineage reset requires authorization");
-            assert_eq!(
-                missing,
-                WorkflowStoreError::RecoveryAuthorizationRequired {
-                    action: "reset_plan_lineage"
-                }
-            );
+            assert!(matches!(missing, WorkflowStoreError::GateNotReady(_)));
             assert_eq!(durable_state(&db, &workflow_id).await, before);
 
             let (authorization_id, _) =
@@ -19319,7 +19075,12 @@ mod tests {
             )
             .await
             .expect_err("changed displayed reason is stale");
-            assert_eq!(stale, WorkflowStoreError::RecoveryAuthorizationStale);
+            assert_eq!(
+                stale,
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
+            );
             assert_eq!(durable_state(&db, &workflow_id).await, before);
             assert_eq!(
                 load_authorization(&db, &authorization_id).await.status,
@@ -19348,7 +19109,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
             let header = load_header(&db, &workflow_id).await;
             let mut restored_plan: delegation_workflow::ActiveModel = header.into();
@@ -19390,7 +19153,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
             let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
                 workflow_id.clone(),
@@ -19438,7 +19203,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
             let author_binding = delegation_workflow_run_binding::Entity::find()
                 .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(workflow_id.clone()))
@@ -19485,7 +19252,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
             let settlement = delegation_workflow_gate_settlement::Entity::find_by_id((
                 workflow_id.clone(),
@@ -19507,19 +19276,12 @@ mod tests {
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
             );
-            let stale_rejections = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(stale_rejections.len(), 5);
-            for rejection in stale_rejections {
-                assert_eq!(rejection.channel, "workflow.recovery_rejected");
-                assert_eq!(rejection.payload["workflow_id"], workflow_id);
-                assert_eq!(rejection.payload["action"], "reset_plan_lineage");
-                assert_eq!(
-                    rejection.payload["rejection_code"],
-                    "recovery_authorization_stale"
-                );
-            }
+            assert!(
+                rx.try_recv().is_err(),
+                "legacy lineage-reset inputs must not emit recovery events"
+            );
 
-            let settled = settle_reset(
+            let error = settle_reset(
                 &db,
                 &emitter,
                 parent,
@@ -19531,157 +19293,32 @@ mod tests {
                 vec![],
             )
             .await
-            .expect("exact reason resets Plan lineage");
-            let after = durable_state(&db, &workflow_id).await;
-            let reset = after.settlements.last().expect("reset settlement");
-            let receipt = load_authorization(&db, &authorization_id).await;
+            .expect_err("fixed-v2 settlement rejects legacy lineage-reset authority");
             assert_eq!(
-                settled.plan_next_action,
-                Some(PlanReviewNextAction::Approved)
+                error,
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
-            assert_eq!(reset.revision_kind, Some(DbPlanRevisionKind::Initial));
+            assert_eq!(durable_state(&db, &workflow_id).await, before);
             assert_eq!(
-                reset.lineage_reset_authorization_id.as_deref(),
-                Some(authorization_id.as_str())
+                load_authorization(&db, &authorization_id).await.status,
+                RecoveryAuthorizationStatus::Approved
             );
-            assert_eq!(after.revisions.len(), before.revisions.len() + 1);
-            assert_eq!(
-                after
-                    .revisions
-                    .last()
-                    .unwrap()
-                    .recovery_authorization_id
-                    .as_deref(),
-                Some(authorization_id.as_str())
-            );
-            assert_eq!(receipt.status, RecoveryAuthorizationStatus::Consumed);
-            assert_eq!(
-                receipt.consumer_correlation_id.as_deref(),
-                Some(format!("plan_lineage_reset:{workflow_id}:plan:6").as_str())
-            );
-            let channels = std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| event.channel)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                channels,
-                vec![
-                    "workflow.recovery_decision",
-                    "workflow.recovery_confirmation_requested",
-                    "workflow.recovery_authorization_consumed",
-                    "workflow.state_only_revision_created",
-                    "workflow.plan_lineage_reset",
-                    "workflow.binding_reactivated",
-                    super::super::super::events::WORKFLOW_GRAPH_CHANGED_EVENT,
-                ]
-            );
+            assert!(rx.try_recv().is_err());
         }
 
         #[tokio::test]
-        async fn lineage_reset_can_atomically_end_estimated_or_approved_and_can_remain_blocked() {
-            for (suffix, outcome, findings, target, next_action) in [
-                (
-                    "approved",
-                    GateSettlementOutcome::Approved,
-                    vec![],
-                    ManifestWorkflowState::Approved,
-                    PlanReviewNextAction::Approved,
-                ),
-                (
-                    "estimated",
-                    GateSettlementOutcome::ChangesRequested,
-                    vec![finding(
-                        "F-reset-estimated",
-                        FindingSeverity::Important,
-                        FindingStatus::Open,
-                        &["plan-reviewer-1"],
-                    )],
-                    ManifestWorkflowState::Estimated,
-                    PlanReviewNextAction::ContinueReview,
-                ),
-                (
-                    "blocked",
-                    GateSettlementOutcome::Blocked,
-                    vec![finding(
-                        "F-reset-blocked",
-                        FindingSeverity::Important,
-                        FindingStatus::Open,
-                        &["plan-reviewer-1"],
-                    )],
-                    ManifestWorkflowState::Blocked,
-                    PlanReviewNextAction::ContinueReview,
-                ),
-            ] {
-                let token = format!("reset-outcome-{suffix}");
-                let reason = format!("requirements changed for {suffix}");
-                let (db, parent, workflow_id, emitter, mut rx) =
-                    plan_lineage_reset_fixture(&token).await;
-                insert_reset_reviewer_evidence(&db, parent, &workflow_id, &token).await;
-                let (authorization_id, _) =
-                    authorize_decision(&db, parent, &workflow_id, Some(&reason)).await;
-                let before = durable_state(&db, &workflow_id).await;
-                let settled = settle_reset(
-                    &db,
-                    &emitter,
-                    parent,
-                    &workflow_id,
-                    &token,
-                    &reason,
-                    Some(authorization_id.clone()),
-                    outcome,
-                    findings,
-                )
-                .await
-                .expect("commit lineage reset outcome");
-                let after = durable_state(&db, &workflow_id).await;
-                let revision = after.revisions.last().expect("reset state revision");
-                let settlement = after.settlements.last().expect("reset settlement");
-                let receipt = load_authorization(&db, &authorization_id).await;
-                assert_eq!(settled.plan_next_action, Some(next_action));
-                assert_eq!(after.header.workflow_state, manifest_state_to_db(target));
-                assert_eq!(after.revisions.len(), before.revisions.len() + 1);
-                assert_eq!(revision.revision_kind.as_deref(), Some("state_only"));
-                assert_eq!(
-                    revision.source_manifest_revision,
-                    Some(before.header.active_manifest_revision)
-                );
-                assert_eq!(
-                    revision.recovery_authorization_id.as_deref(),
-                    Some(authorization_id.as_str())
-                );
-                assert_eq!(
-                    settlement.lineage_reset_authorization_id.as_deref(),
-                    Some(authorization_id.as_str())
-                );
-                assert_eq!(receipt.status, RecoveryAuthorizationStatus::Consumed);
-                assert_eq!(
-                    receipt.consumed_by_id.as_deref(),
-                    Some(revision.manifest_revision.to_string().as_str())
-                );
-                if target == ManifestWorkflowState::Blocked {
-                    assert_eq!(revision.manifest_state, "blocked");
-                    assert_eq!(
-                        revision.transition_reason_code.as_deref(),
-                        Some(WorkflowBlockCause::PlanGateBlocked.as_str())
-                    );
-                }
-                let channels = std::iter::from_fn(|| rx.try_recv().ok())
-                    .map(|event| event.channel)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    channels.contains(&"workflow.binding_reactivated".to_string()),
-                    target != ManifestWorkflowState::Blocked
-                );
-            }
-
-            let token = "reset-atomic-rollback";
-            let reason = "requirements changed for rollback";
-            let (db, parent, workflow_id, emitter, _) = plan_lineage_reset_fixture(token).await;
+        async fn legacy_lineage_reset_receipt_is_read_only_under_fixed_v2() {
+            let token = "fixed-v2-read-only-reset";
+            let reason = "requirements changed after review";
+            let (db, parent, workflow_id, emitter, mut rx) =
+                plan_lineage_reset_fixture(token).await;
             insert_reset_reviewer_evidence(&db, parent, &workflow_id, token).await;
             let (authorization_id, _) =
                 authorize_decision(&db, parent, &workflow_id, Some(reason)).await;
             let before = durable_state(&db, &workflow_id).await;
-            set_inject_publish_persistence_failure(true);
-            let failed = settle_reset(
+            let error = settle_reset(
                 &db,
                 &emitter,
                 parent,
@@ -19692,14 +19329,20 @@ mod tests {
                 GateSettlementOutcome::Approved,
                 vec![],
             )
-            .await;
-            set_inject_publish_persistence_failure(false);
-            assert!(matches!(failed, Err(WorkflowStoreError::Persistence(_))));
+            .await
+            .expect_err("fixed-v2 settlement rejects legacy lineage-reset authority");
+            assert_eq!(
+                error,
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
+            );
             assert_eq!(durable_state(&db, &workflow_id).await, before);
             assert_eq!(
                 load_authorization(&db, &authorization_id).await.status,
                 RecoveryAuthorizationStatus::Approved
             );
+            assert!(rx.try_recv().is_err());
         }
 
         #[tokio::test]
@@ -19793,7 +19436,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
+                WorkflowStoreError::RecoveryAuthorizationRejected {
+                    code: "recovery_authorization_action_mismatch"
+                }
             );
             assert_eq!(
                 durable_state(&reset_db, &reset_workflow_id).await,
@@ -19915,68 +19560,6 @@ mod tests {
                     .filter(|event| event.channel.starts_with("workflow.")),
             );
 
-            let reset_reason = "private reset reason must never be emitted";
-            let reset_token = "production-reset-event-privacy";
-            let (reset_db, reset_parent, reset_workflow_id, reset_emitter, mut reset_rx) =
-                plan_lineage_reset_fixture(reset_token).await;
-            insert_reset_reviewer_evidence(
-                &reset_db,
-                reset_parent,
-                &reset_workflow_id,
-                reset_token,
-            )
-            .await;
-            let (reset_authorization_id, reset_decision) = authorize_decision(
-                &reset_db,
-                reset_parent,
-                &reset_workflow_id,
-                Some(reset_reason),
-            )
-            .await;
-            let reset_before_rejection = durable_state(&reset_db, &reset_workflow_id).await;
-            assert_eq!(
-                settle_reset(
-                    &reset_db,
-                    &reset_emitter,
-                    reset_parent,
-                    &reset_workflow_id,
-                    reset_token,
-                    "changed private reset reason",
-                    Some(reset_authorization_id.clone()),
-                    GateSettlementOutcome::Approved,
-                    vec![],
-                )
-                .await
-                .unwrap_err(),
-                WorkflowStoreError::RecoveryAuthorizationStale
-            );
-            assert_eq!(
-                durable_state(&reset_db, &reset_workflow_id).await,
-                reset_before_rejection
-            );
-            events.push(
-                reset_rx
-                    .try_recv()
-                    .expect("capture production lineage-reset rejection event"),
-            );
-            let reset_result = settle_reset(
-                &reset_db,
-                &reset_emitter,
-                reset_parent,
-                &reset_workflow_id,
-                reset_token,
-                reset_reason,
-                Some(reset_authorization_id.clone()),
-                GateSettlementOutcome::Approved,
-                vec![],
-            )
-            .await
-            .expect("capture committed lineage-reset events");
-            events.extend(
-                std::iter::from_fn(|| reset_rx.try_recv().ok())
-                    .filter(|event| event.channel.starts_with("workflow.")),
-            );
-
             let channels = events
                 .iter()
                 .map(|event| event.channel.as_str())
@@ -19990,13 +19573,6 @@ mod tests {
                     "workflow.state_only_revision_created",
                     "workflow.binding_reactivated",
                     "workflow.recovery_rejected",
-                    "workflow.recovery_rejected",
-                    "workflow.recovery_decision",
-                    "workflow.recovery_confirmation_requested",
-                    "workflow.recovery_authorization_consumed",
-                    "workflow.state_only_revision_created",
-                    "workflow.plan_lineage_reset",
-                    "workflow.binding_reactivated",
                 ]
             );
 
@@ -20105,29 +19681,6 @@ mod tests {
                     assert_eq!(value["action"], "recover_workflow");
                     assert_eq!(value["cause_code"], decision.cause_code.as_str());
                     assert_eq!(value["rejection_code"], "workflow_recovery_conflict");
-                } else if value["workflow_id"] == reset_workflow_id {
-                    let expected_graph_revision = if event.channel == "workflow.recovery_rejected" {
-                        reset_before_rejection.header.graph_revision as u64
-                    } else {
-                        reset_result.graph_revision
-                    };
-                    assert_eq!(value["graph_revision"], expected_graph_revision);
-                    if value.get("action").is_some() {
-                        assert_eq!(value["action"], "reset_plan_lineage");
-                    }
-                    if value.get("cause_code").is_some() {
-                        assert_eq!(value["cause_code"], reset_decision.cause_code.as_str());
-                    }
-                    if value.get("recovery_authorization_id").is_some() {
-                        assert_eq!(value["recovery_authorization_id"], reset_authorization_id);
-                    }
-                    if event.channel == "workflow.recovery_rejected" {
-                        assert_eq!(
-                            value["source_manifest_revision"],
-                            reset_before_rejection.header.active_manifest_revision
-                        );
-                        assert_eq!(value["rejection_code"], "recovery_authorization_stale");
-                    }
                 } else {
                     assert_eq!(value["workflow_id"], workflow_id);
                     assert_eq!(value["graph_revision"], recovered.graph_revision);

@@ -5883,9 +5883,13 @@ mod tests {
             plan_fingerprint: Set("plan-fingerprint".into()),
             block_cause_code: Set(None),
             block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(
+                crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
+            ),
+            legacy_source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
-            ..Default::default()
         }
         .insert(&db.conn)
         .await
@@ -5978,14 +5982,16 @@ mod tests {
             let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
             let store = RunStore::new(db.clone());
             seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, role, phase).await;
-            store
-                .settle_terminal(
-                    task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                        .with_card_summary_json(summary),
-                )
-                .await
-                .expect("settle role-aware summary");
+            on_terminal_settle_txn(
+                &db.conn,
+                task_id,
+                parent_id,
+                Some(summary),
+                &DelegationRunStatus::Completed,
+                None,
+            )
+            .await
+            .expect("project role-aware summary");
             let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
                 task_id.to_string(),
             )
@@ -6021,14 +6027,16 @@ mod tests {
             let store = RunStore::new(db.clone());
             seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "reviewer", phase)
                 .await;
-            store
-                .settle_terminal(
-                    task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                        .with_card_summary_json(summary),
-                )
-                .await
-                .expect("settle reviewer with blank report path");
+            on_terminal_settle_txn(
+                &db.conn,
+                task_id,
+                parent_id,
+                Some(summary),
+                &DelegationRunStatus::Completed,
+                None,
+            )
+            .await
+            .expect("project reviewer with blank report path");
             let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
                 task_id.to_string(),
             )
@@ -6050,16 +6058,18 @@ mod tests {
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let store = RunStore::new(db.clone());
         seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "author", "plan").await;
-        store
-            .settle_terminal(
-                task_id,
-                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                    .with_card_summary_json(
-                        r#"{"kind":"author","status":"done","summary":"authored","plan_digest":"sha256:author-plan","report_file":"reports/author.md"}"#,
-                    ),
-            )
-            .await
-            .unwrap();
+        on_terminal_settle_txn(
+            &db.conn,
+            task_id,
+            parent_id,
+            Some(
+                r#"{"kind":"author","status":"done","summary":"authored","plan_digest":"sha256:author-plan","report_file":"reports/author.md"}"#,
+            ),
+            &DelegationRunStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap();
         let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
             task_id.to_string(),
         )

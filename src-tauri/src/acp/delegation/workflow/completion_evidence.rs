@@ -4598,16 +4598,19 @@ mod tests {
     #[tokio::test]
     async fn typed_completion_attention_design_self_review_is_typed_and_replayable() {
         let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
-        delegation_workflow_gate_state::ActiveModel {
-            workflow_id: Set(fixture.workflow_id.clone()),
-            gate_id: Set("design".into()),
-            gate_lineage: Set("design-lineage-1".into()),
-            current_review_round: Set(1),
-            selected_node_ids_json: Set(r#"["design-reviewer"]"#.into()),
-        }
-        .insert(&fixture.db.conn)
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            fixture.workflow_id.clone(),
+            "design".to_string(),
+        ))
+        .one(&fixture.db.conn)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("fixed-v2 publication initializes Design gate state");
+        let mut state: delegation_workflow_gate_state::ActiveModel = state.into();
+        state.gate_lineage = Set("design-lineage-1".into());
+        state.current_review_round = Set(1);
+        state.selected_node_ids_json = Set(r#"["design-reviewer"]"#.into());
+        state.update(&fixture.db.conn).await.unwrap();
         let binding = delegation_workflow_design_root_binding::ActiveModel {
             workflow_id: Set(fixture.workflow_id.clone()),
             gate_id: Set("design".into()),

@@ -139,7 +139,7 @@ pub use store::{
 };
 #[cfg(test)]
 use store::{
-    settle_workflow_gate_from_derived_test_input as settle_workflow_gate_core, SettleGateEvidence,
+    settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core, SettleGateEvidence,
     SettleWorkflowRequest,
 };
 pub use types::*;

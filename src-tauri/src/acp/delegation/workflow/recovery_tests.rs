@@ -16,11 +16,14 @@ use crate::acp::recovery_authorization::{
     RecoveryAuthorizationService, RecoveryAuthorizationStore, RecoveryChallenge,
     RecoverySubjectKind, RECOVERY_APPROVE_LABEL,
 };
-use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+use crate::db::entities::delegation_task_run::{
+    AdmissionClass, CompletionState, DelegationRunStatus,
+};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 use crate::db::entities::{
-    delegation_task_run, delegation_workflow, delegation_workflow_manifest_revision,
-    delegation_workflow_node_binding, delegation_workflow_run_binding, recovery_authorization,
+    delegation_task_run, delegation_workflow, delegation_workflow_gate_state,
+    delegation_workflow_manifest_revision, delegation_workflow_node_binding,
+    delegation_workflow_run_binding, recovery_authorization,
 };
 use crate::db::service::conversation_service;
 use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -39,12 +42,9 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
     // revision/header = 8/blocked
     // Plan digest = sha256:77fca1481d57395b3b7fe090be2d116e647f6275e303895b0b88e7ad4428d4b5
     let db = fresh_in_memory_db().await;
-    let parent = seed_conversation(
-        &db,
-        seed_folder(&db, "/tmp/session-2566-parent").await,
-        AgentType::Codex,
-    )
-    .await;
+    let workspace = session_2566_workspace();
+    let parent_folder = seed_folder(&db, workspace.to_str().unwrap()).await;
+    let parent = seed_conversation(&db, parent_folder, AgentType::Codex).await;
     let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
     let published = publish_workflow_manifest_core(
         &db,
@@ -119,7 +119,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
                 scope: PlanReviewScope::Full,
                 revision_kind: PlanRevisionKind::Initial,
                 scope_reason: "reconstructed session-2566 approval".into(),
-                covered_author_task_id: "session-2566-author".into(),
+                covered_author_task_id: author_task_id.into(),
                 covered_plan_digest: SESSION_2566_PLAN_DIGEST.into(),
                 required_reviewer_node_ids: vec![
                     "plan-reviewer-1".into(),
@@ -133,11 +133,8 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
         },
     )
     .await
-    .expect("current Plan evidence approves cycle one");
-
+    .expect("current fixed-v2 Plan evidence approves cycle one");
     assert_eq!(settled.outcome, GateSettlementOutcome::Approved);
-    assert_eq!(settled.critical_count, 0);
-    assert_eq!(settled.important_count, 0);
 
     append_session_revisions(&db, &workflow_id).await;
     let blocked_header = load_header(&db, &workflow_id).await;
@@ -269,12 +266,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
         recovery_authorization::RecoveryAuthorizationStatus::Consumed
     );
 
-    let task_child = seed_conversation(
-        &db,
-        seed_folder(&db, "/tmp/session-2566-task-1").await,
-        AgentType::Grok,
-    )
-    .await;
+    let task_child = seed_conversation(&db, parent_folder, AgentType::Grok).await;
     insert_unbound_run(
         &db,
         parent,
@@ -300,7 +292,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
             generation: 1,
             kind: AdmissionDispatchKind::FirstDispatch,
             admission_class: AdmissionClass::NormalRevision,
-            workspace_path: None,
+            workspace_path: workspace.to_str(),
         },
     )
     .await
@@ -466,8 +458,45 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
 }
 
 const SESSION_2566_WORKFLOW_ID: &str = "afd89cd7-5df0-49d9-8a40-1d2c95791cbd";
+const SESSION_2566_DESIGN_BYTES: &[u8] = b"# Design\n";
+const SESSION_2566_PLAN_BYTES: &[u8] =
+    b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n";
+const SESSION_2566_DESIGN_DIGEST: &str =
+    "sha256:2c1f01e37a150fd02e10dd63ce8a268c168a68813b40f16f18c3430319073ce6";
 const SESSION_2566_PLAN_DIGEST: &str =
-    "sha256:77fca1481d57395b3b7fe090be2d116e647f6275e303895b0b88e7ad4428d4b5";
+    "sha256:d4ca4b7928291f3ad8cc2dcb8845ee50f6ad12a3ea138769740fe28d247bcbd7";
+
+fn session_2566_workspace() -> std::path::PathBuf {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let design_path = workspace.join("docs/superpowers/specs/session-2566.md");
+    let plan_path = workspace.join("docs/superpowers/plans/session-2566.md");
+    std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+    std::fs::write(design_path, SESSION_2566_DESIGN_BYTES).unwrap();
+    std::fs::write(plan_path, SESSION_2566_PLAN_BYTES).unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Codeg Test",
+            "-c",
+            "user.email=codeg@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture git command failed");
+    }
+    workspace
+}
 
 async fn load_header(db: &crate::db::AppDatabase, workflow_id: &str) -> delegation_workflow::Model {
     delegation_workflow::Entity::find_by_id(workflow_id.to_string())
@@ -488,6 +517,7 @@ async fn rename_workflow_id(db: &crate::db::AppDatabase, initial: &str) -> Strin
     for table in [
         "delegation_workflow_node_bindings",
         "delegation_workflow_manifest_revisions",
+        "delegation_workflow_gate_states",
         "delegation_workflows",
     ] {
         db.conn
@@ -514,7 +544,7 @@ async fn insert_plan_run(
     agent_type: &str,
     reviewed_task_id: Option<&str>,
     observed: bool,
-    summary: serde_json::Value,
+    _summary: serde_json::Value,
 ) {
     let child = seed_conversation(
         db,
@@ -530,6 +560,25 @@ async fn insert_plan_run(
     .await
     .expect("load Plan binding")
     .expect("Plan binding");
+    if binding.role == "reviewer" {
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            workflow_id.to_string(),
+            "plan".to_string(),
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut selected: Vec<String> =
+            serde_json::from_str(&state.selected_node_ids_json).unwrap();
+        if !selected.iter().any(|selected| selected == node_id) {
+            selected.push(node_id.to_string());
+            selected.sort();
+        }
+        let mut state = state.into_active_model();
+        state.selected_node_ids_json = Set(serde_json::to_string(&selected).unwrap());
+        state.update(&db.conn).await.unwrap();
+    }
     insert_unbound_run(
         db,
         parent,
@@ -541,6 +590,30 @@ async fn insert_plan_run(
         AdmissionClass::NormalRevision,
     )
     .await;
+    let run = delegation_task_run::Entity::find_by_id(task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace_path = run.workspace_path.clone().unwrap();
+    admit_workflow_run_txn(
+        &db.conn,
+        &WorkflowAdmitInput {
+            parent_conversation_id: parent,
+            child_conversation_id: child,
+            task_id,
+            work_unit_key: Some(&binding.work_unit_key),
+            agent_type,
+            profile_id: binding.profile_id.as_deref(),
+            lineage_root_task_id: task_id,
+            generation: 1,
+            kind: AdmissionDispatchKind::FirstDispatch,
+            admission_class: AdmissionClass::NormalRevision,
+            workspace_path: Some(&workspace_path),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("admit {task_id}: {error:?}"));
     let now = Utc::now();
     let mut run = delegation_task_run::Entity::find_by_id(task_id.to_string())
         .one(&db.conn)
@@ -550,28 +623,26 @@ async fn insert_plan_run(
         .into_active_model();
     run.status = Set(DelegationRunStatus::Completed);
     run.finished_at = Set(Some(now));
-    run.card_summary_json = Set(Some(summary.to_string()));
+    run.reached_running_at = Set(Some(now));
+    run.card_summary_json = Set(None);
     run.update(&db.conn).await.expect("complete Plan run");
-    delegation_workflow_run_binding::ActiveModel {
-        task_id: Set(task_id.to_string()),
-        workflow_id: Set(workflow_id.to_string()),
-        node_id: Set(node_id.to_string()),
-        gate_id: Set(Some("plan".into())),
-        gate_cycle: Set(Some(1)),
-        manifest_revision: Set(1),
-        content_fingerprint: Set(Some(load_header(db, workflow_id).await.plan_fingerprint)),
-        artifact_digest: Set(Some(SESSION_2566_PLAN_DIGEST.into())),
-        reviewed_task_id: Set(reviewed_task_id.map(str::to_string)),
-        reviewed_implementer_generation: Set(None),
-        lineage_ordinal: Set(1),
-        summary_validated: Set(true),
-        created_at: Set(now),
-        updated_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&db.conn)
+    let completion = materialize_terminal_completion_txn(
+        &db.conn,
+        TerminalCompletionInput {
+            task_id: task_id.to_string(),
+            terminal_status: DelegationRunStatus::Completed,
+            final_assistant_text: if reviewed_task_id.is_some() {
+                "Conclusion: approve".into()
+            } else {
+                "Conclusion: done".into()
+            },
+            pre_read_reports: Vec::new(),
+            pre_read_artifact: None,
+        },
+    )
     .await
-    .expect("insert Plan run binding");
+    .unwrap_or_else(|error| panic!("materialize {task_id}: {error:?}"));
+    assert_eq!(completion.state, CompletionState::Resolved);
     if observed {
         let mut binding = binding.into_active_model();
         binding.is_observed = Set(true);
@@ -594,6 +665,17 @@ async fn insert_unbound_run(
     admission_class: AdmissionClass,
 ) {
     let now = Utc::now();
+    let parent_row = crate::db::entities::conversation::Entity::find_by_id(parent)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace_path = crate::db::entities::folder::Entity::find_by_id(parent_row.folder_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap()
+        .path;
     delegation_task_run::ActiveModel {
         task_id: Set(task_id.to_string()),
         root_task_id: Set(root_task_id.to_string()),
@@ -604,7 +686,7 @@ async fn insert_unbound_run(
         child_conversation_id: Set(child),
         agent_type: Set(agent_type.into()),
         profile_id: Set(None),
-        workspace_path: Set(Some("/tmp/session-2566".into())),
+        workspace_path: Set(Some(workspace_path)),
         route_fingerprint: Set(Some("session-2566-route".into())),
         launch_snapshot_version: Set(Some("v1".into())),
         mode_id: Set(None),
@@ -1017,7 +1099,7 @@ fn session_2566_document() -> ManifestDocument {
         workflow_state: ManifestWorkflowState::Estimated,
         design: Some(DocumentRef {
             rel_path: "docs/superpowers/specs/session-2566.md".into(),
-            digest: "sha256:session-2566-design".into(),
+            digest: SESSION_2566_DESIGN_DIGEST.into(),
         }),
         plan: Some(DocumentRef {
             rel_path: "docs/superpowers/plans/session-2566.md".into(),
