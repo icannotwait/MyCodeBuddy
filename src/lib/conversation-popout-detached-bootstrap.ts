@@ -37,42 +37,78 @@ export function parseConversationRouteAgentType(
   return CUSTOM_AGENT_ID_PATTERN.test(customId) ? (raw as AgentType) : null
 }
 
-export type ParsedPopoutQuery = {
-  conversationId: number
-  folderId: number
-  agentType: AgentType
-  operationId: string
-}
+export type ParsedConversationRoute =
+  | {
+      kind: "desktop"
+      conversationId: number
+      folderId: number
+      agentType: AgentType
+      operationId: string
+    }
+  | {
+      kind: "web"
+      conversationId: number
+      folderId: number
+      agentType: AgentType
+    }
 
-export function parseAgentType(
-  raw: string | null | undefined
-): AgentType | null {
-  return parseConversationRouteAgentType(raw)
-}
+export type ConversationRouteMode =
+  | "desktop"
+  | "web"
+  | "invalid"
+  | "unsupported"
 
 export function parseConversationPopoutQuery(args: {
   conversationId: string | null
   folderId: string | null
   agentType: string | null
   operationId: string | null
-}): ParsedPopoutQuery | null {
+  mode: string | null
+}): ParsedConversationRoute | null {
   const conversationId = Number(args.conversationId ?? "0")
   const folderId = Number(args.folderId ?? "0")
-  const agentType = parseAgentType(args.agentType)
-  const operationId = args.operationId ?? ""
+  const agentType = parseConversationRouteAgentType(args.agentType)
 
   if (
-    !Number.isFinite(conversationId) ||
+    !Number.isSafeInteger(conversationId) ||
     conversationId <= 0 ||
-    !Number.isFinite(folderId) ||
+    !Number.isSafeInteger(folderId) ||
     folderId <= 0 ||
-    !agentType ||
-    operationId.length === 0
+    !agentType
   ) {
     return null
   }
 
-  return { conversationId, folderId, agentType, operationId }
+  if (args.mode === "web") {
+    return { kind: "web", conversationId, folderId, agentType }
+  }
+  if (args.mode !== null) {
+    return null
+  }
+
+  const operationId = args.operationId?.trim() ?? ""
+  if (operationId.length === 0) {
+    return null
+  }
+  return {
+    kind: "desktop",
+    conversationId,
+    folderId,
+    agentType,
+    operationId,
+  }
+}
+
+export function resolveConversationRouteMode(args: {
+  route: ParsedConversationRoute | null
+  isDesktop: boolean
+  isLocalDesktop: boolean
+}): ConversationRouteMode {
+  if (!args.route) return "invalid"
+  if (args.route.kind === "web") {
+    return args.isDesktop ? "unsupported" : "web"
+  }
+  return args.isLocalDesktop ? "desktop" : "unsupported"
 }
 
 export function conversationWindowLabel(conversationId: number): string {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { ALL_AGENT_TYPES } from "@/lib/types"
+import { buildWebConversationPopoutUrl } from "@/lib/conversation-popout"
 import {
   buildReadyPayload,
   claimResultMatchesRebind,
@@ -11,6 +12,7 @@ import {
   isHandoffCompletePhase,
   parseConversationRouteAgentType,
   parseConversationPopoutQuery,
+  resolveConversationRouteMode,
   resolveDetachedConnectGate,
   shouldClearSuppressOnDetachedCommitAck,
   shouldClearSuppressOnDetachedUnmount,
@@ -48,32 +50,157 @@ describe("FOCUS_COMPOSER_EVENT", () => {
 })
 
 describe("parseConversationPopoutQuery", () => {
-  it("returns null for missing operationId", () => {
-    expect(
-      parseConversationPopoutQuery({
-        conversationId: "1",
-        folderId: "2",
-        agentType: "claude_code",
-        operationId: "",
-      })
-    ).toBeNull()
-  })
+  const shared = {
+    conversationId: "42",
+    folderId: "7",
+    agentType: "codex",
+  }
 
-  it("parses valid query params", () => {
+  it("parses a valid desktop route with a required operationId", () => {
     expect(
       parseConversationPopoutQuery({
-        conversationId: "42",
-        folderId: "7",
-        agentType: "codex",
+        ...shared,
         operationId: "op-1",
+        mode: null,
       })
     ).toEqual({
+      kind: "desktop",
       conversationId: 42,
       folderId: 7,
       agentType: "codex",
       operationId: "op-1",
     })
   })
+
+  it("parses mode=web and ignores operationId", () => {
+    expect(
+      parseConversationPopoutQuery({
+        ...shared,
+        operationId: "ignored-desktop-token",
+        mode: "web",
+      })
+    ).toEqual({
+      kind: "web",
+      conversationId: 42,
+      folderId: 7,
+      agentType: "codex",
+    })
+  })
+
+  it("round trips custom:goose from the web URL builder through the parser", () => {
+    const built = new URL(
+      buildWebConversationPopoutUrl({
+        conversationId: 42,
+        folderId: 7,
+        agentType: "custom:goose",
+      }),
+      "http://codeg.test"
+    )
+
+    expect(
+      parseConversationPopoutQuery({
+        conversationId: built.searchParams.get("conversationId"),
+        folderId: built.searchParams.get("folderId"),
+        agentType: built.searchParams.get("agentType"),
+        operationId: built.searchParams.get("operationId"),
+        mode: built.searchParams.get("mode"),
+      })
+    ).toEqual({
+      kind: "web",
+      conversationId: 42,
+      folderId: 7,
+      agentType: "custom:goose",
+    })
+  })
+
+  it("rejects a web-shaped query that omitted mode=web", () => {
+    expect(
+      parseConversationPopoutQuery({
+        ...shared,
+        operationId: null,
+        mode: null,
+      })
+    ).toBeNull()
+  })
+
+  it.each([
+    { conversationId: "0", folderId: "7", agentType: "codex" },
+    { conversationId: "1.5", folderId: "7", agentType: "codex" },
+    { conversationId: "42", folderId: "-1", agentType: "codex" },
+    { conversationId: "42", folderId: "7.5", agentType: "codex" },
+    { conversationId: "42", folderId: "7", agentType: "unknown" },
+    { conversationId: "42", folderId: "7", agentType: "custom:" },
+    { conversationId: "42", folderId: "7", agentType: "custom:.hidden" },
+    { conversationId: "42", folderId: "7", agentType: "custom:Goose" },
+    { conversationId: "42", folderId: "7", agentType: "custom:a/b" },
+    {
+      conversationId: "42",
+      folderId: "7",
+      agentType: `custom:${"a".repeat(65)}`,
+    },
+  ])("rejects invalid shared fields: %o", (invalid) => {
+    expect(
+      parseConversationPopoutQuery({
+        ...invalid,
+        operationId: null,
+        mode: "web",
+      })
+    ).toBeNull()
+  })
+
+  it("rejects whitespace desktop operation ids and unknown modes", () => {
+    expect(
+      parseConversationPopoutQuery({
+        ...shared,
+        operationId: "   ",
+        mode: null,
+      })
+    ).toBeNull()
+    expect(
+      parseConversationPopoutQuery({
+        ...shared,
+        operationId: null,
+        mode: "desktop",
+      })
+    ).toBeNull()
+  })
+})
+
+describe("resolveConversationRouteMode", () => {
+  const desktopRoute = {
+    kind: "desktop" as const,
+    conversationId: 42,
+    folderId: 7,
+    agentType: "codex" as const,
+    operationId: "op-1",
+  }
+  const webRoute = {
+    kind: "web" as const,
+    conversationId: 42,
+    folderId: 7,
+    agentType: "codex" as const,
+  }
+
+  it.each([
+    [desktopRoute, true, true, "desktop"],
+    [webRoute, false, false, "web"],
+    [desktopRoute, false, false, "unsupported"],
+    [webRoute, true, true, "unsupported"],
+    [desktopRoute, true, false, "unsupported"],
+    [webRoute, true, false, "unsupported"],
+    [null, false, false, "invalid"],
+  ] as const)(
+    "routes %o for desktop=%s local=%s as %s",
+    (route, desktop, localDesktop, expected) => {
+      expect(
+        resolveConversationRouteMode({
+          route,
+          isDesktop: desktop,
+          isLocalDesktop: localDesktop,
+        })
+      ).toBe(expected)
+    }
+  )
 })
 
 describe("resolveDetachedConnectGate (claim-before-activate)", () => {

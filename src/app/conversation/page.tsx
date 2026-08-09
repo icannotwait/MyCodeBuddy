@@ -26,6 +26,7 @@ import {
   isAbortedPhase,
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
+  resolveConversationRouteMode,
   resolveDetachedConnectGate,
   shouldMountDetachedSurface,
   shouldReverseRebindAfterLiveFailure,
@@ -34,7 +35,7 @@ import {
   claimConnectionOwnership,
   setSuppressFrontendDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
-import { isLocalDesktop, subscribe } from "@/lib/platform"
+import { isDesktop, isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType, DbConversationDetail, FolderDetail } from "@/lib/types"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import {
@@ -49,7 +50,7 @@ const TOAST_DURATION_MS = 6000
 const COMMIT_ACK_POLL_MS = 750
 const COMMIT_ACK_POLL_MAX_MS = 30_000
 
-function ConversationPageInner() {
+export function ConversationPageInner() {
   const t = useTranslations("ConversationPopout")
   const searchParams = useSearchParams()
   const localDesktop = isLocalDesktop()
@@ -61,9 +62,16 @@ function ConversationPageInner() {
         folderId: searchParams.get("folderId"),
         agentType: searchParams.get("agentType"),
         operationId: searchParams.get("operationId"),
+        mode: searchParams.get("mode"),
       }),
     [searchParams]
   )
+  const desktop = isDesktop()
+  const routeMode = resolveConversationRouteMode({
+    route: parsed,
+    isDesktop: desktop,
+    isLocalDesktop: localDesktop,
+  })
 
   const [conversation, setConversation] = useState<DbConversationDetail | null>(
     null
@@ -76,22 +84,21 @@ function ConversationPageInner() {
   const [tabId, setTabId] = useState<string | null>(null)
   const [readyEmitted, setReadyEmitted] = useState(false)
 
-  const valid = parsed != null
   const conversationId = parsed?.conversationId ?? 0
   const folderId = parsed?.folderId ?? 0
   const agentType: AgentType | null = parsed?.agentType ?? null
 
-  // Local-desktop boundary: reject browser / remote workspace before any
-  // metadata or ACP work. Menu gates are not enough for a static route.
   useEffect(() => {
-    if (!localDesktop) {
+    if (routeMode === "unsupported") {
       setError(t("localDesktopOnly"))
     }
-  }, [localDesktop, t])
+  }, [routeMode, t])
 
   // 1–2: Load conversation + folder metadata
   useEffect(() => {
-    if (!parsed || !localDesktop) return
+    if (!parsed || (routeMode !== "desktop" && routeMode !== "web")) {
+      return
+    }
     let cancelled = false
     ;(async () => {
       try {
@@ -113,6 +120,9 @@ function ConversationPageInner() {
           title: c.summary.title ?? undefined,
         })
         setTabId(seededTabId)
+        if (parsed.kind === "web") {
+          setBootstrapReady(true)
+        }
       } catch (err) {
         if (!cancelled) {
           setConversation(null)
@@ -124,13 +134,14 @@ function ConversationPageInner() {
     return () => {
       cancelled = true
     }
-  }, [parsed, localDesktop])
+  }, [parsed, routeMode])
 
   // 3–5: Claim/rebind (live) or cold gate; emit ready only on success; suppress until ack
   useEffect(() => {
     if (
       !parsed ||
-      !localDesktop ||
+      parsed.kind !== "desktop" ||
+      routeMode !== "desktop" ||
       !conversation ||
       !folder ||
       !tabId ||
@@ -329,11 +340,19 @@ function ConversationPageInner() {
     return () => {
       cancelled = true
     }
-  }, [parsed, conversation, folder, tabId, readyEmitted, localDesktop, t])
+  }, [parsed, conversation, folder, tabId, readyEmitted, routeMode, t])
 
   // Commit-ack listener + poll fallback
   useEffect(() => {
-    if (!parsed || !bootstrapReady || commitAcked) return
+    if (
+      !parsed ||
+      parsed.kind !== "desktop" ||
+      routeMode !== "desktop" ||
+      !bootstrapReady ||
+      commitAcked
+    ) {
+      return
+    }
     let cancelled = false
     let unsub: (() => void) | null = null
     let pollTimer: ReturnType<typeof setInterval> | null = null
@@ -383,17 +402,18 @@ function ConversationPageInner() {
       unsub?.()
       if (pollTimer) clearInterval(pollTimer)
     }
-  }, [parsed, bootstrapReady, commitAcked])
+  }, [parsed, routeMode, bootstrapReady, commitAcked])
 
   // Intentionally no unmount clear of suppress: parent cleanup runs before
   // descendants; clearing would let useConnectionLifecycle bare-acpDisconnect.
   // Suppress dies with the JS context when the detached window process exits.
 
-  const gate = resolveDetachedConnectGate({
+  const desktopGate = resolveDetachedConnectGate({
     bootstrapReady,
     isLivePath,
     commitAcked,
   })
+  const isActive = routeMode === "web" ? bootstrapReady : desktopGate.isActive
 
   const title = useMemo(() => {
     if (!conversation) return t("title")
@@ -405,13 +425,16 @@ function ConversationPageInner() {
   }, [title])
 
   const workingDir = folder?.path
-  const showSurface = shouldMountDetachedSurface({
-    valid: valid && localDesktop,
-    hasError: Boolean(error),
-    bootstrapReady,
-    readyEmitted,
-    isActive: gate.isActive,
-  })
+  const showSurface =
+    routeMode === "web"
+      ? !error && bootstrapReady && tabId != null
+      : shouldMountDetachedSurface({
+          valid: routeMode === "desktop",
+          hasError: Boolean(error),
+          bootstrapReady,
+          readyEmitted,
+          isActive: desktopGate.isActive,
+        })
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
@@ -421,11 +444,11 @@ function ConversationPageInner() {
         }
       />
       <main className="flex min-h-0 flex-1 flex-col">
-        {!localDesktop ? (
+        {routeMode === "unsupported" ? (
           <div className="m-3 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {t("localDesktopOnly")}
           </div>
-        ) : !valid ? (
+        ) : routeMode === "invalid" ? (
           <div className="m-3 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {t("invalidParams")}
           </div>
@@ -448,10 +471,12 @@ function ConversationPageInner() {
                 folderId={folderId}
                 agentType={agentType!}
                 workingDir={workingDir}
-                isActive={gate.isActive}
+                isActive={isActive}
                 showActiveFlow={false}
                 reloadSignal={0}
-                ownerOperationId={parsed?.operationId ?? null}
+                ownerOperationId={
+                  parsed?.kind === "desktop" ? parsed.operationId : null
+                }
               />
             </div>
           </>
