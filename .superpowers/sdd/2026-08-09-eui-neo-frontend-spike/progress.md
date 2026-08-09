@@ -366,3 +366,28 @@ task_id=f4d869a8-62b0-4805-8499-5fd8e0c285a8
 
 ### SDD path
 `.superpowers/sdd/2026-08-09-eui-neo-frontend-spike/` (force-added for portability)
+
+## Task 6: complete (local closeout)
+- implementer: DONE_WITH_CONCERNS (48e083d7 lineage)
+- dual review: codex+grok approve_with_minors (local implementer path after platform cancel)
+- full cargo: skipped by parent
+
+## Tasks 7–9: complete
+- commit: f14e195a feat(eui): complete native shell, M5 recovery, and perf protocol
+- contracts CTest: 10/10
+- vitest comparison recorder: 2/2
+- perf_compare self-test: pass
+- full cargo / native build.sh: skipped (parent + host OOM)
+
+## Task 10: complete
+- allowlist clean vs ac1e38d5
+- submodule pin cb70ea8bea… verified
+- report: task-10-report.md
+
+## Task 11: complete (DONE_WITH_CONCERNS)
+- final-delivery-report.md written
+- residual: full cargo, dual-agent live E2E, live perf capture
+
+## Workflow terminal intent
+- All plan tasks 1–11 closed under parent SKIP full cargo policy
+- conversation 019fe409-04f4-7a82-ac2e-f7fc1b23a01a remaining implementation work finished on branch
