@@ -189,16 +189,55 @@ The following production operations require the guard:
 - publishing a revision to an existing workflow;
 - settling any workflow gate;
 - recovering a workflow;
+- preparing recovery authorization for a workflow subject, or for a
+  delegation-task subject that has a workflow run binding (before inserting or
+  reusing authorization rows, opening questions, or binding UI attention);
 - resolving completion decisions or Design self-review decisions;
 - retrying or resolving completion artifacts;
 - final-delivery guards and other completion mutations;
 - first dispatch of a workflow work unit;
-- continuing or replacing a workflow child; and
-- terminal semantic completion and gate reduction.
+- continuing or replacing a workflow child;
+- terminal semantic completion and gate reduction; and
+- every linked non-delegation root prompt admission for a conversation that
+  owns or is bound to a workflow (foreground, automation, and chat-channel
+  paths; newly attached and already attached sessions).
 
 For delegation operations, the check occurs before budget authorization,
 reservation insertion, child-process creation, or MCP injection. A historical
 v1 work-unit key cannot start a new child.
+
+### Root Prompt Admission Fence
+
+Removing `restart_legacy_workflow_if_enforced` must not leave a silent resume
+path for historical v1 roots. Every linked non-delegation root prompt path
+(manager foreground, automation engine, chat-channel commands, and their
+Tauri/Axum entry points) must load any workflow header at the current
+pre-side-effect fence and call `require_v2_mutation` before any prompt,
+transcript, status, route, process, or restart-context side effect.
+
+| Header state | Admission result |
+| --- | --- |
+| No workflow linked | Existing non-workflow prompt behavior (unchanged) |
+| `(2, v2_enforce)` | Proceed with the normal prompt path |
+| version `1` (including historical `v1` / `v2_shadow` modes) | Fail closed with `legacy_completion_protocol_read_only` |
+| unknown / inconsistent / corrupt pair | Fail closed with `unsupported_completion_protocol` |
+
+A failed root admission performs no prompt enqueue, no transcript append, no
+automation route advance, no restart, no restart-context capture, and no
+workflow mutation. The user continues the subject only by starting an explicit
+new conversation, which creates an unrelated v2 workflow through the normal
+creation path. Hiding workflow UI buttons is not a substitute for this fence.
+
+### Recovery Authorization Fence
+
+`request_recovery_authorization` is a public write surface distinct from
+`recover_workflow` and continue/replace. For a workflow subject, and for a
+delegation-task subject that has a workflow run binding, the guard runs before
+`RecoveryAuthorizationService::prepare` inserts or reuses a pending
+authorization row, registers a user question, or opens attention. A historical
+v1 or unsupported target returns the stable protocol error with no durable
+authorization or question mutation. Unbound standalone delegation tasks keep
+existing recovery-authorization behavior.
 
 Infrastructure reconciliation may still close an abandoned process/run for
 host consistency, but it cannot parse v1 completion output, write semantic
@@ -215,19 +254,35 @@ The following read behavior remains supported:
 - existing `legacy_source` and `v2_successor` links; and
 - normal explicit deletion of a conversation and its dependent data.
 
-Every v1 workflow projection sets:
+Every v1 workflow projection sets the full post-change completion-protocol
+object:
 
 ```json
 {
   "completion_protocol": {
     "version": 1,
-    "read_only_reason": "legacy_completion_protocol_read_only"
+    "mode": "<persisted mode: v1 or v2_shadow>",
+    "creation_mode": "<persisted creation mode when recorded; otherwise omitted>",
+    "read_only_reason": "legacy_completion_protocol_read_only",
+    "automatic_root_wake": false
   }
 }
 ```
 
-The read-only reason no longer depends on whether a successor exists. Existing
-successor links remain navigable, but no new successor is created.
+Rules for residual projection fields after restart removal:
+
+- `version` and `mode` remain for historical fidelity and must match the
+  persisted header (never rewritten).
+- `read_only_reason` is always
+  `legacy_completion_protocol_read_only` for every v1 workflow and no longer
+  depends on whether a successor exists.
+- `automatic_root_wake` is forced `false` for v1 (and must never enable a
+  resume/restart control). For writable v2 workflows the existing v2
+  attention-driven root-wake behavior is unchanged.
+- Existing `legacy_source` and `v2_successor` relationship links remain
+  navigable when already persisted; no new successor is created.
+- Restart-only controls, restart DTOs, and successor-creation payloads are
+  absent from the projection and UI.
 
 The UI shows the historical read-only notice and existing relationship links.
 It does not show restart, resume, settle, recovery, or other workflow action
@@ -242,12 +297,21 @@ All write surfaces for legacy restart are removed:
 - Tauri command;
 - Axum route and handler;
 - frontend API and web-transport command mapping;
-- workflow overlay restart button and callback; and
-- automatic restart checks before publish, settle, recover, or delegation.
+- workflow overlay restart button and callback;
+- automatic restart checks before publish, settle, recover, or delegation;
+- the root prompt auto-restart fence
+  (`restart_legacy_workflow_if_enforced`) and its replacement is the root
+  admission fence above; and
+- production writers that capture or backfill restart context
+  (`capture_original_request_context` and related helpers).
 
-The historical restart tables, context rows, `legacy_source_workflow_id`
-column, projection fields, and read queries remain because already-created
-links must still render.
+The historical restart tables, already-persisted context rows,
+`legacy_source_workflow_id` column, relationship projection fields, and read
+queries remain because already-created links must still render. Production
+code must not insert new restart-context rows. Restart-only DTOs, structured
+errors that carry `successor_conversation_id`, and restart-outcome metrics
+fields are deleted; only the read projection needed for existing links and
+context remains.
 
 ## V2-Only Public Tool Schemas
 
@@ -320,6 +384,33 @@ The following protocol-v2 inputs remain ordered and supported:
 These channels all produce v2 platform-generated evidence and are not v1
 fallbacks.
 
+### Terminal Fail-Closed Host Surface
+
+When a workflow-bound terminal cannot proceed under the v2 contract, the host
+disposition is typed and non-semantic:
+
+| Case | Host run/task status | Semantic writes | Retry rail |
+| --- | --- | --- | --- |
+| Workflow binding + v1 header | Terminal failed with `legacy_completion_protocol_read_only` | None (no Card, shadow sample, evidence, attention, settlement, or gate/graph update) | Not enqueued |
+| Workflow binding + unknown/inconsistent/corrupt header | Terminal failed with `unsupported_completion_protocol` | None | Not enqueued |
+| Workflow binding + transient protocol lookup error | Existing bounded persistence retry | None until lookup succeeds or is exhausted | Existing transient policy only |
+| Transient lookup exhausted as terminally unavailable | Terminal failed with the typed persistence/protocol error | None | Not re-enqueued as success or Card re-emit |
+| Dangling / missing workflow header for a claimed binding | Terminal failed with the typed protocol/persistence error | None | Not enqueued |
+| Standalone (no workflow binding) | Existing standalone display/Card-summary behavior | Existing standalone behavior only | Existing standalone policy |
+
+Implementation requirements on the settlement rail:
+
+- `Broker::settle_task` / `RunStore` must distinguish typed terminal protocol
+  failures from transient persistence errors.
+- V1 and unsupported protocol outcomes never become `persistence_error`, never
+  install `PendingTerminalRetry`, and never invoke the Card parser or shadow
+  comparator.
+- The durable host status, wait-path error code, and emitted task/run events
+  carry the stable protocol code so operators and parents can observe the
+  failure without workflow graph advancement.
+- Infrastructure may still close process handles for host consistency after
+  the typed terminal status is recorded.
+
 ## Database Enforcement
 
 A new forward migration adds database enforcement without rewriting old rows.
@@ -343,8 +434,18 @@ A `BEFORE UPDATE OF completion_protocol_version,
 completion_protocol_mode` trigger rejects any attempt to change either value.
 This prevents both v2 downgrade and v1 in-place upgrade.
 
+### Frozen Legacy-Source Trigger
+
+A `BEFORE UPDATE OF legacy_source_workflow_id` trigger (or the same freeze
+trigger covering that column) rejects any change to
+`legacy_source_workflow_id`, including NULL-to-value, value-to-NULL, and
+value-to-different-value. Existing historical links keep their stored values
+unchanged. Combined with the insert trigger, this prevents recreating the
+removed legacy-successor write path by inserting a clean v2 row and later
+linking it.
+
 The application guard remains necessary because semantic workflow state also
-lives in related tables. The trigger is a final insertion/freeze invariant,
+lives in related tables. The triggers are final insertion/freeze invariants,
 not a replacement for authorization at every mutation boundary.
 
 Migration rollback removes only the new triggers. It does not alter workflow
@@ -358,29 +459,54 @@ The completion rollout is no longer a setting or a status surface. Remove:
 - the frontend API type and call;
 - the delegation settings completion-protocol status block;
 - default-mode, profile-override, shadow-difference, rollout-window, and
-  rollout-decision metrics and translations; and
-- metrics code used only to compare v1 with v2 shadow behavior.
+  rollout-decision metrics and translations;
+- metrics code used only to compare v1 with v2 shadow behavior; and
+- restart-only metrics, recorder methods, and snapshot fields
+  (`restart_outcomes`, `record_completion_restart`,
+  `CompletionRestartOutcome`, and equivalents).
 
 Keep metrics that observe v2 completion intent sources, evidence resolution,
-attention, artifact recovery, and typed completion outcomes.
+attention, artifact recovery, and typed completion outcomes. Keep non-restart
+v2 root-wake machinery used by completion attention outbox replay; do not
+delete `CompletionRootWakeQueue` wholesale when removing restart metrics.
 
 Creation telemetry may record the fixed v2 protocol if useful for operational
 counts, but it must not expose or depend on a selectable creation mode.
 
+Public settlement must call only the v2 settlement core. Production v1 settle
+write paths are deleted or hard-error before any write; historical v1
+settlement rows remain readable only.
+
 ## Error Contract
 
-All transports preserve stable error codes.
+### Post-change stable codes
+
+After this change, the following codes are the stable public contract. “Stable”
+means this post-change set, not that pre-change restart codes remain forever.
 
 | Condition | Stable code | Retry behavior |
 | --- | --- | --- |
-| Mutation targets a persisted v1 workflow | `legacy_completion_protocol_read_only` | Not retryable in that workflow |
+| Mutation or root admission targets a persisted v1 workflow | `legacy_completion_protocol_read_only` | Not retryable in that workflow |
 | Persisted protocol pair is unknown or inconsistent | `unsupported_completion_protocol` | Not retryable until data is repaired |
 | V2 instruction or scope binding cannot be built | `completion_instruction_binding_failed` | Retry only after the reported material problem changes |
 | Workflow/header lookup has a transient database error | Existing persistence code | Existing transient retry policy |
 | Removed completion rollout environment variable is present | `completion_protocol_configuration_removed` | Remove the variable and restart |
 
-No error mapper converts any of these conditions into a successful v1 result,
-a legacy restart projection, or a Card re-emission request.
+### Restart-family retirement map
+
+The legacy restart error family is removed from production wire surfaces:
+
+| Pre-change code / payload | Post-change fate |
+| --- | --- |
+| `legacy_completion_protocol_restart_required` | Removed; callers that previously forced restart now surface `legacy_completion_protocol_read_only` (or the configuration-removed code when the env surface is the problem) |
+| `legacy_completion_protocol_restart_invalid` | Removed |
+| `legacy_completion_protocol_restart_not_required` | Removed |
+| `AcpError::LegacyCompletionProtocolRestart { successor_conversation_id }` and equivalent structured payloads | Removed; no successor conversation id is returned from protocol errors |
+| `AppErrorCode` / MCP / FE mappings for the restart family | Deleted with reference-search assertions |
+
+No error mapper converts any protocol condition into a successful v1 result, a
+legacy restart projection, a successor conversation id, or a Card re-emission
+request.
 
 ## Frontend Behavior
 
@@ -408,6 +534,10 @@ creation path.
 - Publication revisions retain the original v2 pair.
 - Production code has no caller-supplied completion selection.
 - Test-only legacy fixtures cannot be imported by non-test builds.
+- Historical fixtures are migration-aware: migrate through the predecessor
+  migration, seed historical v1 rows, then migrate to latest (including the
+  new triggers). Do not drop or disable triggers on a fully migrated shared
+  connection, and do not insert post-trigger v1 rows.
 
 ### Startup Configuration Tests
 
@@ -425,25 +555,32 @@ creation path.
 - A new v2 row with `legacy_source_workflow_id` is rejected.
 - Updating either protocol field is rejected for both historical and current
   rows.
+- Updating `legacy_source_workflow_id` is rejected for NULL-to-value,
+  value-to-NULL, and value-to-different-value; unchanged historical links
+  survive migrate up and down.
 - Rolling back the migration removes the triggers without changing rows.
 
 ### Historical Read-Only Matrix
 
 For a seeded v1 workflow, verify that each operation returns
 `legacy_completion_protocol_read_only` and leaves workflow revision, gate
-state, settlements, attentions, run bindings, and child-spawn counts unchanged:
+state, settlements, attentions, run bindings, child-spawn counts,
+authorization-row counts, and user-question counts unchanged:
 
 - publish revision;
 - settle gate;
 - recover workflow;
+- request recovery authorization (workflow subject and workflow-bound task);
 - resolve completion decision;
 - retry completion artifact;
 - first workflow dispatch;
-- continue delegation; and
-- replace delegation.
+- continue delegation;
+- replace delegation; and
+- root non-delegation prompt admission (manager, automation, chat-channel,
+  Tauri, and Axum entry points).
 
 State and graph reads must still succeed. Existing relationship links must
-still project.
+still project. Cover both `(1, v1)` and `(1, v2_shadow)` seeds.
 
 ### Tool and Transport Schema Tests
 
@@ -453,14 +590,25 @@ still project.
 - A v2 child receives `complete_work`; root, standalone, unbound, and historical
   v1 children do not.
 - Unknown tool arguments continue to fail schema validation.
+- `AppErrorCode` / `AcpError` restart-family variants and
+  `successor_conversation_id` payloads are absent.
+- Metrics snapshots no longer expose restart-outcome or shadow-rollout fields
+  while retaining v2 intent/evidence/attention metrics and non-restart
+  root-wake behavior.
 
 ### Terminal Processing Tests
 
 - A v2 workflow run uses only v2 completion resolution.
-- A v1-bound terminal attempt returns the read-only error and does not invoke
-  the Card parser.
+- A v1-bound terminal attempt returns the read-only error, marks the host task
+  failed with that stable code, emits the typed failure event, does not invoke
+  the Card parser, and does not enqueue `PendingTerminalRetry` /
+  `persistence_error`.
+- An unsupported or inconsistent protocol pair fails the same way with
+  `unsupported_completion_protocol`.
 - A dangling or failed workflow-protocol lookup never produces a Card summary
   or shadow sample.
+- Transient lookup errors still use the existing bounded persistence retry;
+  exhaustion remains typed and non-semantic.
 - Standalone delegation retains its existing display summary behavior.
 - `complete_work`, conclusion line, report conclusion, ambiguity attention, and
   user adjudication remain valid v2 paths.
@@ -509,12 +657,35 @@ memory. Low-memory commands remain opt-in according to `AGENTS.md`.
 
 ## Implementation Order
 
-1. Add the v2-only protocol constructor, shared mutation guard, stable errors,
-   and negative tests.
-2. Make publication and settlement v2-only and remove rollout selection.
-3. Enforce v2 admission and terminal processing without Card/shadow fallback.
-4. Remove legacy restart write surfaces and add historical read-only
-   projection behavior.
-5. Add database triggers and migration tests.
-6. Remove rollout settings, metrics, frontend APIs, controls, and translations.
+1. Add the v2-only protocol constructor, shared mutation guard (including root
+   prompt and recovery-authorization fences), post-change stable errors and
+   restart-family retirement, and negative tests.
+2. Make publication and settlement v2-only and remove rollout selection and
+   production v1 settle write paths.
+3. Enforce v2 admission and terminal processing without Card/shadow fallback,
+   including typed host terminal disposition outside the persistence retry rail.
+4. Remove legacy restart write surfaces (including auto-restart and
+   restart-context capture) and add historical read-only projection behavior
+   with the full residual field rules.
+5. Add database triggers (insert pair, freeze protocol fields, freeze
+   `legacy_source_workflow_id`) and migration-aware historical fixtures/tests.
+6. Remove rollout settings, restart/shadow metrics, frontend APIs, controls,
+   and translations while keeping v2 root-wake attention machinery.
 7. Update fixtures and run cross-surface verification.
+
+## Design Review Amendment Log (2026-08-09 cycle 1)
+
+Addresses external Design review findings without changing the executive
+decision (writable protocol is only `(2, v2_enforce)`; historical v1 remains
+read-only; no automatic successor; v2 semantic channels preserved):
+
+- D-CODEX-C1 / D-GROK-I1: root prompt admission fence replaces auto-restart.
+- D-CODEX-I1: freeze `legacy_source_workflow_id` on UPDATE.
+- D-CODEX-I2: recovery-authorization prepare is guarded.
+- D-CODEX-I3 / D-GROK-I3: terminal fail-closed host surface and non-retry rail.
+- D-GROK-I2: restart-family retirement map; “stable” means the post-change set.
+- D-GROK-I4: full historical projection residual fields.
+- D-CODEX-M1 / D-GROK-M1 / D-GROK-M4: restart-context capture and restart
+  metrics removed; v2 root-wake retained.
+- D-CODEX-M2: migration-aware historical fixtures.
+- D-GROK-M2 / D-GROK-M3: v1 settle write-path deletion and expanded tests.
