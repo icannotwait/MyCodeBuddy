@@ -37,11 +37,28 @@ impl CoreResult {
 }
 
 pub(crate) trait CoreOps: Send + Sync {
+    fn capture_context(&self, _selection_epoch: u64, _op: Operation) -> CommandContext {
+        CommandContext::None
+    }
     fn begin_selection(&self, selection_epoch: u64, op: Operation);
     fn set_workspace(&self, selection_epoch: u64, path: Vec<u8>) -> CoreFuture;
-    fn create_session(&self, selection_epoch: u64, agent: Vec<u8>) -> CoreFuture;
-    fn select_session(&self, selection_epoch: u64, conversation_id: i32) -> CoreFuture;
-    fn send_user_message(&self, text: Vec<u8>) -> CoreFuture;
+    fn create_session(
+        &self,
+        selection_epoch: u64,
+        workspace: codeg_lib::commands::eui_facade::EuiWorkspace,
+        agent: Vec<u8>,
+    ) -> CoreFuture;
+    fn select_session(
+        &self,
+        selection_epoch: u64,
+        workspace: codeg_lib::commands::eui_facade::EuiWorkspace,
+        conversation_id: i32,
+    ) -> CoreFuture;
+    fn send_user_message(
+        &self,
+        selection: codeg_lib::commands::eui_facade::EuiSessionSelection,
+        text: Vec<u8>,
+    ) -> CoreFuture;
     fn get_agent_settings(&self, agent: Vec<u8>) -> CoreFuture;
     fn set_agent_settings(&self, agent: Vec<u8>, json: Vec<u8>) -> CoreFuture;
     fn probe_agent(&self, agent: Vec<u8>) -> CoreFuture;
@@ -59,7 +76,48 @@ struct AppCommandContext {
     selection: Option<codeg_lib::commands::eui_facade::EuiSessionSelection>,
 }
 
+pub(crate) enum CommandContext {
+    None,
+    Workspace(codeg_lib::commands::eui_facade::EuiWorkspace),
+    Selection(codeg_lib::commands::eui_facade::EuiSessionSelection),
+    Unavailable(String),
+}
+
+fn capture_command_context(
+    context: &Arc<Mutex<AppCommandContext>>,
+    selection_epoch: u64,
+    op: Operation,
+) -> CommandContext {
+    let current = context.lock().unwrap_or_else(|error| error.into_inner());
+    if current.selection_epoch != selection_epoch {
+        return CommandContext::Unavailable(
+            "EUI selection changed before command context was captured".to_string(),
+        );
+    }
+    match op {
+        Operation::CreateSession | Operation::SelectSession => current
+            .workspace
+            .clone()
+            .map(CommandContext::Workspace)
+            .unwrap_or_else(|| {
+                CommandContext::Unavailable("no EUI workspace is selected".to_string())
+            }),
+        Operation::SendUserMessage => current
+            .selection
+            .clone()
+            .map(CommandContext::Selection)
+            .unwrap_or_else(|| {
+                CommandContext::Unavailable("no EUI session is selected".to_string())
+            }),
+        _ => CommandContext::None,
+    }
+}
+
 impl CoreOps for AppCoreOps {
+    fn capture_context(&self, selection_epoch: u64, op: Operation) -> CommandContext {
+        capture_command_context(&self.context, selection_epoch, op)
+    }
+
     fn begin_selection(&self, selection_epoch: u64, op: Operation) {
         let mut context = self
             .context
@@ -98,19 +156,18 @@ impl CoreOps for AppCoreOps {
         })
     }
 
-    fn create_session(&self, selection_epoch: u64, agent: Vec<u8>) -> CoreFuture {
+    fn create_session(
+        &self,
+        selection_epoch: u64,
+        workspace: codeg_lib::commands::eui_facade::EuiWorkspace,
+        agent: Vec<u8>,
+    ) -> CoreFuture {
         let state = Arc::clone(&self.state);
         let context = Arc::clone(&self.context);
         Box::pin(async move {
             let wire = String::from_utf8(agent).map_err(|_| "agent is not UTF-8".to_string())?;
             let agent = codeg_lib::commands::eui_facade::parse_supported_agent(&wire)
                 .map_err(|error| error.to_string())?;
-            let workspace = context
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .workspace
-                .clone()
-                .ok_or_else(|| "no EUI workspace is selected".to_string())?;
             let selection =
                 codeg_lib::commands::eui_facade::create_eui_session(&state, &workspace, agent)
                     .await
@@ -119,16 +176,15 @@ impl CoreOps for AppCoreOps {
         })
     }
 
-    fn select_session(&self, selection_epoch: u64, conversation_id: i32) -> CoreFuture {
+    fn select_session(
+        &self,
+        selection_epoch: u64,
+        workspace: codeg_lib::commands::eui_facade::EuiWorkspace,
+        conversation_id: i32,
+    ) -> CoreFuture {
         let state = Arc::clone(&self.state);
         let context = Arc::clone(&self.context);
         Box::pin(async move {
-            let workspace = context
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .workspace
-                .clone()
-                .ok_or_else(|| "no EUI workspace is selected".to_string())?;
             let selection = codeg_lib::commands::eui_facade::select_eui_session(
                 &state,
                 &workspace,
@@ -140,17 +196,14 @@ impl CoreOps for AppCoreOps {
         })
     }
 
-    fn send_user_message(&self, text: Vec<u8>) -> CoreFuture {
+    fn send_user_message(
+        &self,
+        selection: codeg_lib::commands::eui_facade::EuiSessionSelection,
+        text: Vec<u8>,
+    ) -> CoreFuture {
         let state = Arc::clone(&self.state);
-        let context = Arc::clone(&self.context);
         Box::pin(async move {
             let text = String::from_utf8(text).map_err(|_| "message is not UTF-8".to_string())?;
-            let selection = context
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .selection
-                .clone()
-                .ok_or_else(|| "no EUI session is selected".to_string())?;
             codeg_lib::commands::eui_facade::send_eui_message(&state, &selection, text)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -363,6 +416,7 @@ impl RuntimeOwner {
         })?;
         let request_id = next_request_id()?;
         let selection_epoch = model.selection_epoch();
+        let context = self.core_ops.capture_context(selection_epoch, op);
         model.reserve(request_id, op, selection_epoch)?;
         let selection_epoch = model.selection_epoch();
         if op.changes_selection() {
@@ -373,6 +427,7 @@ impl RuntimeOwner {
             selection_epoch,
             op,
             payload,
+            context,
         });
         if op == Operation::SendUserMessage {
             model.record_send_accepted(native_timestamp_ns());
@@ -463,6 +518,7 @@ async fn run_worker(
                     command.selection_epoch,
                     command.op,
                     command.payload,
+                    command.context,
                     Arc::clone(&core_ops),
                 ));
                 metadata.insert(abort.id(), command_metadata);
@@ -522,8 +578,13 @@ async fn execute_command(
     selection_epoch: u64,
     op: Operation,
     payload: CommandPayload,
+    context: CommandContext,
     core_ops: Arc<dyn CoreOps>,
 ) -> Result<CoreResult, String> {
+    let context = match context {
+        CommandContext::Unavailable(error) => return Err(error),
+        context => context,
+    };
     match payload {
         #[cfg(feature = "ffi-test-hooks")]
         CommandPayload::Blocked => pending().await,
@@ -534,15 +595,30 @@ async fn execute_command(
         CommandPayload::Empty => Err("operation is not implemented in Task 5".to_string()),
         CommandPayload::Utf8(value) => match op {
             Operation::SetWorkspace => core_ops.set_workspace(selection_epoch, value).await,
-            Operation::CreateSession => core_ops.create_session(selection_epoch, value).await,
-            Operation::SendUserMessage => core_ops.send_user_message(value).await,
+            Operation::CreateSession => {
+                let CommandContext::Workspace(workspace) = context else {
+                    return Err("create session is missing its admitted workspace".to_string());
+                };
+                core_ops
+                    .create_session(selection_epoch, workspace, value)
+                    .await
+            }
+            Operation::SendUserMessage => {
+                let CommandContext::Selection(selection) = context else {
+                    return Err("send is missing its admitted session".to_string());
+                };
+                core_ops.send_user_message(selection, value).await
+            }
             Operation::GetAgentSettings => core_ops.get_agent_settings(value).await,
             Operation::ProbeAgent => core_ops.probe_agent(value).await,
             _ => Err("invalid UTF-8 command payload".to_string()),
         },
         CommandPayload::SelectSession(conversation_id) => {
+            let CommandContext::Workspace(workspace) = context else {
+                return Err("select session is missing its admitted workspace".to_string());
+            };
             core_ops
-                .select_session(selection_epoch, conversation_id)
+                .select_session(selection_epoch, workspace, conversation_id)
                 .await
         }
         CommandPayload::AgentSettings { agent, json } => {
@@ -559,18 +635,85 @@ mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU64;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tokio::sync::{mpsc, watch, Notify};
     use tokio::task::JoinSet;
 
     use super::{
-        execute_command, run_worker, terminalize_task, CommandMetadata, CoreFuture, CoreOps,
-        CoreResult,
+        capture_command_context, execute_command, run_worker, terminalize_task, AppCommandContext,
+        CommandContext, CommandMetadata, CoreFuture, CoreOps, CoreResult,
     };
     use crate::commands::{CommandPayload, Operation, RuntimeCommand};
     use crate::model::{ModelUpdate, OwnedCompletion, OwnedSessionSummary};
     use crate::{CompletionStatus, LifecycleState, SharedModel};
+    use codeg_lib::commands::eui_facade::{EuiSessionSelection, EuiWorkspace};
+    use codeg_lib::models::AgentType;
+
+    fn test_workspace(folder_id: i32, path: &str) -> EuiWorkspace {
+        EuiWorkspace {
+            folder_id,
+            path: std::path::PathBuf::from(path),
+            sessions: Vec::new(),
+        }
+    }
+
+    fn test_selection(
+        workspace: &EuiWorkspace,
+        conversation_id: i32,
+        connection_id: &str,
+    ) -> EuiSessionSelection {
+        EuiSessionSelection {
+            folder_id: workspace.folder_id,
+            path: workspace.path.clone(),
+            conversation_id,
+            title: Some(format!("Session {conversation_id}")),
+            agent_type: AgentType::Codex,
+            status: "active".to_string(),
+            external_session_id: None,
+            updated_at_ms: 1,
+            connection_id: connection_id.to_string(),
+            transcript: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepted_commands_keep_their_original_workspace_and_selection() {
+        let workspace_a = test_workspace(11, "/workspace-a");
+        let selection_a = test_selection(&workspace_a, 101, "connection-a");
+        let context = Arc::new(Mutex::new(AppCommandContext {
+            selection_epoch: 7,
+            workspace: Some(workspace_a.clone()),
+            selection: Some(selection_a),
+        }));
+
+        let create_context = capture_command_context(&context, 7, Operation::CreateSession);
+        let send_context = capture_command_context(&context, 7, Operation::SendUserMessage);
+
+        let workspace_b = test_workspace(22, "/workspace-b");
+        let selection_b = test_selection(&workspace_b, 202, "connection-b");
+        *context.lock().unwrap() = AppCommandContext {
+            selection_epoch: 8,
+            workspace: Some(workspace_b),
+            selection: Some(selection_b),
+        };
+
+        let CommandContext::Workspace(captured_workspace) = create_context else {
+            panic!("create must capture a workspace");
+        };
+        assert_eq!(captured_workspace.folder_id, 11);
+        assert_eq!(
+            captured_workspace.path,
+            std::path::PathBuf::from("/workspace-a")
+        );
+
+        let CommandContext::Selection(captured_selection) = send_context else {
+            panic!("send must capture a selection");
+        };
+        assert_eq!(captured_selection.folder_id, 11);
+        assert_eq!(captured_selection.conversation_id, 101);
+        assert_eq!(captured_selection.connection_id, "connection-a");
+    }
 
     struct ErrorOps;
 
@@ -581,15 +724,25 @@ mod tests {
             Box::pin(async { Err("unexpected workspace".to_string()) })
         }
 
-        fn create_session(&self, _selection_epoch: u64, _agent: Vec<u8>) -> CoreFuture {
+        fn create_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _agent: Vec<u8>,
+        ) -> CoreFuture {
             Box::pin(async { Err("unexpected create".to_string()) })
         }
 
-        fn select_session(&self, _selection_epoch: u64, _conversation_id: i32) -> CoreFuture {
+        fn select_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _conversation_id: i32,
+        ) -> CoreFuture {
             Box::pin(async { Err("unexpected select".to_string()) })
         }
 
-        fn send_user_message(&self, _text: Vec<u8>) -> CoreFuture {
+        fn send_user_message(&self, _selection: EuiSessionSelection, _text: Vec<u8>) -> CoreFuture {
             Box::pin(async { Err("unexpected send".to_string()) })
         }
 
@@ -612,6 +765,7 @@ mod tests {
             0,
             Operation::SendUserMessage,
             CommandPayload::Error("expected".to_string()),
+            CommandContext::None,
             Arc::new(ErrorOps),
         )
         .await
@@ -625,6 +779,7 @@ mod tests {
             0,
             Operation::SendUserMessage,
             CommandPayload::Panic,
+            CommandContext::None,
             Arc::new(ErrorOps),
         ))
         .await;
@@ -656,6 +811,7 @@ mod tests {
                 0,
                 Operation::SendUserMessage,
                 payload,
+                CommandContext::None,
                 Arc::new(ErrorOps),
             ));
             metadata.insert(
@@ -694,15 +850,25 @@ mod tests {
             Box::pin(async { Err("unexpected workspace".to_string()) })
         }
 
-        fn create_session(&self, _selection_epoch: u64, _agent: Vec<u8>) -> CoreFuture {
+        fn create_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _agent: Vec<u8>,
+        ) -> CoreFuture {
             Box::pin(async { Err("unexpected create".to_string()) })
         }
 
-        fn select_session(&self, _selection_epoch: u64, _conversation_id: i32) -> CoreFuture {
+        fn select_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _conversation_id: i32,
+        ) -> CoreFuture {
             Box::pin(async { Err("unexpected select".to_string()) })
         }
 
-        fn send_user_message(&self, _text: Vec<u8>) -> CoreFuture {
+        fn send_user_message(&self, _selection: EuiSessionSelection, _text: Vec<u8>) -> CoreFuture {
             Box::pin(async { Err("unexpected send".to_string()) })
         }
 
@@ -749,6 +915,7 @@ mod tests {
                 selection_epoch: 0,
                 op: Operation::ProbeAgent,
                 payload: CommandPayload::Utf8(b"codex".to_vec()),
+                context: CommandContext::None,
             })
             .await
             .unwrap();
@@ -789,7 +956,12 @@ mod tests {
             Box::pin(async { Err("unexpected workspace".to_string()) })
         }
 
-        fn create_session(&self, _selection_epoch: u64, _agent: Vec<u8>) -> CoreFuture {
+        fn create_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _agent: Vec<u8>,
+        ) -> CoreFuture {
             let started = Arc::clone(&self.started);
             let gate = Arc::clone(&self.gate);
             Box::pin(async move {
@@ -811,11 +983,16 @@ mod tests {
             })
         }
 
-        fn select_session(&self, _selection_epoch: u64, _conversation_id: i32) -> CoreFuture {
+        fn select_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _conversation_id: i32,
+        ) -> CoreFuture {
             Box::pin(async { Err("unexpected select".to_string()) })
         }
 
-        fn send_user_message(&self, _text: Vec<u8>) -> CoreFuture {
+        fn send_user_message(&self, _selection: EuiSessionSelection, _text: Vec<u8>) -> CoreFuture {
             Box::pin(async { Err("unexpected send".to_string()) })
         }
 
@@ -863,6 +1040,7 @@ mod tests {
                 selection_epoch: create_epoch,
                 op: Operation::CreateSession,
                 payload: CommandPayload::Utf8(b"codex".to_vec()),
+                context: CommandContext::Workspace(test_workspace(1, "/workspace")),
             })
             .await
             .unwrap();
@@ -898,6 +1076,156 @@ mod tests {
             }
         }
         assert_eq!(create_completions, 1);
+
+        model.terminalize(
+            newer_epoch,
+            OwnedCompletion::error(
+                newer_id,
+                Operation::SelectSession,
+                "test cleanup".to_string(),
+            ),
+        );
+        let _ = model.build_frame(false, &quiesced);
+        shutdown_tx.send(true).unwrap();
+        worker.await.unwrap();
+    }
+
+    struct SlowBoundSendOps {
+        started: Arc<Notify>,
+        gate: Arc<Notify>,
+        linked: Arc<Mutex<Vec<(String, i32, i32, String)>>>,
+    }
+
+    impl CoreOps for SlowBoundSendOps {
+        fn begin_selection(&self, _selection_epoch: u64, _op: Operation) {}
+
+        fn set_workspace(&self, _selection_epoch: u64, _path: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected workspace".to_string()) })
+        }
+
+        fn create_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _agent: Vec<u8>,
+        ) -> CoreFuture {
+            Box::pin(async { Err("unexpected create".to_string()) })
+        }
+
+        fn select_session(
+            &self,
+            _selection_epoch: u64,
+            _workspace: EuiWorkspace,
+            _conversation_id: i32,
+        ) -> CoreFuture {
+            Box::pin(async { Err("unexpected select".to_string()) })
+        }
+
+        fn send_user_message(&self, selection: EuiSessionSelection, text: Vec<u8>) -> CoreFuture {
+            let started = Arc::clone(&self.started);
+            let gate = Arc::clone(&self.gate);
+            let linked = Arc::clone(&self.linked);
+            Box::pin(async move {
+                started.notify_one();
+                gate.notified().await;
+                linked.lock().unwrap().push((
+                    selection.connection_id,
+                    selection.folder_id,
+                    selection.conversation_id,
+                    String::from_utf8(text).unwrap(),
+                ));
+                Ok(CoreResult::json(Vec::new()))
+            })
+        }
+
+        fn get_agent_settings(&self, _agent: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected get".to_string()) })
+        }
+
+        fn set_agent_settings(&self, _agent: Vec<u8>, _json: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected set".to_string()) })
+        }
+
+        fn probe_agent(&self, _agent: Vec<u8>) -> CoreFuture {
+            Box::pin(async { Err("unexpected probe".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_send_keeps_original_ids_and_terminalizes_stale_once() {
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let linked = Arc::new(Mutex::new(Vec::new()));
+        let workspace_a = test_workspace(11, "/workspace-a");
+        let selection_a = test_selection(&workspace_a, 101, "connection-a");
+        let command_context = CommandContext::Selection(selection_a);
+        let model = SharedModel::new();
+        let send_id = NonZeroU64::new(61).unwrap();
+        model
+            .reserve(send_id, Operation::SendUserMessage, 0)
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let worker = tokio::spawn(run_worker(
+            command_rx,
+            shutdown_rx,
+            model.clone(),
+            codeg_lib::acp::manager::ConnectionManager::new(),
+            Arc::new(std::sync::Mutex::new(())),
+            Arc::clone(&quiesced),
+            Arc::new(SlowBoundSendOps {
+                started: Arc::clone(&started),
+                gate: Arc::clone(&gate),
+                linked: Arc::clone(&linked),
+            }),
+        ));
+        command_tx
+            .send(RuntimeCommand {
+                request_id: send_id,
+                selection_epoch: 0,
+                op: Operation::SendUserMessage,
+                payload: CommandPayload::Utf8(b"hello".to_vec()),
+                context: command_context,
+            })
+            .await
+            .unwrap();
+        started.notified().await;
+
+        let newer_id = NonZeroU64::new(62).unwrap();
+        model
+            .reserve(newer_id, Operation::SelectSession, model.selection_epoch())
+            .unwrap();
+        let newer_epoch = model.selection_epoch();
+        gate.notify_one();
+
+        let mut send_completions = 0;
+        for generation in 1..=100 {
+            tokio::task::yield_now().await;
+            let (frame, _) = model.build_frame(false, &quiesced);
+            let abi = frame.as_abi(LifecycleState::Running, generation, false);
+            assert_eq!(abi.connection_id.len, 0);
+            assert_eq!(abi.transcript_json.len, 0);
+            let completions = if abi.completions_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(abi.completions, abi.completions_len) }
+            };
+            for completion in completions {
+                if completion.request_id == send_id.get() {
+                    send_completions += 1;
+                    assert_eq!(completion.status, CompletionStatus::Stale as u32);
+                }
+            }
+            if send_completions == 1 {
+                break;
+            }
+        }
+        assert_eq!(send_completions, 1);
+        assert_eq!(
+            linked.lock().unwrap().as_slice(),
+            &[("connection-a".to_string(), 11, 101, "hello".to_string())]
+        );
 
         model.terminalize(
             newer_epoch,

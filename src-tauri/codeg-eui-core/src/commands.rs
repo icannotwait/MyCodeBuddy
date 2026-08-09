@@ -46,6 +46,7 @@ pub(crate) struct RuntimeCommand {
     pub selection_epoch: u64,
     pub op: Operation,
     pub payload: CommandPayload,
+    pub context: crate::runtime::CommandContext,
 }
 
 pub(crate) fn enqueue(

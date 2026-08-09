@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::acp::preflight::CheckStatus;
 use crate::acp::terminal_context::{build_acp_launch_inputs, AcpRouteRequest};
 use crate::acp::types::{
-    AcpAgentInfo, CodexSandboxSettings, CodexSandboxStructuredConfig, GrokSettings,
+    AcpAgentInfo, AcpEvent, CodexSandboxSettings, CodexSandboxStructuredConfig, GrokSettings,
     GrokStructuredConfig, PromptInputBlock,
 };
 use crate::app_state::AppState;
@@ -23,6 +23,7 @@ use crate::commands::history_window::HistoryLoadOpts;
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::service::conversation_service;
 use crate::models::{AgentType, DbConversationSummary, MessageTurn};
+use crate::web::event_bridge::emit_with_state_gated;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +92,14 @@ pub(crate) trait EuiSessionOps: Send + Sync {
     ) -> Result<String, EuiFacadeError>;
 
     async fn find_connection(&self, state: &AppState, conversation_id: i32) -> Option<String>;
+
+    async fn bind_connection(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        folder_id: i32,
+        conversation_id: i32,
+    ) -> Result<(), EuiFacadeError>;
 
     #[allow(clippy::too_many_arguments)]
     async fn send_linked(
@@ -170,6 +179,16 @@ impl EuiSessionOps for ProductionEuiSessionOps {
             .connection_manager
             .find_connection_by_conversation_id(conversation_id)
             .await
+    }
+
+    async fn bind_connection(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        folder_id: i32,
+        conversation_id: i32,
+    ) -> Result<(), EuiFacadeError> {
+        bind_eui_connection(state, connection_id, folder_id, conversation_id).await
     }
 
     async fn send_linked(
@@ -261,6 +280,13 @@ pub enum EuiFacadeError {
         conversation_id: i32,
         folder_id: i32,
     },
+    #[error("conversation {conversation_id} is not an eligible EUI session")]
+    IneligibleConversation { conversation_id: i32 },
+    #[error("could not bind EUI connection {connection_id}: {reason}")]
+    ConnectionBinding {
+        connection_id: String,
+        reason: String,
+    },
     #[error("EUI application operation failed: {0}")]
     App(#[from] crate::app_error::AppCommandError),
     #[error("EUI database operation failed: {0}")]
@@ -297,7 +323,7 @@ pub async fn set_eui_workspace(
         conversation_service::list_by_folder(&state.db.conn, folder.id, None, None, None, None)
             .await?
             .into_iter()
-            .filter(|row| row.kind == ConversationKind::Regular)
+            .filter(is_eui_session_eligible)
             .map(project_session_summary)
             .collect();
     Ok(EuiWorkspace {
@@ -355,6 +381,13 @@ pub(crate) async fn create_eui_session_with_ops<O: EuiSessionOps>(
             "eui",
         )
         .await?;
+    ops.bind_connection(
+        state,
+        &connection_id,
+        workspace.folder_id,
+        summary.conversation_id,
+    )
+    .await?;
     Ok(selection_from_parts(
         workspace,
         summary,
@@ -391,16 +424,25 @@ pub(crate) async fn select_eui_session_with_ops<O: EuiSessionOps>(
                     loaded.summary.conversation_id,
                 )
                 .await?;
-            ops.spawn_agent(
+            let connection_id = ops
+                .spawn_agent(
+                    state,
+                    loaded.summary.agent_type,
+                    &workspace.path,
+                    loaded.summary.external_session_id.clone(),
+                    loaded.summary.conversation_id,
+                    launch_inputs,
+                    "eui",
+                )
+                .await?;
+            ops.bind_connection(
                 state,
-                loaded.summary.agent_type,
-                &workspace.path,
-                loaded.summary.external_session_id.clone(),
+                &connection_id,
+                workspace.folder_id,
                 loaded.summary.conversation_id,
-                launch_inputs,
-                "eui",
             )
-            .await?
+            .await?;
+            connection_id
         }
     };
     Ok(selection_from_parts(
@@ -442,6 +484,16 @@ pub(crate) async fn load_eui_session(
     workspace: &EuiWorkspace,
     conversation_id: i32,
 ) -> Result<LoadedEuiSession, EuiFacadeError> {
+    let row = conversation_service::get_by_id(&state.db.conn, conversation_id).await?;
+    if row.folder_id != workspace.folder_id {
+        return Err(EuiFacadeError::ConversationOutsideWorkspace {
+            conversation_id,
+            folder_id: workspace.folder_id,
+        });
+    }
+    if !is_eui_session_eligible(&row) {
+        return Err(EuiFacadeError::IneligibleConversation { conversation_id });
+    }
     let detail = get_folder_conversation_with_live_core(
         &state.db.conn,
         &state.connection_manager,
@@ -495,6 +547,70 @@ fn project_session_summary(row: DbConversationSummary) -> EuiSessionSummary {
         status: row.status,
         external_session_id: row.external_id,
         updated_at_ms: row.updated_at.timestamp_millis(),
+    }
+}
+
+fn is_eui_session_eligible(row: &DbConversationSummary) -> bool {
+    row.kind == ConversationKind::Regular
+        && matches!(row.agent_type, AgentType::Codex | AgentType::Grok)
+}
+
+async fn bind_eui_connection(
+    state: &AppState,
+    connection_id: &str,
+    folder_id: i32,
+    conversation_id: i32,
+) -> Result<(), EuiFacadeError> {
+    let (session, emitter) = state
+        .connection_manager
+        .get_state_and_emitter(connection_id)
+        .await
+        .ok_or_else(|| EuiFacadeError::ConnectionBinding {
+            connection_id: connection_id.to_string(),
+            reason: "connection is no longer live".to_string(),
+        })?;
+    {
+        let current = session.read().await;
+        match (current.conversation_id, current.folder_id) {
+            (Some(current_conversation), Some(current_folder))
+                if current_conversation == conversation_id && current_folder == folder_id =>
+            {
+                return Ok(())
+            }
+            (Some(current_conversation), _) => {
+                return Err(EuiFacadeError::ConnectionBinding {
+                    connection_id: connection_id.to_string(),
+                    reason: format!("already belongs to conversation {current_conversation}"),
+                })
+            }
+            _ => {}
+        }
+    }
+
+    let applied = emit_with_state_gated(
+        &session,
+        &emitter,
+        AcpEvent::ConversationLinked {
+            conversation_id,
+            folder_id,
+            parent_conversation_id: None,
+            parent_tool_use_id: None,
+        },
+        |current| current.conversation_id.is_none(),
+    )
+    .await;
+    if applied {
+        return Ok(());
+    }
+
+    let current = session.read().await;
+    if current.conversation_id == Some(conversation_id) && current.folder_id == Some(folder_id) {
+        Ok(())
+    } else {
+        Err(EuiFacadeError::ConnectionBinding {
+            connection_id: connection_id.to_string(),
+            reason: "a concurrent operation bound it to another conversation".to_string(),
+        })
     }
 }
 
@@ -697,12 +813,13 @@ fn ensure_supported(agent: AgentType) -> Result<(), EuiFacadeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
     use super::{
-        create_eui_conversation, create_eui_session_with_ops, ensure_supported, load_eui_session,
-        parse_supported_agent, project_agent_settings, send_eui_message, send_eui_message_with_ops,
+        bind_eui_connection, create_eui_conversation, create_eui_session_with_ops,
+        ensure_supported, load_eui_session, parse_supported_agent, project_agent_settings,
+        select_eui_session_with_ops, send_eui_message, send_eui_message_with_ops,
         set_eui_workspace, EuiAgentSettingsPatch, EuiFacadeError, EuiSessionOps,
         EuiSessionSelection,
     };
@@ -722,6 +839,7 @@ mod tests {
     struct RecordingSessionOps {
         calls: Arc<Mutex<Vec<&'static str>>>,
         last_send: Arc<Mutex<Option<(String, i32, i32, String, String)>>>,
+        live_connections: Arc<Mutex<HashMap<i32, String>>>,
     }
 
     impl RecordingSessionOps {
@@ -780,13 +898,28 @@ mod tests {
             Ok("recorded-connection".to_string())
         }
 
-        async fn find_connection(
+        async fn find_connection(&self, _state: &AppState, conversation_id: i32) -> Option<String> {
+            self.record("find_connection");
+            self.live_connections
+                .lock()
+                .unwrap()
+                .get(&conversation_id)
+                .cloned()
+        }
+
+        async fn bind_connection(
             &self,
             _state: &AppState,
-            _conversation_id: i32,
-        ) -> Option<String> {
-            self.record("find_connection");
-            None
+            connection_id: &str,
+            _folder_id: i32,
+            conversation_id: i32,
+        ) -> Result<(), EuiFacadeError> {
+            self.record("bind_connection");
+            self.live_connections
+                .lock()
+                .unwrap()
+                .insert(conversation_id, connection_id.to_string());
+            Ok(())
         }
 
         async fn send_linked(
@@ -828,7 +961,12 @@ mod tests {
 
         assert_eq!(
             ops.calls(),
-            ["verify_installed", "build_launch_inputs", "spawn_agent"]
+            [
+                "verify_installed",
+                "build_launch_inputs",
+                "spawn_agent",
+                "bind_connection"
+            ]
         );
         assert!(selection.conversation_id > 0);
         assert_eq!(selection.connection_id, "recorded-connection");
@@ -877,6 +1015,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_list_contains_only_supported_regular_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+
+        let eligible = conversation_service::create(
+            &state.db.conn,
+            workspace.folder_id,
+            AgentType::Codex,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::create(
+            &state.db.conn,
+            workspace.folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::create_chat(
+            &state.db.conn,
+            workspace.folder_id,
+            AgentType::Grok,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let workspace = set_eui_workspace(&state, workspace.path).await.unwrap();
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .map(|session| session.conversation_id)
+                .collect::<Vec<_>>(),
+            [eligible.id]
+        );
     }
 
     #[tokio::test]
@@ -932,6 +1117,114 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn selection_rejects_ineligible_rows_before_connection_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let unsupported = conversation_service::create(
+            &state.db.conn,
+            workspace.folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let non_regular = conversation_service::create_chat(
+            &state.db.conn,
+            workspace.folder_id,
+            AgentType::Codex,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ops = RecordingSessionOps::default();
+        ops.live_connections
+            .lock()
+            .unwrap()
+            .insert(unsupported.id, "unsupported-live-connection".to_string());
+
+        assert!(matches!(
+            select_eui_session_with_ops(&state, &workspace, unsupported.id, &ops).await,
+            Err(EuiFacadeError::IneligibleConversation { conversation_id })
+                if conversation_id == unsupported.id
+        ));
+        assert!(ops.calls().is_empty());
+
+        assert!(matches!(
+            select_eui_session_with_ops(&state, &workspace, non_regular.id, &ops).await,
+            Err(EuiFacadeError::IneligibleConversation { conversation_id })
+                if conversation_id == non_regular.id
+        ));
+        assert!(ops.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_then_select_before_send_reuses_the_spawned_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let ops = RecordingSessionOps::default();
+
+        let created = create_eui_session_with_ops(&state, &workspace, AgentType::Codex, &ops)
+            .await
+            .unwrap();
+        ops.calls.lock().unwrap().clear();
+
+        let selected =
+            select_eui_session_with_ops(&state, &workspace, created.conversation_id, &ops)
+                .await
+                .unwrap();
+
+        assert_eq!(selected.connection_id, created.connection_id);
+        assert_eq!(ops.calls(), ["find_connection"]);
+    }
+
+    #[tokio::test]
+    async fn connection_binding_makes_a_spawn_discoverable_before_send() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let row = create_eui_conversation(&state, workspace.folder_id, AgentType::Codex)
+            .await
+            .unwrap();
+        let _commands = state
+            .connection_manager
+            .insert_test_connection_live(
+                "eui-pre-send-connection",
+                AgentType::Codex,
+                Some(workspace.path),
+                state.emitter.clone(),
+            )
+            .await;
+
+        bind_eui_connection(
+            &state,
+            "eui-pre-send-connection",
+            workspace.folder_id,
+            row.conversation_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state
+                .connection_manager
+                .find_connection_by_conversation_id(row.conversation_id)
+                .await
+                .as_deref(),
+            Some("eui-pre-send-connection")
+        );
     }
 
     #[tokio::test]
