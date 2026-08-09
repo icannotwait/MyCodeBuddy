@@ -4635,6 +4635,7 @@
     "cannotPopOutLastTab": "Cannot pop out the last tab",
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
+    "popOutPopupBlocked": "브라우저가 대화 팝아웃을 차단했습니다. 팝업을 허용한 후 다시 시도하세요.",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },

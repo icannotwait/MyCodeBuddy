@@ -4635,6 +4635,7 @@
     "cannotPopOutLastTab": "Cannot pop out the last tab",
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
+    "popOutPopupBlocked": "O navegador bloqueou a janela da conversa. Permita pop-ups e tente novamente.",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },

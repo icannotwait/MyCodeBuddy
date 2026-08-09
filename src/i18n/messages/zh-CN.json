@@ -4635,6 +4635,7 @@
     "cannotPopOutLastTab": "无法弹出最后一个标签",
     "cannotPopOutDraft": "请先开始会话再弹出",
     "popOutHandoffFailed": "弹出会话失败",
+    "popOutPopupBlocked": "浏览器阻止了会话弹出窗口。请允许弹出窗口后重试。",
     "localDesktopOnly": "会话弹出窗口仅在本地桌面应用中可用。",
     "liveHandoffFailed": "接管实时会话失败。主窗口仍持有该会话。"
   },

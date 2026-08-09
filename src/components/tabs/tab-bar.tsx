@@ -26,9 +26,10 @@ import { useIsCoarsePointer } from "@/hooks/use-is-coarse-pointer"
 import { TabItem, type TabMoveTarget } from "./tab-item"
 import {
   canPopOutConversation,
+  isPopOutPopupBlockedError,
   popOutConversation,
+  shouldShowConversationPopout,
 } from "@/lib/conversation-popout"
-import { isLocalDesktop } from "@/lib/platform"
 
 interface TabBarProps {
   /** Split-group strip: render only this group's tabs, highlight the GROUP's
@@ -46,7 +47,7 @@ export function TabBar({ groupId }: TabBarProps) {
   const tPop = useTranslations("ConversationPopout")
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
-  const showPopOut = isLocalDesktop()
+  const showPopOut = shouldShowConversationPopout()
   const groupOf = useTabStore((s) => s.groupOf)
   const groupLayout = useTabStore((s) => s.groupLayout)
   const groupSelection = useTabStore((s) => s.groupSelection)
@@ -217,7 +218,11 @@ export function TabBar({ groupId }: TabBarProps) {
         agentType: tab.agentType,
       }).catch((err) => {
         console.error("[TabBar] pop-out failed", err)
-        toast.error(tPop("popOutHandoffFailed"))
+        toast.error(
+          isPopOutPopupBlockedError(err)
+            ? tPop("popOutPopupBlocked")
+            : tPop("popOutHandoffFailed")
+        )
       })
     },
     [tabs, tPop]

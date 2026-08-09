@@ -57,3 +57,15 @@ describe("tab drag selection guard wiring", () => {
     expect(tabItem).toMatch(/handleDragEnd[\s\S]{0,200}longPressDragEnd\(\)/)
   })
 })
+
+describe("tab strip conversation pop-out wiring", () => {
+  it("uses the shared runtime gate and popup-blocked copy", () => {
+    expect(tabBar).toContain(
+      "const showPopOut = shouldShowConversationPopout()"
+    )
+    expect(tabBar).not.toContain("const showPopOut = isLocalDesktop()")
+    expect(tabBar).toContain("isPopOutPopupBlockedError(err)")
+    expect(tabBar).toContain('tPop("popOutPopupBlocked")')
+    expect(tabBar).toContain('tPop("popOutHandoffFailed")')
+  })
+})

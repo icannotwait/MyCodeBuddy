@@ -23,9 +23,10 @@ import { cn } from "@/lib/utils"
 import { formatConversationTitle } from "@/lib/conversation-title"
 import {
   canPopOutConversation,
+  isPopOutPopupBlockedError,
   popOutConversation,
+  shouldShowConversationPopout,
 } from "@/lib/conversation-popout"
-import { isLocalDesktop } from "@/lib/platform"
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -164,7 +165,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [renameValue, setRenameValue] = useState("")
 
-  const showPopOut = isLocalDesktop()
+  const showPopOut = shouldShowConversationPopout()
   const popOutEnablement = canPopOutConversation({
     conversationId: conversation.id,
     isOpenMainTab: isOpenInTab,
@@ -185,7 +186,11 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
       agentType: conversation.agent_type,
     }).catch((err) => {
       console.error("[SidebarConversationCard] pop-out failed", err)
-      toast.error(tPop("popOutHandoffFailed"))
+      toast.error(
+        isPopOutPopupBlockedError(err)
+          ? tPop("popOutPopupBlocked")
+          : tPop("popOutHandoffFailed")
+      )
     })
   }, [
     popOutEnablement.enabled,

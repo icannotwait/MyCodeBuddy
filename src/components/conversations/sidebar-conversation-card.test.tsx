@@ -14,13 +14,19 @@ import enMessages from "@/i18n/messages/en.json"
 // easy, unambiguous render probe.
 const probe = vi.hoisted(() => ({ agentIconRenders: 0 }))
 const popoutMocks = vi.hoisted(() => ({
-  isLocalDesktop: vi.fn(() => false),
+  showPopOut: vi.fn(() => false),
   popOutConversation: vi.fn(
     async (_args: {
       conversationId: number
       folderId: number
       agentType: string
     }) => {}
+  ),
+  isPopupBlocked: vi.fn(
+    (error: unknown) =>
+      typeof error === "object" &&
+      error != null &&
+      (error as { code?: unknown }).code === "popup_blocked"
   ),
   canPopOutConversation: vi.fn(
     (args: {
@@ -44,10 +50,8 @@ vi.mock("@/components/agent-icon", () => ({
     return null
   },
 }))
-vi.mock("@/lib/platform", () => ({
-  isLocalDesktop: () => popoutMocks.isLocalDesktop(),
-}))
 vi.mock("@/lib/conversation-popout", () => ({
+  shouldShowConversationPopout: () => popoutMocks.showPopOut(),
   canPopOutConversation: (args: {
     conversationId: number | null | undefined
     isOpenMainTab: boolean
@@ -58,6 +62,8 @@ vi.mock("@/lib/conversation-popout", () => ({
     folderId: number
     agentType: string
   }) => popoutMocks.popOutConversation(args),
+  isPopOutPopupBlockedError: (error: unknown) =>
+    popoutMocks.isPopupBlocked(error),
 }))
 
 const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
@@ -475,8 +481,12 @@ describe("SidebarConversationCard sub-session chevron", () => {
 
 describe("SidebarConversationCard pop-out menu", () => {
   beforeEach(() => {
-    popoutMocks.isLocalDesktop.mockReturnValue(true)
-    popoutMocks.popOutConversation.mockClear()
+    popoutMocks.showPopOut.mockReturnValue(true)
+    popoutMocks.popOutConversation.mockReset()
+    popoutMocks.popOutConversation.mockResolvedValue(undefined)
+    popoutMocks.isPopupBlocked.mockClear()
+    sonnerMock.error.mockClear()
+    sonnerMock.success.mockClear()
   })
 
   function renderCard(
@@ -499,7 +509,7 @@ describe("SidebarConversationCard pop-out menu", () => {
     )
   }
 
-  it("shows pop-out on local desktop and invokes popOutConversation", () => {
+  it("shows pop-out when the shared helper admits pure web", () => {
     const { getByText } = renderCard(conv(1))
     fireEvent.contextMenu(getByText("conv-1"))
     fireEvent.click(getByText("Pop out window"))
@@ -508,13 +518,44 @@ describe("SidebarConversationCard pop-out menu", () => {
       folderId: 1,
       agentType: "claude_code",
     })
+    expect(sonnerMock.success).not.toHaveBeenCalled()
   })
 
-  it("hides pop-out when not local desktop", () => {
-    popoutMocks.isLocalDesktop.mockReturnValue(false)
+  it("hides pop-out when the shared helper rejects remote desktop", () => {
+    popoutMocks.showPopOut.mockReturnValue(false)
     const { getByText, queryByText } = renderCard(conv(1))
     fireEvent.contextMenu(getByText("conv-1"))
     expect(queryByText("Pop out window")).toBeNull()
+  })
+
+  it("uses dedicated copy when the browser blocks window.open", async () => {
+    popoutMocks.popOutConversation.mockRejectedValueOnce({
+      code: "popup_blocked",
+    })
+    const { getByText } = renderCard(conv(1))
+    fireEvent.contextMenu(getByText("conv-1"))
+    fireEvent.click(getByText("Pop out window"))
+
+    await waitFor(() =>
+      expect(sonnerMock.error).toHaveBeenCalledWith(
+        "Your browser blocked the conversation pop-out. Allow pop-ups and try again."
+      )
+    )
+  })
+
+  it("keeps generic handoff copy for every other rejection", async () => {
+    popoutMocks.popOutConversation.mockRejectedValueOnce(
+      new Error("desktop handoff failed")
+    )
+    const { getByText } = renderCard(conv(1))
+    fireEvent.contextMenu(getByText("conv-1"))
+    fireEvent.click(getByText("Pop out window"))
+
+    await waitFor(() =>
+      expect(sonnerMock.error).toHaveBeenCalledWith(
+        "Failed to pop out conversation"
+      )
+    )
   })
 
   it("disables pop-out for the last open main tab", () => {
