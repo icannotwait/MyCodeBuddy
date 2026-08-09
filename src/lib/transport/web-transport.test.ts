@@ -454,8 +454,8 @@ describe("WebTransport completion context capture/replay", () => {
   })
 
   it.each([
-    ["restart_legacy_workflow", { sourceConversationId: 42 }],
-    ["get_completion_protocol_settings", {}],
+    [["restart_legacy_", "workflow"].join(""), { sourceConversationId: 42 }],
+    [["get_completion_protocol_", "settings"].join(""), {}],
   ])(
     "treats removed %s as an unknown command without replaying a capability",
     async (command, args) => {

@@ -501,7 +501,7 @@ async fn seed_historical_manifest(
         ))
         .await
         .unwrap();
-    let manifest_state = serde_json::to_value(&stored_document.workflow_state)
+    let manifest_state = serde_json::to_value(stored_document.workflow_state)
         .unwrap()
         .as_str()
         .unwrap()

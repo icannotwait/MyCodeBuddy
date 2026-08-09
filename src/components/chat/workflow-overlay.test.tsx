@@ -448,7 +448,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
           workflow_id: "wf-successor",
           conversation_id: 99,
         },
-        read_only_reason: "legacy_completion_protocol_restart_required",
+        read_only_reason: "legacy_completion_protocol_read_only",
         automatic_root_wake: false,
       },
     } satisfies WorkflowGraphSnapshot

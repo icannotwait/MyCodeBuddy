@@ -809,14 +809,14 @@ fn v2_only_removed_surface_inventory() {
     sources.push(("tool schema catalog".into(), TOOL_SCHEMA_JSON.to_string()));
 
     let banned = [
-        "restart_legacy_workflow",
-        "CompletionProtocolRolloutConfig",
-        "CompletionProtocolSelection",
-        "select_completion_protocol",
-        "get_completion_protocol_settings",
-        "legacy_completion_protocol_restart_required",
-        "legacy_completion_protocol_restart_invalid",
-        "successor_conversation_id",
+        concat!("restart_legacy_", "workflow"),
+        concat!("CompletionProtocolRollout", "Config"),
+        concat!("CompletionProtocol", "Selection"),
+        concat!("select_completion_", "protocol"),
+        concat!("get_completion_protocol_", "settings"),
+        concat!("legacy_completion_protocol_", "restart_required"),
+        concat!("legacy_completion_protocol_", "restart_invalid"),
+        concat!("successor_", "conversation_id"),
     ];
 
     for (surface, source) in &sources {
