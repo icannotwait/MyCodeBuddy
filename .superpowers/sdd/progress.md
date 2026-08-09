@@ -1,64 +1,47 @@
 # B2D thread ledger — completion protocol v2-only
 
 - design: `docs/superpowers/specs/2026-08-09-completion-protocol-v2-only-design.md`
-- design_digest: `sha256:61780e516676ca31f2dc2226d3b70bff67920b566d4fe28dc06d6d81a3295efa` (cycle-1 amend @38ea87d6)
-- plan_target: `docs/superpowers/plans/2026-08-09-completion-protocol-v2-only.md`
+- design_digest: `sha256:61780e516676ca31f2dc2226d3b70bff67920b566d4fe28dc06d6d81a3295efa`
+- plan: `docs/superpowers/plans/2026-08-09-completion-protocol-v2-only.md`
+- plan_digest: `sha256:e59e90636265fe6f11c284a1da5e09d5752b04db25c42b142ad3981aaeb15255`
 - worktree: `D:\MyCodeBuddy\.worktrees\completion-protocol-v2-only`
 - branch: `feat/completion-protocol-v2-only`
-- base_HEAD: `e36a11af`
-- risk_policy_version: `b2d_task_risk_v1`
-- publication_token: `7b96254a-b450-4055-b195-16dd886ed80c`
 - workflow_id: `a07e4975-2a54-4672-86a0-93fb94c5714d`
-- workflow_state: `skeleton` (manifest_revision=3, graph_revision=9)
-- parent_conversation_id: 3458
-- protocol: v2 only (workflow_manifest_v2)
-
-## Capability probe
-- get_workflow_capabilities: OK
-- tools: get_workflow_capabilities, get_workflow_state, recover_workflow, publish_workflow_manifest, settle_workflow_gate, restart_legacy_workflow present
-- workflow_manifest_v2: true
-
-## Design self-check (triggers external Design review)
-- cross-module / large surface: yes (ACP workflow, MCP, Tauri, Axum, FE, migrations)
-- migration: yes (DB insert/update triggers)
-- security/authorization: yes (require_v2_mutation, fail-closed)
-- concurrency/lifecycle: yes (protocol freeze, mutation guard before budget)
-- persistence/state-machine: yes
-- externally visible compatibility: yes (schema removals, env rejection)
-- Decision: **external Design review** required (parent_adjudication)
+- publication_token: `7b96254a-b450-4055-b195-16dd886ed80c`
+- workflow_state: `approved`
+- protocol note: platform created this workflow as historical completion protocol **v1** (settled with v1 evidence shapes); product work implements v2-only creation going forward.
 
 ## Gates
-- design: **approved** (cycle 1, graph_revision 28, minors retained for Plan)
-- plan: estimated rev7; dispatching dual Plan reviewers
+- design: approved (cycle 1, dual codex+grok approve_with_minors)
+- plan: approved (cycle 1 after 2 Author revisions, dual approve)
 
-## Design cycle 1 settlement
-- Codex: request_changes (1C/3I/2M) — report design-review-codex-report.md
-- Grok: request_changes (0C/4I/4M) — report design-review-grok-report.md
-- Parent amended design (commit 38ea87d6); digest republished
+## Task progress
+
+| Task | Risk | Status | Producer | Notes |
+| ---: | --- | --- | --- | --- |
+| 1 | high | **passed** | `01795471` | dual approve; Grok M1 From blanket |
+| 2 | high | **passed** | `74b2e5e9` | fix T2-CODEX-I1; Grok minors open |
+| 3 | high | **passed** | `87279ef9` | fix T3-CODEX-I1; Grok M1 open |
+| 4 | high | **passed** | `3f0fb8f4` | fix round 1; Grok minors open |
+| 5 | high | **fix fix round 1** | `d145b2c2` / latest producer `7c63eb27` | dual request_changes → continue implementer |
+| 6–11 | high/normal | pending | | |
 
 ## Threads
 
 | work_unit_key | role | agent | profile | latest_task_id | state |
 | --- | --- | --- | --- | --- | --- |
-| design\|…\|reviewer\|codex\|none | design reviewer | codex | none | `c1c23f6d-1a01-4c6f-a5aa-a883ae8c2cd4` (cont of 67b97f9f) | running c2 |
-| design\|…\|reviewer\|grok\|none | design reviewer | grok | none | `d0be5cef-b671-4c0e-8e75-67c80907d62e` (cont of 734ca0e3) | running c2 |
-| plan\|…\|author\|codex\|none | plan author | codex | none | `e9763766-6922-40c1-9488-39a38e7fd477` | running |
+| task\|5\|implementer\|codex\|none | implementer | codex | none | `7c63eb27-e8eb-4cb6-9808-a1787a31dbea` (lineage `20149d71`) | continue for fix |
+| task\|5\|reviewer\|codex\|none | reviewer | codex | none | (request_changes on `7c63eb27`) | await re-review after fix |
+| task\|5\|reviewer\|grok\|none | reviewer | grok | none | (request_changes on `7c63eb27`) | await re-review after fix |
 
-## Plan review cycle 1
-- Codex: request_changes (I1 Task10 route, I2 Final HEAD order, I3 corrupt header non-terminal) — b0adfe3c
-- Grok: request_changes (I1 protocol freeze WHEN NEW/OLD) — 32592543
-- Author continue: revision 1 in progress
+## Intent
+- Continue Task 5 implementer with consolidated Important findings (Codex I1–I3 + Grok I1)
+- After new producer commit: dual re-review both covering latest artifact_digest
+- Then Tasks 6–11 serially with risk routes
+- Final dual review + delivery report
 
-## Gates
-- design: approved
-- plan: approved (cycle 1, digest e59e9063)
-- workflow_state: approved
-- workspace_baseline_HEAD: bb24a884 (clean porcelain)
-
-## Task progress
-| Task | Risk | Status | Commits | Notes |
-| ---: | --- | --- | --- | --- |
-| 1 | high | **passed** | `01795471` | codex approve; grok approve_with_minors (M1 From blanket) |
-
-## Intent (current)
-- Dispatch Task 2 high implementer (codex)
+## Recovery notes
+- Implementation cards must use valid `card_summary.rs` schemas or reviewers fail admission (non-empty artifact_digest)
+- Review cards require `critical`/`important`/`minor` field names (not `*_count`)
+- Prefer re-emit cards via continue before replacement
+- Workspace gate: porcelain must be empty before producer admission
