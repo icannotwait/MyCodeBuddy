@@ -23,25 +23,26 @@
 | 2 | high | **passed** | `74b2e5e9` | fix T2-CODEX-I1; Grok minors open |
 | 3 | high | **passed** | `87279ef9` | fix T3-CODEX-I1; Grok M1 open |
 | 4 | high | **passed** | `3f0fb8f4` | fix round 1; Grok minors open |
-| 5 | high | **fix fix round 1** | `d145b2c2` / latest producer `7c63eb27` | dual request_changes → continue implementer |
-| 6–11 | high/normal | pending | | |
+| 5 | high | **passed** | `0239f462` / task `0a4e6cc1` | dual approve_with_minors on re-review |
+| 6 | high | **dispatching** | | remove restart writers; preserve historical projection |
+| 7–11 | high/normal | pending | | |
 
 ## Threads
 
 | work_unit_key | role | agent | profile | latest_task_id | state |
 | --- | --- | --- | --- | --- | --- |
-| task\|5\|implementer\|codex\|none | implementer | codex | none | `7c63eb27-e8eb-4cb6-9808-a1787a31dbea` (lineage `20149d71`) | continue for fix |
-| task\|5\|reviewer\|codex\|none | reviewer | codex | none | (request_changes on `7c63eb27`) | await re-review after fix |
-| task\|5\|reviewer\|grok\|none | reviewer | grok | none | (request_changes on `7c63eb27`) | await re-review after fix |
+| task|5|implementer|codex|none | implementer | codex | none | `0a4e6cc1-1fa2-47b6-95b4-6fc5995e29d4` | passed |
+| task|5|reviewer|codex|none | reviewer | codex | none | `6c771ee9-e6f4-4c86-a1c0-0f18415b6f8a` | approve_with_minors |
+| task|5|reviewer|grok|none | reviewer | grok | none | `36c2a1c9-8ff7-4804-8818-d5ccd31b1a0c` | approve_with_minors |
+| task|6|implementer|codex|none | implementer | codex | none | (pending) | dispatching |
 
 ## Intent
-- Continue Task 5 implementer with consolidated Important findings (Codex I1–I3 + Grok I1)
-- After new producer commit: dual re-review both covering latest artifact_digest
-- Then Tasks 6–11 serially with risk routes
-- Final dual review + delivery report
+- Dispatch Task 6 high implementer (Codex)
+- Dual re-review after producer commit
+- Continue Tasks 7–11 then Final
 
 ## Recovery notes
-- Implementation cards must use valid `card_summary.rs` schemas or reviewers fail admission (non-empty artifact_digest)
-- Review cards require `critical`/`important`/`minor` field names (not `*_count`)
+- Implementation cards must use valid card_summary schemas
+- Review cards require critical/important/minor field names
 - Prefer re-emit cards via continue before replacement
-- Workspace gate: porcelain must be empty before producer admission
+- Workspace gate: porcelain empty before producer admission
