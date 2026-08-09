@@ -55,6 +55,10 @@
 - workflow_state: approved
 - workspace_baseline_HEAD: bb24a884 (clean porcelain)
 
+## Task progress
+| Task | Risk | Status | Commits | Notes |
+| ---: | --- | --- | --- | --- |
+| 1 | high | **passed** | `01795471` | codex approve; grok approve_with_minors (M1 From blanket) |
+
 ## Intent (current)
-- Dispatch Task 1 high implementer (codex)
-- Dual review codex+grok after producer commit
+- Dispatch Task 2 high implementer (codex)
