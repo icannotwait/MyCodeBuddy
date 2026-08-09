@@ -9,6 +9,7 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
         AppErrorCode::InvalidInput
+        | AppErrorCode::CompletionProtocolConfigurationRemoved
         | AppErrorCode::TerminalShellUnavailable
         | AppErrorCode::TerminalShellUnsupported
         | AppErrorCode::RouteUnavailable
@@ -19,6 +20,9 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::TurnInProgress
         | AppErrorCode::ConversationWaitingForSubagents
         | AppErrorCode::DelegateViewerOnly
+        | AppErrorCode::LegacyCompletionProtocolReadOnly
+        | AppErrorCode::UnsupportedCompletionProtocol
+        | AppErrorCode::CompletionInstructionBindingFailed
         | AppErrorCode::LegacyCompletionProtocolRestartRequired
         | AppErrorCode::SessionRouteConflict
         | AppErrorCode::Cancelled
@@ -81,6 +85,21 @@ mod tests {
         assert_eq!(
             status_for_app_error_code(AppErrorCode::ConversationWaitingForSubagents),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn stable_completion_protocol_errors_map_to_expected_http_status() {
+        for code in [
+            AppErrorCode::LegacyCompletionProtocolReadOnly,
+            AppErrorCode::UnsupportedCompletionProtocol,
+            AppErrorCode::CompletionInstructionBindingFailed,
+        ] {
+            assert_eq!(status_for_app_error_code(code), StatusCode::CONFLICT);
+        }
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::CompletionProtocolConfigurationRemoved),
+            StatusCode::BAD_REQUEST
         );
     }
 }

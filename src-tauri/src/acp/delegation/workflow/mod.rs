@@ -63,7 +63,10 @@ pub use dto::{
     WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
-pub use error::{CompletionEvidenceError, CompletionRecoveryFenceError, WorkflowStoreError};
+pub use error::{
+    require_v2_mutation, CompletionEvidenceError, CompletionProtocolConfigurationRemoved,
+    CompletionRecoveryFenceError, WorkflowStoreError,
+};
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,

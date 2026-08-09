@@ -2976,6 +2976,12 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::SummaryTooLarge => "summary_too_large",
         WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
+        WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
+            "legacy_completion_protocol_read_only"
+        }
+        WorkflowStoreError::UnsupportedCompletionProtocol { .. } => {
+            "unsupported_completion_protocol"
+        }
         WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_) => {
             "legacy_completion_protocol_restart_required"
         }

@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
 use super::completion_intent::{
     CompletionIntent, CompletionIntentSource, CompletionOutcome, CompletionRole,
 };
@@ -28,9 +30,14 @@ pub const MAX_ADJUDICATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_JSON_BYTES: usize = 512 * 1024;
 pub const COMPLETE_WORK_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 pub const COMPLETE_WORK_REPORT_FILE_MAX_BYTES: usize = 1024;
+pub const CURRENT_COMPLETION_PROTOCOL_VERSION: i64 = 2;
 pub const COMPLETION_PROTOCOL_VERSION_V2: u32 = 2;
 pub const EVIDENCE_SCOPE_SCHEMA_VERSION_V2: u32 = 2;
 pub const COMPLETION_ROLLOUT_MINIMUM_SAMPLES: u64 = 100;
+
+pub fn current_completion_protocol_mode() -> CompletionProtocolMode {
+    CompletionProtocolMode::V2Enforce
+}
 
 /// Server-owned rollout policy. Overrides use the exact stable key returned by
 /// [`completion_protocol_profile_key`]; unknown or malformed modes never reach

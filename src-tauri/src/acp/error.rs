@@ -4,6 +4,9 @@ use serde::Serialize;
 
 use crate::acp::delegation::continuation::types::ContinuationState;
 use crate::acp::delegation::route::RouteDegradedReason;
+use crate::acp::delegation::workflow::{
+    CompletionProtocolConfigurationRemoved, WorkflowStoreError,
+};
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::terminal::shell::ShellResolveError;
 
@@ -82,6 +85,14 @@ pub enum AcpError {
     },
     #[error("legacy completion protocol restart required; successor conversation {successor_conversation_id}")]
     LegacyCompletionProtocolRestart { successor_conversation_id: i32 },
+    #[error("legacy completion protocol is read-only")]
+    LegacyCompletionProtocolReadOnly,
+    #[error("unsupported completion protocol: {0}")]
+    UnsupportedCompletionProtocol(String),
+    #[error("completion instruction binding failed: {0}")]
+    CompletionInstructionBindingFailed(String),
+    #[error("completion protocol configuration was removed: {variable}")]
+    CompletionProtocolConfigurationRemoved { variable: &'static str },
 }
 
 impl AcpError {
@@ -127,6 +138,14 @@ impl AcpError {
             Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
             Self::LegacyCompletionProtocolRestart { .. } => {
                 Some("legacy_completion_protocol_restart_required")
+            }
+            Self::LegacyCompletionProtocolReadOnly => Some("legacy_completion_protocol_read_only"),
+            Self::UnsupportedCompletionProtocol(_) => Some("unsupported_completion_protocol"),
+            Self::CompletionInstructionBindingFailed(_) => {
+                Some("completion_instruction_binding_failed")
+            }
+            Self::CompletionProtocolConfigurationRemoved { .. } => {
+                Some("completion_protocol_configuration_removed")
             }
             Self::Protocol(_) => None,
         }
@@ -222,7 +241,55 @@ impl AcpError {
                 )
                 .with_detail(successor_conversation_id.to_string()),
             ),
+            AcpError::LegacyCompletionProtocolReadOnly => Some(AppCommandError::new(
+                AppErrorCode::LegacyCompletionProtocolReadOnly,
+                "Legacy completion protocol is read-only",
+            )),
+            AcpError::UnsupportedCompletionProtocol(detail) => Some(
+                AppCommandError::new(
+                    AppErrorCode::UnsupportedCompletionProtocol,
+                    "Unsupported completion protocol",
+                )
+                .with_detail(detail.clone()),
+            ),
+            AcpError::CompletionInstructionBindingFailed(detail) => Some(
+                AppCommandError::new(
+                    AppErrorCode::CompletionInstructionBindingFailed,
+                    "Completion instruction binding failed",
+                )
+                .with_detail(detail.clone()),
+            ),
+            AcpError::CompletionProtocolConfigurationRemoved { variable } => Some(
+                AppCommandError::new(
+                    AppErrorCode::CompletionProtocolConfigurationRemoved,
+                    "Completion protocol configuration was removed",
+                )
+                .with_detail(*variable),
+            ),
             _ => None,
+        }
+    }
+}
+
+impl From<WorkflowStoreError> for AcpError {
+    fn from(error: WorkflowStoreError) -> Self {
+        let message = error.to_string();
+        match error {
+            WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
+                Self::LegacyCompletionProtocolReadOnly
+            }
+            WorkflowStoreError::UnsupportedCompletionProtocol { .. } => {
+                Self::UnsupportedCompletionProtocol(message)
+            }
+            _ => Self::Protocol(message),
+        }
+    }
+}
+
+impl From<CompletionProtocolConfigurationRemoved> for AcpError {
+    fn from(error: CompletionProtocolConfigurationRemoved) -> Self {
+        Self::CompletionProtocolConfigurationRemoved {
+            variable: error.variable,
         }
     }
 }

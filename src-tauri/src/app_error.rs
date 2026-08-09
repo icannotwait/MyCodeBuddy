@@ -110,6 +110,14 @@ pub enum AppErrorCode {
     /// A legacy protocol-v1 root was restarted before prompt admission.
     /// Maps to HTTP 409. `detail` carries the successor conversation id.
     LegacyCompletionProtocolRestartRequired,
+    /// A mutation targeted a historical protocol-v1 workflow.
+    LegacyCompletionProtocolReadOnly,
+    /// A persisted workflow protocol pair is unknown or inconsistent.
+    UnsupportedCompletionProtocol,
+    /// A protocol-v2 completion instruction could not be bound durably.
+    CompletionInstructionBindingFailed,
+    /// A removed completion-protocol environment variable is still present.
+    CompletionProtocolConfigurationRemoved,
 
     // ─── Incremental reference search ─────────────────────────────────
     /// Search job was cancelled by a later cancel/start for the same source.
@@ -281,5 +289,35 @@ impl AppCommandError {
 impl From<DbError> for AppCommandError {
     fn from(value: DbError) -> Self {
         Self::db(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_completion_protocol_codes_serialize_as_snake_case() {
+        for (code, expected) in [
+            (
+                AppErrorCode::LegacyCompletionProtocolReadOnly,
+                "legacy_completion_protocol_read_only",
+            ),
+            (
+                AppErrorCode::UnsupportedCompletionProtocol,
+                "unsupported_completion_protocol",
+            ),
+            (
+                AppErrorCode::CompletionInstructionBindingFailed,
+                "completion_instruction_binding_failed",
+            ),
+            (
+                AppErrorCode::CompletionProtocolConfigurationRemoved,
+                "completion_protocol_configuration_removed",
+            ),
+        ] {
+            let serialized = serde_json::to_value(AppCommandError::new(code, "test")).unwrap();
+            assert_eq!(serialized["code"], expected);
+        }
     }
 }

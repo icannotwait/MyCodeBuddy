@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
 pub use super::artifact_resolver::{ArtifactError, ArtifactFailure};
 pub use super::evidence_scope::EvidenceScopeError;
 pub use super::plan_material::{PlanMaterialError, PlanMaterialErrorKind};
@@ -12,6 +14,20 @@ pub use super::types::WorkflowError;
 pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
 pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
 pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "completion protocol configuration {variable} was removed; remove the variable and restart"
+)]
+pub struct CompletionProtocolConfigurationRemoved {
+    pub variable: &'static str,
+}
+
+impl CompletionProtocolConfigurationRemoved {
+    pub const fn code(&self) -> &'static str {
+        "completion_protocol_configuration_removed"
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CompletionRecoveryFenceError {
@@ -170,6 +186,15 @@ pub enum WorkflowStoreError {
     #[error("parent conversation {0} not found")]
     ParentNotFound(i32),
 
+    #[error("legacy completion protocol is read-only")]
+    LegacyCompletionProtocolReadOnly,
+
+    #[error("unsupported completion protocol pair: version {version}, mode {mode:?}")]
+    UnsupportedCompletionProtocol {
+        version: i64,
+        mode: CompletionProtocolMode,
+    },
+
     #[error("legacy workflow restart is required: {0}")]
     LegacyCompletionProtocolRestartRequired(String),
 
@@ -203,6 +228,8 @@ pub enum WorkflowStoreError {
 impl WorkflowStoreError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::LegacyCompletionProtocolReadOnly => "legacy_completion_protocol_read_only",
+            Self::UnsupportedCompletionProtocol { .. } => "unsupported_completion_protocol",
             Self::LegacyCompletionProtocolRestartRequired(_) => {
                 "legacy_completion_protocol_restart_required"
             }
@@ -233,5 +260,51 @@ impl WorkflowStoreError {
             self,
             Self::Busy(_) | Self::Persistence(_) | Self::LegacyCompletionProtocolRestartRequired(_)
         )
+    }
+}
+
+pub fn require_v2_mutation(
+    version: i64,
+    mode: &CompletionProtocolMode,
+) -> Result<(), WorkflowStoreError> {
+    if version == 2 && mode == &CompletionProtocolMode::V2Enforce {
+        return Ok(());
+    }
+    if version == 1 {
+        return Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly);
+    }
+    Err(WorkflowStoreError::UnsupportedCompletionProtocol {
+        version,
+        mode: mode.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
+    #[test]
+    fn require_v2_mutation_classifies_all_protocol_pairs() {
+        use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+        assert_eq!(require_v2_mutation(2, &V2Enforce), Ok(()));
+        for mode in [V1, V2Shadow, V2Enforce] {
+            let error = require_v2_mutation(1, &mode).unwrap_err();
+            assert_eq!(error.code(), "legacy_completion_protocol_read_only");
+            assert!(!error.is_retryable());
+        }
+        for mode in [V1, V2Shadow] {
+            let error = require_v2_mutation(2, &mode).unwrap_err();
+            assert_eq!(error.code(), "unsupported_completion_protocol");
+            assert!(!error.is_retryable());
+        }
+        for version in [0, 3] {
+            for mode in [V1, V2Shadow, V2Enforce] {
+                let error = require_v2_mutation(version, &mode).unwrap_err();
+                assert_eq!(error.code(), "unsupported_completion_protocol");
+                assert!(!error.is_retryable());
+            }
+        }
     }
 }

@@ -40,14 +40,15 @@ use codeg_lib::acp::delegation::workflow::{
     publish_workflow_manifest_core, publish_workflow_manifest_with_selection_core,
     restart_legacy_workflow_core, restart_legacy_workflow_if_enforced, select_completion_protocol,
     settle_workflow_gate_v2_core, CompletionCardV2, CompletionIntent, CompletionIntentSource,
-    CompletionOutcome, CompletionProtocolRolloutConfig, CompletionProtocolSelection,
-    CompletionResolution, CompletionRole, DocumentGateKind, DocumentRef, FinalDeliveryGuardRequest,
-    FinalDeliveryGuardResult, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
-    ManifestNodeRole, ManifestPhase, ManifestWorkflowState, PlanReviewChangeV2,
-    PlanReviewNextAction, ProfileCompletionWindow, PublishWorkflowRequest, ResolutionMode,
-    RolloutDecision, SettleWorkflowV2Request, TerminalCompletionInput, WorkUnitKeyParts,
-    MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    CompletionOutcome, CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
+    CompletionProtocolSelection, CompletionResolution, CompletionRole, DocumentGateKind,
+    DocumentRef, FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument,
+    ManifestGate, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
+    ManifestWorkflowState, PlanReviewChangeV2, PlanReviewNextAction, ProfileCompletionWindow,
+    PublishWorkflowRequest, ResolutionMode, RolloutDecision, SettleWorkflowV2Request,
+    TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
+    CURRENT_COMPLETION_PROTOCOL_VERSION, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL,
+    PHASE_PLAN, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::ConnectionManager;
@@ -73,6 +74,56 @@ use sea_orm::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+#[test]
+fn stable_protocol_error_codes() {
+    assert_eq!(CURRENT_COMPLETION_PROTOCOL_VERSION, 2);
+    assert_eq!(
+        codeg_lib::acp::delegation::workflow::current_completion_protocol_mode(),
+        delegation_workflow::CompletionProtocolMode::V2Enforce
+    );
+
+    let read_only = WorkflowStoreError::LegacyCompletionProtocolReadOnly;
+    let unsupported = WorkflowStoreError::UnsupportedCompletionProtocol {
+        version: 2,
+        mode: delegation_workflow::CompletionProtocolMode::V2Shadow,
+    };
+    assert_eq!(read_only.code(), "legacy_completion_protocol_read_only");
+    assert_eq!(unsupported.code(), "unsupported_completion_protocol");
+    assert!(!read_only.is_retryable());
+    assert!(!unsupported.is_retryable());
+
+    let configuration_removed = CompletionProtocolConfigurationRemoved {
+        variable: "CODEG_COMPLETION_PROTOCOL_MODE",
+    };
+    assert_eq!(
+        configuration_removed.code(),
+        "completion_protocol_configuration_removed"
+    );
+
+    let acp_errors = [
+        (
+            AcpError::from(read_only),
+            "legacy_completion_protocol_read_only",
+        ),
+        (
+            AcpError::from(unsupported),
+            "unsupported_completion_protocol",
+        ),
+        (
+            AcpError::CompletionInstructionBindingFailed("scope mismatch".into()),
+            "completion_instruction_binding_failed",
+        ),
+        (
+            AcpError::from(configuration_removed),
+            "completion_protocol_configuration_removed",
+        ),
+    ];
+    for (error, expected) in acp_errors {
+        assert_eq!(error.code(), Some(expected));
+        assert_eq!(serde_json::to_value(error).unwrap()["code"], expected);
+    }
+}
 
 struct RootDepth;
 
