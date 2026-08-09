@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { ALL_AGENT_TYPES } from "@/lib/types"
 import {
   buildReadyPayload,
   claimResultMatchesRebind,
@@ -8,6 +9,7 @@ import {
   FOCUS_COMPOSER_EVENT,
   isAbortedPhase,
   isHandoffCompletePhase,
+  parseConversationRouteAgentType,
   parseConversationPopoutQuery,
   resolveDetachedConnectGate,
   shouldClearSuppressOnDetachedCommitAck,
@@ -15,6 +17,28 @@ import {
   shouldMountDetachedSurface,
   shouldReverseRebindAfterLiveFailure,
 } from "@/lib/conversation-popout-detached-bootstrap"
+
+describe("parseConversationRouteAgentType", () => {
+  it.each(ALL_AGENT_TYPES)("accepts builtin %s", (agentType) => {
+    expect(parseConversationRouteAgentType(agentType)).toBe(agentType)
+  })
+
+  it("accepts a syntactically valid registered custom wire id", () => {
+    expect(parseConversationRouteAgentType("custom:goose")).toBe("custom:goose")
+  })
+
+  it.each([
+    null,
+    "unknown",
+    "custom:",
+    "custom:.hidden",
+    "custom:Goose",
+    "custom:a/b",
+    `custom:${"a".repeat(65)}`,
+  ])("rejects unsupported or malformed agent wire value %s", (agentType) => {
+    expect(parseConversationRouteAgentType(agentType)).toBeNull()
+  })
+})
 
 describe("FOCUS_COMPOSER_EVENT", () => {
   it("matches the Rust eval CustomEvent name for pop-out activate", () => {

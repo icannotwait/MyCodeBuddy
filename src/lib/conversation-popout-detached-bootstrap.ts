@@ -4,7 +4,11 @@
  * without mounting the full React page.
  */
 
-import type { AgentType } from "@/lib/types"
+import {
+  ALL_AGENT_TYPES,
+  CUSTOM_AGENT_PREFIX,
+  type AgentType,
+} from "@/lib/types"
 
 export const CONVERSATION_WINDOW_READY_EVENT = "conversation-window://ready"
 export const CONVERSATION_WINDOW_COMMIT_ACK_EVENT =
@@ -18,6 +22,21 @@ export const CONVERSATION_WINDOW_COMMIT_ACK_EVENT =
  */
 export const FOCUS_COMPOSER_EVENT = "codeg:focus-composer"
 
+const CUSTOM_AGENT_ID_PATTERN = /^(?!\.)[a-z0-9._-]{1,64}$/
+
+export function parseConversationRouteAgentType(
+  raw: string | null | undefined
+): AgentType | null {
+  if (!raw) return null
+  if ((ALL_AGENT_TYPES as readonly string[]).includes(raw)) {
+    return raw as AgentType
+  }
+  if (!raw.startsWith(CUSTOM_AGENT_PREFIX)) return null
+
+  const customId = raw.slice(CUSTOM_AGENT_PREFIX.length)
+  return CUSTOM_AGENT_ID_PATTERN.test(customId) ? (raw as AgentType) : null
+}
+
 export type ParsedPopoutQuery = {
   conversationId: number
   folderId: number
@@ -25,25 +44,10 @@ export type ParsedPopoutQuery = {
   operationId: string
 }
 
-const ALLOWED_AGENTS: AgentType[] = [
-  "claude_code",
-  "codex",
-  "open_code",
-  "gemini",
-  "cline",
-  "hermes",
-  "code_buddy",
-  "kimi_code",
-  "pi",
-  "grok",
-  "cursor",
-]
-
 export function parseAgentType(
   raw: string | null | undefined
 ): AgentType | null {
-  if (!raw) return null
-  return (ALLOWED_AGENTS as string[]).includes(raw) ? (raw as AgentType) : null
+  return parseConversationRouteAgentType(raw)
 }
 
 export function parseConversationPopoutQuery(args: {

@@ -18,13 +18,60 @@ import {
   releaseConnectionWithoutDisconnect,
   type ReclaimAfterAbortLease,
 } from "@/lib/conversation-popout-acp-bridge"
-import { isLocalDesktop, subscribe } from "@/lib/platform"
+import {
+  conversationWindowLabel,
+  parseConversationRouteAgentType,
+} from "@/lib/conversation-popout-detached-bootstrap"
+import { isDesktop, isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
 import { useTabStore, type DetachRestoreToken } from "@/stores/tab-store"
 
+export type PopOutDisableReason = "not_supported" | "draft" | "last_tab"
+
 export type PopOutEnablement =
   | { enabled: true }
-  | { enabled: false; reason: "not_local_desktop" | "draft" | "last_tab" }
+  | { enabled: false; reason: PopOutDisableReason }
+
+export class PopOutPopupBlockedError extends Error {
+  readonly code = "popup_blocked" as const
+
+  constructor() {
+    super("popup_blocked")
+    this.name = "PopOutPopupBlockedError"
+  }
+}
+
+export function isPopOutPopupBlockedError(
+  error: unknown
+): error is PopOutPopupBlockedError {
+  return (
+    error instanceof PopOutPopupBlockedError ||
+    (typeof error === "object" &&
+      error != null &&
+      (error as { code?: unknown }).code === "popup_blocked")
+  )
+}
+
+export function shouldShowConversationPopout(): boolean {
+  return isLocalDesktop() || !isDesktop()
+}
+
+export function buildWebConversationPopoutUrl(args: {
+  conversationId: number
+  folderId: number
+  agentType: AgentType
+}): string {
+  const agentType = parseConversationRouteAgentType(args.agentType)
+  if (!agentType) throw new Error("invalid_agent_type")
+
+  const params = new URLSearchParams({
+    conversationId: String(args.conversationId),
+    folderId: String(args.folderId),
+    agentType,
+    mode: "web",
+  })
+  return `/conversation?${params.toString()}`
+}
 
 const detachedCache = new Set<number>()
 const inFlight = new Map<number, Promise<void>>()
@@ -123,13 +170,15 @@ export function canPopOutConversation(args: {
   isOpenMainTab: boolean
   mainTabCount: number
 }): PopOutEnablement {
-  if (!isLocalDesktop()) {
-    return { enabled: false, reason: "not_local_desktop" }
+  const localDesktop = isLocalDesktop()
+  const pureWeb = !isDesktop()
+  if (!localDesktop && !pureWeb) {
+    return { enabled: false, reason: "not_supported" }
   }
   if (args.conversationId == null || args.conversationId <= 0) {
     return { enabled: false, reason: "draft" }
   }
-  if (args.isOpenMainTab && args.mainTabCount < 2) {
+  if (localDesktop && args.isOpenMainTab && args.mainTabCount < 2) {
     return { enabled: false, reason: "last_tab" }
   }
   return { enabled: true }
@@ -897,6 +946,33 @@ export async function popOutConversation(args: {
   folderId: number
   agentType: AgentType
 }): Promise<void> {
+  if (!isDesktop()) {
+    const tabs = useTabStore.getState().rawTabs
+    const tab = tabs.find(
+      (candidate) =>
+        candidate.conversationId === args.conversationId &&
+        candidate.folderId === args.folderId &&
+        candidate.agentType === args.agentType
+    )
+    const enablement = canPopOutConversation({
+      conversationId: args.conversationId,
+      isOpenMainTab: tab != null,
+      mainTabCount: tabs.length,
+    })
+    if (!enablement.enabled) {
+      throw new Error(enablement.reason)
+    }
+
+    const opened = window.open(
+      buildWebConversationPopoutUrl(args),
+      conversationWindowLabel(args.conversationId)
+    )
+    if (opened == null) {
+      throw new PopOutPopupBlockedError()
+    }
+    return
+  }
+
   ensureClosedListener()
 
   const existing = inFlight.get(args.conversationId)

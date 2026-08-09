@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/lib/platform", () => ({
+  isDesktop: vi.fn(() => true),
   isLocalDesktop: vi.fn(() => true),
   subscribe: vi.fn(async () => () => {}),
 }))
@@ -97,19 +98,22 @@ vi.mock("@/stores/tab-store", () => ({
   },
 }))
 
-import { isLocalDesktop, subscribe } from "@/lib/platform"
+import { isDesktop, isLocalDesktop, subscribe } from "@/lib/platform"
 import * as api from "@/lib/api"
 import {
   __bumpTransferEpochForTests,
   __flushPendingTerminalRecoveriesForTests,
   __resetPopoutRuntimeForTests,
   __setAbortWaitForTests,
+  buildWebConversationPopoutUrl,
   canPopOutConversation,
   focusDetachedConversation,
   getTransferEpoch,
   isConversationDetachedCache,
   isPopOutInFlight,
+  isPopOutPopupBlockedError,
   popOutConversation,
+  shouldShowConversationPopout,
 } from "@/lib/conversation-popout"
 import {
   __resetTransferFencesForTests,
@@ -119,12 +123,13 @@ import {
   registerPopoutAcpBridge,
 } from "@/lib/conversation-popout-acp-bridge"
 
-describe("canPopOutConversation", () => {
+describe("canPopOutConversation runtime matrix", () => {
   beforeEach(() => {
+    vi.mocked(isDesktop).mockReturnValue(true)
     vi.mocked(isLocalDesktop).mockReturnValue(true)
   })
 
-  it("disables for draft", () => {
+  it("disables drafts on local desktop", () => {
     expect(
       canPopOutConversation({
         conversationId: null,
@@ -134,7 +139,7 @@ describe("canPopOutConversation", () => {
     ).toEqual({ enabled: false, reason: "draft" })
   })
 
-  it("disables for last main tab", () => {
+  it("keeps the local-desktop last-tab rule", () => {
     expect(
       canPopOutConversation({
         conversationId: 1,
@@ -144,30 +149,188 @@ describe("canPopOutConversation", () => {
     ).toEqual({ enabled: false, reason: "last_tab" })
   })
 
-  it("enables when multiple tabs", () => {
+  it("enables a persisted pure-web conversation even when it is the last tab", () => {
+    vi.mocked(isDesktop).mockReturnValue(false)
+    vi.mocked(isLocalDesktop).mockReturnValue(false)
+
+    expect(shouldShowConversationPopout()).toBe(true)
     expect(
       canPopOutConversation({
-        conversationId: 1,
+        conversationId: 7,
         isOpenMainTab: true,
-        mainTabCount: 2,
+        mainTabCount: 1,
       })
     ).toEqual({ enabled: true })
   })
 
-  it("hides for non-local desktop", () => {
+  it("disables a pure-web draft", () => {
+    vi.mocked(isDesktop).mockReturnValue(false)
     vi.mocked(isLocalDesktop).mockReturnValue(false)
+
     expect(
       canPopOutConversation({
-        conversationId: 1,
+        conversationId: null,
+        isOpenMainTab: false,
+        mainTabCount: 0,
+      })
+    ).toEqual({ enabled: false, reason: "draft" })
+  })
+
+  it("classifies remote desktop as unsupported and hides the action", () => {
+    vi.mocked(isDesktop).mockReturnValue(true)
+    vi.mocked(isLocalDesktop).mockReturnValue(false)
+
+    expect(shouldShowConversationPopout()).toBe(false)
+    expect(
+      canPopOutConversation({
+        conversationId: 7,
         isOpenMainTab: true,
         mainTabCount: 2,
       })
-    ).toEqual({ enabled: false, reason: "not_local_desktop" })
+    ).toEqual({ enabled: false, reason: "not_supported" })
+  })
+})
+
+describe("buildWebConversationPopoutUrl", () => {
+  it("builds the static-export route with mode=web and no operationId", () => {
+    const path = buildWebConversationPopoutUrl({
+      conversationId: 42,
+      folderId: 7,
+      agentType: "codex",
+    })
+    const parsed = new URL(path, "http://codeg.test")
+
+    expect(parsed.pathname).toBe("/conversation")
+    expect(Object.fromEntries(parsed.searchParams)).toEqual({
+      conversationId: "42",
+      folderId: "7",
+      agentType: "codex",
+      mode: "web",
+    })
+    expect(parsed.searchParams.has("operationId")).toBe(false)
+  })
+
+  it("encodes a valid registered custom agent wire id", () => {
+    const path = buildWebConversationPopoutUrl({
+      conversationId: 42,
+      folderId: 7,
+      agentType: "custom:goose",
+    })
+
+    expect(
+      new URL(path, "http://codeg.test").searchParams.get("agentType")
+    ).toBe("custom:goose")
+  })
+
+  it.each([
+    "custom:",
+    "custom:.hidden",
+    "custom:Goose",
+    "custom:a/b",
+    `custom:${"a".repeat(65)}`,
+  ])("rejects malformed custom agent wire value %s", (agentType) => {
+    expect(() =>
+      buildWebConversationPopoutUrl({
+        conversationId: 42,
+        folderId: 7,
+        agentType,
+      })
+    ).toThrow("invalid_agent_type")
+  })
+})
+
+describe("web conversation pop-out", () => {
+  beforeEach(() => {
+    vi.mocked(isDesktop).mockReturnValue(false)
+    vi.mocked(isLocalDesktop).mockReturnValue(false)
+    vi.mocked(subscribe).mockClear()
+    vi.mocked(api.focusConversationWindow).mockClear()
+    vi.mocked(api.openConversationWindow).mockClear()
+    vi.mocked(api.completeConversationPopoutOperation).mockClear()
+    tabMocks.resetRawTabs()
+    tabMocks.detachTab.mockClear()
+    __resetTransferFencesForTests()
+    __resetPopoutRuntimeForTests()
+  })
+
+  it("opens once, keeps the main tab, and enters no desktop handoff stage", async () => {
+    const tabsBefore = [...tabMocks.rawTabs]
+    const open = vi.spyOn(window, "open").mockReturnValue({} as Window)
+
+    try {
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+
+      expect(open).toHaveBeenCalledWith(
+        "/conversation?conversationId=1&folderId=1&agentType=claude_code&mode=web",
+        "conversation-1"
+      )
+      expect(open).toHaveBeenCalledTimes(1)
+      expect(tabMocks.rawTabs).toEqual(tabsBefore)
+      expect(tabMocks.detachTab).not.toHaveBeenCalled()
+      expect(isTransferringOut(1)).toBe(false)
+      expect(subscribe).not.toHaveBeenCalled()
+      expect(api.focusConversationWindow).not.toHaveBeenCalled()
+      expect(api.openConversationWindow).not.toHaveBeenCalled()
+      expect(api.completeConversationPopoutOperation).not.toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it("reports a null browser window as popup_blocked without desktop effects", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null)
+
+    try {
+      let rejected: unknown = null
+      try {
+        await popOutConversation({
+          conversationId: 1,
+          folderId: 1,
+          agentType: "claude_code",
+        })
+      } catch (error) {
+        rejected = error
+      }
+      expect(isPopOutPopupBlockedError(rejected)).toBe(true)
+      expect(rejected).toMatchObject({ code: "popup_blocked" })
+      expect(open).toHaveBeenCalledTimes(1)
+      expect(tabMocks.detachTab).not.toHaveBeenCalled()
+      expect(isTransferringOut(1)).toBe(false)
+      expect(subscribe).not.toHaveBeenCalled()
+      expect(api.openConversationWindow).not.toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it("rejects a malformed custom agent before calling window.open", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue({} as Window)
+
+    try {
+      await expect(
+        popOutConversation({
+          conversationId: 1,
+          folderId: 1,
+          agentType: "custom:Goose",
+        })
+      ).rejects.toThrow("invalid_agent_type")
+      expect(open).not.toHaveBeenCalled()
+      expect(tabMocks.detachTab).not.toHaveBeenCalled()
+      expect(subscribe).not.toHaveBeenCalled()
+      expect(api.openConversationWindow).not.toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
   })
 })
 
 describe("popOutConversation compensation", () => {
   beforeEach(() => {
+    vi.mocked(isDesktop).mockReturnValue(true)
     vi.mocked(isLocalDesktop).mockReturnValue(true)
     __resetTransferFencesForTests()
     __setAbortWaitForTests(null)
