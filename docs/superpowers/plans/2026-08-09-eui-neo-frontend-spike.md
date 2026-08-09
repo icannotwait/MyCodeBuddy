@@ -38,6 +38,7 @@
 - Do not insert human UAT, manual sign-off, or user approval between Tasks. Real-agent/native-window evidence is producer-run and recorded; human acceptance is listed only as post-delivery residual work.
 - Final product-loop acceptance requires successful real workspace/session/send/stream evidence for both Grok and Codex on the prepared producer host. Missing installation, credentials, or launchability for either agent blocks delivery unless the approved design scope is explicitly revised; performance-only skip notation does not satisfy this gate.
 - Generated Cargo/CMake output, screenshots, and raw/local performance artifacts are local ignored evidence. Producer commits stage exact source paths only; recursive parent-directory staging is forbidden. Intentionally ignored `.superpowers` delivery reports use `git add -f`.
+- All headless C++ suites use the repository-owned `CODEG_EUI_TEST_HARNESS_VERSION=1` in `codeg-eui/tests/test_harness.h` plus `test_main.cpp`; do not fetch GoogleTest/Catch2 or require EUI/GLFW/OpenGL in contracts-only mode. Every C++ RED source is added through `codeg_eui_add_contract_test(<exact-ctest-name> <source>)` no later than its RED step, builds that target, proves `ctest -N -R '^<exact-name>$'` selects exactly one test through `assert_ctest_registered.sh`, and then proves the named assertion fails. A compile failure or zero-test selection is an invalid RED result.
 - Work from `/workspace/MyCodeBuddy/.worktrees/feat/eui-neo-frontend-spike` using POSIX shell syntax. Create local commits only; do not push, merge, rebase, or open a pull request.
 
 ### Risk Policy
@@ -98,6 +99,10 @@ Policy version: `b2d_task_risk_v1`.
 | `codeg-eui/app/pages/settings.h` | Grok/Codex probe, P0 launch fields, P1 structured fields, and advanced raw editors. |
 | `codeg-eui/app/perf_metrics.h` | UI presentation markers, active frame intervals, fixed 50 ms count, and JSON result output. |
 | `codeg-eui/tests/*.cpp` | Header layout, deep-copy lifetime, completion dispatch, stale-result, and metric aggregation tests. |
+| `codeg-eui/tests/test_harness.h` | Repository-owned C++ test registry and `TEST`/`EXPECT_*`/`ASSERT_EQ` macros, frozen at harness version 1. |
+| `codeg-eui/tests/test_main.cpp` | One custom `main()` shared by every headless C++ test executable. |
+| `codeg-eui/tests/assert_ctest_registered.sh` | Fail unless each supplied anchored CTest name selects exactly one registered test. |
+| `codeg-eui/tests/assert_ctest_red.sh` | Run one exact CTest name and fail unless its executable builds but the named harness assertion fails. |
 | `codeg-eui/tests/perf_compare_test.sh` | Exercise all performance-script subcommands, usage failures, metadata validation, and self-test behavior. |
 | `codeg-eui/scripts/build.sh` | Build Rust staticlib, configure CMake, build/link EUI, and print the runnable binary path. |
 | `codeg-eui/scripts/perf_compare.sh` | Run/aggregate three measurements, sample shell RSS, validate metadata, and render comparison rows. |
@@ -124,6 +129,26 @@ Policy version: `b2d_task_risk_v1`.
 | Grok and Codex real streaming each present non-empty text and complete successfully | Tasks 6 and 11 | mandatory producer-run evidence for both agents; either unavailable or unsuccessful agent blocks delivery |
 | Default product paths have no EUI dependency | Tasks 1, 10, and 11 | default desktop/server/MCP checks with EUI submodule temporarily unavailable |
 
+### C++ Contract Test Registry
+
+`codeg_eui_add_contract_test(name, source)` always creates executable
+`${name}_test`, links `tests/test_main.cpp`, and registers one CTest test named
+exactly `${name}`. These are the complete planned registrations:
+
+| Producer Task | Source | Executable | Exact CTest name |
+| --- | --- | --- | --- |
+| 1 | `tests/harness_self_test.cpp` | `codeg_eui_harness_self_test` | `codeg_eui_harness_self` |
+| 1 | `tests/abi_layout_test.cpp` | `codeg_eui_abi_layout_test` | `codeg_eui_abi_layout` |
+| 3 | `tests/shutdown_drain_test.cpp` | `codeg_eui_shutdown_drain_test` | `codeg_eui_shutdown_drain` |
+| 3 | `tests/ui_snapshot_test.cpp` | `codeg_eui_ui_snapshot_test` | `codeg_eui_ui_snapshot` |
+| 7 | `tests/client_completion_test.cpp` | `codeg_eui_client_completion_test` | `codeg_eui_client_completion` |
+| 7 | `tests/app_lifecycle_test.cpp` | `codeg_eui_app_lifecycle_test` | `codeg_eui_app_lifecycle` |
+| 7 | `tests/shell_page_test.cpp` | `codeg_eui_shell_page_test` | `codeg_eui_shell_page` |
+| 7 | `tests/chat_page_test.cpp` | `codeg_eui_chat_page_test` | `codeg_eui_chat_page` |
+| 7 | `tests/settings_page_test.cpp` | `codeg_eui_settings_page_test` | `codeg_eui_settings_page` |
+| 8 | `tests/m5_controls_test.cpp` | `codeg_eui_m5_controls_test` | `codeg_eui_m5_controls` |
+| 9 | `tests/perf_metrics_test.cpp` | `codeg_eui_perf_metrics_test` | `codeg_eui_perf_metrics` |
+
 ---
 
 ### Task 1: Establish the Optional EUI Build Spine and Hello Window
@@ -143,13 +168,18 @@ Policy version: `b2d_task_risk_v1`.
 - Create: `codeg-eui/CMakeLists.txt`
 - Create: `codeg-eui/app/app.cpp`
 - Create: `codeg-eui/app/bridge/codeg_eui_bridge.h`
+- Create: `codeg-eui/tests/test_harness.h`
+- Create: `codeg-eui/tests/test_main.cpp`
+- Create: `codeg-eui/tests/harness_self_test.cpp`
+- Create: `codeg-eui/tests/assert_ctest_registered.sh`
+- Create: `codeg-eui/tests/assert_ctest_red.sh`
 - Create: `codeg-eui/tests/abi_layout_test.cpp`
 - Create: `codeg-eui/scripts/build.sh`
 
 **Interfaces:**
 
 - Consumes: `codeg_lib` from `src-tauri` with `default-features = false`; EUI `glfw_app_main.cpp`, `eui_neo_configure_app`, and `app::{dslAppConfig,compose}`.
-- Produces: ABI version constant `CODEG_EUI_API_VERSION=1`; exported `codeg_eui_api_version`, `codeg_eui_init`, `codeg_eui_poll`, initial `codeg_eui_begin_shutdown`, and `codeg_eui_shutdown`; CMake target `codeg-eui`; Rust artifact `libcodeg_eui_core.a`; explicit generated-output ignores.
+- Produces: ABI version constant `CODEG_EUI_API_VERSION=1`; exported `codeg_eui_api_version`, `codeg_eui_init`, `codeg_eui_poll`, initial `codeg_eui_begin_shutdown`, and `codeg_eui_shutdown`; CMake target `codeg-eui`; Rust artifact `libcodeg_eui_core.a`; repository-owned C++ harness v1 and `codeg_eui_add_contract_test`; explicit generated-output ignores.
 - Preserves: no root Cargo workspace and no reference from `src-tauri/Cargo.toml`, `package.json`, or default CMake/build paths to the new crate or submodule.
 
 **Task Routing Matrix:**
@@ -258,7 +288,143 @@ pub extern "C" fn codeg_eui_poll(out: *mut CodegEuiFrame) -> i32 {
 
 The M0 lifecycle already follows the public call order used by the final bridge: `init` enters `running`, `begin_shutdown` enters `stopping` and rejects new work, the first successful stopping `poll` returns `shutdown_ready=1`, and only then does `shutdown` enter `stopped`. Because M0 accepts no async requests, that stopping poll is immediately ready. Task 3 replaces the minimal process-local state with the full worker/drain state machine without changing these symbols or weakening their ordering.
 
-- [ ] **Step 5: Mirror ABI v1 in C and write the headless layout test**
+- [ ] **Step 5: Add the self-contained C++ test harness before any C++ RED**
+
+Create `test_harness.h` as a dependency-free C++17 registry. It records an
+expectation failure without aborting the process, aborts only the current test
+for `ASSERT_EQ`, prints `[FAIL] Suite.Name` for a failing case, and returns `1`
+from the shared runner when any case fails:
+
+```cpp
+#pragma once
+#include <exception>
+#include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#define CODEG_EUI_TEST_HARNESS_VERSION 1
+
+namespace codeg_eui::test {
+struct Case { const char* name; void (*body)(); };
+struct AbortCase final {};
+inline std::vector<Case>& registry() { static std::vector<Case> value; return value; }
+inline int& failures() { static int value = 0; return value; }
+struct Registrar {
+  Registrar(const char* name, void (*body)()) { registry().push_back({name, body}); }
+};
+inline void expect(bool ok, const char* expression, const char* file, int line) {
+  if (!ok) { ++failures(); std::cerr << file << ':' << line << ": " << expression << '\n'; }
+}
+template <class A, class B>
+inline void expectEq(const A& actual, const B& expected, const char* expression,
+                     const char* file, int line, bool fatal) {
+  if (!(actual == expected)) {
+    expect(false, expression, file, line);
+    if (fatal) throw AbortCase{};
+  }
+}
+inline int runAll() {
+  int failedCases = 0;
+  for (const Case& test : registry()) {
+    const int before = failures();
+    try { test.body(); }
+    catch (const AbortCase&) {}
+    catch (const std::exception& error) {
+      expect(false, error.what(), __FILE__, __LINE__);
+    }
+    if (failures() != before) {
+      ++failedCases;
+      std::cerr << "[FAIL] " << test.name << '\n';
+    } else {
+      std::cout << "[PASS] " << test.name << '\n';
+    }
+  }
+  return failedCases == 0 ? 0 : 1;
+}
+}  // namespace codeg_eui::test
+
+#define TEST(suite, name) \
+  static void suite##_##name(); \
+  static ::codeg_eui::test::Registrar suite##_##name##_registrar( \
+      #suite "." #name, &suite##_##name); \
+  static void suite##_##name()
+#define EXPECT_TRUE(value) ::codeg_eui::test::expect(!!(value), #value, __FILE__, __LINE__)
+#define EXPECT_FALSE(value) ::codeg_eui::test::expect(!(value), "!(" #value ")", __FILE__, __LINE__)
+#define EXPECT_EQ(actual, expected) ::codeg_eui::test::expectEq((actual), (expected), #actual " == " #expected, __FILE__, __LINE__, false)
+#define EXPECT_GE(actual, expected) ::codeg_eui::test::expect(((actual) >= (expected)), #actual " >= " #expected, __FILE__, __LINE__)
+#define ASSERT_EQ(actual, expected) ::codeg_eui::test::expectEq((actual), (expected), #actual " == " #expected, __FILE__, __LINE__, true)
+```
+
+Create the shared main:
+
+```cpp
+#include "test_harness.h"
+int main() { return codeg_eui::test::runAll(); }
+```
+
+`harness_self_test.cpp` includes the header, asserts version `1`, and exercises
+all five macros with passing values:
+
+```cpp
+#include "test_harness.h"
+TEST(Harness, version_and_plan_assertions_are_available) {
+  EXPECT_EQ(CODEG_EUI_TEST_HARNESS_VERSION, 1);
+  EXPECT_TRUE(true);
+  EXPECT_FALSE(false);
+  EXPECT_GE(2, 1);
+  ASSERT_EQ(4, 2 + 2);
+}
+```
+
+Create `assert_ctest_registered.sh`:
+
+```bash
+#!/bin/sh
+set -eu
+build_dir=$1
+shift
+for exact_name do
+  count=$(ctest --test-dir "$build_dir" -N -R "^${exact_name}$" |
+    awk '/Total Tests:/ { print $3 }')
+  test "$count" = 1 || {
+    printf 'expected one CTest named %s, found %s\n' "$exact_name" "${count:-0}" >&2
+    exit 1
+  }
+done
+```
+
+Create `assert_ctest_red.sh` so every RED command proves both selection and the
+specific failed behavior while returning success to the outer evidence script:
+
+```bash
+#!/bin/sh
+set -eu
+build_dir=$1
+exact_name=$2
+failed_case=$3
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+"$script_dir/assert_ctest_registered.sh" "$build_dir" "$exact_name"
+set +e
+output=$(ctest --test-dir "$build_dir" -R "^${exact_name}$" --output-on-failure 2>&1)
+status=$?
+set -e
+test "$status" -ne 0
+printf '%s\n' "$output" | grep -F "[FAIL] $failed_case" >/dev/null
+printf '%s\n' "$output" | grep -F '0% tests passed, 1 tests failed out of 1' >/dev/null
+```
+
+Mark both scripts executable:
+
+```bash
+chmod +x codeg-eui/tests/assert_ctest_registered.sh \
+  codeg-eui/tests/assert_ctest_red.sh
+```
+
+This is a repository-owned harness pin, not an external dependency: changing
+its version or semantics requires an explicit Plan/contract review.
+
+- [ ] **Step 6: Mirror ABI v1 in C and write the headless layout test**
 
 The header must use only fixed-width C types and include compile-time assertions:
 
@@ -288,9 +454,15 @@ static_assert(sizeof(CodegEuiFrame) == 24, "CodegEuiFrame ABI drift");
 #endif
 ```
 
-`abi_layout_test.cpp` asserts version `1`, size `24`, `offsetof(generation)==8`, and `offsetof(shutdown_ready)==16` without linking the EUI application. The Rust smoke test also drives `init -> begin_shutdown -> stopping poll with shutdown_ready=1 -> shutdown` and rejects final shutdown before the ready poll.
+`abi_layout_test.cpp` includes `test_harness.h`, has no local `main`, retains
+the compile-time `static_assert`s, and registers
+`TEST(AbiLayout, matches_v1_size_alignment_and_offsets)` with runtime
+`EXPECT_EQ` checks for version `1`, size `24`, `offsetof(generation)==8`, and
+`offsetof(shutdown_ready)==16` without linking the EUI application. The Rust
+smoke test also drives `init -> begin_shutdown -> stopping poll with
+shutdown_ready=1 -> shutdown` and rejects final shutdown before the ready poll.
 
-- [ ] **Step 6: Add CMake and the hello window**
+- [ ] **Step 7: Add CMake test registration and the hello window**
 
 Use the EUI integration contract exactly:
 
@@ -304,9 +476,15 @@ option(CODEG_EUI_ABI_LINK_TESTS "Link black-box ABI tests to the Rust archive" O
 set(CODEG_EUI_RUST_LIB "" CACHE FILEPATH "Absolute libcodeg_eui_core.a path")
 
 enable_testing()
-add_executable(codeg_eui_abi_layout_test tests/abi_layout_test.cpp)
-target_include_directories(codeg_eui_abi_layout_test PRIVATE app/bridge)
-add_test(NAME codeg_eui_abi_layout COMMAND codeg_eui_abi_layout_test)
+function(codeg_eui_add_contract_test exact_name source)
+  set(target "${exact_name}_test")
+  add_executable(${target} "${source}" tests/test_main.cpp)
+  target_include_directories(${target} PRIVATE tests app app/bridge)
+  add_test(NAME "${exact_name}" COMMAND ${target})
+endfunction()
+
+codeg_eui_add_contract_test(codeg_eui_harness_self tests/harness_self_test.cpp)
+codeg_eui_add_contract_test(codeg_eui_abi_layout tests/abi_layout_test.cpp)
 
 if(CODEG_EUI_ABI_LINK_TESTS OR NOT CODEG_EUI_CONTRACTS_ONLY)
   if(NOT IS_ABSOLUTE "${CODEG_EUI_RUST_LIB}" OR
@@ -320,14 +498,13 @@ if(CODEG_EUI_ABI_LINK_TESTS OR NOT CODEG_EUI_CONTRACTS_ONLY)
 endif()
 
 if(CODEG_EUI_ABI_LINK_TESTS)
-  add_executable(codeg_eui_shutdown_drain_test tests/shutdown_drain_test.cpp)
+  codeg_eui_add_contract_test(
+    codeg_eui_shutdown_drain tests/shutdown_drain_test.cpp)
   target_compile_definitions(codeg_eui_shutdown_drain_test PRIVATE
     CODEG_EUI_TEST_HOOKS=1)
   target_include_directories(codeg_eui_shutdown_drain_test PRIVATE app/bridge)
   target_link_libraries(codeg_eui_shutdown_drain_test PRIVATE
     codeg_eui_core Threads::Threads ${CMAKE_DL_LIBS} m)
-  add_test(NAME codeg_eui_shutdown_drain COMMAND
-    codeg_eui_shutdown_drain_test)
 endif()
 
 if(NOT CODEG_EUI_CONTRACTS_ONLY)
@@ -359,27 +536,31 @@ Create exact ignore files before any build:
 /target/
 ```
 
-- [ ] **Step 7: Add the deterministic build orchestrator**
+- [ ] **Step 8: Add the deterministic build orchestrator**
 
 `codeg-eui/scripts/build.sh` must use `set -eu`, resolve the absolute repository root from the script path, reject non-Linux hosts, verify the submodule commit, build `codeg-eui-core --release`, pass `-DCODEG_EUI_RUST_LIB="${repo_root}/src-tauri/codeg-eui-core/target/release/libcodeg_eui_core.a"`, and print the absolute `codeg-eui` binary path as its final output line. It must not run `git submodule update` implicitly or mutate the pin.
 
-- [ ] **Step 8: Run automated verification and a prepared-host native build**
+- [ ] **Step 9: Verify both exact C++ registrations and run the prepared-host build**
 
 ```bash
 cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test abi_smoke
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
 cmake --build codeg-eui/build-contract --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_harness_self codeg_eui_abi_layout
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_harness_self$' --output-on-failure
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_abi_layout$' --output-on-failure
 ctest --test-dir codeg-eui/build-contract --output-on-failure
 codeg-eui/scripts/build.sh
 ```
 
 Expected: Rust and headless C++ tests pass. On a Linux host with CMake, a C++17 compiler, GLFW/OpenGL development libraries, and initialized submodules, `build.sh` produces a runnable hello window. Missing native packages are recorded in the review package and do not weaken the Rust/headless gates.
 
-- [ ] **Step 9: Commit and prepare the Task 1 review package**
+- [ ] **Step 10: Commit and prepare the Task 1 review package**
 
 ```bash
-git add --dry-run -- .gitmodules codeg-eui/.gitignore codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/scripts/build.sh codeg-eui/tests/abi_layout_test.cpp codeg-eui/third_party/EUI-NEO src-tauri/codeg-eui-core/.gitignore src-tauri/codeg-eui-core/Cargo.toml src-tauri/codeg-eui-core/src/lib.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/abi_smoke.rs
-git add -- .gitmodules codeg-eui/.gitignore codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/scripts/build.sh codeg-eui/tests/abi_layout_test.cpp codeg-eui/third_party/EUI-NEO src-tauri/codeg-eui-core/.gitignore src-tauri/codeg-eui-core/Cargo.toml src-tauri/codeg-eui-core/src/lib.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/abi_smoke.rs
+git add --dry-run -- .gitmodules codeg-eui/.gitignore codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/scripts/build.sh codeg-eui/tests/test_harness.h codeg-eui/tests/test_main.cpp codeg-eui/tests/harness_self_test.cpp codeg-eui/tests/assert_ctest_registered.sh codeg-eui/tests/assert_ctest_red.sh codeg-eui/tests/abi_layout_test.cpp codeg-eui/third_party/EUI-NEO src-tauri/codeg-eui-core/.gitignore src-tauri/codeg-eui-core/Cargo.toml src-tauri/codeg-eui-core/src/lib.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/abi_smoke.rs
+git add -- .gitmodules codeg-eui/.gitignore codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/scripts/build.sh codeg-eui/tests/test_harness.h codeg-eui/tests/test_main.cpp codeg-eui/tests/harness_self_test.cpp codeg-eui/tests/assert_ctest_registered.sh codeg-eui/tests/assert_ctest_red.sh codeg-eui/tests/abi_layout_test.cpp codeg-eui/third_party/EUI-NEO src-tauri/codeg-eui-core/.gitignore src-tauri/codeg-eui-core/Cargo.toml src-tauri/codeg-eui-core/src/lib.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/abi_smoke.rs
 git diff --cached --name-only
 git status --short --untracked-files=all
 git commit -m "feat(eui): add optional native shell build spine"
@@ -387,7 +568,7 @@ git show --stat --oneline HEAD
 git diff HEAD^ -- .gitmodules codeg-eui src-tauri/codeg-eui-core
 ```
 
-Expected package: one commit with the exact submodule pin, independent crate, ABI v1 skeleton, CMake target, hello app, headless tests, and ignore ownership. The staged list contains no `target`, `build`, `results`, screenshot, binary, or object path. Attach Task 1 command evidence and route it to both high-risk reviewers, then continue directly to Task 2.
+Expected package: one commit with the exact submodule pin, independent crate, ABI v1 skeleton, CMake target, hello app, self-contained harness v1, exact CTest registration guard, headless tests, and ignore ownership. The staged list contains no `target`, `build`, `results`, screenshot, binary, or object path. Attach Task 1 command evidence and route it to both high-risk reviewers, then continue directly to Task 2.
 
 ### Task 2: Pin the Isolated Data Root and Construct the EUI AppState Profile
 
@@ -785,7 +966,8 @@ cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test abi_smoke
 cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test bridge_contract lifecycle -- --nocapture
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
 cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R abi_layout --output-on-failure
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_abi_layout
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_abi_layout$' --output-on-failure
 ```
 
 Expected: complete layout, lifecycle order, wrong-thread, panic, and input cases pass; queue/frame/drain-with-in-flight-work cases remain unimplemented.
@@ -871,9 +1053,17 @@ Run the Step 10 command. Expected: all pointer-lifetime and completion-transfer 
 
 `shutdown_contract.rs` uses barriers to accept a controllable blocked request, calls `codeg_eui_begin_shutdown`, and asserts: new enqueue is rejected; poll remains legal in `stopping`; final shutdown returns `NOT_READY` before a ready frame; cancellation terminalizes the blocked ID; one successful poll exposes that completion and `shutdown_ready=1`; only then final shutdown returns `OK`, joins the runtime, frees the frame, and enters `stopped`.
 
-Create `shutdown_drain_test.cpp` as the black-box consumer. Build the staticlib with Cargo feature `ffi-test-hooks`; the feature exposes only `codeg_eui_test_enqueue_blocked(uint64_t*)` as a stimulus. The C++ test uses the ordinary public lifecycle/poll ABI and must copy the result before final free:
+Create `shutdown_drain_test.cpp` as the black-box consumer and wrap the body in
+`TEST(ShutdownDrain, exposes_cancelled_completion_before_final_free)`. Build the
+staticlib with Cargo feature `ffi-test-hooks`; the feature exposes only
+`codeg_eui_test_enqueue_blocked(uint64_t*)` as a stimulus. The RED setup must
+export a compile-safe hook that accepts one synthetic request and returns its
+ID, but it does not yet terminalize that ID during drain; the harness therefore
+builds and fails the final completion assertion. The C++ test uses the ordinary
+public lifecycle/poll ABI and must copy the result before final free:
 
 ```cpp
+TEST(ShutdownDrain, exposes_cancelled_completion_before_final_free) {
 ASSERT_EQ(codeg_eui_init(root.data(), root.size()), CODEG_EUI_OK);
 uint64_t requestId = 0;
 ASSERT_EQ(codeg_eui_test_enqueue_blocked(&requestId), CODEG_EUI_OK);
@@ -890,6 +1080,7 @@ for (int attempt = 0; attempt < 200; ++attempt) {
 }
 ASSERT_EQ(countCompletion(seen, requestId, CODEG_EUI_COMPLETION_CANCELLED), 1);
 ASSERT_EQ(codeg_eui_shutdown(), CODEG_EUI_OK);
+}
 ```
 
 The test hook is absent from normal builds and normal headers unless `CODEG_EUI_TEST_HOOKS` is defined.
@@ -906,11 +1097,21 @@ ffi-test-hooks = []
 cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test shutdown_contract
 cargo build --manifest-path src-tauri/codeg-eui-core/Cargo.toml --features ffi-test-hooks
 cmake -S codeg-eui -B codeg-eui/build-abi-link -DCODEG_EUI_CONTRACTS_ONLY=ON -DCODEG_EUI_ABI_LINK_TESTS=ON -DCODEG_EUI_RUST_LIB="$PWD/src-tauri/codeg-eui-core/target/debug/libcodeg_eui_core.a"
-cmake --build codeg-eui/build-abi-link --parallel
-ctest --test-dir codeg-eui/build-abi-link -R shutdown_drain --output-on-failure
+cmake --build codeg-eui/build-abi-link --target codeg_eui_shutdown_drain_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-abi-link codeg_eui_shutdown_drain
+set +e
+red_output=$(ctest --test-dir codeg-eui/build-abi-link -R '^codeg_eui_shutdown_drain$' --output-on-failure 2>&1)
+red_status=$?
+set -e
+test "$red_status" -ne 0
+printf '%s\n' "$red_output" | rg -q '\[FAIL\] ShutdownDrain.exposes_cancelled_completion_before_final_free'
+printf '%s\n' "$red_output" | rg -q '0% tests passed, 1 tests failed out of 1'
 ```
 
-Expected: RED because stopping polls, `shutdown_ready`, and finalization gating are absent.
+Expected: the Rust contract test fails on missing stopping behavior; the C++
+target compiles, registration count is exactly one, and the harness reports the
+named `ShutdownDrain` assertion failure. Configure/build failure, `No tests were
+found`, or `Total Tests: 0` does not count as RED.
 
 - [ ] **Step 14: Implement begin-drain, stopping polls, and final shutdown**
 
@@ -930,25 +1131,66 @@ fn final_shutdown(slot: &mut BridgeSlot) -> i32 {
 
 - [ ] **Step 15: Run public shutdown tests to verify GREEN**
 
-Run every command from Step 13. Expected: the C++ consumer observes the cancelled request once before final shutdown, and Rust verifies disconnect/join/free ordering without timing sleeps.
+```bash
+cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test shutdown_contract
+cargo build --manifest-path src-tauri/codeg-eui-core/Cargo.toml --features ffi-test-hooks
+cmake -S codeg-eui -B codeg-eui/build-abi-link -DCODEG_EUI_CONTRACTS_ONLY=ON -DCODEG_EUI_ABI_LINK_TESTS=ON -DCODEG_EUI_RUST_LIB="$PWD/src-tauri/codeg-eui-core/target/debug/libcodeg_eui_core.a"
+cmake --build codeg-eui/build-abi-link --target codeg_eui_shutdown_drain_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-abi-link codeg_eui_shutdown_drain
+ctest --test-dir codeg-eui/build-abi-link -R '^codeg_eui_shutdown_drain$' --output-on-failure
+```
+
+Expected: the exact registered C++ consumer test passes after observing the
+cancelled request once before final shutdown, and Rust verifies
+disconnect/join/free ordering without timing sleeps.
 
 - [ ] **Step 16: Write the C++ deep-copy RED test**
 
 `ui_snapshot_test.cpp` copies frame A, triggers successful frame B, completes the two-phase shutdown, and then reads only the copied A value strings. It also rejects `(ptr=null,len>0)` and accepts `(ptr=null,len=0)`.
 
-```bash
-cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R ui_snapshot --output-on-failure
+Add a compile-safe neutral `UiSnapshot`/`copy_frame` signature in
+`ui_snapshot.h`; the RED implementation returns an empty value. Register the
+source in `CMakeLists.txt` before configuring:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_ui_snapshot tests/ui_snapshot_test.cpp)
 ```
 
-Expected: FAIL because `copy_frame` is not implemented.
+The behavioral assertion must name its failure:
+
+```cpp
+TEST(UiSnapshot, owns_frame_a_after_frame_b_and_shutdown) {
+  const UiSnapshot copied = copy_frame(frameWithAssistant("frame-a"));
+  advanceToFrameBAndShutdown();
+  EXPECT_EQ(copied.liveAssistant, std::string("frame-a"));
+}
+```
+
+```bash
+cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
+cmake --build codeg-eui/build-contract --target codeg_eui_ui_snapshot_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_ui_snapshot
+set +e
+red_output=$(ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_ui_snapshot$' --output-on-failure 2>&1)
+red_status=$?
+set -e
+test "$red_status" -ne 0
+printf '%s\n' "$red_output" | rg -q '\[FAIL\] UiSnapshot.owns_frame_a_after_frame_b_and_shutdown'
+printf '%s\n' "$red_output" | rg -q '0% tests passed, 1 tests failed out of 1'
+```
+
+Expected: the target builds and one registered test fails because the neutral
+copy has no `frame-a` bytes. Missing source/symbol/target or zero selected tests
+is an invalid RED result.
 
 - [ ] **Step 17: Implement and verify the C++ deep-copy boundary**
 
 `ui_snapshot.h` defines value-owned C++ strings/vectors and performs the copy immediately after `codeg_eui_poll` returns `OK`. Implement the null/length checks and copy every nested slice/vector exercised by the Step 16 test. C++ never stores any raw Rust pointer in page state.
 
-Run the Step 16 command. Expected: PASS.
+Build `codeg_eui_ui_snapshot_test`, assert the exact registration again, then
+run `ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_ui_snapshot$'
+--output-on-failure`. Expected: PASS.
 
 - [ ] **Step 18: Run Task 3 automated verification**
 
@@ -959,6 +1201,9 @@ cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test shutdown_c
 cargo build --manifest-path src-tauri/codeg-eui-core/Cargo.toml --features ffi-test-hooks
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON -DCODEG_EUI_ABI_LINK_TESTS=ON -DCODEG_EUI_RUST_LIB="$PWD/src-tauri/codeg-eui-core/target/debug/libcodeg_eui_core.a"
 cmake --build codeg-eui/build-contract --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_harness_self codeg_eui_abi_layout \
+  codeg_eui_shutdown_drain codeg_eui_ui_snapshot
 ctest --test-dir codeg-eui/build-contract --output-on-failure
 ```
 
@@ -1540,19 +1785,33 @@ TEST(BridgeClient, stale_completion_finishes_request_without_mutating_selection)
 }
 ```
 
+In the same RED edit, add this registration and create compile-safe
+`PendingRequest`, `AppModel`, and `BridgeClient` declarations. `AppModel::apply`
+is initially a no-op, so the pending map remains non-empty and the named
+assertion fails at runtime:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_client_completion tests/client_completion_test.cpp)
+```
+
 - [ ] **Step 2: Run client tests to verify RED**
 
 ```bash
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R client_completion --output-on-failure
+cmake --build codeg-eui/build-contract --target codeg_eui_client_completion_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_client_completion \
+  BridgeClient.stale_completion_finishes_request_without_mutating_selection
 ```
 
-Expected: configure or compile FAIL because `BridgeClient`, `PendingRequest`, and `AppModel` are absent.
+Expected: the target compiles, exactly one test is registered, and the harness
+reports the named failure because the neutral `apply` method does not remove
+request `9`. Missing declarations/target or zero selected tests is not RED.
 
 - [ ] **Step 3: Implement the typed client and value-owned model skeleton**
 
-`copy_frame` converts every slice with `(ptr==nullptr && len==0)` as empty and rejects `(ptr==nullptr && len>0)` as an internal bridge error. `BridgeClient` owns `std::unordered_map<uint64_t, PendingRequest>`, rejects duplicate completion IDs, dispatches JSON only after checking expected op, and turns ABI enqueue errors into the global error strip without inserting a pending request.
+Replace the neutral method bodies with the behavior below. `copy_frame` converts every slice with `(ptr==nullptr && len==0)` as empty and rejects `(ptr==nullptr && len>0)` as an internal bridge error. `BridgeClient` owns `std::unordered_map<uint64_t, PendingRequest>`, rejects duplicate completion IDs, dispatches JSON only after checking expected op, and turns ABI enqueue errors into the global error strip without inserting a pending request.
 
 ```cpp
 struct PendingRequest {
@@ -1580,11 +1839,26 @@ class BridgeClient {
 
 - [ ] **Step 4: Run client tests to verify GREEN**
 
-Run the Step 2 command. Expected: all request-state and copied-value cases pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_client_completion_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_client_completion
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_client_completion$' --output-on-failure
+```
+
+Expected: all request-state and copied-value cases pass.
 
 - [ ] **Step 5: Write lifecycle, drain, poll-cadence, and smoke-hook RED tests**
 
 `app_lifecycle_test.cpp` uses a fake `BridgeApi` to prove: init occurs once; poll is called no faster than 16 ms; close calls begin-shutdown once; stopping frames continue dispatching completions; final shutdown is attempted only after a copied `shutdownReady` frame; invalid/zero smoke values disable; values `1` and `3` request GLFW close on exactly callback N.
+
+Register the test and add compile-safe `ShutdownDriver`/`SmokeFrameExit`
+signatures in `app/model.h`. The RED `ShutdownDriver::drainAndShutdown()` is an
+empty body, so the fake API call list stays empty:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_app_lifecycle tests/app_lifecycle_test.cpp)
+```
 
 ```cpp
 TEST(ShutdownDriver, dispatches_stopping_completions_before_final_free) {
@@ -1601,11 +1875,14 @@ TEST(ShutdownDriver, dispatches_stopping_completions_before_final_free) {
 
 ```bash
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R app_lifecycle --output-on-failure
+cmake --build codeg-eui/build-contract --target codeg_eui_app_lifecycle_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_app_lifecycle \
+  ShutdownDriver.dispatches_stopping_completions_before_final_free
 ```
 
-Expected: FAIL because `ShutdownDriver`, cadence control, and `SmokeFrameExit` are absent.
+Expected: one compiled/registered test fails the named call-order assertion;
+missing symbols or an empty CTest selection is invalid RED evidence.
 
 - [ ] **Step 7: Implement app lifecycle, stopping-poll drain, and smoke hook**
 
@@ -1650,11 +1927,26 @@ Parse `CODEG_EUI_SMOKE_EXIT_AFTER_FRAMES` once at startup as a positive decimal 
 
 - [ ] **Step 8: Run lifecycle tests to verify GREEN**
 
-Run the Step 6 command. Expected: cadence, stopping completion dispatch, finalization order, deadline, and smoke counter pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_app_lifecycle_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_app_lifecycle
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_app_lifecycle$' --output-on-failure
+```
+
+Expected: cadence, stopping completion dispatch, finalization order, deadline,
+and smoke counter pass.
 
 - [ ] **Step 9: Write shell layout/navigation RED tests**
 
 `shell_page_test.cpp` exercises pure `ShellLayout::calculate(width,height)` and route state. Assert fixed 248 px sidebar, 48 px header, 44 px composer, non-negative content at 800x600 and 1440x900, global error-strip placement, New enablement from workspace+agent, and Chat/Settings navigation.
+
+Register the source and add a pure compile-safe `ShellLayout` whose RED
+`calculate` returns zero-initialized regions. No EUI header is included by this
+state type in contracts-only mode:
+
+```cmake
+codeg_eui_add_contract_test(codeg_eui_shell_page tests/shell_page_test.cpp)
+```
 
 ```cpp
 TEST(ShellLayout, remains_valid_at_minimum_supported_size) {
@@ -1668,7 +1960,15 @@ TEST(ShellLayout, remains_valid_at_minimum_supported_size) {
 
 - [ ] **Step 10: Run shell tests to verify RED**
 
-Run the contract configure/build command from Step 6, then `ctest --test-dir codeg-eui/build-contract -R shell_page --output-on-failure`. Expected: FAIL because shell layout/route types are absent.
+```bash
+cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
+cmake --build codeg-eui/build-contract --target codeg_eui_shell_page_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_shell_page ShellLayout.remains_valid_at_minimum_supported_size
+```
+
+Expected: the exact test fails on sidebar width `0 != 248`; configure, compile,
+or zero-selection failure is invalid RED evidence.
 
 - [ ] **Step 11: Implement the shell page**
 
@@ -1686,11 +1986,24 @@ class ShellPage {
 
 - [ ] **Step 12: Run shell tests to verify GREEN**
 
-Run the Step 10 test command. Expected: layout and navigation cases pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_shell_page_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_shell_page
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_shell_page$' --output-on-failure
+```
+
+Expected: layout and navigation cases pass.
 
 - [ ] **Step 13: Write chat/composer/markdown RED tests**
 
 `chat_page_test.cpp` proves send enablement, composer clear-on-accept and retain-on-reject, pending request disablement, bottom-follow threshold, plain user text, one-line tool projection, and markdown rebuild at 0 ms, not at 74 ms, at 75 ms, and immediately on turn end.
+
+Register the source and add a compile-safe `ChatState` whose RED
+`shouldRebuildMarkdown` always returns `false`:
+
+```cmake
+codeg_eui_add_contract_test(codeg_eui_chat_page tests/chat_page_test.cpp)
+```
 
 ```cpp
 TEST(ChatState, throttles_streaming_markdown_but_flushes_turn_end) {
@@ -1704,7 +2017,15 @@ TEST(ChatState, throttles_streaming_markdown_but_flushes_turn_end) {
 
 - [ ] **Step 14: Run chat tests to verify RED**
 
-Run contract configure/build, then `ctest --test-dir codeg-eui/build-contract -R chat_page --output-on-failure`. Expected: FAIL because `ChatState` and `ChatPage` are absent.
+```bash
+cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
+cmake --build codeg-eui/build-contract --target codeg_eui_chat_page_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_chat_page ChatState.throttles_streaming_markdown_but_flushes_turn_end
+```
+
+Expected: the first rebuild expectation fails in the exact registered test;
+compile or empty-selection failure is invalid RED evidence.
 
 - [ ] **Step 15: Implement chat rendering and composer behavior**
 
@@ -1723,16 +2044,32 @@ class ChatPage {
 
 - [ ] **Step 16: Run chat tests to verify GREEN**
 
-Run the Step 14 test command. Expected: chat state and rendering projections pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_chat_page_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_chat_page
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_chat_page$' --output-on-failure
+```
+
+Expected: chat state and rendering projections pass.
 
 - [ ] **Step 17: Write P0 settings RED tests**
 
 `settings_page_test.cpp` proves Grok/Codex-only tabs, probe/save pending IDs, launch-required field mapping, unsupported-agent rejection, backend JSON field names, credential redaction in errors, and raw editor round-trip.
 
+Register the source and add a compile-safe `SettingsState` whose RED
+`buildPatchJson()` returns `{}`. Require at least the `enabled` facade key so
+the neutral JSON fails behaviorally:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_settings_page tests/settings_page_test.cpp)
+```
+
 ```cpp
 TEST(SettingsState, save_payload_contains_only_facade_fields) {
   SettingsState state = codexSettingsFixture();
   const auto json = state.buildPatchJson();
+  EXPECT_TRUE(json.contains("enabled"));
   EXPECT_TRUE(hasOnlyKeys(json, codexFacadeKeys()));
   EXPECT_FALSE(json.contains("OPENAI_API_KEY=test-secret"));
 }
@@ -1740,7 +2077,15 @@ TEST(SettingsState, save_payload_contains_only_facade_fields) {
 
 - [ ] **Step 18: Run settings tests to verify RED**
 
-Run contract configure/build, then `ctest --test-dir codeg-eui/build-contract -R settings_page --output-on-failure`. Expected: FAIL because `SettingsState` and `SettingsPage` are absent.
+```bash
+cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
+cmake --build codeg-eui/build-contract --target codeg_eui_settings_page_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_settings_page SettingsState.save_payload_contains_only_facade_fields
+```
+
+Expected: the exact test fails because the neutral JSON lacks `enabled`;
+compile or zero-selection failure is invalid RED evidence.
 
 - [ ] **Step 19: Implement P0 settings**
 
@@ -1759,13 +2104,23 @@ class SettingsPage {
 
 - [ ] **Step 20: Run settings tests to verify GREEN**
 
-Run the Step 18 test command. Expected: P0 mapping, pending state, and redaction cases pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_settings_page_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_settings_page
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_settings_page$' --output-on-failure
+```
+
+Expected: P0 mapping, pending state, and redaction cases pass.
 
 - [ ] **Step 21: Run C++ and native-shell verification**
 
 ```bash
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
 cmake --build codeg-eui/build-contract --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_harness_self codeg_eui_abi_layout codeg_eui_ui_snapshot \
+  codeg_eui_client_completion codeg_eui_app_lifecycle \
+  codeg_eui_shell_page codeg_eui_chat_page codeg_eui_settings_page
 ctest --test-dir codeg-eui/build-contract --output-on-failure
 codeg-eui/scripts/build.sh
 ```
@@ -1801,6 +2156,7 @@ Expected package: one native UI commit with test-first client/lifecycle/page sta
 - Expand: `codeg-eui/app/pages/shell.h`
 - Expand: `codeg-eui/app/pages/chat.h`
 - Expand: `codeg-eui/app/pages/settings.h`
+- Modify: `codeg-eui/CMakeLists.txt`
 - Test: `src-tauri/codeg-eui-core/tests/m5_contract.rs`
 - Create: `codeg-eui/tests/m5_controls_test.cpp`
 - Expand test: `codeg-eui/tests/settings_page_test.cpp`
@@ -1890,6 +2246,15 @@ Run the Step 6 command. Expected: partial content, recovery enablement, and erro
 
 `m5_controls_test.cpp` proves the 36x36 stop-square visibility, tooltip text, pending disablement, stale cancel no-op on the new selection, partial transcript after crash, session-row active/streaming/error status, and scoped error-strip clearing.
 
+Register it and add the compile-safe `M5ControlsState` shape shown in Step 11
+with neutral/no-op `beginCancel`, `select`, and `apply` methods. Because the RED
+`select` does not change the connection, the named assertion fails at runtime:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_m5_controls tests/m5_controls_test.cpp)
+```
+
 ```cpp
 TEST(M5Controls, stale_cancel_does_not_change_new_selection) {
   M5ControlsState state = streamingSelection("conn-a", 10);
@@ -1905,11 +2270,13 @@ TEST(M5Controls, stale_cancel_does_not_change_new_selection) {
 
 ```bash
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R m5_controls --output-on-failure
+cmake --build codeg-eui/build-contract --target codeg_eui_m5_controls_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_m5_controls M5Controls.stale_cancel_does_not_change_new_selection
 ```
 
-Expected: FAIL because `M5ControlsState` and control rendering are absent.
+Expected: the target builds, exactly one test is registered, and the named
+selection assertion fails; compile or empty-selection failure is invalid RED.
 
 - [ ] **Step 11: Implement cancel/session/error controls**
 
@@ -1927,15 +2294,34 @@ Add a stop-square icon button while streaming, with tooltip `Cancel active turn`
 
 - [ ] **Step 12: Run control tests to verify GREEN**
 
-Run the Step 10 command. Expected: cancel, selection, crash, error, and row-status cases pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_m5_controls_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_m5_controls
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_m5_controls$' --output-on-failure
+```
+
+Expected: cancel, selection, crash, error, and row-status cases pass.
 
 - [ ] **Step 13: Write P1 settings RED tests**
 
 Extend `settings_page_test.cpp` with Codex model/provider/reasoning and sandbox/approval fields, Grok model/reasoning/structured fields, raw-editor precedence, and exact facade JSON keys. Assert no UI-only field is serialized.
 
+Name the primary new case
+`SettingsState.serializes_p1_fields_without_ui_only_keys`. The existing Task 7
+target registration and now-GREEN P0 implementation ensure the binary builds;
+the assertion fails only because the P1 keys are not projected yet.
+
 - [ ] **Step 14: Run P1 settings tests to verify RED**
 
-Run contract configure/build, then `ctest --test-dir codeg-eui/build-contract -R settings_page --output-on-failure`. Expected: FAIL on missing P1 field projection.
+```bash
+cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
+cmake --build codeg-eui/build-contract --target codeg_eui_settings_page_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_settings_page SettingsState.serializes_p1_fields_without_ui_only_keys
+```
+
+Expected: exactly one registered settings executable fails the named P1
+projection assertion; build/selection failure does not count.
 
 - [ ] **Step 15: Implement P1 structured settings**
 
@@ -1943,7 +2329,13 @@ Expose remaining backend-provided Codex model/provider/reasoning and sandbox/app
 
 - [ ] **Step 16: Run P1 settings tests to verify GREEN**
 
-Run the Step 14 command. Expected: all P1 mapping/raw-precedence cases pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_settings_page_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_settings_page
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_settings_page$' --output-on-failure
+```
+
+Expected: all P1 mapping/raw-precedence cases pass.
 
 - [ ] **Step 17: Run M5 integrated verification**
 
@@ -1954,7 +2346,10 @@ cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test interactio
 cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml --test settings_contract -- --test-threads=1
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
 cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R 'm5_controls|settings_page' --output-on-failure
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_m5_controls codeg_eui_settings_page
+ctest --test-dir codeg-eui/build-contract \
+  -R '^(codeg_eui_m5_controls|codeg_eui_settings_page)$' --output-on-failure
 ```
 
 Expected: cancel/switch/crash/settings regressions pass without parked work or cross-selection mutation.
@@ -1962,8 +2357,8 @@ Expected: cancel/switch/crash/settings regressions pass without parked work or c
 - [ ] **Step 18: Commit and prepare the Task 8 review package**
 
 ```bash
-git add --dry-run -- src-tauri/codeg-eui-core/src/commands.rs src-tauri/codeg-eui-core/src/live.rs src-tauri/codeg-eui-core/src/model.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/m5_contract.rs codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/app/bridge/client.h codeg-eui/app/pages/shell.h codeg-eui/app/pages/chat.h codeg-eui/app/pages/settings.h codeg-eui/tests/m5_controls_test.cpp codeg-eui/tests/settings_page_test.cpp
-git add -- src-tauri/codeg-eui-core/src/commands.rs src-tauri/codeg-eui-core/src/live.rs src-tauri/codeg-eui-core/src/model.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/m5_contract.rs codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/app/bridge/client.h codeg-eui/app/pages/shell.h codeg-eui/app/pages/chat.h codeg-eui/app/pages/settings.h codeg-eui/tests/m5_controls_test.cpp codeg-eui/tests/settings_page_test.cpp
+git add --dry-run -- src-tauri/codeg-eui-core/src/commands.rs src-tauri/codeg-eui-core/src/live.rs src-tauri/codeg-eui-core/src/model.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/m5_contract.rs codeg-eui/CMakeLists.txt codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/app/bridge/client.h codeg-eui/app/pages/shell.h codeg-eui/app/pages/chat.h codeg-eui/app/pages/settings.h codeg-eui/tests/m5_controls_test.cpp codeg-eui/tests/settings_page_test.cpp
+git add -- src-tauri/codeg-eui-core/src/commands.rs src-tauri/codeg-eui-core/src/live.rs src-tauri/codeg-eui-core/src/model.rs src-tauri/codeg-eui-core/src/abi.rs src-tauri/codeg-eui-core/tests/m5_contract.rs codeg-eui/CMakeLists.txt codeg-eui/app/bridge/codeg_eui_bridge.h codeg-eui/app/bridge/client.h codeg-eui/app/pages/shell.h codeg-eui/app/pages/chat.h codeg-eui/app/pages/settings.h codeg-eui/tests/m5_controls_test.cpp codeg-eui/tests/settings_page_test.cpp
 git diff --cached --name-only
 git status --short --untracked-files=all
 git commit -m "feat(eui): add native session recovery controls"
@@ -1983,6 +2378,7 @@ Expected package: one M5 commit with epoch-fenced lifecycle and visible controls
 - Expand: `src-tauri/codeg-eui-core/src/model.rs`
 - Create: `codeg-eui/app/perf_metrics.h`
 - Expand: `codeg-eui/app/app.cpp`
+- Modify: `codeg-eui/CMakeLists.txt`
 - Create: `codeg-eui/tests/perf_metrics_test.cpp`
 - Create: `src/lib/perf/eui-comparison-recorder.ts`
 - Create: `src/lib/perf/eui-comparison-recorder.test.ts`
@@ -2010,6 +2406,25 @@ Expected package: one M5 commit with epoch-fenced lifecycle and visible controls
 
 In TypeScript and C++, feed timestamps `[0,16,32,92,108]` with `t0=0`, `firstPresented=16`, `end=108`. Both implementations must produce active intervals `[16,60,16]`, p95 `60`, threshold `50`, and long-frame count `1`. The first-token marker is diagnostic and must not substitute for first-presented.
 
+Register the C++ source now and add a compile-safe `PerfSummary` plus
+`summarizeFrames(...)` in `perf_metrics.h`; the RED function returns a
+zero-initialized summary:
+
+```cmake
+codeg_eui_add_contract_test(
+  codeg_eui_perf_metrics tests/perf_metrics_test.cpp)
+```
+
+```cpp
+TEST(PerfMetrics, uses_first_presentation_and_fixed_threshold) {
+  const auto run = summarizeFrames({0, 16, 32, 92, 108}, 0, 16, 108);
+  EXPECT_EQ(run.firstPresentedLatencyMs, 16.0);
+  EXPECT_EQ(run.frameIntervalP95Ms, 60.0);
+  EXPECT_EQ(run.longFrameThresholdMs, 50.0);
+  EXPECT_EQ(run.longFrameCount, 1u);
+}
+```
+
 ```ts
 it("uses first presentation and the fixed 50 ms threshold", () => {
   const run = recorderFromFrames([0, 16, 32, 92, 108], {
@@ -2028,13 +2443,19 @@ it("uses first presentation and the fixed 50 ms threshold", () => {
 - [ ] **Step 2: Run metric tests to verify RED**
 
 ```bash
-pnpm test -- src/lib/perf/eui-comparison-recorder.test.ts
+if pnpm test -- src/lib/perf/eui-comparison-recorder.test.ts; then
+  printf 'expected TypeScript metric RED\n' >&2
+  exit 1
+fi
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R perf_metrics --output-on-failure
+cmake --build codeg-eui/build-contract --target codeg_eui_perf_metrics_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_perf_metrics PerfMetrics.uses_first_presentation_and_fixed_threshold
 ```
 
-Expected: TypeScript file missing and/or C++ metric target missing.
+Expected: the TypeScript behavior test is RED; the C++ target builds, has one
+exact registration, and fails the named arithmetic assertion because its
+summary is neutral. Missing C++ target/symbol or zero tests is invalid RED.
 
 - [ ] **Step 3: Implement common metric calculations**
 
@@ -2042,11 +2463,24 @@ Both implementations sample presented-frame intervals only from the frame that r
 
 - [ ] **Step 4: Run metric-arithmetic tests to verify GREEN**
 
-Run the Step 2 commands. Expected: TypeScript and C++ produce the same latency, intervals, p95, threshold, and count.
+```bash
+pnpm test -- src/lib/perf/eui-comparison-recorder.test.ts
+cmake --build codeg-eui/build-contract --target codeg_eui_perf_metrics_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_perf_metrics
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_perf_metrics$' --output-on-failure
+```
+
+Expected: TypeScript and C++ produce the same latency, intervals, p95,
+threshold, and count.
 
 - [ ] **Step 5: Write EUI presentation-order RED tests**
 
 In `perf_metrics_test.cpp`, drive an explicit fake phase scheduler. Composition with first assistant text arms but does not mark; the simulated `present` still does not mark; the first subsequent EUI `onFrame` marks exactly once and begins interval sampling.
+
+Add a compile-safe `PresentationClock` to `perf_metrics.h` with no-op phase
+methods and an empty `firstPresentedNs()`. The already registered
+`codeg_eui_perf_metrics` executable therefore builds and the new named behavior
+case fails only at the post-`onFrame` expectation.
 
 ```cpp
 TEST(PresentationClock, eui_marks_on_update_after_eligible_present) {
@@ -2066,11 +2500,13 @@ TEST(PresentationClock, eui_marks_on_update_after_eligible_present) {
 
 ```bash
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
-cmake --build codeg-eui/build-contract --parallel
-ctest --test-dir codeg-eui/build-contract -R perf_metrics --output-on-failure
+cmake --build codeg-eui/build-contract --target codeg_eui_perf_metrics_test --parallel
+codeg-eui/tests/assert_ctest_red.sh codeg-eui/build-contract \
+  codeg_eui_perf_metrics PresentationClock.eui_marks_on_update_after_eligible_present
 ```
 
-Expected: FAIL because `PresentationClock` phase behavior is absent.
+Expected: one compiled/registered executable fails the named phase assertion;
+missing symbols or no selected tests is invalid RED evidence.
 
 - [ ] **Step 7: Implement the EUI post-presentation proxy**
 
@@ -2078,7 +2514,13 @@ Rust already supplies send acceptance, first-token, and end nanoseconds. EUI v0.
 
 - [ ] **Step 8: Run EUI ordering tests to verify GREEN**
 
-Run the Step 6 command. Expected: composition/presentation/callback ordering and one-shot behavior pass.
+```bash
+cmake --build codeg-eui/build-contract --target codeg_eui_perf_metrics_test --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract codeg_eui_perf_metrics
+ctest --test-dir codeg-eui/build-contract -R '^codeg_eui_perf_metrics$' --output-on-failure
+```
+
+Expected: composition/presentation/callback ordering and one-shot behavior pass.
 
 - [ ] **Step 9: Write WebView two-RAF ordering RED tests**
 
@@ -2203,6 +2645,11 @@ pnpm eslint src/lib/perf/eui-comparison-recorder.ts src/lib/perf/eui-comparison-
 cargo test --manifest-path src-tauri/codeg-eui-core/Cargo.toml perf
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON
 cmake --build codeg-eui/build-contract --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_harness_self codeg_eui_abi_layout codeg_eui_ui_snapshot \
+  codeg_eui_client_completion codeg_eui_app_lifecycle codeg_eui_shell_page \
+  codeg_eui_chat_page codeg_eui_settings_page codeg_eui_m5_controls \
+  codeg_eui_perf_metrics
 ctest --test-dir codeg-eui/build-contract --output-on-failure
 codeg-eui/scripts/perf_compare.sh self-test
 bash codeg-eui/tests/perf_compare_test.sh
@@ -2227,8 +2674,8 @@ Copy the aggregate values, host label, date, git commit, backend, build type, an
 - [ ] **Step 20: Commit and prepare the Task 9 review package**
 
 ```bash
-git add --dry-run -- src-tauri/codeg-eui-core/src/perf.rs src-tauri/codeg-eui-core/src/model.rs codeg-eui/app/app.cpp codeg-eui/app/perf_metrics.h codeg-eui/tests/perf_metrics_test.cpp codeg-eui/tests/perf_compare_test.sh codeg-eui/scripts/perf_compare.sh codeg-eui/fixtures/perf-workspace/README.md codeg-eui/README.md src/lib/perf/eui-comparison-recorder.ts src/lib/perf/eui-comparison-recorder.test.ts src/contexts/acp-connections-context.tsx src/components/message/live-transcript-row.tsx src/components/message/live-transcript-row.test.tsx
-git add -- src-tauri/codeg-eui-core/src/perf.rs src-tauri/codeg-eui-core/src/model.rs codeg-eui/app/app.cpp codeg-eui/app/perf_metrics.h codeg-eui/tests/perf_metrics_test.cpp codeg-eui/tests/perf_compare_test.sh codeg-eui/scripts/perf_compare.sh codeg-eui/fixtures/perf-workspace/README.md codeg-eui/README.md src/lib/perf/eui-comparison-recorder.ts src/lib/perf/eui-comparison-recorder.test.ts src/contexts/acp-connections-context.tsx src/components/message/live-transcript-row.tsx src/components/message/live-transcript-row.test.tsx
+git add --dry-run -- src-tauri/codeg-eui-core/src/perf.rs src-tauri/codeg-eui-core/src/model.rs codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/perf_metrics.h codeg-eui/tests/perf_metrics_test.cpp codeg-eui/tests/perf_compare_test.sh codeg-eui/scripts/perf_compare.sh codeg-eui/fixtures/perf-workspace/README.md codeg-eui/README.md src/lib/perf/eui-comparison-recorder.ts src/lib/perf/eui-comparison-recorder.test.ts src/contexts/acp-connections-context.tsx src/components/message/live-transcript-row.tsx src/components/message/live-transcript-row.test.tsx
+git add -- src-tauri/codeg-eui-core/src/perf.rs src-tauri/codeg-eui-core/src/model.rs codeg-eui/CMakeLists.txt codeg-eui/app/app.cpp codeg-eui/app/perf_metrics.h codeg-eui/tests/perf_metrics_test.cpp codeg-eui/tests/perf_compare_test.sh codeg-eui/scripts/perf_compare.sh codeg-eui/fixtures/perf-workspace/README.md codeg-eui/README.md src/lib/perf/eui-comparison-recorder.ts src/lib/perf/eui-comparison-recorder.test.ts src/contexts/acp-connections-context.tsx src/components/message/live-transcript-row.tsx src/components/message/live-transcript-row.test.tsx
 git diff --cached --name-only
 git status --short --untracked-files=all
 git commit -m "perf(eui): add native WebView comparison protocol"
@@ -2263,7 +2710,7 @@ Expected package: one instrumentation/evidence commit with arithmetic and presen
 - [ ] **Step 1: Resolve the Plan commit as the delivery base**
 
 ```bash
-delivery_base=$(git rev-list -n 1 --grep='^docs: revise EUI-NEO spike plan after review$' HEAD)
+delivery_base=$(git rev-list -n 1 --grep='^docs: pin C++ test harness for EUI-NEO plan$' HEAD)
 test -n "$delivery_base"
 git log --reverse --format='%h %s' "$delivery_base..HEAD"
 ```
@@ -2388,6 +2835,11 @@ Expected: EUI facade tests and shared-library clippy pass. The EUI bootstrap pro
 cargo build --manifest-path src-tauri/codeg-eui-core/Cargo.toml --features ffi-test-hooks
 cmake -S codeg-eui -B codeg-eui/build-contract -DCODEG_EUI_CONTRACTS_ONLY=ON -DCODEG_EUI_ABI_LINK_TESTS=ON -DCODEG_EUI_RUST_LIB="$PWD/src-tauri/codeg-eui-core/target/debug/libcodeg_eui_core.a" -DCMAKE_BUILD_TYPE=Release
 cmake --build codeg-eui/build-contract --parallel
+codeg-eui/tests/assert_ctest_registered.sh codeg-eui/build-contract \
+  codeg_eui_harness_self codeg_eui_abi_layout codeg_eui_shutdown_drain \
+  codeg_eui_ui_snapshot codeg_eui_client_completion \
+  codeg_eui_app_lifecycle codeg_eui_shell_page codeg_eui_chat_page \
+  codeg_eui_settings_page codeg_eui_m5_controls codeg_eui_perf_metrics
 ctest --test-dir codeg-eui/build-contract --output-on-failure
 bash codeg-eui/tests/perf_compare_test.sh
 ```
@@ -2482,7 +2934,7 @@ If any Step 1-8 command fails, stop the Final sequence, assign the failure to th
 - [ ] **Step 10: Run final diff, submodule, and worktree checks**
 
 ```bash
-delivery_base=$(git rev-list -n 1 --grep='^docs: revise EUI-NEO spike plan after review$' HEAD)
+delivery_base=$(git rev-list -n 1 --grep='^docs: pin C++ test harness for EUI-NEO plan$' HEAD)
 test -n "$delivery_base"
 git diff --check "$delivery_base..HEAD"
 test "$(git -C codeg-eui/third_party/EUI-NEO rev-parse HEAD)" = cb70ea8bea263efa7805a40c07135df028ad44b1
