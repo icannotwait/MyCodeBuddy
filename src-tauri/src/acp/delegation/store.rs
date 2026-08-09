@@ -294,6 +294,14 @@ pub struct PendingTerminalRetry {
     pub frozen: bool,
 }
 
+/// Durable completion contract selected before terminal output parsing.
+/// Workflow-bound callers either prove exact v2 or receive a typed error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCompletionProtocol {
+    Standalone,
+    V2,
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TaskStoreError {
     #[error("transient database error: {0}")]

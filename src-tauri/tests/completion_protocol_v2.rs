@@ -23,6 +23,7 @@ use codeg_lib::acp::delegation::metrics::{
 };
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
 use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
+use codeg_lib::acp::delegation::store::TaskStoreError;
 use codeg_lib::acp::delegation::transport::{
     client_cancel_task_round_trip, client_get_workflow_state_round_trip, client_status_round_trip,
     BrokerCancelTaskRequest, BrokerGetWorkflowStateRequest, BrokerStatusRequest,
@@ -796,6 +797,230 @@ async fn historical_protocol_mutation_matrix() {
             mutation_snapshot(&db, parent, &published.workflow_id).await,
             before,
             "rejected pair version={version} must preserve every tracked side effect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workflow_admission_requires_v2() {
+    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+    for (index, version, mode, expected_code) in [
+        (0, 1, V1, "legacy_completion_protocol_read_only"),
+        (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+        (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+        (3, 2, V1, "unsupported_completion_protocol"),
+        (4, 2, V2Shadow, "unsupported_completion_protocol"),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let document = skeleton(&format!("task-5-admission-{index}"));
+        let work_unit_key = document.nodes[0].work_unit_key.clone().unwrap();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
+        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+
+        let task_id = format!("task-5-admission-run-{index}");
+        let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        let error = runs
+            .admit_gen1_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent,
+                parent_tool_use_id: Some(format!("tool-{task_id}")),
+                child_conversation_id: child,
+                agent_type: "codex".into(),
+                profile_id: None,
+                workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                route_fingerprint: Some(format!("route-{task_id}")),
+                launch_snapshot_version: Some("v1".into()),
+                mode_id: None,
+                config_values_json: Some("{}".into()),
+                task_preview: Some("Task 5 v2 admission fence".into()),
+                request_fingerprint: Some(format!("fingerprint-{task_id}")),
+                admission_class: delegation_task_run::AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: Some(work_unit_key),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(chrono::Utc::now()),
+            })
+            .await
+            .expect_err("non-v2 workflow admission must fail closed");
+        assert_eq!(error.workflow_admission_code(), Some(expected_code));
+        assert!(
+            delegation_task_run::Entity::find_by_id(&task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected admission must roll back the reserving run"
+        );
+        assert!(
+            delegation_workflow_run_binding::Entity::find_by_id(&task_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected admission must not create a workflow run binding"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_protocol_failure_is_typed() {
+    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+    for (index, version, mode, expected_code) in [
+        (0, 1, V1, "legacy_completion_protocol_read_only"),
+        (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+        (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+        (3, 2, V1, "unsupported_completion_protocol"),
+        (4, 2, V2Shadow, "unsupported_completion_protocol"),
+    ] {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/task-5-terminal-protocol").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-5-terminal-{index}")),
+            },
+        )
+        .await
+        .unwrap();
+        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        let task_id = format!("task-5-terminal-run-{index}");
+        seed_conversation_workflow_association(
+            &db,
+            parent,
+            child,
+            &task_id,
+            1,
+            chrono::Utc::now(),
+            Some(&published.workflow_id),
+        )
+        .await;
+
+        let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        let error = runs
+            .terminal_completion_protocol(&task_id)
+            .await
+            .expect_err("non-v2 terminal protocol must be a typed rejection");
+        assert!(matches!(error, TaskStoreError::WorkflowAdmission { .. }));
+        assert_eq!(error.workflow_admission_code(), Some(expected_code));
+    }
+
+    for corruption in ["dangling", "corrupt-mode"] {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-5-terminal-{corruption}")),
+            },
+        )
+        .await
+        .unwrap();
+        let task_id = format!("task-5-terminal-{corruption}-run");
+        seed_conversation_workflow_association(
+            &db,
+            parent,
+            child,
+            &task_id,
+            1,
+            chrono::Utc::now(),
+            Some(&published.workflow_id),
+        )
+        .await;
+
+        match corruption {
+            "dangling" => {
+                db.conn
+                    .execute(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "PRAGMA foreign_keys = OFF".to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                db.conn
+                    .execute(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "DELETE FROM delegation_workflows WHERE workflow_id = ?",
+                        vec![published.workflow_id.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                db.conn
+                    .execute(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "PRAGMA foreign_keys = ON".to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            "corrupt-mode" => {
+                db.conn
+                    .execute(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "PRAGMA ignore_check_constraints = ON".to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                db.conn
+                    .execute(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "UPDATE delegation_workflows SET completion_protocol_mode = ? WHERE workflow_id = ?",
+                        vec!["future_mode".into(), published.workflow_id.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                db.conn
+                    .execute(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "PRAGMA ignore_check_constraints = OFF".to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        }));
+        let error = runs
+            .terminal_completion_protocol(&task_id)
+            .await
+            .expect_err("corrupt or dangling terminal header must fail closed");
+        assert!(matches!(error, TaskStoreError::WorkflowAdmission { .. }));
+        assert_eq!(
+            error.workflow_admission_code(),
+            Some("unsupported_completion_protocol"),
+            "{corruption}"
         );
     }
 }
@@ -2472,7 +2697,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
 }
 
 #[tokio::test]
-async fn every_model_capability_reaches_one_platform_completion_truth() {
+async fn completion_v2_semantic_inputs() {
     for case in [
         CapabilityCase::ToolCompleteWork,
         CapabilityCase::TerminalConclusionOnly,

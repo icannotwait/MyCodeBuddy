@@ -9066,7 +9066,19 @@ mod tests {
             let error = load_workflow_child_mcp_binding(&fixture.db, TASK_ID)
                 .await
                 .unwrap_err();
-            assert!(matches!(error, CompleteWorkError::Persistence(_)));
+            assert!(matches!(
+                error,
+                CompleteWorkError::Protocol {
+                    code: "unsupported_completion_protocol",
+                    ..
+                }
+            ));
+            fixture
+                .db
+                .conn
+                .execute_unprepared("PRAGMA foreign_keys=ON")
+                .await
+                .unwrap();
         }
     }
 

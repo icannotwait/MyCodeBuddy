@@ -22,7 +22,7 @@ use crate::acp::delegation::card_summary::{
 };
 use crate::acp::delegation::runtime_stats::DelegationTouchedFile;
 use crate::acp::delegation::store::{
-    classify_sqlite_transient, extract_sqlite_codes, TaskStoreError,
+    classify_sqlite_transient, extract_sqlite_codes, is_transient_sqlite, TaskStoreError,
 };
 use crate::db::entities::delegation_completion_tool_intent;
 use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
@@ -357,20 +357,22 @@ pub async fn load_workflow_child_mcp_binding(
     else {
         return Ok(None);
     };
-    let Some(workflow) = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
-        .one(&db.conn)
-        .await
-        .map_err(|error| CompleteWorkError::Persistence(error.to_string()))?
-    else {
-        return Err(CompleteWorkError::Persistence(format!(
-            "workflow {} referenced by task {task_id} is missing",
-            binding.workflow_id
-        )));
-    };
+    let (protocol_version, protocol_mode) =
+        load_completion_protocol_header(&db.conn, &binding.workflow_id)
+            .await
+            .map_err(complete_work_store_error)?
+            .ok_or_else(|| CompleteWorkError::Protocol {
+                code: "unsupported_completion_protocol",
+                message: format!(
+                    "workflow {} referenced by task {task_id} is missing",
+                    binding.workflow_id
+                ),
+            })?;
+    require_v2_mutation(protocol_version, &protocol_mode).map_err(complete_work_store_error)?;
     Ok(Some(WorkflowChildMcpBinding {
         task_id: task_id.to_string(),
         workflow_id: binding.workflow_id,
-        protocol_version: workflow.completion_protocol_version,
+        protocol_version,
         node_id: binding.node_id,
     }))
 }
@@ -701,6 +703,19 @@ fn admission_err(code: &str, msg: impl Into<String>) -> TaskStoreError {
     }
 }
 
+fn workflow_protocol_admission_err(error: WorkflowStoreError) -> TaskStoreError {
+    match error {
+        WorkflowStoreError::Persistence(message) => {
+            if is_transient_sqlite(&message) {
+                TaskStoreError::Transient(message)
+            } else {
+                TaskStoreError::Permanent(message)
+            }
+        }
+        other => admission_err(other.code(), other.to_string()),
+    }
+}
+
 fn artifact_admission_err(error: ArtifactError) -> TaskStoreError {
     admission_err(error.code(), error.to_string())
 }
@@ -747,7 +762,12 @@ async fn revalidate_v2_reviewer_head(
 }
 
 fn map_db(e: sea_orm::DbErr) -> TaskStoreError {
-    TaskStoreError::Permanent(format!("workflow admission db: {e}"))
+    let message = format!("workflow admission db: {e}");
+    if classify_sqlite_transient(&e).is_some() {
+        TaskStoreError::Transient(message)
+    } else {
+        TaskStoreError::Permanent(message)
+    }
 }
 
 pub async fn load_admitted_completion_instruction<C: ConnectionTrait>(
@@ -771,9 +791,11 @@ pub async fn load_admitted_completion_instruction<C: ConnectionTrait>(
                 "admitted completion workflow is missing",
             )
         })?;
-    if workflow.completion_protocol_version != 2 {
-        return Ok(None);
-    }
+    require_v2_mutation(
+        workflow.completion_protocol_version,
+        &workflow.completion_protocol_mode,
+    )
+    .map_err(workflow_protocol_admission_err)?;
     let node = delegation_workflow_node_binding::Entity::find_by_id((
         binding.workflow_id.clone(),
         binding.node_id.clone(),
@@ -2680,12 +2702,59 @@ async fn load_workflow_header<C: ConnectionTrait>(
     conn: &C,
     parent_conversation_id: i32,
 ) -> Result<Option<delegation_workflow::Model>, TaskStoreError> {
-    delegation_workflow::Entity::find()
+    let Some(workflow_id) = delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
         .filter(
             delegation_workflow::Column::WorkflowKind
                 .eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string()),
         )
+        .select_only()
+        .column(delegation_workflow::Column::WorkflowId)
+        .into_tuple::<String>()
+        .one(conn)
+        .await
+        .map_err(map_db)?
+    else {
+        let task_ids = delegation_task_run::Entity::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .select_only()
+            .column(delegation_task_run::Column::TaskId)
+            .into_tuple::<String>()
+            .all(conn)
+            .await
+            .map_err(map_db)?;
+        if !task_ids.is_empty() {
+            let claimed_workflow_id = delegation_workflow_run_binding::Entity::find()
+                .filter(delegation_workflow_run_binding::Column::TaskId.is_in(task_ids))
+                .select_only()
+                .column(delegation_workflow_run_binding::Column::WorkflowId)
+                .order_by_asc(delegation_workflow_run_binding::Column::WorkflowId)
+                .into_tuple::<String>()
+                .one(conn)
+                .await
+                .map_err(map_db)?;
+            if let Some(claimed_workflow_id) = claimed_workflow_id {
+                return Err(admission_err(
+                    "unsupported_completion_protocol",
+                    format!(
+                        "workflow run binding claims missing workflow {claimed_workflow_id} during admission"
+                    ),
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    let (version, mode) = load_completion_protocol_header(conn, &workflow_id)
+        .await
+        .map_err(workflow_protocol_admission_err)?
+        .ok_or_else(|| {
+            admission_err(
+                "unsupported_completion_protocol",
+                format!("workflow {workflow_id} header disappeared during admission"),
+            )
+        })?;
+    require_v2_mutation(version, &mode).map_err(workflow_protocol_admission_err)?;
+    delegation_workflow::Entity::find_by_id(workflow_id)
         .one(conn)
         .await
         .map_err(map_db)
