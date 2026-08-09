@@ -16,6 +16,15 @@ pub enum Operation {
     ProbeAgent = 8,
 }
 
+impl Operation {
+    pub(crate) fn changes_selection(self) -> bool {
+        matches!(
+            self,
+            Self::SetWorkspace | Self::CreateSession | Self::SelectSession
+        )
+    }
+}
+
 pub(crate) enum CommandPayload {
     Empty,
     Utf8(Vec<u8>),

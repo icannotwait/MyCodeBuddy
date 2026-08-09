@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::abi::{CodegEuiFrame, LifecycleState, CODEG_EUI_API_VERSION};
 use crate::commands::Operation;
-use crate::{CODEG_EUI_COMPLETION_CAPACITY, CODEG_EUI_ERR_QUEUE_FULL};
+use crate::{CODEG_EUI_COMPLETION_CAPACITY, CODEG_EUI_ERR_INTERNAL, CODEG_EUI_ERR_QUEUE_FULL};
 
 pub const CODEG_EUI_COMPLETION_OK: u32 = CompletionStatus::Ok as u32;
 pub const CODEG_EUI_COMPLETION_ERROR: u32 = CompletionStatus::Error as u32;
@@ -54,6 +54,17 @@ pub struct OwnedSessionSummary {
     pub title: Vec<u8>,
     pub agent: Vec<u8>,
     pub updated_at_ms: i64,
+}
+
+pub(crate) enum ModelUpdate {
+    Workspace {
+        sessions: Vec<OwnedSessionSummary>,
+    },
+    Selection {
+        sessions: Vec<OwnedSessionSummary>,
+        connection_id: Vec<u8>,
+        transcript_json: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -214,12 +225,64 @@ impl SharedModel {
         op: Operation,
         selection_epoch: u64,
     ) -> Result<(), i32> {
-        self.lock().ledger.reserve(request_id, op, selection_epoch)
+        let mut state = self.lock();
+        let changes_selection = op.changes_selection();
+        let captured_epoch = if changes_selection {
+            state
+                .selection_epoch
+                .checked_add(1)
+                .ok_or(CODEG_EUI_ERR_INTERNAL)?
+        } else {
+            selection_epoch
+        };
+        state.ledger.reserve(request_id, op, captured_epoch)?;
+        if changes_selection {
+            state.selection_epoch = captured_epoch;
+            if op == Operation::SetWorkspace {
+                state.sessions.clear();
+            }
+            state.connection_id.clear();
+            state.event_seq = 0;
+            state.transcript_json.clear();
+            state.live_assistant.clear();
+            state.stream_active = false;
+            state.needs_resync = false;
+            state.t0_ns = 0;
+            state.t_first_token_ns = 0;
+            state.t_end_ns = 0;
+        }
+        Ok(())
     }
 
     pub(crate) fn terminalize(&self, captured_selection_epoch: u64, completion: OwnedCompletion) {
+        self.terminalize_with_update(captured_selection_epoch, completion, None);
+    }
+
+    pub(crate) fn terminalize_with_update(
+        &self,
+        captured_selection_epoch: u64,
+        completion: OwnedCompletion,
+        update: Option<ModelUpdate>,
+    ) {
         let mut state = self.lock();
         let current_selection_epoch = state.selection_epoch;
+        if captured_selection_epoch == current_selection_epoch {
+            match update {
+                Some(ModelUpdate::Workspace { sessions }) => {
+                    state.sessions = sessions;
+                }
+                Some(ModelUpdate::Selection {
+                    sessions,
+                    connection_id,
+                    transcript_json,
+                }) => {
+                    state.sessions = sessions;
+                    state.connection_id = connection_id;
+                    state.transcript_json = transcript_json;
+                }
+                None => {}
+            }
+        }
         state.ledger.terminalize(
             current_selection_epoch,
             captured_selection_epoch,
@@ -229,6 +292,13 @@ impl SharedModel {
 
     pub(crate) fn cancel_all(&self) {
         self.lock().ledger.cancel_all();
+    }
+
+    pub(crate) fn record_send_accepted(&self, t0_ns: u64) {
+        let mut state = self.lock();
+        state.t0_ns = t0_ns;
+        state.t_first_token_ns = 0;
+        state.t_end_ns = 0;
     }
 
     pub fn set_error_strip(&self, message: Vec<u8>) {
@@ -404,6 +474,38 @@ mod tests {
 
     use super::{CompletionStatus, OwnedCompletion, SharedModel};
     use crate::commands::Operation;
+
+    #[test]
+    fn accepted_workspace_and_session_changes_advance_the_selection_epoch() {
+        let model = SharedModel::new();
+
+        model
+            .reserve(
+                NonZeroU64::new(1).unwrap(),
+                Operation::SetWorkspace,
+                model.selection_epoch(),
+            )
+            .unwrap();
+        assert_eq!(model.selection_epoch(), 1);
+
+        model
+            .reserve(
+                NonZeroU64::new(2).unwrap(),
+                Operation::CreateSession,
+                model.selection_epoch(),
+            )
+            .unwrap();
+        assert_eq!(model.selection_epoch(), 2);
+
+        model
+            .reserve(
+                NonZeroU64::new(3).unwrap(),
+                Operation::SelectSession,
+                model.selection_epoch(),
+            )
+            .unwrap();
+        assert_eq!(model.selection_epoch(), 3);
+    }
 
     #[test]
     fn selection_changes_mark_one_terminal_completion_stale() {

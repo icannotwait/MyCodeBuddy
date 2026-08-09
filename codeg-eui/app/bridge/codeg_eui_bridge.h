@@ -100,6 +100,9 @@ int codeg_eui_init(const uint8_t* data_dir_utf8, size_t data_dir_len);
 int codeg_eui_poll(CodegEuiFrame* out);
 int codeg_eui_begin_shutdown(void);
 int codeg_eui_shutdown(void);
+/* Session operations are asynchronous. Successful workspace/create/select
+ * completions carry JSON; create/select include conversationId and
+ * connectionId. A successful send admission updates CodegEuiFrame::t0_ns. */
 int codeg_eui_set_workspace(const uint8_t* path_utf8,
                             size_t path_len,
                             uint64_t* out_request_id);

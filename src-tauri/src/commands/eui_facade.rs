@@ -1,19 +1,202 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::acp::preflight::CheckStatus;
+use crate::acp::terminal_context::{build_acp_launch_inputs, AcpRouteRequest};
 use crate::acp::types::{
     AcpAgentInfo, CodexSandboxSettings, CodexSandboxStructuredConfig, GrokSettings,
-    GrokStructuredConfig,
+    GrokStructuredConfig, PromptInputBlock,
 };
 use crate::app_state::AppState;
 use crate::commands::acp::{
     acp_list_agents_core, acp_preflight_core, acp_update_agent_config_and_refresh,
-    acp_update_agent_env_and_refresh,
+    acp_update_agent_env_and_refresh, verify_agent_installed,
 };
-use crate::models::agent::AgentType;
+use crate::commands::conversations::{
+    create_project_conversation_core, get_folder_conversation_with_live_core,
+};
+use crate::commands::folders::open_folder_core;
+use crate::commands::history_window::HistoryLoadOpts;
+use crate::db::entities::conversation::ConversationKind;
+use crate::db::service::conversation_service;
+use crate::models::{AgentType, DbConversationSummary, MessageTurn};
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EuiWorkspace {
+    pub folder_id: i32,
+    pub path: PathBuf,
+    pub sessions: Vec<EuiSessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EuiSessionSummary {
+    pub conversation_id: i32,
+    pub title: Option<String>,
+    pub agent_type: AgentType,
+    pub status: String,
+    pub external_session_id: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EuiSessionSelection {
+    pub folder_id: i32,
+    pub path: PathBuf,
+    pub conversation_id: i32,
+    pub title: Option<String>,
+    pub agent_type: AgentType,
+    pub status: String,
+    pub external_session_id: Option<String>,
+    pub updated_at_ms: i64,
+    pub connection_id: String,
+    pub transcript: Vec<MessageTurn>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LoadedEuiSession {
+    pub summary: EuiSessionSummary,
+    pub transcript: Vec<MessageTurn>,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait EuiSessionOps: Send + Sync {
+    type LaunchInputs: Send;
+
+    async fn verify_installed(&self, agent_type: AgentType) -> Result<(), EuiFacadeError>;
+
+    async fn build_launch_inputs(
+        &self,
+        state: &AppState,
+        agent_type: AgentType,
+        external_session_id: Option<&str>,
+        conversation_id: i32,
+    ) -> Result<Self::LaunchInputs, EuiFacadeError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent(
+        &self,
+        state: &AppState,
+        agent_type: AgentType,
+        workspace_path: &std::path::Path,
+        external_session_id: Option<String>,
+        conversation_id: i32,
+        launch_inputs: Self::LaunchInputs,
+        owner: &str,
+    ) -> Result<String, EuiFacadeError>;
+
+    async fn find_connection(&self, state: &AppState, conversation_id: i32) -> Option<String>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_linked(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: i32,
+        conversation_id: i32,
+        client_message_id: String,
+    ) -> Result<(), EuiFacadeError>;
+}
+
+struct ProductionEuiSessionOps;
+
+#[async_trait::async_trait]
+impl EuiSessionOps for ProductionEuiSessionOps {
+    type LaunchInputs = crate::acp::terminal_context::AcpLaunchInputs;
+
+    async fn verify_installed(&self, agent_type: AgentType) -> Result<(), EuiFacadeError> {
+        verify_agent_installed(agent_type)
+            .await
+            .map_err(EuiFacadeError::from)
+    }
+
+    async fn build_launch_inputs(
+        &self,
+        state: &AppState,
+        agent_type: AgentType,
+        external_session_id: Option<&str>,
+        conversation_id: i32,
+    ) -> Result<Self::LaunchInputs, EuiFacadeError> {
+        build_acp_launch_inputs(
+            &state.db,
+            agent_type,
+            external_session_id,
+            &state.data_dir,
+            AcpRouteRequest::root(Some(conversation_id), None),
+            &state.delegation_runtime_settings.snapshot(),
+        )
+        .await
+        .map_err(EuiFacadeError::from)
+    }
+
+    async fn spawn_agent(
+        &self,
+        state: &AppState,
+        agent_type: AgentType,
+        workspace_path: &std::path::Path,
+        external_session_id: Option<String>,
+        _conversation_id: i32,
+        launch_inputs: Self::LaunchInputs,
+        owner: &str,
+    ) -> Result<String, EuiFacadeError> {
+        let launch_context = crate::auto_title::user_launch_context_from_db(&state.db.conn).await;
+        state
+            .connection_manager
+            .spawn_agent(
+                agent_type,
+                Some(workspace_path.to_string_lossy().into_owned()),
+                external_session_id,
+                launch_inputs,
+                owner.to_string(),
+                state.emitter.clone(),
+                None,
+                BTreeMap::new(),
+                launch_context,
+                None,
+                None,
+            )
+            .await
+            .map_err(EuiFacadeError::from)
+    }
+
+    async fn find_connection(&self, state: &AppState, conversation_id: i32) -> Option<String> {
+        state
+            .connection_manager
+            .find_connection_by_conversation_id(conversation_id)
+            .await
+    }
+
+    async fn send_linked(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: i32,
+        conversation_id: i32,
+        client_message_id: String,
+    ) -> Result<(), EuiFacadeError> {
+        state
+            .connection_manager
+            .send_prompt_linked_with_message_id(
+                &state.db,
+                connection_id,
+                blocks,
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                Some(client_message_id),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+}
 
 /// The native EUI settings contract intentionally contains only fields owned
 /// by the existing Grok/Codex ACP settings paths.
@@ -71,8 +254,248 @@ pub enum EuiFacadeError {
     AgentNotFound(AgentType),
     #[error("invalid agent settings patch: {0}")]
     InvalidPatch(String),
+    #[error("invalid EUI workspace {path}: {reason}")]
+    InvalidWorkspace { path: String, reason: String },
+    #[error("conversation {conversation_id} does not belong to workspace folder {folder_id}")]
+    ConversationOutsideWorkspace {
+        conversation_id: i32,
+        folder_id: i32,
+    },
+    #[error("EUI application operation failed: {0}")]
+    App(#[from] crate::app_error::AppCommandError),
+    #[error("EUI database operation failed: {0}")]
+    Database(#[from] crate::db::error::DbError),
     #[error("ACP settings operation failed: {0}")]
     Acp(#[from] crate::acp::error::AcpError),
+}
+
+pub async fn set_eui_workspace(
+    state: &AppState,
+    requested_path: PathBuf,
+) -> Result<EuiWorkspace, EuiFacadeError> {
+    let path = std::fs::canonicalize(&requested_path).map_err(|error| {
+        EuiFacadeError::InvalidWorkspace {
+            path: requested_path.display().to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    if !path.is_dir() {
+        return Err(EuiFacadeError::InvalidWorkspace {
+            path: path.display().to_string(),
+            reason: "path is not a directory".to_string(),
+        });
+    }
+    let wire_path = path
+        .to_str()
+        .ok_or_else(|| EuiFacadeError::InvalidWorkspace {
+            path: path.display().to_string(),
+            reason: "canonical path is not valid UTF-8".to_string(),
+        })?
+        .to_string();
+    let folder = open_folder_core(&state.db, wire_path).await?;
+    let sessions =
+        conversation_service::list_by_folder(&state.db.conn, folder.id, None, None, None, None)
+            .await?
+            .into_iter()
+            .filter(|row| row.kind == ConversationKind::Regular)
+            .map(project_session_summary)
+            .collect();
+    Ok(EuiWorkspace {
+        folder_id: folder.id,
+        path,
+        sessions,
+    })
+}
+
+pub async fn create_eui_conversation(
+    state: &AppState,
+    folder_id: i32,
+    agent_type: AgentType,
+) -> Result<EuiSessionSummary, EuiFacadeError> {
+    ensure_supported(agent_type)?;
+    let created =
+        create_project_conversation_core(&state.db.conn, folder_id, agent_type, None, None).await?;
+    let row = conversation_service::get_by_id(&state.db.conn, created.conversation_id).await?;
+    Ok(project_session_summary(row))
+}
+
+pub async fn create_eui_session(
+    state: &AppState,
+    workspace: &EuiWorkspace,
+    agent_type: AgentType,
+) -> Result<EuiSessionSelection, EuiFacadeError> {
+    create_eui_session_with_ops(state, workspace, agent_type, &ProductionEuiSessionOps).await
+}
+
+pub(crate) async fn create_eui_session_with_ops<O: EuiSessionOps>(
+    state: &AppState,
+    workspace: &EuiWorkspace,
+    agent_type: AgentType,
+    ops: &O,
+) -> Result<EuiSessionSelection, EuiFacadeError> {
+    ensure_supported(agent_type)?;
+    ops.verify_installed(agent_type).await?;
+    let summary = create_eui_conversation(state, workspace.folder_id, agent_type).await?;
+    let launch_inputs = ops
+        .build_launch_inputs(
+            state,
+            summary.agent_type,
+            summary.external_session_id.as_deref(),
+            summary.conversation_id,
+        )
+        .await?;
+    let connection_id = ops
+        .spawn_agent(
+            state,
+            summary.agent_type,
+            &workspace.path,
+            summary.external_session_id.clone(),
+            summary.conversation_id,
+            launch_inputs,
+            "eui",
+        )
+        .await?;
+    Ok(selection_from_parts(
+        workspace,
+        summary,
+        connection_id,
+        Vec::new(),
+    ))
+}
+
+pub async fn select_eui_session(
+    state: &AppState,
+    workspace: &EuiWorkspace,
+    conversation_id: i32,
+) -> Result<EuiSessionSelection, EuiFacadeError> {
+    select_eui_session_with_ops(state, workspace, conversation_id, &ProductionEuiSessionOps).await
+}
+
+pub(crate) async fn select_eui_session_with_ops<O: EuiSessionOps>(
+    state: &AppState,
+    workspace: &EuiWorkspace,
+    conversation_id: i32,
+    ops: &O,
+) -> Result<EuiSessionSelection, EuiFacadeError> {
+    let loaded = load_eui_session(state, workspace, conversation_id).await?;
+    let connection_id = match ops.find_connection(state, conversation_id).await {
+        Some(connection_id) => connection_id,
+        None => {
+            ensure_supported(loaded.summary.agent_type)?;
+            ops.verify_installed(loaded.summary.agent_type).await?;
+            let launch_inputs = ops
+                .build_launch_inputs(
+                    state,
+                    loaded.summary.agent_type,
+                    loaded.summary.external_session_id.as_deref(),
+                    loaded.summary.conversation_id,
+                )
+                .await?;
+            ops.spawn_agent(
+                state,
+                loaded.summary.agent_type,
+                &workspace.path,
+                loaded.summary.external_session_id.clone(),
+                loaded.summary.conversation_id,
+                launch_inputs,
+                "eui",
+            )
+            .await?
+        }
+    };
+    Ok(selection_from_parts(
+        workspace,
+        loaded.summary,
+        connection_id,
+        loaded.transcript,
+    ))
+}
+
+pub async fn send_eui_message(
+    state: &AppState,
+    selection: &EuiSessionSelection,
+    text: String,
+) -> Result<(), EuiFacadeError> {
+    send_eui_message_with_ops(state, selection, text, &ProductionEuiSessionOps).await
+}
+
+pub(crate) async fn send_eui_message_with_ops<O: EuiSessionOps>(
+    state: &AppState,
+    selection: &EuiSessionSelection,
+    text: String,
+    ops: &O,
+) -> Result<(), EuiFacadeError> {
+    let blocks = vec![PromptInputBlock::Text { text }];
+    ops.send_linked(
+        state,
+        &selection.connection_id,
+        blocks,
+        selection.folder_id,
+        selection.conversation_id,
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await
+}
+
+pub(crate) async fn load_eui_session(
+    state: &AppState,
+    workspace: &EuiWorkspace,
+    conversation_id: i32,
+) -> Result<LoadedEuiSession, EuiFacadeError> {
+    let detail = get_folder_conversation_with_live_core(
+        &state.db.conn,
+        &state.connection_manager,
+        &state.chat_channel_manager,
+        &state.emitter,
+        state.internal_sessions.as_ref(),
+        conversation_id,
+        HistoryLoadOpts {
+            user_turn_limit: Some(100),
+            before_turn_id: None,
+        },
+    )
+    .await?;
+    if detail.summary.folder_id != workspace.folder_id {
+        return Err(EuiFacadeError::ConversationOutsideWorkspace {
+            conversation_id,
+            folder_id: workspace.folder_id,
+        });
+    }
+    Ok(LoadedEuiSession {
+        summary: project_session_summary(detail.summary),
+        transcript: detail.turns,
+    })
+}
+
+fn selection_from_parts(
+    workspace: &EuiWorkspace,
+    summary: EuiSessionSummary,
+    connection_id: String,
+    transcript: Vec<MessageTurn>,
+) -> EuiSessionSelection {
+    EuiSessionSelection {
+        folder_id: workspace.folder_id,
+        path: workspace.path.clone(),
+        conversation_id: summary.conversation_id,
+        title: summary.title,
+        agent_type: summary.agent_type,
+        status: summary.status,
+        external_session_id: summary.external_session_id,
+        updated_at_ms: summary.updated_at_ms,
+        connection_id,
+        transcript,
+    }
+}
+
+fn project_session_summary(row: DbConversationSummary) -> EuiSessionSummary {
+    EuiSessionSummary {
+        conversation_id: row.id,
+        title: row.title,
+        agent_type: row.agent_type,
+        status: row.status,
+        external_session_id: row.external_id,
+        updated_at_ms: row.updated_at.timestamp_millis(),
+    }
 }
 
 impl EuiAgentSettingsPatch {
@@ -275,13 +698,326 @@ fn ensure_supported(agent: AgentType) -> Result<(), EuiFacadeError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     use super::{
-        ensure_supported, parse_supported_agent, project_agent_settings, EuiAgentSettingsPatch,
-        EuiFacadeError,
+        create_eui_conversation, create_eui_session_with_ops, ensure_supported, load_eui_session,
+        parse_supported_agent, project_agent_settings, send_eui_message, send_eui_message_with_ops,
+        set_eui_workspace, EuiAgentSettingsPatch, EuiFacadeError, EuiSessionOps,
+        EuiSessionSelection,
     };
+    use crate::acp::connection::ConnectionCommand;
     use crate::acp::types::AcpAgentInfo;
+    use crate::app_state::AppState;
+    use crate::db::service::{conversation_service, folder_service};
+    use crate::db::test_helpers::fresh_disk_db;
     use crate::models::agent::AgentType;
+
+    async fn eui_test_state(root: &std::path::Path) -> AppState {
+        let db = fresh_disk_db(root).await;
+        AppState::new_for_test(db, root.to_path_buf())
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSessionOps {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        last_send: Arc<Mutex<Option<(String, i32, i32, String, String)>>>,
+    }
+
+    impl RecordingSessionOps {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EuiSessionOps for RecordingSessionOps {
+        type LaunchInputs = (AgentType, Option<String>, i32);
+
+        async fn verify_installed(&self, agent_type: AgentType) -> Result<(), EuiFacadeError> {
+            assert!(matches!(agent_type, AgentType::Codex | AgentType::Grok));
+            self.record("verify_installed");
+            Ok(())
+        }
+
+        async fn build_launch_inputs(
+            &self,
+            _state: &AppState,
+            agent_type: AgentType,
+            external_session_id: Option<&str>,
+            conversation_id: i32,
+        ) -> Result<Self::LaunchInputs, EuiFacadeError> {
+            assert!(conversation_id > 0);
+            self.record("build_launch_inputs");
+            Ok((
+                agent_type,
+                external_session_id.map(str::to_string),
+                conversation_id,
+            ))
+        }
+
+        async fn spawn_agent(
+            &self,
+            _state: &AppState,
+            agent_type: AgentType,
+            workspace_path: &std::path::Path,
+            external_session_id: Option<String>,
+            conversation_id: i32,
+            launch_inputs: Self::LaunchInputs,
+            owner: &str,
+        ) -> Result<String, EuiFacadeError> {
+            assert!(workspace_path.is_absolute());
+            assert_eq!(owner, "eui");
+            assert_eq!(
+                launch_inputs,
+                (agent_type, external_session_id, conversation_id)
+            );
+            self.record("spawn_agent");
+            Ok("recorded-connection".to_string())
+        }
+
+        async fn find_connection(
+            &self,
+            _state: &AppState,
+            _conversation_id: i32,
+        ) -> Option<String> {
+            self.record("find_connection");
+            None
+        }
+
+        async fn send_linked(
+            &self,
+            _state: &AppState,
+            connection_id: &str,
+            blocks: Vec<crate::acp::types::PromptInputBlock>,
+            folder_id: i32,
+            conversation_id: i32,
+            client_message_id: String,
+        ) -> Result<(), EuiFacadeError> {
+            let [crate::acp::types::PromptInputBlock::Text { text }] = blocks.as_slice() else {
+                panic!("EUI send must contain exactly one text block");
+            };
+            self.record("send_prompt_linked");
+            *self.last_send.lock().unwrap() = Some((
+                connection_id.to_string(),
+                folder_id,
+                conversation_id,
+                client_message_id,
+                text.clone(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_verifies_builds_then_spawns_with_eui_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let ops = RecordingSessionOps::default();
+
+        let selection = create_eui_session_with_ops(&state, &workspace, AgentType::Codex, &ops)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ops.calls(),
+            ["verify_installed", "build_launch_inputs", "spawn_agent"]
+        );
+        assert!(selection.conversation_id > 0);
+        assert_eq!(selection.connection_id, "recorded-connection");
+
+        ops.calls.lock().unwrap().clear();
+        send_eui_message_with_ops(&state, &selection, "hello".to_string(), &ops)
+            .await
+            .unwrap();
+        assert_eq!(ops.calls(), ["send_prompt_linked"]);
+        let send = ops.last_send.lock().unwrap().clone().unwrap();
+        assert_eq!(send.0, selection.connection_id);
+        assert_eq!(send.1, selection.folder_id);
+        assert_eq!(send.2, selection.conversation_id);
+        assert!(uuid::Uuid::parse_str(&send.3).is_ok());
+        assert_eq!(send.4, "hello");
+    }
+
+    #[tokio::test]
+    async fn workspace_and_conversation_reuse_existing_database_cores() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+
+        let workspace = set_eui_workspace(&state, workspace_dir.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace.path,
+            std::fs::canonicalize(&workspace_dir).unwrap()
+        );
+        let row = create_eui_conversation(&state, workspace.folder_id, AgentType::Grok)
+            .await
+            .unwrap();
+        assert!(row.conversation_id > 0);
+        assert_eq!(row.agent_type, AgentType::Grok);
+
+        let rows = conversation_service::list_by_folder(
+            &state.db.conn,
+            workspace.folder_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_workspace_does_not_create_a_folder_row() {
+        let root = tempfile::tempdir().unwrap();
+        let state = eui_test_state(root.path()).await;
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        assert!(matches!(
+            set_eui_workspace(&state, file).await,
+            Err(EuiFacadeError::InvalidWorkspace { .. })
+        ));
+        assert!(matches!(
+            set_eui_workspace(&state, root.path().join("missing")).await,
+            Err(EuiFacadeError::InvalidWorkspace { .. })
+        ));
+        assert!(folder_service::list_folders(&state.db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_codex_and_grok_conversations_are_created() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+
+        for agent in [AgentType::Codex, AgentType::Grok] {
+            assert_eq!(
+                create_eui_conversation(&state, workspace.folder_id, agent)
+                    .await
+                    .unwrap()
+                    .agent_type,
+                agent
+            );
+        }
+        assert!(matches!(
+            create_eui_conversation(&state, workspace.folder_id, AgentType::ClaudeCode).await,
+            Err(EuiFacadeError::UnsupportedAgent(_))
+        ));
+        let rows = conversation_service::list_by_folder(
+            &state.db.conn,
+            workspace.folder_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn history_projection_is_backend_message_turn_json() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let row = create_eui_conversation(&state, workspace.folder_id, AgentType::Codex)
+            .await
+            .unwrap();
+
+        let loaded = load_eui_session(&state, &workspace, row.conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded.summary, row);
+        assert_eq!(
+            serde_json::to_value(&loaded.transcript).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn send_uses_one_text_block_and_binds_the_selected_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let state = eui_test_state(root.path()).await;
+        let workspace = set_eui_workspace(&state, workspace_dir).await.unwrap();
+        let row = create_eui_conversation(&state, workspace.folder_id, AgentType::Codex)
+            .await
+            .unwrap();
+        let mut commands = state
+            .connection_manager
+            .insert_test_connection_live(
+                "eui-test-connection",
+                AgentType::Codex,
+                Some(workspace.path.clone()),
+                state.emitter.clone(),
+            )
+            .await;
+        let selection = EuiSessionSelection {
+            folder_id: workspace.folder_id,
+            path: workspace.path,
+            conversation_id: row.conversation_id,
+            title: row.title,
+            agent_type: row.agent_type,
+            status: row.status,
+            external_session_id: row.external_session_id,
+            updated_at_ms: row.updated_at_ms,
+            connection_id: "eui-test-connection".to_string(),
+            transcript: Vec::new(),
+        };
+
+        send_eui_message(&state, &selection, "hello".to_string())
+            .await
+            .unwrap();
+
+        let command = commands.recv().await.expect("one prompt command");
+        let ConnectionCommand::Prompt {
+            blocks,
+            user_message,
+            ..
+        } = command
+        else {
+            panic!("expected prompt command");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [crate::acp::types::PromptInputBlock::Text { text }] if text == "hello"
+        ));
+        let message_id = user_message.expect("linked user message").0;
+        assert!(uuid::Uuid::parse_str(&message_id).is_ok());
+        assert_eq!(
+            state
+                .connection_manager
+                .get_state("eui-test-connection")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            Some(selection.conversation_id)
+        );
+    }
 
     #[test]
     fn only_codex_and_grok_wire_values_are_supported() {

@@ -332,11 +332,24 @@ pub extern "C" fn codeg_eui_create_session(
 
 #[no_mangle]
 pub extern "C" fn codeg_eui_select_session(conversation_id: i32, out_request_id: *mut u64) -> i32 {
-    enqueue_payload(
-        out_request_id,
-        Operation::SelectSession,
-        CommandPayload::SelectSession(conversation_id),
-    )
+    ffi_guard(|| {
+        let mut slot = lock_bridge();
+        if let Err(error) = ensure_running(&slot) {
+            return error;
+        }
+        if out_request_id.is_null() {
+            return CODEG_EUI_ERR_NULL_POINTER;
+        }
+        if conversation_id <= 0 {
+            return CODEG_EUI_ERR_INVALID_STATE;
+        }
+        accept_and_write(
+            &mut slot,
+            out_request_id,
+            Operation::SelectSession,
+            CommandPayload::SelectSession(conversation_id),
+        )
+    })
 }
 
 #[no_mangle]
