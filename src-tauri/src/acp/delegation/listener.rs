@@ -8473,6 +8473,13 @@ mod tests {
             completion_tool_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
         }
 
+        async fn completion_tool_fixture_before_v2_only() -> CompletionToolFixture {
+            completion_tool_fixture_with_db(Arc::new(
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+            ))
+            .await
+        }
+
         #[tokio::test]
         async fn broker_accepts_only_live_bound_v2_child_and_orders_distinct_calls() {
             let fixture = completion_tool_fixture().await;
@@ -8544,7 +8551,7 @@ mod tests {
                 (3, 2, V1, "unsupported_completion_protocol"),
                 (4, 2, V2Shadow, "unsupported_completion_protocol"),
             ] {
-                let fixture = completion_tool_fixture().await;
+                let fixture = completion_tool_fixture_before_v2_only().await;
                 let workflow = delegation_workflow::Entity::find_by_id(WORKFLOW_ID)
                     .one(&fixture.db.conn)
                     .await
@@ -8554,6 +8561,10 @@ mod tests {
                 workflow.completion_protocol_version = Set(version);
                 workflow.completion_protocol_mode = Set(mode);
                 workflow.update(&fixture.db.conn).await.unwrap();
+                crate::db::test_helpers::complete_historical_completion_protocol_migrations(
+                    &fixture.db,
+                )
+                .await;
                 let before = delegation_completion_tool_intent::Entity::find()
                     .all(&fixture.db.conn)
                     .await
@@ -8990,10 +9001,13 @@ mod tests {
     #[tokio::test]
     async fn workflow_mutations_reach_v2_store_guards_without_rollout_restart() {
         use crate::acp::delegation::run_store::RunStore;
-        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::db::test_helpers::{
+            complete_historical_completion_protocol_migrations,
+            historical_completion_protocol_db_before_v2_only, seed_conversation, seed_folder,
+        };
         use sea_orm::{ActiveModelTrait, Set};
 
-        let db = Arc::new(fresh_in_memory_db().await);
+        let db = Arc::new(historical_completion_protocol_db_before_v2_only().await);
         let folder = seed_folder(&db, "/tmp/workflow-v2-listener-selection-guard").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let document: ManifestDocument = serde_json::from_value(json!({
@@ -9042,6 +9056,7 @@ mod tests {
         source.completion_protocol_version = Set(1);
         source.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V1);
         source.update(&db.conn).await.unwrap();
+        complete_historical_completion_protocol_migrations(&db).await;
 
         let runs = Arc::new(RunStore::new(Arc::clone(&db)));
         let broker = Arc::new(
@@ -10166,8 +10181,7 @@ mod tests {
             questions: Arc<StubQuestion>,
         }
 
-        async fn recovery_fixture() -> RecoveryFixture {
-            let db = Arc::new(fresh_in_memory_db().await);
+        async fn recovery_fixture_with_db(db: Arc<crate::db::AppDatabase>) -> RecoveryFixture {
             let folder_id = seed_folder(&db, "/tmp/recovery-listener-contract").await;
             let parent_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
@@ -10236,6 +10250,17 @@ mod tests {
                 listener,
                 questions,
             }
+        }
+
+        async fn recovery_fixture() -> RecoveryFixture {
+            recovery_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
+        }
+
+        async fn recovery_fixture_before_v2_only() -> RecoveryFixture {
+            recovery_fixture_with_db(Arc::new(
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+            ))
+            .await
         }
 
         async fn seed_confirmable_task(
@@ -10534,13 +10559,17 @@ mod tests {
                 (3, 2, V1, "unsupported_completion_protocol"),
                 (4, 2, V2Shadow, "unsupported_completion_protocol"),
             ] {
-                let fixture = recovery_fixture().await;
+                let fixture = recovery_fixture_before_v2_only().await;
                 let task_id =
                     seed_confirmable_task(&fixture, fixture.parent_id, &format!("fence-{index}"))
                         .await;
                 let workflow_id =
                     bind_task_to_protocol(&fixture, &task_id, &index.to_string(), version, mode)
                         .await;
+                crate::db::test_helpers::complete_historical_completion_protocol_migrations(
+                    &fixture.db,
+                )
+                .await;
 
                 let task_outcome = finish_authorization_call(
                     &fixture,

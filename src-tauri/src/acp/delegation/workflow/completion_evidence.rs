@@ -3743,10 +3743,24 @@ mod tests {
             Self::new_with_node_id(source, write_plan, "plan-author".into()).await
         }
 
+        async fn new_before_v2_only(source: IntentFixture, write_plan: bool) -> Self {
+            Self::new_with_node_id_at_migration(source, write_plan, "plan-author".into(), false)
+                .await
+        }
+
         async fn new_with_node_id(
             source: IntentFixture,
             write_plan: bool,
             author_node_id: String,
+        ) -> Self {
+            Self::new_with_node_id_at_migration(source, write_plan, author_node_id, true).await
+        }
+
+        async fn new_with_node_id_at_migration(
+            source: IntentFixture,
+            write_plan: bool,
+            author_node_id: String,
+            install_v2_only_triggers: bool,
         ) -> Self {
             let workspace = tempfile::tempdir().expect("workspace");
             let workspace_path = workspace.path().to_path_buf();
@@ -3759,7 +3773,11 @@ mod tests {
                 std::fs::write(&plan_path, b"# Plan\n\nInitial.\n").unwrap();
             }
 
-            let db = Arc::new(fresh_in_memory_db().await);
+            let db = Arc::new(if install_v2_only_triggers {
+                fresh_in_memory_db().await
+            } else {
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await
+            });
             let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
             let parent = seed_conversation(&db, folder, AgentType::Codex).await;
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -4662,6 +4680,8 @@ mod tests {
         workflow.completion_protocol_version = Set(version);
         workflow.completion_protocol_mode = Set(mode);
         workflow.update(&fixture.db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&fixture.db)
+            .await;
     }
 
     async fn completion_mutation_snapshot(fixture: &TerminalFixture) -> String {
@@ -4704,7 +4724,7 @@ mod tests {
             (3, 2, V1, "unsupported_completion_protocol"),
             (4, 2, V2Shadow, "unsupported_completion_protocol"),
         ] {
-            let decision = TerminalFixture::new(IntentFixture::Missing, true).await;
+            let decision = TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
             let decision_cas = decision.materialize().await.attention.unwrap();
             set_fixture_protocol(&decision, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&decision).await;
@@ -4720,7 +4740,8 @@ mod tests {
             assert_eq!(error.code(), expected_code, "pair index {index}");
             assert_eq!(completion_mutation_snapshot(&decision).await, before);
 
-            let artifact = TerminalFixture::new(IntentFixture::AssistantText, false).await;
+            let artifact =
+                TerminalFixture::new_before_v2_only(IntentFixture::AssistantText, false).await;
             let artifact_cas = artifact.materialize().await.attention.unwrap();
             set_fixture_protocol(&artifact, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&artifact).await;
@@ -4735,7 +4756,7 @@ mod tests {
             assert_eq!(error.code(), expected_code, "pair index {index}");
             assert_eq!(completion_mutation_snapshot(&artifact).await, before);
 
-            let design = TerminalFixture::new(IntentFixture::Missing, true).await;
+            let design = TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
             let binding = delegation_workflow_design_root_binding::ActiveModel {
                 workflow_id: Set(design.workflow_id.clone()),
                 gate_id: Set("design".into()),
@@ -4762,7 +4783,8 @@ mod tests {
             assert_eq!(error.code(), expected_code, "pair index {index}");
             assert_eq!(completion_mutation_snapshot(&design).await, before);
 
-            let design_resolution = TerminalFixture::new(IntentFixture::Missing, true).await;
+            let design_resolution =
+                TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
             let binding = delegation_workflow_design_root_binding::ActiveModel {
                 workflow_id: Set(design_resolution.workflow_id.clone()),
                 gate_id: Set("design".into()),

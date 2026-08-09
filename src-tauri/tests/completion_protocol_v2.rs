@@ -63,8 +63,9 @@ use codeg_lib::db::entities::{
     delegation_workflow_run_binding, recovery_authorization,
 };
 use codeg_lib::db::test_helpers::{
-    fresh_in_memory_db, historical_completion_protocol_db, seed_conversation, seed_folder,
-    HistoricalWorkflowSeed,
+    complete_historical_completion_protocol_migrations, fresh_in_memory_db,
+    historical_completion_protocol_db, historical_completion_protocol_db_before_v2_only,
+    seed_conversation, seed_folder, HistoricalWorkflowSeed,
 };
 use codeg_lib::models::AgentType;
 use codeg_lib::web::auth::COMPLETION_CONTEXT_HEADER;
@@ -1004,43 +1005,37 @@ async fn terminal_protocol_failure_is_typed() {
         assert_eq!(error.workflow_admission_code(), Some(expected_code));
     }
 
-    for corruption in ["dangling", "unknown-version"] {
-        let (db, parent, child, workflow_id) = if corruption == "dangling" {
-            let db = fresh_in_memory_db().await;
-            let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
-            let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-            let child = seed_conversation(&db, folder, AgentType::Codex).await;
-            let published = publish_workflow_manifest_core(
-                &db,
-                &EventEmitter::Noop,
-                parent,
-                PublishWorkflowRequest {
-                    document: skeleton("task-5-terminal-dangling"),
-                },
-            )
-            .await
-            .unwrap();
-            (db, parent, child, published.workflow_id)
+    for corruption in ["dangling", "unknown-version", "corrupt-mode"] {
+        let db = if corruption == "dangling" {
+            fresh_in_memory_db().await
         } else {
-            let parent = 101;
-            let workflow_id = "wf-task-5-terminal-unknown-version";
-            let db = historical_completion_protocol_db(&[historical_workflow_seed(
-                workflow_id,
-                parent,
-                99,
-                delegation_workflow::CompletionProtocolMode::V2Enforce,
-                None,
-            )])
-            .await;
-            let child = seed_conversation(&db, 1, AgentType::Codex).await;
-            seed_historical_manifest(
-                &db,
-                workflow_id,
-                &skeleton("task-5-terminal-unknown-version"),
-            )
-            .await;
-            (db, parent, child, workflow_id.to_owned())
+            historical_completion_protocol_db_before_v2_only().await
         };
+        let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-5-terminal-{corruption}")),
+            },
+        )
+        .await
+        .unwrap();
+        let workflow_id = published.workflow_id;
+        match corruption {
+            "unknown-version" => {
+                corrupt_protocol_header(&db, &workflow_id, 99, "v2_enforce").await;
+                complete_historical_completion_protocol_migrations(&db).await;
+            }
+            "corrupt-mode" => {
+                corrupt_protocol_header(&db, &workflow_id, 2, "future_mode").await;
+                complete_historical_completion_protocol_migrations(&db).await;
+            }
+            _ => {}
+        }
         let task_id = format!("task-5-terminal-{corruption}-run");
         seed_conversation_workflow_association(
             &db,
@@ -1078,7 +1073,7 @@ async fn terminal_protocol_failure_is_typed() {
                     .await
                     .unwrap();
             }
-            "unknown-version" => {}
+            "unknown-version" | "corrupt-mode" => {}
             _ => unreachable!(),
         }
 
@@ -1233,24 +1228,50 @@ async fn corrupt_mutation_snapshot(
     )
 }
 
+async fn corrupt_protocol_header(
+    db: &codeg_lib::db::AppDatabase,
+    workflow_id: &str,
+    version: i64,
+    mode: &str,
+) {
+    db.conn
+        .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+        .await
+        .unwrap();
+    let update = db
+        .conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows SET completion_protocol_version = ?, completion_protocol_mode = ? WHERE workflow_id = ?",
+            vec![version.into(), mode.into(), workflow_id.into()],
+        ))
+        .await;
+    db.conn
+        .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+        .await
+        .unwrap();
+    update.unwrap();
+}
+
 #[tokio::test]
 async fn corrupt_header_nonterminal_fences() {
-    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V1};
-
-    for (index, version, mode) in [(0, 99, V2Enforce), (1, 2, V1)] {
-        let folder = 1;
-        let parent = 101;
-        let workflow_id = format!("wf-task-4-corrupt-header-{index}");
-        let db = historical_completion_protocol_db(&[historical_workflow_seed(
-            &workflow_id,
-            parent,
-            version,
-            mode,
-            None,
-        )])
-        .await;
+    for (index, version, mode) in [(0, 99, "v2_enforce"), (1, 2, "corrupt_mode")] {
+        let db = historical_completion_protocol_db_before_v2_only().await;
+        let folder = seed_folder(&db, &format!("/tmp/task-4-corrupt-header-{index}")).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let mut document = skeleton(&format!("task-4-corrupt-header-{index}"));
-        let published = seed_historical_manifest(&db, &workflow_id, &document).await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        corrupt_protocol_header(&db, &published.workflow_id, version, mode).await;
+        complete_historical_completion_protocol_migrations(&db).await;
         let before = corrupt_mutation_snapshot(&db, parent, &published.workflow_id).await;
 
         document.workflow_id = Some(published.workflow_id.clone());

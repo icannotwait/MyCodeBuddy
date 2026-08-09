@@ -31151,7 +31151,8 @@ mod tests {
         use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
-        let (db, runs, _mock, events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, _mock, events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let report = broker
             .start_delegation(v2_plan_author_request(parent_id, "v1-card-preflight-error"))
             .await;
@@ -31166,6 +31167,7 @@ mod tests {
         workflow.completion_protocol_version = Set(1);
         workflow.completion_protocol_mode = Set(CompletionProtocolMode::V1);
         workflow.update(&db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
         let stale = delegation_task_run::Entity::find_by_id(&task_id)
             .one(&db.conn)
             .await
@@ -31244,7 +31246,8 @@ mod tests {
         use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
-        let (db, runs, _mock, events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, _mock, events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let report = broker
             .start_delegation(v2_plan_author_request(
                 parent_id,
@@ -31280,6 +31283,7 @@ mod tests {
         workflow.completion_protocol_version = Set(1);
         workflow.completion_protocol_mode = Set(CompletionProtocolMode::V1);
         workflow.update(&db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
         release_tx.send(()).unwrap();
         driver.await.unwrap();
 
@@ -31484,7 +31488,7 @@ mod tests {
             ),
         ] {
             let (db, _runs, _mock, events, broker, parent_id) =
-                v2_plan_author_launch_fixture().await;
+                v2_plan_author_launch_fixture_before_v2_only().await;
             let report = broker
                 .start_delegation(v2_plan_author_request(
                     parent_id,
@@ -31502,6 +31506,7 @@ mod tests {
             workflow.completion_protocol_version = Set(version);
             workflow.completion_protocol_mode = Set(mode);
             workflow.update(&db.conn).await.unwrap();
+            crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
 
             assert_terminal_protocol_host_failure(
                 db.as_ref(),
@@ -31528,7 +31533,7 @@ mod tests {
             ),
         ] {
             let (db, _runs, _mock, events, broker, parent_id) =
-                v2_plan_author_launch_fixture().await;
+                v2_plan_author_launch_fixture_before_v2_only().await;
             let report = broker
                 .start_delegation(v2_plan_author_request(
                     parent_id,
@@ -31546,6 +31551,7 @@ mod tests {
                 .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
                 .await
                 .unwrap();
+            crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
             assert_terminal_protocol_host_failure(
                 db.as_ref(),
                 events.as_ref(),
@@ -35261,7 +35267,9 @@ mod tests {
         .unwrap();
     }
 
-    async fn v2_plan_author_launch_fixture() -> (
+    async fn v2_plan_author_launch_fixture_with_db(
+        db: Arc<crate::db::AppDatabase>,
+    ) -> (
         Arc<crate::db::AppDatabase>,
         Arc<RunStore>,
         Arc<MockSpawner>,
@@ -35270,9 +35278,8 @@ mod tests {
         i32,
     ) {
         use crate::db::service::conversation_service;
-        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::db::test_helpers::seed_folder;
 
-        let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-launch-binding").await;
         let parent = conversation_service::create(
             &db.conn,
@@ -35306,6 +35313,34 @@ mod tests {
         );
         enable_delegation(&broker).await;
         (db, runs, mock, events, broker, parent.id)
+    }
+
+    async fn v2_plan_author_launch_fixture() -> (
+        Arc<crate::db::AppDatabase>,
+        Arc<RunStore>,
+        Arc<MockSpawner>,
+        Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
+        Arc<DelegationBroker>,
+        i32,
+    ) {
+        v2_plan_author_launch_fixture_with_db(Arc::new(
+            crate::db::test_helpers::fresh_in_memory_db().await,
+        ))
+        .await
+    }
+
+    async fn v2_plan_author_launch_fixture_before_v2_only() -> (
+        Arc<crate::db::AppDatabase>,
+        Arc<RunStore>,
+        Arc<MockSpawner>,
+        Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
+        Arc<DelegationBroker>,
+        i32,
+    ) {
+        v2_plan_author_launch_fixture_with_db(Arc::new(
+            crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+        ))
+        .await
     }
 
     fn v2_plan_author_request(parent_id: i32, tool_use_id: &str) -> DelegationRequest {
@@ -35353,7 +35388,8 @@ mod tests {
         use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
-        let (db, _runs, _mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, _runs, _mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let report = broker
             .start_delegation(v2_plan_author_request(parent_id, "launch-instruction-pair"))
             .await;
@@ -35369,6 +35405,7 @@ mod tests {
         workflow.completion_protocol_version = Set(2);
         workflow.completion_protocol_mode = Set(CompletionProtocolMode::V2Shadow);
         workflow.update(&db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
 
         let error =
             crate::acp::delegation::workflow::admission::append_admitted_completion_instruction(
@@ -35607,6 +35644,7 @@ mod tests {
         workflow.completion_protocol_version = Set(version);
         workflow.completion_protocol_mode = Set(mode);
         workflow.update(&db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(db).await;
     }
 
     async fn delete_launch_workflow_header(db: &crate::db::AppDatabase) {
@@ -35638,7 +35676,8 @@ mod tests {
 
     #[tokio::test]
     async fn gen1_pre_spawn_protocol_race_preserves_legacy_code_and_zero_launch_side_effects() {
-        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         broker
@@ -35688,7 +35727,8 @@ mod tests {
     ) {
         use crate::acp::delegation::types::ContinueDelegationRequest;
 
-        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let (root_task_id, _child_id) = prepare_v2_bound_root_for_continue(
             db.as_ref(),
             broker.as_ref(),
@@ -35862,7 +35902,7 @@ mod tests {
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
             let (db, runs, mock, _events, broker, parent_id) =
-                v2_plan_author_launch_fixture().await;
+                v2_plan_author_launch_fixture_before_v2_only().await;
             set_launch_workflow_protocol_pair(&db, version, mode).await;
             let tool_use_id = format!("protocol-pair-first-{index}");
             let report = broker
@@ -35880,7 +35920,7 @@ mod tests {
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
             let (db, runs, mock, _events, broker, parent_id) =
-                v2_plan_author_launch_fixture().await;
+                v2_plan_author_launch_fixture_before_v2_only().await;
             let (root_task_id, _child_id) = prepare_v2_bound_root_for_continue(
                 db.as_ref(),
                 broker.as_ref(),
@@ -35917,7 +35957,7 @@ mod tests {
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
             let (db, runs, mock, _events, broker, parent_id) =
-                v2_plan_author_launch_fixture().await;
+                v2_plan_author_launch_fixture_before_v2_only().await;
             let source = broker
                 .start_delegation(v2_plan_author_request(
                     parent_id,
@@ -35955,23 +35995,10 @@ mod tests {
     #[tokio::test]
     async fn workflow_launch_variants_reject_historical_protocol_before_process_spawn() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
-        use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode};
-        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
-        async fn make_historical(db: &crate::db::AppDatabase) {
-            let workflow = delegation_workflow::Entity::find_by_id("launch-binding-workflow")
-                .one(&db.conn)
-                .await
-                .unwrap()
-                .unwrap();
-            let mut workflow = workflow.into_active_model();
-            workflow.completion_protocol_version = Set(1);
-            workflow.completion_protocol_mode = Set(CompletionProtocolMode::V1);
-            workflow.update(&db.conn).await.unwrap();
-        }
-
-        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
-        make_historical(&db).await;
+        let (db, runs, mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
+        make_launch_workflow_historical(&db).await;
         let first = broker
             .start_delegation(v2_plan_author_request(parent_id, "historical-first"))
             .await;
@@ -35987,7 +36014,8 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let (root_task_id, _child_id) = prepare_v2_bound_root_for_continue(
             db.as_ref(),
             broker.as_ref(),
@@ -35995,7 +36023,7 @@ mod tests {
             "historical-continue-root",
         )
         .await;
-        make_historical(&db).await;
+        make_launch_workflow_historical(&db).await;
         let continued = broker
             .continue_delegation(ContinueDelegationRequest {
                 parent_connection_id: "parent-conn".into(),
@@ -36021,7 +36049,8 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let (db, runs, mock, _events, broker, parent_id) = v2_plan_author_launch_fixture().await;
+        let (db, runs, mock, _events, broker, parent_id) =
+            v2_plan_author_launch_fixture_before_v2_only().await;
         let root = broker
             .start_delegation(v2_plan_author_request(
                 parent_id,
@@ -36039,7 +36068,7 @@ mod tests {
                 ),
             )
             .await;
-        make_historical(&db).await;
+        make_launch_workflow_historical(&db).await;
         let mut request = v2_plan_author_request(parent_id, "historical-replacement");
         request.replaces_task_id = Some(root_task_id);
         request.replacement_reason = Some("unresumable".into());

@@ -11181,7 +11181,7 @@ mod tests {
             design_bytes,
         )
         .unwrap();
-        let db = fresh_in_memory_db().await;
+        let db = crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
         let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let (emitter, _) = emitter_with_rx();
@@ -11264,6 +11264,7 @@ mod tests {
                 .into();
         flipped.completion_protocol_mode = Set(CompletionProtocolMode::V2Shadow);
         flipped.update(&db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
         release_preflight.send(()).unwrap();
 
         let error = settle_task.await.unwrap().unwrap_err();
@@ -11366,7 +11367,7 @@ mod tests {
             design_bytes,
         )
         .unwrap();
-        let db = fresh_in_memory_db().await;
+        let db = crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
         let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let (emitter, _) = emitter_with_rx();
@@ -11428,6 +11429,7 @@ mod tests {
             .await
             .unwrap();
         update.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&db).await;
         release_preflight.send(()).unwrap();
 
         let error = settle_task.await.unwrap().unwrap_err();

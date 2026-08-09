@@ -87,8 +87,8 @@ pub async fn fresh_in_memory_db() -> AppDatabase {
     AppDatabase { conn }
 }
 
-/// Seed immutable historical workflow headers before installing v2-only triggers.
-pub async fn historical_completion_protocol_db(seeds: &[HistoricalWorkflowSeed]) -> AppDatabase {
+/// Open a database at the last schema version before v2-only triggers are installed.
+pub async fn historical_completion_protocol_db_before_v2_only() -> AppDatabase {
     let conn = Database::connect("sqlite::memory:")
         .await
         .expect("open historical in-memory sqlite");
@@ -101,40 +101,57 @@ pub async fn historical_completion_protocol_db(seeds: &[HistoricalWorkflowSeed])
     BeforeCompletionProtocolV2Only::up(&conn, None)
         .await
         .expect("run predecessor migrations");
+    AppDatabase { conn }
+}
 
-    conn.execute(Statement::from_string(
-        DbBackend::Sqlite,
-        "INSERT INTO folder \
+/// Install all migrations that follow the historical fixture boundary.
+pub async fn complete_historical_completion_protocol_migrations(db: &AppDatabase) {
+    Migrator::up(&db.conn, None)
+        .await
+        .map_err(|error| DbError::Migration(error.to_string()))
+        .expect("run remaining migrations");
+}
+
+/// Seed immutable historical workflow headers before installing v2-only triggers.
+pub async fn historical_completion_protocol_db(seeds: &[HistoricalWorkflowSeed]) -> AppDatabase {
+    let db = historical_completion_protocol_db_before_v2_only().await;
+
+    db.conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO folder \
          (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
          VALUES (1,'historical','C:/completion-protocol-history','2026-08-09T00:00:00Z',\
                  '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z',1,1,'inherit','regular')"
-            .to_owned(),
-    ))
-    .await
-    .expect("seed historical folder");
+                .to_owned(),
+        ))
+        .await
+        .expect("seed historical folder");
 
     let parent_conversation_ids = seeds
         .iter()
         .map(|seed| seed.parent_conversation_id)
         .collect::<BTreeSet<_>>();
     for parent_conversation_id in parent_conversation_ids {
-        conn.execute(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO conversation (\
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO conversation (\
                id,folder_id,agent_type,status,kind,message_count,title_locked,\
                auto_title_finalized,parent_id,created_at,updated_at\
              ) VALUES (?,1,'codex','completed','regular',0,0,0,NULL,\
                        '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')",
-            vec![parent_conversation_id.into()],
-        ))
-        .await
-        .expect("seed historical parent conversation");
+                vec![parent_conversation_id.into()],
+            ))
+            .await
+            .expect("seed historical parent conversation");
     }
 
     let now = chrono::Utc::now();
     let contains_corrupt_version = seeds.iter().any(|seed| !matches!(seed.version, 1 | 2));
     if contains_corrupt_version {
-        conn.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
             .await
             .expect("allow corrupt historical protocol fixtures");
     }
@@ -161,21 +178,19 @@ pub async fn historical_completion_protocol_db(seeds: &[HistoricalWorkflowSeed])
             created_at: Set(now),
             updated_at: Set(now),
         }
-        .insert(&conn)
+        .insert(&db.conn)
         .await
         .expect("seed historical workflow");
     }
     if contains_corrupt_version {
-        conn.execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
             .await
             .expect("restore historical check constraints");
     }
 
-    Migrator::up(&conn, None)
-        .await
-        .map_err(|error| DbError::Migration(error.to_string()))
-        .expect("run remaining migrations");
-    AppDatabase { conn }
+    complete_historical_completion_protocol_migrations(&db).await;
+    db
 }
 
 pub async fn seed_folder(db: &AppDatabase, path: &str) -> i32 {
