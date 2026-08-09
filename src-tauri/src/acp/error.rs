@@ -278,7 +278,8 @@ impl From<WorkflowStoreError> for AcpError {
             WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
                 Self::LegacyCompletionProtocolReadOnly
             }
-            WorkflowStoreError::UnsupportedCompletionProtocol { .. } => {
+            WorkflowStoreError::UnsupportedCompletionProtocol { .. }
+            | WorkflowStoreError::UnsupportedCompletionProtocolHeader(_) => {
                 Self::UnsupportedCompletionProtocol(message)
             }
             _ => Self::Protocol(message),

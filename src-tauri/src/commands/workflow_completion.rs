@@ -17,7 +17,7 @@ use crate::acp::delegation::workflow::{
     CompletionMutationError, CompletionProtocolRolloutConfig, LegacyWorkflowRestartProjection,
     WorkflowStoreError,
 };
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::delegation_attention_request;
 use crate::db::AppDatabase;
 use chrono::Utc;
@@ -268,7 +268,58 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
         CompletionMutationError::Evidence(
             crate::acp::delegation::workflow::CompletionEvidenceError::Persistence(_),
         ) => AppCommandError::database_error(message).with_detail(stable_code),
+        CompletionMutationError::Protocol { code, .. }
+        | CompletionMutationError::Evidence(
+            crate::acp::delegation::workflow::CompletionEvidenceError::Protocol { code, .. },
+        ) => match code {
+            "legacy_completion_protocol_read_only" => {
+                AppCommandError::new(AppErrorCode::LegacyCompletionProtocolReadOnly, message)
+                    .with_detail(code)
+            }
+            "unsupported_completion_protocol" => {
+                AppCommandError::new(AppErrorCode::UnsupportedCompletionProtocol, message)
+                    .with_detail(code)
+            }
+            _ => AppCommandError::invalid_input(message).with_detail(code),
+        },
         _ => AppCommandError::invalid_input(message).with_detail(stable_code),
+    }
+}
+
+#[cfg(test)]
+mod protocol_error_tests {
+    use super::*;
+    use crate::acp::delegation::workflow::CompletionEvidenceError;
+
+    #[test]
+    fn completion_protocol_mutations_preserve_stable_app_error_codes() {
+        let read_only = map_completion_mutation_error(CompletionMutationError::Protocol {
+            code: "legacy_completion_protocol_read_only",
+            message: "legacy workflow is read-only".into(),
+        });
+        assert_eq!(
+            read_only.code,
+            AppErrorCode::LegacyCompletionProtocolReadOnly
+        );
+        assert_eq!(
+            read_only.detail.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+
+        let unsupported = map_completion_mutation_error(CompletionMutationError::Evidence(
+            CompletionEvidenceError::Protocol {
+                code: "unsupported_completion_protocol",
+                message: "workflow protocol header is unsupported".into(),
+            },
+        ));
+        assert_eq!(
+            unsupported.code,
+            AppErrorCode::UnsupportedCompletionProtocol
+        );
+        assert_eq!(
+            unsupported.detail.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
     }
 }
 

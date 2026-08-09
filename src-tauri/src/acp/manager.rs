@@ -24,17 +24,15 @@ use crate::acp::delegation::continuation::store::{
     ContinuationPatch, ContinuationStore, FieldPatch,
 };
 use crate::acp::delegation::continuation::types::ContinuationState;
-use crate::acp::delegation::metrics::{
-    CompletionRestartOutcome, DelegationMetrics, PromptAdmissionSource,
-};
+use crate::acp::delegation::metrics::{DelegationMetrics, PromptAdmissionSource};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::delegation::workflow::{
-    capture_original_request_context, restart_legacy_workflow_if_enforced,
-    CompletionProtocolRolloutConfig,
+    capture_original_request_context, load_completion_protocol_for_conversation,
+    require_v2_mutation, CompletionProtocolRolloutConfig,
 };
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
@@ -515,6 +513,7 @@ pub struct ConnectionManager {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CompletionProtocolRuntime {
     rollout: Arc<CompletionProtocolRolloutConfig>,
     metrics: Arc<DelegationMetrics>,
@@ -2577,44 +2576,20 @@ impl ConnectionManager {
             )
         };
 
-        // Root resumes of legacy workflows are fenced before prompt admission,
-        // hydration, events, transcript writes, status changes, or agent send.
+        // Linked root prompts must pass the persisted protocol fence before
+        // admission, hydration, transcript/status writes, routing, or send.
         if delegation.is_none() {
             let effective_conversation_id = conversation_id.or({
                 let state = state_arc.read().await;
                 state.conversation_id
             });
-            if let (Some(source_conversation_id), Some(runtime)) = (
-                effective_conversation_id,
-                self.completion_protocol_runtime.get(),
-            ) {
-                match restart_legacy_workflow_if_enforced(
-                    db,
-                    source_conversation_id,
-                    None,
-                    &runtime.rollout,
-                )
-                .await
+            if let Some(conversation_id) = effective_conversation_id {
+                if let Some((version, mode)) =
+                    load_completion_protocol_for_conversation(db, conversation_id)
+                        .await
+                        .map_err(AcpError::from)?
                 {
-                    Ok(Some(projection)) => {
-                        runtime.metrics.record_completion_restart(
-                            if projection.idempotent_replay {
-                                CompletionRestartOutcome::Reused
-                            } else {
-                                CompletionRestartOutcome::Created
-                            },
-                        );
-                        return Err(AcpError::LegacyCompletionProtocolRestart {
-                            successor_conversation_id: projection.successor_conversation_id,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        runtime
-                            .metrics
-                            .record_completion_restart(CompletionRestartOutcome::Failed);
-                        return Err(AcpError::protocol(error.code()));
-                    }
+                    require_v2_mutation(version, &mode).map_err(AcpError::from)?;
                 }
             }
         }

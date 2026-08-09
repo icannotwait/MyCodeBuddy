@@ -40,7 +40,10 @@ use super::artifact_resolver::{
     ArtifactError, ArtifactFailure, ResolvedArtifact,
 };
 use super::completion_evidence::load_validated_completion_evidence;
-use super::error::{CompletionEvidenceError, WorkflowAdmissionRecoveryError};
+use super::error::{
+    require_v2_mutation, CompletionEvidenceError, WorkflowAdmissionRecoveryError,
+    WorkflowStoreError,
+};
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::evidence_scope::{
     build_admission_completion_context, AdmissionCandidate, EvidenceScopeError, WorkflowStore,
@@ -53,7 +56,7 @@ use super::gates::{
 use super::key::parse_recognized_work_unit_key;
 use super::project::{evidence_from_run_and_binding, evidence_from_run_binding_and_validated};
 use super::recovery_policy::decide_workflow_recovery;
-use super::store::load_workflow_recovery_snapshot_conn;
+use super::store::{load_completion_protocol_header, load_workflow_recovery_snapshot_conn};
 use super::types::{
     AcceptedToolIntent, CompleteWorkRequest, DocumentGateKind, InstructionBlockV1,
     ManifestDocument, ParsedWorkUnitKey, WorkflowChildMcpBinding,
@@ -144,6 +147,8 @@ pub enum CompleteWorkError {
     RoleMismatch,
     #[error("invalid complete_work arguments: {0}")]
     InvalidArguments(String),
+    #[error("{message}")]
+    Protocol { code: &'static str, message: String },
     #[error("completion intent persistence failed: {0}")]
     Persistence(String),
 }
@@ -155,8 +160,19 @@ impl CompleteWorkError {
             Self::CallConflict => "completion_tool_call_conflict",
             Self::RoleMismatch => "completion_outcome_role_mismatch",
             Self::InvalidArguments(_) => "invalid_arguments",
+            Self::Protocol { code, .. } => code,
             Self::Persistence(_) => "persistence",
         }
+    }
+}
+
+fn complete_work_store_error(error: WorkflowStoreError) -> CompleteWorkError {
+    match error {
+        WorkflowStoreError::Persistence(message) => CompleteWorkError::Persistence(message),
+        other => CompleteWorkError::Protocol {
+            code: other.code(),
+            message: other.to_string(),
+        },
     }
 }
 
@@ -523,6 +539,18 @@ async fn accept_complete_work_once(
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
+        let (protocol_version, protocol_mode) =
+            load_completion_protocol_header(&txn, &binding.workflow_id)
+                .await
+                .map_err(|error| {
+                    CompleteWorkAttemptError::Contract(complete_work_store_error(error))
+                })?
+                .ok_or(CompleteWorkAttemptError::Contract(
+                    CompleteWorkError::Unauthorized,
+                ))?;
+        require_v2_mutation(protocol_version, &protocol_mode).map_err(|error| {
+            CompleteWorkAttemptError::Contract(complete_work_store_error(error))
+        })?;
         let workflow = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
             .one(&txn)
             .await
@@ -533,11 +561,11 @@ async fn accept_complete_work_once(
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
-        if workflow.completion_protocol_version != 2 {
-            return Err(CompleteWorkAttemptError::Contract(
-                CompleteWorkError::Unauthorized,
-            ));
-        }
+        require_v2_mutation(
+            workflow.completion_protocol_version,
+            &workflow.completion_protocol_mode,
+        )
+        .map_err(|error| CompleteWorkAttemptError::Contract(complete_work_store_error(error)))?;
         let node = delegation_workflow_node_binding::Entity::find_by_id((
             binding.workflow_id.clone(),
             binding.node_id.clone(),

@@ -60,6 +60,8 @@ pub enum CompletionEvidenceError {
     DecisionSuperseded,
     #[error("completion evidence is corrupt: {0}")]
     EvidenceCorrupt(String),
+    #[error("{message}")]
+    Protocol { code: &'static str, message: String },
     #[error("completion persistence failure: {0}")]
     Persistence(String),
 }
@@ -73,6 +75,7 @@ impl CompletionEvidenceError {
             Self::Scope(error) => error.code(),
             Self::DecisionSuperseded => "completion_decision_superseded",
             Self::EvidenceCorrupt(_) => "completion_evidence_corrupt",
+            Self::Protocol { code, .. } => code,
             Self::Persistence(_) => "completion_persistence_failure",
         }
     }
@@ -195,6 +198,9 @@ pub enum WorkflowStoreError {
         mode: CompletionProtocolMode,
     },
 
+    #[error("unsupported completion protocol header: {0}")]
+    UnsupportedCompletionProtocolHeader(String),
+
     #[error("legacy workflow restart is required: {0}")]
     LegacyCompletionProtocolRestartRequired(String),
 
@@ -229,7 +235,8 @@ impl WorkflowStoreError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::LegacyCompletionProtocolReadOnly => "legacy_completion_protocol_read_only",
-            Self::UnsupportedCompletionProtocol { .. } => "unsupported_completion_protocol",
+            Self::UnsupportedCompletionProtocol { .. }
+            | Self::UnsupportedCompletionProtocolHeader(_) => "unsupported_completion_protocol",
             Self::LegacyCompletionProtocolRestartRequired(_) => {
                 "legacy_completion_protocol_restart_required"
             }

@@ -37,7 +37,7 @@ use codeg_lib::acp::delegation::workflow::{
     get_workflow_state_core, guard_current_final_delivery_core, guard_final_delivery_core,
     guard_task_final_delivery_core, inject_legacy_restart_header_failure_once,
     materialize_terminal_completion_txn, project_workflow_graph_core,
-    publish_workflow_manifest_core, restart_legacy_workflow_core,
+    publish_workflow_manifest_core, recover_workflow_core, restart_legacy_workflow_core,
     restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_v2_core,
     CompletionCardV2, CompletionIntent, CompletionIntentSource, CompletionOutcome,
     CompletionProtocolConfigurationRemoved, CompletionProtocolRolloutConfig,
@@ -45,8 +45,8 @@ use codeg_lib::acp::delegation::workflow::{
     DocumentRef, FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument,
     ManifestGate, ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase,
     ManifestWorkflowState, PlanReviewChangeV2, PlanReviewNextAction, ProfileCompletionWindow,
-    PublishWorkflowRequest, ResolutionMode, RolloutDecision, SettleWorkflowV2Request,
-    TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
+    PublishWorkflowRequest, RecoverWorkflowRequest, ResolutionMode, RolloutDecision,
+    SettleWorkflowV2Request, TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
     CURRENT_COMPLETION_PROTOCOL_VERSION, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL,
     PHASE_PLAN, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
@@ -58,10 +58,11 @@ use codeg_lib::app_state::AppState;
 use codeg_lib::commands::workflow_completion::restart_legacy_workflow_authenticated_core;
 use codeg_lib::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 use codeg_lib::db::entities::{
-    auto_title_job, delegation_attention_request, delegation_task_run, delegation_workflow,
-    delegation_workflow_gate_settlement, delegation_workflow_gate_state,
-    delegation_workflow_manifest_revision, delegation_workflow_node_binding,
-    delegation_workflow_restart_context, delegation_workflow_run_binding,
+    auto_title_job, delegation_attention_request, delegation_completion_tool_intent,
+    delegation_task_run, delegation_workflow, delegation_workflow_gate_settlement,
+    delegation_workflow_gate_state, delegation_workflow_manifest_revision,
+    delegation_workflow_node_binding, delegation_workflow_restart_context,
+    delegation_workflow_run_binding, recovery_authorization,
 };
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
@@ -70,7 +71,8 @@ use codeg_lib::web::event_bridge::EventEmitter;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait,
+    QueryFilter, Set, Statement, TransactionTrait,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -450,6 +452,514 @@ async fn mark_historical_completion_protocol(
     row.completion_protocol_version = Set(1);
     row.completion_protocol_mode = Set(mode);
     row.update(&db.conn).await.unwrap();
+}
+
+async fn set_completion_protocol_pair(
+    db: &codeg_lib::db::AppDatabase,
+    workflow_id: &str,
+    version: i64,
+    mode: delegation_workflow::CompletionProtocolMode,
+) {
+    let row = delegation_workflow::Entity::find_by_id(workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row: delegation_workflow::ActiveModel = row.into();
+    row.completion_protocol_version = Set(version);
+    row.completion_protocol_mode = Set(mode);
+    row.update(&db.conn).await.unwrap();
+}
+
+async fn mutation_snapshot(
+    db: &codeg_lib::db::AppDatabase,
+    parent: i32,
+    workflow_id: &str,
+) -> String {
+    let workflow = delegation_workflow::Entity::find_by_id(workflow_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = codeg_lib::db::entities::conversation::Entity::find_by_id(parent)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let revisions = delegation_workflow_manifest_revision::Entity::find()
+        .filter(delegation_workflow_manifest_revision::Column::WorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let settlements = delegation_workflow_gate_settlement::Entity::find()
+        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let attentions = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::ParentConversationId.eq(parent))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let bindings = delegation_workflow_run_binding::Entity::find()
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let intents = delegation_completion_tool_intent::Entity::find()
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let authorizations = recovery_authorization::Entity::find()
+        .filter(recovery_authorization::Column::ParentConversationId.eq(parent))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let successors = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    format!(
+        "{workflow:?}|{conversation:?}|revisions={revisions}|settlements={settlements}|attentions={attentions}|bindings={bindings}|intents={intents}|authorizations={authorizations}|successors={successors}"
+    )
+}
+
+async fn seed_final_guard_binding(
+    db: &codeg_lib::db::AppDatabase,
+    parent: i32,
+    child: i32,
+    workflow_id: &str,
+    task_id: &str,
+) {
+    let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    }));
+    runs.insert_reserving(ReservingRunInsert {
+        task_id: task_id.into(),
+        root_task_id: task_id.into(),
+        previous_task_id: None,
+        generation: 1,
+        parent_conversation_id: parent,
+        parent_tool_use_id: Some(format!("tool-{task_id}")),
+        child_conversation_id: child,
+        agent_type: "codex".into(),
+        profile_id: None,
+        workspace_path: Some("/tmp/task-4-final-guard".into()),
+        route_fingerprint: Some(format!("route-{task_id}")),
+        launch_snapshot_version: Some("v1".into()),
+        mode_id: None,
+        config_values_json: Some("{}".into()),
+        task_preview: Some("Task 4 Final delivery guard".into()),
+        request_fingerprint: Some(format!("fingerprint-{task_id}")),
+        admission_class: delegation_task_run::AdmissionClass::NormalRevision,
+        lineage_root_task_id: task_id.into(),
+        work_unit_key: None,
+        history_only: false,
+        replaced_task_id: None,
+        replacement_reason: None,
+        started_at: Some(chrono::Utc::now()),
+    })
+    .await
+    .unwrap();
+    let now = chrono::Utc::now();
+    delegation_workflow_run_binding::ActiveModel {
+        task_id: Set(task_id.into()),
+        workflow_id: Set(workflow_id.into()),
+        node_id: Set("plan-author".into()),
+        gate_id: Set(None),
+        gate_cycle: Set(None),
+        manifest_revision: Set(1),
+        content_fingerprint: Set(None),
+        evidence_scope_digest: Set(None),
+        gate_lineage: Set(None),
+        review_round: Set(None),
+        instruction_block_digest: Set(None),
+        material_selector_digest: Set(None),
+        subject_material_digest: Set(None),
+        requirements_identity: Set(None),
+        task_specification_identity: Set(None),
+        final_findings_identity: Set(None),
+        producer_baseline_head: Set(None),
+        artifact_digest: Set(None),
+        reviewed_task_id: Set(None),
+        reviewed_implementer_generation: Set(None),
+        lineage_ordinal: Set(1),
+        summary_validated: Set(false),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn historical_protocol_mutation_matrix() {
+    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+    for (index, version, mode, expected_code) in [
+        (0, 1, V1, "legacy_completion_protocol_read_only"),
+        (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+        (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+        (3, 2, V1, "unsupported_completion_protocol"),
+        (4, 2, V2Shadow, "unsupported_completion_protocol"),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let mut document = skeleton(&format!("task-4-mutation-matrix-{index}"));
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let task_id = format!("task-4-final-guard-{index}");
+        seed_final_guard_binding(&db, parent, child, &published.workflow_id, &task_id).await;
+        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        let before = mutation_snapshot(&db, parent, &published.workflow_id).await;
+
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(published.manifest_revision);
+        document.nodes[0].title = Some("must not publish".into());
+        let publish_error = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .expect_err("rejected protocol pair must not publish");
+        assert_eq!(publish_error.code(), expected_code);
+
+        for (gate_id, expected_review_round, expected_outcome) in [
+            ("design", Some(1), Some(GateSettlementOutcome::Approved)),
+            ("plan", Some(1), Some(GateSettlementOutcome::Approved)),
+        ] {
+            let error = settle_workflow_gate_v2_core(
+                &db,
+                &EventEmitter::Noop,
+                parent,
+                SettleWorkflowV2Request {
+                    workflow_id: published.workflow_id.clone(),
+                    gate_id: gate_id.into(),
+                    expected_graph_revision: published.graph_revision,
+                    expected_review_round,
+                    expected_outcome,
+                    summary: "must not settle".into(),
+                    recovery_authorization_id: None,
+                },
+            )
+            .await
+            .expect_err("rejected protocol pair must not settle");
+            assert_eq!(error.code(), expected_code);
+        }
+
+        let recovery_error = recover_workflow_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            RecoverWorkflowRequest {
+                workflow_id: published.workflow_id.clone(),
+                recovery_authorization_id: "must-not-consume".into(),
+                expected_manifest_revision: published.manifest_revision,
+                correlation_id: format!("task-4-recover-{index}"),
+            },
+        )
+        .await
+        .expect_err("rejected protocol pair must not recover");
+        assert_eq!(recovery_error.code(), expected_code);
+
+        let direct_final_error = guard_final_delivery_core(
+            &db,
+            &EventEmitter::Noop,
+            FinalDeliveryGuardRequest {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: PHASE_FINAL.into(),
+                workspace_path: workspace.path().to_path_buf(),
+                final_reviewer_task_id: task_id.clone(),
+            },
+        )
+        .await
+        .expect_err("rejected protocol pair must not reach direct Final delivery");
+        assert_eq!(direct_final_error.code(), expected_code);
+
+        let current_final_error = guard_current_final_delivery_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            Some(&published.workflow_id),
+        )
+        .await
+        .expect_err("rejected protocol pair must not reach current Final delivery");
+        assert_eq!(current_final_error.code(), expected_code);
+
+        let task_final_error = guard_task_final_delivery_core(&db, &EventEmitter::Noop, &task_id)
+            .await
+            .expect_err("rejected protocol pair must not reach task Final delivery");
+        assert_eq!(task_final_error.code(), expected_code);
+
+        assert_eq!(
+            mutation_snapshot(&db, parent, &published.workflow_id).await,
+            before,
+            "rejected pair version={version} must preserve every tracked side effect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_protocol_cross_parent_mutations_remain_unauthorized() {
+    let db = fresh_in_memory_db().await;
+    let owner_folder = seed_folder(&db, "/tmp/task-4-owner-fence").await;
+    let foreign_folder = seed_folder(&db, "/tmp/task-4-foreign-fence").await;
+    let owner = seed_conversation(&db, owner_folder, AgentType::Codex).await;
+    let foreign = seed_conversation(&db, foreign_folder, AgentType::Codex).await;
+    let published = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        owner,
+        PublishWorkflowRequest {
+            document: skeleton("task-4-cross-parent-protocol-fence"),
+        },
+    )
+    .await
+    .unwrap();
+    set_completion_protocol_pair(
+        &db,
+        &published.workflow_id,
+        1,
+        delegation_workflow::CompletionProtocolMode::V1,
+    )
+    .await;
+    let before = mutation_snapshot(&db, owner, &published.workflow_id).await;
+
+    let mut foreign_revision = skeleton("task-4-cross-parent-protocol-fence");
+    foreign_revision.workflow_id = Some(published.workflow_id.clone());
+    foreign_revision.expected_manifest_revision = Some(published.manifest_revision);
+    foreign_revision.nodes[0].title = Some("foreign revision".into());
+    let publication_error = publish_workflow_manifest_core(
+        &db,
+        &EventEmitter::Noop,
+        foreign,
+        PublishWorkflowRequest {
+            document: foreign_revision,
+        },
+    )
+    .await
+    .expect_err("cross-parent publication must remain unauthorized");
+    assert_eq!(publication_error.code(), "unauthorized");
+
+    let settle_error = settle_workflow_gate_v2_core(
+        &db,
+        &EventEmitter::Noop,
+        foreign,
+        SettleWorkflowV2Request {
+            workflow_id: published.workflow_id.clone(),
+            gate_id: "design".into(),
+            expected_graph_revision: published.graph_revision,
+            expected_review_round: Some(1),
+            expected_outcome: Some(GateSettlementOutcome::Approved),
+            summary: "foreign caller must not learn the protocol".into(),
+            recovery_authorization_id: None,
+        },
+    )
+    .await
+    .expect_err("cross-parent settlement must remain unauthorized");
+    assert_eq!(settle_error.code(), "unauthorized");
+
+    let recovery_error = recover_workflow_core(
+        &db,
+        &EventEmitter::Noop,
+        foreign,
+        RecoverWorkflowRequest {
+            workflow_id: published.workflow_id.clone(),
+            recovery_authorization_id: "foreign-authorization".into(),
+            expected_manifest_revision: published.manifest_revision,
+            correlation_id: "task-4-cross-parent-recovery".into(),
+        },
+    )
+    .await
+    .expect_err("cross-parent recovery must remain unauthorized");
+    assert_eq!(recovery_error.code(), "unauthorized");
+
+    let final_error = guard_current_final_delivery_core(
+        &db,
+        &EventEmitter::Noop,
+        foreign,
+        Some(&published.workflow_id),
+    )
+    .await
+    .expect_err("cross-parent Final guard must remain unauthorized");
+    assert_eq!(final_error.code(), "unauthorized");
+    assert_eq!(
+        mutation_snapshot(&db, owner, &published.workflow_id).await,
+        before
+    );
+}
+
+async fn corrupt_protocol_header(
+    db: &codeg_lib::db::AppDatabase,
+    workflow_id: &str,
+    version: i64,
+    mode: &str,
+) {
+    db.conn
+        .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+        .await
+        .unwrap();
+    let update = db
+        .conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows SET completion_protocol_version = ?, completion_protocol_mode = ? WHERE workflow_id = ?",
+            vec![version.into(), mode.into(), workflow_id.into()],
+        ))
+        .await;
+    db.conn
+        .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+        .await
+        .unwrap();
+    update.unwrap();
+}
+
+async fn corrupt_mutation_snapshot(
+    db: &codeg_lib::db::AppDatabase,
+    parent: i32,
+    workflow_id: &str,
+) -> String {
+    let header = db
+        .conn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT completion_protocol_version, completion_protocol_mode, active_manifest_revision, graph_revision FROM delegation_workflows WHERE workflow_id = ?",
+            vec![workflow_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let version: i64 = header.try_get("", "completion_protocol_version").unwrap();
+    let mode: String = header.try_get("", "completion_protocol_mode").unwrap();
+    let manifest_revision: i64 = header.try_get("", "active_manifest_revision").unwrap();
+    let graph_revision: i64 = header.try_get("", "graph_revision").unwrap();
+    let conversation = codeg_lib::db::entities::conversation::Entity::find_by_id(parent)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let revisions = delegation_workflow_manifest_revision::Entity::find()
+        .filter(delegation_workflow_manifest_revision::Column::WorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let settlements = delegation_workflow_gate_settlement::Entity::find()
+        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(workflow_id))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let attentions = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::ParentConversationId.eq(parent))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    let authorizations = recovery_authorization::Entity::find()
+        .filter(recovery_authorization::Column::ParentConversationId.eq(parent))
+        .count(&db.conn)
+        .await
+        .unwrap();
+    format!(
+        "version={version}|mode={mode}|manifest={manifest_revision}|graph={graph_revision}|{conversation:?}|revisions={revisions}|settlements={settlements}|attentions={attentions}|authorizations={authorizations}"
+    )
+}
+
+#[tokio::test]
+async fn corrupt_header_nonterminal_fences() {
+    for (index, version, mode) in [(0, 99, "v2_enforce"), (1, 2, "corrupt_mode")] {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, &format!("/tmp/task-4-corrupt-header-{index}")).await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let mut document = skeleton(&format!("task-4-corrupt-header-{index}"));
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        corrupt_protocol_header(&db, &published.workflow_id, version, mode).await;
+        let before = corrupt_mutation_snapshot(&db, parent, &published.workflow_id).await;
+
+        document.workflow_id = Some(published.workflow_id.clone());
+        document.expected_manifest_revision = Some(published.manifest_revision);
+        document.nodes[0].title = Some("corrupt header must not publish".into());
+        let publish_error = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .expect_err("corrupt header publication must fail closed");
+        assert_eq!(publish_error.code(), "unsupported_completion_protocol");
+
+        let recover_error = recover_workflow_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            RecoverWorkflowRequest {
+                workflow_id: published.workflow_id.clone(),
+                recovery_authorization_id: "must-not-consume".into(),
+                expected_manifest_revision: published.manifest_revision,
+                correlation_id: format!("task-4-corrupt-recover-{index}"),
+            },
+        )
+        .await
+        .expect_err("corrupt header recovery must fail closed");
+        assert_eq!(recover_error.code(), "unsupported_completion_protocol");
+
+        let manager = ConnectionManager::new();
+        manager.install_completion_protocol_runtime(
+            Arc::new(CompletionProtocolRolloutConfig {
+                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+                ..Default::default()
+            }),
+            Arc::new(DelegationMetrics::default()),
+        );
+        let connection_id = format!("task-4-corrupt-root-{index}");
+        manager
+            .insert_test_connection(&connection_id, AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let state = manager.get_state(&connection_id).await.unwrap();
+        state.write().await.conversation_id = Some(parent);
+        let root_error = manager
+            .send_prompt_linked_background(
+                &db,
+                &connection_id,
+                vec![PromptInputBlock::Text {
+                    text: "corrupt root must not resume".into(),
+                }],
+                Some(folder),
+                Some(parent),
+                None,
+            )
+            .await
+            .expect_err("corrupt linked root admission must fail closed");
+        assert_eq!(root_error.code(), Some("unsupported_completion_protocol"));
+        assert!(!state.read().await.turn_in_flight);
+        assert_eq!(
+            corrupt_mutation_snapshot(&db, parent, &published.workflow_id).await,
+            before
+        );
+    }
 }
 
 fn complete_gate_state_skeleton(token: &str) -> ManifestDocument {
@@ -1323,9 +1833,10 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
     .await;
     // Production listener/root paths go through preflight request construction
     // (`current_final_delivery_request`), not a hand-built guard request.
-    let ready_after_add_task = guard_task_final_delivery_core(&db, &EventEmitter::Noop, extra_task_id)
-        .await
-        .expect("production task delivery path must not fail after roster add");
+    let ready_after_add_task =
+        guard_task_final_delivery_core(&db, &EventEmitter::Noop, extra_task_id)
+            .await
+            .expect("production task delivery path must not fail after roster add");
     assert!(
         matches!(
             ready_after_add_task,
@@ -2984,77 +3495,108 @@ async fn legacy_restart_failed_creation_leaves_source_unchanged_and_is_retryable
 }
 
 #[tokio::test]
-async fn legacy_prompt_restart_fences_desktop_and_server_plain_text_before_source_mutation() {
-    let (db, parent, source_workflow_id) = legacy_source().await;
-    let before = source_fingerprint(&db, parent, &source_workflow_id).await;
-    let folder_id = codeg_lib::db::entities::conversation::Entity::find_by_id(parent)
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap()
-        .folder_id;
-    let metrics = std::sync::Arc::new(DelegationMetrics::default());
-    let rollout = CompletionProtocolRolloutConfig {
-        default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
-        ..Default::default()
-    };
-    let rollout = std::sync::Arc::new(rollout);
-    let manager = ConnectionManager::new();
-    manager.install_completion_protocol_runtime(rollout, metrics);
-    manager
-        .insert_test_connection(
-            "legacy-root",
-            AgentType::Codex,
-            Some(std::path::PathBuf::from("/tmp/task-15-legacy-restart")),
-            EventEmitter::Noop,
-        )
-        .await;
-    let state = manager.get_state("legacy-root").await.unwrap();
-    {
-        let mut state = state.write().await;
-        state.conversation_id = Some(parent);
-    }
+async fn root_prompt_protocol_fence() {
+    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
 
-    let error = manager
-        .send_prompt_linked_with_message_id(
-            &db,
-            "legacy-root",
-            vec![PromptInputBlock::Text {
-                text: "continue without workflow tools".into(),
+    for (index, version, mode, expected_code) in [
+        (0, 1, V1, "legacy_completion_protocol_read_only"),
+        (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+        (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+        (3, 2, V1, "unsupported_completion_protocol"),
+        (4, 2, V2Shadow, "unsupported_completion_protocol"),
+    ] {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, &format!("/tmp/task-4-root-fence-{index}")).await;
+        let parent = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        capture_original_request_context(
+            &db.conn,
+            parent,
+            &format!("task-4-root-original-{index}"),
+            &[PromptInputBlock::Text {
+                text: "original request must remain immutable".into(),
             }],
-            Some(folder_id),
-            Some(parent),
-            None,
-            Some("plain-text-resume".into()),
-            None,
+            "codex",
         )
         .await
-        .expect_err("legacy prompt must be redirected before admission");
-    let successor_conversation_id = match error {
-        AcpError::LegacyCompletionProtocolRestart {
-            successor_conversation_id,
-        } => successor_conversation_id,
-        other => panic!("expected typed legacy restart, got {other:?}"),
-    };
+        .unwrap();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton(&format!("task-4-root-fence-{index}")),
+            },
+        )
+        .await
+        .unwrap();
+        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        let before = mutation_snapshot(&db, parent, &published.workflow_id).await;
 
-    assert_ne!(successor_conversation_id, parent);
-    assert_eq!(
-        source_fingerprint(&db, parent, &source_workflow_id).await,
-        before
-    );
-    assert!(!state.read().await.turn_in_flight);
-    assert_eq!(
-        delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(source_workflow_id))
-            .count(&db.conn)
+        let manager = ConnectionManager::new();
+        manager.install_completion_protocol_runtime(
+            Arc::new(CompletionProtocolRolloutConfig {
+                default_mode: delegation_workflow::CompletionProtocolMode::V2Enforce,
+                ..Default::default()
+            }),
+            Arc::new(DelegationMetrics::default()),
+        );
+        let connection_id = format!("task-4-root-{index}");
+        manager
+            .insert_test_connection(
+                &connection_id,
+                AgentType::Codex,
+                Some(std::path::PathBuf::from(format!(
+                    "/tmp/task-4-root-fence-{index}"
+                ))),
+                EventEmitter::Noop,
+            )
+            .await;
+        let state = manager.get_state(&connection_id).await.unwrap();
+        state.write().await.conversation_id = Some(parent);
+
+        let foreground = manager
+            .send_prompt_linked_with_message_id(
+                &db,
+                &connection_id,
+                vec![PromptInputBlock::Text {
+                    text: "foreground resume must be rejected".into(),
+                }],
+                Some(folder_id),
+                Some(parent),
+                None,
+                Some(format!("task-4-foreground-{index}")),
+                None,
+            )
             .await
-            .unwrap(),
-        1
-    );
+            .expect_err("linked foreground prompt must fail before admission");
+        assert_eq!(foreground.code(), Some(expected_code));
+
+        let background = manager
+            .send_prompt_linked_background(
+                &db,
+                &connection_id,
+                vec![PromptInputBlock::Text {
+                    text: "automation and chat resume must be rejected".into(),
+                }],
+                Some(folder_id),
+                Some(parent),
+                None,
+            )
+            .await
+            .expect_err("linked background prompt must fail before admission");
+        assert_eq!(background.code(), Some(expected_code));
+
+        assert!(!state.read().await.turn_in_flight);
+        assert_eq!(
+            mutation_snapshot(&db, parent, &published.workflow_id).await,
+            before,
+            "root admission rejection must not create successors or mutate state"
+        );
+    }
 }
 
 #[tokio::test]
-async fn legacy_restart_upgrade_recovers_first_request_before_enforce_resume() {
+async fn legacy_restart_upgrade_is_rejected_before_resume_side_effects() {
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -3134,60 +3676,25 @@ async fn legacy_restart_upgrade_recovers_first_request_before_enforce_resume() {
             None,
         )
         .await
-        .expect_err("first enforce resume must redirect to a recovered successor");
-    let successor_conversation_id = match error {
-        AcpError::LegacyCompletionProtocolRestart {
-            successor_conversation_id,
-        } => successor_conversation_id,
-        other => panic!("expected typed legacy restart, got {other:?}"),
-    };
+        .expect_err("historical root resume must be rejected as read-only");
+    assert!(matches!(error, AcpError::LegacyCompletionProtocolReadOnly));
 
     assert_eq!(
         source_fingerprint(&db, parent, &published.workflow_id).await,
         before,
-        "upgrade recovery must not mutate the source workflow or conversation"
+        "root admission rejection must not mutate the source workflow or conversation"
     );
     assert!(!state.read().await.turn_in_flight);
-    let context =
-        delegation_workflow_restart_context::Entity::find_by_id(successor_conversation_id)
+    assert!(
+        delegation_workflow_restart_context::Entity::find_by_id(parent)
             .one(&db.conn)
             .await
             .unwrap()
-            .unwrap();
-    assert_eq!(context.original_conversation_id, parent);
-    assert_eq!(context.original_request_text, original_request);
-    assert_ne!(context.original_request_id, "upgrade-resume-turn");
-    let successor = delegation_workflow::Entity::find()
-        .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&published.workflow_id))
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(successor.parent_conversation_id, successor_conversation_id);
-    assert_eq!(
-        delegation_workflow_manifest_revision::Entity::find()
-            .filter(
-                delegation_workflow_manifest_revision::Column::WorkflowId
-                    .eq(&successor.workflow_id),
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        1
+            .is_none()
     );
     assert_eq!(
-        delegation_task_run::Entity::find()
-            .filter(
-                delegation_task_run::Column::ParentConversationId.eq(successor_conversation_id),
-            )
-            .count(&db.conn)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        delegation_workflow_run_binding::Entity::find()
-            .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(&successor.workflow_id),)
+        delegation_workflow::Entity::find()
+            .filter(delegation_workflow::Column::LegacySourceWorkflowId.eq(&published.workflow_id))
             .count(&db.conn)
             .await
             .unwrap(),

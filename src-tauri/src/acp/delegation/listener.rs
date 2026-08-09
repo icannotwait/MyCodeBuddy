@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
-use sea_orm::EntityTrait;
+use sea_orm::{EntityTrait, QuerySelect};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(test, feature = "test-utils"))]
@@ -55,10 +55,11 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
-    publish_workflow_manifest_core, recover_workflow_core, restart_legacy_workflow_if_enforced,
-    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, FinalDeliveryGuardResult,
-    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
-    SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
+    load_completion_protocol_header, publish_workflow_manifest_core, recover_workflow_core,
+    require_v2_mutation, restart_legacy_workflow_if_enforced, settle_workflow_gate_v2_core,
+    CompletionProtocolRolloutConfig, FinalDeliveryGuardResult, ManifestDocument, PlanReviewError,
+    PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowV2Request, WorkflowError,
+    WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -73,7 +74,9 @@ use crate::acp::recovery_authorization::{
 };
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
-use crate::db::entities::{delegation_workflow, recovery_authorization};
+use crate::db::entities::{
+    delegation_workflow, delegation_workflow_run_binding, recovery_authorization,
+};
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
@@ -1822,6 +1825,31 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
+        let state = match get_workflow_state_core(
+            runs.db(),
+            parent_conversation_id,
+            req.workflow_id.as_deref(),
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => return workflow_store_error_value(error),
+        };
+        match require_v2_mutation(
+            state.completion_protocol.version,
+            &state.completion_protocol.mode,
+        ) {
+            Ok(()) => {}
+            Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly) => {
+                return serde_json::to_value(state).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!(
+                        "serialize historical workflow state: {error}"
+                    ))
+                    .to_value()
+                });
+            }
+            Err(error) => return workflow_store_error_value(error),
+        }
         match guard_current_final_delivery_core(
             runs.db(),
             &self.workflow_emitter,
@@ -2058,6 +2086,24 @@ impl DelegationListener {
                 "task is not directly owned by this caller",
             ));
         }
+        if let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+            .one(&runs.db().conn)
+            .await
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
+            })?
+        {
+            let (version, mode) =
+                load_completion_protocol_header(&runs.db().conn, &binding.workflow_id)
+                    .await
+                    .map_err(workflow_store_error_value)?
+                    .ok_or_else(|| {
+                        workflow_store_error_value(WorkflowStoreError::NotFound(
+                            binding.workflow_id.clone(),
+                        ))
+                    })?;
+            require_v2_mutation(version, &mode).map_err(workflow_store_error_value)?;
+        }
         let eligibility = runs
             .build_continue_eligibility(&target)
             .await
@@ -2142,21 +2188,40 @@ impl DelegationListener {
                 ));
             }
         }
-        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        let owner = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .select_only()
+            .column(delegation_workflow::Column::ParentConversationId)
+            .into_tuple::<i32>()
             .one(&runs.db().conn)
             .await
-            .map_err(|_| {
-                recovery_wire_error("recovery_subject_load_failed", "failed to load workflow")
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
             })?
             .ok_or_else(|| {
                 recovery_wire_error("recovery_subject_not_found", "workflow was not found")
             })?;
-        if header.parent_conversation_id != parent_conversation_id {
+        if owner != parent_conversation_id {
             return Err(recovery_wire_error(
                 "recovery_subject_not_owned",
                 "workflow is not owned by this caller",
             ));
         }
+        let (version, mode) = load_completion_protocol_header(&runs.db().conn, workflow_id)
+            .await
+            .map_err(workflow_store_error_value)?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "workflow was not found")
+            })?;
+        require_v2_mutation(version, &mode).map_err(workflow_store_error_value)?;
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&runs.db().conn)
+            .await
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
+            })?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "workflow was not found")
+            })?;
         let snapshot =
             crate::acp::delegation::workflow::store::load_workflow_recovery_snapshot_conn(
                 &runs.db().conn,
@@ -2827,6 +2892,9 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
             "legacy_completion_protocol_read_only"
         }
         WorkflowStoreError::UnsupportedCompletionProtocol { .. } => {
+            "unsupported_completion_protocol"
+        }
+        WorkflowStoreError::UnsupportedCompletionProtocolHeader(_) => {
             "unsupported_completion_protocol"
         }
         WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_) => {
@@ -8601,6 +8669,52 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn historical_protocol_mutation_matrix_complete_work() {
+            use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+            for (index, version, mode, expected_code) in [
+                (0, 1, V1, "legacy_completion_protocol_read_only"),
+                (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+                (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+                (3, 2, V1, "unsupported_completion_protocol"),
+                (4, 2, V2Shadow, "unsupported_completion_protocol"),
+            ] {
+                let fixture = completion_tool_fixture().await;
+                let workflow = delegation_workflow::Entity::find_by_id(WORKFLOW_ID)
+                    .one(&fixture.db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut workflow: delegation_workflow::ActiveModel = workflow.into();
+                workflow.completion_protocol_version = Set(version);
+                workflow.completion_protocol_mode = Set(mode);
+                workflow.update(&fixture.db.conn).await.unwrap();
+                let before = delegation_completion_tool_intent::Entity::find()
+                    .all(&fixture.db.conn)
+                    .await
+                    .unwrap();
+
+                let response = fixture
+                    .complete(
+                        fixture.v2_child_token(),
+                        &format!("task-4-rejected-call-{index}"),
+                        approve(),
+                    )
+                    .await;
+
+                assert_eq!(response_code(&response), Some(expected_code));
+                assert_eq!(
+                    delegation_completion_tool_intent::Entity::find()
+                        .all(&fixture.db.conn)
+                        .await
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(fixture.run().await.status, DelegationRunStatus::Running);
+            }
+        }
+
+        #[tokio::test]
         async fn listener_report_status_and_mcp_render_share_the_durable_completion_projection() {
             let fixture = completion_tool_fixture().await;
             let run = fixture.run().await;
@@ -9136,6 +9250,19 @@ mod tests {
         assert_eq!(workflows[0].completion_protocol_version, 1);
         assert_eq!(workflows[0].active_manifest_revision, 1);
         assert!(workflows[0].legacy_source_workflow_id.is_none());
+
+        let state = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "workflow-selection-guard".into(),
+                workflow_id: Some(published.workflow_id),
+            })
+            .await;
+        assert!(
+            state.get("error").is_none(),
+            "historical read failed: {state}"
+        );
+        assert_eq!(state["completion_protocol"]["version"], 1);
+        assert_eq!(state["completion_protocol"]["mode"], "v1");
     }
 
     #[tokio::test]
@@ -10132,7 +10259,10 @@ mod tests {
             self as delegation_task_run, AdmissionClass, DelegationRunStatus,
         };
         use crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus;
-        use crate::db::entities::{conversation, recovery_authorization};
+        use crate::db::entities::{
+            conversation, delegation_workflow, delegation_workflow_node_binding,
+            delegation_workflow_run_binding, recovery_authorization,
+        };
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
         use sea_orm::{
@@ -10180,6 +10310,21 @@ mod tests {
                         coordination_v1: true,
                         delegation_continuation_v1: false,
                         role: CompanionRole::DelegationChild,
+                        workflow_v2: true,
+                        completion_v2: false,
+                        bound_task_id: None,
+                    },
+                )
+                .await;
+            tokens
+                .register(
+                    "recovery-root-token".into(),
+                    TokenEntry {
+                        parent_connection_id: "recovery-parent-conn".into(),
+                        working_dir: PathBuf::from("/tmp"),
+                        coordination_v1: true,
+                        delegation_continuation_v1: false,
+                        role: CompanionRole::Root,
                         workflow_v2: true,
                         completion_v2: false,
                         bound_task_id: None,
@@ -10374,6 +10519,192 @@ mod tests {
                 .count(&fixture.db.conn)
                 .await
                 .expect("count recovery authorization rows")
+        }
+
+        async fn bind_task_to_protocol(
+            fixture: &RecoveryFixture,
+            task_id: &str,
+            suffix: &str,
+            version: i64,
+            mode: delegation_workflow::CompletionProtocolMode,
+        ) -> String {
+            let workflow_id = format!("task-4-recovery-workflow-{suffix}");
+            let node_id = format!("task-4-recovery-node-{suffix}");
+            let now = Utc::now();
+            delegation_workflow::ActiveModel {
+                workflow_id: Set(workflow_id.clone()),
+                parent_conversation_id: Set(fixture.parent_id),
+                workflow_kind: Set("brainstorm_to_delivery".into()),
+                schema_version: Set(2),
+                active_manifest_revision: Set(1),
+                graph_revision: Set(1),
+                workflow_state: Set(delegation_workflow::WorkflowState::Blocked),
+                capability_version: Set("workflow_manifest_v2".into()),
+                publication_token: Set(format!("task-4-recovery-token-{suffix}")),
+                supersedes_approved_revision: Set(None),
+                structural_revision: Set(1),
+                design_fingerprint: Set("design".into()),
+                plan_fingerprint: Set("plan".into()),
+                block_cause_code: Set(Some("active_run_terminal_failure".into())),
+                block_source_manifest_revision: Set(Some(1)),
+                completion_protocol_version: Set(version),
+                completion_protocol_mode: Set(mode),
+                legacy_source_workflow_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_node_binding::ActiveModel {
+                workflow_id: Set(workflow_id.clone()),
+                node_id: Set(node_id.clone()),
+                work_unit_key: Set(format!("task|{suffix}|implementer|codex|none")),
+                role: Set("implementer".into()),
+                agent_type: Set("codex".into()),
+                profile_id: Set(None),
+                phase_id: Set("tasks".into()),
+                task_index: Set(Some(4)),
+                introduced_revision: Set(1),
+                retired_revision: Set(None),
+                is_observed: Set(true),
+                retained_observed: Set(false),
+                cohort_frozen: Set(false),
+                node_outcome: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_run_binding::ActiveModel {
+                task_id: Set(task_id.to_string()),
+                workflow_id: Set(workflow_id.clone()),
+                node_id: Set(node_id),
+                gate_id: Set(None),
+                gate_cycle: Set(None),
+                manifest_revision: Set(1),
+                content_fingerprint: Set(None),
+                evidence_scope_digest: Set(None),
+                gate_lineage: Set(None),
+                review_round: Set(None),
+                instruction_block_digest: Set(None),
+                material_selector_digest: Set(None),
+                subject_material_digest: Set(None),
+                requirements_identity: Set(None),
+                task_specification_identity: Set(None),
+                final_findings_identity: Set(None),
+                producer_baseline_head: Set(None),
+                artifact_digest: Set(None),
+                reviewed_task_id: Set(None),
+                reviewed_implementer_generation: Set(None),
+                lineage_ordinal: Set(1),
+                summary_validated: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            workflow_id
+        }
+
+        async fn finish_authorization_call(
+            fixture: &RecoveryFixture,
+            request: BrokerRecoveryAuthorizationRequest,
+        ) -> Value {
+            let listener = Arc::clone(&fixture.listener);
+            let call = tokio::spawn(async move {
+                listener
+                    .process_recovery_authorization(request, CancellationToken::new())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if call.is_finished() || !fixture.questions.registered.lock().await.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("authorization call or question");
+            if !call.is_finished() {
+                fixture
+                    .questions
+                    .answer("q-1", question_outcome(Some(RECOVERY_DECLINE_LABEL), false))
+                    .await;
+            }
+            call.await.expect("authorization call")
+        }
+
+        #[tokio::test]
+        async fn recovery_authorization_protocol_fence() {
+            use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+            for (index, version, mode, expected_code) in [
+                (0, 1, V1, "legacy_completion_protocol_read_only"),
+                (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+                (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+                (3, 2, V1, "unsupported_completion_protocol"),
+                (4, 2, V2Shadow, "unsupported_completion_protocol"),
+            ] {
+                let fixture = recovery_fixture().await;
+                let task_id =
+                    seed_confirmable_task(&fixture, fixture.parent_id, &format!("fence-{index}"))
+                        .await;
+                let workflow_id =
+                    bind_task_to_protocol(&fixture, &task_id, &index.to_string(), version, mode)
+                        .await;
+
+                let task_outcome = finish_authorization_call(
+                    &fixture,
+                    BrokerRecoveryAuthorizationRequest {
+                        token: "recovery-child-token".into(),
+                        subject_kind: RecoverySubjectKind::DelegationTask,
+                        subject_id: task_id,
+                        correlation_id: format!("task-4-task-fence-{index}"),
+                        proposed_user_reason: None,
+                    },
+                )
+                .await;
+                assert_eq!(task_outcome["error"]["code"], expected_code);
+                assert_eq!(authorization_count(&fixture).await, 0);
+                assert!(fixture.questions.registered.lock().await.is_empty());
+
+                let workflow_outcome = finish_authorization_call(
+                    &fixture,
+                    BrokerRecoveryAuthorizationRequest {
+                        token: "recovery-root-token".into(),
+                        subject_kind: RecoverySubjectKind::Workflow,
+                        subject_id: workflow_id,
+                        correlation_id: format!("task-4-workflow-fence-{index}"),
+                        proposed_user_reason: None,
+                    },
+                )
+                .await;
+                assert_eq!(workflow_outcome["error"]["code"], expected_code);
+                assert_eq!(authorization_count(&fixture).await, 0);
+                assert!(fixture.questions.registered.lock().await.is_empty());
+            }
+
+            let standalone = recovery_fixture().await;
+            let task_id =
+                seed_confirmable_task(&standalone, standalone.parent_id, "standalone").await;
+            let outcome = finish_authorization_call(
+                &standalone,
+                BrokerRecoveryAuthorizationRequest {
+                    token: "recovery-child-token".into(),
+                    subject_kind: RecoverySubjectKind::DelegationTask,
+                    subject_id: task_id,
+                    correlation_id: "task-4-standalone".into(),
+                    proposed_user_reason: None,
+                },
+            )
+            .await;
+            assert_eq!(outcome["status"], "declined");
+            assert_eq!(authorization_count(&standalone).await, 1);
+            assert_eq!(standalone.questions.registered.lock().await.len(), 1);
         }
 
         #[test]

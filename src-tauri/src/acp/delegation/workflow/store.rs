@@ -6,8 +6,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -716,6 +716,7 @@ pub async fn guard_final_delivery_core(
     emitter: &EventEmitter,
     request: FinalDeliveryGuardRequest,
 ) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+    require_stored_v2_header(&db.conn, &request.workflow_id).await?;
     let parent_conversation_id =
         delegation_workflow::Entity::find_by_id(request.workflow_id.clone())
             .one(&db.conn)
@@ -753,35 +754,28 @@ pub async fn guard_current_final_delivery_core(
     parent_conversation_id: i32,
     workflow_id: Option<&str>,
 ) -> Result<Option<FinalDeliveryGuardResult>, WorkflowStoreError> {
-    let header = match workflow_id {
-        Some(workflow_id) => delegation_workflow::Entity::find_by_id(workflow_id)
-            .one(&db.conn)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.to_string()))?,
-        None => delegation_workflow::Entity::find()
-            .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
-            .filter(
-                delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-            )
-            .one(&db.conn)
-            .await
-            .map_err(db_err)?
+    let workflow_id = match workflow_id {
+        Some(workflow_id) => workflow_id.to_string(),
+        None => load_workflow_id_by_parent_kind(&db.conn, parent_conversation_id)
+            .await?
             .ok_or_else(|| {
                 WorkflowStoreError::NotFound(format!(
                     "parent={parent_conversation_id} kind={WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY}"
                 ))
             })?,
     };
+    require_owned_stored_v2_header(&db.conn, &workflow_id, parent_conversation_id).await?;
+    let header = delegation_workflow::Entity::find_by_id(&workflow_id)
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.clone()))?;
     if header.parent_conversation_id != parent_conversation_id {
         return Err(WorkflowStoreError::CrossParent {
             workflow_id: header.workflow_id,
             expected_parent: parent_conversation_id,
             actual_parent: header.parent_conversation_id,
         });
-    }
-    if header.completion_protocol_version != 2 {
-        return Ok(None);
     }
     let Some(request) = current_final_delivery_request(db, &header, None).await? else {
         return Ok(None);
@@ -806,14 +800,12 @@ pub async fn guard_task_final_delivery_core(
     else {
         return Ok(None);
     };
+    require_stored_v2_header(&db.conn, &binding.workflow_id).await?;
     let header = delegation_workflow::Entity::find_by_id(binding.workflow_id)
         .one(&db.conn)
         .await
         .map_err(db_err)?
         .ok_or_else(|| WorkflowStoreError::NotFound(task_id.to_string()))?;
-    if header.completion_protocol_version != 2 {
-        return Ok(None);
-    }
     let Some(request) = current_final_delivery_request(db, &header, Some(task_id)).await? else {
         return Ok(None);
     };
@@ -854,11 +846,12 @@ async fn current_final_delivery_request(
     // Align with selection-aware `guard_final_delivery_txn`: selected nodes
     // must cover the current review round, while retained unselected siblings
     // may keep earlier same-lineage rounds after roster-only add/remove.
-    let selected_node_ids =
-        match serde_json::from_str::<BTreeSet<String>>(&current_final_gate.selected_node_ids_json) {
-            Ok(ids) => ids,
-            Err(_) => return Ok(None),
-        };
+    let selected_node_ids = match serde_json::from_str::<BTreeSet<String>>(
+        &current_final_gate.selected_node_ids_json,
+    ) {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
     let required_reviewer_node_ids = required_final_reviewers
         .iter()
         .map(|node| node.id.clone())
@@ -866,18 +859,17 @@ async fn current_final_delivery_request(
     if !selected_node_ids.is_subset(&required_reviewer_node_ids) {
         return Ok(None);
     }
-    let binding_covers_current_selection =
-        |candidate: &delegation_workflow_run_binding::Model| {
-            candidate.gate_id.as_deref() == Some(current_final_gate.gate_id.as_str())
-                && candidate.gate_lineage.as_deref() == Some(current_final_gate.gate_lineage.as_str())
-                && if selected_node_ids.contains(&candidate.node_id) {
-                    candidate.review_round == Some(current_final_gate.current_review_round)
-                } else {
-                    candidate.review_round.is_some_and(|review_round| {
-                        review_round > 0 && review_round < current_final_gate.current_review_round
-                    })
-                }
-        };
+    let binding_covers_current_selection = |candidate: &delegation_workflow_run_binding::Model| {
+        candidate.gate_id.as_deref() == Some(current_final_gate.gate_id.as_str())
+            && candidate.gate_lineage.as_deref() == Some(current_final_gate.gate_lineage.as_str())
+            && if selected_node_ids.contains(&candidate.node_id) {
+                candidate.review_round == Some(current_final_gate.current_review_round)
+            } else {
+                candidate.review_round.is_some_and(|review_round| {
+                    review_round > 0 && review_round < current_final_gate.current_review_round
+                })
+            }
+    };
     let mut delivery_anchor = None;
     let mut preferred_selected_anchor = None;
     let mut required_task_anchor = None;
@@ -956,16 +948,16 @@ async fn guard_final_delivery_txn(
     txn: &DatabaseTransaction,
     request: FinalDeliveryGuardRequest,
 ) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+    require_stored_v2_header(txn, &request.workflow_id).await?;
     let header = delegation_workflow::Entity::find_by_id(request.workflow_id.clone())
         .one(txn)
         .await
         .map_err(db_err)?
         .ok_or_else(|| WorkflowStoreError::NotFound(request.workflow_id.clone()))?;
-    if header.completion_protocol_version != 2 {
-        return Err(WorkflowStoreError::GateNotReady(
-            "Final delivery artifact guard requires completion protocol v2".into(),
-        ));
-    }
+    require_v2_mutation(
+        header.completion_protocol_version,
+        &header.completion_protocol_mode,
+    )?;
     let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
         request.workflow_id.clone(),
         request.gate_id.clone(),
@@ -1331,16 +1323,23 @@ pub async fn recover_workflow_core(
     parent_conversation_id: i32,
     req: RecoverWorkflowRequest,
 ) -> Result<RecoverWorkflowResult, WorkflowStoreError> {
+    require_owned_stored_v2_header(&db.conn, &req.workflow_id, parent_conversation_id).await?;
     let rejection_req = req.clone();
     let result = db
         .conn
         .transaction::<_, RecoverWorkflowResult, WorkflowStoreError>(|txn| {
             Box::pin(async move {
+                require_owned_stored_v2_header(txn, &req.workflow_id, parent_conversation_id)
+                    .await?;
                 let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
                     .one(txn)
                     .await
                     .map_err(db_err)?
                     .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
+                require_v2_mutation(
+                    header.completion_protocol_version,
+                    &header.completion_protocol_mode,
+                )?;
 
                 if let Some(replay) =
                     load_committed_recovery_replay_txn(txn, &header, parent_conversation_id, &req)
@@ -2016,6 +2015,7 @@ pub async fn settle_workflow_gate_v2_core(
     parent_conversation_id: i32,
     req: SettleWorkflowV2Request,
 ) -> Result<SettleResult, WorkflowStoreError> {
+    require_owned_stored_v2_header(&db.conn, &req.workflow_id, parent_conversation_id).await?;
     let guard_header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
         .one(&db.conn)
         .await
@@ -2034,6 +2034,7 @@ pub async fn settle_workflow_gate_v2_core(
     )?;
     #[cfg(test)]
     honor_settle_v2_preflight_test_gate(&req.workflow_id).await;
+    require_owned_stored_v2_header(&db.conn, &req.workflow_id, parent_conversation_id).await?;
     if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
         return Err(WorkflowStoreError::SummaryTooLarge);
     }
@@ -2095,6 +2096,7 @@ pub async fn settle_workflow_gate_v2_core(
         }
     }
 
+    require_owned_stored_v2_header(&db.conn, &req.workflow_id, parent_conversation_id).await?;
     let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
         .one(&db.conn)
         .await
@@ -2254,6 +2256,14 @@ async fn settle_workflow_gate_derived_core(
             |txn| {
                 Box::pin(async move {
                     let mut req = req;
+                    if v2_expectation.is_some() {
+                        require_owned_stored_v2_header(
+                            txn,
+                            &req.workflow_id,
+                            parent_conversation_id,
+                        )
+                        .await?;
+                    }
                     let header = delegation_workflow::Entity::find_by_id(req.workflow_id.clone())
                         .one(txn)
                         .await
@@ -4892,6 +4902,113 @@ fn db_err(e: sea_orm::DbErr) -> WorkflowStoreError {
     WorkflowStoreError::Persistence(e.to_string())
 }
 
+fn map_completion_protocol_header_db_error(error: sea_orm::DbErr) -> WorkflowStoreError {
+    match error {
+        sea_orm::DbErr::Type(message) => {
+            WorkflowStoreError::UnsupportedCompletionProtocolHeader(message)
+        }
+        error @ sea_orm::DbErr::TryIntoErr { .. } => {
+            WorkflowStoreError::UnsupportedCompletionProtocolHeader(error.to_string())
+        }
+        other => WorkflowStoreError::Persistence(other.to_string()),
+    }
+}
+
+pub async fn load_completion_protocol_header<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+) -> Result<Option<(i64, delegation_workflow::CompletionProtocolMode)>, WorkflowStoreError> {
+    delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        .select_only()
+        .column(delegation_workflow::Column::CompletionProtocolVersion)
+        .column(delegation_workflow::Column::CompletionProtocolMode)
+        .into_tuple::<(i64, delegation_workflow::CompletionProtocolMode)>()
+        .one(conn)
+        .await
+        .map_err(map_completion_protocol_header_db_error)
+}
+
+async fn load_workflow_id_by_parent_kind<C: ConnectionTrait>(
+    conn: &C,
+    parent_conversation_id: i32,
+) -> Result<Option<String>, WorkflowStoreError> {
+    delegation_workflow::Entity::find()
+        .select_only()
+        .column(delegation_workflow::Column::WorkflowId)
+        .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
+        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
+        .into_tuple::<String>()
+        .one(conn)
+        .await
+        .map_err(db_err)
+}
+
+pub async fn load_completion_protocol_for_conversation(
+    db: &AppDatabase,
+    conversation_id: i32,
+) -> Result<Option<(i64, delegation_workflow::CompletionProtocolMode)>, WorkflowStoreError> {
+    if let Some(workflow_id) = load_workflow_id_by_parent_kind(&db.conn, conversation_id).await? {
+        return load_completion_protocol_header(&db.conn, &workflow_id).await;
+    }
+
+    let task_id = delegation_task_run::Entity::find()
+        .select_only()
+        .column(delegation_task_run::Column::TaskId)
+        .filter(delegation_task_run::Column::ChildConversationId.eq(conversation_id))
+        .order_by_desc(delegation_task_run::Column::CreatedAt)
+        .into_tuple::<String>()
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?;
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+    let workflow_id = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+        .select_only()
+        .column(delegation_workflow_run_binding::Column::WorkflowId)
+        .into_tuple::<String>()
+        .one(&db.conn)
+        .await
+        .map_err(db_err)?;
+    let Some(workflow_id) = workflow_id else {
+        return Ok(None);
+    };
+    load_completion_protocol_header(&db.conn, &workflow_id).await
+}
+
+async fn require_stored_v2_header<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    let (version, mode) = load_completion_protocol_header(conn, workflow_id)
+        .await?
+        .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.to_string()))?;
+    require_v2_mutation(version, &mode)
+}
+
+async fn require_owned_stored_v2_header<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    expected_parent: i32,
+) -> Result<(), WorkflowStoreError> {
+    let actual_parent = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        .select_only()
+        .column(delegation_workflow::Column::ParentConversationId)
+        .into_tuple::<i32>()
+        .one(conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.to_string()))?;
+    if actual_parent != expected_parent {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id: workflow_id.to_string(),
+            expected_parent,
+            actual_parent,
+        });
+    }
+    require_stored_v2_header(conn, workflow_id).await
+}
+
 async fn ensure_parent_exists(
     db: &AppDatabase,
     parent_conversation_id: i32,
@@ -4909,9 +5026,21 @@ async fn ensure_parent_exists(
 async fn load_by_publication_token_txn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     token: &str,
+    parent_conversation_id: i32,
 ) -> Result<Option<delegation_workflow::Model>, WorkflowStoreError> {
-    delegation_workflow::Entity::find()
+    let workflow_id = delegation_workflow::Entity::find()
+        .select_only()
+        .column(delegation_workflow::Column::WorkflowId)
         .filter(delegation_workflow::Column::PublicationToken.eq(token.to_string()))
+        .into_tuple::<String>()
+        .one(conn)
+        .await
+        .map_err(db_err)?;
+    let Some(workflow_id) = workflow_id else {
+        return Ok(None);
+    };
+    require_owned_stored_v2_header(conn, &workflow_id, parent_conversation_id).await?;
+    delegation_workflow::Entity::find_by_id(&workflow_id)
         .one(conn)
         .await
         .map_err(db_err)
@@ -4960,11 +5089,16 @@ pub async fn append_state_only_revision_txn(
     request: StateOnlyRevisionRequest<'_>,
     now: DateTime<Utc>,
 ) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+    require_stored_v2_header(txn, &header.workflow_id).await?;
     let current = delegation_workflow::Entity::find_by_id(header.workflow_id.clone())
         .one(txn)
         .await
         .map_err(db_err)?
         .ok_or_else(|| WorkflowStoreError::NotFound(header.workflow_id.clone()))?;
+    require_v2_mutation(
+        current.completion_protocol_version,
+        &current.completion_protocol_mode,
+    )?;
     if current.active_manifest_revision != header.active_manifest_revision {
         return Err(WorkflowStoreError::StaleManifestRevision {
             expected: header.active_manifest_revision as u64,
@@ -5155,12 +5289,9 @@ async fn publish_in_txn(
 ) -> Result<PublishResult, WorkflowStoreError> {
     // --- re-read by publication_token (inside write txn) -------------------
     if let Some(by_token) =
-        load_by_publication_token_txn(txn, &normalized.publication_token).await?
+        load_by_publication_token_txn(txn, &normalized.publication_token, parent_conversation_id)
+            .await?
     {
-        require_v2_mutation(
-            by_token.completion_protocol_version,
-            &by_token.completion_protocol_mode,
-        )?;
         if by_token.parent_conversation_id != parent_conversation_id {
             return Err(WorkflowStoreError::CrossParent {
                 workflow_id: by_token.workflow_id.clone(),
@@ -5168,6 +5299,10 @@ async fn publish_in_txn(
                 actual_parent: by_token.parent_conversation_id,
             });
         }
+        require_v2_mutation(
+            by_token.completion_protocol_version,
+            &by_token.completion_protocol_mode,
+        )?;
         let active_digest = load_active_manifest_digest_txn(
             txn,
             &by_token.workflow_id,
@@ -5820,7 +5955,8 @@ async fn insert_header_create_or_reclassify(
 
     // Double-check token immediately before insert (another writer may have landed).
     if let Some(by_token) =
-        load_by_publication_token_txn(txn, &normalized.publication_token).await?
+        load_by_publication_token_txn(txn, &normalized.publication_token, parent_conversation_id)
+            .await?
     {
         let _ = txn.execute_unprepared(&format!("RELEASE {SP}")).await;
         return Ok(Some(
@@ -5901,9 +6037,12 @@ async fn load_by_parent_kind_txn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     parent_conversation_id: i32,
 ) -> Result<Option<delegation_workflow::Model>, WorkflowStoreError> {
-    delegation_workflow::Entity::find()
-        .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
-        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
+    let workflow_id = load_workflow_id_by_parent_kind(conn, parent_conversation_id).await?;
+    let Some(workflow_id) = workflow_id else {
+        return Ok(None);
+    };
+    require_stored_v2_header(conn, &workflow_id).await?;
+    delegation_workflow::Entity::find_by_id(&workflow_id)
         .one(conn)
         .await
         .map_err(db_err)
@@ -5916,7 +6055,9 @@ async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
     document_digest: &str,
     parent_conversation_id: i32,
 ) -> Result<Option<PublishResult>, WorkflowStoreError> {
-    if let Some(by_token) = load_by_publication_token_txn(conn, token).await? {
+    if let Some(by_token) =
+        load_by_publication_token_txn(conn, token, parent_conversation_id).await?
+    {
         return Ok(Some(
             classify_existing_header(
                 conn,
@@ -5960,6 +6101,13 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     token: &str,
     document_digest: &str,
 ) -> Result<PublishResult, WorkflowStoreError> {
+    if header.parent_conversation_id != parent_conversation_id {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id: header.workflow_id,
+            expected_parent: parent_conversation_id,
+            actual_parent: header.parent_conversation_id,
+        });
+    }
     require_v2_mutation(
         header.completion_protocol_version,
         &header.completion_protocol_mode,
@@ -8396,6 +8544,44 @@ mod tests {
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::WebEventBroadcaster;
     use std::sync::Arc;
+
+    #[test]
+    fn header_db_error_classification() {
+        let permanent = [
+            sea_orm::DbErr::Type("invalid completion_protocol_mode".into()),
+            sea_orm::DbErr::TryIntoErr {
+                from: "String",
+                into: "CompletionProtocolMode",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unknown enum value",
+                )),
+            },
+        ];
+        for error in permanent {
+            let mapped = map_completion_protocol_header_db_error(error);
+            assert!(matches!(
+                mapped,
+                WorkflowStoreError::UnsupportedCompletionProtocolHeader(_)
+            ));
+            assert_eq!(mapped.code(), "unsupported_completion_protocol");
+            assert!(!mapped.is_retryable());
+        }
+
+        let infrastructure = [
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::ConnectionClosed),
+            sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal("closed connection".into())),
+            sea_orm::DbErr::Query(sea_orm::RuntimeErr::Internal("query failure".into())),
+            sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal("database is locked".into())),
+        ];
+        for error in infrastructure {
+            let mapped = map_completion_protocol_header_db_error(error);
+            assert!(matches!(mapped, WorkflowStoreError::Persistence(_)));
+            assert_eq!(mapped.code(), "workflow_persistence_failure");
+            assert!(mapped.is_retryable());
+        }
+    }
 
     fn emitter_with_rx() -> (
         EventEmitter,
@@ -18284,12 +18470,12 @@ mod tests {
                     .unwrap_err(),
                 WorkflowStoreError::WorkflowRecoveryConflict
             );
-            assert_eq!(
+            assert!(matches!(
                 recover_workflow_core(&db, &emitter, parent + 1, request.clone())
                     .await
                     .unwrap_err(),
-                WorkflowStoreError::WorkflowRecoveryConflict
-            );
+                WorkflowStoreError::CrossParent { .. }
+            ));
             let mut changed = request.clone();
             changed.recovery_authorization_id = "different-authorization".into();
             assert_eq!(
