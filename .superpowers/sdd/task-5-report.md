@@ -109,3 +109,88 @@ done
 <!-- codeg-card-summary-v1
 {"kind":"implementation","phase":"implementation","status":"done","summary":"Enforced exact-v2 workflow admission and immutable MCP bindings, then moved workflow terminal handling onto a typed fail-closed host surface with permanent protocol failures outside the persistence retry rail while preserving standalone Card behavior and all v2 semantic inputs.","commits":[{"sha":"d145b2c2b7a1811d4c11905935227625e0849e44","subject":"fix: fail closed on workflow terminal protocol errors"}],"tests":{"status":"passed","passed":35,"failed":0,"summary":"The 34-test completion_protocol_v2 target and one pending-terminal-retry library regression passed, followed by cargo check, strict all-target Clippy, scoped rustfmt, and working/cached diff checks."},"concerns":["The local build continues to emit the existing zero-byte codeg-mcp sidecar packaging warning; it is outside this producer diff.","Independent Codex and Grok review is pending before Task 6."],"report_file":".superpowers/sdd/task-5-report.md"}
 -->
+
+## Fix Round 1
+
+Both independent reviewers requested changes on producer `d145b2c2`. Fix round
+1 closes all three Important findings and the requested cheap matrix gaps in a
+new producer commit:
+
+- `T5-CODEX-I1`: added typed database availability classification before
+  stringification. SeaORM connection-acquire timeout/closed, SQLx pool
+  timeout/closed, closed-connection, and SQLite busy/locked errors stay on the
+  transient rail. Retryable workflow-header `Persistence` stays transient;
+  permanent query failures and corrupt/unknown header decoding remain
+  permanent typed failures.
+- `T5-CODEX-I2`: terminal publication now derives its conversation status from
+  the persisted winning report. If the in-transaction protocol recheck changes
+  a producer completion into `Failed`, durable run/conversation state, waiter
+  report, `ConversationStatusChanged`, and the terminal event all publish the
+  same `Failed` / `Cancelled` disposition and stable code.
+- `T5-CODEX-I3` / `T5-GROK-I1`: the pre-spawn MCP binding loader now returns
+  structured `TaskStoreError` through `RunStore` and
+  `WorkflowLaunchLoadError`, preserving protocol codes and transient versus
+  permanent persistence classification. First-dispatch and replacement
+  protocol races retain a durable failed row; generic binding failures keep
+  the existing provisional compensation behavior. Protocol failure settlement
+  skips workflow semantic side effects.
+- `T5-CODEX-M1` / `T5-GROK-M1`: added all five rejected protocol pairs through
+  first, continue, and replacement launch paths, plus permanent terminal host
+  parity for all five pairs, unknown version, and corrupt mode.
+- `T5-GROK-M2`: added transient terminal lookup followed by successful exact-v2
+  semantic settlement with no Card authority.
+- `T5-GROK-M4`: added dangling replacement rejection before process spawn in
+  addition to the post-admission dangling replacement race.
+
+No Task 6 restart tool, route, schema, API, transport, or UI removal was made.
+
+### Fix-Round TDD Evidence
+
+RED was observed before each production fix:
+
+- Connection availability failed the new mapper regression as a permanent
+  error.
+- The gated terminal CAS race persisted `Failed` / `Cancelled` but emitted
+  stale `PendingReview` through `ConversationStatusChanged`.
+- Gated pre-spawn races returned `spawn_failed` for first dispatch,
+  `admission_failed` for continuation, and cleanup-induced
+  `workflow_not_found` for dangling replacement instead of the stable protocol
+  codes.
+
+GREEN was then observed for typed pool/connection classification, the
+transaction-authoritative status race, and all three pre-spawn protocol races.
+An initial unknown-version matrix fixture hit SQLite's protocol-version check
+constraint before terminal processing; the fixture was corrected to use the
+same explicit check-constraint bypass as the established corrupt-header tests.
+
+### Fix-Round Verification
+
+- Full `completion_protocol_v2` integration target: 34 passed, 0 failed.
+- `terminal_protocol` library filter: 6 passed, 0 failed.
+- Committed exact-v2 `workflow_binding` filter: 2 passed, 0 failed.
+- First/continue/replacement `pre_spawn_protocol_race` filter: 3 passed,
+  0 failed.
+- Five-pair `workflow_launch` variant filter: 2 passed, 0 failed.
+- Dangling header/admission/binding filter: 5 passed, 0 failed.
+- Transient retry filter: 7 passed, 0 failed.
+- `pending_terminal_retry`: 1 passed, 0 failed.
+- Generic first/continue binding-failure compatibility, direct dangling MCP
+  binding, and structured launch-error mapping regressions passed.
+- `cargo check`: passed.
+- Strict all-target Clippy with `-D warnings`: passed.
+- Scoped Rustfmt and working/cached diff checks: passed.
+
+The focused library filter counts overlap. Fix round 1 added nine distinct
+regressions. Cargo continued to emit only the existing ignored zero-byte
+`codeg-mcp` sidecar packaging warning.
+
+### Fix-Round Producer Commit
+
+- `0239f462bf33c922cefe4fbe172f881f38479aaa` -
+  `fix: close terminal protocol fail-closed gaps`
+
+Independent Codex and Grok re-review is pending before Task 6.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done","summary":"Closed Task 5 review gaps by preserving typed connection-availability retry, publishing transaction-authoritative terminal status, and carrying stable protocol codes through first/continue/replacement pre-spawn MCP binding races; completed the requested launch, terminal, transient-success, and dangling-replacement matrices.","commits":[{"sha":"0239f462bf33c922cefe4fbe172f881f38479aaa","subject":"fix: close terminal protocol fail-closed gaps"}],"tests":{"status":"passed","passed":43,"failed":0,"summary":"The 34-test completion_protocol_v2 target and nine new fix regressions passed; terminal, binding, launch, dangling, transient, pending-retry, compatibility, cargo check, strict Clippy, Rustfmt, and diff gates were also green."},"concerns":["The existing zero-byte codeg-mcp sidecar packaging warning remains outside this diff.","Independent Codex and Grok re-review is pending before Task 6."],"report_file":".superpowers/sdd/task-5-report.md"}
+-->
