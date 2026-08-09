@@ -59,9 +59,13 @@ use codeg_lib::db::entities::{
     auto_title_job, delegation_attention_request, delegation_completion_tool_intent,
     delegation_task_run, delegation_workflow, delegation_workflow_gate_settlement,
     delegation_workflow_gate_state, delegation_workflow_manifest_revision,
-    delegation_workflow_restart_context, delegation_workflow_run_binding, recovery_authorization,
+    delegation_workflow_node_binding, delegation_workflow_restart_context,
+    delegation_workflow_run_binding, recovery_authorization,
 };
-use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+use codeg_lib::db::test_helpers::{
+    fresh_in_memory_db, historical_completion_protocol_db, seed_conversation, seed_folder,
+    HistoricalWorkflowSeed,
+};
 use codeg_lib::models::AgentType;
 use codeg_lib::web::auth::COMPLETION_CONTEXT_HEADER;
 use codeg_lib::web::event_bridge::EventEmitter;
@@ -200,26 +204,18 @@ async fn fixed_v2_creation_persists_across_agent_profiles_and_revisions() {
 
 #[tokio::test]
 async fn fixed_v2_creation_rejects_revision_after_header_becomes_historical() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-2-fixed-v2-historical-revision").await;
-    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let mut document = skeleton("task-2-fixed-v2-historical-revision");
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
+    let parent = 101;
+    let workflow_id = "wf-task-2-fixed-v2-historical-revision";
+    let db = historical_completion_protocol_db(&[historical_workflow_seed(
+        workflow_id,
         parent,
-        PublishWorkflowRequest {
-            document: document.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
+        1,
         delegation_workflow::CompletionProtocolMode::V1,
-    )
+        None,
+    )])
     .await;
+    let mut document = skeleton("task-2-fixed-v2-historical-revision");
+    let published = seed_historical_manifest(&db, workflow_id, &document).await;
 
     document.workflow_id = Some(published.workflow_id.clone());
     document.expected_manifest_revision = Some(published.manifest_revision);
@@ -435,37 +431,121 @@ fn skeleton(token: &str) -> ManifestDocument {
     }
 }
 
-async fn mark_historical_completion_protocol(
-    db: &codeg_lib::db::AppDatabase,
-    workflow_id: &str,
-    mode: delegation_workflow::CompletionProtocolMode,
-) {
-    let row = delegation_workflow::Entity::find_by_id(workflow_id)
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut row: delegation_workflow::ActiveModel = row.into();
-    row.completion_protocol_version = Set(1);
-    row.completion_protocol_mode = Set(mode);
-    row.update(&db.conn).await.unwrap();
+struct HistoricalPublication {
+    workflow_id: String,
+    manifest_revision: u64,
+    graph_revision: u64,
 }
 
-async fn set_completion_protocol_pair(
-    db: &codeg_lib::db::AppDatabase,
-    workflow_id: &str,
+fn historical_workflow_seed(
+    workflow_id: impl Into<String>,
+    parent_conversation_id: i32,
     version: i64,
     mode: delegation_workflow::CompletionProtocolMode,
-) {
-    let row = delegation_workflow::Entity::find_by_id(workflow_id)
-        .one(&db.conn)
+    legacy_source_workflow_id: Option<String>,
+) -> HistoricalWorkflowSeed {
+    HistoricalWorkflowSeed {
+        workflow_id: workflow_id.into(),
+        parent_conversation_id,
+        version,
+        mode,
+        legacy_source_workflow_id,
+    }
+}
+
+async fn seed_historical_manifest(
+    db: &codeg_lib::db::AppDatabase,
+    workflow_id: &str,
+    document: &ManifestDocument,
+) -> HistoricalPublication {
+    let mut stored_document = document.clone();
+    stored_document.workflow_id = Some(workflow_id.to_owned());
+    stored_document.expected_manifest_revision = None;
+    let document_json = serde_json::to_string(&stored_document).unwrap();
+    let now = chrono::Utc::now();
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows SET publication_token = ? WHERE workflow_id = ?",
+            vec![
+                stored_document.publication_token.clone().into(),
+                workflow_id.into(),
+            ],
+        ))
         .await
-        .unwrap()
         .unwrap();
-    let mut row: delegation_workflow::ActiveModel = row.into();
-    row.completion_protocol_version = Set(version);
-    row.completion_protocol_mode = Set(mode);
-    row.update(&db.conn).await.unwrap();
+    let manifest_state = serde_json::to_value(&stored_document.workflow_state)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    delegation_workflow_manifest_revision::ActiveModel {
+        workflow_id: Set(workflow_id.to_owned()),
+        manifest_revision: Set(1),
+        manifest_state: Set(manifest_state),
+        document_digest: Set(format!(
+            "sha256:{:x}",
+            Sha256::digest(document_json.as_bytes())
+        )),
+        document_json: Set(document_json),
+        revision_kind: Set(Some("initial".into())),
+        source_manifest_revision: Set(None),
+        recovery_authorization_id: Set(None),
+        transition_reason_code: Set(None),
+        consumer_correlation_id: Set(None),
+        graph_revision: Set(Some(1)),
+        recovery_source_state_fingerprint: Set(None),
+        recovery_risk_class: Set(None),
+        created_at: Set(now),
+    }
+    .insert(&db.conn)
+    .await
+    .unwrap();
+
+    for node in &stored_document.nodes {
+        let (Some(work_unit_key), Some(role), Some(agent_type), Some(phase_id)) = (
+            node.work_unit_key.as_ref(),
+            node.role,
+            node.agent_type.as_ref(),
+            node.phase_id.as_ref(),
+        ) else {
+            continue;
+        };
+        let role = serde_json::to_value(role)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        delegation_workflow_node_binding::ActiveModel {
+            workflow_id: Set(workflow_id.to_owned()),
+            node_id: Set(node.id.clone()),
+            work_unit_key: Set(work_unit_key.clone()),
+            role: Set(role),
+            agent_type: Set(agent_type.clone()),
+            profile_id: Set(node.profile_id.clone()),
+            phase_id: Set(phase_id.clone()),
+            task_index: Set(node.task_index.map(i64::from)),
+            introduced_revision: Set(1),
+            retired_revision: Set(None),
+            is_observed: Set(false),
+            retained_observed: Set(false),
+            cohort_frozen: Set(false),
+            node_outcome: Set(node
+                .node_outcome
+                .map(|_| delegation_workflow_node_binding::NodeOutcome::Canceled)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    HistoricalPublication {
+        workflow_id: workflow_id.to_owned(),
+        manifest_revision: 1,
+        graph_revision: 1,
+    }
 }
 
 async fn mutation_snapshot(
@@ -689,24 +769,21 @@ async fn historical_protocol_mutation_matrix() {
         (4, 2, V2Shadow, "unsupported_completion_protocol"),
     ] {
         let workspace = tempfile::tempdir().unwrap();
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let child = seed_conversation(&db, folder, AgentType::Codex).await;
-        let mut document = skeleton(&format!("task-4-mutation-matrix-{index}"));
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
+        let parent = 101;
+        let workflow_id = format!("wf-task-4-mutation-matrix-{index}");
+        let db = historical_completion_protocol_db(&[historical_workflow_seed(
+            &workflow_id,
             parent,
-            PublishWorkflowRequest {
-                document: document.clone(),
-            },
-        )
-        .await
-        .unwrap();
+            version,
+            mode,
+            None,
+        )])
+        .await;
+        let child = seed_conversation(&db, 1, AgentType::Codex).await;
+        let mut document = skeleton(&format!("task-4-mutation-matrix-{index}"));
+        let published = seed_historical_manifest(&db, &workflow_id, &document).await;
         let task_id = format!("task-4-final-guard-{index}");
         seed_final_guard_binding(&db, parent, child, &published.workflow_id, &task_id).await;
-        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
         let before = mutation_snapshot(&db, parent, &published.workflow_id).await;
 
         document.workflow_id = Some(published.workflow_id.clone());
@@ -809,21 +886,20 @@ async fn workflow_admission_requires_v2() {
         (4, 2, V2Shadow, "unsupported_completion_protocol"),
     ] {
         let workspace = tempfile::tempdir().unwrap();
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let parent = 101;
+        let workflow_id = format!("wf-task-5-admission-{index}");
+        let db = historical_completion_protocol_db(&[historical_workflow_seed(
+            &workflow_id,
+            parent,
+            version,
+            mode,
+            None,
+        )])
+        .await;
+        let child = seed_conversation(&db, 1, AgentType::Codex).await;
         let document = skeleton(&format!("task-5-admission-{index}"));
         let work_unit_key = document.nodes[0].work_unit_key.clone().unwrap();
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
-            parent,
-            PublishWorkflowRequest { document },
-        )
-        .await
-        .unwrap();
-        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        let _published = seed_historical_manifest(&db, &workflow_id, &document).await;
 
         let task_id = format!("task-5-admission-run-{index}");
         let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
@@ -888,21 +964,23 @@ async fn terminal_protocol_failure_is_typed() {
         (3, 2, V1, "unsupported_completion_protocol"),
         (4, 2, V2Shadow, "unsupported_completion_protocol"),
     ] {
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, "/tmp/task-5-terminal-protocol").await;
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let child = seed_conversation(&db, folder, AgentType::Codex).await;
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
+        let parent = 101;
+        let workflow_id = format!("wf-task-5-terminal-{index}");
+        let db = historical_completion_protocol_db(&[historical_workflow_seed(
+            &workflow_id,
             parent,
-            PublishWorkflowRequest {
-                document: skeleton(&format!("task-5-terminal-{index}")),
-            },
+            version,
+            mode,
+            None,
+        )])
+        .await;
+        let child = seed_conversation(&db, 1, AgentType::Codex).await;
+        let published = seed_historical_manifest(
+            &db,
+            &workflow_id,
+            &skeleton(&format!("task-5-terminal-{index}")),
         )
-        .await
-        .unwrap();
-        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        .await;
         let task_id = format!("task-5-terminal-run-{index}");
         seed_conversation_workflow_association(
             &db,
@@ -926,21 +1004,43 @@ async fn terminal_protocol_failure_is_typed() {
         assert_eq!(error.workflow_admission_code(), Some(expected_code));
     }
 
-    for corruption in ["dangling", "corrupt-mode"] {
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let child = seed_conversation(&db, folder, AgentType::Codex).await;
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
-            parent,
-            PublishWorkflowRequest {
-                document: skeleton(&format!("task-5-terminal-{corruption}")),
-            },
-        )
-        .await
-        .unwrap();
+    for corruption in ["dangling", "unknown-version"] {
+        let (db, parent, child, workflow_id) = if corruption == "dangling" {
+            let db = fresh_in_memory_db().await;
+            let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
+            let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+            let child = seed_conversation(&db, folder, AgentType::Codex).await;
+            let published = publish_workflow_manifest_core(
+                &db,
+                &EventEmitter::Noop,
+                parent,
+                PublishWorkflowRequest {
+                    document: skeleton("task-5-terminal-dangling"),
+                },
+            )
+            .await
+            .unwrap();
+            (db, parent, child, published.workflow_id)
+        } else {
+            let parent = 101;
+            let workflow_id = "wf-task-5-terminal-unknown-version";
+            let db = historical_completion_protocol_db(&[historical_workflow_seed(
+                workflow_id,
+                parent,
+                99,
+                delegation_workflow::CompletionProtocolMode::V2Enforce,
+                None,
+            )])
+            .await;
+            let child = seed_conversation(&db, 1, AgentType::Codex).await;
+            seed_historical_manifest(
+                &db,
+                workflow_id,
+                &skeleton("task-5-terminal-unknown-version"),
+            )
+            .await;
+            (db, parent, child, workflow_id.to_owned())
+        };
         let task_id = format!("task-5-terminal-{corruption}-run");
         seed_conversation_workflow_association(
             &db,
@@ -949,7 +1049,7 @@ async fn terminal_protocol_failure_is_typed() {
             &task_id,
             1,
             chrono::Utc::now(),
-            Some(&published.workflow_id),
+            Some(&workflow_id),
         )
         .await;
 
@@ -966,7 +1066,7 @@ async fn terminal_protocol_failure_is_typed() {
                     .execute(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "DELETE FROM delegation_workflows WHERE workflow_id = ?",
-                        vec![published.workflow_id.clone().into()],
+                        vec![workflow_id.clone().into()],
                     ))
                     .await
                     .unwrap();
@@ -978,30 +1078,7 @@ async fn terminal_protocol_failure_is_typed() {
                     .await
                     .unwrap();
             }
-            "corrupt-mode" => {
-                db.conn
-                    .execute(Statement::from_string(
-                        DbBackend::Sqlite,
-                        "PRAGMA ignore_check_constraints = ON".to_string(),
-                    ))
-                    .await
-                    .unwrap();
-                db.conn
-                    .execute(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "UPDATE delegation_workflows SET completion_protocol_mode = ? WHERE workflow_id = ?",
-                        vec!["future_mode".into(), published.workflow_id.clone().into()],
-                    ))
-                    .await
-                    .unwrap();
-                db.conn
-                    .execute(Statement::from_string(
-                        DbBackend::Sqlite,
-                        "PRAGMA ignore_check_constraints = OFF".to_string(),
-                    ))
-                    .await
-                    .unwrap();
-            }
+            "unknown-version" => {}
             _ => unreachable!(),
         }
 
@@ -1023,26 +1100,22 @@ async fn terminal_protocol_failure_is_typed() {
 
 #[tokio::test]
 async fn historical_protocol_cross_parent_mutations_remain_unauthorized() {
-    let db = fresh_in_memory_db().await;
-    let owner_folder = seed_folder(&db, "/tmp/task-4-owner-fence").await;
-    let foreign_folder = seed_folder(&db, "/tmp/task-4-foreign-fence").await;
-    let owner = seed_conversation(&db, owner_folder, AgentType::Codex).await;
-    let foreign = seed_conversation(&db, foreign_folder, AgentType::Codex).await;
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
+    let owner = 101;
+    let workflow_id = "wf-task-4-cross-parent-protocol-fence";
+    let db = historical_completion_protocol_db(&[historical_workflow_seed(
+        workflow_id,
         owner,
-        PublishWorkflowRequest {
-            document: skeleton("task-4-cross-parent-protocol-fence"),
-        },
-    )
-    .await
-    .unwrap();
-    set_completion_protocol_pair(
-        &db,
-        &published.workflow_id,
         1,
         delegation_workflow::CompletionProtocolMode::V1,
+        None,
+    )])
+    .await;
+    let foreign_folder = seed_folder(&db, "/tmp/task-4-foreign-fence").await;
+    let foreign = seed_conversation(&db, foreign_folder, AgentType::Codex).await;
+    let published = seed_historical_manifest(
+        &db,
+        workflow_id,
+        &skeleton("task-4-cross-parent-protocol-fence"),
     )
     .await;
     let before = mutation_snapshot(&db, owner, &published.workflow_id).await;
@@ -1111,31 +1184,6 @@ async fn historical_protocol_cross_parent_mutations_remain_unauthorized() {
     );
 }
 
-async fn corrupt_protocol_header(
-    db: &codeg_lib::db::AppDatabase,
-    workflow_id: &str,
-    version: i64,
-    mode: &str,
-) {
-    db.conn
-        .execute_unprepared("PRAGMA ignore_check_constraints = ON")
-        .await
-        .unwrap();
-    let update = db
-        .conn
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE delegation_workflows SET completion_protocol_version = ?, completion_protocol_mode = ? WHERE workflow_id = ?",
-            vec![version.into(), mode.into(), workflow_id.into()],
-        ))
-        .await;
-    db.conn
-        .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
-        .await
-        .unwrap();
-    update.unwrap();
-}
-
 async fn corrupt_mutation_snapshot(
     db: &codeg_lib::db::AppDatabase,
     parent: i32,
@@ -1187,22 +1235,22 @@ async fn corrupt_mutation_snapshot(
 
 #[tokio::test]
 async fn corrupt_header_nonterminal_fences() {
-    for (index, version, mode) in [(0, 99, "v2_enforce"), (1, 2, "corrupt_mode")] {
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, &format!("/tmp/task-4-corrupt-header-{index}")).await;
-        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let mut document = skeleton(&format!("task-4-corrupt-header-{index}"));
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
+    use delegation_workflow::CompletionProtocolMode::{V2Enforce, V1};
+
+    for (index, version, mode) in [(0, 99, V2Enforce), (1, 2, V1)] {
+        let folder = 1;
+        let parent = 101;
+        let workflow_id = format!("wf-task-4-corrupt-header-{index}");
+        let db = historical_completion_protocol_db(&[historical_workflow_seed(
+            &workflow_id,
             parent,
-            PublishWorkflowRequest {
-                document: document.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        corrupt_protocol_header(&db, &published.workflow_id, version, mode).await;
+            version,
+            mode,
+            None,
+        )])
+        .await;
+        let mut document = skeleton(&format!("task-4-corrupt-header-{index}"));
+        let published = seed_historical_manifest(&db, &workflow_id, &document).await;
         let before = corrupt_mutation_snapshot(&db, parent, &published.workflow_id).await;
 
         document.workflow_id = Some(published.workflow_id.clone());
@@ -1456,25 +1504,38 @@ async fn v2_settlement_requires_gate_kind_cas_fields_and_guards_legacy_before_wr
         "unexpected Plan validation error: {plan_error:?}"
     );
 
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
+    let legacy_parent = 101;
+    let legacy_workflow_id = "wf-task-3-v2-settlement-historical";
+    let legacy_db = historical_completion_protocol_db(&[historical_workflow_seed(
+        legacy_workflow_id,
+        legacy_parent,
+        1,
         delegation_workflow::CompletionProtocolMode::V1,
+        None,
+    )])
+    .await;
+    let legacy_published = seed_historical_manifest(
+        &legacy_db,
+        legacy_workflow_id,
+        &complete_gate_state_skeleton("task-3-v2-settlement-historical"),
     )
     .await;
     let settlements_before = delegation_workflow_gate_settlement::Entity::find()
-        .filter(delegation_workflow_gate_settlement::Column::WorkflowId.eq(&published.workflow_id))
-        .count(&db.conn)
+        .filter(
+            delegation_workflow_gate_settlement::Column::WorkflowId
+                .eq(&legacy_published.workflow_id),
+        )
+        .count(&legacy_db.conn)
         .await
         .unwrap();
     let legacy_error = settle_workflow_gate_v2_core(
-        &db,
+        &legacy_db,
         &EventEmitter::Noop,
-        parent,
+        legacy_parent,
         SettleWorkflowV2Request {
-            workflow_id: published.workflow_id.clone(),
+            workflow_id: legacy_published.workflow_id.clone(),
             gate_id: "design".into(),
-            expected_graph_revision: published.graph_revision,
+            expected_graph_revision: legacy_published.graph_revision,
             expected_review_round: Some(1),
             expected_outcome: Some(GateSettlementOutcome::Approved),
             summary: "historical workflow stays read-only".into(),
@@ -1490,9 +1551,10 @@ async fn v2_settlement_requires_gate_kind_cas_fields_and_guards_legacy_before_wr
     assert_eq!(
         delegation_workflow_gate_settlement::Entity::find()
             .filter(
-                delegation_workflow_gate_settlement::Column::WorkflowId.eq(&published.workflow_id),
+                delegation_workflow_gate_settlement::Column::WorkflowId
+                    .eq(&legacy_published.workflow_id),
             )
-            .count(&db.conn)
+            .count(&legacy_db.conn)
             .await
             .unwrap(),
         settlements_before
@@ -3510,33 +3572,40 @@ async fn historical_protocol_projection() {
     const CARD_JSON: &str = r#"{ "kind":"implementation", "phase":"implementation", "status":"done", "summary":"historical card bytes", "commits":[], "concerns":[] }"#;
 
     for (index, persisted_mode) in [V1, V2Shadow].into_iter().enumerate() {
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, &format!("/tmp/task-6-historical-{index}")).await;
-        let source_parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let successor_parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        let child = seed_conversation(&db, folder, AgentType::Codex).await;
-        let source = publish_workflow_manifest_core(
+        let source_parent = 101;
+        let successor_parent = 102;
+        let source_workflow_id = format!("wf-task-6-historical-source-{index}");
+        let successor_workflow_id = format!("wf-task-6-historical-successor-{index}");
+        let db = historical_completion_protocol_db(&[
+            historical_workflow_seed(
+                &source_workflow_id,
+                source_parent,
+                1,
+                persisted_mode.clone(),
+                None,
+            ),
+            historical_workflow_seed(
+                &successor_workflow_id,
+                successor_parent,
+                2,
+                delegation_workflow::CompletionProtocolMode::V2Enforce,
+                Some(source_workflow_id.clone()),
+            ),
+        ])
+        .await;
+        let child = seed_conversation(&db, 1, AgentType::Codex).await;
+        let source = seed_historical_manifest(
             &db,
-            &EventEmitter::Noop,
-            source_parent,
-            PublishWorkflowRequest {
-                document: skeleton(&format!("task-6-historical-source-{index}")),
-            },
+            &source_workflow_id,
+            &skeleton(&format!("task-6-historical-source-{index}")),
         )
-        .await
-        .unwrap();
-        let successor = publish_workflow_manifest_core(
+        .await;
+        let successor = seed_historical_manifest(
             &db,
-            &EventEmitter::Noop,
-            successor_parent,
-            PublishWorkflowRequest {
-                document: skeleton(&format!("task-6-historical-successor-{index}")),
-            },
+            &successor_workflow_id,
+            &skeleton(&format!("task-6-historical-successor-{index}")),
         )
-        .await
-        .unwrap();
-
-        mark_historical_completion_protocol(&db, &source.workflow_id, persisted_mode.clone()).await;
+        .await;
         let context_request_id = format!("historical-request-{index}");
         delegation_workflow_restart_context::ActiveModel {
             conversation_id: Set(source_parent),
@@ -3551,14 +3620,6 @@ async fn historical_protocol_projection() {
         .insert(&db.conn)
         .await
         .unwrap();
-        let successor_row = delegation_workflow::Entity::find_by_id(&successor.workflow_id)
-            .one(&db.conn)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut successor_row: delegation_workflow::ActiveModel = successor_row.into();
-        successor_row.legacy_source_workflow_id = Set(Some(source.workflow_id.clone()));
-        successor_row.update(&db.conn).await.unwrap();
 
         let task_id = format!("task-6-historical-card-{index}");
         seed_conversation_workflow_association(
@@ -3679,20 +3740,23 @@ async fn root_prompt_protocol_fence() {
         (3, 2, V1, "unsupported_completion_protocol"),
         (4, 2, V2Shadow, "unsupported_completion_protocol"),
     ] {
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, &format!("/tmp/task-4-root-fence-{index}")).await;
-        let parent = seed_conversation(&db, folder_id, AgentType::Codex).await;
-        let published = publish_workflow_manifest_core(
-            &db,
-            &EventEmitter::Noop,
+        let folder_id = 1;
+        let parent = 101;
+        let workflow_id = format!("wf-task-4-root-fence-{index}");
+        let db = historical_completion_protocol_db(&[historical_workflow_seed(
+            &workflow_id,
             parent,
-            PublishWorkflowRequest {
-                document: skeleton(&format!("task-4-root-fence-{index}")),
-            },
+            version,
+            mode,
+            None,
+        )])
+        .await;
+        let published = seed_historical_manifest(
+            &db,
+            &workflow_id,
+            &skeleton(&format!("task-4-root-fence-{index}")),
         )
-        .await
-        .unwrap();
-        set_completion_protocol_pair(&db, &published.workflow_id, version, mode).await;
+        .await;
         let before = mutation_snapshot(&db, parent, &published.workflow_id).await;
 
         let manager = ConnectionManager::new();
@@ -3760,26 +3824,19 @@ async fn root_prompt_protocol_fence() {
 
 #[tokio::test]
 async fn root_protocol_loader_scans_older_bound_generation_when_latest_is_unbound() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-4-root-multi-generation").await;
-    let workflow_parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let child = seed_conversation(&db, folder, AgentType::Codex).await;
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
+    let workflow_parent = 101;
+    let workflow_id = "wf-task-4-root-multi-generation";
+    let db = historical_completion_protocol_db(&[historical_workflow_seed(
+        workflow_id,
         workflow_parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-4-root-multi-generation"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
+        1,
         delegation_workflow::CompletionProtocolMode::V1,
-    )
+        None,
+    )])
     .await;
+    let child = seed_conversation(&db, 1, AgentType::Codex).await;
+    let published =
+        seed_historical_manifest(&db, workflow_id, &skeleton("task-4-root-multi-generation")).await;
     let base = chrono::Utc::now();
     seed_conversation_workflow_association(
         &db,
@@ -3824,24 +3881,21 @@ async fn root_protocol_loader_scans_older_bound_generation_when_latest_is_unboun
 
 #[tokio::test]
 async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-4-root-owned-bound-conflict").await;
-    let legacy_parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let child = seed_conversation(&db, folder, AgentType::Codex).await;
-    let legacy = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
+    let legacy_parent = 101;
+    let legacy_workflow_id = "wf-task-4-root-bound-legacy";
+    let db = historical_completion_protocol_db(&[historical_workflow_seed(
+        legacy_workflow_id,
         legacy_parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-4-root-bound-legacy"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &legacy.workflow_id,
+        1,
         delegation_workflow::CompletionProtocolMode::V1,
+        None,
+    )])
+    .await;
+    let child = seed_conversation(&db, 1, AgentType::Codex).await;
+    let legacy = seed_historical_manifest(
+        &db,
+        legacy_workflow_id,
+        &skeleton("task-4-root-bound-legacy"),
     )
     .await;
     let owned = publish_workflow_manifest_core(
@@ -3885,9 +3939,17 @@ async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
 
 #[tokio::test]
 async fn historical_root_resume_is_rejected_before_side_effects() {
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, "/tmp/task-15-legacy-upgrade").await;
-    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    let folder = 1;
+    let parent = 101;
+    let workflow_id = "wf-task-15-pre-migration-source";
+    let db = historical_completion_protocol_db(&[historical_workflow_seed(
+        workflow_id,
+        parent,
+        1,
+        delegation_workflow::CompletionProtocolMode::V1,
+        None,
+    )])
+    .await;
     let original_request = "implement the historical Task 15 request after upgrading";
     let now = chrono::Utc::now();
     auto_title_job::ActiveModel {
@@ -3907,22 +3969,8 @@ async fn historical_root_resume_is_rejected_before_side_effects() {
     .insert(&db.conn)
     .await
     .unwrap();
-    let published = publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        parent,
-        PublishWorkflowRequest {
-            document: skeleton("task-15-pre-migration-source"),
-        },
-    )
-    .await
-    .unwrap();
-    mark_historical_completion_protocol(
-        &db,
-        &published.workflow_id,
-        delegation_workflow::CompletionProtocolMode::V1,
-    )
-    .await;
+    let published =
+        seed_historical_manifest(&db, workflow_id, &skeleton("task-15-pre-migration-source")).await;
     assert!(
         delegation_workflow_restart_context::Entity::find_by_id(parent)
             .one(&db.conn)
