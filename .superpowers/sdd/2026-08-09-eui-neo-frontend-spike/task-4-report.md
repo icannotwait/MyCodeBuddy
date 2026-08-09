@@ -137,3 +137,43 @@ swap. This is a verification limitation, not a known Task 4 behavior defect.
 <!-- codeg-card-summary-v1
 {"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Added the Grok/Codex settings facade and asynchronous get/set/probe bridge workers over existing ACP persistence and preflight helpers.","commits":[{"subject":"feat(eui): expose Grok and Codex settings facade"}],"tests":{"status":"partial","passed":14,"failed":0,"summary":"11 actual-source shape-compatible Rust probes and 3 contracts-only CTest cases pass; full Cargo tests were skipped by parent instruction and dependency-complete codeg checking was host-SIGKILLed."},"concerns":["Dependency-complete settings_contract and shared-codeg verification require more than the available 3.8 GiB memory or usable swap."],"report_file":".superpowers/sdd/2026-08-09-eui-neo-frontend-spike/task-4-report.md"}
 -->
+
+## High-Gate Fix Round 1/5
+
+Status: DONE_WITH_CONCERNS
+
+The two independent reviewers found the same Important defect: the focused
+`settings_contract` called `codeg_eui_shutdown` without importing it, so the
+integration target could not resolve that name. The import is now present.
+
+The cheap review minors were also covered in the same contract target:
+
+- A settings body of `CODEG_EUI_MAX_SETTINGS_JSON_BYTES + 1` is rejected with
+  `CODEG_EUI_ERR_TOO_LARGE` before acceptance and leaves the request ID
+  unchanged.
+- The public get-settings ABI accepts an unsupported wire request
+  asynchronously, then returns exactly one error completion with no settings
+  payload.
+- The public probe ABI returns a JSON completion containing `launchable`,
+  `installedVersion`, and `message` through the worker/facade route.
+
+TDD and verification evidence:
+
+- RED: direct `rustc --test` compilation of the committed contract failed with
+  `E0425: cannot find function codeg_eui_shutdown in this scope` at
+  `complete_shutdown`.
+- GREEN: the complete `settings_contract.rs` compiled with `-D warnings`
+  against the established shape-compatible Task 4 boundary.
+- Five selected real-ABI contract cases passed: malformed, oversized,
+  unsupported agent, probe completion, and get completion.
+- Contracts-only CTest remained **3/3 passed**.
+- Both Cargo format checks, `git diff --check`, approved-design digest, and
+  standalone-lockfile absence passed.
+
+Per parent instruction, **all full Cargo tests remain skipped**. The isolated
+native-file round-trip still requires dependency-complete execution on a host
+with more memory or usable swap; this fix round does not claim otherwise.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns","summary":"Task 4 high-gate I1 fixed: settings_contract now imports codeg_eui_shutdown and covers oversized JSON, unsupported agents, and the public probe ABI.","commits":[{"subject":"fix(eui): compile settings bridge contract"}],"tests":{"status":"partial","passed":8,"failed":0,"summary":"5 selected settings ABI contract cases and 3 contracts-only CTest cases pass; the full Cargo suite remains skipped by parent instruction."},"concerns":["Dependency-complete native-file round-trip and shared-codeg verification still require more than the available 3.8 GiB memory or usable swap."],"report_file":".superpowers/sdd/2026-08-09-eui-neo-frontend-spike/task-4-report.md"}
+-->

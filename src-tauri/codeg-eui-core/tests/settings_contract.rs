@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use codeg_eui_core::{
     codeg_eui_begin_shutdown, codeg_eui_get_agent_settings, codeg_eui_init, codeg_eui_poll,
-    codeg_eui_set_agent_settings, CodegEuiCompletion, CodegEuiFrame, CodegEuiSlice,
-    CODEG_EUI_ERR_INVALID_STATE, CODEG_EUI_OK,
+    codeg_eui_probe_agent, codeg_eui_set_agent_settings, codeg_eui_shutdown, CodegEuiCompletion,
+    CodegEuiFrame, CodegEuiSlice, CODEG_EUI_ERR_INVALID_STATE, CODEG_EUI_ERR_TOO_LARGE,
+    CODEG_EUI_MAX_SETTINGS_JSON_BYTES, CODEG_EUI_OK,
 };
 use serde_json::Value;
 
@@ -30,6 +31,67 @@ fn malformed_patch_is_rejected_before_acceptance() {
             CODEG_EUI_ERR_INVALID_STATE
         );
         assert_eq!(request_id, 1234);
+        complete_shutdown();
+    });
+}
+
+#[test]
+fn oversized_patch_is_rejected_before_acceptance() {
+    run_isolated("oversized", || {
+        assert_eq!(init(), CODEG_EUI_OK);
+        let mut request_id = 1234;
+        let oversized = vec![b' '; CODEG_EUI_MAX_SETTINGS_JSON_BYTES + 1];
+        assert_eq!(
+            codeg_eui_set_agent_settings(
+                b"codex".as_ptr(),
+                5,
+                oversized.as_ptr(),
+                oversized.len(),
+                &mut request_id,
+            ),
+            CODEG_EUI_ERR_TOO_LARGE
+        );
+        assert_eq!(request_id, 1234);
+        complete_shutdown();
+    });
+}
+
+#[test]
+fn unsupported_agent_completes_with_an_error() {
+    run_isolated("unsupported", || {
+        assert_eq!(init(), CODEG_EUI_OK);
+        let agent = b"claude_code";
+        let mut request_id = 0;
+        assert_eq!(
+            codeg_eui_get_agent_settings(agent.as_ptr(), agent.len(), &mut request_id),
+            CODEG_EUI_OK
+        );
+
+        let completion = wait_for_completion(request_id);
+        assert_eq!(completion.status, 1);
+        assert!(completion.result_payload.is_empty());
+        assert!(String::from_utf8_lossy(&completion.error).contains("unsupported EUI agent"));
+        complete_shutdown();
+    });
+}
+
+#[test]
+fn probe_result_arrives_through_the_public_abi() {
+    run_isolated("probe", || {
+        assert_eq!(init(), CODEG_EUI_OK);
+        let mut request_id = 0;
+        assert_eq!(
+            codeg_eui_probe_agent(b"codex".as_ptr(), 5, &mut request_id),
+            CODEG_EUI_OK
+        );
+
+        let completion = wait_for_completion(request_id);
+        assert_completion_ok(&completion);
+        let probe: Value =
+            serde_json::from_slice(&completion.result_payload).expect("probe completion JSON");
+        assert!(probe["launchable"].is_boolean());
+        assert!(probe["message"].is_string());
+        assert!(probe["installedVersion"].is_null() || probe["installedVersion"].is_string());
         complete_shutdown();
     });
 }
