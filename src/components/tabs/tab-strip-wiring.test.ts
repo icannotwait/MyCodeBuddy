@@ -59,13 +59,21 @@ describe("tab drag selection guard wiring", () => {
 })
 
 describe("tab strip conversation pop-out wiring", () => {
-  it("uses the shared runtime gate and popup-blocked copy", () => {
+  it("uses the shared runtime gate and failure notifier", () => {
     expect(tabBar).toContain(
       "const showPopOut = shouldShowConversationPopout()"
     )
     expect(tabBar).not.toContain("const showPopOut = isLocalDesktop()")
-    expect(tabBar).toContain("isPopOutPopupBlockedError(err)")
-    expect(tabBar).toContain('tPop("popOutPopupBlocked")')
-    expect(tabBar).toContain('tPop("popOutHandoffFailed")')
+    expect(tabBar).toContain("notifyConversationPopoutFailure(err, {")
+    expect(tabBar).not.toContain("isPopOutPopupBlockedError(err)")
+    for (const key of [
+      "popOutPopupBlocked",
+      "popOutHandoffFailed",
+      "runtimeRestartRequired",
+      "restartDrawCode",
+      "restartFailed",
+    ]) {
+      expect(tabBar).toContain(`tPop("${key}")`)
+    }
   })
 })

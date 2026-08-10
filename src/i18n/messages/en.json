@@ -4622,6 +4622,9 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "Your browser blocked the conversation pop-out. Allow pop-ups and try again.",
+    "runtimeRestartRequired": "WebView2 was updated. Restart DrawCode before using conversation pop-out. Restarting interrupts currently running tasks.",
+    "restartDrawCode": "Restart DrawCode",
+    "restartFailed": "DrawCode could not restart. Please try again.",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },

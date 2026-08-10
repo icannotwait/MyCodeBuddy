@@ -81,6 +81,25 @@ describe("i18n locale key parity vs en.json", () => {
       }
     }
   })
+
+  it("defines restart-required pop-out copy in all ten locales", () => {
+    for (const messages of locales) {
+      const popout = messages.ConversationPopout as Record<string, string>
+      for (const key of [
+        "runtimeRestartRequired",
+        "restartDrawCode",
+        "restartFailed",
+      ]) {
+        expect(popout[key], `missing ConversationPopout.${key}`).toEqual(
+          expect.any(String)
+        )
+        expect(popout[key].trim()).not.toBe("")
+      }
+    }
+    expect(en.ConversationPopout.runtimeRestartRequired).toBe(
+      "WebView2 was updated. Restart DrawCode before using conversation pop-out. Restarting interrupts currently running tasks."
+    )
+  })
 })
 
 describe("DrawCode branding", () => {

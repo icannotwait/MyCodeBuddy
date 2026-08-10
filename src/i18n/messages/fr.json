@@ -4622,6 +4622,9 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "Le navigateur a bloqué l'ouverture de la conversation. Autorisez les fenêtres contextuelles, puis réessayez.",
+    "runtimeRestartRequired": "WebView2 a été mis à jour. Redémarrez DrawCode avant de détacher une conversation. Le redémarrage interrompt les tâches en cours.",
+    "restartDrawCode": "Redémarrer DrawCode",
+    "restartFailed": "DrawCode n’a pas pu redémarrer. Réessayez.",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },
