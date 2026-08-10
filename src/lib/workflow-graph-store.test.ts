@@ -882,7 +882,8 @@ describe("workflow activation lifecycle", () => {
         }
       )
       expect(warn).toHaveBeenCalledTimes(2)
-      expect(vi.getTimerCount()).toBe(1)
+      // One listener-retry timer plus one active-surface authority timer.
+      expect(vi.getTimerCount()).toBe(2)
 
       await vi.advanceTimersByTimeAsync(4_999)
       expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(1)
@@ -893,11 +894,12 @@ describe("workflow activation lifecycle", () => {
       expect(subscribeWorkflowGraphChanged).toHaveBeenCalledTimes(2)
       expect(subscribeWorkflowCompatibilityNudge).toHaveBeenCalledTimes(2)
       expect(warn).toHaveBeenCalledTimes(2)
-      expect(vi.getTimerCount()).toBe(1)
+      expect(vi.getTimerCount()).toBe(2)
     } finally {
       release()
       warn.mockRestore()
     }
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it("retries only the missing required listener and retains its sibling", async () => {
@@ -1114,13 +1116,13 @@ describe("active workflow refresh scheduling", () => {
     vi.useRealTimers()
   })
 
-  it("active numbered overlay converges after 15 seconds and stops when settled", async () => {
+  it("active overlay keeps polling after authority settles until release", async () => {
     const active = activeSnapshot({ graph_revision: 2 })
     const settled = settledSnapshot({ graph_revision: 3 })
     useWorkflowGraphStore.getState().applyFromDetail(201, active)
     getWorkflowGraphSnapshot
       .mockResolvedValueOnce(active)
-      .mockResolvedValueOnce(settled)
+      .mockResolvedValue(settled)
 
     const release = useWorkflowGraphStore
       .getState()
@@ -1128,23 +1130,21 @@ describe("active workflow refresh scheduling", () => {
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
-    await vi.advanceTimersByTimeAsync(14_999)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(15_000)
     await flushMicrotasks()
-
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
-    expect(
-      useWorkflowGraphStore.getState().getSnapshot(201)?.graph_revision
-    ).toBe(3)
     expect(
       useWorkflowGraphStore.getState().getSnapshot(201)?.overall_state
     ).toBe("completed")
 
-    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
+    await vi.advanceTimersByTimeAsync(15_000)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
     release()
+    await vi.advanceTimersByTimeAsync(15_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
   it.each([
@@ -1205,40 +1205,39 @@ describe("active workflow refresh scheduling", () => {
     release()
   })
 
-  it("settled numbered overlay handles newer events without a timer", async () => {
+  it("settled numbered overlay discovers a newer active revision without an event", async () => {
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(92, settledSnapshot({ graph_revision: 2 }))
-    getWorkflowGraphSnapshot.mockResolvedValue(
-      settledSnapshot({ graph_revision: 3 })
-    )
+    getWorkflowGraphSnapshot
+      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 2 }))
+      .mockResolvedValue(activeSnapshot({ graph_revision: 3 }))
+
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(92)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
 
-    useWorkflowGraphStore.getState().handleGraphChanged({
-      parent_conversation_id: 92,
-      workflow_id: "wf-1",
-      graph_revision: 3,
-    })
-    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(14_999)
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
 
-    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
-    await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(92)?.graph_revision
+    ).toBe(3)
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(92)?.overall_state
+    ).toBe("in_progress")
     release()
   })
 
-  it("overlay-only discovery re-arms the 10-minute fallback until a graph appears", async () => {
-    // b2d / writing-plans handoff: overlay opens on sessions while the
-    // workflow is not yet published. If the first-publish event is missed,
-    // the 10-minute safety net must still discover the graph so the chip
-    // can leave the sub-agent-only state.
+  it("overlay discovery uses ten minutes until numbered, then fifteen seconds", async () => {
+    const discovered = settledSnapshot({ graph_revision: 1 })
     getWorkflowGraphSnapshot
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
+      .mockResolvedValue(discovered)
 
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(94)
     await flushMicrotasks()
@@ -1257,27 +1256,32 @@ describe("active workflow refresh scheduling", () => {
       useWorkflowGraphStore.getState().getSnapshot(94)?.graph_revision
     ).toBe(1)
 
-    // Discovered graph under overlay-only: no further fallback polls.
-    await vi.advanceTimersByTimeAsync(20 * 60 * 1_000)
-    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(14_999)
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(4)
+
     release()
+    await vi.advanceTimersByTimeAsync(15_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(4)
   })
 
-  it("seeds the first publish event after an overlay mount resolves null", async () => {
+  it("first publish event switches overlay to fifteen-second authority", async () => {
     const changedDispose = vi.fn()
     const nudgeDispose = vi.fn()
+    const discovered = settledSnapshot({ graph_revision: 1 })
     subscribeWorkflowGraphChanged.mockResolvedValue(changedDispose)
     subscribeWorkflowCompatibilityNudge.mockResolvedValue(nudgeDispose)
     getWorkflowGraphSnapshot
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(settledSnapshot({ graph_revision: 1 }))
+      .mockResolvedValue(discovered)
 
     const release = useWorkflowGraphStore.getState().activateOverlayInterest(98)
     await flushMicrotasks()
 
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
-    expect(getWorkflowGraphSnapshot).toHaveBeenNthCalledWith(1, 98)
     expect(useWorkflowGraphStore.getState().getSnapshot(98)).toBeNull()
 
     useWorkflowGraphStore.getState().handleGraphChanged({
@@ -1288,29 +1292,29 @@ describe("active workflow refresh scheduling", () => {
     await flushMicrotasks()
 
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
-    expect(getWorkflowGraphSnapshot).toHaveBeenNthCalledWith(2, 98)
     expect(
       useWorkflowGraphStore.getState().getSnapshot(98)?.graph_revision
     ).toBe(1)
 
-    // Event discovery disarms the overlay-only fallback once a revision lands.
-    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(14_999)
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
 
     release()
-    expect(changedDispose).toHaveBeenCalledTimes(1)
-    expect(nudgeDispose).toHaveBeenCalledTimes(1)
+    expect(changedDispose).toHaveBeenCalledOnce()
+    expect(nudgeDispose).toHaveBeenCalledOnce()
     useWorkflowGraphStore.getState().handleGraphChanged({
       parent_conversation_id: 98,
       workflow_id: "wf-1",
       graph_revision: 2,
     })
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
-  it("releasing expanded interest keeps overlay events but stops fallback", async () => {
+  it("releasing expanded interest keeps overlay authority polling", async () => {
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(93, settledSnapshot({ graph_revision: 5 }))
@@ -1331,30 +1335,25 @@ describe("active workflow refresh scheduling", () => {
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
     releaseExpanded()
 
-    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
-    useWorkflowGraphStore.getState().handleCompatibilityNudge({
-      parent_conversation_id: 93,
-    })
+    await vi.advanceTimersByTimeAsync(15_000)
     await flushMicrotasks()
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
-    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
 
     releaseOverlay()
-    useWorkflowGraphStore.getState().handleCompatibilityNudge({
-      parent_conversation_id: 93,
-    })
+    await vi.advanceTimersByTimeAsync(15_000)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
-  it("late expanded completion updates cache but cannot arm an overlay timer", async () => {
+  it("late expanded completion keeps the overlay authority timer", async () => {
     useWorkflowGraphStore
       .getState()
       .applyFromDetail(97, settledSnapshot({ graph_revision: 1 }))
     const pending = deferred<WorkflowGraphSnapshot | null>()
-    getWorkflowGraphSnapshot.mockReturnValue(pending.promise)
+    getWorkflowGraphSnapshot
+      .mockReturnValueOnce(pending.promise)
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(settledSnapshot({ graph_revision: 2 }))
     const releaseOverlay = useWorkflowGraphStore
       .getState()
       .activateOverlayInterest(97)
@@ -1369,9 +1368,15 @@ describe("active workflow refresh scheduling", () => {
     expect(
       useWorkflowGraphStore.getState().getSnapshot(97)?.graph_revision
     ).toBe(2)
-    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(15_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
+
     releaseOverlay()
+    await vi.advanceTimersByTimeAsync(15_000)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(3)
   })
 
   it("refreshes every ten minutes and resets the clock after event convergence", async () => {

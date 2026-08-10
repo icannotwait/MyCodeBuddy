@@ -6,9 +6,9 @@
  *   in-flight fetch cannot overwrite a newer nudge result.
  * - Cold detail installs via `applyFromDetail`; live clock via graph-changed
  *   + snapshot refetch; compatibility_nudge triggers the same refetch path.
- * - Authority refresh: active workflow state uses 15 seconds; expanded-graph
- *   and undiscovered overlay interest use a 10-minute fallback. A settled,
- *   discovered overlay relies on graph-changed / nudge events without a timer.
+ * - Authority refresh: active workflow state and discovered active-surface
+ *   overlay interest use 15 seconds. Expanded-only and undiscovered interest
+ *   use a 10-minute fallback.
  */
 
 import { create } from "zustand"
@@ -255,6 +255,14 @@ function hasExpandedInterestEpoch(
 ): boolean {
   const active = activeConversations.get(conversationId)
   return active != null && active.epoch === epoch && active.expandedCount > 0
+}
+
+function hasOverlayInterestEpoch(
+  conversationId: number,
+  epoch: number
+): boolean {
+  const active = activeConversations.get(conversationId)
+  return active != null && active.epoch === epoch && active.overlayCount > 0
 }
 
 function clearFallbackTimer(active: ActiveConversationRecord): void {
@@ -582,8 +590,8 @@ async function runRefresh(
   if (!currentActive || !isActiveEpoch(conversationId, activationEpoch)) {
     return
   }
-  // Active authority uses 15 seconds. Expanded or undiscovered interest uses
-  // 10 minutes; a settled, discovered overlay does not own a refresh timer.
+  // Active state and discovered active-surface overlay interest use 15 seconds.
+  // Expanded-only and undiscovered interest use the 10-minute fallback.
   const delay = nextAuthorityRefreshDelay(conversationId, activationEpoch, get)
   if (delay == null) return
 
@@ -619,6 +627,12 @@ function nextAuthorityRefreshDelay(
   if (!isActiveEpoch(conversationId, epoch)) return null
   const entry = get().getEntry(conversationId)
   if (hasActiveWorkflowState(entry?.snapshot ?? null)) {
+    return ACTIVE_AUTHORITY_REFRESH_MS
+  }
+  if (
+    entry?.appliedGraphRevision != null &&
+    hasOverlayInterestEpoch(conversationId, epoch)
+  ) {
     return ACTIVE_AUTHORITY_REFRESH_MS
   }
   if (hasExpandedInterestEpoch(conversationId, epoch)) {
