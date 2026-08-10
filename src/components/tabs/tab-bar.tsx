@@ -5,7 +5,6 @@ import { Reorder } from "motion/react"
 import type { PanInfo } from "motion/react"
 import { SquarePen } from "lucide-react"
 import { useTranslations } from "next-intl"
-import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -26,10 +25,10 @@ import { useIsCoarsePointer } from "@/hooks/use-is-coarse-pointer"
 import { TabItem, type TabMoveTarget } from "./tab-item"
 import {
   canPopOutConversation,
-  isPopOutPopupBlockedError,
   popOutConversation,
   shouldShowConversationPopout,
 } from "@/lib/conversation-popout"
+import { notifyConversationPopoutFailure } from "@/lib/conversation-popout-notifications"
 
 interface TabBarProps {
   /** Split-group strip: render only this group's tabs, highlight the GROUP's
@@ -218,11 +217,13 @@ export function TabBar({ groupId }: TabBarProps) {
         agentType: tab.agentType,
       }).catch((err) => {
         console.error("[TabBar] pop-out failed", err)
-        toast.error(
-          isPopOutPopupBlockedError(err)
-            ? tPop("popOutPopupBlocked")
-            : tPop("popOutHandoffFailed")
-        )
+        notifyConversationPopoutFailure(err, {
+          popupBlocked: tPop("popOutPopupBlocked"),
+          handoffFailed: tPop("popOutHandoffFailed"),
+          runtimeRestartRequired: tPop("runtimeRestartRequired"),
+          restartAction: tPop("restartDrawCode"),
+          restartFailed: tPop("restartFailed"),
+        })
       })
     },
     [tabs, tPop]

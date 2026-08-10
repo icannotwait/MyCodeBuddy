@@ -10,10 +10,11 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY};
 use crate::commands::windows::{apply_platform_window_style, post_window_setup};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+use crate::window_diagnostics::WebviewRuntimeDrift;
 
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::manager::ConnectionManager;
@@ -164,48 +165,56 @@ pub enum OpenConversationResult {
     FocusedExisting,
 }
 
-/// Side effects for open/focus-existing decisions.
-///
-/// Production uses a Tauri-backed adapter for get/unminimize/focus.
-/// Unit tests use a recording fake that also implements insert/create so the
-/// FocusedExisting path can prove those ops are skipped when a label exists.
+/// Side effects for the focus-existing and runtime-drift preflight.
 pub(crate) trait ConversationWindowOps {
     fn get_by_label(&self, label: &str) -> bool;
     fn unminimize(&self, label: &str);
     fn set_focus(&self, label: &str) -> Result<(), String>;
-    /// Used by [`decide_open_or_focus_existing`] (behavioral tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn insert_op(
-        &self,
-        conversation_id: i32,
-        operation_id: &str,
-        label: &str,
-    ) -> Result<(), String>;
-    /// Used by [`decide_open_or_focus_existing`] (behavioral tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn create_window(&self, label: &str) -> Result<(), String>;
+    fn check_runtime_drift(&self) -> WebviewRuntimeDrift;
 }
 
-/// If a window with `label` exists: unminimize + focus and return
-/// `FocusedExisting` **without** insert_op / create_window.
-/// Otherwise: insert_op + create_window and return `Opened`.
-///
-/// Production open uses [`try_focus_existing_conversation_window`] for the
-/// early return, then its own create path; this helper models the full
-/// branch so tests can assert create/insert are skipped on focus.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn decide_open_or_focus_existing(
+pub(crate) struct ConversationWindowCreatePermit(());
+
+pub(crate) enum ConversationWindowPreflight {
+    FocusedExisting,
+    CreateNew(ConversationWindowCreatePermit),
+    RuntimeRestartRequired {
+        startup: String,
+        available_now: String,
+    },
+}
+
+pub(crate) fn decide_conversation_window_preflight(
     ops: &impl ConversationWindowOps,
-    conversation_id: i32,
-    operation_id: &str,
     label: &str,
-) -> Result<OpenConversationResult, String> {
-    if let Some(focused) = try_focus_existing_conversation_window(ops, label)? {
-        return Ok(focused);
+) -> Result<ConversationWindowPreflight, String> {
+    if try_focus_existing_conversation_window(ops, label)?.is_some() {
+        return Ok(ConversationWindowPreflight::FocusedExisting);
     }
-    ops.insert_op(conversation_id, operation_id, label)?;
-    ops.create_window(label)?;
-    Ok(OpenConversationResult::Opened)
+
+    Ok(match ops.check_runtime_drift() {
+        WebviewRuntimeDrift::Changed {
+            startup,
+            available_now,
+        } => ConversationWindowPreflight::RuntimeRestartRequired {
+            startup,
+            available_now,
+        },
+        WebviewRuntimeDrift::Unchanged | WebviewRuntimeDrift::Unknown => {
+            ConversationWindowPreflight::CreateNew(ConversationWindowCreatePermit(()))
+        }
+    })
+}
+
+fn runtime_restart_required_error() -> AppCommandError {
+    AppCommandError::window(
+        "Restart DrawCode before opening a conversation pop-out",
+        "The available WebView2 Runtime changed after DrawCode started",
+    )
+    .with_i18n(
+        CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
+        std::collections::BTreeMap::new(),
+    )
 }
 
 /// Focus-existing early return used by the Tauri open command.
@@ -250,9 +259,7 @@ fn activate_conversation_window(window: &tauri::WebviewWindow) -> Result<(), Str
     Ok(())
 }
 
-/// Tauri-backed window ops for the open/focus path (desktop only).
-/// Only get/unminimize/focus are used on the production early-return path;
-/// insert/create stay in `open_conversation_window` after `None`.
+/// Tauri-backed window ops for the open/focus preflight (desktop only).
 #[cfg(feature = "tauri-runtime")]
 struct TauriConversationWindowOps<'a> {
     app: &'a AppHandle,
@@ -282,17 +289,8 @@ impl ConversationWindowOps for TauriConversationWindowOps<'_> {
         Ok(())
     }
 
-    fn insert_op(
-        &self,
-        _conversation_id: i32,
-        _operation_id: &str,
-        _label: &str,
-    ) -> Result<(), String> {
-        Err("Tauri adapter: insert_op owned by open_conversation_window".into())
-    }
-
-    fn create_window(&self, _label: &str) -> Result<(), String> {
-        Err("Tauri adapter: create_window owned by open_conversation_window".into())
+    fn check_runtime_drift(&self) -> WebviewRuntimeDrift {
+        crate::window_diagnostics::current_webview_runtime_drift()
     }
 }
 
@@ -1029,6 +1027,16 @@ impl ConversationPopoutState {
     }
 }
 
+fn insert_opened_after_preflight(
+    _permit: ConversationWindowCreatePermit,
+    popout: &ConversationPopoutState,
+    conversation_id: i32,
+    operation_id: String,
+    label: String,
+) -> Result<(), AppCommandError> {
+    popout.insert_opened(conversation_id, operation_id, label)
+}
+
 /// Result of [`ConversationPopoutState::decide_abort`].
 #[derive(Debug, Clone)]
 pub enum AbortDecision {
@@ -1088,14 +1096,27 @@ pub async fn open_conversation_window(
     }
 
     let label = conversation_window_label(conversation_id);
-    // FocusExisting path: unminimize+focus; no insert_opened / no second window.
-    // Behavioral unit coverage: `decide_open_or_focus_existing` with a fake ops.
     let focus_ops = TauriConversationWindowOps { app: &app };
-    if let Some(focused) = try_focus_existing_conversation_window(&focus_ops, &label)
-        .map_err(|e| AppCommandError::window("Failed to focus conversation window", e))?
+    let create_permit = match decide_conversation_window_preflight(&focus_ops, &label)
+        .map_err(|error| AppCommandError::window("Failed to focus conversation window", error))?
     {
-        return Ok(focused);
-    }
+        ConversationWindowPreflight::FocusedExisting => {
+            return Ok(OpenConversationResult::FocusedExisting);
+        }
+        ConversationWindowPreflight::CreateNew(permit) => permit,
+        ConversationWindowPreflight::RuntimeRestartRequired {
+            startup,
+            available_now,
+        } => {
+            crate::window_diagnostics::emit_webview_runtime_drift_blocked_popout(
+                &label,
+                &operation_id,
+                &startup,
+                &available_now,
+            );
+            return Err(runtime_restart_required_error());
+        }
+    };
 
     let _ = locale;
     let conv_title = crate::db::service::conversation_service::get_by_id(&db.conn, conversation_id)
@@ -1115,7 +1136,13 @@ pub async fn open_conversation_window(
     );
     let url = WebviewUrl::App(url_str.into());
 
-    popout.insert_opened(conversation_id, operation_id.clone(), label.clone())?;
+    insert_opened_after_preflight(
+        create_permit,
+        &popout,
+        conversation_id,
+        operation_id.clone(),
+        label.clone(),
+    )?;
 
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)
@@ -1814,125 +1841,138 @@ mod tests {
         assert_eq!(parse_conversation_id_from_label("main"), None);
     }
 
-    /// Recording fake for open/focus idempotency behavioral tests.
-    #[derive(Default)]
+    /// Recording fake for ordered conversation-window preflight tests.
     struct FakeConversationWindowOps {
-        /// Labels that already have a window.
         existing: std::sync::Mutex<std::collections::HashSet<String>>,
-        unminimize_calls: std::sync::atomic::AtomicUsize,
-        focus_calls: std::sync::atomic::AtomicUsize,
-        insert_op_calls: std::sync::atomic::AtomicUsize,
-        create_window_calls: std::sync::atomic::AtomicUsize,
-        last_focused_label: std::sync::Mutex<Option<String>>,
+        drift: WebviewRuntimeDrift,
+        events: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl FakeConversationWindowOps {
-        fn with_existing(label: impl Into<String>) -> Self {
-            let fake = Self::default();
+        fn new(drift: WebviewRuntimeDrift) -> Self {
+            Self {
+                existing: std::sync::Mutex::new(std::collections::HashSet::new()),
+                drift,
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_existing(label: impl Into<String>, drift: WebviewRuntimeDrift) -> Self {
+            let fake = Self::new(drift);
             fake.existing.lock().unwrap().insert(label.into());
             fake
         }
 
-        fn count(atom: &std::sync::atomic::AtomicUsize) -> usize {
-            atom.load(std::sync::atomic::Ordering::SeqCst)
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn record_insert(&self, _permit: ConversationWindowCreatePermit) {
+            self.events.lock().unwrap().push("insert_opened");
+        }
+
+        fn record_create(&self) {
+            self.events.lock().unwrap().push("create_window");
         }
     }
 
     impl ConversationWindowOps for FakeConversationWindowOps {
         fn get_by_label(&self, label: &str) -> bool {
+            self.events.lock().unwrap().push("get_by_label");
             self.existing.lock().unwrap().contains(label)
         }
 
         fn unminimize(&self, _label: &str) {
-            self.unminimize_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().unwrap().push("unminimize");
         }
 
-        fn set_focus(&self, label: &str) -> Result<(), String> {
-            self.focus_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *self.last_focused_label.lock().unwrap() = Some(label.to_string());
+        fn set_focus(&self, _label: &str) -> Result<(), String> {
+            self.events.lock().unwrap().push("set_focus");
             Ok(())
         }
 
-        fn insert_op(
-            &self,
-            _conversation_id: i32,
-            _operation_id: &str,
-            _label: &str,
-        ) -> Result<(), String> {
-            self.insert_op_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn create_window(&self, _label: &str) -> Result<(), String> {
-            self.create_window_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+        fn check_runtime_drift(&self) -> WebviewRuntimeDrift {
+            self.events.lock().unwrap().push("check_runtime_drift");
+            self.drift.clone()
         }
     }
 
     #[test]
-    fn open_conversation_focuses_existing_when_label_present() {
-        let label = conversation_window_label(42);
-        let fake = FakeConversationWindowOps::with_existing(label.clone());
-
-        let result =
-            decide_open_or_focus_existing(&fake, 42, "op-focus-1", &label).expect("focus path");
-
-        assert_eq!(result, OpenConversationResult::FocusedExisting);
-        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 1);
-        assert_eq!(FakeConversationWindowOps::count(&fake.unminimize_calls), 1);
-        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 0);
+    fn conversation_popout_runtime_restart_error_uses_exact_typed_contract() {
+        let error = runtime_restart_required_error();
         assert_eq!(
-            FakeConversationWindowOps::count(&fake.create_window_calls),
-            0
+            error.code,
+            crate::app_error::AppErrorCode::WindowOperationFailed
         );
         assert_eq!(
-            fake.last_focused_label.lock().unwrap().as_deref(),
-            Some(label.as_str())
+            error.i18n_key.as_deref(),
+            Some(crate::app_error::CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY)
         );
-
-        // Production early-return helper agrees with the same fake.
-        let again = try_focus_existing_conversation_window(&fake, &label)
-            .expect("try focus")
-            .expect("existing maps to Some");
-        assert_eq!(again, OpenConversationResult::FocusedExisting);
-        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 2);
-        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 0);
         assert_eq!(
-            FakeConversationWindowOps::count(&fake.create_window_calls),
-            0
+            error.i18n_key.as_deref(),
+            Some("ConversationPopout.runtimeRestartRequired")
         );
-
-        let json = serde_json::to_value(OpenConversationResult::FocusedExisting).unwrap();
-        assert_eq!(json, serde_json::json!("focusedExisting"));
-        let back: OpenConversationResult = serde_json::from_value(json).unwrap();
-        assert_eq!(back, OpenConversationResult::FocusedExisting);
+        assert!(error.i18n_params.is_none());
     }
 
     #[test]
-    fn open_conversation_creates_when_label_absent() {
-        let label = conversation_window_label(7);
-        let fake = FakeConversationWindowOps::default();
-
-        let result =
-            decide_open_or_focus_existing(&fake, 7, "op-open-1", &label).expect("open path");
-
-        assert_eq!(result, OpenConversationResult::Opened);
-        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 0);
-        assert_eq!(FakeConversationWindowOps::count(&fake.unminimize_calls), 0);
-        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 1);
-        assert_eq!(
-            FakeConversationWindowOps::count(&fake.create_window_calls),
-            1
+    fn conversation_window_preflight_existing_focus_bypasses_drift_and_creation() {
+        let fake = FakeConversationWindowOps::with_existing(
+            "conversation-42",
+            WebviewRuntimeDrift::Changed {
+                startup: "151.0.4129.59".into(),
+                available_now: "151.0.4129.72".into(),
+            },
         );
 
-        assert_eq!(
-            try_focus_existing_conversation_window(&fake, &label).unwrap(),
-            None
-        );
+        let decision =
+            decide_conversation_window_preflight(&fake, "conversation-42").expect("focus succeeds");
+
+        assert!(matches!(
+            decision,
+            ConversationWindowPreflight::FocusedExisting
+        ));
+        assert_eq!(fake.events(), ["get_by_label", "unminimize", "set_focus"]);
+    }
+
+    #[test]
+    fn conversation_window_preflight_checks_drift_after_focus_miss_before_insert() {
+        for drift in [WebviewRuntimeDrift::Unchanged, WebviewRuntimeDrift::Unknown] {
+            let fake = FakeConversationWindowOps::new(drift);
+            let decision = decide_conversation_window_preflight(&fake, "conversation-7")
+                .expect("preflight succeeds");
+            let ConversationWindowPreflight::CreateNew(permit) = decision else {
+                panic!("expected create permit");
+            };
+            fake.record_insert(permit);
+            fake.record_create();
+            assert_eq!(
+                fake.events(),
+                [
+                    "get_by_label",
+                    "check_runtime_drift",
+                    "insert_opened",
+                    "create_window"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_window_preflight_changed_runtime_stops_before_insert_and_create() {
+        let fake = FakeConversationWindowOps::new(WebviewRuntimeDrift::Changed {
+            startup: "151.0.4129.59".into(),
+            available_now: "151.0.4129.72".into(),
+        });
+
+        let decision = decide_conversation_window_preflight(&fake, "conversation-7")
+            .expect("preflight classifies drift");
+
+        assert!(matches!(
+            decision,
+            ConversationWindowPreflight::RuntimeRestartRequired { .. }
+        ));
+        assert_eq!(fake.events(), ["get_by_label", "check_runtime_drift"]);
     }
 
     #[test]

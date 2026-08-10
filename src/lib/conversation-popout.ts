@@ -2,12 +2,14 @@ import {
   abortConversationPopoutOperation,
   closeConversationWindow,
   completeConversationPopoutOperation,
+  CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
   focusConversationWindow,
   getConversationPopoutOperation,
   openConversationWindow,
   type OpenConversationResult,
   type PopoutOpStatus,
 } from "@/lib/api"
+import { extractAppCommandError } from "@/lib/app-error"
 import {
   clearTransferringOut,
   getTransferFence,
@@ -39,6 +41,35 @@ export class PopOutPopupBlockedError extends Error {
     super("popup_blocked")
     this.name = "PopOutPopupBlockedError"
   }
+}
+
+export class PopOutRuntimeRestartRequiredError extends Error {
+  readonly code = "runtime_restart_required" as const
+  readonly cause: unknown
+
+  constructor(cause: unknown) {
+    super("runtime_restart_required")
+    this.name = "PopOutRuntimeRestartRequiredError"
+    this.cause = cause
+  }
+}
+
+function isRuntimeRestartRequiredCommandError(error: unknown): boolean {
+  return (
+    extractAppCommandError(error)?.i18n_key ===
+    CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY
+  )
+}
+
+export function isPopOutRuntimeRestartRequiredError(
+  error: unknown
+): error is PopOutRuntimeRestartRequiredError {
+  return (
+    error instanceof PopOutRuntimeRestartRequiredError ||
+    (typeof error === "object" &&
+      error != null &&
+      (error as { code?: unknown }).code === "runtime_restart_required")
+  )
 }
 
 export function isPopOutPopupBlockedError(
@@ -1058,15 +1089,18 @@ export async function popOutConversation(args: {
         agentType: args.agentType,
         operationId,
       })
-    } catch (e) {
+    } catch (error) {
       wait.cancel()
-      // Window may have been created despite error in older code paths;
-      // still attempt non-destructive abort + close CAS.
+      if (isRuntimeRestartRequiredCommandError(error)) {
+        clearTransferringOut(args.conversationId, operationId)
+        throw new PopOutRuntimeRestartRequiredError(error)
+      }
+      // Older/asynchronous paths may have created backend state.
       await compensate({
         conversationId: args.conversationId,
         operationId,
       })
-      throw e
+      throw error
     }
 
     if (openResult === "focusedExisting") {

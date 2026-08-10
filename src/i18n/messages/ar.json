@@ -4622,6 +4622,9 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "حظر المتصفح نافذة المحادثة المنبثقة. اسمح بالنوافذ المنبثقة ثم حاول مرة أخرى.",
+    "runtimeRestartRequired": "تم تحديث WebView2. أعد تشغيل DrawCode قبل استخدام نافذة المحادثة المنبثقة. تؤدي إعادة التشغيل إلى مقاطعة المهام قيد التشغيل حاليًا.",
+    "restartDrawCode": "إعادة تشغيل DrawCode",
+    "restartFailed": "تعذر إعادة تشغيل DrawCode. حاول مرة أخرى.",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },

@@ -4622,6 +4622,9 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "瀏覽器封鎖了會話彈出視窗。請允許彈出視窗後再試一次。",
+    "runtimeRestartRequired": "WebView2 已更新。請先重新啟動 DrawCode，再使用會話彈出視窗。重新啟動會中斷目前執行中的工作。",
+    "restartDrawCode": "重新啟動 DrawCode",
+    "restartFailed": "DrawCode 無法重新啟動，請再試一次。",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   },

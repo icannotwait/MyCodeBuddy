@@ -16,17 +16,13 @@ const probe = vi.hoisted(() => ({ agentIconRenders: 0 }))
 const popoutMocks = vi.hoisted(() => ({
   showPopOut: vi.fn(() => false),
   popOutConversation: vi.fn(
-    async (_args: {
+    async (args: {
       conversationId: number
       folderId: number
       agentType: string
-    }) => {}
-  ),
-  isPopupBlocked: vi.fn(
-    (error: unknown) =>
-      typeof error === "object" &&
-      error != null &&
-      (error as { code?: unknown }).code === "popup_blocked"
+    }) => {
+      void args
+    }
   ),
   canPopOutConversation: vi.fn(
     (args: {
@@ -43,6 +39,9 @@ const popoutMocks = vi.hoisted(() => ({
       return { enabled: true as const }
     }
   ),
+}))
+const notificationMocks = vi.hoisted(() => ({
+  notifyConversationPopoutFailure: vi.fn(),
 }))
 vi.mock("@/components/agent-icon", () => ({
   AgentIcon: () => {
@@ -62,12 +61,21 @@ vi.mock("@/lib/conversation-popout", () => ({
     folderId: number
     agentType: string
   }) => popoutMocks.popOutConversation(args),
-  isPopOutPopupBlockedError: (error: unknown) =>
-    popoutMocks.isPopupBlocked(error),
 }))
+vi.mock("@/lib/conversation-popout-notifications", () => notificationMocks)
 
 const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
 vi.mock("sonner", () => ({ toast: sonnerMock }))
+
+const popoutFailureMessages = {
+  popupBlocked:
+    "Your browser blocked the conversation pop-out. Allow pop-ups and try again.",
+  handoffFailed: "Failed to pop out conversation",
+  runtimeRestartRequired:
+    "WebView2 was updated. Restart DrawCode before using conversation pop-out. Restarting interrupts currently running tasks.",
+  restartAction: "Restart DrawCode",
+  restartFailed: "DrawCode could not restart. Please try again.",
+}
 
 const MINUTE = 60_000
 const NOW = 1_700_000_000_000
@@ -484,7 +492,7 @@ describe("SidebarConversationCard pop-out menu", () => {
     popoutMocks.showPopOut.mockReturnValue(true)
     popoutMocks.popOutConversation.mockReset()
     popoutMocks.popOutConversation.mockResolvedValue(undefined)
-    popoutMocks.isPopupBlocked.mockClear()
+    notificationMocks.notifyConversationPopoutFailure.mockClear()
     sonnerMock.error.mockClear()
     sonnerMock.success.mockClear()
   })
@@ -528,34 +536,49 @@ describe("SidebarConversationCard pop-out menu", () => {
     expect(queryByText("Pop out window")).toBeNull()
   })
 
-  it("uses dedicated copy when the browser blocks window.open", async () => {
-    popoutMocks.popOutConversation.mockRejectedValueOnce({
-      code: "popup_blocked",
-    })
+  it("routes runtime restart rejection through the shared notifier", async () => {
+    const error = { code: "runtime_restart_required" }
+    popoutMocks.popOutConversation.mockRejectedValueOnce(error)
     const { getByText } = renderCard(conv(1))
     fireEvent.contextMenu(getByText("conv-1"))
     fireEvent.click(getByText("Pop out window"))
 
     await waitFor(() =>
-      expect(sonnerMock.error).toHaveBeenCalledWith(
-        "Your browser blocked the conversation pop-out. Allow pop-ups and try again."
-      )
+      expect(
+        notificationMocks.notifyConversationPopoutFailure
+      ).toHaveBeenCalledWith(error, popoutFailureMessages)
     )
+    expect(sonnerMock.error).not.toHaveBeenCalled()
   })
 
-  it("keeps generic handoff copy for every other rejection", async () => {
-    popoutMocks.popOutConversation.mockRejectedValueOnce(
-      new Error("desktop handoff failed")
-    )
+  it("routes popup-blocked rejection through the shared notifier", async () => {
+    const error = { code: "popup_blocked" }
+    popoutMocks.popOutConversation.mockRejectedValueOnce(error)
     const { getByText } = renderCard(conv(1))
     fireEvent.contextMenu(getByText("conv-1"))
     fireEvent.click(getByText("Pop out window"))
 
     await waitFor(() =>
-      expect(sonnerMock.error).toHaveBeenCalledWith(
-        "Failed to pop out conversation"
-      )
+      expect(
+        notificationMocks.notifyConversationPopoutFailure
+      ).toHaveBeenCalledWith(error, popoutFailureMessages)
     )
+    expect(sonnerMock.error).not.toHaveBeenCalled()
+  })
+
+  it("routes generic handoff rejection through the shared notifier", async () => {
+    const error = new Error("desktop handoff failed")
+    popoutMocks.popOutConversation.mockRejectedValueOnce(error)
+    const { getByText } = renderCard(conv(1))
+    fireEvent.contextMenu(getByText("conv-1"))
+    fireEvent.click(getByText("Pop out window"))
+
+    await waitFor(() =>
+      expect(
+        notificationMocks.notifyConversationPopoutFailure
+      ).toHaveBeenCalledWith(error, popoutFailureMessages)
+    )
+    expect(sonnerMock.error).not.toHaveBeenCalled()
   })
 
   it("disables pop-out for the last open main tab", () => {

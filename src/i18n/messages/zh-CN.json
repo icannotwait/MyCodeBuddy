@@ -4622,6 +4622,9 @@
     "cannotPopOutDraft": "请先开始会话再弹出",
     "popOutHandoffFailed": "弹出会话失败",
     "popOutPopupBlocked": "浏览器阻止了会话弹出窗口。请允许弹出窗口后重试。",
+    "runtimeRestartRequired": "WebView2 已更新。请先重启 DrawCode，再使用会话弹出窗口。重启会中断当前正在运行的任务。",
+    "restartDrawCode": "重启 DrawCode",
+    "restartFailed": "DrawCode 无法重启，请重试。",
     "localDesktopOnly": "会话弹出窗口仅在本地桌面应用中可用。",
     "liveHandoffFailed": "接管实时会话失败。主窗口仍持有该会话。"
   },

@@ -7,6 +7,8 @@ vi.mock("@/lib/platform", () => ({
 }))
 
 vi.mock("@/lib/api", () => ({
+  CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY:
+    "ConversationPopout.runtimeRestartRequired",
   focusConversationWindow: vi.fn(async () => false),
   openConversationWindow: vi.fn(async () => "opened"),
   closeConversationWindow: vi.fn(async () => true),
@@ -112,6 +114,7 @@ import {
   isConversationDetachedCache,
   isPopOutInFlight,
   isPopOutPopupBlockedError,
+  isPopOutRuntimeRestartRequiredError,
   popOutConversation,
   shouldShowConversationPopout,
 } from "@/lib/conversation-popout"
@@ -380,6 +383,62 @@ describe("popOutConversation compensation", () => {
       operationId: "op",
       abortOutcome: { never_rebound: null },
     })
+  })
+
+  it("clears only the transfer fence for runtime drift", async () => {
+    const unsubscribeReady = vi.fn()
+    const unsubscribeClosed = vi.fn()
+    vi.mocked(subscribe).mockImplementation(async (event) =>
+      event === "conversation-window://ready"
+        ? unsubscribeReady
+        : unsubscribeClosed
+    )
+    vi.mocked(api.openConversationWindow).mockRejectedValueOnce({
+      code: "window_operation_failed",
+      message: "Restart DrawCode before opening a conversation pop-out",
+      detail: "The available WebView2 Runtime changed after DrawCode started",
+      i18n_key: api.CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
+    })
+    vi.mocked(api.getConversationPopoutOperation).mockClear()
+
+    let rejection: unknown
+    try {
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    } catch (error) {
+      rejection = error
+    }
+
+    expect(isPopOutRuntimeRestartRequiredError(rejection)).toBe(true)
+    expect(rejection).toMatchObject({ code: "runtime_restart_required" })
+    expect(unsubscribeReady).toHaveBeenCalledOnce()
+    expect(unsubscribeClosed).toHaveBeenCalledOnce()
+    expect(isTransferringOut(1)).toBe(false)
+    expect(api.abortConversationPopoutOperation).not.toHaveBeenCalled()
+    expect(api.getConversationPopoutOperation).not.toHaveBeenCalled()
+    expect(api.closeConversationWindow).not.toHaveBeenCalled()
+    expect(tabMocks.restoreDetachedTab).not.toHaveBeenCalled()
+  })
+
+  it("keeps generic open failures on the compensation path", async () => {
+    vi.mocked(subscribe).mockResolvedValue(() => {})
+    vi.mocked(api.openConversationWindow).mockRejectedValueOnce(
+      new Error("desktop open failed")
+    )
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow("desktop open failed")
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalledOnce()
+    expect(isTransferringOut(1)).toBe(false)
   })
 
   it("aborts then restores when detach CAS fails after ready", async () => {

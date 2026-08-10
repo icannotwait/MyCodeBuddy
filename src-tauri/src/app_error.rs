@@ -44,6 +44,12 @@ pub const UPLOAD_I18N_KEY_NOT_A_FILE: &str = "errors.upload.notAFile";
 /// Frontend params: `used`, `limit` (both byte counts as strings).
 pub const UPLOAD_I18N_KEY_QUOTA_EXCEEDED: &str = "errors.upload.quotaExceeded";
 
+/// Emitted only when Windows detects that the available WebView2 Runtime no
+/// longer matches the process-start snapshot before a new conversation WebView.
+#[cfg(any(feature = "tauri-runtime", test))]
+pub const CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY: &str =
+    "ConversationPopout.runtimeRestartRequired";
+
 // ─── Backup / restore i18n keys ──────────────────────────────────────
 //
 // Emitted by `commands::backup::*` and consumed by `BackupSettings` on the
@@ -289,6 +295,14 @@ impl From<DbError> for AppCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_popout_runtime_restart_key_has_stable_wire_value() {
+        assert_eq!(
+            CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
+            "ConversationPopout.runtimeRestartRequired"
+        );
+    }
 
     #[test]
     fn stable_completion_protocol_codes_serialize_as_snake_case() {

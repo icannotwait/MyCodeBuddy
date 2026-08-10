@@ -66,6 +66,44 @@ pub(crate) struct RuntimeSnapshot {
     pub(crate) webview_log_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebviewRuntimeDrift {
+    Unchanged,
+    Changed {
+        startup: String,
+        available_now: String,
+    },
+    Unknown,
+}
+
+fn normalized_runtime_version(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+pub(crate) fn project_webview_runtime_drift(
+    startup: Option<&str>,
+    available_now: Result<&str, &str>,
+) -> WebviewRuntimeDrift {
+    let Some(startup) = normalized_runtime_version(startup) else {
+        return WebviewRuntimeDrift::Unknown;
+    };
+    let Ok(available_now) = available_now else {
+        return WebviewRuntimeDrift::Unknown;
+    };
+    let Some(available_now) = normalized_runtime_version(Some(available_now)) else {
+        return WebviewRuntimeDrift::Unknown;
+    };
+
+    if startup == available_now {
+        WebviewRuntimeDrift::Unchanged
+    } else {
+        WebviewRuntimeDrift::Changed {
+            startup: startup.to_string(),
+            available_now: available_now.to_string(),
+        }
+    }
+}
+
 pub(crate) struct ProcessState {
     started_at: Instant,
     pub(crate) snapshot: RuntimeSnapshot,
@@ -79,6 +117,58 @@ pub(crate) fn current_process_state() -> &'static ProcessState {
     PROCESS_STATE
         .get()
         .expect("window diagnostics must be initialized before window creation")
+}
+
+#[cfg(any(windows, test))]
+fn sanitize_webview_runtime_query_error(error: Option<&str>) -> Option<String> {
+    error.map(sanitize_diagnostic_text)
+}
+
+#[cfg(windows)]
+pub(crate) fn current_webview_runtime_drift() -> WebviewRuntimeDrift {
+    let startup = current_process_state().snapshot.webview_version.as_deref();
+    let available_now = tauri::webview_version().map_err(|error| error.to_string());
+    let drift =
+        project_webview_runtime_drift(startup, available_now.as_deref().map_err(String::as_str));
+    if drift == WebviewRuntimeDrift::Unknown {
+        let query_error = sanitize_webview_runtime_query_error(
+            available_now.as_deref().err().map(String::as_str),
+        );
+        tracing::warn!(
+            target: "codeg::window",
+            event = "webview_runtime_drift_unknown",
+            startup,
+            available_now = available_now.as_deref().ok(),
+            query_error = query_error.as_deref(),
+        );
+    }
+    drift
+}
+
+#[cfg(any(not(windows), test))]
+fn non_windows_webview_runtime_drift() -> WebviewRuntimeDrift {
+    WebviewRuntimeDrift::Unchanged
+}
+
+#[cfg(not(windows))]
+pub(crate) fn current_webview_runtime_drift() -> WebviewRuntimeDrift {
+    non_windows_webview_runtime_drift()
+}
+
+pub(crate) fn emit_webview_runtime_drift_blocked_popout(
+    label: &str,
+    operation_id: &str,
+    startup: &str,
+    available_now: &str,
+) {
+    tracing::warn!(
+        target: "codeg::window",
+        event = "webview_runtime_drift_blocked_popout",
+        label,
+        operation_id,
+        startup,
+        available_now,
+    );
 }
 
 #[cfg(any(windows, test))]
@@ -1101,6 +1191,63 @@ mod tests {
                 source: None,
             })),
         }
+    }
+
+    #[test]
+    fn webview_runtime_drift_projects_trimmed_exact_versions() {
+        assert_eq!(
+            project_webview_runtime_drift(Some(" 151.0.4129.59 "), Ok("151.0.4129.59")),
+            WebviewRuntimeDrift::Unchanged
+        );
+        assert_eq!(
+            project_webview_runtime_drift(Some("151.0.4129.59"), Ok("151.0.4129.72")),
+            WebviewRuntimeDrift::Changed {
+                startup: "151.0.4129.59".to_string(),
+                available_now: "151.0.4129.72".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn webview_runtime_drift_projects_unavailable_or_blank_as_unknown() {
+        for drift in [
+            project_webview_runtime_drift(None, Ok("151.0.4129.72")),
+            project_webview_runtime_drift(Some(""), Ok("151.0.4129.72")),
+            project_webview_runtime_drift(Some("   "), Ok("151.0.4129.72")),
+            project_webview_runtime_drift(Some("151.0.4129.59"), Ok("\t\r\n")),
+            project_webview_runtime_drift(Some("151.0.4129.59"), Err("loader unavailable")),
+        ] {
+            assert_eq!(drift, WebviewRuntimeDrift::Unknown);
+        }
+    }
+
+    #[test]
+    fn webview_runtime_drift_does_not_apply_three_component_semver_rules() {
+        assert_eq!(
+            project_webview_runtime_drift(Some("151.0.4129.059"), Ok("151.0.4129.59")),
+            WebviewRuntimeDrift::Changed {
+                startup: "151.0.4129.059".to_string(),
+                available_now: "151.0.4129.59".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn non_windows_webview_runtime_drift_is_unchanged_without_query() {
+        assert_eq!(
+            non_windows_webview_runtime_drift(),
+            WebviewRuntimeDrift::Unchanged
+        );
+    }
+
+    #[test]
+    fn webview_runtime_query_error_diagnostic_is_sanitized() {
+        let raw = r#"loader failed at C:\Users\secret\runtime.dll https://token.example/a"#;
+        let safe = sanitize_webview_runtime_query_error(Some(raw)).expect("safe error");
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("token.example"));
+        assert!(safe.chars().count() <= DIAGNOSTIC_TEXT_MAX_CHARS);
+        assert_eq!(sanitize_webview_runtime_query_error(None), None);
     }
 
     #[test]
