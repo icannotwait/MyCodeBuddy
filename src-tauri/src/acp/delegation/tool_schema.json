@@ -339,7 +339,7 @@
   },
   {
     "name": "settle_workflow_gate",
-    "description": "Root-only Design/Plan settle; v1 or v2 shape selected by durable protocol.",
+    "description": "Root-only protocol-v2 Design/Plan settlement from durable platform evidence.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -349,32 +349,10 @@
         "expected_graph_revision",
         "summary"
       ],
-      "oneOf": [
-        {
-          "required": ["manifest_revision", "gate_cycle", "outcome", "evidence"]
-        },
-        {
-          "propertyNames": {
-            "not": {
-              "enum": ["manifest_revision", "gate_cycle", "outcome", "evidence"]
-            }
-          }
-        }
-      ],
       "properties": {
         "workflow_id": { "type": "string" },
         "gate_id": { "type": "string" },
         "expected_graph_revision": { "type": "integer", "minimum": 0 },
-        "manifest_revision": { "type": "integer", "minimum": 0 },
-        "gate_cycle": { "type": "integer", "minimum": 1 },
-        "outcome": {
-          "type": "string",
-          "enum": ["approved", "changes_requested", "blocked"]
-        },
-        "evidence": {
-          "type": "object",
-          "required": ["kind"]
-        },
         "expected_review_round": { "type": "integer", "minimum": 1 },
         "expected_gate_cycle": { "type": "integer", "minimum": 1 },
         "expected_outcome": {
@@ -383,18 +361,6 @@
         },
         "recovery_authorization_id": { "type": "string" },
         "summary": { "type": "string" }
-      }
-    }
-  },
-  {
-    "name": "restart_legacy_workflow",
-    "description": "Return one empty v2 successor; legacy source stays read-only.",
-    "inputSchema": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source_conversation_id"],
-      "properties": {
-        "source_conversation_id": { "type": "integer" }
       }
     }
   }

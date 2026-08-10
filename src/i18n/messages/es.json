@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "Watchdog suave (segundos)",
-      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). 0 desactiva el marcado de estancamiento. No cancela ni cambia la ruta.",
-      "completionDefaultMode": "Modo de creación de finalizaciones",
-      "completionCreations": "{mode}: {count} creaciones",
-      "completionSamples": "{count} muestras terminales",
-      "completionMinimumProgress": "{count} / {minimum} muestras mínimas",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "El despliegue espera alcanzar el mínimo de muestras",
-        "may_expand": "El despliegue puede ampliarse",
-        "stop_role_mismatch": "Despliegue pausado: discrepancia de rol superior al 1%",
-        "stop_needs_decision": "Despliegue pausado: decisiones necesarias superiores al 5%"
-      }
+      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). 0 desactiva el marcado de estancamiento. No cancela ni cambia la ruta."
     },
     "actions": {
       "dragSort": "Arrastrar para reordenar",
@@ -2790,11 +2778,9 @@
         "completionStale": "Esta decisión está obsoleta. Vuelve a cargar el flujo de trabajo.",
         "completionConflict": "Ya se confirmó un resultado diferente.",
         "completionLegacyReadOnly": "El flujo de trabajo heredado es de solo lectura",
-        "completionLegacyRestart": "Reiniciar con el protocolo de finalización v2",
         "completionLegacySource": "Flujo de origen heredado #{conversation}",
         "completionLegacySuccessor": "Flujo sucesor #{conversation}",
         "completionAutomaticWake": "La orquestación raíz se reanudó automáticamente",
-        "completionManualRootResume": "Reanudar la orquestación raíz",
         "completionOutcome": {
           "approve": "Aprobar",
           "approve_with_minors": "Aprobar con cambios menores",

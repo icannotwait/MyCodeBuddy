@@ -276,6 +276,7 @@ pub struct BrokerPublishWorkflowRequest {
 /// Settle a Design/Plan document gate for one cycle. Backs
 /// `settle_workflow_gate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrokerSettleWorkflowRequest {
     pub token: String,
     pub workflow_id: String,
@@ -289,16 +290,6 @@ pub struct BrokerSettleWorkflowRequest {
     pub expected_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate_cycle: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
-    /// Tagged `design` or `plan` evidence. Listener deserializes this into the
-    /// canonical store evidence type so nested validation stays in Rust.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<Value>,
     pub summary: String,
 }
 
@@ -360,12 +351,6 @@ pub struct BrokerGetWorkflowStateRequest {
     pub workflow_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrokerRestartLegacyWorkflowRequest {
-    pub token: String,
-    pub source_conversation_id: i64,
-}
-
 /// Ask the user to authorize the central recovery action derived for an owned
 /// delegation task or root workflow. Action/target/warning fields are omitted
 /// intentionally: the listener derives them from durable state.
@@ -425,7 +410,6 @@ pub enum BrokerMessage {
     SettleWorkflow(BrokerSettleWorkflowRequest),
     CompleteWork(BrokerCompleteWorkRequest),
     GetWorkflowState(BrokerGetWorkflowStateRequest),
-    RestartLegacyWorkflow(BrokerRestartLegacyWorkflowRequest),
     RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest),
     RecoverWorkflow(BrokerRecoverWorkflowRequest),
 }
@@ -700,18 +684,6 @@ pub async fn client_get_workflow_state_round_trip(
     req: &BrokerGetWorkflowStateRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::GetWorkflowState(req.clone())).await
-}
-
-/// Dispatch `restart_legacy_workflow` and read the linked successor projection.
-pub async fn client_restart_legacy_workflow_round_trip(
-    socket_path: &str,
-    req: &BrokerRestartLegacyWorkflowRequest,
-) -> io::Result<BrokerResponse> {
-    message_round_trip(
-        socket_path,
-        &BrokerMessage::RestartLegacyWorkflow(req.clone()),
-    )
-    .await
 }
 
 /// Dispatch a blocking typed recovery authorization request.

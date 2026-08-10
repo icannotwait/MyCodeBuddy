@@ -1,78 +1,91 @@
-# Task 8 Report — Full verification matrix + residual cleanup
-
-**Branch:** `feat/delegation-promote-reliability`
-**Worktree:** `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`
-**Date:** 2026-07-27
-**Implementer:** Grok
-**Base HEAD:** `fe26132e` (Tasks 1–7 complete)
+# Task 8 Report: Backend Rollout, Settings, And Obsolete Metrics Removal
 
 ## Status
 
-**COMPLETE with residual concern** — functional matrix commands 2–9 pass after residual cleanup. Workspace `cargo fmt --check` remains **FAIL** on ~54 files outside the plan File Map (pre-existing style drift, not introduced by Tasks 1–7). All mapped Rust paths are rustfmt-clean. Literal matrix: **8 green + 1 justified formatter exception**.
+**IMPLEMENTATION COMPLETE; INDEPENDENT CODEX AND GROK REVIEW PENDING**
 
-## Plan File Map amendment (fix round 1)
+- Work unit: `task|8|implementer|codex|none`
+- Scope: Completion Protocol V2-Only plan Task 8 only
+- Baseline HEAD: `dda2f4f4ee7fc840d1a2803d8550adfb434686f2`
+- Producer commit: `1f8da1184a59f985ea510576430952be7f997a8f`
+- Task 9 frontend work: not started
 
-`docs/superpowers/plans/2026-07-26-delegation-promote-reliability.md` File Map now includes the two test-only fallout paths already fixed in residual commit `b509917d`:
+## Implementation
 
-| Path | Responsibility |
-| --- | --- |
-| `src-tauri/src/acp/delegation/attention.rs` | Task 8 test-only residual: bind-before-promote in fixture helpers after Task 3/4 claim filter |
-| `src-tauri/tests/delegation_session_reuse_integration.rs` | Task 8 test-only residual: bind-before-promote + `Ok(_)` for `PersistedRun` |
+- Deleted rollout configuration, selection/source types, profile-key parsing,
+  rollout window decisions, and the rollout-only listener/manager constructors.
+- Removed rollout state from desktop, server, embedded web, `AppState`, and
+  test bootstrap paths.
+- Removed the Tauri command, Axum handler, and HTTP route for completion
+  protocol settings.
+- Removed creation-mode, shadow comparison, rollout-window/decision, and
+  restart-outcome telemetry, including their producers and serialized fields.
+- Removed shadow comparison execution and its obsolete tests.
+- Retained the fixed v2 identity and Task 2 startup rejection based solely on
+  removed environment-variable presence.
+- Retained completion intent-source, resolution/outcome, evidence/decision,
+  attention/outbox, artifact-recovery, continuation, and final-state metrics.
+- Retained `CompletionRootWakeQueue`, attention outbox replay, and automatic
+  root wake for a valid persisted v2 workflow.
+- Did not modify frontend code or historical protocol read behavior.
 
-No production behavior change in this amendment.
+## TDD Evidence
 
-## Residual fixes applied (all within amended File Map)
+The new transport absence test failed before implementation because
+`POST /api/get_completion_protocol_settings` returned `200` with rollout data.
+After route removal it reaches the repository's authenticated unknown-command
+fallback and returns typed `501 not_implemented`; the Tauri registration is
+also absent.
 
-| Area | Change |
-| --- | --- |
-| `run_store.rs` | rustfmt; clippy: `#[allow(large_enum_variant)]` on `PromoteTxnResult`; needless-borrow / bool-comparison test fixes |
-| `broker.rs` | rustfmt; `#[allow(too_many_arguments)]` on `settle_post_accept_admission_failure` |
-| `metrics.rs` | rustfmt; `#[allow(too_many_arguments)]` on `emit_promote_structured_log` |
-| `store.rs` | rustfmt; bind-before-promote in `db_store_settle_with_final_runtime_stats_via_run_row` |
-| `tool_schema.json` + `companion.rs` | Trim descriptions enough for Grok stdio tools/list budget (≤7680) while keeping essential guidance phrases |
-| `listener.rs`, `types.rs`, `manager.rs`, `companion.rs` | rustfmt only |
-| `attention.rs` (test fixture) | bind-before-promote — Task 3/4 claim filter fallout |
-| `tests/delegation_session_reuse_integration.rs` | `Ok(_)` + bind-before-promote for seed/race promote paths |
+The new metrics JSON test failed before implementation because
+`creation_modes` remained serialized. After cleanup, all obsolete metric
+families are absent while the retained v2 metric families and representative
+counters remain present.
 
-## Full matrix results
+The positive replay regression persists a real `(2, v2_enforce)` workflow,
+inserts a typed completion-resolution outbox row, drains it through a recording
+`CompletionRootWakeQueue`, and observes exactly one root wake with one dispatch
+attempt and non-null delivery acknowledgement.
 
-| # | Command | Result | Notes |
-| --- | --- | --- | --- |
-| 1 | `cargo fmt --check` | **FAIL** | ~54 files outside File Map; File Map rustfmt **PASS** (justified residual) |
-| 2 | `cargo check` | **PASS** | exit 0 |
-| 3 | `cargo test --features test-utils` | **PASS** | lib 3264 passed / 1 ignored; all integration binaries green |
-| 4 | `cargo clippy --all-targets --features test-utils -- -D warnings` | **PASS** | exit 0 |
-| 5 | `cargo check --no-default-features --bin codeg-server` | **PASS** | exit 0 |
-| 6 | `cargo test --no-default-features --bin codeg-server --lib` | **PASS** | 3188 passed / 1 ignored |
-| 7 | `cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings` | **PASS** | exit 0 |
-| 8 | `cargo check --no-default-features --bin codeg-mcp` | **PASS** | exit 0 |
-| 9 | `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings` | **PASS** | exit 0 |
+## Verification
 
-Logs under `.superpowers/sdd/task-8-final-*.log` and earlier diagnostic logs.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_transport_parity --features test-utils completion_rollout_surface_is_absent`
+  - Pass: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-utils completion_metrics_v2_only`
+  - Pass: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_v2 --features test-utils valid_v2_attention_outbox_replay_wakes_root_once_and_acknowledges_delivery`
+  - Pass: 1 passed, 0 failed.
+- Focused retained metrics integration and listener fixed-v2 store-guard tests
+  - Pass: 2 passed, 0 failed.
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+  - Pass.
+- `cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features server --bin codeg-server`
+  - Pass.
+- `cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --bin codeg-mcp`
+  - Pass.
+- Plan-exact forbidden-symbol search
+  - Pass: no rollout, settings, shadow, or restart metric symbols remain in
+    `src-tauri/src` or `src-tauri/tests`.
+- Retention search
+  - Pass: root-wake and v2 intent, decision/evidence, attention/outbox,
+    artifact, continuation, and typed outcome metrics remain.
+- `git diff --check`, producer allowlist, and cached diff checks
+  - Pass: producer commit contains exactly 14 declared Task 8 files.
 
-## Failures found → fixed
+The desktop build continues to emit the existing zero-byte `codeg-mcp` sidecar
+packaging warning. It is outside this producer diff. The full Rust suite and
+Clippy matrix are reserved for later plan tasks; Task 8 ran its specified
+focused tests and three runtime checks.
 
-1. **`promote_running` zero-row claim** after Task 3/4 claim filter (`child_connection_id` must be pre-bound): fixed test helpers in `store.rs`, `attention.rs`, and session-reuse integration test.
-2. **tools/list stdio budget** (7914 > 7680) after Task 5 admission recovery text: trimmed `tool_schema.json` / legacy delegate description while preserving phrase checks.
-3. **Clippy `-D warnings`**: too-many-arguments on intentional Task 4/7 APIs (allow); large enum variant on internal `PromoteTxnResult` (allow); test needless-borrow / bool-comparison.
-4. **Integration match** `Ok(())` vs `Result<PersistedRun,_>`: `Ok(_)`.
+## Producer Commit
 
-## Concerns
+- `1f8da1184a59f985ea510576430952be7f997a8f` -
+  `refactor: remove completion protocol rollout state`
 
-1. **Full `cargo fmt --check` is still red** on non-File-Map paths (connection, auto_title, commands, tests, tool_watchdog, etc.). Formatting those would require a separate chore; Task 8 only formatted mapped paths. This is the sole justified incomplete matrix command.
-2. Sidecar placeholder warning (`codeg-mcp` missing binary) is environmental noise; does not fail checks.
+## Conclusion
 
-## Spec coverage (Task 8)
+done_with_concerns
 
-| Spec area | Covered by matrix / residual |
-| --- | --- |
-| Full verification | Yes — commands 2–9 green; command 1 justified workspace-fmt residual outside File Map |
-| Residual scope | Yes — residual code limited to amended File Map (including two test-only fallout paths); schema budget; clippy allows; rustfmt |
-
-## Commits
-
-| Hash | Message |
-| --- | --- |
-| `b509917d` | `chore(delegation): green verification matrix for promote reliability` |
-| `9d92fe92` | `docs(delegation): Task 8 full verification matrix report` |
-| (fix r1) | `docs(delegation): amend Task 8 File Map for test fallout paths` |
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Removed backend completion rollout/settings state plus shadow/restart telemetry while retaining fixed-v2 intent, evidence, attention, artifact, typed outcome metrics, env rejection, and root-wake replay.","commits":[{"sha":"1f8da1184a59f985ea510576430952be7f997a8f","subject":"refactor: remove completion protocol rollout state"}],"tests":{"status":"passed","passed":5,"failed":0,"summary":"Five focused transport, metrics, listener, and root-wake regressions plus desktop, server, and codeg-mcp checks passed; removal and retention gates were clean."},"concerns":["The existing zero-byte codeg-mcp sidecar packaging warning remains outside this diff.","Independent Codex and Grok review is pending before Task 9."],"report_file":".superpowers/sdd/task-8-report.md"}
+-->

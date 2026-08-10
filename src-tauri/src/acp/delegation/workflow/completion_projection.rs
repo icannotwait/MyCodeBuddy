@@ -574,10 +574,17 @@ pub(crate) async fn load_workflow_completion_projection_batch<C: ConnectionTrait
             let preload = validation_context_by_workspace
                 .get(workspace)
                 .expect("completion validation preload was inserted");
-            let validated = validate_preloaded_completion_evidence_with_context(
+            let validated = match validate_preloaded_completion_evidence_with_context(
                 conn, run, binding, workflow, node, preload,
             )
-            .await?;
+            .await
+            {
+                Ok(validated) => validated,
+                Err(CompletionEvidenceError::Persistence(message)) => {
+                    return Err(CompletionEvidenceError::Persistence(message));
+                }
+                Err(_) => continue,
+            };
             batch
                 .validated_by_task
                 .insert(binding.task_id.clone(), validated);

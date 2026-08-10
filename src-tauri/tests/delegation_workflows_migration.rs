@@ -153,11 +153,13 @@ async fn delete_workflow_cascades_to_child_tables() {
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
            publication_token, supersedes_approved_revision, structural_revision, \
+           completion_protocol_version, completion_protocol_mode, legacy_source_workflow_id, \
            created_at, updated_at \
          ) VALUES ( \
-           'wf-1', 1, 'brainstorm_to_delivery', 1, \
-           1, 1, 'estimated', 'workflow_manifest_v1', \
+           'wf-1', 1, 'brainstorm_to_delivery', 2, \
+           1, 1, 'estimated', 'workflow_manifest_v2', \
            'pub-token-1', NULL, 1, \
+           2, 'v2_enforce', NULL, \
            '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
          )"))
         .await
@@ -428,11 +430,13 @@ async fn unique_parent_kind_and_publication_token() {
     db.execute(sql("INSERT INTO delegation_workflows ( \
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
-           publication_token, created_at, updated_at \
+           publication_token, completion_protocol_version, completion_protocol_mode, \
+           legacy_source_workflow_id, created_at, updated_at \
          ) VALUES ( \
-           'wf-a', 1, 'brainstorm_to_delivery', 1, \
-           1, 1, 'skeleton', 'workflow_manifest_v1', \
-           'token-a', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
+           'wf-a', 1, 'brainstorm_to_delivery', 2, \
+           1, 1, 'skeleton', 'workflow_manifest_v2', \
+           'token-a', 2, 'v2_enforce', NULL, \
+           '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
          )"))
         .await
         .expect("first workflow");
@@ -441,11 +445,13 @@ async fn unique_parent_kind_and_publication_token() {
         .execute(sql("INSERT INTO delegation_workflows ( \
                workflow_id, parent_conversation_id, workflow_kind, schema_version, \
                active_manifest_revision, graph_revision, workflow_state, capability_version, \
-               publication_token, created_at, updated_at \
+               publication_token, completion_protocol_version, completion_protocol_mode, \
+               legacy_source_workflow_id, created_at, updated_at \
              ) VALUES ( \
-               'wf-b', 1, 'brainstorm_to_delivery', 1, \
-               1, 1, 'skeleton', 'workflow_manifest_v1', \
-               'token-b', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
+               'wf-b', 1, 'brainstorm_to_delivery', 2, \
+               1, 1, 'skeleton', 'workflow_manifest_v2', \
+               'token-b', 2, 'v2_enforce', NULL, \
+               '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
              )"))
         .await;
     assert!(
@@ -457,11 +463,13 @@ async fn unique_parent_kind_and_publication_token() {
         .execute(sql("INSERT INTO delegation_workflows ( \
                workflow_id, parent_conversation_id, workflow_kind, schema_version, \
                active_manifest_revision, graph_revision, workflow_state, capability_version, \
-               publication_token, created_at, updated_at \
+               publication_token, completion_protocol_version, completion_protocol_mode, \
+               legacy_source_workflow_id, created_at, updated_at \
              ) VALUES ( \
-               'wf-c', 1, 'other_kind', 1, \
-               1, 1, 'skeleton', 'workflow_manifest_v1', \
-               'token-a', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
+               'wf-c', 1, 'other_kind', 2, \
+               1, 1, 'skeleton', 'workflow_manifest_v2', \
+               'token-a', 2, 'v2_enforce', NULL, \
+               '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
              )"))
         .await;
     assert!(

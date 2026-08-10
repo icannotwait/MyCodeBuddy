@@ -1,7 +1,7 @@
 //! Task / Final execution-gate evaluator (A7 + B3 + B13).
 //!
 //! Pure function over pre-loaded evidence. Document gates use
-//! `settle_workflow_gate_core`; execution gates are projected only.
+//! the v2 workflow settlement store; execution gates are projected only.
 
 use crate::acp::delegation::card_summary::{ReviewVerdict, WorkStatus};
 use crate::acp::delegation::workflow::{CompletionOutcome, ValidatedCompletionEvidence};

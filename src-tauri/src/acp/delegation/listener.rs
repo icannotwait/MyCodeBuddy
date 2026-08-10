@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
-use sea_orm::EntityTrait;
+use sea_orm::{EntityTrait, QuerySelect};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(test, feature = "test-utils"))]
@@ -30,7 +30,6 @@ use crate::acp::delegation::continuation::{
     foreground_mcp_release_fence, ForegroundMcpReleaseOwner,
 };
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
-use crate::acp::delegation::metrics::CompletionRestartOutcome;
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, RecoveryAction, RecoveryRailSnapshot, RequestedRecoveryOperation,
 };
@@ -42,9 +41,9 @@ use crate::acp::delegation::transport::{
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
     BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse,
-    BrokerRestartLegacyWorkflowRequest, BrokerSessionRequest, BrokerSettleWorkflowRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
+    CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -55,12 +54,10 @@ use crate::acp::delegation::types::{
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
-    publish_workflow_manifest_with_selection_core, recover_workflow_core,
-    restart_legacy_workflow_if_enforced, select_completion_protocol, settle_workflow_gate_core,
-    settle_workflow_gate_v2_core, CompletionProtocolRolloutConfig, FinalDeliveryGuardResult,
-    ManifestDocument, PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest,
-    SettleWorkflowRequest, SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition,
-    WorkflowStoreError,
+    load_completion_protocol_header, publish_workflow_manifest_core, recover_workflow_core,
+    require_v2_mutation, settle_workflow_gate_v2_core, FinalDeliveryGuardResult, ManifestDocument,
+    PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowV2Request,
+    WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -75,7 +72,9 @@ use crate::acp::recovery_authorization::{
 };
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
-use crate::db::entities::{delegation_workflow, recovery_authorization};
+use crate::db::entities::{
+    delegation_workflow, delegation_workflow_run_binding, recovery_authorization,
+};
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
@@ -358,7 +357,6 @@ pub struct DelegationListener {
     pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     /// Shared `EventEmitter` for workflow graph live events (publish/settle).
     pub workflow_emitter: EventEmitter,
-    pub completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
     recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
     #[cfg(any(test, feature = "test-utils"))]
     status_release_decision_gate: Arc<StatusReleaseDecisionGate>,
@@ -425,33 +423,6 @@ impl DelegationListener {
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
         workflow_emitter: EventEmitter,
     ) -> Arc<Self> {
-        Self::new_with_workflow_runtime(
-            broker,
-            tokens,
-            leases,
-            parent_lookup,
-            feedback,
-            questions,
-            session_info,
-            wait_cancel,
-            workflow_emitter,
-            Arc::new(CompletionProtocolRolloutConfig::default()),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_workflow_runtime(
-        broker: Arc<DelegationBroker>,
-        tokens: Arc<TokenRegistry>,
-        leases: Arc<CompanionLeaseRegistry>,
-        parent_lookup: Arc<dyn ParentSessionLookup>,
-        feedback: Arc<dyn SessionFeedbackAccess>,
-        questions: Arc<dyn SessionQuestionAccess>,
-        session_info: Arc<dyn SessionInfoAccess>,
-        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
-        workflow_emitter: EventEmitter,
-        completion_protocol_rollout: Arc<CompletionProtocolRolloutConfig>,
-    ) -> Arc<Self> {
         let metrics = broker.metrics();
         let recovery_authorizations = broker
             .run_store()
@@ -467,7 +438,6 @@ impl DelegationListener {
             wait_cancel,
             metrics,
             workflow_emitter,
-            completion_protocol_rollout,
             recovery_authorizations,
             #[cfg(any(test, feature = "test-utils"))]
             status_release_decision_gate: Arc::new(StatusReleaseDecisionGate::default()),
@@ -748,9 +718,6 @@ impl DelegationListener {
             }
             BrokerMessage::GetWorkflowState(req) => {
                 value_response(&self.process_get_workflow_state(req).await)?
-            }
-            BrokerMessage::RestartLegacyWorkflow(req) => {
-                value_response(&self.process_restart_legacy_workflow(req).await)?
             }
             BrokerMessage::RequestRecoveryAuthorization(req) => {
                 let cancelled = CancellationToken::new();
@@ -1627,41 +1594,6 @@ impl DelegationListener {
         Ok((entry, parent_conversation_id))
     }
 
-    async fn restart_legacy_if_required(
-        &self,
-        db: &crate::db::AppDatabase,
-        parent_conversation_id: i32,
-        rollout_subject: Option<(String, Option<String>)>,
-    ) -> Result<
-        Option<crate::acp::delegation::workflow::LegacyWorkflowRestartProjection>,
-        WorkflowStoreError,
-    > {
-        match restart_legacy_workflow_if_enforced(
-            db,
-            parent_conversation_id,
-            rollout_subject,
-            &self.completion_protocol_rollout,
-        )
-        .await
-        {
-            Ok(Some(projection)) => {
-                self.metrics
-                    .record_completion_restart(if projection.idempotent_replay {
-                        CompletionRestartOutcome::Reused
-                    } else {
-                        CompletionRestartOutcome::Created
-                    });
-                Ok(Some(projection))
-            }
-            Ok(None) => Ok(None),
-            Err(error) => {
-                self.metrics
-                    .record_completion_restart(CompletionRestartOutcome::Failed);
-                Err(error)
-            }
-        }
-    }
-
     async fn process_publish_workflow(&self, req: BrokerPublishWorkflowRequest) -> Value {
         let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
             Ok((_, id)) => id,
@@ -1679,58 +1611,17 @@ impl DelegationListener {
                 .to_value();
             }
         };
-        let rollout_subject = document
-            .nodes
-            .iter()
-            .find(|node| {
-                node.role == Some(crate::acp::delegation::workflow::ManifestNodeRole::Author)
-            })
-            .or_else(|| document.nodes.iter().find(|node| node.agent_type.is_some()));
-        let rollout_subject_owned = rollout_subject.map(|node| {
-            (
-                node.agent_type.clone().unwrap_or_else(|| "unknown".into()),
-                node.profile_id.clone(),
-            )
-        });
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, rollout_subject_owned)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
-        let selection = select_completion_protocol(
-            rollout_subject
-                .and_then(|node| node.agent_type.as_deref())
-                .unwrap_or("unknown"),
-            rollout_subject.and_then(|node| node.profile_id.as_deref()),
-            &self.completion_protocol_rollout,
-        );
-        let creation_mode = selection.mode.clone();
-        match publish_workflow_manifest_with_selection_core(
+        match publish_workflow_manifest_core(
             runs.db(),
             &self.workflow_emitter,
             parent_conversation_id,
             PublishWorkflowRequest { document },
-            selection,
         )
         .await
         {
-            Ok(r) => {
-                if r.manifest_revision == 1 && !r.idempotent_replay {
-                    self.metrics
-                        .record_completion_protocol_creation(creation_mode);
-                }
-                serde_json::to_value(r).unwrap_or_else(|e| {
-                    WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
-                })
-            }
+            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
+                WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
+            }),
             Err(e) => workflow_store_error_value(e),
         }
     }
@@ -1743,154 +1634,37 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        let header = match delegation_workflow::Entity::find_by_id(&req.workflow_id)
-            .one(&runs.db().conn)
-            .await
-        {
-            Ok(Some(header)) => header,
-            Ok(None) => {
-                return workflow_store_error_value(WorkflowStoreError::NotFound(req.workflow_id))
-            }
-            Err(error) => {
-                return WorkflowWireError::Internal(format!(
-                    "load workflow settlement protocol: {error}"
-                ))
+        let expected_review_round = match (req.expected_review_round, req.expected_gate_cycle) {
+            (Some(round), Some(cycle)) if round != cycle => {
+                return WorkflowWireError::InvalidArguments(
+                    "expected_review_round and expected_gate_cycle disagree".into(),
+                )
                 .to_value()
             }
+            (round, cycle) => round.or(cycle),
         };
-        if header.parent_conversation_id != parent_conversation_id {
-            return workflow_store_error_value(WorkflowStoreError::CrossParent {
-                workflow_id: header.workflow_id,
-                expected_parent: parent_conversation_id,
-                actual_parent: header.parent_conversation_id,
-            });
-        }
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
-
-        let result = if header.completion_protocol_version == 2 {
-            if req.manifest_revision.is_some()
-                || req.gate_cycle.is_some()
-                || req.outcome.is_some()
-                || req.evidence.is_some()
-            {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v2 settlement rejects legacy manifest, cycle, outcome, and evidence fields"
-                        .into(),
-                )
-                .to_value();
-            }
-            let expected_review_round = match (req.expected_review_round, req.expected_gate_cycle) {
-                (Some(round), Some(cycle)) if round != cycle => {
-                    return WorkflowWireError::InvalidArguments(
-                        "expected_review_round and expected_gate_cycle disagree".into(),
-                    )
-                    .to_value()
-                }
-                (round, cycle) => round.or(cycle),
-            };
-            let expected_outcome = match req.expected_outcome.as_deref() {
-                Some(value) => match parse_gate_settlement_outcome(value) {
-                    Ok(outcome) => Some(outcome),
-                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
-                },
-                None => None,
-            };
-            settle_workflow_gate_v2_core(
-                runs.db(),
-                &self.workflow_emitter,
-                parent_conversation_id,
-                SettleWorkflowV2Request {
-                    workflow_id: req.workflow_id,
-                    gate_id: req.gate_id,
-                    expected_graph_revision: req.expected_graph_revision,
-                    expected_review_round,
-                    expected_outcome,
-                    summary: req.summary,
-                    recovery_authorization_id: req.recovery_authorization_id,
-                },
-            )
-            .await
-        } else {
-            if req.expected_review_round.is_some()
-                || req.expected_gate_cycle.is_some()
-                || req.expected_outcome.is_some()
-            {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires the legacy request shape".into(),
-                )
-                .to_value();
-            }
-            let outcome = match req.outcome.as_deref() {
-                Some(value) => match parse_gate_settlement_outcome(value) {
-                    Ok(outcome) => outcome,
-                    Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
-                },
-                None => {
-                    return WorkflowWireError::InvalidArguments(
-                        "protocol-v1 settlement requires outcome".into(),
-                    )
-                    .to_value()
-                }
-            };
-            let evidence = match req.evidence {
-                Some(value) => match serde_json::from_value(value) {
-                    Ok(evidence) => evidence,
-                    Err(error) => {
-                        return WorkflowWireError::InvalidArguments(format!(
-                            "settle_workflow_gate evidence: {error}"
-                        ))
-                        .to_value()
-                    }
-                },
-                None => {
-                    return WorkflowWireError::InvalidArguments(
-                        "protocol-v1 settlement requires evidence".into(),
-                    )
-                    .to_value()
-                }
-            };
-            let Some(manifest_revision) = req.manifest_revision else {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires manifest_revision".into(),
-                )
-                .to_value();
-            };
-            let Some(gate_cycle) = req.gate_cycle else {
-                return WorkflowWireError::InvalidArguments(
-                    "protocol-v1 settlement requires gate_cycle".into(),
-                )
-                .to_value();
-            };
-            settle_workflow_gate_core(
-                runs.db(),
-                &self.workflow_emitter,
-                parent_conversation_id,
-                SettleWorkflowRequest {
-                    workflow_id: req.workflow_id,
-                    manifest_revision,
-                    gate_id: req.gate_id,
-                    expected_graph_revision: req.expected_graph_revision,
-                    gate_cycle,
-                    outcome,
-                    evidence,
-                    summary: req.summary,
-                    recovery_authorization_id: req.recovery_authorization_id,
-                },
-            )
-            .await
+        let expected_outcome = match req.expected_outcome.as_deref() {
+            Some(value) => match parse_gate_settlement_outcome(value) {
+                Ok(outcome) => Some(outcome),
+                Err(message) => return WorkflowWireError::InvalidArguments(message).to_value(),
+            },
+            None => None,
         };
+        let result = settle_workflow_gate_v2_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            SettleWorkflowV2Request {
+                workflow_id: req.workflow_id,
+                gate_id: req.gate_id,
+                expected_graph_revision: req.expected_graph_revision,
+                expected_review_round,
+                expected_outcome,
+                summary: req.summary,
+                recovery_authorization_id: req.recovery_authorization_id,
+            },
+        )
+        .await;
         match result {
             Ok(r) => {
                 if let Some(action) = r.plan_next_action {
@@ -1975,6 +1749,31 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
+        let state = match get_workflow_state_core(
+            runs.db(),
+            parent_conversation_id,
+            req.workflow_id.as_deref(),
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => return workflow_store_error_value(error),
+        };
+        match require_v2_mutation(
+            state.completion_protocol.version,
+            &state.completion_protocol.mode,
+        ) {
+            Ok(()) => {}
+            Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly) => {
+                return serde_json::to_value(state).unwrap_or_else(|error| {
+                    WorkflowWireError::Internal(format!(
+                        "serialize historical workflow state: {error}"
+                    ))
+                    .to_value()
+                });
+            }
+            Err(error) => return workflow_store_error_value(error),
+        }
         match guard_current_final_delivery_core(
             runs.db(),
             &self.workflow_emitter,
@@ -2006,63 +1805,6 @@ impl DelegationListener {
                 WorkflowWireError::Internal(format!("serialize workflow state: {e}")).to_value()
             }),
             Err(e) => workflow_store_error_value(e),
-        }
-    }
-
-    async fn process_restart_legacy_workflow(
-        &self,
-        req: BrokerRestartLegacyWorkflowRequest,
-    ) -> Value {
-        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
-            Ok((_, id)) => id,
-            Err(error) => return error.to_value(),
-        };
-        if i64::from(parent_conversation_id) != req.source_conversation_id {
-            self.metrics
-                .record_completion_restart(CompletionRestartOutcome::Rejected);
-            return workflow_store_error_value(WorkflowStoreError::CrossParent {
-                workflow_id: "legacy_restart".into(),
-                expected_parent: parent_conversation_id,
-                actual_parent: i32::try_from(req.source_conversation_id).unwrap_or_default(),
-            });
-        }
-        let Some(runs) = self.broker.run_store() else {
-            return WorkflowWireError::StoreUnavailable.to_value();
-        };
-        match restart_legacy_workflow_if_enforced(
-            runs.db(),
-            parent_conversation_id,
-            None,
-            &self.completion_protocol_rollout,
-        )
-        .await
-        {
-            Ok(Some(projection)) => {
-                self.metrics
-                    .record_completion_restart(if projection.idempotent_replay {
-                        CompletionRestartOutcome::Reused
-                    } else {
-                        CompletionRestartOutcome::Created
-                    });
-                serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {
-                self.metrics
-                    .record_completion_restart(CompletionRestartOutcome::Rejected);
-                workflow_store_error_value(
-                    WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(
-                        "legacy restart requires current v2_enforce mode".into(),
-                    ),
-                )
-            }
-            Err(error) => {
-                self.metrics
-                    .record_completion_restart(CompletionRestartOutcome::Failed);
-                workflow_store_error_value(error)
-            }
         }
     }
 
@@ -2211,6 +1953,24 @@ impl DelegationListener {
                 "task is not directly owned by this caller",
             ));
         }
+        if let Some(binding) = delegation_workflow_run_binding::Entity::find_by_id(task_id)
+            .one(&runs.db().conn)
+            .await
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
+            })?
+        {
+            let (version, mode) =
+                load_completion_protocol_header(&runs.db().conn, &binding.workflow_id)
+                    .await
+                    .map_err(workflow_store_error_value)?
+                    .ok_or_else(|| {
+                        workflow_store_error_value(WorkflowStoreError::NotFound(
+                            binding.workflow_id.clone(),
+                        ))
+                    })?;
+            require_v2_mutation(version, &mode).map_err(workflow_store_error_value)?;
+        }
         let eligibility = runs
             .build_continue_eligibility(&target)
             .await
@@ -2295,21 +2055,40 @@ impl DelegationListener {
                 ));
             }
         }
-        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+        let owner = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .select_only()
+            .column(delegation_workflow::Column::ParentConversationId)
+            .into_tuple::<i32>()
             .one(&runs.db().conn)
             .await
-            .map_err(|_| {
-                recovery_wire_error("recovery_subject_load_failed", "failed to load workflow")
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
             })?
             .ok_or_else(|| {
                 recovery_wire_error("recovery_subject_not_found", "workflow was not found")
             })?;
-        if header.parent_conversation_id != parent_conversation_id {
+        if owner != parent_conversation_id {
             return Err(recovery_wire_error(
                 "recovery_subject_not_owned",
                 "workflow is not owned by this caller",
             ));
         }
+        let (version, mode) = load_completion_protocol_header(&runs.db().conn, workflow_id)
+            .await
+            .map_err(workflow_store_error_value)?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "workflow was not found")
+            })?;
+        require_v2_mutation(version, &mode).map_err(workflow_store_error_value)?;
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&runs.db().conn)
+            .await
+            .map_err(|error| {
+                workflow_store_error_value(WorkflowStoreError::Persistence(error.to_string()))
+            })?
+            .ok_or_else(|| {
+                recovery_wire_error("recovery_subject_not_found", "workflow was not found")
+            })?;
         let snapshot =
             crate::acp::delegation::workflow::store::load_workflow_recovery_snapshot_conn(
                 &runs.db().conn,
@@ -2469,19 +2248,6 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        match self
-            .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
-            .await
-        {
-            Ok(Some(projection)) => {
-                return serde_json::to_value(projection).unwrap_or_else(|error| {
-                    WorkflowWireError::Internal(format!("serialize legacy restart result: {error}"))
-                        .to_value()
-                })
-            }
-            Ok(None) => {}
-            Err(error) => return workflow_store_error_value(error),
-        }
         match recover_workflow_core(
             runs.db(),
             &self.workflow_emitter,
@@ -2525,27 +2291,6 @@ impl DelegationListener {
             Some(id) => id,
             None => return cancel("parent has no active conversation"),
         };
-
-        if entry.role == CompanionRole::Root && entry.workflow_v2 {
-            if let Some(runs) = self.broker.run_store() {
-                match self
-                    .restart_legacy_if_required(runs.db(), parent_conversation_id, None)
-                    .await
-                {
-                    Ok(Some(projection)) => {
-                        return report_failed(
-                            "legacy_completion_protocol_restart_required",
-                            &format!(
-                            "legacy workflow is read-only; continue in successor conversation {}",
-                            projection.successor_conversation_id
-                        ),
-                        )
-                    }
-                    Ok(None) => {}
-                    Err(error) => return report_failed(error.code(), &error.to_string()),
-                }
-            }
-        }
 
         let work_unit_key = match parse_work_unit_key(&req.input) {
             Ok(key) => key,
@@ -2976,11 +2721,14 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
         WorkflowStoreError::SummaryTooLarge => "summary_too_large",
         WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
-        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_) => {
-            "legacy_completion_protocol_restart_required"
+        WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
+            "legacy_completion_protocol_read_only"
         }
-        WorkflowStoreError::LegacyCompletionProtocolRestartInvalid(_) => {
-            "legacy_completion_protocol_restart_invalid"
+        WorkflowStoreError::UnsupportedCompletionProtocol { .. } => {
+            "unsupported_completion_protocol"
+        }
+        WorkflowStoreError::UnsupportedCompletionProtocolHeader(_) => {
+            "unsupported_completion_protocol"
         }
         WorkflowStoreError::Busy(_) => "busy",
         WorkflowStoreError::WorkflowRecoveryNotAvailable => "workflow_recovery_not_available",
@@ -8409,6 +8157,7 @@ mod tests {
     mod complete_work_contract {
         use super::*;
         use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::store::TaskStoreError;
         use crate::acp::delegation::transport::BrokerCompleteWorkRequest;
         use crate::acp::delegation::workflow::{
             accept_complete_work_txn_with_test_control, load_completion_projection,
@@ -8693,6 +8442,13 @@ mod tests {
             completion_tool_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
         }
 
+        async fn completion_tool_fixture_before_v2_only() -> CompletionToolFixture {
+            completion_tool_fixture_with_db(Arc::new(
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+            ))
+            .await
+        }
+
         #[tokio::test]
         async fn broker_accepts_only_live_bound_v2_child_and_orders_distinct_calls() {
             let fixture = completion_tool_fixture().await;
@@ -8751,6 +8507,56 @@ mod tests {
             let run = fixture.run().await;
             assert_eq!(run.status, DelegationRunStatus::Running);
             assert_eq!(run.completion_evidence_json, None);
+        }
+
+        #[tokio::test]
+        async fn historical_protocol_mutation_matrix_complete_work() {
+            use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+            for (index, version, mode, expected_code) in [
+                (0, 1, V1, "legacy_completion_protocol_read_only"),
+                (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+                (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+                (3, 2, V1, "unsupported_completion_protocol"),
+                (4, 2, V2Shadow, "unsupported_completion_protocol"),
+            ] {
+                let fixture = completion_tool_fixture_before_v2_only().await;
+                let workflow = delegation_workflow::Entity::find_by_id(WORKFLOW_ID)
+                    .one(&fixture.db.conn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut workflow: delegation_workflow::ActiveModel = workflow.into();
+                workflow.completion_protocol_version = Set(version);
+                workflow.completion_protocol_mode = Set(mode);
+                workflow.update(&fixture.db.conn).await.unwrap();
+                crate::db::test_helpers::complete_historical_completion_protocol_migrations(
+                    &fixture.db,
+                )
+                .await;
+                let before = delegation_completion_tool_intent::Entity::find()
+                    .all(&fixture.db.conn)
+                    .await
+                    .unwrap();
+
+                let response = fixture
+                    .complete(
+                        fixture.v2_child_token(),
+                        &format!("task-4-rejected-call-{index}"),
+                        approve(),
+                    )
+                    .await;
+
+                assert_eq!(response_code(&response), Some(expected_code));
+                assert_eq!(
+                    delegation_completion_tool_intent::Entity::find()
+                        .all(&fixture.db.conn)
+                        .await
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(fixture.run().await.status, DelegationRunStatus::Running);
+            }
         }
 
         #[tokio::test]
@@ -9118,7 +8924,17 @@ mod tests {
             let error = load_workflow_child_mcp_binding(&fixture.db, TASK_ID)
                 .await
                 .unwrap_err();
-            assert!(matches!(error, CompleteWorkError::Persistence(_)));
+            assert!(matches!(
+                error,
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "unsupported_completion_protocol"
+            ));
+            fixture
+                .db
+                .conn
+                .execute_unprepared("PRAGMA foreign_keys=ON")
+                .await
+                .unwrap();
         }
     }
 
@@ -9152,6 +8968,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_mutations_reach_v2_store_guards() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{
+            complete_historical_completion_protocol_migrations,
+            historical_completion_protocol_db_before_v2_only, seed_conversation, seed_folder,
+        };
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = Arc::new(historical_completion_protocol_db_before_v2_only().await);
+        let folder = seed_folder(&db, "/tmp/workflow-v2-listener-selection-guard").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let document: ManifestDocument = serde_json::from_value(json!({
+            "schema_version": 2,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "listener-selection-guard",
+            "workflow_state": "skeleton",
+            "plan_target_rel_path": "docs/superpowers/plans/selection-guard.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "phases": [
+                {"id": "design", "kind": "design"},
+                {"id": "plan", "kind": "plan"}
+            ],
+            "nodes": [{
+                "id": "plan-author",
+                "kind": "work_unit",
+                "phase_id": "plan",
+                "role": "author",
+                "agent_type": "codex",
+                "profile_id": "selection-canary",
+                "work_unit_key": "plan|docs/superpowers/plans/selection-guard.md|author|codex|selection-canary",
+                "deps": [],
+                "required": true
+            }],
+            "edges": [],
+            "gates": [],
+            "task_policies": []
+        }))
+        .unwrap();
+        let published = publish_workflow_manifest_core(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest {
+                document: document.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let source = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source: delegation_workflow::ActiveModel = source.into();
+        source.completion_protocol_version = Set(1);
+        source.completion_protocol_mode = Set(delegation_workflow::CompletionProtocolMode::V1);
+        source.update(&db.conn).await.unwrap();
+        complete_historical_completion_protocol_migrations(&db).await;
+
+        let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "workflow-selection-guard".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-selection-guard".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                    coordination_v1: false,
+                    delegation_continuation_v1: false,
+                    role: CompanionRole::Root,
+                    workflow_v2: true,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = DelegationListener::new_with_workflow_emitter(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(Some(parent))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+            EventEmitter::Noop,
+        );
+
+        let outcome = listener
+            .process_publish_workflow(BrokerPublishWorkflowRequest {
+                token: "workflow-selection-guard".into(),
+                document: serde_json::to_value(document).unwrap(),
+            })
+            .await;
+
+        assert_eq!(
+            outcome["error"]["code"], "legacy_completion_protocol_read_only",
+            "publication must reach the fixed-v2 store guard directly: {outcome}"
+        );
+        let workflows = delegation_workflow::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            workflows.len(),
+            1,
+            "publication must not create a successor"
+        );
+        assert_eq!(workflows[0].workflow_id, published.workflow_id);
+        assert_eq!(workflows[0].completion_protocol_version, 1);
+        assert_eq!(workflows[0].active_manifest_revision, 1);
+        assert!(workflows[0].legacy_source_workflow_id.is_none());
+
+        let recovery = listener
+            .process_recover_workflow(BrokerRecoverWorkflowRequest {
+                token: "workflow-selection-guard".into(),
+                workflow_id: published.workflow_id.clone(),
+                recovery_authorization_id: "must-not-be-consumed".into(),
+                expected_manifest_revision: 1,
+                correlation_id: "listener-recover-guard".into(),
+            })
+            .await;
+        assert_eq!(
+            recovery["error"]["code"], "legacy_completion_protocol_read_only",
+            "MCP recovery must reach the fixed-v2 store guard directly: {recovery}"
+        );
+        assert_eq!(
+            delegation_workflow::Entity::find()
+                .all(&db.conn)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "MCP recovery must not create a successor workflow"
+        );
+
+        let state = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "workflow-selection-guard".into(),
+                workflow_id: Some(published.workflow_id.clone()),
+            })
+            .await;
+        assert!(
+            state.get("error").is_none(),
+            "historical read failed: {state}"
+        );
+        assert_eq!(state["completion_protocol"]["version"], 1);
+        assert_eq!(state["completion_protocol"]["mode"], "v1");
+    }
+
+    #[tokio::test]
     async fn workflow_feature_disabled_token_is_rejected() {
         let broker = make_broker(Arc::new(MockSpawner::new())).await;
         let tokens = Arc::new(TokenRegistry::default());
@@ -9174,9 +9148,7 @@ mod tests {
             dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
         };
         use crate::acp::delegation::run_store::RunStore;
-        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
-        use sea_orm::{ActiveModelTrait, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/workflow-v2-listener").await;
@@ -9401,10 +9373,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut header: delegation_workflow::ActiveModel = header.into();
-        header.completion_protocol_version = Set(2);
-        header.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
-        header.update(&db.conn).await.unwrap();
+        assert_eq!(header.completion_protocol_version, 2);
+        assert_eq!(
+            header.completion_protocol_mode,
+            delegation_workflow::CompletionProtocolMode::V2Enforce
+        );
 
         let outcome = listener
             .process_get_workflow_state(BrokerGetWorkflowStateRequest {
@@ -9485,38 +9458,30 @@ mod tests {
             "gate_not_ready"
         );
 
-        let plan_evidence = json!({
-            "kind": "plan",
-            "scope": "full",
-            "revision_kind": "initial",
-            "scope_reason": "initial independent review",
-            "covered_author_task_id": "author-task-1",
-            "covered_plan_digest": "sha256:contradictory-plan",
-            "required_reviewer_node_ids": ["plan-reviewer-codex"],
-            "finding_updates": [],
-            "lineage_reset_reason": null
-        });
-        let legacy_result = call_companion_workflow(
-            &companion,
-            inflight,
-            4,
-            "settle_workflow_gate",
-            json!({
-                "workflow_id": workflow_id,
-                "manifest_revision": 1,
-                "gate_id": "plan-gate",
-                "expected_graph_revision": 1,
-                "gate_cycle": 1,
-                "outcome": "changes_requested",
-                "evidence": plan_evidence,
-                "summary": "framed contradictory Plan evidence"
-            }),
-        )
-        .await;
-        assert_eq!(
-            legacy_result["structuredContent"]["error"]["code"],
-            "invalid_arguments"
-        );
+        let legacy_line = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "settle_workflow_gate",
+                "arguments": {
+                    "workflow_id": workflow_id,
+                    "manifest_revision": 1,
+                    "gate_id": "plan-gate",
+                    "expected_graph_revision": 1,
+                    "summary": "framed contradictory Plan evidence"
+                }
+            }
+        })
+        .to_string();
+        let LineAction::Respond(legacy_result) =
+            dispatch_line(&companion, inflight, &legacy_line).await
+        else {
+            panic!("legacy settlement fields must fail before transport")
+        };
+        let legacy_error = legacy_result.error.expect("legacy settlement error");
+        assert_eq!(legacy_error.code, -32602);
+        assert!(legacy_error.message.contains("manifest_revision"));
         listener_task.abort();
         let _ = listener_task.await;
         #[cfg(unix)]
@@ -10169,7 +10134,10 @@ mod tests {
             self as delegation_task_run, AdmissionClass, DelegationRunStatus,
         };
         use crate::db::entities::recovery_authorization::RecoveryAuthorizationStatus;
-        use crate::db::entities::{conversation, recovery_authorization};
+        use crate::db::entities::{
+            conversation, delegation_workflow, delegation_workflow_node_binding,
+            delegation_workflow_run_binding, recovery_authorization,
+        };
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
         use sea_orm::{
@@ -10188,8 +10156,7 @@ mod tests {
             questions: Arc<StubQuestion>,
         }
 
-        async fn recovery_fixture() -> RecoveryFixture {
-            let db = Arc::new(fresh_in_memory_db().await);
+        async fn recovery_fixture_with_db(db: Arc<crate::db::AppDatabase>) -> RecoveryFixture {
             let folder_id = seed_folder(&db, "/tmp/recovery-listener-contract").await;
             let parent_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
@@ -10223,6 +10190,21 @@ mod tests {
                     },
                 )
                 .await;
+            tokens
+                .register(
+                    "recovery-root-token".into(),
+                    TokenEntry {
+                        parent_connection_id: "recovery-parent-conn".into(),
+                        working_dir: PathBuf::from("/tmp"),
+                        coordination_v1: true,
+                        delegation_continuation_v1: false,
+                        role: CompanionRole::Root,
+                        workflow_v2: true,
+                        completion_v2: false,
+                        bound_task_id: None,
+                    },
+                )
+                .await;
             let questions = Arc::new(StubQuestion::default());
             let listener = DelegationListener::new(
                 broker,
@@ -10243,6 +10225,17 @@ mod tests {
                 listener,
                 questions,
             }
+        }
+
+        async fn recovery_fixture() -> RecoveryFixture {
+            recovery_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
+        }
+
+        async fn recovery_fixture_before_v2_only() -> RecoveryFixture {
+            recovery_fixture_with_db(Arc::new(
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+            ))
+            .await
         }
 
         async fn seed_confirmable_task(
@@ -10411,6 +10404,196 @@ mod tests {
                 .count(&fixture.db.conn)
                 .await
                 .expect("count recovery authorization rows")
+        }
+
+        async fn bind_task_to_protocol(
+            fixture: &RecoveryFixture,
+            task_id: &str,
+            suffix: &str,
+            version: i64,
+            mode: delegation_workflow::CompletionProtocolMode,
+        ) -> String {
+            let workflow_id = format!("task-4-recovery-workflow-{suffix}");
+            let node_id = format!("task-4-recovery-node-{suffix}");
+            let now = Utc::now();
+            delegation_workflow::ActiveModel {
+                workflow_id: Set(workflow_id.clone()),
+                parent_conversation_id: Set(fixture.parent_id),
+                workflow_kind: Set("brainstorm_to_delivery".into()),
+                schema_version: Set(2),
+                active_manifest_revision: Set(1),
+                graph_revision: Set(1),
+                workflow_state: Set(delegation_workflow::WorkflowState::Blocked),
+                capability_version: Set("workflow_manifest_v2".into()),
+                publication_token: Set(format!("task-4-recovery-token-{suffix}")),
+                supersedes_approved_revision: Set(None),
+                structural_revision: Set(1),
+                design_fingerprint: Set("design".into()),
+                plan_fingerprint: Set("plan".into()),
+                block_cause_code: Set(Some("active_run_terminal_failure".into())),
+                block_source_manifest_revision: Set(Some(1)),
+                completion_protocol_version: Set(version),
+                completion_protocol_mode: Set(mode),
+                legacy_source_workflow_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_node_binding::ActiveModel {
+                workflow_id: Set(workflow_id.clone()),
+                node_id: Set(node_id.clone()),
+                work_unit_key: Set(format!("task|{suffix}|implementer|codex|none")),
+                role: Set("implementer".into()),
+                agent_type: Set("codex".into()),
+                profile_id: Set(None),
+                phase_id: Set("tasks".into()),
+                task_index: Set(Some(4)),
+                introduced_revision: Set(1),
+                retired_revision: Set(None),
+                is_observed: Set(true),
+                retained_observed: Set(false),
+                cohort_frozen: Set(false),
+                node_outcome: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            delegation_workflow_run_binding::ActiveModel {
+                task_id: Set(task_id.to_string()),
+                workflow_id: Set(workflow_id.clone()),
+                node_id: Set(node_id),
+                gate_id: Set(None),
+                gate_cycle: Set(None),
+                manifest_revision: Set(1),
+                content_fingerprint: Set(None),
+                evidence_scope_digest: Set(None),
+                gate_lineage: Set(None),
+                review_round: Set(None),
+                instruction_block_digest: Set(None),
+                material_selector_digest: Set(None),
+                subject_material_digest: Set(None),
+                requirements_identity: Set(None),
+                task_specification_identity: Set(None),
+                final_findings_identity: Set(None),
+                producer_baseline_head: Set(None),
+                artifact_digest: Set(None),
+                reviewed_task_id: Set(None),
+                reviewed_implementer_generation: Set(None),
+                lineage_ordinal: Set(1),
+                summary_validated: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&fixture.db.conn)
+            .await
+            .unwrap();
+            workflow_id
+        }
+
+        async fn finish_authorization_call(
+            fixture: &RecoveryFixture,
+            request: BrokerRecoveryAuthorizationRequest,
+        ) -> Value {
+            let listener = Arc::clone(&fixture.listener);
+            let call = tokio::spawn(async move {
+                listener
+                    .process_recovery_authorization(request, CancellationToken::new())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if call.is_finished() || !fixture.questions.registered.lock().await.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("authorization call or question");
+            if !call.is_finished() {
+                fixture
+                    .questions
+                    .answer("q-1", question_outcome(Some(RECOVERY_DECLINE_LABEL), false))
+                    .await;
+            }
+            call.await.expect("authorization call")
+        }
+
+        #[tokio::test]
+        async fn recovery_authorization_protocol_fence() {
+            use delegation_workflow::CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+            for (index, version, mode, expected_code) in [
+                (0, 1, V1, "legacy_completion_protocol_read_only"),
+                (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+                (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+                (3, 2, V1, "unsupported_completion_protocol"),
+                (4, 2, V2Shadow, "unsupported_completion_protocol"),
+            ] {
+                let fixture = recovery_fixture_before_v2_only().await;
+                let task_id =
+                    seed_confirmable_task(&fixture, fixture.parent_id, &format!("fence-{index}"))
+                        .await;
+                let workflow_id =
+                    bind_task_to_protocol(&fixture, &task_id, &index.to_string(), version, mode)
+                        .await;
+                crate::db::test_helpers::complete_historical_completion_protocol_migrations(
+                    &fixture.db,
+                )
+                .await;
+
+                let task_outcome = finish_authorization_call(
+                    &fixture,
+                    BrokerRecoveryAuthorizationRequest {
+                        token: "recovery-child-token".into(),
+                        subject_kind: RecoverySubjectKind::DelegationTask,
+                        subject_id: task_id,
+                        correlation_id: format!("task-4-task-fence-{index}"),
+                        proposed_user_reason: None,
+                    },
+                )
+                .await;
+                assert_eq!(task_outcome["error"]["code"], expected_code);
+                assert_eq!(authorization_count(&fixture).await, 0);
+                assert!(fixture.questions.registered.lock().await.is_empty());
+
+                let workflow_outcome = finish_authorization_call(
+                    &fixture,
+                    BrokerRecoveryAuthorizationRequest {
+                        token: "recovery-root-token".into(),
+                        subject_kind: RecoverySubjectKind::Workflow,
+                        subject_id: workflow_id,
+                        correlation_id: format!("task-4-workflow-fence-{index}"),
+                        proposed_user_reason: None,
+                    },
+                )
+                .await;
+                assert_eq!(workflow_outcome["error"]["code"], expected_code);
+                assert_eq!(authorization_count(&fixture).await, 0);
+                assert!(fixture.questions.registered.lock().await.is_empty());
+            }
+
+            let standalone = recovery_fixture().await;
+            let task_id =
+                seed_confirmable_task(&standalone, standalone.parent_id, "standalone").await;
+            let outcome = finish_authorization_call(
+                &standalone,
+                BrokerRecoveryAuthorizationRequest {
+                    token: "recovery-child-token".into(),
+                    subject_kind: RecoverySubjectKind::DelegationTask,
+                    subject_id: task_id,
+                    correlation_id: "task-4-standalone".into(),
+                    proposed_user_reason: None,
+                },
+            )
+            .await;
+            assert_eq!(outcome["status"], "declined");
+            assert_eq!(authorization_count(&standalone).await, 1);
+            assert_eq!(standalone.questions.registered.lock().await.len(), 1);
         }
 
         #[test]

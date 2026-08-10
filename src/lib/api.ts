@@ -157,8 +157,6 @@ import type {
   CompletionAttentionCas,
   CompletionOutcome,
   CompletionProjectionV2,
-  CompletionProtocolMode,
-  LegacyWorkflowRestartProjection,
   WorkflowGraphSnapshot,
 } from "./types"
 
@@ -1960,14 +1958,6 @@ export async function resolveDesignSelfReview(request: {
   outcome: CompletionOutcome
 }): Promise<CompletionMutationResult> {
   return getTransport().call("resolve_design_self_review", request)
-}
-
-export async function restartLegacyWorkflow(request: {
-  source_conversation_id: number
-}): Promise<LegacyWorkflowRestartProjection> {
-  return getTransport().call("restart_legacy_workflow", {
-    sourceConversationId: request.source_conversation_id,
-  })
 }
 
 /** Live clock after durable manifest / gate settlement commit. */
@@ -4228,29 +4218,6 @@ export interface DelegationSettings {
   /** Optional per-agent overrides applied when codeg-mcp spawns a subagent.
    * Keyed by `agent_type`. Missing entries mean "use agent defaults." */
   agent_defaults?: Partial<Record<AgentType, AgentDelegationDefaults>>
-}
-
-export interface CompletionProtocolSettingsSnapshot {
-  default_mode: CompletionProtocolMode
-  profile_overrides: Record<string, CompletionProtocolMode>
-  minimum_samples: number
-  creation_modes: Record<string, number>
-  shadow_differences: Record<string, number>
-  rollout_windows: Record<
-    string,
-    { samples: number; role_mismatch: number; needs_decision: number }
-  >
-  rollout_decisions: Record<
-    string,
-    | "insufficient_samples"
-    | "may_expand"
-    | "stop_role_mismatch"
-    | "stop_needs_decision"
-  >
-}
-
-export async function getCompletionProtocolSettings(): Promise<CompletionProtocolSettingsSnapshot> {
-  return getTransport().call("get_completion_protocol_settings")
 }
 
 export async function getDelegationSettings(): Promise<DelegationSettings> {

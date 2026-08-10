@@ -16,30 +16,30 @@ import {
   cancelReferenceSearch,
   cancelToolWatchdogLease,
   closeFolderIfEmpty,
+  deleteConversation,
   extendToolWatchdogLease,
   getFolderConversation,
   getToolWatchdogSettings,
   setToolWatchdogSettings,
   matchReferenceRegex,
   nextReferenceSearchPage,
-  restartLegacyWorkflow,
   saveTranslationAs,
   startReferenceSearch,
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
 
-describe("completion restart transport payload", () => {
+describe("completion protocol frontend command removal", () => {
   beforeEach(() => {
     mockTransport.call.mockReset()
     mockTransport.call.mockResolvedValue({})
   })
 
-  it("uses the Tauri-compatible top-level camelCase argument", async () => {
-    await restartLegacyWorkflow({ source_conversation_id: 42 })
+  it("keeps ordinary conversation deletion outside graph mutations", async () => {
+    await deleteConversation(42)
 
-    expect(mockTransport.call).toHaveBeenCalledWith("restart_legacy_workflow", {
-      sourceConversationId: 42,
+    expect(mockTransport.call).toHaveBeenCalledWith("delete_conversation", {
+      conversationId: 42,
     })
   })
 })

@@ -9,7 +9,7 @@
 //! payloads, or credentials. Labels are stable enums / agent type / error codes
 //! / ids and bounded numeric durations only.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -26,10 +26,8 @@ use crate::acp::delegation::route::{
 use crate::acp::delegation::transport::CancelDelegationReason;
 use crate::acp::delegation::types::{TaskObservation, TaskStatus};
 use crate::acp::delegation::workflow::{
-    completion_protocol_profile_key, evaluate_rollout_window, ArtifactFailure,
-    CompletionIntentReason, CompletionIntentSource, CompletionRole, PlanReviewChangeV2,
-    PlanReviewNextAction, ProfileCompletionWindow, RolloutDecision,
-    COMPLETION_ROLLOUT_MINIMUM_SAMPLES,
+    ArtifactFailure, CompletionIntentReason, CompletionIntentSource, CompletionRole,
+    PlanReviewChangeV2, PlanReviewNextAction,
 };
 use crate::models::AgentType;
 
@@ -76,46 +74,6 @@ pub enum CompletionScopeInvalidationDimension {
     Lineage,
     TaskScope,
     Artifact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionRestartOutcome {
-    Created,
-    Reused,
-    Failed,
-    Rejected,
-}
-
-impl CompletionRestartOutcome {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Reused => "reused",
-            Self::Failed => "failed",
-            Self::Rejected => "rejected",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionShadowDifference {
-    Match,
-    Outcome,
-    NeedsDecision,
-    ArtifactRecovery,
-    RoleMismatch,
-}
-
-impl CompletionShadowDifference {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Match => "match",
-            Self::Outcome => "outcome",
-            Self::NeedsDecision => "needs_decision",
-            Self::ArtifactRecovery => "artifact_recovery",
-            Self::RoleMismatch => "role_mismatch",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,11 +495,6 @@ pub struct CompletionProtocolMetricsSnapshot {
     pub final_context_states: BTreeMap<String, u64>,
     pub outbox_states: BTreeMap<String, u64>,
     pub plan_reducer_states: BTreeMap<String, u64>,
-    pub restart_outcomes: BTreeMap<String, u64>,
-    pub creation_modes: BTreeMap<String, u64>,
-    pub shadow_differences: BTreeMap<String, u64>,
-    pub rollout_windows: BTreeMap<String, ProfileCompletionWindow>,
-    pub rollout_decisions: BTreeMap<String, RolloutDecision>,
     pub continuation_reasons: BTreeMap<String, u64>,
     pub natural_language_fallback_count: u64,
     pub resolution_count: u64,
@@ -618,10 +571,6 @@ pub struct DelegationMetrics {
     completion_final_context_states: Mutex<BTreeMap<String, u64>>,
     completion_outbox_states: Mutex<BTreeMap<String, u64>>,
     completion_plan_reducer_states: Mutex<BTreeMap<String, u64>>,
-    completion_restart_outcomes: Mutex<BTreeMap<String, u64>>,
-    completion_creation_modes: Mutex<BTreeMap<String, u64>>,
-    completion_shadow_differences: Mutex<BTreeMap<String, u64>>,
-    completion_rollout_windows: Mutex<BTreeMap<String, VecDeque<CompletionShadowDifference>>>,
     completion_continuation_reasons: Mutex<BTreeMap<String, u64>>,
     completion_natural_language_fallback_count: AtomicU64,
     completion_resolution_count: AtomicU64,
@@ -678,57 +627,6 @@ impl DelegationMetrics {
             &self.completion_tool_accepted,
             completion_role_label(role).into(),
         );
-    }
-
-    pub fn record_completion_protocol_creation(
-        &self,
-        mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    ) {
-        Self::inc_labeled(
-            &self.completion_creation_modes,
-            completion_protocol_mode_label(&mode).into(),
-        );
-    }
-
-    pub fn record_completion_restart(&self, outcome: CompletionRestartOutcome) {
-        Self::inc_labeled(&self.completion_restart_outcomes, outcome.as_str().into());
-    }
-
-    pub fn record_completion_shadow_difference(&self, difference: CompletionShadowDifference) {
-        Self::inc_labeled(
-            &self.completion_shadow_differences,
-            difference.as_str().into(),
-        );
-    }
-
-    pub fn record_completion_shadow_sample(
-        &self,
-        agent: &str,
-        profile: Option<&str>,
-        difference: CompletionShadowDifference,
-    ) {
-        self.record_completion_shadow_difference(difference);
-        const MAX_PROFILE_WINDOWS: usize = 256;
-        let raw_key = completion_protocol_profile_key(agent, profile);
-        let bounded_key = if raw_key.len() <= 256 {
-            raw_key
-        } else {
-            "overflow|none".to_string()
-        };
-        let mut windows = self
-            .completion_rollout_windows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let key = if windows.contains_key(&bounded_key) || windows.len() < MAX_PROFILE_WINDOWS {
-            bounded_key
-        } else {
-            "overflow|none".to_string()
-        };
-        let window = windows.entry(key).or_default();
-        if window.len() == COMPLETION_ROLLOUT_MINIMUM_SAMPLES as usize {
-            window.pop_front();
-        }
-        window.push_back(difference);
     }
 
     pub fn record_completion_decision_opened(&self) {
@@ -1389,36 +1287,6 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let rollout_windows = self
-            .completion_rollout_windows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .map(|(key, samples)| {
-                let window = ProfileCompletionWindow {
-                    samples: samples.len() as u64,
-                    role_mismatch: samples
-                        .iter()
-                        .filter(|sample| **sample == CompletionShadowDifference::RoleMismatch)
-                        .count() as u64,
-                    needs_decision: samples
-                        .iter()
-                        .filter(|sample| {
-                            matches!(
-                                sample,
-                                CompletionShadowDifference::NeedsDecision
-                                    | CompletionShadowDifference::RoleMismatch
-                            )
-                        })
-                        .count() as u64,
-                };
-                (key.clone(), window)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let rollout_decisions = rollout_windows
-            .iter()
-            .map(|(key, window)| (key.clone(), evaluate_rollout_window(window)))
-            .collect();
         let completion_protocol = CompletionProtocolMetricsSnapshot {
             resolutions: completion_resolutions.clone(),
             tool_accepted: self
@@ -1455,23 +1323,6 @@ impl DelegationMetrics {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            restart_outcomes: self
-                .completion_restart_outcomes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-            creation_modes: self
-                .completion_creation_modes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-            shadow_differences: self
-                .completion_shadow_differences
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-            rollout_windows,
-            rollout_decisions,
             continuation_reasons: self
                 .completion_continuation_reasons
                 .lock()
@@ -1575,16 +1426,6 @@ fn completion_source_label(source: CompletionIntentSource) -> &'static str {
         CompletionIntentSource::AssistantConclusion => "assistant_conclusion",
         CompletionIntentSource::Report => "report",
         CompletionIntentSource::UserAdjudication => "user_adjudication",
-    }
-}
-
-fn completion_protocol_mode_label(
-    mode: &crate::db::entities::delegation_workflow::CompletionProtocolMode,
-) -> &'static str {
-    match mode {
-        crate::db::entities::delegation_workflow::CompletionProtocolMode::V1 => "v1",
-        crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow => "v2_shadow",
-        crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce => "v2_enforce",
     }
 }
 
@@ -2314,7 +2155,7 @@ mod tests {
     use crate::acp::delegation::route::ROUTE_ADAPTER_CONTRACT_VERSION;
 
     #[test]
-    fn completion_protocol_metrics_use_only_bounded_enum_labels() {
+    fn completion_metrics_v2_only() {
         let metrics = DelegationMetrics::default();
         metrics.record_completion_resolution(
             crate::acp::delegation::workflow::CompletionIntentSource::AssistantConclusion,
@@ -2334,11 +2175,8 @@ mod tests {
             CompletionMetricPhase::Tasks,
             CompletionScopeInvalidationDimension::Instruction,
         );
-        metrics.record_completion_protocol_creation(
-            crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow,
-        );
-        metrics.record_completion_restart(CompletionRestartOutcome::Created);
-        metrics.record_completion_shadow_difference(CompletionShadowDifference::NeedsDecision);
+        metrics.record_completion_decision_opened();
+        metrics.record_completion_outbox_pending(1);
         assert!(!metrics.record_format_repair_child_run(
             crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
         ));
@@ -2347,6 +2185,37 @@ mod tests {
         ));
 
         let snapshot = metrics.snapshot();
+        let completion_json = serde_json::to_value(&snapshot.completion_protocol).unwrap();
+        let completion = completion_json.as_object().unwrap();
+        let removed = [
+            "default_mode".to_string(),
+            "profile_overrides".to_string(),
+            "creation_modes".to_string(),
+            ["shadow", "differences"].join("_"),
+            ["rollout", "windows"].join("_"),
+            ["rollout", "decisions"].join("_"),
+            ["restart", "outcomes"].join("_"),
+        ];
+        for removed in removed {
+            assert!(
+                !completion.contains_key(&removed),
+                "obsolete completion metric {removed} remains serialized"
+            );
+        }
+        for retained in [
+            "resolutions",
+            "tool_accepted",
+            "intent_diagnostics",
+            "decision_lifecycle",
+            "artifact_failures",
+            "scope_invalidations",
+            "outbox_states",
+        ] {
+            assert!(
+                completion.contains_key(retained),
+                "retained v2 completion metric {retained} is missing"
+            );
+        }
         assert_eq!(
             snapshot.completion_resolutions["assistant_conclusion:reviewer"],
             1
@@ -2361,12 +2230,8 @@ mod tests {
             snapshot.completion_scope_invalidations["tasks:instruction"],
             1
         );
-        assert_eq!(snapshot.completion_protocol.creation_modes["v2_shadow"], 1);
-        assert_eq!(snapshot.completion_protocol.restart_outcomes["created"], 1);
-        assert_eq!(
-            snapshot.completion_protocol.shadow_differences["needs_decision"],
-            1
-        );
+        assert_eq!(snapshot.completion_protocol.decision_lifecycle["opened"], 1);
+        assert_eq!(snapshot.completion_protocol.outbox_states["pending"], 1);
         assert_eq!(snapshot.completion_protocol.format_only_child_runs, 1);
         assert_eq!(snapshot.completion_protocol.card_reemit_prompts, 1);
     }

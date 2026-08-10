@@ -24,17 +24,14 @@ use crate::acp::delegation::continuation::store::{
     ContinuationPatch, ContinuationStore, FieldPatch,
 };
 use crate::acp::delegation::continuation::types::ContinuationState;
-use crate::acp::delegation::metrics::{
-    CompletionRestartOutcome, DelegationMetrics, PromptAdmissionSource,
-};
+use crate::acp::delegation::metrics::PromptAdmissionSource;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::delegation::workflow::{
-    capture_original_request_context, restart_legacy_workflow_if_enforced,
-    CompletionProtocolRolloutConfig,
+    load_completion_protocol_for_conversation, require_v2_mutation,
 };
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
@@ -483,7 +480,6 @@ pub struct ConnectionManager {
     /// Durable continuation ownership store installed once with the shared
     /// delegation runtime. The outer Arc keeps `clone_ref` clones on one slot.
     continuation_store: Arc<std::sync::OnceLock<Arc<dyn ContinuationStore>>>,
-    completion_protocol_runtime: Arc<std::sync::OnceLock<CompletionProtocolRuntime>>,
     /// Per-agent-type serialization for `probe_agent_options`. Without
     /// this, rapid agent-tab clicks in the settings UI would fan out one
     /// real CLI process per click — each one running up to 60s. The
@@ -512,12 +508,6 @@ pub struct ConnectionManager {
     >,
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
-}
-
-#[derive(Clone)]
-struct CompletionProtocolRuntime {
-    rollout: Arc<CompletionProtocolRolloutConfig>,
-    metrics: Arc<DelegationMetrics>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -589,7 +579,6 @@ impl ConnectionManager {
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
-            completion_protocol_runtime: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
@@ -613,7 +602,6 @@ impl ConnectionManager {
             mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
             continuation_store: self.continuation_store.clone(),
-            completion_protocol_runtime: self.completion_protocol_runtime.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
@@ -676,16 +664,6 @@ impl ConnectionManager {
 
     pub(crate) fn install_continuation_store(&self, store: Arc<dyn ContinuationStore>) {
         let _ = self.continuation_store.set(store);
-    }
-
-    pub fn install_completion_protocol_runtime(
-        &self,
-        rollout: Arc<CompletionProtocolRolloutConfig>,
-        metrics: Arc<DelegationMetrics>,
-    ) {
-        let _ = self
-            .completion_protocol_runtime
-            .set(CompletionProtocolRuntime { rollout, metrics });
     }
 
     #[allow(dead_code)]
@@ -2065,19 +2043,6 @@ impl ConnectionManager {
         // Unlinked and internal-purpose sends bypass capture entirely.
         if let (Some(db), Some(conversation_id)) = (db, state.conversation_id) {
             if !is_internal {
-                if register_mandatory_routes {
-                    if let Some((request_id, _)) = user_message.as_ref() {
-                        capture_original_request_context(
-                            &db.conn,
-                            conversation_id,
-                            request_id,
-                            &blocks,
-                            state.agent_type.as_wire().as_ref(),
-                        )
-                        .await
-                        .map_err(|error| AcpError::protocol(error.to_string()))?;
-                    }
-                }
                 let captured = capture_prompt_context(
                     &db.conn,
                     conversation_id,
@@ -2577,44 +2542,20 @@ impl ConnectionManager {
             )
         };
 
-        // Root resumes of legacy workflows are fenced before prompt admission,
-        // hydration, events, transcript writes, status changes, or agent send.
+        // Linked root prompts must pass the persisted protocol fence before
+        // admission, hydration, transcript/status writes, routing, or send.
         if delegation.is_none() {
             let effective_conversation_id = conversation_id.or({
                 let state = state_arc.read().await;
                 state.conversation_id
             });
-            if let (Some(source_conversation_id), Some(runtime)) = (
-                effective_conversation_id,
-                self.completion_protocol_runtime.get(),
-            ) {
-                match restart_legacy_workflow_if_enforced(
-                    db,
-                    source_conversation_id,
-                    None,
-                    &runtime.rollout,
-                )
-                .await
+            if let Some(conversation_id) = effective_conversation_id {
+                if let Some((version, mode)) =
+                    load_completion_protocol_for_conversation(db, conversation_id)
+                        .await
+                        .map_err(AcpError::from)?
                 {
-                    Ok(Some(projection)) => {
-                        runtime.metrics.record_completion_restart(
-                            if projection.idempotent_replay {
-                                CompletionRestartOutcome::Reused
-                            } else {
-                                CompletionRestartOutcome::Created
-                            },
-                        );
-                        return Err(AcpError::LegacyCompletionProtocolRestart {
-                            successor_conversation_id: projection.successor_conversation_id,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        runtime
-                            .metrics
-                            .record_completion_restart(CompletionRestartOutcome::Failed);
-                        return Err(AcpError::protocol(error.code()));
-                    }
+                    require_v2_mutation(version, &mode).map_err(AcpError::from)?;
                 }
             }
         }

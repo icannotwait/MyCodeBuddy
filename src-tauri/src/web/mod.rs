@@ -843,10 +843,6 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::acp::delegation::metrics::DelegationMetrics>>()
             .inner()
             .clone(),
-        completion_protocol_rollout: app
-            .state::<Arc<crate::acp::delegation::workflow::CompletionProtocolRolloutConfig>>()
-            .inner()
-            .clone(),
         completion_outbox_dispatcher: app
             .state::<Arc<crate::acp::delegation::event_emitter::CompletionOutboxDispatcher>>()
             .inner()

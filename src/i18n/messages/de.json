@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "Soft-Watchdog (Sekunden)",
-      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). 0 deaktiviert Stall-Markierung. Bricht nicht ab und wechselt die Route nicht.",
-      "completionDefaultMode": "Erstellungsmodus für Abschlüsse",
-      "completionCreations": "{mode}: {count} Erstellungen",
-      "completionSamples": "{count} terminale Stichproben",
-      "completionMinimumProgress": "{count} / {minimum} Mindeststichproben",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "Rollout wartet auf die Mindestanzahl an Stichproben",
-        "may_expand": "Rollout kann erweitert werden",
-        "stop_role_mismatch": "Rollout pausiert: Rollenabweichung über 1 %",
-        "stop_needs_decision": "Rollout pausiert: Entscheidungsbedarf über 5 %"
-      }
+      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). 0 deaktiviert Stall-Markierung. Bricht nicht ab und wechselt die Route nicht."
     },
     "actions": {
       "dragSort": "Zum Neuordnen ziehen",
@@ -2790,11 +2778,9 @@
         "completionStale": "Diese Entscheidung ist veraltet. Laden Sie den Workflow neu.",
         "completionConflict": "Ein anderes Ergebnis wurde bereits festgeschrieben.",
         "completionLegacyReadOnly": "Der alte Workflow ist schreibgeschützt",
-        "completionLegacyRestart": "Mit Abschlussprotokoll v2 neu starten",
         "completionLegacySource": "Alter Quell-Workflow #{conversation}",
         "completionLegacySuccessor": "Nachfolge-Workflow #{conversation}",
         "completionAutomaticWake": "Die Root-Orchestrierung wurde automatisch fortgesetzt",
-        "completionManualRootResume": "Root-Orchestrierung fortsetzen",
         "completionOutcome": {
           "approve": "Genehmigen",
           "approve_with_minors": "Mit kleinen Änderungen genehmigen",

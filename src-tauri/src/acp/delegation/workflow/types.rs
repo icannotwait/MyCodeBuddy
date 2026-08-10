@@ -1,9 +1,11 @@
 //! Shared types for workflow key derivation and manifest validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::db::entities::delegation_workflow::CompletionProtocolMode;
 
 use super::completion_intent::{
     CompletionIntent, CompletionIntentSource, CompletionOutcome, CompletionRole,
@@ -28,203 +30,25 @@ pub const MAX_ADJUDICATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_JSON_BYTES: usize = 512 * 1024;
 pub const COMPLETE_WORK_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 pub const COMPLETE_WORK_REPORT_FILE_MAX_BYTES: usize = 1024;
+pub const CURRENT_COMPLETION_PROTOCOL_VERSION: i64 = 2;
 pub const COMPLETION_PROTOCOL_VERSION_V2: u32 = 2;
 pub const EVIDENCE_SCOPE_SCHEMA_VERSION_V2: u32 = 2;
-pub const COMPLETION_ROLLOUT_MINIMUM_SAMPLES: u64 = 100;
 
-/// Server-owned rollout policy. Overrides use the exact stable key returned by
-/// [`completion_protocol_profile_key`]; unknown or malformed modes never reach
-/// this typed structure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompletionProtocolRolloutConfig {
-    pub default_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    #[serde(default)]
-    pub profile_overrides:
-        BTreeMap<String, crate::db::entities::delegation_workflow::CompletionProtocolMode>,
+pub fn current_completion_protocol_mode() -> CompletionProtocolMode {
+    CompletionProtocolMode::V2Enforce
 }
 
-impl Default for CompletionProtocolRolloutConfig {
-    fn default() -> Self {
-        Self {
-            default_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V1,
-            profile_overrides: BTreeMap::new(),
+pub fn reject_removed_completion_protocol_configuration(
+) -> Result<(), super::error::CompletionProtocolConfigurationRemoved> {
+    for variable in [
+        "CODEG_COMPLETION_PROTOCOL_MODE",
+        "CODEG_COMPLETION_PROTOCOL_OVERRIDES",
+    ] {
+        if std::env::var_os(variable).is_some() {
+            return Err(super::error::CompletionProtocolConfigurationRemoved { variable });
         }
-    }
-}
-
-impl CompletionProtocolRolloutConfig {
-    pub fn from_env() -> Result<Self, String> {
-        let default_value = match std::env::var("CODEG_COMPLETION_PROTOCOL_MODE") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(format!("invalid completion protocol mode: {error}")),
-        };
-        let overrides_value = match std::env::var("CODEG_COMPLETION_PROTOCOL_OVERRIDES") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(format!("invalid completion protocol overrides: {error}")),
-        };
-        Self::from_serialized_values(default_value.as_deref(), overrides_value.as_deref())
-    }
-
-    pub fn from_serialized_values(
-        default_mode: Option<&str>,
-        profile_overrides: Option<&str>,
-    ) -> Result<Self, String> {
-        let default_mode = default_mode
-            .map(parse_completion_protocol_mode)
-            .transpose()?
-            .unwrap_or(crate::db::entities::delegation_workflow::CompletionProtocolMode::V1);
-        let profile_overrides = match profile_overrides.map(str::trim) {
-            Some(value) if !value.is_empty() => {
-                let raw: BTreeMap<String, String> = serde_json::from_str(value)
-                    .map_err(|error| format!("invalid completion protocol overrides: {error}"))?;
-                raw.into_iter()
-                    .map(|(key, mode)| {
-                        validate_completion_protocol_profile_key(&key)?;
-                        Ok((key, parse_completion_protocol_mode(&mode)?))
-                    })
-                    .collect::<Result<_, String>>()?
-            }
-            Some(_) | None => BTreeMap::new(),
-        };
-        Ok(Self {
-            default_mode,
-            profile_overrides,
-        })
-    }
-}
-
-fn parse_completion_protocol_mode(
-    value: &str,
-) -> Result<crate::db::entities::delegation_workflow::CompletionProtocolMode, String> {
-    use crate::db::entities::delegation_workflow::CompletionProtocolMode;
-    match value {
-        "v1" => Ok(CompletionProtocolMode::V1),
-        "v2_shadow" => Ok(CompletionProtocolMode::V2Shadow),
-        "v2_enforce" => Ok(CompletionProtocolMode::V2Enforce),
-        _ => Err(format!(
-            "completion protocol mode must be v1, v2_shadow, or v2_enforce; got {value:?}"
-        )),
-    }
-}
-
-pub fn completion_protocol_profile_key(agent: &str, profile: Option<&str>) -> String {
-    format!("{agent}|{}", profile.unwrap_or("none"))
-}
-
-fn validate_completion_protocol_profile_key(key: &str) -> Result<(), String> {
-    let Some((agent, profile)) = key.split_once('|') else {
-        return Err(format!(
-            "completion protocol override key must be agent|profile; got {key:?}"
-        ));
-    };
-    if agent.is_empty()
-        || profile.is_empty()
-        || agent.len() > 64
-        || profile.len() > 128
-        || !agent
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        || !profile
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return Err(format!("invalid completion protocol override key {key:?}"));
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletionProtocolSelectionSource {
-    Default,
-    ProfileOverride,
-    LegacyRestart,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompletionProtocolSelection {
-    pub version: i64,
-    pub mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    pub source: CompletionProtocolSelectionSource,
-}
-
-impl CompletionProtocolSelection {
-    pub fn v1_default() -> Self {
-        Self {
-            version: 1,
-            mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V1,
-            source: CompletionProtocolSelectionSource::Default,
-        }
-    }
-
-    pub fn legacy_restart() -> Self {
-        Self {
-            version: 2,
-            mode: crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
-            source: CompletionProtocolSelectionSource::LegacyRestart,
-        }
-    }
-}
-
-pub fn select_completion_protocol(
-    agent: &str,
-    profile: Option<&str>,
-    config: &CompletionProtocolRolloutConfig,
-) -> CompletionProtocolSelection {
-    let key = completion_protocol_profile_key(agent, profile);
-    let (mode, source) = config
-        .profile_overrides
-        .get(&key)
-        .cloned()
-        .map(|mode| (mode, CompletionProtocolSelectionSource::ProfileOverride))
-        .unwrap_or_else(|| {
-            (
-                config.default_mode.clone(),
-                CompletionProtocolSelectionSource::Default,
-            )
-        });
-    let version = match &mode {
-        crate::db::entities::delegation_workflow::CompletionProtocolMode::V1
-        | crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Shadow => 1,
-        crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce => 2,
-    };
-    CompletionProtocolSelection {
-        version,
-        mode,
-        source,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfileCompletionWindow {
-    pub samples: u64,
-    pub role_mismatch: u64,
-    pub needs_decision: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RolloutDecision {
-    InsufficientSamples,
-    MayExpand,
-    StopRoleMismatch,
-    StopNeedsDecision,
-}
-
-pub fn evaluate_rollout_window(window: &ProfileCompletionWindow) -> RolloutDecision {
-    if window.samples < COMPLETION_ROLLOUT_MINIMUM_SAMPLES {
-        return RolloutDecision::InsufficientSamples;
-    }
-    if window.role_mismatch.saturating_mul(100) > window.samples {
-        return RolloutDecision::StopRoleMismatch;
-    }
-    if window.needs_decision.saturating_mul(100) > window.samples.saturating_mul(5) {
-        return RolloutDecision::StopNeedsDecision;
-    }
-    RolloutDecision::MayExpand
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,29 +69,6 @@ pub struct CompletionProtocolWorkflowProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only_reason: Option<String>,
     pub automatic_root_wake: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyWorkflowRestartProjection {
-    pub source_workflow_id: String,
-    pub source_conversation_id: i32,
-    pub successor_workflow_id: String,
-    pub successor_conversation_id: i32,
-    pub open_gate: DocumentGateKind,
-    pub completion_protocol: CompletionProtocolWorkflowProjection,
-    pub restart_context: LegacyWorkflowRestartContext,
-    pub idempotent_replay: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyWorkflowRestartContext {
-    pub original_conversation_id: i32,
-    pub original_request_id: String,
-    pub original_request_text: String,
-    pub original_request_digest: String,
-    pub agent_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1102,4 +903,29 @@ pub struct NormalizedManifest {
     pub task_policies: Vec<ManifestTaskPolicy>,
     /// Distinct Task indices present on work units (1-based).
     pub task_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn removed_completion_protocol_environment_rejects_every_historical_value() {
+        for variable in [
+            "CODEG_COMPLETION_PROTOCOL_MODE",
+            "CODEG_COMPLETION_PROTOCOL_OVERRIDES",
+        ] {
+            for value in ["v1", "v2_shadow", "v2_enforce"] {
+                let other = if variable == "CODEG_COMPLETION_PROTOCOL_MODE" {
+                    "CODEG_COMPLETION_PROTOCOL_OVERRIDES"
+                } else {
+                    "CODEG_COMPLETION_PROTOCOL_MODE"
+                };
+                temp_env::with_vars([(variable, Some(value)), (other, None::<&str>)], || {
+                    let error = super::reject_removed_completion_protocol_configuration()
+                        .expect_err("removed configuration must fail startup");
+                    assert_eq!(error.code(), "completion_protocol_configuration_removed");
+                    assert_eq!(error.variable, variable);
+                });
+            }
+        }
+    }
 }

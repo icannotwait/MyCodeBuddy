@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use axum_test::TestServer;
 use chrono::Utc;
+use codeg_lib::acp::delegation::companion::TOOL_SCHEMA_JSON;
 use codeg_lib::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+use codeg_lib::acp::delegation::transport::BrokerSettleWorkflowRequest;
 use codeg_lib::acp::delegation::types::{
     CompletionMutationResult, DelegationReplyResult, ResolveCompletionDecisionRequest,
     ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
@@ -18,11 +20,9 @@ use codeg_lib::acp::delegation::workflow::types::{
 };
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, capture_original_request_context, load_completion_projection,
-    materialize_terminal_completion_txn, project_workflow_graph_core, restart_legacy_workflow_core,
-    CompletionOutcome, CompletionProtocolRolloutConfig, TerminalCompletionInput,
+    build_work_unit_key, load_completion_projection, materialize_terminal_completion_txn,
+    project_workflow_graph_core, CompletionOutcome, TerminalCompletionInput,
 };
-use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::entities::delegation_attention_request::AttentionKind;
 use codeg_lib::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
@@ -87,10 +87,11 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
         .await
         .unwrap()
         .unwrap();
-    let mut workflow: delegation_workflow::ActiveModel = workflow.into();
-    workflow.completion_protocol_version = Set(2);
-    workflow.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
-    workflow.update(&db.conn).await.unwrap();
+    assert_eq!(workflow.completion_protocol_version, 2);
+    assert_eq!(
+        workflow.completion_protocol_mode,
+        CompletionProtocolMode::V2Enforce
+    );
 
     let task_id = format!("http-attention-{}", uuid::Uuid::new_v4());
     let db_arc = Arc::new(codeg_lib::db::AppDatabase {
@@ -269,6 +270,69 @@ fn attention_six_field_cas_rejects_every_missing_field() {
 }
 
 #[test]
+fn settle_workflow_gate_v2_only_schema() {
+    let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+    let settle = catalog
+        .as_array()
+        .expect("tool catalog array")
+        .iter()
+        .find(|tool| tool["name"] == "settle_workflow_gate")
+        .expect("settle_workflow_gate tool");
+    let properties = settle["inputSchema"]["properties"]
+        .as_object()
+        .expect("settlement properties");
+
+    for removed in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
+        assert!(
+            properties.get(removed).is_none(),
+            "legacy field {removed} remains"
+        );
+    }
+    for retained in [
+        "workflow_id",
+        "gate_id",
+        "expected_graph_revision",
+        "expected_review_round",
+        "expected_gate_cycle",
+        "expected_outcome",
+        "recovery_authorization_id",
+        "summary",
+    ] {
+        assert!(
+            properties.get(retained).is_some(),
+            "v2 field {retained} missing"
+        );
+    }
+
+    let request = json!({
+        "token": "secret",
+        "workflow_id": "workflow-1",
+        "gate_id": "design",
+        "expected_graph_revision": 4,
+        "expected_gate_cycle": 1,
+        "expected_outcome": "approved",
+        "summary": "settled from platform evidence"
+    });
+    serde_json::from_value::<BrokerSettleWorkflowRequest>(request.clone())
+        .expect("v2 settlement request decodes");
+    for (removed, value) in [
+        ("manifest_revision", json!(2)),
+        ("gate_cycle", json!(1)),
+        ("outcome", json!("approved")),
+        ("evidence", json!({ "kind": "design" })),
+    ] {
+        let mut legacy = request.clone();
+        legacy[removed] = value;
+        let error = serde_json::from_value::<BrokerSettleWorkflowRequest>(legacy)
+            .expect_err("legacy settlement property must be rejected");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "legacy field {removed} was not rejected as unknown: {error}"
+        );
+    }
+}
+
+#[test]
 fn attention_mutation_routes_and_desktop_commands_are_registered() {
     let router = include_str!("../src/web/router.rs");
     let handlers = include_str!("../src/web/handlers/mod.rs");
@@ -291,6 +355,27 @@ fn attention_mutation_routes_and_desktop_commands_are_registered() {
             "missing Tauri command registration {operation}"
         );
     }
+}
+
+#[tokio::test]
+async fn completion_rollout_surface_is_absent() {
+    let fixture = completion_http_fixture().await;
+    let operation = ["get", "completion", "protocol", "settings"].join("_");
+    let response = fixture
+        .server
+        .post(&format!("/api/{operation}"))
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(response.status_code(), 501);
+    let body: Value = response.json();
+    assert_eq!(body["code"], "not_implemented");
+
+    let lib = include_str!("../src/lib.rs");
+    assert!(
+        !lib.contains(&format!("workflow_completion::{operation}")),
+        "removed completion settings command remains registered"
+    );
 }
 
 fn error_detail(response: &axum_test::TestResponse) -> String {
@@ -628,100 +713,137 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
     assert_eq!(error_detail(&conflict), "completion_decision_conflict");
 }
 
-#[tokio::test]
-async fn registered_tauri_and_http_restart_surfaces_share_one_successor() {
-    let workspace = tempfile::tempdir().unwrap();
-    let static_dir = tempfile::tempdir().unwrap();
-    let db = fresh_in_memory_db().await;
-    let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
-    let source_conversation_id = seed_conversation(&db, folder, AgentType::Codex).await;
-    capture_original_request_context(
-        &db.conn,
-        source_conversation_id,
-        "transport-parity-original-request",
-        &[PromptInputBlock::Text {
-            text: "restart this original transport parity request".into(),
-        }],
-        "codex",
-    )
-    .await
-    .unwrap();
-    let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
-        rel_plan_path: PLAN_REL_PATH,
-        agent_type: "codex",
-        profile_id: None,
-    })
-    .unwrap();
-    publish_workflow_manifest_core(
-        &db,
-        &EventEmitter::Noop,
-        source_conversation_id,
-        PublishWorkflowRequest {
-            document: completion_manifest(&author_key),
-        },
-    )
-    .await
-    .unwrap();
+#[test]
+fn legacy_restart_surface_is_absent() {
+    let production_sources = [
+        ("tool schema", TOOL_SCHEMA_JSON),
+        (
+            "companion",
+            include_str!("../src/acp/delegation/companion.rs"),
+        ),
+        (
+            "transport",
+            include_str!("../src/acp/delegation/transport.rs"),
+        ),
+        (
+            "listener",
+            include_str!("../src/acp/delegation/listener.rs"),
+        ),
+        ("broker", include_str!("../src/acp/delegation/broker.rs")),
+        (
+            "workflow types",
+            include_str!("../src/acp/delegation/workflow/types.rs"),
+        ),
+        (
+            "workflow errors",
+            include_str!("../src/acp/delegation/workflow/error.rs"),
+        ),
+        ("ACP errors", include_str!("../src/acp/error.rs")),
+        ("app errors", include_str!("../src/app_error.rs")),
+        (
+            "commands",
+            include_str!("../src/commands/workflow_completion.rs"),
+        ),
+        (
+            "web handler",
+            include_str!("../src/web/handlers/workflow_completion.rs"),
+        ),
+        ("web router", include_str!("../src/web/router.rs")),
+        ("Tauri registration", include_str!("../src/lib.rs")),
+    ];
+    let forbidden = [
+        ["restart_legacy_", "workflow"].concat(),
+        ["LegacyWorkflowRestart", "Projection"].concat(),
+        ["LegacyCompletionProtocol", "Restart"].concat(),
+        ["legacy_completion_protocol_", "restart_required"].concat(),
+        ["legacy_completion_protocol_", "restart_invalid"].concat(),
+        ["legacy_completion_protocol_", "restart_not_required"].concat(),
+        ["successor_conversation_", "id"].concat(),
+        ["capture_original_request_", "context"].concat(),
+    ];
 
-    let mut state = AppState::new_for_test(db, workspace.path().to_path_buf());
-    let rollout = CompletionProtocolRolloutConfig {
-        default_mode: CompletionProtocolMode::V2Enforce,
-        ..Default::default()
-    };
-    state.completion_protocol_rollout = Arc::new(rollout);
-    let state = Arc::new(state);
-    let server = TestServer::new(build_router(
-        state.clone(),
-        TEST_TOKEN.into(),
-        static_dir.path().to_path_buf(),
-        Arc::new(ShutdownSignal::new()),
-    ))
-    .unwrap();
-    let context_response = server
-        .post("/api/get_workflow_graph_snapshot")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .json(&json!({ "conversationId": source_conversation_id }))
-        .await;
-    context_response.assert_status_ok();
-    let completion_context = context_response
-        .headers()
-        .get(COMPLETION_CONTEXT_HEADER)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    for (surface, source) in production_sources {
+        for removed in &forbidden {
+            assert!(
+                !source.contains(removed),
+                "legacy restart surface {removed} remains in {surface}"
+            );
+        }
+    }
+}
 
-    let direct = restart_legacy_workflow_core(&state.db, i64::from(source_conversation_id))
-        .await
-        .unwrap();
-    let http = server
-        .post("/api/restart_legacy_workflow")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&json!({ "sourceConversationId": source_conversation_id }))
-        .await;
-    http.assert_status_ok();
-    let http: codeg_lib::acp::delegation::workflow::LegacyWorkflowRestartProjection = http.json();
-    assert_eq!(
-        direct.successor_conversation_id,
-        http.successor_conversation_id
+/// Cross-surface inventory of removed public v2-only symbols. Scans only
+/// repository-owned production sources under `src-tauri/src` (not tests).
+#[test]
+fn v2_only_removed_surface_inventory() {
+    use std::path::{Path, PathBuf};
+
+    fn collect_owned_sources(dir: &Path, out: &mut Vec<(String, String)>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_owned_sources(&path, out);
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "rs" | "json" | "sql" | "toml") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    out.push((path.display().to_string(), content));
+                }
+            }
+        }
+    }
+
+    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_owned_sources(&src_root, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "expected repository-owned production sources under {}",
+        src_root.display()
     );
-    assert!(http.idempotent_replay);
+    sources.push(("tool schema catalog".into(), TOOL_SCHEMA_JSON.to_string()));
 
-    let foreign_context = state
-        .web_server_state
-        .completion_authorizations()
-        .issue(source_conversation_id + 1);
-    let foreign = server
-        .post("/api/restart_legacy_workflow")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, foreign_context)
-        .json(&json!({ "source_conversation_id": source_conversation_id }))
-        .await;
-    assert_eq!(foreign.status_code(), 403);
+    let banned = [
+        concat!("restart_legacy_", "workflow"),
+        concat!("CompletionProtocolRollout", "Config"),
+        concat!("CompletionProtocol", "Selection"),
+        concat!("select_completion_", "protocol"),
+        concat!("get_completion_protocol_", "settings"),
+        concat!("legacy_completion_protocol_", "restart_required"),
+        concat!("legacy_completion_protocol_", "restart_invalid"),
+        concat!("successor_", "conversation_id"),
+    ];
 
-    let router = include_str!("../src/web/router.rs");
-    let lib = include_str!("../src/lib.rs");
-    assert!(router.contains("\"/restart_legacy_workflow\""));
-    assert!(lib.contains("workflow_completion::restart_legacy_workflow"));
+    for (surface, source) in &sources {
+        for removed in banned {
+            assert!(
+                !source.contains(removed),
+                "removed public symbol {removed} remains in {surface}"
+            );
+        }
+    }
+
+    // manifest_revision / gate_cycle remain valid in durable models; ban only
+    // the settle_workflow_gate tool object properties.
+    let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema JSON");
+    let settle = catalog
+        .as_array()
+        .expect("tool catalog array")
+        .iter()
+        .find(|tool| tool["name"] == "settle_workflow_gate")
+        .expect("settle_workflow_gate tool");
+    let properties = settle["inputSchema"]["properties"]
+        .as_object()
+        .expect("settlement properties");
+    for removed in ["manifest_revision", "gate_cycle"] {
+        assert!(
+            properties.get(removed).is_none(),
+            "legacy settle property {removed} remains on settle_workflow_gate"
+        );
+    }
 }

@@ -381,6 +381,15 @@ describe("WebTransport completion context capture/replay", () => {
     return init?.headers
   }
 
+  const unknownCommandResponse = () => ({
+    status: 501,
+    ok: false,
+    json: async () => ({
+      code: "not_implemented",
+      message: "Unknown command",
+    }),
+  })
+
   it("captures snapshot capability and replays it on completion mutations", async () => {
     const t = new WebTransport("http://localhost")
     const attentionId = "attention-root-42"
@@ -425,7 +434,6 @@ describe("WebTransport completion context capture/replay", () => {
         )
       )
       .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
-      .mockResolvedValueOnce(mockJsonResponse({ ok: true }))
 
     await t.call("get_workflow_graph_snapshot", { conversationId: 42 })
 
@@ -440,13 +448,37 @@ describe("WebTransport completion context capture/replay", () => {
       },
       outcome: "done",
     })
-    await t.call("restart_legacy_workflow", { sourceConversationId: 42 })
 
     const decisionHeaders = callHeaders(1) as Record<string, string>
-    const restartHeaders = callHeaders(2) as Record<string, string>
     expect(decisionHeaders[COMPLETION_CONTEXT_HEADER]).toBe(token)
-    expect(restartHeaders[COMPLETION_CONTEXT_HEADER]).toBe(token)
   })
+
+  it.each([
+    [["restart_legacy_", "workflow"].join(""), { sourceConversationId: 42 }],
+    [["get_completion_protocol_", "settings"].join(""), {}],
+  ])(
+    "treats removed %s as an unknown command without replaying a capability",
+    async (command, args) => {
+      const t = new WebTransport("http://localhost")
+      fetchMock
+        .mockResolvedValueOnce(
+          mockJsonResponse(
+            { nodes: [] },
+            { [COMPLETION_CONTEXT_HEADER]: "token-root-42" }
+          )
+        )
+        .mockResolvedValueOnce(unknownCommandResponse())
+
+      await t.call("get_workflow_graph_snapshot", { conversationId: 42 })
+      await expect(t.call(command, args)).rejects.toEqual({
+        code: "not_implemented",
+        message: "Unknown command",
+      })
+
+      const headers = callHeaders(1) as Record<string, string>
+      expect(headers[COMPLETION_CONTEXT_HEADER]).toBeUndefined()
+    }
+  )
 
   it("scopes replayed capabilities to the snapshot root", async () => {
     const t = new WebTransport("http://localhost")

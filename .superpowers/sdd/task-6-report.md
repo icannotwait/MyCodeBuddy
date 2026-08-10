@@ -1,105 +1,104 @@
-# Task 6 Report — Startup reconcile bound/unbound split
-
-**Branch:** `feat/delegation-promote-reliability`
-**Worktree:** `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`
-**Date:** 2026-07-26
-**Implementer:** Grok
-**Base HEAD:** `8dd2c0f3` (Tasks 1–5 complete)
-**Prior partial:** `7ffb293c` (bound/unbound split in `reconcile_non_terminal` + audit helper — incomplete without named tests / full contract)
+# Task 6 Report: Remove Legacy Restart Writers
 
 ## Status
 
-**COMPLETE** — startup reconcile splits unbound reserving (`host_restarted`) from bound reserving (`admission_unknown` + structured audit); not continuable; not auto-replayed; process-local `PendingTerminalRetry` documented as non-surviving across restart; four named tests prove the contract end-to-end.
+**IMPLEMENTATION COMPLETE; INDEPENDENT CODEX/GROK REVIEW PENDING**
 
-## Summary
+- Work unit: `task|6|implementer|codex|none`
+- Scope: Completion Protocol V2-Only plan Task 6 only
+- Baseline HEAD: `459da9d02c85db04bbe85a2555a9147f85963bd9`
+- Producer commit: `83c27aa13a4e83383b1cfa28d615210e90e44cda`
+- Task 7+: not started
 
-### Behavior
+## Implementation
 
-| Prior state | After reconcile | Continuable? | Recovery |
-| --- | --- | --- | --- |
-| Unbound `reserving` (`child_connection_id IS NULL`) | `failed` / `host_restarted` + audit `prior_status: reserving` | Yes (inherits `admission_class` via existing pre-admission path) | Safe continue |
-| Bound `reserving` (`child_connection_id IS NOT NULL`) | `failed` / `admission_unknown` + audit `{ prior_status: reserving, restart_provenance: bound_reserving }` | **No** | Explicit `replacement_reason = admission_unknown` only |
-| `running` | unchanged from prior: `canceled` / `host_restarted` | Unexpected-continue path when budget remains | Existing |
+- Removed the legacy restart writer, successor creation transaction, original
+  request capture/backfill writers, parser fallback, and automatic
+  pre-delegation restart checks.
+- Removed restart MCP schema/dispatch, broker transport/listener variants,
+  Tauri command registration, Axum route/handler, request/response DTOs, and
+  restart-only ACP/application/workflow errors.
+- Reduced `workflow_restart.rs` to historical relationship projection and a
+  read-only restart-context loader. No code writes the historical context table.
+- Preserved `legacy_source_workflow_id`, the historical restart migration/table
+  and entity, existing predecessor/successor links, and context-row reads.
+- Preserved projection fields `version`, `mode`, required `creation_mode`,
+  `legacy_source`, `v2_successor`, `read_only_reason`, and
+  `automatic_root_wake`. `creation_mode` is derived from and equals persisted
+  `mode`; every version-1 header projects
+  `legacy_completion_protocol_read_only` regardless of link presence.
+- Kept `automatic_root_wake` false in this projection, matching its existing
+  behavior; v2 attention-driven wake remains owned by the completion outbox.
+- Kept exactly five `WORKFLOW_V2_TOOLS` and the shared root coordination tool
+  `request_recovery_authorization`.
+- Removed the now-orphaned private `parser_for_agent` helper; its sole consumer
+  was the deleted historical context backfill writer.
 
-### Audit (bound reserving)
+`project.rs` required no textual edit: its existing projection call now uses
+the reduced read-only helper. No historical database migration or table was
+modified or deleted.
 
-```json
-{
-  "version": 1,
-  "source": "host_restart",
-  "reason": "admission_unknown",
-  "prior_status": "reserving",
-  "restart_provenance": "bound_reserving",
-  "note": "child_connection_id was bound; prompt may have been accepted before restart"
-}
-```
+## TDD Evidence
 
-### Non-continuability / no auto-replay
+Before production deletion, the new tests failed because:
 
-- Bound reconcile outcome uses `error_code = admission_unknown`, which is deny-listed in `is_revision_eligible_failure` and never matches the pre-admission `host_restarted` continue inherit path.
-- No automatic prompt replay after restart; Skill must issue an explicit replacement.
-- Doc comment on `reconcile_non_terminal`: process-local `PendingTerminalRetry` does **not** survive host restart; still-non-terminal rows are handled only by this durable gate.
+- `restart_legacy_workflow` was still present in public/backend surfaces.
+- Historical projection returned
+  `legacy_completion_protocol_restart_required` instead of the immutable
+  read-only reason.
+- `WORKFLOW_V2_TOOLS` still contained six tools.
 
-### Completes partial `7ffb293c`
+After implementation, the historical projection regression covers both
+persisted `v1` and `v2_shadow` rows. It verifies exact stored Card JSON byte
+preservation after projection, displayed Card summary, both relationship
+directions, required/equal `creation_mode`, immutable read-only reason,
+`automatic_root_wake`, and historical context-row reads.
 
-Partial already introduced:
-- `host_restarted_bound_reserving_audit()`
-- bound vs unbound branch inside `reconcile_non_terminal`
+## Verification
 
-This task completed the contract with named tests and the `PendingTerminalRetry` comment, and re-verified eligibility through the real replace-admit path.
+All commands below were rerun after the final source-format adjustment.
 
-## Named tests
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_transport_parity --features test-utils legacy_restart_surface_is_absent`
+  - Pass: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_v2 --features test-utils historical_protocol_projection`
+  - Pass: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-utils workflow_v2_root_catalog_agrees_with_local_capabilities`
+  - Pass: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --test completion_protocol_v2 --features test-utils historical_root_resume_is_rejected_before_side_effects`
+  - Pass: 1 passed, 0 failed.
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+  - Pass.
+- `cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features server --bin codeg-server`
+  - Pass.
+- `cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --bin codeg-mcp`
+  - Pass.
+- Strict forbidden-symbol search over `src-tauri/src` and `src-tauri/tests`
+  - Pass: no restart writer/API/error/payload symbols remain.
+- Retained read/tool searches
+  - Pass: historical table/relationship/context references, exact five workflow
+    tools, and recovery authorization remain.
+- Restart-context writer/backfill search
+  - Pass: no production writer/backfill references remain.
+- `rustfmt --edition 2021 --check` over Task 6 modified Rust files except
+  `lib.rs`
+  - Pass. The Task 6 `lib.rs` change is a one-line Tauri registration deletion.
+- `git diff --check` and `git diff --cached --check`
+  - Pass before the producer commit.
 
-| Test | Result |
-| --- | --- |
-| `reconcile_unbound_reserving_host_restarted` | PASS |
-| `reconcile_bound_reserving_admission_unknown_with_audit` | PASS |
-| `gen1_post_accept_pre_promote_bound_crash_not_continuable` | PASS |
-| `admission_unknown_replacement_eligible` | PASS |
+## Concerns
 
-Also still green: existing `reconcile_status_and_audit_split_reserving_vs_running`.
+- Full-repository `cargo fmt --check` remains red on pre-existing unrelated
+  formatting in `connection.rs`, `launch_snapshot.rs`,
+  `document_translate/service.rs`, `lib.rs`, and `window_diagnostics.rs`. Those
+  unrelated files/hunks were not reformatted; scoped Task 6 formatting passed.
+- Desktop test/check commands emit the existing warning that the ignored
+  `codeg-mcp` sidecar is a zero-byte placeholder. It is not part of the diff.
+- Independent Codex and Grok review is pending before Task 7 admission.
 
-## Verify commands
+## Conclusion
 
-```powershell
-Set-Location D:\MyCodeBuddy\.worktrees\delegation-promote-reliability\src-tauri
-cargo test --features test-utils --lib reconcile_ -- --nocapture
-# 34 passed (includes 2 new named reconcile_ tests + existing)
+done_with_concerns
 
-cargo test --features test-utils --lib admission_unknown -- --nocapture
-# 6 passed (includes admission_unknown_replacement_eligible + bound reconcile)
-
-cargo test --features test-utils --lib gen1_post_accept -- --nocapture
-# 1 passed (gen1_post_accept_pre_promote_bound_crash_not_continuable)
-
-cargo check
-# Finished ok
-```
-
-## Files
-
-| File | Change |
-| --- | --- |
-| `src-tauri/src/acp/delegation/run_store.rs` | PendingTerminalRetry comment on reconcile; four named contract tests |
-
-## Commits
-
-| Hash | Message |
-| --- | --- |
-| `7ffb293c` | prior partial: split implementation (incomplete) |
-| `33c42260` | `fix(delegation): split reserving restart into host_restarted vs admission_unknown` |
-| `bc48496d` | `docs(delegation): Task 6 reconcile bound/unbound split report` |
-
-## Concerns / residual
-
-- Bound-but-pre-send false positives remain by design (bind precedes prompt send); recovery is explicit replacement with duplicate-execution warning (Task 5 surfaces).
-- `PendingTerminalRetry` itself is process-local in broker/store memory — this task only documents the restart interaction; no durable retry-record migration.
-- Tasks 7–8 not started (timestamps/metrics; full verification).
-- Historic `host_restarted` rows (pre-split, bound reserving classified as host_restarted) are not rewritten — by design.
-
-## Out of scope (confirmed)
-
-- No Tasks 7–8 work
-- No frontend card redesign
-- No `settle_terminal` write-first refactor
-- No automatic prompt replay
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done_with_concerns","summary":"Removed legacy restart writers and public dispatch/error surfaces while preserving v1/v2_shadow history, exact Card bytes, relationship/context reads, five workflow tools, and recovery authorization.","commits":[{"sha":"83c27aa13a4e83383b1cfa28d615210e90e44cda","subject":"refactor: remove legacy workflow restart writes"}],"tests":{"status":"passed","passed":4,"failed":0,"summary":"Four focused regressions and desktop/server/codeg-mcp checks passed, along with strict absence/retention, scoped rustfmt, and diff gates."},"concerns":["Full cargo fmt --check finds pre-existing unrelated formatting outside the Task 6 changes; scoped Task 6 rustfmt passed.","Desktop checks emit the existing zero-byte codeg-mcp sidecar warning.","Independent Codex and Grok review is pending before Task 7."],"report_file":".superpowers/sdd/task-6-report.md"}
+-->

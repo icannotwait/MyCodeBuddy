@@ -32,8 +32,9 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::store::{
-    classify_sqlite_transient, is_transient_sqlite, PersistedTask, PromoteRetryPolicy, Settlement,
-    SqliteTransientClass, TaskStoreError, TerminalTaskWrite,
+    classify_sqlite_transient, is_transient_db_error, is_transient_sqlite, PersistedTask,
+    PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
+    TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{DelegationRecoveryProjection, TaskStatus};
 use crate::acp::delegation::workflow::admission::{
@@ -950,6 +951,9 @@ fn is_unique_violation(msg: &str) -> bool {
 }
 
 fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
+    if is_transient_db_error(&err) {
+        return TaskStoreError::Transient(err.to_string());
+    }
     let msg = err.to_string();
     if is_transient_sqlite(&msg) {
         TaskStoreError::Transient(msg)
@@ -969,16 +973,24 @@ fn completion_recovery_fence_error(error: CompletionRecoveryFenceError) -> TaskS
     }
 }
 
+fn terminal_protocol_store_error(
+    error: crate::acp::delegation::workflow::WorkflowStoreError,
+) -> TaskStoreError {
+    match error {
+        crate::acp::delegation::workflow::WorkflowStoreError::Persistence(message) => {
+            TaskStoreError::Transient(message)
+        }
+        other => TaskStoreError::WorkflowAdmission {
+            code: other.code().into(),
+            message: other.to_string(),
+        },
+    }
+}
+
 async fn load_terminal_completion_protocol<C: ConnectionTrait>(
     conn: &C,
     task_id: &str,
-) -> Result<
-    Option<(
-        i64,
-        crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    )>,
-    TaskStoreError,
-> {
+) -> Result<TerminalCompletionProtocol, TaskStoreError> {
     let Some(binding) = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
         task_id.to_string(),
     )
@@ -986,22 +998,24 @@ async fn load_terminal_completion_protocol<C: ConnectionTrait>(
     .await
     .map_err(map_db_err)?
     else {
-        return Ok(None);
+        return Ok(TerminalCompletionProtocol::Standalone);
     };
-    let workflow =
-        crate::db::entities::delegation_workflow::Entity::find_by_id(binding.workflow_id)
-            .one(conn)
-            .await
-            .map_err(map_db_err)?
-            .ok_or_else(|| {
-                TaskStoreError::Permanent(
-                    "workflow run binding references a missing workflow".into(),
-                )
-            })?;
-    Ok(Some((
-        workflow.completion_protocol_version,
-        workflow.completion_protocol_mode,
-    )))
+    let (version, mode) = crate::acp::delegation::workflow::load_completion_protocol_header(
+        conn,
+        &binding.workflow_id,
+    )
+    .await
+    .map_err(terminal_protocol_store_error)?
+    .ok_or_else(|| TaskStoreError::WorkflowAdmission {
+        code: "unsupported_completion_protocol".into(),
+        message: format!(
+            "workflow run binding for task {task_id} references missing workflow {}",
+            binding.workflow_id
+        ),
+    })?;
+    crate::acp::delegation::workflow::require_v2_mutation(version, &mode)
+        .map_err(terminal_protocol_store_error)?;
+    Ok(TerminalCompletionProtocol::V2)
 }
 
 /// Map unique-index collisions from gen-1 insert to typed wire errors.
@@ -1937,7 +1951,7 @@ pub struct RunStore {
     workflow_binding_load_fail: std::sync::atomic::AtomicBool,
     /// Test-only: fail the next out-of-transaction terminal protocol pre-read.
     #[cfg(any(test, feature = "test-utils"))]
-    terminal_completion_protocol_load_fail: std::sync::atomic::AtomicBool,
+    terminal_completion_protocol_load_failures_remaining: std::sync::atomic::AtomicUsize,
     /// Test-only: fail after the run CAS write and before child projection.
     #[cfg(any(test, feature = "test-utils"))]
     terminal_transaction_fail: std::sync::atomic::AtomicBool,
@@ -1983,7 +1997,8 @@ impl RunStore {
             #[cfg(any(test, feature = "test-utils"))]
             workflow_binding_load_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
-            terminal_completion_protocol_load_fail: std::sync::atomic::AtomicBool::new(false),
+            terminal_completion_protocol_load_failures_remaining:
+                std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             terminal_transaction_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
@@ -2052,17 +2067,16 @@ impl RunStore {
     pub async fn terminal_completion_protocol(
         &self,
         task_id: &str,
-    ) -> Result<
-        Option<(
-            i64,
-            crate::db::entities::delegation_workflow::CompletionProtocolMode,
-        )>,
-        TaskStoreError,
-    > {
+    ) -> Result<TerminalCompletionProtocol, TaskStoreError> {
         #[cfg(any(test, feature = "test-utils"))]
         if self
-            .terminal_completion_protocol_load_fail
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .terminal_completion_protocol_load_failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
         {
             return Err(TaskStoreError::Transient(
                 "injected terminal completion protocol load failure".into(),
@@ -2073,8 +2087,13 @@ impl RunStore {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_next_terminal_completion_protocol_load(&self) {
-        self.terminal_completion_protocol_load_fail
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.fail_terminal_completion_protocol_loads(1);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_terminal_completion_protocol_loads(&self, count: usize) {
+        self.terminal_completion_protocol_load_failures_remaining
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read the platform role and durable tool-intent candidates used by the
@@ -2205,17 +2224,17 @@ impl RunStore {
     pub async fn workflow_child_mcp_binding(
         &self,
         task_id: &str,
-    ) -> Result<Option<WorkflowChildMcpBinding>, String> {
+    ) -> Result<Option<WorkflowChildMcpBinding>, TaskStoreError> {
         #[cfg(any(test, feature = "test-utils"))]
         if self
             .workflow_binding_load_fail
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err("injected workflow binding load failure".into());
+            return Err(TaskStoreError::Permanent(
+                "injected workflow binding load failure".into(),
+            ));
         }
-        crate::acp::delegation::workflow::load_workflow_child_mcp_binding(&self.db, task_id)
-            .await
-            .map_err(|error| error.to_string())
+        crate::acp::delegation::workflow::load_workflow_child_mcp_binding(&self.db, task_id).await
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -3446,6 +3465,10 @@ impl RunStore {
         let proj_status = task_status_to_delegation_task_status(terminal.status)?;
         let finished_at = terminal.finished_at;
         let error_code = terminal.error_code.clone();
+        let protocol_failure = matches!(
+            error_code.as_deref(),
+            Some("legacy_completion_protocol_read_only" | "unsupported_completion_protocol")
+        );
         let conversation_status = terminal.conversation_status.clone();
         let card_summary_json = terminal.card_summary_json.clone();
         let termination_evidence = terminal.termination_evidence().cloned();
@@ -3575,15 +3598,19 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
 
-                    let effect = on_terminal_settle_txn(
-                        txn,
-                        &task_id,
-                        won.parent_conversation_id,
-                        card_summary_json.as_deref(),
-                        &won.status,
-                        won.workspace_path.as_deref(),
-                    )
-                    .await?;
+                    let effect = if protocol_failure {
+                        WorkflowTxnSideEffect::None
+                    } else {
+                        on_terminal_settle_txn(
+                            txn,
+                            &task_id,
+                            won.parent_conversation_id,
+                            card_summary_json.as_deref(),
+                            &won.status,
+                            won.workspace_path.as_deref(),
+                        )
+                        .await?
+                    };
 
                     let persisted = model_to_persisted_run(won).ok_or_else(|| {
                         TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
@@ -4288,6 +4315,50 @@ impl RunStore {
                         DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
                     }
 
+                    let mut run_status = run_status;
+                    let mut proj_status = proj_status;
+                    let mut error_code = error_code;
+                    let mut conversation_status = conversation_status;
+                    let mut card_summary_json = card_summary_json;
+                    let mut termination_evidence = termination_evidence;
+                    let mut completion_input = completion_input;
+                    let mut protocol_failure = false;
+                    let protocol = match load_terminal_completion_protocol(txn, &task_id).await {
+                        Ok(protocol) => protocol,
+                        Err(TaskStoreError::WorkflowAdmission { code, message }) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error_code = %code,
+                                error = %message,
+                                "[delegation] terminal protocol rejected inside settlement transaction"
+                            );
+                            run_status = DelegationRunStatus::Failed;
+                            proj_status = task_status_to_delegation_task_status(TaskStatus::Failed)?;
+                            error_code = Some(code);
+                            conversation_status = ConversationStatus::Cancelled;
+                            card_summary_json = None;
+                            completion_input = None;
+                            protocol_failure = true;
+                            if termination_evidence.is_none() {
+                                termination_evidence = Some(DelegationTerminationAuditV1::new(
+                                    AcpTerminationSummaryV1::new(
+                                        AcpTerminationSource::Admission,
+                                        AcpTerminationReason::AdmissionFailed,
+                                        AcpTerminationClassification::Unexpected,
+                                        true,
+                                        finished_at,
+                                    ),
+                                    row.status.clone(),
+                                    row.admission_class.clone(),
+                                    row.parent_tool_use_id.clone(),
+                                    row.child_connection_id.clone(),
+                                ));
+                            }
+                            TerminalCompletionProtocol::Standalone
+                        }
+                        Err(error) => return Err(error),
+                    };
+
                     let termination_audit_json =
                         serialize_termination_evidence(termination_evidence.as_ref(), &row)?;
                     let generation = row.generation;
@@ -4314,7 +4385,29 @@ impl RunStore {
                             sea_orm::sea_query::Expr::value(now),
                         );
 
-                    if let Some(ref summary) = card_summary_json {
+                    if protocol_failure {
+                        update = update
+                            .col_expr(
+                                delegation_task_run::Column::CardSummaryJson,
+                                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::CompletionState,
+                                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::CompletionOutcome,
+                                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::CompletionEvidenceJson,
+                                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::FinalRemediationContextsJson,
+                                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                            );
+                    } else if let Some(ref summary) = card_summary_json {
                         update = update.col_expr(
                             delegation_task_run::Column::CardSummaryJson,
                             sea_orm::sea_query::Expr::value(summary.clone()),
@@ -4399,12 +4492,7 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
 
-                    let protocol = load_terminal_completion_protocol(txn, &task_id).await?;
-                    let enforce_v2 = protocol.is_some_and(|(version, mode)| {
-                        version == 2
-                            && mode
-                                == crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce
-                    });
+                    let enforce_v2 = protocol == TerminalCompletionProtocol::V2;
                     if enforce_v2 {
                         let mut clear_v1_authority = DelegationTaskRun::update_many().col_expr(
                             delegation_task_run::Column::CardSummaryJson,
@@ -4435,7 +4523,9 @@ impl RunStore {
                             .await
                             .map_err(map_db_err)?;
                     }
-                    let (effect, completion) = if enforce_v2
+                    let (effect, completion) = if protocol_failure {
+                        (WorkflowTxnSideEffect::None, None)
+                    } else if enforce_v2
                         && run_status == DelegationRunStatus::Completed
                     {
                         let input = completion_input.ok_or_else(|| {
@@ -5488,6 +5578,50 @@ mod tests {
     }
 
     #[test]
+    fn terminal_protocol_db_errors_preserve_connection_availability_and_decode_classes() {
+        use crate::acp::delegation::workflow::WorkflowStoreError;
+        use sea_orm::sqlx::error::Error as SqlxError;
+        use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+
+        for error in [
+            DbErr::ConnectionAcquire(ConnAcquireErr::Timeout),
+            DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed),
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::PoolTimedOut)),
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::PoolClosed)),
+            DbErr::Conn(RuntimeErr::Internal("closed connection".into())),
+            DbErr::Exec(RuntimeErr::Internal("database is busy".into())),
+            DbErr::Exec(RuntimeErr::Internal("database is locked".into())),
+        ] {
+            assert!(
+                matches!(map_db_err(error), TaskStoreError::Transient(_)),
+                "connection availability and SQLite contention must be retryable"
+            );
+        }
+
+        assert!(matches!(
+            map_db_err(DbErr::Query(RuntimeErr::Internal(
+                "permanent query failure".into()
+            ))),
+            TaskStoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            terminal_protocol_store_error(WorkflowStoreError::Persistence(
+                "temporarily unavailable header store".into()
+            )),
+            TaskStoreError::Transient(_)
+        ));
+        assert!(matches!(
+            terminal_protocol_store_error(
+                WorkflowStoreError::UnsupportedCompletionProtocolHeader(
+                    "invalid completion_protocol_mode".into()
+                )
+            ),
+            TaskStoreError::WorkflowAdmission { ref code, .. }
+                if code == "unsupported_completion_protocol"
+        ));
+    }
+
+    #[test]
     fn preview_redacts_gitlab_slack_aws_pem() {
         let gl = derive_task_preview("glpat-abc_def-123");
         assert!(gl.contains("[redacted]"));
@@ -5749,9 +5883,13 @@ mod tests {
             plan_fingerprint: Set("plan-fingerprint".into()),
             block_cause_code: Set(None),
             block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(
+                crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce,
+            ),
+            legacy_source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
-            ..Default::default()
         }
         .insert(&db.conn)
         .await
@@ -5844,14 +5982,16 @@ mod tests {
             let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
             let store = RunStore::new(db.clone());
             seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, role, phase).await;
-            store
-                .settle_terminal(
-                    task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                        .with_card_summary_json(summary),
-                )
-                .await
-                .expect("settle role-aware summary");
+            on_terminal_settle_txn(
+                &db.conn,
+                task_id,
+                parent_id,
+                Some(summary),
+                &DelegationRunStatus::Completed,
+                None,
+            )
+            .await
+            .expect("project role-aware summary");
             let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
                 task_id.to_string(),
             )
@@ -5887,14 +6027,16 @@ mod tests {
             let store = RunStore::new(db.clone());
             seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "reviewer", phase)
                 .await;
-            store
-                .settle_terminal(
-                    task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                        .with_card_summary_json(summary),
-                )
-                .await
-                .expect("settle reviewer with blank report path");
+            on_terminal_settle_txn(
+                &db.conn,
+                task_id,
+                parent_id,
+                Some(summary),
+                &DelegationRunStatus::Completed,
+                None,
+            )
+            .await
+            .expect("project reviewer with blank report path");
             let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
                 task_id.to_string(),
             )
@@ -5916,16 +6058,18 @@ mod tests {
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let store = RunStore::new(db.clone());
         seed_workflow_mapped_run(&db, &store, task_id, parent_id, child_id, "author", "plan").await;
-        store
-            .settle_terminal(
-                task_id,
-                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                    .with_card_summary_json(
-                        r#"{"kind":"author","status":"done","summary":"authored","plan_digest":"sha256:author-plan","report_file":"reports/author.md"}"#,
-                    ),
-            )
-            .await
-            .unwrap();
+        on_terminal_settle_txn(
+            &db.conn,
+            task_id,
+            parent_id,
+            Some(
+                r#"{"kind":"author","status":"done","summary":"authored","plan_digest":"sha256:author-plan","report_file":"reports/author.md"}"#,
+            ),
+            &DelegationRunStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap();
         let binding = crate::db::entities::delegation_workflow_run_binding::Entity::find_by_id(
             task_id.to_string(),
         )

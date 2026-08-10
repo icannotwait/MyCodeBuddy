@@ -179,20 +179,12 @@ pub fn build_router(
             post(handlers::workflow_completion::resolve_completion_decision),
         )
         .route(
-            "/get_completion_protocol_settings",
-            post(handlers::workflow_completion::get_completion_protocol_settings),
-        )
-        .route(
             "/retry_completion_artifact",
             post(handlers::workflow_completion::retry_completion_artifact),
         )
         .route(
             "/resolve_design_self_review",
             post(handlers::workflow_completion::resolve_design_self_review),
-        )
-        .route(
-            "/restart_legacy_workflow",
-            post(handlers::workflow_completion::restart_legacy_workflow),
         )
         .route(
             "/list_opened_tabs",

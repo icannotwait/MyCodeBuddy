@@ -53,14 +53,13 @@ use crate::acp::delegation::transport::{
     client_get_workflow_state_round_trip, client_parent_decision_round_trip,
     client_publish_workflow_round_trip, client_recover_workflow_round_trip,
     client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
-    client_restart_legacy_workflow_round_trip, client_round_trip, client_session_round_trip,
-    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
-    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
-    BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest, BrokerRequest,
-    BrokerResponse, BrokerRestartLegacyWorkflowRequest, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
+    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
+    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
@@ -200,7 +199,7 @@ pub struct CompanionFeatures {
     pub ask: bool,
     pub sessions: bool,
     /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
-    /// enables all six B9 tools together (structural catalog agreement).
+    /// enables all five B9 tools together (structural catalog agreement).
     pub workflow_v2: bool,
     /// Child-only workflow completion-intent transport.
     pub completion_v2: bool,
@@ -213,15 +212,14 @@ pub const WORKFLOW_V2_TOOLS: &[&str] = &[
     "recover_workflow",
     "publish_workflow_manifest",
     "settle_workflow_gate",
-    "restart_legacy_workflow",
 ];
 
 /// Capability catalog classification (B9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowCapabilityMode {
-    /// None of the six workflow tools present; workflow is unavailable.
+    /// None of the five workflow tools present; workflow is unavailable.
     Unavailable,
-    /// All six present → v2 mode (capability must also report true).
+    /// All five present → v2 mode (capability must also report true).
     WorkflowManifestV2,
     /// Partial tool set → inconsistent hard-block.
     Inconsistent,
@@ -371,10 +369,7 @@ impl CompanionContext {
             | "get_workflow_state"
             | "publish_workflow_manifest"
             | "settle_workflow_gate"
-            | "recover_workflow"
-            | "restart_legacy_workflow" => {
-                self.features.workflow_v2 && self.role == CompanionRole::Root
-            }
+            | "recover_workflow" => self.features.workflow_v2 && self.role == CompanionRole::Root,
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -1003,28 +998,6 @@ async fn build_tools_call_spawn(
                 Box::pin(async move { client_recover_workflow_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
-        "restart_legacy_workflow" => {
-            let request: crate::acp::delegation::types::RestartLegacyWorkflowRequest =
-                match serde_json::from_value(arguments) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return LineAction::Respond(err(
-                            id,
-                            -32602,
-                            format!("invalid restart_legacy_workflow arguments: {error}"),
-                        ));
-                    }
-                };
-            let req = BrokerRestartLegacyWorkflowRequest {
-                token: ctx.token.clone(),
-                source_conversation_id: request.source_conversation_id,
-            };
-            let round_trip =
-                Box::pin(
-                    async move { client_restart_legacy_workflow_round_trip(&socket, &req).await },
-                );
-            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
-        }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
 }
@@ -1200,10 +1173,6 @@ fn parse_settle_workflow_args(
             "expected_outcome",
             "recovery_authorization_id",
             "summary",
-            "manifest_revision",
-            "gate_cycle",
-            "outcome",
-            "evidence",
         ],
     )?;
     let workflow_id = arguments
@@ -1224,8 +1193,6 @@ fn parse_settle_workflow_args(
         .ok_or_else(|| "settle_workflow_gate requires summary string".to_string())?
         .to_string();
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
-    let manifest_revision = parse_optional_u64_arg(arguments, "manifest_revision")?;
-    let gate_cycle = parse_optional_u64_arg(arguments, "gate_cycle")?;
     let expected_review_round = parse_optional_u64_arg(arguments, "expected_review_round")?;
     let expected_gate_cycle = parse_optional_u64_arg(arguments, "expected_gate_cycle")?;
     let parse_outcome = |key: &str| -> Result<Option<String>, String> {
@@ -1242,37 +1209,7 @@ fn parse_settle_workflow_args(
         }
         Ok(Some(value.to_string()))
     };
-    let outcome = parse_outcome("outcome")?;
     let expected_outcome = parse_outcome("expected_outcome")?;
-    let evidence = arguments
-        .get("evidence")
-        .cloned()
-        .map(|evidence_value| {
-            let evidence: crate::acp::delegation::workflow::SettleGateEvidence =
-                serde_json::from_value(evidence_value)
-                    .map_err(|e| format!("settle_workflow_gate evidence: {e}"))?;
-            if let crate::acp::delegation::workflow::SettleGateEvidence::Design {
-                critical_count,
-                important_count,
-                minor_count,
-            } = &evidence
-            {
-                for (key, value) in [
-                    ("critical_count", critical_count),
-                    ("important_count", important_count),
-                    ("minor_count", minor_count),
-                ] {
-                    if *value < 0 {
-                        return Err(format!(
-                            "settle_workflow_gate {key} must be a non-negative integer"
-                        ));
-                    }
-                }
-            }
-            serde_json::to_value(evidence)
-                .map_err(|e| format!("settle_workflow_gate evidence: {e}"))
-        })
-        .transpose()?;
     let recovery_authorization_id = arguments
         .get("recovery_authorization_id")
         .map(|value| {
@@ -1294,10 +1231,6 @@ fn parse_settle_workflow_args(
         expected_gate_cycle,
         expected_outcome,
         recovery_authorization_id,
-        manifest_revision,
-        gate_cycle,
-        outcome,
-        evidence,
         summary,
     })
 }
@@ -4552,6 +4485,17 @@ mod tests {
     #[tokio::test]
     async fn workflow_v2_root_catalog_agrees_with_local_capabilities() {
         let names = list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
+        assert_eq!(
+            WORKFLOW_V2_TOOLS,
+            &[
+                "get_workflow_capabilities",
+                "get_workflow_state",
+                "recover_workflow",
+                "publish_workflow_manifest",
+                "settle_workflow_gate",
+            ]
+        );
+        assert!(names.contains(&"request_recovery_authorization".to_string()));
         for tool in WORKFLOW_V2_TOOLS {
             assert!(
                 names.iter().any(|n| n == *tool),
@@ -5159,113 +5103,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_workflow_gate_rejects_negative_finding_counts_synchronously() {
-        // Defense at companion parse: no UDS spawn for negative counts.
-        for (key, args) in [
-            (
-                "critical_count",
-                json!({
-                    "workflow_id": "wf-1",
-                    "manifest_revision": 1,
-                    "gate_id": "design",
-                    "expected_graph_revision": 1,
-                    "gate_cycle": 1,
-                    "outcome": "changes_requested",
-                    "evidence": {
-                        "kind": "design",
-                        "critical_count": -1,
-                        "important_count": 0,
-                        "minor_count": 0
-                    },
-                    "summary": "nope",
-                }),
-            ),
-            (
-                "important_count",
-                json!({
-                    "workflow_id": "wf-1",
-                    "manifest_revision": 1,
-                    "gate_id": "design",
-                    "expected_graph_revision": 1,
-                    "gate_cycle": 1,
-                    "outcome": "changes_requested",
-                    "evidence": {
-                        "kind": "design",
-                        "critical_count": 0,
-                        "important_count": -2,
-                        "minor_count": 0
-                    },
-                    "summary": "nope",
-                }),
-            ),
-            (
-                "minor_count",
-                json!({
-                    "workflow_id": "wf-1",
-                    "manifest_revision": 1,
-                    "gate_id": "design",
-                    "expected_graph_revision": 1,
-                    "gate_cycle": 1,
-                    "outcome": "blocked",
-                    "evidence": {
-                        "kind": "design",
-                        "critical_count": 0,
-                        "important_count": 0,
-                        "minor_count": -3
-                    },
-                    "summary": "nope",
-                }),
-            ),
+    async fn settle_workflow_gate_rejects_legacy_fields_synchronously() {
+        for (field, value) in [
+            ("manifest_revision", json!(1)),
+            ("gate_cycle", json!(1)),
+            ("outcome", json!("changes_requested")),
+            ("evidence", json!({ "kind": "design" })),
         ] {
+            let mut args = json!({
+                "workflow_id": "wf-1",
+                "gate_id": "design",
+                "expected_graph_revision": 1,
+                "expected_gate_cycle": 1,
+                "expected_outcome": "changes_requested",
+                "summary": "platform evidence decides",
+            });
+            args[field] = value;
             let action =
                 dispatch_with_features(WORKFLOW_ROOT, &call(11, "settle_workflow_gate", args))
                     .await;
             let resp = unwrap_respond(action);
             let err = resp
                 .error
-                .unwrap_or_else(|| panic!("expected -32602 for negative {key}"));
-            assert_eq!(err.code, -32602, "negative {key}");
+                .unwrap_or_else(|| panic!("expected -32602 for legacy field {field}"));
+            assert_eq!(err.code, -32602, "legacy field {field}");
             assert!(
-                err.message.contains(key) && err.message.contains("non-negative"),
-                "negative {key}: {}",
+                err.message.contains(field) && err.message.contains("does not accept"),
+                "legacy field {field}: {}",
                 err.message
             );
-        }
-    }
-
-    #[test]
-    fn workflow_manifest_v1_plan_settlement_uses_legacy_request() {
-        let evidence = json!({
-            "kind": "design",
-            "critical_count": 0,
-            "important_count": 0,
-            "minor_count": 0
-        });
-        let req = parse_settle_workflow_args(
-            &json!({
-                "workflow_id": "wf-v1",
-                "manifest_revision": 2,
-                "gate_id": "design",
-                "expected_graph_revision": 3,
-                "gate_cycle": 4,
-                "outcome": "approved",
-                "evidence": evidence,
-                "summary": "legacy settlement"
-            }),
-            "token",
-        )
-        .expect("legacy v1 settlement request parses");
-        let wire = serde_json::to_value(req).expect("serialize legacy broker request");
-        assert_eq!(wire["manifest_revision"], 2);
-        assert_eq!(wire["gate_cycle"], 4);
-        assert_eq!(wire["outcome"], "approved");
-        assert_eq!(wire["evidence"], evidence);
-        for forbidden in [
-            "expected_review_round",
-            "expected_gate_cycle",
-            "expected_outcome",
-        ] {
-            assert!(wire.get(forbidden).is_none(), "v1 wire leaked {forbidden}");
         }
     }
 
@@ -5294,6 +5160,10 @@ mod tests {
     #[test]
     fn workflow_manifest_v2_settlement_rejects_unknown_arguments() {
         for field in [
+            "manifest_revision",
+            "gate_cycle",
+            "outcome",
+            "evidence",
             "critical_count",
             "reviewer_task_ids",
             "covered_digest",
@@ -5374,10 +5244,6 @@ mod tests {
             assert!(required.iter().any(|value| value == field));
         }
         for property in [
-            "manifest_revision",
-            "gate_cycle",
-            "outcome",
-            "evidence",
             "expected_review_round",
             "expected_gate_cycle",
             "expected_outcome",
@@ -5388,18 +5254,13 @@ mod tests {
                 "settlement schema omits {property}"
             );
         }
-        let arms = settle_schema["oneOf"]
-            .as_array()
-            .expect("settlement schema must expose v1 and v2 arms");
-        assert_eq!(arms.len(), 2);
-        assert_eq!(
-            arms[0]["required"],
-            json!(["manifest_revision", "gate_cycle", "outcome", "evidence"])
-        );
-        assert_eq!(
-            arms[1]["propertyNames"]["not"]["enum"],
-            json!(["manifest_revision", "gate_cycle", "outcome", "evidence"])
-        );
+        for property in ["manifest_revision", "gate_cycle", "outcome", "evidence"] {
+            assert!(
+                settle_schema["properties"].get(property).is_none(),
+                "settlement schema retains legacy property {property}"
+            );
+        }
+        assert!(settle_schema.get("oneOf").is_none());
     }
 
     #[test]
@@ -5472,7 +5333,7 @@ mod tests {
             "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
             line.len(),
         );
-        // Root + coordination_v1 + workflow_v2: reply + authorization + six workflow tools.
+        // Root + coordination_v1 + workflow_v2: reply + authorization + five workflow tools.
         assert_eq!(
             names,
             vec![
@@ -5489,7 +5350,6 @@ mod tests {
                 "recover_workflow",
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
-                "restart_legacy_workflow",
             ]
         );
     }

@@ -294,6 +294,14 @@ pub struct PendingTerminalRetry {
     pub frozen: bool,
 }
 
+/// Durable completion contract selected before terminal output parsing.
+/// Workflow-bound callers either prove exact v2 or receive a typed error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCompletionProtocol {
+    Standalone,
+    V2,
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TaskStoreError {
     #[error("transient database error: {0}")]
@@ -543,6 +551,26 @@ pub fn classify_sqlite_transient(err: &sea_orm::DbErr) -> Option<SqliteTransient
     }
 
     classify_sqlite_transient_msg(&err.to_string())
+}
+
+/// Preserve typed connection-availability failures before SeaORM formats them.
+pub fn is_transient_db_error(err: &sea_orm::DbErr) -> bool {
+    use sea_orm::sqlx::error::Error as SqlxError;
+    use sea_orm::{DbErr, RuntimeErr};
+
+    (match err {
+        DbErr::ConnectionAcquire(_) => true,
+        DbErr::Conn(RuntimeErr::SqlxError(error)) => {
+            matches!(error, SqlxError::PoolTimedOut | SqlxError::PoolClosed)
+        }
+        DbErr::Conn(RuntimeErr::Internal(message)) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("closed connection")
+                || lower.contains("connection closed")
+                || lower.contains("pool closed")
+        }
+        _ => false,
+    }) || classify_sqlite_transient(err).is_some()
 }
 
 /// Classify from an already-stringified error (tests / inject hooks).

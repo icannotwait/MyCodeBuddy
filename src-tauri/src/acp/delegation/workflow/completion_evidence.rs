@@ -22,7 +22,9 @@ use super::completion_intent::{
     CompletionResolution, CompletionResolverInput, CompletionRole, CompletionToolIntent,
 };
 use super::dto::sha256_hex_str;
-use super::error::{CompletionEvidenceError, CompletionRecoveryFenceError};
+use super::error::{
+    require_v2_mutation, CompletionEvidenceError, CompletionRecoveryFenceError, WorkflowStoreError,
+};
 use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
     build_admission_completion_context,
@@ -41,6 +43,7 @@ use super::final_findings::{
     FinalFindingsPackageInputV1, FinalFindingsPackageV1, FinalReviewerEvaluationV1,
     RemediationContextAvailability, RemediationContextInputV1, RemediationContextSnapshotV1,
 };
+use super::store::load_completion_protocol_header;
 use super::types::{
     AdmissionCompletionContextV2, ArtifactSubjectIdentityV2, CompletionArtifactV2,
     CompletionEvidenceBindingV2, CompletionEvidenceV2, CompletionScopeRole,
@@ -205,6 +208,8 @@ pub enum CompletionMutationError {
     RoleMismatch,
     #[error("completion attention is invalid: {0}")]
     InvalidAttention(String),
+    #[error("{message}")]
+    Protocol { code: &'static str, message: String },
     #[error(transparent)]
     Evidence(#[from] CompletionEvidenceError),
 }
@@ -218,9 +223,81 @@ impl CompletionMutationError {
             Self::Conflict => "completion_decision_conflict",
             Self::RoleMismatch => "completion_outcome_role_mismatch",
             Self::InvalidAttention(_) => "completion_attention_invalid",
+            Self::Protocol { code, .. } => code,
             Self::Evidence(error) => error.code(),
         }
     }
+}
+
+fn completion_store_mutation_error(error: WorkflowStoreError) -> CompletionMutationError {
+    match error {
+        WorkflowStoreError::Persistence(message) => {
+            CompletionEvidenceError::Persistence(message).into()
+        }
+        other => CompletionMutationError::Protocol {
+            code: other.code(),
+            message: other.to_string(),
+        },
+    }
+}
+
+fn completion_store_evidence_error(error: WorkflowStoreError) -> CompletionEvidenceError {
+    match error {
+        WorkflowStoreError::Persistence(message) => CompletionEvidenceError::Persistence(message),
+        other => CompletionEvidenceError::Protocol {
+            code: other.code(),
+            message: other.to_string(),
+        },
+    }
+}
+
+async fn require_workflow_v2_completion_mutation<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+) -> Result<(), CompletionMutationError> {
+    let (version, mode) = load_completion_protocol_header(conn, workflow_id)
+        .await
+        .map_err(completion_store_mutation_error)?
+        .ok_or_else(|| {
+            CompletionMutationError::InvalidAttention("workflow protocol header is missing".into())
+        })?;
+    require_v2_mutation(version, &mode).map_err(completion_store_mutation_error)
+}
+
+async fn require_task_v2_completion_mutation<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<(), CompletionMutationError> {
+    let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            CompletionMutationError::InvalidAttention("workflow run binding is missing".into())
+        })?;
+    require_workflow_v2_completion_mutation(conn, &binding.workflow_id).await
+}
+
+async fn require_task_v2_completion_evidence<C: ConnectionTrait>(
+    conn: &C,
+    task_id: &str,
+) -> Result<(), CompletionEvidenceError> {
+    let binding = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+        .one(conn)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            CompletionEvidenceError::InvalidTerminalState("workflow run binding is missing".into())
+        })?;
+    let (version, mode) = load_completion_protocol_header(conn, &binding.workflow_id)
+        .await
+        .map_err(completion_store_evidence_error)?
+        .ok_or_else(|| {
+            CompletionEvidenceError::InvalidTerminalState(
+                "workflow protocol header is missing".into(),
+            )
+        })?;
+    require_v2_mutation(version, &mode).map_err(completion_store_evidence_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -907,6 +984,9 @@ async fn resolve_completion_attention_row<C: ConnectionTrait>(
 fn completion_mutation_error(error: CompletionMutationError) -> CompletionEvidenceError {
     match error {
         CompletionMutationError::Evidence(error) => error,
+        CompletionMutationError::Protocol { code, message } => {
+            CompletionEvidenceError::Protocol { code, message }
+        }
         error => CompletionEvidenceError::InvalidAttention(error.to_string()),
     }
 }
@@ -960,6 +1040,7 @@ async fn resolve_completion_decision_once<C: ConnectionTrait>(
     let attention = load_mutation_attention(conn, &request.attention_id).await?;
     require_attention_kind(&attention, request, AttentionKind::CompletionDecision)?;
     require_attention_owner(&attention, parent_conversation_id)?;
+    require_task_v2_completion_mutation(conn, &attention.task_id).await?;
     if attention.status == "resolved" {
         return replay_user_outcome(conn, &attention, request, outcome).await;
     }
@@ -1078,6 +1159,7 @@ pub async fn open_design_self_review_decision_txn<C: ConnectionTrait>(
     binding: &delegation_workflow_design_root_binding::Model,
     parent_conversation_id: i32,
 ) -> Result<CompletionAttentionCas, CompletionMutationError> {
+    require_workflow_v2_completion_mutation(conn, &binding.workflow_id).await?;
     let payload = DesignSelfReviewPayloadV1 {
         version: 1,
         design_identity: binding.design_identity.clone(),
@@ -1123,6 +1205,16 @@ pub async fn resolve_design_self_review_txn(
                     AttentionKind::DesignSelfReviewDecision,
                 )?;
                 require_attention_owner(&attention, parent_conversation_id)?;
+                let binding = delegation_workflow_design_root_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_design_root_binding::Column::TaskId
+                            .eq(&attention.task_id),
+                    )
+                    .one(txn)
+                    .await
+                    .map_err(db_error)?
+                    .ok_or(CompletionMutationError::Superseded)?;
+                require_workflow_v2_completion_mutation(txn, &binding.workflow_id).await?;
                 if attention.status == "resolved" {
                     return replay_user_outcome(txn, &attention, &request, outcome).await;
                 }
@@ -1137,15 +1229,6 @@ pub async fn resolve_design_self_review_txn(
                 {
                     return Err(CompletionMutationError::RoleMismatch);
                 }
-                let binding = delegation_workflow_design_root_binding::Entity::find()
-                    .filter(
-                        delegation_workflow_design_root_binding::Column::TaskId
-                            .eq(&request.task_id),
-                    )
-                    .one(txn)
-                    .await
-                    .map_err(db_error)?
-                    .ok_or(CompletionMutationError::Superseded)?;
                 let workflow = delegation_workflow::Entity::find_by_id(&binding.workflow_id)
                     .one(txn)
                     .await
@@ -2096,6 +2179,7 @@ pub async fn retry_completion_artifact_for_user_txn(
                     AttentionKind::CompletionArtifactRecovery,
                 )?;
                 require_attention_owner(&attention, parent_conversation_id)?;
+                require_task_v2_completion_mutation(txn, &attention.task_id).await?;
                 if !attention_cas_fields_match(&attention, &request) {
                     return Err(CompletionMutationError::Superseded);
                 }
@@ -2163,6 +2247,7 @@ async fn retry_completion_artifact_once<C: ConnectionTrait>(
         .await
         .map_err(db_error)?
         .ok_or_else(|| CompletionEvidenceError::InvalidAttention("attention not found".into()))?;
+    require_task_v2_completion_evidence(conn, &attention.task_id).await?;
     if !attention_cas_fields_match(&attention, request) {
         return Err(CompletionEvidenceError::InvalidAttention(
             "attention CAS mismatch".into(),
@@ -3491,7 +3576,9 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    };
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
@@ -3656,10 +3743,24 @@ mod tests {
             Self::new_with_node_id(source, write_plan, "plan-author".into()).await
         }
 
+        async fn new_before_v2_only(source: IntentFixture, write_plan: bool) -> Self {
+            Self::new_with_node_id_at_migration(source, write_plan, "plan-author".into(), false)
+                .await
+        }
+
         async fn new_with_node_id(
             source: IntentFixture,
             write_plan: bool,
             author_node_id: String,
+        ) -> Self {
+            Self::new_with_node_id_at_migration(source, write_plan, author_node_id, true).await
+        }
+
+        async fn new_with_node_id_at_migration(
+            source: IntentFixture,
+            write_plan: bool,
+            author_node_id: String,
+            install_v2_only_triggers: bool,
         ) -> Self {
             let workspace = tempfile::tempdir().expect("workspace");
             let workspace_path = workspace.path().to_path_buf();
@@ -3672,7 +3773,11 @@ mod tests {
                 std::fs::write(&plan_path, b"# Plan\n\nInitial.\n").unwrap();
             }
 
-            let db = Arc::new(fresh_in_memory_db().await);
+            let db = Arc::new(if install_v2_only_triggers {
+                fresh_in_memory_db().await
+            } else {
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await
+            });
             let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
             let parent = seed_conversation(&db, folder, AgentType::Codex).await;
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -4493,16 +4598,19 @@ mod tests {
     #[tokio::test]
     async fn typed_completion_attention_design_self_review_is_typed_and_replayable() {
         let fixture = TerminalFixture::new(IntentFixture::Missing, true).await;
-        delegation_workflow_gate_state::ActiveModel {
-            workflow_id: Set(fixture.workflow_id.clone()),
-            gate_id: Set("design".into()),
-            gate_lineage: Set("design-lineage-1".into()),
-            current_review_round: Set(1),
-            selected_node_ids_json: Set(r#"["design-reviewer"]"#.into()),
-        }
-        .insert(&fixture.db.conn)
+        let state = delegation_workflow_gate_state::Entity::find_by_id((
+            fixture.workflow_id.clone(),
+            "design".to_string(),
+        ))
+        .one(&fixture.db.conn)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("fixed-v2 publication initializes Design gate state");
+        let mut state: delegation_workflow_gate_state::ActiveModel = state.into();
+        state.gate_lineage = Set("design-lineage-1".into());
+        state.current_review_round = Set(1);
+        state.selected_node_ids_json = Set(r#"["design-reviewer"]"#.into());
+        state.update(&fixture.db.conn).await.unwrap();
         let binding = delegation_workflow_design_root_binding::ActiveModel {
             workflow_id: Set(fixture.workflow_id.clone()),
             gate_id: Set("design".into()),
@@ -4559,6 +4667,165 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state.completion.as_ref(), Some(&durable));
+    }
+
+    async fn set_fixture_protocol(
+        fixture: &TerminalFixture,
+        version: i64,
+        mode: CompletionProtocolMode,
+    ) {
+        let workflow = delegation_workflow::Entity::find_by_id(&fixture.workflow_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut workflow: delegation_workflow::ActiveModel = workflow.into();
+        workflow.completion_protocol_version = Set(version);
+        workflow.completion_protocol_mode = Set(mode);
+        workflow.update(&fixture.db.conn).await.unwrap();
+        crate::db::test_helpers::complete_historical_completion_protocol_migrations(&fixture.db)
+            .await;
+    }
+
+    async fn completion_mutation_snapshot(fixture: &TerminalFixture) -> String {
+        let workflow = delegation_workflow::Entity::find_by_id(&fixture.workflow_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = delegation_task_run::Entity::find_by_id(&fixture.task_id)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let attentions = delegation_attention_request::Entity::find()
+            .filter(
+                delegation_attention_request::Column::ParentConversationId
+                    .eq(fixture.parent_conversation_id),
+            )
+            .order_by_asc(delegation_attention_request::Column::RequestId)
+            .all(&fixture.db.conn)
+            .await
+            .unwrap();
+        let outbox = delegation_workflow_outbox_event::Entity::find()
+            .filter(delegation_workflow_outbox_event::Column::WorkflowId.eq(&fixture.workflow_id))
+            .order_by_asc(delegation_workflow_outbox_event::Column::EventId)
+            .all(&fixture.db.conn)
+            .await
+            .unwrap();
+        format!("{workflow:?}|{run:?}|{attentions:?}|{outbox:?}")
+    }
+
+    #[tokio::test]
+    async fn historical_protocol_mutation_matrix_completion_evidence() {
+        use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
+
+        for (index, version, mode, expected_code) in [
+            (0, 1, V1, "legacy_completion_protocol_read_only"),
+            (1, 1, V2Shadow, "legacy_completion_protocol_read_only"),
+            (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
+            (3, 2, V1, "unsupported_completion_protocol"),
+            (4, 2, V2Shadow, "unsupported_completion_protocol"),
+        ] {
+            let decision = TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
+            let decision_cas = decision.materialize().await.attention.unwrap();
+            set_fixture_protocol(&decision, version, mode.clone()).await;
+            let before = completion_mutation_snapshot(&decision).await;
+            let error = resolve_completion_decision_txn(
+                &decision.db,
+                decision.parent_conversation_id,
+                decision_cas,
+                CompletionOutcome::Done,
+                "application_user",
+            )
+            .await
+            .expect_err("rejected completion decision must not mutate state");
+            assert_eq!(error.code(), expected_code, "pair index {index}");
+            assert_eq!(completion_mutation_snapshot(&decision).await, before);
+
+            let artifact =
+                TerminalFixture::new_before_v2_only(IntentFixture::AssistantText, false).await;
+            let artifact_cas = artifact.materialize().await.attention.unwrap();
+            set_fixture_protocol(&artifact, version, mode.clone()).await;
+            let before = completion_mutation_snapshot(&artifact).await;
+            let error = retry_completion_artifact_for_user_txn(
+                &artifact.db,
+                artifact.parent_conversation_id,
+                artifact_cas,
+                &DelegationMetrics::default(),
+            )
+            .await
+            .expect_err("rejected artifact retry must not mutate state");
+            assert_eq!(error.code(), expected_code, "pair index {index}");
+            assert_eq!(completion_mutation_snapshot(&artifact).await, before);
+
+            let design = TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
+            let binding = delegation_workflow_design_root_binding::ActiveModel {
+                workflow_id: Set(design.workflow_id.clone()),
+                gate_id: Set("design".into()),
+                gate_lineage: Set(format!("task-4-design-lineage-{index}")),
+                node_id: Set("design-reviewer".into()),
+                task_id: Set(format!("task-4-design-root-task-{index}")),
+                latest_run_id: Set(format!("task-4-design-root-run-{index}")),
+                design_identity: Set(format!("sha256:{}", "d".repeat(64))),
+                evidence_scope_digest: Set(format!("sha256:{}", "e".repeat(64))),
+                graph_revision: Set(1),
+            }
+            .insert(&design.db.conn)
+            .await
+            .unwrap();
+            set_fixture_protocol(&design, version, mode.clone()).await;
+            let before = completion_mutation_snapshot(&design).await;
+            let error = open_design_self_review_decision_txn(
+                &design.db.conn,
+                &binding,
+                design.parent_conversation_id,
+            )
+            .await
+            .expect_err("rejected Design self-review attention must not open");
+            assert_eq!(error.code(), expected_code, "pair index {index}");
+            assert_eq!(completion_mutation_snapshot(&design).await, before);
+
+            let design_resolution =
+                TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
+            let binding = delegation_workflow_design_root_binding::ActiveModel {
+                workflow_id: Set(design_resolution.workflow_id.clone()),
+                gate_id: Set("design".into()),
+                gate_lineage: Set(format!("task-4-design-resolution-lineage-{index}")),
+                node_id: Set("design-reviewer".into()),
+                task_id: Set(format!("task-4-design-resolution-task-{index}")),
+                latest_run_id: Set(format!("task-4-design-resolution-run-{index}")),
+                design_identity: Set(format!("sha256:{}", "a".repeat(64))),
+                evidence_scope_digest: Set(format!("sha256:{}", "b".repeat(64))),
+                graph_revision: Set(1),
+            }
+            .insert(&design_resolution.db.conn)
+            .await
+            .unwrap();
+            let cas = open_design_self_review_decision_txn(
+                &design_resolution.db.conn,
+                &binding,
+                design_resolution.parent_conversation_id,
+            )
+            .await
+            .unwrap();
+            set_fixture_protocol(&design_resolution, version, mode).await;
+            let before = completion_mutation_snapshot(&design_resolution).await;
+            let error = resolve_design_self_review_txn(
+                &design_resolution.db,
+                design_resolution.parent_conversation_id,
+                cas,
+                CompletionOutcome::Approve,
+                "application_user",
+            )
+            .await
+            .expect_err("rejected Design self-review resolution must not mutate state");
+            assert_eq!(error.code(), expected_code, "pair index {index}");
+            assert_eq!(
+                completion_mutation_snapshot(&design_resolution).await,
+                before
+            );
+        }
     }
 
     #[tokio::test]

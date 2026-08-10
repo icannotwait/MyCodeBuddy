@@ -63,7 +63,10 @@ pub use dto::{
     WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
-pub use error::{CompletionEvidenceError, CompletionRecoveryFenceError, WorkflowStoreError};
+pub use error::{
+    require_v2_mutation, CompletionEvidenceError, CompletionProtocolConfigurationRemoved,
+    CompletionRecoveryFenceError, WorkflowStoreError,
+};
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,
@@ -126,23 +129,22 @@ pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
     guard_current_final_delivery_core, guard_final_delivery_core, guard_task_final_delivery_core,
-    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core,
-    publish_workflow_manifest_with_selection_core, recover_workflow_core,
-    settle_workflow_gate_core, settle_workflow_gate_v2_core, FinalDeliveryGuardRequest,
-    FinalDeliveryGuardResult, FinalReviewReopened, PublishResult, PublishWorkflowRequest,
-    RecoverWorkflowRequest, RecoverWorkflowResult, SettleGateEvidence, SettleResult,
-    SettleWorkflowRequest, SettleWorkflowV2Request, StateOnlyRevisionRequest,
+    load_completion_protocol_for_conversation, load_completion_protocol_header,
+    load_workflow_recovery_snapshot_txn, publish_workflow_manifest_core, recover_workflow_core,
+    settle_workflow_gate_v2_core, FinalDeliveryGuardRequest, FinalDeliveryGuardResult,
+    FinalReviewReopened, PublishResult, PublishWorkflowRequest, RecoverWorkflowRequest,
+    RecoverWorkflowResult, SettleResult, SettleWorkflowV2Request, StateOnlyRevisionRequest,
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
+#[cfg(test)]
+use store::{
+    settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core, SettleGateEvidence,
+    SettleWorkflowRequest,
+};
 pub use types::*;
 pub use validate::validate_manifest_document;
-#[cfg(any(test, feature = "test-utils"))]
-pub use workflow_restart::inject_legacy_restart_header_failure_once;
-pub use workflow_restart::{
-    capture_original_request_context, restart_legacy_workflow_core,
-    restart_legacy_workflow_if_enforced,
-};
+pub use workflow_restart::load_historical_workflow_context;
 
 #[cfg(test)]
 mod recovery_tests;

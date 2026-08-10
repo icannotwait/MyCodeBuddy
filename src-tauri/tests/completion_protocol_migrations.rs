@@ -11,8 +11,16 @@ const MIGRATION_1: &str = "m20260804_000001_completion_protocol_and_run_evidence
 const MIGRATION_2: &str = "m20260804_000002_completion_scope_and_gate_settlement";
 const MIGRATION_3: &str = "m20260804_000003_completion_tool_intents_and_restart_link";
 const MIGRATION_4: &str = "m20260804_000004_typed_completion_attention";
+const MIGRATION_V2_ONLY: &str = "m20260809_000001_completion_protocol_v2_only";
+const PRE_V2_ONLY_MIGRATION: &str = "m20260806_000004_legacy_restart_context";
 const PREVIOUS_MIGRATION: &str = "m20260731_000004_custom_agent_source";
 const PRE_MANIFEST_V2_MIGRATION: &str = "m20260727_000002_workflow_gate_fingerprints";
+
+const V2_ONLY_TRIGGERS: &[&str] = &[
+    "trg_delegation_workflows_legacy_source_frozen",
+    "trg_delegation_workflows_protocol_frozen",
+    "trg_delegation_workflows_v2_only_insert",
+];
 
 const V1_SETTLEMENT_COLUMNS: &[&str] = &[
     "workflow_id",
@@ -89,6 +97,23 @@ impl MigratorTrait for BeforeCompletionProtocol {
             selected.push(migration);
         }
         panic!("missing {MIGRATION_1}");
+    }
+}
+
+struct BeforeCompletionProtocolV2Only;
+
+#[async_trait::async_trait]
+impl MigratorTrait for BeforeCompletionProtocolV2Only {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        let mut selected = Vec::new();
+        for migration in Migrator::migrations() {
+            let is_predecessor = migration.name() == PRE_V2_ONLY_MIGRATION;
+            selected.push(migration);
+            if is_predecessor {
+                return selected;
+            }
+        }
+        panic!("missing {PRE_V2_ONLY_MIGRATION}");
     }
 }
 
@@ -1451,4 +1476,459 @@ fn migration_4_is_registered_immediately_after_migration_3() {
     let third = names.iter().position(|name| name == MIGRATION_3).unwrap();
     let fourth = names.iter().position(|name| name == MIGRATION_4).unwrap();
     assert_eq!(fourth, third + 1);
+}
+
+async fn open_before_completion_protocol_v2_only() -> DatabaseConnection {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys = ON")
+        .await
+        .unwrap();
+    BeforeCompletionProtocolV2Only::up(&db, None).await.unwrap();
+    db
+}
+
+async fn seed_trigger_folder(db: &DatabaseConnection) {
+    db.execute(sql("INSERT INTO folder \
+         (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
+         VALUES (1,'repo','C:/completion-protocol-v2-only','2026-08-09','2026-08-09',\
+                 '2026-08-09',1,1,'inherit','regular')"))
+        .await
+        .unwrap();
+}
+
+async fn seed_trigger_conversation(db: &DatabaseConnection, conversation_id: i32) {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO conversation (\
+           id,folder_id,agent_type,status,kind,message_count,title_locked,\
+           auto_title_finalized,parent_id,created_at,updated_at\
+         ) VALUES (?,1,'codex','completed','regular',0,0,0,NULL,\
+                   '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')",
+        vec![conversation_id.into()],
+    ))
+    .await
+    .unwrap();
+}
+
+async fn insert_trigger_workflow(
+    db: &DatabaseConnection,
+    workflow_id: &str,
+    parent_conversation_id: i32,
+    version: i64,
+    mode: &str,
+    legacy_source_workflow_id: Option<&str>,
+) -> Result<(), DbErr> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO delegation_workflows (\
+           workflow_id,parent_conversation_id,workflow_kind,schema_version,\
+           active_manifest_revision,graph_revision,workflow_state,capability_version,\
+           publication_token,structural_revision,design_fingerprint,plan_fingerprint,\
+           completion_protocol_version,completion_protocol_mode,\
+           legacy_source_workflow_id,created_at,updated_at\
+         ) VALUES (?,?, 'brainstorm_to_delivery',1,1,1,'approved',\
+                   'workflow_manifest_v1',?,1,'design-v1','plan-v1',?,?,?,\
+                   '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')",
+        vec![
+            workflow_id.into(),
+            parent_conversation_id.into(),
+            format!("publication-{workflow_id}").into(),
+            version.into(),
+            mode.into(),
+            legacy_source_workflow_id.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn insert_trigger_workflow_without_protocol(
+    db: &DatabaseConnection,
+    workflow_id: &str,
+    parent_conversation_id: i32,
+) -> Result<(), DbErr> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO delegation_workflows (\
+           workflow_id,parent_conversation_id,workflow_kind,schema_version,\
+           active_manifest_revision,graph_revision,workflow_state,capability_version,\
+           publication_token,structural_revision,design_fingerprint,plan_fingerprint,\
+           created_at,updated_at\
+         ) VALUES (?,?, 'brainstorm_to_delivery',1,1,1,'approved',\
+                   'workflow_manifest_v1',?,1,'design-v1','plan-v1',\
+                   '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')",
+        vec![
+            workflow_id.into(),
+            parent_conversation_id.into(),
+            format!("publication-{workflow_id}").into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn seed_trigger_cascade_dependents(
+    db: &DatabaseConnection,
+    workflow_id: &str,
+    parent_conversation_id: i32,
+    child_conversation_id: i32,
+) {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO delegation_workflow_manifest_revisions (\
+           workflow_id,manifest_revision,manifest_state,document_json,document_digest,created_at\
+         ) VALUES (?,1,'approved','{\"schema_version\":1}','sha256:manifest',\
+                   '2026-08-09T00:00:00Z')",
+        vec![workflow_id.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO delegation_task_runs (\
+           task_id,root_task_id,generation,parent_conversation_id,child_conversation_id,\
+           agent_type,admission_class,lineage_root_task_id,history_only,status,\
+           completion_state,completion_outcome,completion_evidence_json,created_at,updated_at\
+         ) VALUES (?,?,1,?,?,'codex','normal_revision',?,0,'completed',\
+                   'resolved','done','{\"evidence\":[\"historical\"]}',\
+                   '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')",
+        vec![
+            format!("task-{workflow_id}").into(),
+            format!("task-{workflow_id}").into(),
+            parent_conversation_id.into(),
+            child_conversation_id.into(),
+            format!("task-{workflow_id}").into(),
+        ],
+    ))
+    .await
+    .unwrap();
+}
+
+async fn workflow_rows_snapshot(db: &DatabaseConnection) -> Vec<String> {
+    let columns = table_columns(db, "delegation_workflows").await;
+    let projection = columns
+        .iter()
+        .map(|column| format!("quote({})", column.name))
+        .collect::<Vec<_>>()
+        .join(" || char(31) || ");
+    db.query_all(sql(format!(
+        "SELECT {projection} AS snapshot FROM delegation_workflows ORDER BY workflow_id"
+    )))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("", "snapshot").unwrap())
+    .collect()
+}
+
+async fn trigger_names(db: &DatabaseConnection) -> Vec<String> {
+    db.query_all(sql(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("", "name").unwrap())
+    .collect()
+}
+
+async fn assert_statement_aborts_with(
+    db: &DatabaseConnection,
+    statement: Statement,
+    expected_marker: &str,
+) {
+    let error = db
+        .execute(statement)
+        .await
+        .expect_err("statement unexpectedly succeeded");
+    assert!(
+        error.to_string().contains(expected_marker),
+        "expected {expected_marker}, got {error}"
+    );
+}
+
+async fn count_rows_by_id(db: &DatabaseConnection, table: &str, column: &str, value: &str) -> i64 {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!("SELECT COUNT(*) AS count FROM {table} WHERE {column} = ?"),
+        vec![value.into()],
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "count")
+    .unwrap()
+}
+
+#[test]
+fn v2_only_trigger_migration_is_registered_after_legacy_restart_context() {
+    let names: Vec<String> = Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    let predecessor = names
+        .iter()
+        .position(|name| name == PRE_V2_ONLY_MIGRATION)
+        .unwrap();
+    let v2_only = names
+        .iter()
+        .position(|name| name == MIGRATION_V2_ONLY)
+        .expect("missing completion-protocol-v2-only migration");
+    assert_eq!(v2_only, predecessor + 1);
+}
+
+#[tokio::test]
+async fn v2_only_trigger_matrix_preserves_history_and_freezes_writes() {
+    let db = open_before_completion_protocol_v2_only().await;
+    seed_trigger_folder(&db).await;
+    for conversation_id in [101, 102, 103, 104] {
+        seed_trigger_conversation(&db, conversation_id).await;
+    }
+
+    insert_trigger_workflow(&db, "wf-historical", 101, 1, "v1", None)
+        .await
+        .unwrap();
+    insert_trigger_workflow(
+        &db,
+        "wf-linked-successor",
+        102,
+        2,
+        "v2_enforce",
+        Some("wf-historical"),
+    )
+    .await
+    .unwrap();
+    insert_trigger_workflow(&db, "wf-delete-cascade", 103, 1, "v1", None)
+        .await
+        .unwrap();
+    seed_trigger_cascade_dependents(&db, "wf-delete-cascade", 103, 104).await;
+
+    let historical_before_up = workflow_rows_snapshot(&db).await;
+    Migrator::up(&db, None).await.unwrap();
+    assert_eq!(
+        workflow_rows_snapshot(&db).await,
+        historical_before_up,
+        "migration up must not rewrite historical headers or links"
+    );
+
+    for conversation_id in 110..=119 {
+        seed_trigger_conversation(&db, conversation_id).await;
+    }
+
+    let omitted = insert_trigger_workflow_without_protocol(&db, "wf-omitted", 110)
+        .await
+        .expect_err("insert with omitted protocol columns unexpectedly succeeded");
+    assert!(
+        omitted.to_string().contains("completion_protocol_v2_only"),
+        "unexpected omitted-protocol insert error: {omitted}"
+    );
+
+    for (index, version, mode) in [
+        (111, 1, "v1"),
+        (112, 1, "v2_shadow"),
+        (113, 1, "v2_enforce"),
+        (114, 2, "v1"),
+        (115, 2, "v2_shadow"),
+    ] {
+        let error = insert_trigger_workflow(
+            &db,
+            &format!("wf-rejected-{index}"),
+            index,
+            version,
+            mode,
+            None,
+        )
+        .await
+        .expect_err("non-v2-only insert unexpectedly succeeded");
+        assert!(
+            error.to_string().contains("completion_protocol_v2_only"),
+            "unexpected insert error: {error}"
+        );
+    }
+
+    insert_trigger_workflow(&db, "wf-current", 117, 2, "v2_enforce", None)
+        .await
+        .unwrap();
+    let legacy_insert = insert_trigger_workflow(
+        &db,
+        "wf-v2-with-legacy-source",
+        118,
+        2,
+        "v2_enforce",
+        Some("wf-historical"),
+    )
+    .await
+    .expect_err("new v2 workflow accepted a legacy source");
+    assert!(
+        legacy_insert
+            .to_string()
+            .contains("completion_protocol_v2_only"),
+        "unexpected legacy-source insert error: {legacy_insert}"
+    );
+
+    for (workflow_id, version, mode) in [
+        ("wf-historical", 2, "v2_shadow"),
+        ("wf-current", 1, "v2_shadow"),
+    ] {
+        assert_statement_aborts_with(
+            &db,
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE delegation_workflows SET completion_protocol_version = ? \
+                 WHERE workflow_id = ?",
+                vec![version.into(), workflow_id.into()],
+            ),
+            "completion_protocol_frozen",
+        )
+        .await;
+        assert_statement_aborts_with(
+            &db,
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE delegation_workflows SET completion_protocol_mode = ? \
+                 WHERE workflow_id = ?",
+                vec![mode.into(), workflow_id.into()],
+            ),
+            "completion_protocol_frozen",
+        )
+        .await;
+    }
+
+    for workflow_id in ["wf-historical", "wf-current"] {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows \
+             SET graph_revision = graph_revision + 1,\
+                 updated_at = '2026-08-09T01:00:00Z',\
+                 completion_protocol_version = completion_protocol_version,\
+                 completion_protocol_mode = completion_protocol_mode \
+             WHERE workflow_id = ?",
+            vec![workflow_id.into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows \
+             SET graph_revision = graph_revision + 1,\
+                 updated_at = '2026-08-09T02:00:00Z' \
+             WHERE workflow_id = ?",
+            vec![workflow_id.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    assert_statement_aborts_with(
+        &db,
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows SET legacy_source_workflow_id = ? \
+             WHERE workflow_id = 'wf-historical'",
+            vec!["wf-linked-successor".into()],
+        ),
+        "legacy_source_workflow_frozen",
+    )
+    .await;
+    assert_statement_aborts_with(
+        &db,
+        sql(
+            "UPDATE delegation_workflows SET legacy_source_workflow_id = NULL \
+             WHERE workflow_id = 'wf-linked-successor'",
+        ),
+        "legacy_source_workflow_frozen",
+    )
+    .await;
+    assert_statement_aborts_with(
+        &db,
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_workflows SET legacy_source_workflow_id = ? \
+             WHERE workflow_id = 'wf-linked-successor'",
+            vec!["wf-other-source".into()],
+        ),
+        "legacy_source_workflow_frozen",
+    )
+    .await;
+    db.execute(sql("UPDATE delegation_workflows \
+         SET legacy_source_workflow_id = legacy_source_workflow_id \
+         WHERE workflow_id = 'wf-linked-successor'"))
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_source(&db, "wf-linked-successor").await.as_deref(),
+        Some("wf-historical")
+    );
+
+    db.execute(sql("DELETE FROM conversation WHERE id = 103"))
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows_by_id(
+            &db,
+            "delegation_workflows",
+            "workflow_id",
+            "wf-delete-cascade"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count_rows_by_id(
+            &db,
+            "delegation_workflow_manifest_revisions",
+            "workflow_id",
+            "wf-delete-cascade"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count_rows_by_id(
+            &db,
+            "delegation_task_runs",
+            "task_id",
+            "task-wf-delete-cascade"
+        )
+        .await,
+        0
+    );
+
+    db.execute_unprepared(
+        "CREATE TRIGGER trg_task7_sentinel \
+         BEFORE UPDATE OF workflow_state ON delegation_workflows \
+         WHEN 0 BEGIN SELECT 1; END",
+    )
+    .await
+    .unwrap();
+    let triggers_before_down = trigger_names(&db).await;
+    for trigger in V2_ONLY_TRIGGERS {
+        assert!(
+            triggers_before_down.iter().any(|name| name == trigger),
+            "missing trigger {trigger}"
+        );
+    }
+    let rows_before_down = workflow_rows_snapshot(&db).await;
+
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == MIGRATION_V2_ONLY)
+        .expect("missing completion-protocol-v2-only migration");
+    migration.down(&SchemaManager::new(&db)).await.unwrap();
+
+    let expected_triggers_after_down = triggers_before_down
+        .into_iter()
+        .filter(|name| !V2_ONLY_TRIGGERS.contains(&name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(trigger_names(&db).await, expected_triggers_after_down);
+    assert_eq!(workflow_rows_snapshot(&db).await, rows_before_down);
+    assert_eq!(
+        legacy_source(&db, "wf-linked-successor").await.as_deref(),
+        Some("wf-historical")
+    );
+
+    insert_trigger_workflow(&db, "wf-v1-after-down", 119, 1, "v1", None)
+        .await
+        .expect("down must remove the v2-only insert trigger");
+    assert_foreign_key_check_clean(&db).await;
 }

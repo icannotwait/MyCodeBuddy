@@ -848,24 +848,6 @@ export interface CompletionProtocolWorkflowProjection {
   automatic_root_wake: boolean
 }
 
-export interface LegacyWorkflowRestartProjection {
-  source_workflow_id: string
-  source_conversation_id: number
-  successor_workflow_id: string
-  successor_conversation_id: number
-  open_gate: "design" | "plan"
-  completion_protocol: CompletionProtocolWorkflowProjection
-  restart_context: {
-    original_conversation_id: number
-    original_request_id: string
-    original_request_text: string
-    original_request_digest: string
-    agent_type: string
-    profile_id?: string | null
-  }
-  idempotent_replay: boolean
-}
-
 /** Mirrors Rust `WorkflowGraphSnapshot` (redacted — no work_unit_key). */
 export interface WorkflowGraphSnapshot {
   schema_version: number

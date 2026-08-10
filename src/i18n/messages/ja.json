@@ -603,19 +603,7 @@
         "native": "Native"
       },
       "softWatchdog": "ソフトウォッチドッグ（秒）",
-      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。0 で停滞表示を無効化。キャンセルやルート変更はしません。",
-      "completionDefaultMode": "完了作成モード",
-      "completionCreations": "{mode}: {count} 件の作成",
-      "completionSamples": "{count} 件の終端サンプル",
-      "completionMinimumProgress": "最小 {minimum} 件中 {count} 件",
-      "completionOverride": "{profile}: {mode}",
-      "completionShadowDifference": "{kind}: {count}",
-      "completionRolloutDecision": {
-        "insufficient_samples": "ロールアウトは最小サンプル数を待っています",
-        "may_expand": "ロールアウトを拡大できます",
-        "stop_role_mismatch": "ロールアウトを一時停止: ロール不一致が 1% を超えました",
-        "stop_needs_decision": "ロールアウトを一時停止: 判断が必要な割合が 5% を超えました"
-      }
+      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。0 で停滞表示を無効化。キャンセルやルート変更はしません。"
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",
@@ -2790,11 +2778,9 @@
         "completionStale": "この判断は古くなりました。ワークフローを再読み込みしてください。",
         "completionConflict": "別の結果がすでに確定されています。",
         "completionLegacyReadOnly": "旧形式のワークフローは読み取り専用です",
-        "completionLegacyRestart": "完了プロトコル v2 で再開",
         "completionLegacySource": "旧形式の元ワークフロー #{conversation}",
         "completionLegacySuccessor": "後続ワークフロー #{conversation}",
         "completionAutomaticWake": "ルートオーケストレーションは自動的に再開されました",
-        "completionManualRootResume": "ルートオーケストレーションを再開",
         "completionOutcome": {
           "approve": "承認",
           "approve_with_minors": "軽微な修正付きで承認",

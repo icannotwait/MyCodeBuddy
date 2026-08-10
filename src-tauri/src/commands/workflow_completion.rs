@@ -3,78 +3,20 @@
 #[cfg(feature = "tauri-runtime")]
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
 use crate::acp::delegation::event_emitter::CompletionOutboxDispatcher;
 use crate::acp::delegation::types::{
     CompletionMutationContext, CompletionMutationResult, ResolveCompletionDecisionRequest,
-    ResolveDesignSelfReviewRequest, RestartLegacyWorkflowRequest, RetryCompletionArtifactRequest,
+    ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
 };
 use crate::acp::delegation::workflow::{
     resolve_completion_decision_txn, resolve_design_self_review_txn,
-    restart_legacy_workflow_if_enforced, retry_completion_artifact_for_user_txn,
-    CompletionMutationError, CompletionProtocolRolloutConfig, LegacyWorkflowRestartProjection,
-    WorkflowStoreError,
+    retry_completion_artifact_for_user_txn, CompletionMutationError,
 };
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::delegation_attention_request;
 use crate::db::AppDatabase;
 use chrono::Utc;
 use sea_orm::EntityTrait;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionProtocolSettingsSnapshot {
-    pub default_mode: crate::db::entities::delegation_workflow::CompletionProtocolMode,
-    pub profile_overrides:
-        BTreeMap<String, crate::db::entities::delegation_workflow::CompletionProtocolMode>,
-    pub minimum_samples: u64,
-    pub creation_modes: BTreeMap<String, u64>,
-    pub shadow_differences: BTreeMap<String, u64>,
-    pub rollout_windows:
-        BTreeMap<String, crate::acp::delegation::workflow::ProfileCompletionWindow>,
-    pub rollout_decisions: BTreeMap<String, crate::acp::delegation::workflow::RolloutDecision>,
-}
-
-pub fn get_completion_protocol_settings_core(
-    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
-    rollout: &CompletionProtocolRolloutConfig,
-) -> CompletionProtocolSettingsSnapshot {
-    let completion = metrics.snapshot().completion_protocol;
-    CompletionProtocolSettingsSnapshot {
-        default_mode: rollout.default_mode.clone(),
-        profile_overrides: rollout.profile_overrides.clone(),
-        minimum_samples: crate::acp::delegation::workflow::COMPLETION_ROLLOUT_MINIMUM_SAMPLES,
-        creation_modes: completion.creation_modes,
-        shadow_differences: completion.shadow_differences,
-        rollout_windows: completion.rollout_windows,
-        rollout_decisions: completion.rollout_decisions,
-    }
-}
-
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub fn get_completion_protocol_settings(
-    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
-        '_,
-        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
-    >,
-    #[cfg(feature = "tauri-runtime")] rollout: tauri::State<
-        '_,
-        Arc<CompletionProtocolRolloutConfig>,
-    >,
-) -> Result<CompletionProtocolSettingsSnapshot, AppCommandError> {
-    #[cfg(feature = "tauri-runtime")]
-    {
-        Ok(get_completion_protocol_settings_core(
-            metrics.inner(),
-            rollout.inner(),
-        ))
-    }
-    #[cfg(not(feature = "tauri-runtime"))]
-    {
-        Err(AppCommandError::configuration_invalid("tauri-only command"))
-    }
-}
 
 pub async fn completion_attention_parent_conversation_id(
     db: &AppDatabase,
@@ -91,65 +33,10 @@ pub async fn completion_attention_parent_conversation_id(
         })
 }
 
+#[cfg(feature = "tauri-runtime")]
 fn unauthorized_context_error() -> AppCommandError {
     AppCommandError::permission_denied("completion attention is owned by another root conversation")
         .with_detail("unauthorized")
-}
-
-pub async fn restart_legacy_workflow_authenticated_core(
-    db: &AppDatabase,
-    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
-    rollout: &CompletionProtocolRolloutConfig,
-    context: &CompletionMutationContext,
-    request: RestartLegacyWorkflowRequest,
-) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
-    if i64::from(context.parent_conversation_id()) != request.source_conversation_id {
-        metrics.record_completion_restart(
-            crate::acp::delegation::metrics::CompletionRestartOutcome::Rejected,
-        );
-        return Err(unauthorized_context_error());
-    }
-    match restart_legacy_workflow_if_enforced(db, context.parent_conversation_id(), None, rollout)
-        .await
-    {
-        Ok(Some(projection)) => {
-            metrics.record_completion_restart(if projection.idempotent_replay {
-                crate::acp::delegation::metrics::CompletionRestartOutcome::Reused
-            } else {
-                crate::acp::delegation::metrics::CompletionRestartOutcome::Created
-            });
-            Ok(projection)
-        }
-        Ok(None) => {
-            metrics.record_completion_restart(
-                crate::acp::delegation::metrics::CompletionRestartOutcome::Rejected,
-            );
-            Err(
-                AppCommandError::invalid_input("legacy restart requires current v2_enforce mode")
-                    .with_detail("legacy_completion_protocol_restart_not_required"),
-            )
-        }
-        Err(error) => {
-            metrics.record_completion_restart(
-                crate::acp::delegation::metrics::CompletionRestartOutcome::Failed,
-            );
-            Err(map_legacy_restart_error(error))
-        }
-    }
-}
-
-fn map_legacy_restart_error(error: WorkflowStoreError) -> AppCommandError {
-    let code = error.code();
-    let message = error.to_string();
-    match error {
-        WorkflowStoreError::CrossParent { .. } => {
-            AppCommandError::permission_denied(message).with_detail(code)
-        }
-        WorkflowStoreError::LegacyCompletionProtocolRestartRequired(_)
-        | WorkflowStoreError::Persistence(_)
-        | WorkflowStoreError::Busy(_) => AppCommandError::database_error(message).with_detail(code),
-        _ => AppCommandError::invalid_input(message).with_detail(code),
-    }
 }
 
 pub async fn resolve_completion_decision_core(
@@ -268,7 +155,58 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
         CompletionMutationError::Evidence(
             crate::acp::delegation::workflow::CompletionEvidenceError::Persistence(_),
         ) => AppCommandError::database_error(message).with_detail(stable_code),
+        CompletionMutationError::Protocol { code, .. }
+        | CompletionMutationError::Evidence(
+            crate::acp::delegation::workflow::CompletionEvidenceError::Protocol { code, .. },
+        ) => match code {
+            "legacy_completion_protocol_read_only" => {
+                AppCommandError::new(AppErrorCode::LegacyCompletionProtocolReadOnly, message)
+                    .with_detail(code)
+            }
+            "unsupported_completion_protocol" => {
+                AppCommandError::new(AppErrorCode::UnsupportedCompletionProtocol, message)
+                    .with_detail(code)
+            }
+            _ => AppCommandError::invalid_input(message).with_detail(code),
+        },
         _ => AppCommandError::invalid_input(message).with_detail(stable_code),
+    }
+}
+
+#[cfg(test)]
+mod protocol_error_tests {
+    use super::*;
+    use crate::acp::delegation::workflow::CompletionEvidenceError;
+
+    #[test]
+    fn completion_protocol_mutations_preserve_stable_app_error_codes() {
+        let read_only = map_completion_mutation_error(CompletionMutationError::Protocol {
+            code: "legacy_completion_protocol_read_only",
+            message: "legacy workflow is read-only".into(),
+        });
+        assert_eq!(
+            read_only.code,
+            AppErrorCode::LegacyCompletionProtocolReadOnly
+        );
+        assert_eq!(
+            read_only.detail.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+
+        let unsupported = map_completion_mutation_error(CompletionMutationError::Evidence(
+            CompletionEvidenceError::Protocol {
+                code: "unsupported_completion_protocol",
+                message: "workflow protocol header is unsupported".into(),
+            },
+        ));
+        assert_eq!(
+            unsupported.code,
+            AppErrorCode::UnsupportedCompletionProtocol
+        );
+        assert_eq!(
+            unsupported.detail.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
     }
 }
 
@@ -347,44 +285,6 @@ pub async fn resolve_design_self_review(
         let context = desktop_completion_context(&db, &window, &request.cas.attention_id).await?;
         resolve_design_self_review_core(&db, metrics.inner(), dispatcher.inner(), &context, request)
             .await
-    }
-    #[cfg(not(feature = "tauri-runtime"))]
-    {
-        let _ = request;
-        Err(AppCommandError::configuration_invalid("tauri-only command"))
-    }
-}
-
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn restart_legacy_workflow(
-    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
-    #[cfg(feature = "tauri-runtime")] metrics: tauri::State<
-        '_,
-        Arc<crate::acp::delegation::metrics::DelegationMetrics>,
-    >,
-    #[cfg(feature = "tauri-runtime")] rollout: tauri::State<
-        '_,
-        Arc<CompletionProtocolRolloutConfig>,
-    >,
-    #[cfg(feature = "tauri-runtime")] window: tauri::WebviewWindow,
-    source_conversation_id: i64,
-) -> Result<LegacyWorkflowRestartProjection, AppCommandError> {
-    let request = RestartLegacyWorkflowRequest {
-        source_conversation_id,
-    };
-    #[cfg(feature = "tauri-runtime")]
-    {
-        let source_conversation_id = i32::try_from(request.source_conversation_id)
-            .map_err(|_| AppCommandError::invalid_input("source conversation id is invalid"))?;
-        let context = desktop_completion_context_for_label(source_conversation_id, window.label())?;
-        restart_legacy_workflow_authenticated_core(
-            &db,
-            metrics.inner(),
-            rollout.inner(),
-            &context,
-            request,
-        )
-        .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {

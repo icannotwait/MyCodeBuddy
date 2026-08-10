@@ -130,6 +130,12 @@ mod tauri_app {
         // needed); hold the guard for the whole process so buffered file lines
         // flush on a graceful exit.
         let _log_guard = crate::logging::init::init_desktop();
+        if let Err(error) =
+            crate::acp::delegation::workflow::reject_removed_completion_protocol_configuration()
+        {
+            tracing::error!("[delegation][FATAL] {}: {}", error.code(), error);
+            return;
+        }
         let preferences = crate::preferences::load();
         crate::window_diagnostics::initialize(process_start, &preferences);
 
@@ -560,14 +566,6 @@ mod tauri_app {
                         db_conn.clone(),
                         effective_data_dir.clone(),
                     );
-                    let completion_protocol_rollout = std::sync::Arc::new(
-                        crate::acp::delegation::workflow::CompletionProtocolRolloutConfig::from_env()
-                            .map_err(std::io::Error::other)?,
-                    );
-                    cm_state.install_completion_protocol_runtime(
-                        completion_protocol_rollout.clone(),
-                        stack.metrics.clone(),
-                    );
                     let completion_outbox_dispatcher = std::sync::Arc::new(
                         crate::acp::delegation::event_emitter::CompletionOutboxDispatcher::new(
                             std::sync::Arc::new(db::AppDatabase {
@@ -585,7 +583,6 @@ mod tauri_app {
                     app.manage(stack.sessions.clone());
                     app.manage(stack.runtime_settings.clone());
                     app.manage(stack.metrics.clone());
-                    app.manage(completion_protocol_rollout.clone());
                     app.manage(stack.continuation_coordinator.clone());
                     app.manage(completion_outbox_dispatcher.clone());
                     app.manage(crate::commands::delegation::DelegationSocketPath(
@@ -679,7 +676,7 @@ mod tauri_app {
                         runs.set_workflow_emitter(workflow_emitter.clone());
                     }
                     let listener =
-                        crate::acp::delegation::listener::DelegationListener::new_with_workflow_runtime(
+                        crate::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
                         listener_broker,
                         stack.tokens,
                         stack.leases,
@@ -712,7 +709,6 @@ mod tauri_app {
                         ),
                         cm_state.wait_cancel_registry(),
                         workflow_emitter,
-                        completion_protocol_rollout,
                     );
                     let socket_path = stack.socket_path;
                     tauri::async_runtime::spawn(async move {
@@ -1152,8 +1148,6 @@ mod tauri_app {
                 crate::commands::workflow_completion::resolve_completion_decision,
                 crate::commands::workflow_completion::retry_completion_artifact,
                 crate::commands::workflow_completion::resolve_design_self_review,
-                crate::commands::workflow_completion::restart_legacy_workflow,
-                crate::commands::workflow_completion::get_completion_protocol_settings,
                 conversations::list_folders,
                 conversations::get_stats,
                 conversations::get_sidebar_data,
