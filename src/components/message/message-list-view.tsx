@@ -1041,6 +1041,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   historicalDelegations,
   historicalActivities,
   historicalKey,
+  isActive,
   onResumeRoot,
   onOpenRootConversation,
 }: {
@@ -1055,6 +1056,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
    */
   historicalActivities: DelegationActivityView[]
   historicalKey: string
+  isActive: boolean
   onResumeRoot?: () => void | Promise<void>
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }) {
@@ -1102,6 +1104,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       defaultExpanded
       conversationId={conversationId}
       workflowGraph={workflowGraph}
+      isActive={isActive}
       onResumeRoot={onResumeRoot}
       onOpenRootConversation={onOpenRootConversation}
     />
@@ -1112,7 +1115,7 @@ export function MessageListView({
   conversationId,
   agentType,
   connStatus,
-  isActive: _isActive = true,
+  isActive = true,
   sendSignal = 0,
   detailLoading = false,
   detailError = null,
@@ -1918,6 +1921,7 @@ export function MessageListView({
             historicalDelegations={allSessionDelegations}
             historicalActivities={sessionActivities}
             historicalKey={subAgentOverlayKey}
+            isActive={isActive}
             onResumeRoot={onResumeRoot}
             onOpenRootConversation={onOpenRootConversation}
           />
@@ -1930,6 +1934,7 @@ export function MessageListView({
             defaultExpanded
             conversationId={conversationId}
             workflowGraph={workflowGraph}
+            isActive={isActive}
             onResumeRoot={onResumeRoot}
             onOpenRootConversation={onOpenRootConversation}
           />

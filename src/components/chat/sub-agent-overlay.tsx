@@ -130,11 +130,13 @@ interface SubAgentOverlayProps {
   /** Expanded by default so the full sub-agent history is visible. */
   defaultExpanded?: boolean
   /**
-   * Parent conversation id — seeds the workflow graph store and, only when the
-   * overlay is expanded on the workflow segment with the full graph open,
-   * acquires active expanded-graph refresh interest.
+   * Parent conversation id. It seeds the graph store and scopes both interest
+   * leases. The active surface keeps overlay interest while collapsed; only the
+   * open full graph adds expanded interest.
    */
   conversationId?: number | null
+  /** Whether this conversation surface is the active tab in its window. */
+  isActive?: boolean
   /**
    * Optional cold-detail seed. Store remains source of truth once seeded for
    * `conversationId`. A13: presence mounts overlay even with zero sessions.
@@ -363,6 +365,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   defaultExpanded = true,
   conversationId = null,
   workflowGraph = null,
+  isActive = true,
   onResumeRoot,
   onOpenRootConversation,
 }: SubAgentOverlayProps) {
@@ -394,9 +397,12 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const isExpanded =
     userCollapsed !== undefined ? !userCollapsed : defaultExpanded
   const overlayInterestActive =
-    conversationId != null && conversationId > 0 && isExpanded
+    conversationId != null && conversationId > 0 && isActive
   const expandedGraphInterestActive =
-    overlayInterestActive && activeSegment === "workflow" && graphExpanded
+    overlayInterestActive &&
+    isExpanded &&
+    activeSegment === "workflow" &&
+    graphExpanded
 
   // Detail seed only — never installs listener/activation cleanup.
   useEffect(() => {

@@ -241,6 +241,7 @@ vi.mock("@/components/chat/sub-agent-overlay", () => ({
     delegations?: Array<{ parentToolUseId: string }>
     defaultExpanded?: boolean
     overlayKey?: string | null
+    isActive?: boolean
   }) => {
     subAgentOverlayPropsSpy(props)
     return <div data-testid="sub-agent-overlay-capture" />
@@ -525,6 +526,7 @@ function lastOverlayProps(): {
   delegations?: Array<{ parentToolUseId: string }>
   defaultExpanded?: boolean
   overlayKey?: string | null
+  isActive?: boolean
 } {
   const calls = subAgentOverlayPropsSpy.mock.calls
   expect(calls.length).toBeGreaterThan(0)
@@ -699,6 +701,7 @@ function enableIncremental() {
 function messageListUi(options?: {
   waitingForSubagentsArmedAtMs?: number | null
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
+  isActive?: boolean
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -706,7 +709,7 @@ function messageListUi(options?: {
         conversationId={CID}
         agentType="codex"
         connStatus={options?.connStatus ?? "prompting"}
-        isActive
+        isActive={options?.isActive ?? true}
         showMessageNav={false}
         waitingForSubagentsArmedAtMs={
           options?.waitingForSubagentsArmedAtMs ?? null
@@ -719,6 +722,7 @@ function messageListUi(options?: {
 function renderMessageList(options?: {
   waitingForSubagentsArmedAtMs?: number | null
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
+  isActive?: boolean
 }) {
   return render(messageListUi(options))
 }
@@ -1584,6 +1588,17 @@ describe("MessageListView sub-agent overlay composition", () => {
     expect(parentIds).toEqual(["pt-older", "pt-newer"])
     expect(props.defaultExpanded).toBe(true)
     expect(props.overlayKey).toBe(`subagents-${CID}`)
+  })
+
+  it("forwards inactive state through the incremental overlay path", () => {
+    renderMessageList({ isActive: false })
+    expect(lastOverlayProps().isActive).toBe(false)
+  })
+
+  it("forwards inactive state through the legacy overlay path", () => {
+    __resetStreamingPerformanceConfigForTests()
+    renderMessageList({ isActive: false })
+    expect(lastOverlayProps().isActive).toBe(false)
   })
 })
 

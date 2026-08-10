@@ -1534,14 +1534,14 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     expect(releaseOverlay).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse sub-agents" }))
-    expect(releaseOverlay).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
   })
 
-  it("chip-collapsed overlays acquire no interest", () => {
-    const activateOverlay = vi.spyOn(
-      useWorkflowGraphStore.getState(),
-      "activateOverlayInterest"
-    )
+  it("chip-collapsed active overlays retain overlay interest", () => {
+    const releaseOverlay = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
     const activateExpanded = vi.spyOn(
       useWorkflowGraphStore.getState(),
       "activateConversation"
@@ -1555,9 +1555,11 @@ describe("SubAgentOverlay A13 workflow mount", () => {
         defaultExpanded={false}
       />
     )
-    expect(activateOverlay).not.toHaveBeenCalled()
+    expect(activateOverlay).toHaveBeenCalledOnce()
+    expect(activateOverlay).toHaveBeenCalledWith(42)
     expect(activateExpanded).not.toHaveBeenCalled()
     unmount()
+    expect(releaseOverlay).toHaveBeenCalledOnce()
   })
 
   it.each([0, -1])(
@@ -1588,7 +1590,7 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     }
   )
 
-  it("switching segments and collapsing the overlay releases the active lease", () => {
+  it("switching segments and collapsing releases only expanded interest", () => {
     const releaseOverlay = vi.fn()
     const releaseExpanded1 = vi.fn()
     const releaseExpanded2 = vi.fn()
@@ -1626,7 +1628,48 @@ describe("SubAgentOverlay A13 workflow mount", () => {
     fireEvent.click(screen.getByRole("button", { name: "Collapse sub-agents" }))
     expect(releaseExpanded1).toHaveBeenCalledTimes(1)
     expect(releaseExpanded2).toHaveBeenCalledTimes(1)
-    expect(releaseOverlay).toHaveBeenCalledTimes(1)
+    expect(releaseOverlay).not.toHaveBeenCalled()
+  })
+
+  it("becoming inactive releases overlay and expanded interest", () => {
+    const releaseOverlay = vi.fn()
+    const releaseExpanded = vi.fn()
+    const activateOverlay = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateOverlayInterest")
+      .mockReturnValue(releaseOverlay)
+    const activateExpanded = vi
+      .spyOn(useWorkflowGraphStore.getState(), "activateConversation")
+      .mockReturnValue(releaseExpanded)
+
+    const { rerender } = renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[]}
+        conversationId={42}
+        workflowGraph={skeletonGraph()}
+        defaultExpanded
+        isActive
+      />
+    )
+    fireEvent.click(screen.getByTestId("workflow-expand-toggle"))
+    expect(activateOverlay).toHaveBeenCalledWith(42)
+    expect(activateExpanded).toHaveBeenCalledWith(42)
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          activities={[]}
+          conversationId={42}
+          workflowGraph={skeletonGraph()}
+          defaultExpanded
+          isActive={false}
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(releaseOverlay).toHaveBeenCalledOnce()
+    expect(releaseExpanded).toHaveBeenCalledOnce()
   })
 
   it("detail updates reseed without reinstalling active interest", () => {
