@@ -417,10 +417,7 @@ mod tests {
             .collect();
 
         assert_eq!(envs.get("LANG").map(String::as_str), Some("C.UTF-8"));
-        assert_eq!(
-            envs.get("LC_ALL").map(String::as_str),
-            Some("C.UTF-8")
-        );
+        assert_eq!(envs.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
     }
 
     #[tokio::test]
