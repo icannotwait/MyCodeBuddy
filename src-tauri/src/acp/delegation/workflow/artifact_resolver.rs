@@ -207,13 +207,17 @@ pub async fn resolve_git_head_clean(workspace: &Path) -> Result<GitHeadV1Artifac
     Ok(GitHeadV1Artifact { head })
 }
 
+fn git_command() -> tokio::process::Command {
+    crate::process::tokio_command("git")
+}
+
 async fn run_git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>, ArtifactError> {
     if workspace.as_os_str().is_empty() {
         return Err(ArtifactError::Unavailable(
             ArtifactFailure::WorkspaceUnavailable,
         ));
     }
-    let output = tokio::process::Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(workspace)
         .kill_on_drop(true)
@@ -318,7 +322,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        resolve_document, resolve_final_delivery, resolve_git_head_clean,
+        git_command, resolve_document, resolve_final_delivery, resolve_git_head_clean,
         resolve_producer_completion, resolve_reviewer_completion, ArtifactFailure,
         ResolvedArtifact,
     };
@@ -396,6 +400,27 @@ mod tests {
                 ],
             );
         }
+    }
+
+    #[test]
+    fn git_command_sets_explicit_utf8_locale() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+
+        assert_eq!(envs.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            envs.get("LC_ALL").map(String::as_str),
+            Some("C.UTF-8")
+        );
     }
 
     #[tokio::test]
