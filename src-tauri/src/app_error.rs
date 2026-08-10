@@ -46,6 +46,7 @@ pub const UPLOAD_I18N_KEY_QUOTA_EXCEEDED: &str = "errors.upload.quotaExceeded";
 
 /// Emitted only when Windows detects that the available WebView2 Runtime no
 /// longer matches the process-start snapshot before a new conversation WebView.
+#[cfg(any(feature = "tauri-runtime", test))]
 pub const CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY: &str =
     "ConversationPopout.runtimeRestartRequired";
 
