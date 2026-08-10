@@ -68,20 +68,27 @@ error behavior far beyond the incident. Rejected as unnecessary scope.
 
 Implementation follows test-driven development.
 
-Two module-local policy regressions will inspect only the production portion of
-their source modules and reject raw `Command::new("git")` construction while
-requiring the corresponding central helper. This is intentionally a structural
-test: the defect is bypassing a mandatory process-construction policy, and the
-Windows creation flags are not exposed by Rust's public `Command` inspection
-API. Existing artifact resolver tests continue to prove real Git behavior,
-including HEAD normalization, dirty-worktree rejection, and error
-classification.
+Each module will first extract its existing raw Git construction into a small
+module-private builder that is used by the production path. Existing behavioral
+tests must remain green after that refactor. A module-local regression test will
+then inspect the real builder through `Command::get_envs()` (or Tokio
+`Command::as_std().get_envs()`) and require the explicit `LANG=C.UTF-8` and
+`LC_ALL=C.UTF-8` configuration owned by the central process helpers. The test
+must fail while the builder still uses raw `Command::new("git")`, then pass when
+the builder switches to the corresponding central helper.
+
+This tests observable command-construction behavior rather than grepping Rust
+source text. Rust does not expose Windows creation flags through a public getter,
+but the UTF-8 environment and `CREATE_NO_WINDOW` are applied by the same helper
+call. Existing artifact resolver and admission tests continue to prove real Git
+behavior, including HEAD normalization, dirty-worktree rejection, failure
+classification, and branch-tip stamping.
 
 Targeted Rust verification from `src-tauri/`:
 
 ```text
-cargo test --lib --features test-utils acp::delegation::workflow::artifact_resolver::tests::production_git_spawn_uses_central_process_helper -- --exact
-cargo test --lib --features test-utils acp::delegation::workflow::admission::tests::production_git_spawn_uses_central_process_helper -- --exact
+cargo test --lib --features test-utils acp::delegation::workflow::artifact_resolver::tests::git_command_sets_explicit_utf8_locale -- --exact
+cargo test --lib --features test-utils acp::delegation::workflow::admission::tests::git_command_sets_explicit_utf8_locale -- --exact
 cargo check
 ```
 
