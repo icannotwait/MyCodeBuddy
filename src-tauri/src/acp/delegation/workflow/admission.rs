@@ -1351,11 +1351,15 @@ async fn durable_task_allows_noop<C: ConnectionTrait>(
         .is_some_and(|policy| policy.allow_noop_verification))
 }
 
+fn git_command() -> std::process::Command {
+    crate::process::std_command("git")
+}
+
 /// Read `git rev-parse HEAD` from a workspace path. Returns `None` on any failure
 /// (missing git, not a repo, empty path). Synchronous by design for settle hooks.
 fn workspace_head_commit(workspace_path: Option<&str>) -> Option<String> {
     let path = workspace_path.map(str::trim).filter(|s| !s.is_empty())?;
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(path)
         .output()
@@ -2945,6 +2949,27 @@ mod tests {
         assert!(!completion_constraint_race_codes(19, 1299));
         assert!(!completion_constraint_race_codes(19, 275));
     }
+
+    #[test]
+    fn git_command_sets_explicit_utf8_locale() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+
+        assert_eq!(envs.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            envs.get("LC_ALL").map(String::as_str),
+            Some("C.UTF-8")
+        );
+    }
+
     use crate::acp::delegation::run_store::{Gen1AdmitOutcome, ReservingRunInsert, RunStore};
     use crate::acp::delegation::store::TerminalTaskWrite;
     use crate::acp::delegation::workflow::events::{
