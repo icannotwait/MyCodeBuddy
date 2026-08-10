@@ -16,6 +16,7 @@ import {
   cancelReferenceSearch,
   cancelToolWatchdogLease,
   closeFolderIfEmpty,
+  CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
   deleteConversation,
   extendToolWatchdogLease,
   getFolderConversation,
@@ -28,6 +29,12 @@ import {
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
+
+it("locks the runtime restart wire key to the Rust literal", () => {
+  expect(CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY).toBe(
+    "ConversationPopout.runtimeRestartRequired"
+  )
+})
 
 describe("completion protocol frontend command removal", () => {
   beforeEach(() => {

@@ -2573,6 +2573,11 @@ export async function openProjectBootWindow(source?: string): Promise<void> {
 
 export type OpenConversationResult = "opened" | "focusedExisting"
 
+// MUST stay in lockstep with the Rust constant of the same name in
+// `src-tauri/src/app_error.rs`.
+export const CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY =
+  "ConversationPopout.runtimeRestartRequired"
+
 export interface PopoutOpStatus {
   phase: "opening" | "ready_pending" | "handoff_complete" | "aborted"
   conversationId: number
