@@ -27,12 +27,33 @@ import {
   useWorkflowGraphStore,
 } from "@/lib/workflow-graph-store"
 
-const { openWorkflowFile } = vi.hoisted(() => ({
-  openWorkflowFile: vi.fn(async () => {}),
-}))
+const {
+  getWorkspaceStateStore,
+  openWorkflowFile,
+  workspaceAcquire,
+  workspaceRelease,
+  workspaceSubscribeEnvelopes,
+  workspaceToken,
+  workspaceUnsubscribe,
+} = vi.hoisted(() => {
+  const unsubscribe = vi.fn()
+  return {
+    getWorkspaceStateStore: vi.fn(),
+    openWorkflowFile: vi.fn(async () => {}),
+    workspaceAcquire: vi.fn(),
+    workspaceRelease: vi.fn(),
+    workspaceSubscribeEnvelopes: vi.fn(() => unsubscribe),
+    workspaceToken: { mode: "paths" as const },
+    workspaceUnsubscribe: unsubscribe,
+  }
+})
 
 vi.mock("@/components/ai-elements/link-safety", () => ({
   useOpenLinkOrFile: () => openWorkflowFile,
+}))
+
+vi.mock("@/hooks/use-workspace-state-store", () => ({
+  getWorkspaceStateStore,
 }))
 
 vi.mock("@/hooks/use-delegated-sub-session", () => ({
@@ -393,6 +414,20 @@ function renderWithIntl(
   )
 }
 
+function workspaceStoreDouble() {
+  const token = { mode: "paths" as const }
+  const unsubscribe = vi.fn()
+  return {
+    token,
+    unsubscribe,
+    store: {
+      acquire: vi.fn(() => token),
+      release: vi.fn(),
+      subscribeEnvelopes: vi.fn(() => unsubscribe),
+    },
+  }
+}
+
 const completionCas = {
   attention_id: "attention-task-9",
   task_id: "task-9",
@@ -545,6 +580,17 @@ beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   vi.mocked(openDelegatedChildSession).mockClear()
   openWorkflowFile.mockClear()
+  getWorkspaceStateStore.mockReset()
+  workspaceAcquire.mockReset()
+  workspaceAcquire.mockReturnValue(workspaceToken)
+  workspaceRelease.mockReset()
+  workspaceSubscribeEnvelopes.mockClear()
+  workspaceUnsubscribe.mockClear()
+  getWorkspaceStateStore.mockReturnValue({
+    acquire: workspaceAcquire,
+    release: workspaceRelease,
+    subscribeEnvelopes: workspaceSubscribeEnvelopes,
+  })
   vi.mocked(continueArchivedWorkflowInSimple).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
@@ -689,6 +735,42 @@ describe("Task 7 archived and Simple workflow rendering", () => {
     )
 
     expect(screen.getByText("Partial Simple projection")).toBeVisible()
+  })
+
+  it("releases and reacquires the Simple file watch when the conversation folder changes", async () => {
+    const first = workspaceStoreDouble()
+    const second = workspaceStoreDouble()
+    getWorkspaceStateStore.mockImplementation((rootPath: string) => {
+      if (rootPath === "C:\\First") return first.store
+      if (rootPath === "D:\\Second") return second.store
+      throw new Error(`Unexpected workspace root: ${rootPath}`)
+    })
+    const graph = simpleGraph()
+    const view = (workspaceRootPath: string) => (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          conversationId={4242}
+          workflowGraph={graph}
+          workspaceRootPath={workspaceRootPath}
+        />
+      </NextIntlClientProvider>
+    )
+    const { rerender, unmount } = render(view("C:\\First"))
+
+    await waitFor(() =>
+      expect(first.store.acquire).toHaveBeenCalledWith("paths")
+    )
+    rerender(view("D:\\Second"))
+    await waitFor(() =>
+      expect(second.store.acquire).toHaveBeenCalledWith("paths")
+    )
+
+    expect(first.unsubscribe).toHaveBeenCalledTimes(1)
+    expect(first.store.release).toHaveBeenCalledWith(first.token)
+    unmount()
+    expect(second.unsubscribe).toHaveBeenCalledTimes(1)
+    expect(second.store.release).toHaveBeenCalledWith(second.token)
   })
 })
 

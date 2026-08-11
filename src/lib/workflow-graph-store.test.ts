@@ -332,7 +332,12 @@ describe("Simple workspace exact-path refresh", () => {
     vi.useRealTimers()
   })
 
-  async function activateSimpleWatch(conversationId = 310) {
+  async function activateSimpleWatchAt(
+    conversationId: number,
+    workspaceRootPath: string,
+    planRelPath = "docs/Plan.md",
+    progressRelPath = ".superpowers/sdd/42/progress.md"
+  ) {
     getWorkflowGraphSnapshot.mockResolvedValue(simpleSnapshot())
     const releaseOverlay = useWorkflowGraphStore
       .getState()
@@ -343,11 +348,15 @@ describe("Simple workspace exact-path refresh", () => {
       .getState()
       .activateSimpleFileInterest(
         conversationId,
-        "C:\\Repo",
-        "docs/Plan.md",
-        ".superpowers/sdd/42/progress.md"
+        workspaceRootPath,
+        planRelPath,
+        progressRelPath
       )
     return { releaseOverlay, releaseFiles }
+  }
+
+  async function activateSimpleWatch(conversationId = 310) {
+    return activateSimpleWatchAt(conversationId, "C:\\Repo")
   }
 
   it("ignores unrelated, folder, prefix, suffix, and POSIX case lookalike paths", async () => {
@@ -387,6 +396,73 @@ describe("Simple workspace exact-path refresh", () => {
 
     releasePosixFiles()
     releasePosixOverlay()
+  })
+
+  it("treats an empty overflow envelope as one debounced sweep without matching unrelated paths", async () => {
+    const first = await activateSimpleWatch(314)
+    const second = await activateSimpleWatch(318)
+
+    emitWorkspacePaths([])
+    await vi.advanceTimersByTimeAsync(100)
+    emitWorkspacePaths(["README.md"])
+    await vi.advanceTimersByTimeAsync(49)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    emitWorkspacePaths(["README.md"])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    first.releaseFiles()
+    first.releaseOverlay()
+    second.releaseFiles()
+    second.releaseOverlay()
+  })
+
+  it("matches exact UNC paths case-insensitively but rejects suffix lookalikes", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatchAt(
+      315,
+      "\\\\Server\\Share\\Repo"
+    )
+
+    emitWorkspacePaths(["DOCS\\PLAN.MD.BAK"])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    emitWorkspacePaths(["DOCS\\PLAN.MD"])
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    releaseFiles()
+    releaseOverlay()
+  })
+
+  it("normalizes traversal and dot segments without accepting prefix lookalikes", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatchAt(
+      316,
+      "C:\\Repo",
+      "docs/sections/../Plan.md",
+      ".superpowers/sdd/42/./progress.md"
+    )
+
+    emitWorkspacePaths([
+      "docs/Plan.md.tmp",
+      "docs-prefix/../docs-prefix/Plan.md",
+      ".superpowers/sdd/420/../420/progress.md",
+    ])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    emitWorkspacePaths(["docs/drafts/.././Plan.md"])
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    releaseFiles()
+    releaseOverlay()
   })
 
   it("debounces exact normalized Plan and progress bursts to one refresh each", async () => {
@@ -435,6 +511,23 @@ describe("Simple workspace exact-path refresh", () => {
     expect(workspaceUnsubscribe).toHaveBeenCalledTimes(1)
     expect(workspaceRelease).toHaveBeenCalledTimes(1)
     releaseOverlay()
+  })
+
+  it("store reset cancels pending debounce and releases the paths watch once", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatch(317)
+
+    emitWorkspacePaths(["docs/Plan.md"])
+    __resetWorkflowGraphStoreForTests()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(workspaceUnsubscribe).toHaveBeenCalledTimes(1)
+    expect(workspaceRelease).toHaveBeenCalledTimes(1)
+
+    releaseFiles()
+    releaseOverlay()
+    expect(workspaceUnsubscribe).toHaveBeenCalledTimes(1)
+    expect(workspaceRelease).toHaveBeenCalledTimes(1)
   })
 
   it("prevents an older exact-path request from overwriting a newer projection", async () => {

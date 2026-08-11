@@ -170,12 +170,25 @@ function archivedSnapshot(): WorkflowGraphSnapshot {
 function deferred<T>(): {
   promise: Promise<T>
   resolve: (value: T) => void
+  reject: (reason?: unknown) => void
 } {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((accept) => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((accept, decline) => {
     resolve = accept
+    reject = decline
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
+}
+
+function successorResult(): SimpleSuccessorResult {
+  return {
+    successor_conversation_id: 84,
+    created: true,
+    plan_rel_path: "docs/plan.md",
+    progress_rel_path: ".superpowers/sdd/84/progress.md",
+    bootstrap_prompt: "Continue the archived workflow.",
+  }
 }
 
 describe("SubAgentOverlay", () => {
@@ -228,13 +241,7 @@ describe("SubAgentOverlay", () => {
     expect(action).toBeDisabled()
 
     await act(async () => {
-      pending.resolve({
-        successor_conversation_id: 84,
-        created: true,
-        plan_rel_path: "docs/plan.md",
-        progress_rel_path: ".superpowers/sdd/84/progress.md",
-        bootstrap_prompt: "Continue the archived workflow.",
-      })
+      pending.resolve(successorResult())
       await pending.promise
     })
     expect(onOpenRootConversation).toHaveBeenCalledTimes(1)
@@ -302,6 +309,95 @@ describe("SubAgentOverlay", () => {
       screen.getByRole("button", { name: "Continue in Simple" })
     ).toBeEnabled()
   })
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores an archived successor %s after the overlay unmounts",
+    async (outcome) => {
+      const pending = deferred<SimpleSuccessorResult>()
+      const onOpenRootConversation = vi.fn()
+      vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(
+        pending.promise
+      )
+      const { unmount } = renderWithIntl(
+        <SubAgentOverlay
+          delegations={[]}
+          workflowGraph={archivedSnapshot()}
+          onOpenRootConversation={onOpenRootConversation}
+        />
+      )
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue in Simple" })
+      )
+      expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
+      unmount()
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          pending.resolve(successorResult())
+        } else {
+          pending.reject(new Error("stale archived failure"))
+        }
+        await pending.promise.catch(() => undefined)
+      })
+
+      expect(onOpenRootConversation).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores an archived successor %s after the archived source changes",
+    async (outcome) => {
+      const pending = deferred<SimpleSuccessorResult>()
+      const onOpenRootConversation = vi.fn()
+      vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(
+        pending.promise
+      )
+      const first = archivedSnapshot()
+      const second = archivedSnapshot()
+      second.archived = {
+        ...second.archived!,
+        source_conversation_id: 43,
+        plan_rel_path: "docs/next-plan.md",
+      }
+      const view = (snapshot: WorkflowGraphSnapshot) => (
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <SubAgentOverlay
+            delegations={[]}
+            workflowGraph={snapshot}
+            onOpenRootConversation={onOpenRootConversation}
+          />
+        </NextIntlClientProvider>
+      )
+      const { rerender } = render(view(first))
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue in Simple" })
+      )
+      expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
+      rerender(view(second))
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Continue in Simple" })
+        ).toBeEnabled()
+      )
+
+      await act(async () => {
+        if (outcome === "resolve") {
+          pending.resolve(successorResult())
+        } else {
+          pending.reject(new Error("stale archived failure"))
+        }
+        await pending.promise.catch(() => undefined)
+      })
+
+      expect(onOpenRootConversation).not.toHaveBeenCalled()
+      expect(screen.queryByRole("alert")).toBeNull()
+      expect(
+        screen.getByRole("button", { name: "Continue in Simple" })
+      ).toBeEnabled()
+    }
+  )
 
   it("expands by default and lists every sub-agent", () => {
     const delegations = [

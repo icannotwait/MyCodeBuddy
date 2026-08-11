@@ -28,6 +28,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -110,6 +111,9 @@ import {
   type WorkflowSegment,
 } from "@/lib/workflow-graph-store"
 import { cn, randomUUID } from "@/lib/utils"
+
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect
 
 function resolveDefaultPhaseKind(
   phases: readonly PhaseRailItem[]
@@ -370,10 +374,12 @@ export function groupDelegationSourcesForOverlay(
 
 function ArchivedWorkflowBanner({
   snapshot,
+  conversationId,
   workspaceRootPath,
   onOpenRootConversation,
 }: {
   snapshot: WorkflowGraphSnapshot
+  conversationId: number | null
   workspaceRootPath: string | null
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }) {
@@ -382,18 +388,52 @@ function ArchivedWorkflowBanner({
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const pendingRef = useRef(false)
+  const mountedRef = useRef(true)
+  const actionGenerationRef = useRef(0)
   const archived = snapshot.archived
-  if (!archived) return null
 
   const successorId =
+    archived != null &&
     Number.isSafeInteger(archived.successor_conversation_id) &&
     (archived.successor_conversation_id ?? 0) > 0
       ? archived.successor_conversation_id!
       : null
   const canCreate =
+    archived != null &&
     archived.can_create_simple_successor &&
     Number.isSafeInteger(archived.source_conversation_id) &&
     archived.source_conversation_id > 0
+  const actionScopeKey = JSON.stringify([
+    conversationId,
+    snapshot.workflow_id ?? null,
+    snapshot.graph_revision ?? null,
+    archived?.source_conversation_id ?? null,
+    archived?.successor_conversation_id ?? null,
+    archived?.can_create_simple_successor ?? false,
+    archived?.plan_rel_path ?? null,
+  ])
+
+  useIsomorphicLayoutEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      actionGenerationRef.current += 1
+      pendingRef.current = false
+    }
+  }, [])
+
+  useIsomorphicLayoutEffect(() => {
+    actionGenerationRef.current += 1
+    pendingRef.current = false
+    setPending(false)
+    setError(null)
+    return () => {
+      actionGenerationRef.current += 1
+      pendingRef.current = false
+    }
+  }, [actionScopeKey, onOpenRootConversation, snapshot])
+
+  if (!archived) return null
 
   const openPlan = () => {
     if (!archived.plan_rel_path) return
@@ -410,6 +450,11 @@ function ArchivedWorkflowBanner({
     pendingRef.current = true
     setPending(true)
     setError(null)
+    const actionGeneration = actionGenerationRef.current + 1
+    actionGenerationRef.current = actionGeneration
+    const actionIsCurrent = () =>
+      mountedRef.current &&
+      actionGenerationRef.current === actionGeneration
     try {
       if (successorId != null) {
         await onOpenRootConversation(successorId)
@@ -420,12 +465,16 @@ function ArchivedWorkflowBanner({
         archived.source_conversation_id,
         requestToken
       )
+      if (!actionIsCurrent()) return
       await onOpenRootConversation(result.successor_conversation_id)
     } catch (cause: unknown) {
+      if (!actionIsCurrent()) return
       setError(toErrorMessage(cause))
     } finally {
-      pendingRef.current = false
-      setPending(false)
+      if (actionIsCurrent()) {
+        pendingRef.current = false
+        setPending(false)
+      }
     }
   }
 
@@ -933,6 +982,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
               {graph.archived && (
                 <ArchivedWorkflowBanner
                   snapshot={graph}
+                  conversationId={conversationId}
                   workspaceRootPath={workspaceRootPath}
                   onOpenRootConversation={onOpenRootConversation}
                 />

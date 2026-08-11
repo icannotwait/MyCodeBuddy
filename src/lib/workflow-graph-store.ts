@@ -330,11 +330,13 @@ function activateSimpleFileInterest(
   }
   record.unsubscribe = workspaceStore.subscribeEnvelopes(
     ({ changed_paths: changedPaths }) => {
-      const relevant = changedPaths.some((changedPath) =>
-        targets.has(
-          normalizeWorkspaceFileForComparison(workspaceRootPath, changedPath)
+      const relevant =
+        changedPaths.length === 0 ||
+        changedPaths.some((changedPath) =>
+          targets.has(
+            normalizeWorkspaceFileForComparison(workspaceRootPath, changedPath)
+          )
         )
-      )
       if (!relevant) return
       if (record.debounceTimer != null) clearTimeout(record.debounceTimer)
       record.debounceTimer = setTimeout(() => {
