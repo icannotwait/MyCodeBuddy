@@ -273,6 +273,17 @@ pub struct BrokerPublishWorkflowRequest {
     pub document: Value,
 }
 
+/// Register or update the Simple Plan/progress locator for the token-bound
+/// Root conversation. Conversation identity is deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRegisterSimpleWorkflowRequest {
+    pub token: String,
+    pub plan_rel_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_rel_path: Option<String>,
+}
+
 /// Settle a Design/Plan document gate for one cycle. Backs
 /// `settle_workflow_gate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,7 +306,7 @@ pub struct BrokerSettleWorkflowRequest {
 
 #[cfg(test)]
 mod workflow_v2_tests {
-    use super::BrokerCompleteWorkRequest;
+    use super::{BrokerCompleteWorkRequest, BrokerRegisterSimpleWorkflowRequest};
     use crate::acp::delegation::workflow::{CompleteWorkRequest, CompletionOutcome};
     use serde_json::json;
 
@@ -333,6 +344,19 @@ mod workflow_v2_tests {
             "task_id": "forged"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn simple_registration_transport_has_no_client_supplied_conversation_identity() {
+        let request = BrokerRegisterSimpleWorkflowRequest {
+            token: "secret".into(),
+            plan_rel_path: "docs/plan.md".into(),
+            progress_rel_path: None,
+        };
+        let encoded = serde_json::to_value(request).expect("encode Simple registration");
+        assert_eq!(encoded["plan_rel_path"], "docs/plan.md");
+        assert!(encoded.get("parent_conversation_id").is_none());
+        assert!(encoded.get("conversation_id").is_none());
     }
 }
 
@@ -406,6 +430,7 @@ pub enum BrokerMessage {
     SessionInfo(BrokerSessionRequest),
     ParentDecision(BrokerParentDecisionRequest),
     ReplyDelegation(BrokerReplyDelegationRequest),
+    RegisterSimpleWorkflow(BrokerRegisterSimpleWorkflowRequest),
     PublishWorkflow(BrokerPublishWorkflowRequest),
     SettleWorkflow(BrokerSettleWorkflowRequest),
     CompleteWork(BrokerCompleteWorkRequest),
@@ -668,6 +693,17 @@ pub async fn client_publish_workflow_round_trip(
     req: &BrokerPublishWorkflowRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::PublishWorkflow(req.clone())).await
+}
+
+pub async fn client_register_simple_workflow_round_trip(
+    socket_path: &str,
+    req: &BrokerRegisterSimpleWorkflowRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::RegisterSimpleWorkflow(req.clone()),
+    )
+    .await
 }
 
 /// Dispatch `settle_workflow_gate` and read the settle result (or error).

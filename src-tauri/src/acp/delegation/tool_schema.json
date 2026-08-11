@@ -72,6 +72,19 @@
     }
   },
   {
+    "name": "register_simple_workflow",
+    "description": "Register workspace-relative Plan and progress paths for this Root conversation after the Plan exists.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_rel_path"],
+      "properties": {
+        "plan_rel_path": { "type": "string", "minLength": 1 },
+        "progress_rel_path": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  {
     "name": "continue_delegation",
     "description": "Continue terminal task_id asynchronously with full context; never creates a child. Join via get_delegation_status.",
     "inputSchema": {

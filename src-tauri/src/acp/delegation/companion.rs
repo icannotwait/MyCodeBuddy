@@ -11,6 +11,7 @@
 //! `ask_user_question` (block on a multiple-choice card), `get_session_info`
 //! (resolve a referenced session by id), coordination-only
 //! `request_parent_decision` / `reply_to_delegation`, plus Root-only
+//! `register_simple_workflow` locator registration and legacy Root-only
 //! `workflow_v2` tools (`get_workflow_capabilities`, `get_workflow_state`,
 //! `publish_workflow_manifest`, `settle_workflow_gate`) — whose schemas are
 //! embedded at compile time from [`TOOL_SCHEMA_JSON`] and gated by the
@@ -52,11 +53,13 @@ use crate::acp::delegation::transport::{
     client_complete_work_round_trip, client_feedback_round_trip,
     client_get_workflow_state_round_trip, client_parent_decision_round_trip,
     client_publish_workflow_round_trip, client_recover_workflow_round_trip,
+    client_register_simple_workflow_round_trip,
     client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
     client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
     client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
+    BrokerRegisterSimpleWorkflowRequest,
     BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
     BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
     BrokerStatusRequest, CancelDelegationReason, CompanionRole,
@@ -154,6 +157,14 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterSimpleWorkflowArguments {
+    plan_rel_path: String,
+    #[serde(default)]
+    progress_rel_path: Option<String>,
 }
 
 pub fn serialize_jsonrpc_line(response: &JsonRpcResponse) -> Result<Vec<u8>, serde_json::Error> {
@@ -360,6 +371,9 @@ impl CompanionContext {
                 self.features.completion_v2 && self.role == CompanionRole::DelegationChild
             }
             "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
+            "register_simple_workflow" => {
+                self.features.delegation && self.role == CompanionRole::Root
+            }
             "request_recovery_authorization" => {
                 (self.features.delegation && self.features.coordination_v1)
                     || (self.features.workflow_v2 && self.role == CompanionRole::Root)
@@ -978,6 +992,40 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_publish_workflow_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
+        }
+        "register_simple_workflow" => {
+            let arguments: RegisterSimpleWorkflowArguments =
+                match serde_json::from_value(arguments) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!("invalid register_simple_workflow arguments: {error}"),
+                        ));
+                    }
+                };
+            if arguments.plan_rel_path.trim().is_empty()
+                || arguments
+                    .progress_rel_path
+                    .as_deref()
+                    .is_some_and(|path| path.trim().is_empty())
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "register_simple_workflow paths must be non-empty strings",
+                ));
+            }
+            let req = BrokerRegisterSimpleWorkflowRequest {
+                token: ctx.token.clone(),
+                plan_rel_path: arguments.plan_rel_path,
+                progress_rel_path: arguments.progress_rel_path,
+            };
+            let round_trip = Box::pin(async move {
+                client_register_simple_workflow_round_trip(&socket, &req).await
+            });
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "settle_workflow_gate" => {
@@ -4324,6 +4372,57 @@ mod tests {
             !v1.workflow_tools_enabled(),
             "workflow_v1 must be ignored as an unknown token"
         );
+    }
+
+    #[tokio::test]
+    async fn register_simple_workflow_is_delegation_root_only_and_schema_has_no_parent_id() {
+        let root = legacy_root();
+        let root_names = list_tool_names(dispatch_with_context(root.clone(), tools_list()).await);
+        assert!(root_names.iter().any(|name| name == "register_simple_workflow"));
+
+        let mut child = root.clone();
+        child.role = CompanionRole::DelegationChild;
+        let child_names = list_tool_names(dispatch_with_context(child, tools_list()).await);
+        assert!(!child_names
+            .iter()
+            .any(|name| name == "register_simple_workflow"));
+
+        let disabled = ctx_with(CompanionFeatures::parse(Some("sessions")));
+        let disabled_names = list_tool_names(dispatch_with_context(disabled, tools_list()).await);
+        assert!(!disabled_names
+            .iter()
+            .any(|name| name == "register_simple_workflow"));
+
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema");
+        let registration = schema
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool["name"] == "register_simple_workflow")
+            .expect("Simple registration tool");
+        let properties = registration["inputSchema"]["properties"]
+            .as_object()
+            .expect("registration properties");
+        assert_eq!(
+            properties.keys().cloned().collect::<Vec<_>>(),
+            vec!["plan_rel_path", "progress_rel_path"]
+        );
+
+        let response = unwrap_respond(
+            dispatch_with_context(
+                root,
+                &call(
+                    91,
+                    "register_simple_workflow",
+                    json!({
+                        "plan_rel_path": "docs/plan.md",
+                        "parent_conversation_id": 42
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(response.error.expect("unknown field error").code, -32602);
     }
 
     #[test]

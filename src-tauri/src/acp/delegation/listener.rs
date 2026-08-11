@@ -41,6 +41,7 @@ use crate::acp::delegation::transport::{
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
     BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+    BrokerRegisterSimpleWorkflowRequest,
     BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
     BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
     CompanionRole,
@@ -55,7 +56,8 @@ use crate::acp::delegation::workflow::{
     accept_complete_work_txn, decide_workflow_recovery, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
     load_completion_protocol_header, publish_workflow_manifest_core, recover_workflow_core,
-    require_v2_mutation, settle_workflow_gate_v2_core, FinalDeliveryGuardResult, ManifestDocument,
+    emit_workflow_compatibility_nudge, register_simple_workflow, require_v2_mutation,
+    settle_workflow_gate_v2_core, FinalDeliveryGuardResult, ManifestDocument,
     PlanReviewError, PublishWorkflowRequest, RecoverWorkflowRequest, SettleWorkflowV2Request,
     WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
@@ -706,6 +708,9 @@ impl DelegationListener {
             BrokerMessage::ReplyDelegation(req) => {
                 // Immediate: serialize through the normal final write_frame path.
                 value_response(&self.process_reply_delegation(req).await)?
+            }
+            BrokerMessage::RegisterSimpleWorkflow(req) => {
+                value_response(&self.process_register_simple_workflow(req).await)?
             }
             BrokerMessage::PublishWorkflow(req) => {
                 value_response(&self.process_publish_workflow(req).await)?
@@ -1623,6 +1628,66 @@ impl DelegationListener {
                 WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
             }),
             Err(e) => workflow_store_error_value(e),
+        }
+    }
+
+    async fn process_register_simple_workflow(
+        &self,
+        req: BrokerRegisterSimpleWorkflowRequest,
+    ) -> Value {
+        let entry = match self.tokens.lookup(&req.token).await {
+            Some(entry) => entry,
+            None => return WorkflowWireError::InvalidToken.to_value(),
+        };
+        if entry.role != CompanionRole::Root {
+            return WorkflowWireError::RootOnly.to_value();
+        }
+        let parent_conversation_id = match self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await
+        {
+            Some(id) => id,
+            None => return WorkflowWireError::NoActiveConversation.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        match register_simple_workflow(
+            &runs.db().conn,
+            parent_conversation_id,
+            &req.plan_rel_path,
+            req.progress_rel_path.as_deref(),
+        )
+        .await
+        {
+            Ok(registration) => {
+                if registration.created || registration.updated {
+                    emit_workflow_compatibility_nudge(
+                        &self.workflow_emitter,
+                        parent_conversation_id,
+                    );
+                }
+                let registration_mode = if registration.created {
+                    "created"
+                } else if registration.updated {
+                    "updated"
+                } else {
+                    "unchanged"
+                };
+                serde_json::json!({
+                    "plan_rel_path": registration.descriptor.plan_rel_path,
+                    "progress_rel_path": registration.descriptor.progress_rel_path,
+                    "registration_mode": registration_mode,
+                    "idempotent_replay": !registration.created && !registration.updated,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "error": {
+                    "code": error.code(),
+                    "message": error.to_string(),
+                }
+            }),
         }
     }
 
@@ -8965,6 +9030,108 @@ mod tests {
             outcome["error"]["code"], "root_only",
             "child must not publish even when workflow_v2 token bit is set: {outcome}"
         );
+    }
+
+    #[tokio::test]
+    async fn register_simple_workflow_is_token_bound_idempotent_and_refreshes_after_commit() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::web::event_bridge::WebEventBroadcaster;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/simple-registration-listener").await;
+        let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+        let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("simple-root".into(), root_token_entry("simple-conn"))
+            .await;
+        tokens
+            .register("simple-child".into(), child_token_entry("simple-conn"))
+            .await;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut events = broadcaster.subscribe();
+        let listener = DelegationListener::new_with_workflow_emitter(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(Some(parent))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+            EventEmitter::test_web_only(broadcaster),
+        );
+
+        let created = listener
+            .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
+                token: "simple-root".into(),
+                plan_rel_path: "docs/./plan.md".into(),
+                progress_rel_path: None,
+            })
+            .await;
+        assert_eq!(created["registration_mode"], "created");
+        assert_eq!(created["plan_rel_path"], "docs/plan.md");
+        assert_eq!(
+            created["progress_rel_path"],
+            format!(".superpowers/sdd/{parent}/progress.md")
+        );
+        assert_eq!(created["idempotent_replay"], false);
+        let event = events.try_recv().expect("refresh after committed create");
+        assert_eq!(event.channel, "workflow_graph://compatibility_nudge");
+        assert_eq!(event.payload["parent_conversation_id"], parent);
+
+        let replay = listener
+            .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
+                token: "simple-root".into(),
+                plan_rel_path: "docs/plan.md".into(),
+                progress_rel_path: None,
+            })
+            .await;
+        assert_eq!(replay["registration_mode"], "unchanged");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert!(events.try_recv().is_err(), "replay must not emit a refresh");
+
+        let updated = listener
+            .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
+                token: "simple-root".into(),
+                plan_rel_path: "docs/plan.md".into(),
+                progress_rel_path: Some("state/progress.md".into()),
+            })
+            .await;
+        assert_eq!(updated["registration_mode"], "updated");
+        assert_eq!(updated["progress_rel_path"], "state/progress.md");
+        events.try_recv().expect("refresh after committed update");
+
+        for (token, code) in [
+            ("missing", "invalid_token"),
+            ("simple-child", "root_only"),
+        ] {
+            let denied = listener
+                .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
+                    token: token.into(),
+                    plan_rel_path: "docs/other.md".into(),
+                    progress_rel_path: None,
+                })
+                .await;
+            assert_eq!(denied["error"]["code"], code);
+        }
+        let invalid = listener
+            .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
+                token: "simple-root".into(),
+                plan_rel_path: "../outside.md".into(),
+                progress_rel_path: None,
+            })
+            .await;
+        assert_eq!(invalid["error"]["code"], "workflow_invalid_path");
+        assert!(events.try_recv().is_err(), "failed writes must not emit refresh");
     }
 
     #[tokio::test]

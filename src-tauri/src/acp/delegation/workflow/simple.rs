@@ -74,6 +74,7 @@ impl ConversationWorkflowMode {
 pub struct SimpleWorkflowRegistration {
     pub descriptor: simple_workflow::Model,
     pub created: bool,
+    pub updated: bool,
 }
 
 #[derive(Debug, Error)]
@@ -209,6 +210,7 @@ async fn register_simple_workflow_txn<C: ConnectionTrait>(
                 return Ok(SimpleWorkflowRegistration {
                     descriptor: current,
                     created: false,
+                    updated: false,
                 });
             }
             let mut active: simple_workflow::ActiveModel = current.into();
@@ -219,6 +221,7 @@ async fn register_simple_workflow_txn<C: ConnectionTrait>(
             Ok(SimpleWorkflowRegistration {
                 descriptor,
                 created: false,
+                updated: true,
             })
         }
         None => {
@@ -236,6 +239,7 @@ async fn register_simple_workflow_txn<C: ConnectionTrait>(
             Ok(SimpleWorkflowRegistration {
                 descriptor,
                 created: true,
+                updated: false,
             })
         }
     }
@@ -528,6 +532,7 @@ mod tests {
         .await
         .expect("register");
         assert!(created.created);
+        assert!(!created.updated);
         assert_eq!(created.descriptor.plan_rel_path, "docs/superpowers/plans/plan.md");
         assert_eq!(
             created.descriptor.progress_rel_path,
@@ -544,6 +549,7 @@ mod tests {
         .await
         .expect("idempotent replay");
         assert!(!replay.created);
+        assert!(!replay.updated);
         assert_eq!(replay.descriptor.created_at, original_created_at);
 
         let updated = register_simple_workflow(
@@ -555,6 +561,7 @@ mod tests {
         .await
         .expect("locator update");
         assert!(!updated.created);
+        assert!(updated.updated);
         assert_eq!(updated.descriptor.plan_rel_path, "docs/superpowers/plans/revised.md");
         assert_eq!(
             updated.descriptor.progress_rel_path,
