@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use crate::acp::delegation::route::{is_managed_agent, DelegationRoutePolicy};
@@ -78,6 +78,67 @@ pub async fn create_with_route_override(
         },
     )
     .await
+}
+
+/// Insert a regular root conversation into an existing transaction. This is
+/// the atomic composition point for flows that must commit a conversation and
+/// related ownership metadata together.
+pub(crate) async fn create_root_with_route_override_in_transaction(
+    txn: &DatabaseTransaction,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
+
+    let now = Utc::now();
+    let model = conversation::ActiveModel {
+        id: NotSet,
+        folder_id: Set(folder_id),
+        title: Set(title),
+        title_locked: Set(false),
+        auto_title_finalized: Set(false),
+        agent_type: Set(agent_type.as_wire().into_owned()),
+        status: Set(conversation::ConversationStatus::InProgress),
+        kind: Set(ConversationKind::Regular),
+        model: Set(None),
+        git_branch: Set(None),
+        external_id: Set(None),
+        parent_id: Set(None),
+        parent_tool_use_id: Set(None),
+        delegation_call_id: Set(None),
+        delegation_route_override: Set(route_policy_to_storage(delegation_route_override)),
+        delegation_task_status: Set(None),
+        delegation_error_code: Set(None),
+        delegation_started_at: Set(None),
+        delegation_finished_at: Set(None),
+        delegation_tool_call_count: Set(None),
+        delegation_edit_tool_call_count: Set(None),
+        delegation_touched_files_json: Set(None),
+        delegation_touched_files_truncated: Set(None),
+        delegation_additions: Set(None),
+        delegation_deletions: Set(None),
+        delegation_line_counts_complete: Set(None),
+        message_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: Set(None),
+        pinned_at: Set(None),
+        awaiting_reply_token: Set(None),
+        delegation_run_generation: Set(None),
+        last_termination_audit_json: Set(None),
+    }
+    .insert(txn)
+    .await?;
+    enroll_new_conversation(txn, model.id, now).await?;
+    Ok(model)
 }
 
 /// Mirror of [`create`] for folderless chat-mode conversations: identical row

@@ -887,6 +887,14 @@ export interface ArchivedWorkflowNavigationSnapshot {
   can_create_simple_successor: boolean
 }
 
+export interface SimpleSuccessorResult {
+  successor_conversation_id: number
+  created: boolean
+  plan_rel_path: string
+  progress_rel_path: string
+  bootstrap_prompt: string
+}
+
 export interface WorkflowPhaseSnapshot {
   id: string
   kind?: string | null

@@ -30,6 +30,7 @@ pub mod quick_messages;
 pub mod reference_search;
 pub mod science;
 pub mod session_info;
+pub mod simple_workflow;
 pub mod system_settings;
 pub mod terminal;
 pub mod tool_watchdog;

@@ -131,7 +131,7 @@ pub async fn load_simple_workflow<C: ConnectionTrait>(
         .map_err(db_error)
 }
 
-async fn register_simple_workflow_txn<C: ConnectionTrait>(
+pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
     conn: &C,
     parent_conversation_id: i32,
     plan_rel_path: &str,

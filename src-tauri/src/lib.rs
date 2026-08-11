@@ -1145,6 +1145,7 @@ mod tauri_app {
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
                 crate::commands::workflow_graph::get_workflow_graph_snapshot,
+                crate::commands::simple_workflow::continue_archived_workflow_in_simple,
                 crate::commands::workflow_completion::resolve_completion_decision,
                 crate::commands::workflow_completion::retry_completion_artifact,
                 crate::commands::workflow_completion::resolve_design_self_review,

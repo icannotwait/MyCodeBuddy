@@ -36,7 +36,8 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::ConfigurationInvalid
         | AppErrorCode::DependencyMissing
         | AppErrorCode::NotAGitRepository
-        | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
+        | AppErrorCode::AuthenticationFailed
+        | AppErrorCode::SimpleSuccessorPlanUnavailable => StatusCode::UNPROCESSABLE_ENTITY,
         AppErrorCode::JobExpired => StatusCode::GONE,
         AppErrorCode::SourceTimeout => StatusCode::REQUEST_TIMEOUT,
         AppErrorCode::RegistryOverloaded => StatusCode::TOO_MANY_REQUESTS,

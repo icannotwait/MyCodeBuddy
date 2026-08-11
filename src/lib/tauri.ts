@@ -78,6 +78,7 @@ import type {
   McpMarketplaceItem,
   McpMarketplaceServerDetail,
   DelegationProfileCatalog,
+  SimpleSuccessorResult,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -1064,6 +1065,16 @@ export async function deleteConversation(
   conversationId: number
 ): Promise<void> {
   return invoke("delete_conversation", { conversationId })
+}
+
+export async function continueArchivedWorkflowInSimple(
+  sourceConversationId: number,
+  clientRequestToken: string
+): Promise<SimpleSuccessorResult> {
+  return invoke("continue_archived_workflow_in_simple", {
+    sourceConversationId,
+    clientRequestToken,
+  })
 }
 
 // Folder command management

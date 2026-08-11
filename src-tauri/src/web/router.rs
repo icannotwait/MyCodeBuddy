@@ -175,6 +175,10 @@ pub fn build_router(
             post(handlers::workflow_graph::get_workflow_graph_snapshot),
         )
         .route(
+            "/continue_archived_workflow_in_simple",
+            post(handlers::simple_workflow::continue_archived_workflow_in_simple),
+        )
+        .route(
             "/resolve_completion_decision",
             post(handlers::workflow_completion::resolve_completion_decision),
         )
