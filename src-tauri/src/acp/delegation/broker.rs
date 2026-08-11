@@ -36027,6 +36027,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_v2_retired_launch_matrix_rejects_mutations_without_side_effects() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::AppDatabase;
         use crate::db::entities::{
             conversation, delegation_attention_request, delegation_lineage_budget,
             delegation_plan_round_authorization, delegation_task_run,
@@ -36034,7 +36035,7 @@ mod tests {
             delegation_workflow_outbox_event, recovery_authorization,
         };
         use crate::db::entities::delegation_workflow::CompletionProtocolMode;
-        use sea_orm::PaginatorTrait;
+        use sea_orm::{EntityTrait, PaginatorTrait};
 
         async fn side_effect_counts(db: &AppDatabase) -> [u64; 9] {
             [

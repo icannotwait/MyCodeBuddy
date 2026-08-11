@@ -64,8 +64,7 @@ use crate::acp::delegation::workflow::{
 };
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
-    accept_complete_work_txn, publish_workflow_manifest_core, ManifestDocument,
-    PublishWorkflowRequest,
+    accept_complete_work_txn, ManifestDocument, PublishWorkflowRequest,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -9656,6 +9655,7 @@ mod tests {
             dispatch_line, CompanionContext, CompanionFeatures, InflightCalls, LineAction,
         };
         use crate::acp::delegation::run_store::RunStore;
+        use crate::db::entities::delegation_workflow_manifest_revision;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
         use sea_orm::PaginatorTrait;
 

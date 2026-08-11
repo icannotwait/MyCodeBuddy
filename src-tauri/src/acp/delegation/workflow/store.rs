@@ -9478,6 +9478,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_v2_retired_store_mutations_stop_before_semantic_side_effects() {
+        use crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE;
         use crate::db::entities::{
             delegation_attention_request, delegation_workflow_gate_settlement,
             delegation_workflow_outbox_event, recovery_authorization,
