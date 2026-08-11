@@ -584,12 +584,14 @@ async fn attention_authenticated_context_owns_durable_root_across_core_and_http(
         .unwrap()
         .authorize_completion_root(foreign_fixture.parent_conversation_id + 1)
         .unwrap();
-    let core_foreign = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
-        &foreign_fixture.state.db,
-        foreign_fixture.state.delegation_metrics.as_ref(),
-        foreign_fixture.state.completion_outbox_dispatcher.as_ref(),
-        &foreign_context,
-        foreign_request.clone(),
+    let core_foreign = with_historical_workflow_fixture_mutations(
+        codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
+            &foreign_fixture.state.db,
+            foreign_fixture.state.delegation_metrics.as_ref(),
+            foreign_fixture.state.completion_outbox_dispatcher.as_ref(),
+            &foreign_context,
+            foreign_request.clone(),
+        ),
     )
     .await
     .unwrap_err();
@@ -774,7 +776,6 @@ fn legacy_restart_surface_is_absent() {
         ["legacy_completion_protocol_", "restart_required"].concat(),
         ["legacy_completion_protocol_", "restart_invalid"].concat(),
         ["legacy_completion_protocol_", "restart_not_required"].concat(),
-        ["successor_conversation_", "id"].concat(),
         ["capture_original_request_", "context"].concat(),
     ];
 
@@ -832,7 +833,6 @@ fn v2_only_removed_surface_inventory() {
         concat!("get_completion_protocol_", "settings"),
         concat!("legacy_completion_protocol_", "restart_required"),
         concat!("legacy_completion_protocol_", "restart_invalid"),
-        concat!("successor_", "conversation_id"),
     ];
 
     for (surface, source) in &sources {
