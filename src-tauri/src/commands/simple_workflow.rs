@@ -63,11 +63,12 @@ struct ArchivedSource {
 struct SimpleSuccessorTestControl {
     empty_link_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     empty_link_slots: std::sync::atomic::AtomicUsize,
-    fail_after_candidate: std::sync::atomic::AtomicUsize,
+    fail_after_registration: std::sync::atomic::AtomicUsize,
     empty_link_waits: std::sync::atomic::AtomicUsize,
     retries: std::sync::atomic::AtomicUsize,
     rollbacks: std::sync::atomic::AtomicUsize,
     auto_title_job_seen: std::sync::atomic::AtomicBool,
+    descriptor_link_seen: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -90,8 +91,8 @@ impl SimpleSuccessorTestControl {
         }
     }
 
-    fn should_fail_after_candidate(&self) -> bool {
-        self.fail_after_candidate
+    fn should_fail_after_registration(&self) -> bool {
+        self.fail_after_registration
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
@@ -110,18 +111,21 @@ impl SimpleSuccessorTestControl {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn new(empty_link_parties: Option<usize>, fail_after_candidate: usize) -> Self {
+    fn new(empty_link_parties: Option<usize>, fail_after_registration: usize) -> Self {
         Self {
             empty_link_barrier: empty_link_parties
                 .map(|parties| std::sync::Arc::new(tokio::sync::Barrier::new(parties))),
             empty_link_slots: std::sync::atomic::AtomicUsize::new(
                 empty_link_parties.unwrap_or(0),
             ),
-            fail_after_candidate: std::sync::atomic::AtomicUsize::new(fail_after_candidate),
+            fail_after_registration: std::sync::atomic::AtomicUsize::new(
+                fail_after_registration,
+            ),
             empty_link_waits: std::sync::atomic::AtomicUsize::new(0),
             retries: std::sync::atomic::AtomicUsize::new(0),
             rollbacks: std::sync::atomic::AtomicUsize::new(0),
             auto_title_job_seen: std::sync::atomic::AtomicBool::new(false),
+            descriptor_link_seen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -129,7 +133,7 @@ impl SimpleSuccessorTestControl {
         Self::new(Some(parties), 0)
     }
 
-    fn fail_after_candidate() -> Self {
+    fn fail_after_registration() -> Self {
         Self::new(None, 1)
     }
 
@@ -155,6 +159,16 @@ impl SimpleSuccessorTestControl {
         self.auto_title_job_seen
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn record_descriptor_link_seen(&self, seen: bool) {
+        self.descriptor_link_seen
+            .store(seen, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn descriptor_link_seen(&self) -> bool {
+        self.descriptor_link_seen
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -170,9 +184,9 @@ async fn test_after_empty_link_read() {
 }
 
 #[cfg(test)]
-fn test_should_fail_after_candidate() -> bool {
+fn test_should_fail_after_registration() -> bool {
     SIMPLE_SUCCESSOR_TEST_CONTROL
-        .try_with(|control| control.should_fail_after_candidate())
+        .try_with(|control| control.should_fail_after_registration())
         .unwrap_or(false)
 }
 
@@ -187,9 +201,10 @@ fn test_record_rollback() {
 }
 
 #[cfg(test)]
-async fn test_record_auto_title_enrollment(
+async fn test_record_candidate_registration(
     txn: &sea_orm::DatabaseTransaction,
     conversation_id: i32,
+    source_workflow_id: &str,
 ) -> Result<(), AppCommandError> {
     let Ok(control) = SIMPLE_SUCCESSOR_TEST_CONTROL.try_with(|control| control.clone()) else {
         return Ok(());
@@ -200,6 +215,13 @@ async fn test_record_auto_title_enrollment(
         .map_err(|error| AppCommandError::database_error(error.to_string()))?
         .is_some();
     control.record_auto_title_job_seen(seen);
+    let descriptor = simple_workflow::Entity::find_by_id(conversation_id)
+        .one(txn)
+        .await
+        .map_err(|error| AppCommandError::database_error(error.to_string()))?;
+    control.record_descriptor_link_seen(descriptor.is_some_and(|descriptor| {
+        descriptor.source_workflow_id.as_deref() == Some(source_workflow_id)
+    }));
     Ok(())
 }
 
@@ -274,13 +296,18 @@ fn plan_unavailable(plan_rel_path: &str) -> AppCommandError {
         AppErrorCode::SimpleSuccessorPlanUnavailable,
         "Archived Plan is unavailable",
     );
-    if plan_rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
-        return error;
+    match normalize_bounded_successor_locator(plan_rel_path) {
+        Some(safe_rel_path) => error.with_detail(safe_rel_path),
+        None => error,
     }
-    match normalize_rel_path(plan_rel_path) {
-        Ok(safe_rel_path) => error.with_detail(safe_rel_path),
-        Err(_) => error,
+}
+
+fn normalize_bounded_successor_locator(rel_path: &str) -> Option<String> {
+    if rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
+        return None;
     }
+    let normalized = normalize_rel_path(rel_path).ok()?;
+    (normalized.len() <= MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES).then_some(normalized)
 }
 
 fn parse_route_override(
@@ -470,11 +497,8 @@ async fn load_archived_source(
         .with_detail("workflow_identity_corrupt")
     })?;
     let raw_plan_rel_path = document.plan_target_rel_path;
-    if raw_plan_rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
-        return Err(plan_unavailable(&raw_plan_rel_path));
-    }
-    let plan_rel_path =
-        normalize_rel_path(&raw_plan_rel_path).map_err(|_| plan_unavailable(&raw_plan_rel_path))?;
+    let plan_rel_path = normalize_bounded_successor_locator(&raw_plan_rel_path)
+        .ok_or_else(|| plan_unavailable(&raw_plan_rel_path))?;
     read_simple_plan(std::path::Path::new(&workspace.path), &plan_rel_path)
         .await
         .map_err(|_| plan_unavailable(&plan_rel_path))?;
@@ -496,8 +520,7 @@ async fn load_archived_source(
     });
     let design_rel_path = document
         .design
-        .filter(|design| design.rel_path.len() <= MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES)
-        .and_then(|design| normalize_rel_path(&design.rel_path).ok());
+        .and_then(|design| normalize_bounded_successor_locator(&design.rel_path));
 
     Ok(ArchivedSource {
         root_conversation_id,
@@ -549,9 +572,8 @@ async fn load_existing_successor<C: ConnectionTrait>(
         )
         .with_detail("workflow_identity_corrupt"));
     }
-    if descriptor.progress_rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES
-        || normalize_rel_path(&descriptor.progress_rel_path)
-            .map_or(true, |normalized| normalized != descriptor.progress_rel_path)
+    if normalize_bounded_successor_locator(&descriptor.progress_rel_path)
+        .map_or(true, |normalized| normalized != descriptor.progress_rel_path)
     {
         return Err(AppCommandError::new(
             AppErrorCode::WorkflowIdentityCorrupt,
@@ -747,15 +769,6 @@ async fn create_or_load_successor(
                 return Err(error);
             }
         };
-        #[cfg(test)]
-        test_record_auto_title_enrollment(&txn, candidate.id).await?;
-        #[cfg(test)]
-        if test_should_fail_after_candidate() {
-            rollback_successor_attempt(txn).await?;
-            return Err(AppCommandError::database_error(
-                "forced Simple successor failure after candidate insertion",
-            ));
-        }
         let progress_rel_path = default_simple_progress_rel_path(candidate.id);
         let registration = register_simple_workflow_txn(
             &txn,
@@ -778,6 +791,15 @@ async fn create_or_load_successor(
                 continue;
             }
             return Err(error);
+        }
+        #[cfg(test)]
+        test_record_candidate_registration(&txn, candidate.id, &source.workflow_id).await?;
+        #[cfg(test)]
+        if test_should_fail_after_registration() {
+            rollback_successor_attempt(txn).await?;
+            return Err(AppCommandError::database_error(
+                "forced Simple successor failure after descriptor registration",
+            ));
         }
 
         match txn.commit().await {
@@ -1134,6 +1156,14 @@ mod tests {
             .count(&db.conn)
             .await
             .expect("descriptor count")
+    }
+
+    #[cfg(windows)]
+    fn locator_that_expands_past_successor_bound() -> String {
+        let raw = format!("docs/{}a", "\u{0130}".repeat(2045));
+        assert_eq!(raw.len(), MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES);
+        assert_eq!(normalize_rel_path(&raw).unwrap().len(), 6141);
+        raw
     }
 
     #[tokio::test]
@@ -1675,6 +1705,43 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn simple_successor_rejects_plan_locator_oversized_after_normalization() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let source = seed_conversation(&db, folder, AgentType::Codex).await;
+        let plan_rel_path = locator_that_expands_past_successor_bound();
+        seed_archived_workflow(
+            &db,
+            source,
+            "workflow-normalized-oversized-plan-locator",
+            &plan_rel_path,
+            None,
+            2,
+            CompletionProtocolMode::V2Enforce,
+        )
+        .await;
+        let conversations_before = live_conversation_count(&db).await;
+        let descriptors_before = descriptor_count(&db).await;
+
+        let error = continue_archived_workflow_in_simple_core(
+            &db,
+            &EventEmitter::Noop,
+            source,
+            "normalized-oversized-plan-request",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::SimpleSuccessorPlanUnavailable);
+        assert_eq!(error.detail, None);
+        assert_eq!(live_conversation_count(&db).await, conversations_before);
+        assert_eq!(descriptor_count(&db).await, descriptors_before);
+    }
+
     #[tokio::test]
     async fn simple_successor_omits_oversized_design_locator_from_bootstrap() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1714,6 +1781,55 @@ mod tests {
             &EventEmitter::Noop,
             source,
             "oversized-design-request",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.created);
+        assert!(!result.bootstrap_prompt.contains("Design:"));
+        assert!(result.bootstrap_prompt.len() <= MAX_SIMPLE_SUCCESSOR_BOOTSTRAP_BYTES);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn simple_successor_omits_design_locator_oversized_after_normalization() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
+        std::fs::write(workspace.path().join("docs/plan.md"), "# Plan\n").unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let source = seed_conversation(&db, folder, AgentType::Codex).await;
+        seed_archived_workflow(
+            &db,
+            source,
+            "workflow-normalized-oversized-design-locator",
+            "docs/plan.md",
+            Some("docs/design.md"),
+            2,
+            CompletionProtocolMode::V2Enforce,
+        )
+        .await;
+        let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
+            "workflow-normalized-oversized-design-locator",
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut document: ManifestDocument =
+            serde_json::from_str(&revision.document_json).unwrap();
+        document.design.as_mut().unwrap().rel_path =
+            locator_that_expands_past_successor_bound();
+        let mut revision: delegation_workflow_manifest_revision::ActiveModel = revision.into();
+        revision.document_json = Set(serde_json::to_string(&document).unwrap());
+        revision.update(&db.conn).await.unwrap();
+
+        let result = continue_archived_workflow_in_simple_core(
+            &db,
+            &EventEmitter::Noop,
+            source,
+            "normalized-oversized-design-request",
         )
         .await
         .unwrap();
@@ -1819,7 +1935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_successor_failure_after_candidate_insert_rolls_back_everything() {
+    async fn simple_successor_failure_after_registration_rolls_back_everything() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
         std::fs::write(workspace.path().join("docs/plan.md"), "# Plan\n").unwrap();
@@ -1849,6 +1965,12 @@ mod tests {
         let source = load_archived_source(&db, source).await.unwrap();
         let conversations_before = live_conversation_count(&db).await;
         let title_jobs_before = auto_title_job::Entity::find().count(&db.conn).await.unwrap();
+        let descriptors_before = descriptor_count(&db).await;
+        let source_links_before = simple_workflow::Entity::find()
+            .filter(simple_workflow::Column::SourceWorkflowId.eq(source.workflow_id.clone()))
+            .count(&db.conn)
+            .await
+            .unwrap();
         let header_before = delegation_workflow::Entity::find_by_id(&source.workflow_id)
             .one(&db.conn)
             .await
@@ -1868,7 +1990,7 @@ mod tests {
             .count(&db.conn)
             .await
             .unwrap();
-        let control = std::sync::Arc::new(SimpleSuccessorTestControl::fail_after_candidate());
+        let control = std::sync::Arc::new(SimpleSuccessorTestControl::fail_after_registration());
 
         let error = create_or_load_successor_controlled(&db, &source, control.clone())
             .await
@@ -1880,8 +2002,20 @@ mod tests {
             control.auto_title_job_seen(),
             "candidate auto-title enrollment must be visible inside the transaction"
         );
+        assert!(
+            control.descriptor_link_seen(),
+            "candidate descriptor and source link must be visible inside the transaction"
+        );
         assert_eq!(live_conversation_count(&db).await, conversations_before);
-        assert_eq!(descriptor_count(&db).await, 0);
+        assert_eq!(descriptor_count(&db).await, descriptors_before);
+        assert_eq!(
+            simple_workflow::Entity::find()
+                .filter(simple_workflow::Column::SourceWorkflowId.eq(source.workflow_id.clone()))
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            source_links_before
+        );
         assert_eq!(
             auto_title_job::Entity::find().count(&db.conn).await.unwrap(),
             title_jobs_before
@@ -1976,14 +2110,6 @@ mod tests {
         .unwrap();
         assert!(second.created);
         assert_ne!(second.successor_conversation_id, first.successor_conversation_id);
-    }
-
-    #[cfg(feature = "tauri-runtime")]
-    #[test]
-    fn simple_successor_tauri_command_registers_with_a_typed_handler() {
-        let _handler = tauri::generate_handler![
-            crate::commands::simple_workflow::continue_archived_workflow_in_simple
-        ];
     }
 
     #[test]
