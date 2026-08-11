@@ -280,9 +280,7 @@ const workspaceAcquire = vi.fn(() => ({ mode: "paths" as const }))
 const workspaceRelease = vi.fn()
 const workspaceUnsubscribe = vi.fn()
 
-function emitWorkspaceEnvelope(
-  envelope: Omit<WorkspaceEnvelope, "seq">
-): void {
+function emitWorkspaceEnvelope(envelope: Omit<WorkspaceEnvelope, "seq">): void {
   const sequencedEnvelope = {
     seq: 1,
     ...envelope,

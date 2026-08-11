@@ -647,9 +647,7 @@ describe("Task 7 archived and Simple workflow rendering", () => {
         "0 / 2 · 1 running"
       )
     ).toBeVisible()
-    await userEvent.click(
-      screen.getByTestId("workflow-graph-node-open-n-req")
-    )
+    await userEvent.click(screen.getByTestId("workflow-graph-node-open-n-req"))
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
       expect.objectContaining({ childConversationId: 77 })
     )
@@ -700,9 +698,7 @@ describe("Task 7 archived and Simple workflow rendering", () => {
     expect(screen.getByText("Task status is out of sync")).toBeVisible()
     expect(screen.getByText("Live run: Running")).toBeVisible()
 
-    await userEvent.click(
-      screen.getByTestId("simple-task-open-simple-task-5")
-    )
+    await userEvent.click(screen.getByTestId("simple-task-open-simple-task-5"))
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
       expect.objectContaining({ childConversationId: 105 })
     )

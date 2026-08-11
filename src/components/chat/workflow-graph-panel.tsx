@@ -724,7 +724,9 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
         {readOnly && node.completion ? (
           <HistoricalCompletionCard request={node.completion} />
         ) : (
-          node.completion && <CompletionDecisionCard request={node.completion} />
+          node.completion && (
+            <CompletionDecisionCard request={node.completion} />
+          )
         )}
       </div>
     )
@@ -747,7 +749,8 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       role="region"
       aria-label={t("graphTitle")}
     >
-      {snapshot.completion && !workflowCompletionIsOnNode &&
+      {snapshot.completion &&
+        !workflowCompletionIsOnNode &&
         (readOnly ? (
           <HistoricalCompletionCard request={snapshot.completion} />
         ) : (

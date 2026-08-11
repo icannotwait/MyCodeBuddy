@@ -458,8 +458,7 @@ function ArchivedWorkflowBanner({
     const actionGeneration = actionGenerationRef.current + 1
     actionGenerationRef.current = actionGeneration
     const actionIsCurrent = () =>
-      mountedRef.current &&
-      actionGenerationRef.current === actionGeneration
+      mountedRef.current && actionGenerationRef.current === actionGeneration
     try {
       if (successorId != null) {
         const navigate = navigationRef.current
@@ -643,12 +642,14 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     ) {
       return
     }
-    return useWorkflowGraphStore.getState().activateSimpleFileInterest(
-      conversationId,
-      workspaceRootPath,
-      simplePlanRelPath,
-      simpleProgressRelPath
-    )
+    return useWorkflowGraphStore
+      .getState()
+      .activateSimpleFileInterest(
+        conversationId,
+        workspaceRootPath,
+        simplePlanRelPath,
+        simpleProgressRelPath
+      )
   }, [
     conversationId,
     overlayInterestActive,
@@ -908,25 +909,25 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
             {hasGraph &&
               graph?.compatibility !== "simple" &&
               activeSegment === "workflow" && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={
-                  graphExpanded
-                    ? tw("collapseGraphAria")
-                    : tw("expandGraphAria")
-                }
-                data-testid="workflow-expand-toggle"
-                onClick={() => setGraphExpanded((v) => !v)}
-              >
-                {graphExpanded ? (
-                  <Minimize2 className="h-4 w-4" />
-                ) : (
-                  <Maximize2 className="h-4 w-4" />
-                )}
-              </Button>
-            )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={
+                    graphExpanded
+                      ? tw("collapseGraphAria")
+                      : tw("expandGraphAria")
+                  }
+                  data-testid="workflow-expand-toggle"
+                  onClick={() => setGraphExpanded((v) => !v)}
+                >
+                  {graphExpanded ? (
+                    <Minimize2 className="h-4 w-4" />
+                  ) : (
+                    <Maximize2 className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
             <Button
               type="button"
               variant="ghost"

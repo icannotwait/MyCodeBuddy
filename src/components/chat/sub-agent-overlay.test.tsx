@@ -271,9 +271,7 @@ describe("SubAgentOverlay", () => {
     )
     const { rerender } = render(view(first, initialNavigation))
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Continue in Simple" })
-    )
+    fireEvent.click(screen.getByRole("button", { name: "Continue in Simple" }))
     expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
 
     rerender(view(equivalent, latestNavigation))
@@ -339,9 +337,7 @@ describe("SubAgentOverlay", () => {
       />
     )
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Continue in Simple" })
-    )
+    fireEvent.click(screen.getByRole("button", { name: "Continue in Simple" }))
 
     await waitFor(() =>
       expect(screen.getByRole("alert")).toHaveTextContent(
