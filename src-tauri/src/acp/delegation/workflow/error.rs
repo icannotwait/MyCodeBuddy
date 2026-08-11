@@ -1,21 +1,32 @@
 //! Store and validation errors for the workflow graph.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 use thiserror::Error;
-use sea_orm::ConnectionTrait;
 
 use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+use crate::db::entities::{
+    delegation_task_run, delegation_workflow, delegation_workflow_run_binding, simple_workflow,
+};
 
 pub use super::artifact_resolver::{ArtifactError, ArtifactFailure};
 pub use super::evidence_scope::EvidenceScopeError;
 pub use super::plan_material::{PlanMaterialError, PlanMaterialErrorKind};
 use super::plan_review::PlanReviewError;
 use super::recovery_policy::WorkflowRecoveryProjection;
-use super::simple::{resolve_conversation_workflow_mode, SimpleWorkflowError};
 pub use super::types::WorkflowError;
 
 pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
 pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
 pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
+pub const WORKFLOW_V2_RETIRED_MESSAGE: &str =
+    "This workflow is archived and read-only. Continue in a Simple successor.";
+
+#[cfg(any(test, feature = "test-utils"))]
+tokio::task_local! {
+    static HISTORICAL_WORKFLOW_FIXTURE_MUTATIONS: ();
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error(
@@ -102,8 +113,15 @@ impl WorkflowAdmissionRecoveryError {
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkflowStoreError {
-    #[error("workflow manifest v2 is retired; use the archived workflow navigation to open or create its Simple successor")]
-    WorkflowV2Retired,
+    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    WorkflowV2Retired {
+        source_conversation_id: Option<i32>,
+        successor_conversation_id: Option<i32>,
+        can_create_simple_successor: bool,
+    },
+
+    #[error("conversation {source_conversation_id} has conflicting workflow identities")]
+    WorkflowIdentityCorrupt { source_conversation_id: i32 },
 
     #[error(transparent)]
     Validation(#[from] WorkflowError),
@@ -233,7 +251,8 @@ pub enum WorkflowStoreError {
 impl WorkflowStoreError {
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::WorkflowV2Retired => "workflow_v2_retired",
+            Self::WorkflowV2Retired { .. } => "workflow_v2_retired",
+            Self::WorkflowIdentityCorrupt { .. } => "workflow_identity_corrupt",
             Self::LegacyCompletionProtocolReadOnly => "legacy_completion_protocol_read_only",
             Self::UnsupportedCompletionProtocol { .. }
             | Self::UnsupportedCompletionProtocolHeader(_) => "unsupported_completion_protocol",
@@ -251,6 +270,59 @@ impl WorkflowStoreError {
         Self::GateNotReady(WORKFLOW_RECOVERY_REQUIRED.into())
     }
 
+    pub const fn workflow_v2_retired() -> Self {
+        Self::WorkflowV2Retired {
+            source_conversation_id: None,
+            successor_conversation_id: None,
+            can_create_simple_successor: false,
+        }
+    }
+
+    pub const fn workflow_v2_retired_with_navigation(
+        source_conversation_id: i32,
+        successor_conversation_id: Option<i32>,
+        can_create_simple_successor: bool,
+    ) -> Self {
+        Self::WorkflowV2Retired {
+            source_conversation_id: Some(source_conversation_id),
+            successor_conversation_id,
+            can_create_simple_successor,
+        }
+    }
+
+    pub const fn source_conversation_id(&self) -> Option<i32> {
+        match self {
+            Self::WorkflowV2Retired {
+                source_conversation_id,
+                ..
+            } => *source_conversation_id,
+            Self::WorkflowIdentityCorrupt {
+                source_conversation_id,
+            } => Some(*source_conversation_id),
+            _ => None,
+        }
+    }
+
+    pub const fn successor_conversation_id(&self) -> Option<i32> {
+        match self {
+            Self::WorkflowV2Retired {
+                successor_conversation_id,
+                ..
+            } => *successor_conversation_id,
+            _ => None,
+        }
+    }
+
+    pub const fn can_create_simple_successor(&self) -> Option<bool> {
+        match self {
+            Self::WorkflowV2Retired {
+                can_create_simple_successor,
+                ..
+            } => Some(*can_create_simple_successor),
+            _ => None,
+        }
+    }
+
     pub fn is_workflow_recovery_required(&self) -> bool {
         matches!(self, Self::GateNotReady(reason) if reason == WORKFLOW_RECOVERY_REQUIRED)
     }
@@ -266,13 +338,7 @@ pub fn require_v2_mutation(
     mode: &CompletionProtocolMode,
 ) -> Result<(), WorkflowStoreError> {
     if version == 2 && mode == &CompletionProtocolMode::V2Enforce {
-        // Historical fixtures still exercise the read/projector machinery in
-        // unit tests. Every production entry point uses this branch as the
-        // retirement fence; fixture publication is separately cfg(test).
-        #[cfg(test)]
-        return Ok(());
-        #[cfg(not(test))]
-        return Err(WorkflowStoreError::WorkflowV2Retired);
+        return Err(WorkflowStoreError::workflow_v2_retired());
     }
     if version == 1 {
         return Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly);
@@ -283,6 +349,206 @@ pub fn require_v2_mutation(
     })
 }
 
+/// Lexically permits historical workflow mutation only while an explicit
+/// test fixture future is being polled. The permission cannot survive a
+/// successful or failed fixture call and is never persisted in application
+/// state.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn with_historical_workflow_fixture_mutations<F>(future: F) -> F::Output
+where
+    F: std::future::IntoFuture,
+{
+    HISTORICAL_WORKFLOW_FIXTURE_MUTATIONS
+        .scope((), std::future::IntoFuture::into_future(future))
+        .await
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn historical_workflow_fixture_mutations_enabled() -> bool {
+    HISTORICAL_WORKFLOW_FIXTURE_MUTATIONS
+        .try_with(|()| true)
+        .unwrap_or(false)
+}
+
+pub async fn require_v2_mutation_for_connection<C: ConnectionTrait>(
+    _conn: &C,
+    version: i64,
+    mode: &CompletionProtocolMode,
+) -> Result<(), WorkflowStoreError> {
+    let result = require_v2_mutation(version, mode);
+    #[cfg(any(test, feature = "test-utils"))]
+    if matches!(&result, Err(WorkflowStoreError::WorkflowV2Retired { .. }))
+        && historical_workflow_fixture_mutations_enabled()
+    {
+        return Ok(());
+    }
+    result
+}
+
+#[derive(Debug)]
+struct ArchivedWorkflowNavigation {
+    source_conversation_id: i32,
+    successor_conversation_id: Option<i32>,
+    completion_protocol_version: i64,
+    completion_protocol_mode: CompletionProtocolMode,
+}
+
+async fn archived_workflow_navigation<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+) -> Result<Option<ArchivedWorkflowNavigation>, WorkflowStoreError> {
+    let mut workflow_ids = BTreeSet::new();
+    workflow_ids.extend(
+        delegation_workflow::Entity::find()
+            .select_only()
+            .column(delegation_workflow::Column::WorkflowId)
+            .filter(delegation_workflow::Column::ParentConversationId.eq(conversation_id))
+            .filter(
+                delegation_workflow::Column::WorkflowKind.eq("brainstorm_to_delivery"),
+            )
+            .into_tuple::<String>()
+            .all(conn)
+            .await
+            .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
+    );
+
+    let task_ids = delegation_task_run::Entity::find()
+        .select_only()
+        .column(delegation_task_run::Column::TaskId)
+        .filter(delegation_task_run::Column::ChildConversationId.eq(conversation_id))
+        .into_tuple::<String>()
+        .all(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    if !task_ids.is_empty() {
+        workflow_ids.extend(
+            delegation_workflow_run_binding::Entity::find()
+                .select_only()
+                .column(delegation_workflow_run_binding::Column::WorkflowId)
+                .filter(delegation_workflow_run_binding::Column::TaskId.is_in(task_ids))
+                .into_tuple::<String>()
+                .all(conn)
+                .await
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
+        );
+    }
+
+    if workflow_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let workflows = delegation_workflow::Entity::find()
+        .filter(delegation_workflow::Column::WorkflowId.is_in(workflow_ids.iter().cloned()))
+        .all(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+        .into_iter()
+        .map(|workflow| (workflow.workflow_id.clone(), workflow))
+        .collect::<BTreeMap<_, _>>();
+    if workflows.len() != 1 || workflows.len() != workflow_ids.len() {
+        return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
+            source_conversation_id: conversation_id,
+        });
+    }
+    let (workflow_id, workflow) = workflows.into_iter().next().expect("one workflow");
+
+    if simple_workflow::Entity::find()
+        .filter(
+            simple_workflow::Column::ParentConversationId.eq(workflow.parent_conversation_id),
+        )
+        .one(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
+        .is_some()
+    {
+        return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
+            source_conversation_id: workflow.parent_conversation_id,
+        });
+    }
+
+    let successors = simple_workflow::Entity::find()
+        .filter(simple_workflow::Column::SourceWorkflowId.eq(workflow_id))
+        .all(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    if successors.len() > 1 {
+        return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
+            source_conversation_id: workflow.parent_conversation_id,
+        });
+    }
+
+    Ok(Some(ArchivedWorkflowNavigation {
+        source_conversation_id: workflow.parent_conversation_id,
+        successor_conversation_id: successors
+            .into_iter()
+            .next()
+            .map(|successor| successor.parent_conversation_id),
+        completion_protocol_version: workflow.completion_protocol_version,
+        completion_protocol_mode: workflow.completion_protocol_mode,
+    }))
+}
+
+pub async fn workflow_v2_retired_for_conversation<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+) -> Result<WorkflowStoreError, WorkflowStoreError> {
+    if let Some(navigation) = archived_workflow_navigation(conn, conversation_id).await? {
+        let error = require_v2_mutation(
+            navigation.completion_protocol_version,
+            &navigation.completion_protocol_mode,
+        )
+        .expect_err("persisted workflow protocol pairs are read-only");
+        return Ok(match error {
+            WorkflowStoreError::WorkflowV2Retired { .. } => {
+                WorkflowStoreError::workflow_v2_retired_with_navigation(
+                    navigation.source_conversation_id,
+                    navigation.successor_conversation_id,
+                    navigation.successor_conversation_id.is_none(),
+                )
+            }
+            other => other,
+        });
+    }
+
+    let simple = simple_workflow::Entity::find()
+        .filter(simple_workflow::Column::ParentConversationId.eq(conversation_id))
+        .one(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
+        conversation_id,
+        simple.as_ref().map(|_| conversation_id),
+        simple.is_none(),
+    ))
+}
+
+/// Publication is retired independently of a persisted protocol header. This
+/// resolves navigation from durable workflow/Simple identity without allowing
+/// legacy or malformed headers to change the publication error code.
+pub async fn workflow_v2_publication_retired_for_conversation<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+) -> Result<WorkflowStoreError, WorkflowStoreError> {
+    if let Some(navigation) = archived_workflow_navigation(conn, conversation_id).await? {
+        return Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
+            navigation.source_conversation_id,
+            navigation.successor_conversation_id,
+            navigation.successor_conversation_id.is_none(),
+        ));
+    }
+
+    let simple = simple_workflow::Entity::find()
+        .filter(simple_workflow::Column::ParentConversationId.eq(conversation_id))
+        .one(conn)
+        .await
+        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
+    Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
+        conversation_id,
+        simple.as_ref().map(|_| conversation_id),
+        simple.is_none(),
+    ))
+}
+
 /// Durable fence for all new mutations originating from a conversation. The
 /// resolver follows both root ownership and run bindings, so an archived child
 /// cannot bypass the retired root by presenting only its child id.
@@ -290,14 +556,27 @@ pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
     conn: &C,
     conversation_id: i32,
 ) -> Result<(), WorkflowStoreError> {
-    let mode = resolve_conversation_workflow_mode(conn, conversation_id)
-        .await
-        .map_err(|error| match error {
-            SimpleWorkflowError::Persistence(message) => WorkflowStoreError::Persistence(message),
-            other => WorkflowStoreError::Persistence(other.to_string()),
-        })?;
-    if mode.is_archived_or_corrupt() {
-        return Err(WorkflowStoreError::WorkflowV2Retired);
+    if let Some(navigation) = archived_workflow_navigation(conn, conversation_id).await? {
+        let result = require_v2_mutation(
+            navigation.completion_protocol_version,
+            &navigation.completion_protocol_mode,
+        );
+        #[cfg(any(test, feature = "test-utils"))]
+        if matches!(&result, Err(WorkflowStoreError::WorkflowV2Retired { .. }))
+            && historical_workflow_fixture_mutations_enabled()
+        {
+            return Ok(());
+        }
+        return match result {
+            Err(WorkflowStoreError::WorkflowV2Retired { .. }) => {
+                Err(WorkflowStoreError::workflow_v2_retired_with_navigation(
+                    navigation.source_conversation_id,
+                    navigation.successor_conversation_id,
+                    navigation.successor_conversation_id.is_none(),
+                ))
+            }
+            result => result,
+        };
     }
     Ok(())
 }
@@ -311,7 +590,9 @@ mod tests {
     fn require_v2_mutation_classifies_all_protocol_pairs() {
         use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
 
-        assert_eq!(require_v2_mutation(2, &V2Enforce), Ok(()));
+        let retired = require_v2_mutation(2, &V2Enforce).unwrap_err();
+        assert_eq!(retired.code(), "workflow_v2_retired");
+        assert_eq!(retired.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
         for mode in [V1, V2Shadow, V2Enforce] {
             let error = require_v2_mutation(1, &mode).unwrap_err();
             assert_eq!(error.code(), "legacy_completion_protocol_read_only");
@@ -329,5 +610,303 @@ mod tests {
                 assert!(!error.is_retryable());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn historical_fixture_permission_is_lexical_and_unwinds_after_failure() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+
+        let fixture_db = fresh_in_memory_db().await;
+        let ordinary_db = fresh_in_memory_db().await;
+
+        let ordinary_error = require_v2_mutation_for_connection(
+            &ordinary_db.conn,
+            2,
+            &CompletionProtocolMode::V2Enforce,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(ordinary_error.code(), "workflow_v2_retired");
+
+        let fixture_error = with_historical_workflow_fixture_mutations(async {
+            require_v2_mutation_for_connection(
+                &fixture_db.conn,
+                2,
+                &CompletionProtocolMode::V2Enforce,
+            )
+            .await
+            .unwrap();
+            require_v2_mutation_for_connection(
+                &ordinary_db.conn,
+                2,
+                &CompletionProtocolMode::V2Enforce,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                require_v2_mutation(2, &CompletionProtocolMode::V2Enforce)
+                    .unwrap_err()
+                    .code(),
+                "workflow_v2_retired"
+            );
+            Err::<(), _>("fixture failed")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(fixture_error, "fixture failed");
+
+        for db in [&fixture_db, &ordinary_db] {
+            let error = require_v2_mutation_for_connection(
+                &db.conn,
+                2,
+                &CompletionProtocolMode::V2Enforce,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), "workflow_v2_retired");
+        }
+        assert_eq!(
+            require_v2_mutation(2, &CompletionProtocolMode::V2Enforce)
+                .unwrap_err()
+                .code(),
+            "workflow_v2_retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_retired_resolves_root_child_and_simple_successor_navigation() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::entities::{
+            delegation_workflow, delegation_workflow_run_binding, simple_workflow,
+        };
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/workflow-retired-navigation").await;
+        let root = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let successor = seed_conversation(&db, folder, AgentType::Codex).await;
+        let now = Utc::now();
+        delegation_workflow::ActiveModel {
+            workflow_id: Set("workflow-retired-navigation".into()),
+            parent_conversation_id: Set(root),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(delegation_workflow::WorkflowState::Approved),
+            capability_version: Set("workflow_manifest_v2".into()),
+            publication_token: Set("workflow-retired-navigation-token".into()),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design".into()),
+            plan_fingerprint: Set("plan".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+            legacy_source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_task_run::ActiveModel {
+            task_id: Set("retired-bound-task".into()),
+            root_task_id: Set("retired-bound-task".into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(root),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(child),
+            agent_type: Set("codex".into()),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            lineage_root_task_id: Set("retired-bound-task".into()),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Completed),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("retired-bound-task".into()),
+            workflow_id: Set("workflow-retired-navigation".into()),
+            node_id: Set("task-1".into()),
+            manifest_revision: Set(1),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(successor),
+            plan_rel_path: Set("docs/plan.md".into()),
+            progress_rel_path: Set(".superpowers/sdd/successor/progress.md".into()),
+            source_workflow_id: Set(Some("workflow-retired-navigation".into())),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        for conversation_id in [root, child] {
+            let error = require_writable_conversation_workflow(&db.conn, conversation_id)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "workflow_v2_retired");
+            assert_eq!(error.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
+            assert_eq!(error.source_conversation_id(), Some(root));
+            assert_eq!(error.successor_conversation_id(), Some(successor));
+            assert_eq!(error.can_create_simple_successor(), Some(false));
+        }
+
+        with_historical_workflow_fixture_mutations(async {
+            for conversation_id in [root, child] {
+                require_writable_conversation_workflow(&db.conn, conversation_id)
+                    .await
+                    .expect("explicit historical fixture scope may build archived read models");
+            }
+        })
+        .await;
+        for conversation_id in [root, child] {
+            assert_eq!(
+                require_writable_conversation_workflow(&db.conn, conversation_id)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "workflow_v2_retired"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writable_guard_allows_ordinary_simple_and_no_manifest_a1_but_rejects_corrupt_identity(
+    ) {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::entities::delegation_workflow::{self, WorkflowState};
+        use crate::db::entities::{conversation, simple_workflow};
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/workflow-writable-modes").await;
+        let ordinary = seed_conversation(&db, folder, AgentType::Codex).await;
+        let simple = seed_conversation(&db, folder, AgentType::Codex).await;
+        let archived = seed_conversation(&db, folder, AgentType::Codex).await;
+        let prebound_child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let observed_a1_child = seed_conversation(&db, folder, AgentType::Codex).await;
+        let now = Utc::now();
+
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(simple),
+            plan_rel_path: Set("docs/simple-plan.md".into()),
+            progress_rel_path: Set(".superpowers/sdd/simple/progress.md".into()),
+            source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_task_run::ActiveModel {
+            task_id: Set("ordinary-a1-observed-task".into()),
+            root_task_id: Set("ordinary-a1-observed-task".into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(ordinary),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(observed_a1_child),
+            agent_type: Set("codex".into()),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            lineage_root_task_id: Set("ordinary-a1-observed-task".into()),
+            work_unit_key: Set(Some("task|1|implementer|codex|none".into())),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Completed),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow::ActiveModel {
+            workflow_id: Set("workflow-corrupt-identity".into()),
+            parent_conversation_id: Set(archived),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(WorkflowState::Approved),
+            capability_version: Set("workflow_manifest_v2".into()),
+            publication_token: Set("workflow-corrupt-identity-token".into()),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design".into()),
+            plan_fingerprint: Set("plan".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+            legacy_source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let child = conversation::Entity::find_by_id(prebound_child)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child: conversation::ActiveModel = child.into();
+        child.parent_id = Set(Some(archived));
+        child.update(&db.conn).await.unwrap();
+
+        for conversation_id in [ordinary, simple, prebound_child, observed_a1_child] {
+            require_writable_conversation_workflow(&db.conn, conversation_id)
+                .await
+                .unwrap();
+        }
+
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(archived),
+            plan_rel_path: Set("docs/conflicting-plan.md".into()),
+            progress_rel_path: Set(".superpowers/sdd/conflict/progress.md".into()),
+            source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let error = require_writable_conversation_workflow(&db.conn, archived)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "workflow_identity_corrupt");
+        assert!(!matches!(
+            error,
+            WorkflowStoreError::WorkflowV2Retired { .. }
+        ));
     }
 }

@@ -36,6 +36,40 @@ use sea_orm::{
 };
 use std::sync::Arc;
 
+async fn recover_workflow_core(
+    db: &crate::db::AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    request: RecoverWorkflowRequest,
+) -> Result<RecoverWorkflowResult, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(super::recover_workflow_core(
+        db,
+        emitter,
+        parent_conversation_id,
+        request,
+    ))
+    .await
+}
+
+async fn admit_workflow_run_txn<C: ConnectionTrait>(
+    conn: &C,
+    input: &WorkflowAdmitInput<'_>,
+) -> Result<WorkflowTxnSideEffect, crate::acp::delegation::store::TaskStoreError> {
+    with_historical_workflow_fixture_mutations(super::admit_workflow_run_txn(conn, input)).await
+}
+
+async fn append_state_only_revision_txn(
+    txn: &sea_orm::DatabaseTransaction,
+    header: &delegation_workflow::Model,
+    request: StateOnlyRevisionRequest<'_>,
+    now: chrono::DateTime<Utc>,
+) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(super::append_state_only_revision_txn(
+        txn, header, request, now,
+    ))
+    .await
+}
+
 #[tokio::test]
 async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission() {
     // workflow_id = afd89cd7-5df0-49d9-8a40-1d2c95791cbd
@@ -306,9 +340,10 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
     let spawner = Arc::new(MockSpawner::new());
     let broker = broker_for_recovery(db.clone(), runs.clone(), spawner.clone()).await;
 
-    let rejected = broker
-        .continue_delegation(continue_request(&source_task_id, parent, None))
-        .await;
+    let rejected = with_historical_workflow_fixture_mutations(
+        broker.continue_delegation(continue_request(&source_task_id, parent, None)),
+    )
+    .await;
     assert_eq!(
         rejected.error_code.as_deref(),
         Some("recovery_confirmation_required")
@@ -345,13 +380,14 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
     spawner
         .queue_spawn(Err(SpawnerError::Spawn("resume transport lost".into())))
         .await;
-    let failed = broker
-        .continue_delegation(continue_request(
+    let failed = with_historical_workflow_fixture_mutations(
+        broker.continue_delegation(continue_request(
             &source_task_id,
             parent,
             Some(authorization_id.clone()),
-        ))
-        .await;
+        )),
+    )
+    .await;
     assert_eq!(failed.error_code.as_deref(), Some("unresumable"));
     let continued_task_id = failed.task_id.expect("continued task id");
     let continued = runs
@@ -397,12 +433,12 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
         .count(&db.conn)
         .await
         .expect("count runs before stale replacement");
-    runs.admit_gen1_reserving(replacement_insert(
+    with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(replacement_insert(
         parent,
         stale_replacement_child.id,
         &source_task_id,
         &source_task_id,
-    ))
+    )))
     .await
     .expect_err("replacement must start from the new latest unresumable run");
     assert_eq!(
@@ -427,15 +463,16 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
     )
     .await
     .expect("replacement child");
-    let replacement = runs
-        .admit_gen1_reserving(replacement_insert(
+    let replacement = with_historical_workflow_fixture_mutations(
+        runs.admit_gen1_reserving(replacement_insert(
             parent,
             replacement_child.id,
             &source_task_id,
             &continued_task_id,
-        ))
-        .await
-        .expect("replacement from new latest unresumable run");
+        )),
+    )
+    .await
+    .expect("replacement from new latest unresumable run");
     assert!(matches!(
         replacement,
         crate::acp::delegation::run_store::Gen1AdmitOutcome::Created(_)
@@ -940,10 +977,13 @@ async fn seed_legacy_parent_disconnect(
         .bind_child_connection_while_reserving(&source_task_id, "legacy-child-connection")
         .await
         .expect("bind source");
-    store
-        .promote_running(&source_task_id, "legacy-child-connection", Utc::now())
-        .await
-        .expect("promote source");
+    with_historical_workflow_fixture_mutations(store.promote_running(
+        &source_task_id,
+        "legacy-child-connection",
+        Utc::now(),
+    ))
+    .await
+    .expect("promote source");
     let source = delegation_task_run::Entity::find_by_id(&source_task_id)
         .one(&db.conn)
         .await

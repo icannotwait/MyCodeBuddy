@@ -107,9 +107,10 @@ use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
     AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
     DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
-    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
-    ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
-    DELEGATE_TO_AGENT_TOOL,
+    DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
+    DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot,
+    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
@@ -2407,7 +2408,16 @@ fn report_err(
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
     let recovery = match &err {
-        DelegationError::RecoveryConfirmationRequired(projection) => Some(projection.clone()),
+        DelegationError::RecoveryConfirmationRequired(projection) => {
+            Some(DelegationTaskReportExtension::Recovery {
+                recovery: projection.clone(),
+            })
+        }
+        DelegationError::WorkflowV2Retired { navigation } => {
+            Some(DelegationTaskReportExtension::WorkflowRetirement {
+                workflow_retirement: navigation.clone(),
+            })
+        }
         _ => None,
     };
     let outcome = DelegationOutcome::from_err(err, child_conversation_id);
@@ -2482,6 +2492,28 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::Transient(m) | TaskStoreError::Permanent(m) => {
             DelegationError::SpawnFailed(m)
         }
+    }
+}
+
+fn workflow_store_error_to_delegation_error(
+    error: crate::acp::delegation::workflow::WorkflowStoreError,
+) -> DelegationError {
+    match error {
+        crate::acp::delegation::workflow::WorkflowStoreError::WorkflowV2Retired {
+            source_conversation_id,
+            successor_conversation_id,
+            can_create_simple_successor,
+        } => DelegationError::WorkflowV2Retired {
+            navigation: WorkflowRetirementNavigation {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            },
+        },
+        other => DelegationError::WorkflowAdmission {
+            code: other.code().into(),
+            message: other.to_string(),
+        },
     }
 }
 
@@ -6074,6 +6106,26 @@ impl DelegationBroker {
                 None,
             );
         }
+
+        // Resolve archived ownership before completion-format repair, depth,
+        // child allocation, budget, authorization, or task-run reservation.
+        // The transaction fence in RunStore remains the race backstop.
+        if let Some(runs) = self.run_store.as_ref() {
+            if let Err(error) = require_writable_conversation_workflow(
+                &runs.db().conn,
+                req.parent_conversation_id,
+            )
+            .await
+            {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    workflow_store_error_to_delegation_error(error),
+                    None,
+                );
+            }
+        }
+
         if let (Some(source_task_id), Some(runs)) =
             (req.replaces_task_id.as_deref(), self.run_store.as_ref())
         {
@@ -6365,28 +6417,6 @@ impl DelegationBroker {
                 },
                 None,
             );
-        }
-
-        // Resolve archived ownership before allocating the provisional child,
-        // folder, budget, or task-run reservation. The transaction fence in
-        // RunStore remains the race backstop.
-        if let Some(runs) = self.run_store.as_ref() {
-            if let Err(error) = require_writable_conversation_workflow(
-                &runs.db().conn,
-                req.parent_conversation_id,
-            )
-            .await
-            {
-                self.drop_inflight(inflight_id).await;
-                return report_err(
-                    req.agent_type,
-                    DelegationError::WorkflowAdmission {
-                        code: error.code().into(),
-                        message: error.to_string(),
-                    },
-                    None,
-                );
-            }
         }
 
         // Bounded task label used by the started event and every meta write —
@@ -9303,10 +9333,7 @@ impl DelegationBroker {
             self.drop_inflight(inflight_id).await;
             return report_err(
                 AgentType::ClaudeCode,
-                DelegationError::WorkflowAdmission {
-                    code: error.code().into(),
-                    message: error.to_string(),
-                },
+                workflow_store_error_to_delegation_error(error),
                 None,
             );
         }
@@ -15115,7 +15142,11 @@ impl DelegationBroker {
             if report.status != TaskStatus::Unknown {
                 if let Some(run_store) = &self.run_store {
                     match run_store.recovery_projection_for_task(id).await {
-                        Ok(projection) => report.recovery = projection,
+                        Ok(projection) => {
+                            report.recovery = projection.map(|recovery| {
+                                DelegationTaskReportExtension::Recovery { recovery }
+                            })
+                        }
                         Err(_) => self.metrics.record_recovery_lookup_unknown("store_error"),
                     }
                 }
@@ -35283,6 +35314,64 @@ mod tests {
         .unwrap();
     }
 
+    struct HistoricalWorkflowBroker(Arc<DelegationBroker>);
+
+    impl std::ops::Deref for HistoricalWorkflowBroker {
+        type Target = DelegationBroker;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref()
+        }
+    }
+
+    impl HistoricalWorkflowBroker {
+        fn production(&self) -> &DelegationBroker {
+            self.0.as_ref()
+        }
+
+        async fn start_delegation(&self, request: DelegationRequest) -> DelegationTaskReport {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                self.0.start_delegation(request),
+            )
+            .await
+        }
+
+        async fn continue_delegation(
+            &self,
+            request: crate::acp::delegation::types::ContinueDelegationRequest,
+        ) -> DelegationTaskReport {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                self.0.continue_delegation(request),
+            )
+            .await
+        }
+
+        async fn complete_call(&self, task_id: &str, outcome: DelegationOutcome) {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                self.0.complete_call(task_id, outcome),
+            )
+            .await
+        }
+
+        async fn get_task_status(
+            &self,
+            parent_connection_id: &str,
+            parent_conversation_id: Option<i32>,
+            task_id: &str,
+            wait: StatusWait,
+        ) -> DelegationTaskReport {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                self.0.get_task_status(
+                    parent_connection_id,
+                    parent_conversation_id,
+                    task_id,
+                    wait,
+                ),
+            )
+            .await
+        }
+    }
+
     async fn v2_plan_author_launch_fixture_with_db(
         db: Arc<crate::db::AppDatabase>,
     ) -> (
@@ -35290,7 +35379,7 @@ mod tests {
         Arc<RunStore>,
         Arc<MockSpawner>,
         Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
-        Arc<DelegationBroker>,
+        Arc<HistoricalWorkflowBroker>,
         i32,
     ) {
         use crate::db::service::conversation_service;
@@ -35317,7 +35406,7 @@ mod tests {
         let task_store = Arc::new(
             crate::acp::delegation::store::DbDelegationTaskStore::from_run_store(runs.clone()),
         ) as Arc<dyn DelegationTaskStore>;
-        let broker = Arc::new(
+        let broker = Arc::new(HistoricalWorkflowBroker(Arc::new(
             DelegationBroker::with_writers(
                 mock.clone() as Arc<dyn ConnectionSpawner>,
                 depth,
@@ -35326,7 +35415,7 @@ mod tests {
             )
             .with_task_store(task_store)
             .with_run_store(runs.clone()),
-        );
+        ));
         enable_delegation(&broker).await;
         (db, runs, mock, events, broker, parent.id)
     }
@@ -35336,7 +35425,7 @@ mod tests {
         Arc<RunStore>,
         Arc<MockSpawner>,
         Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
-        Arc<DelegationBroker>,
+        Arc<HistoricalWorkflowBroker>,
         i32,
     ) {
         v2_plan_author_launch_fixture_with_db(Arc::new(
@@ -35350,7 +35439,7 @@ mod tests {
         Arc<RunStore>,
         Arc<MockSpawner>,
         Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
-        Arc<DelegationBroker>,
+        Arc<HistoricalWorkflowBroker>,
         i32,
     ) {
         v2_plan_author_launch_fixture_with_db(Arc::new(
@@ -35513,7 +35602,7 @@ mod tests {
 
     async fn prepare_v2_bound_root_for_continue(
         db: &crate::db::AppDatabase,
-        broker: &DelegationBroker,
+        broker: &HistoricalWorkflowBroker,
         parent_id: i32,
         parent_tool_use_id: &str,
     ) -> (String, i32) {
@@ -35882,9 +35971,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_launch_protocol_pair_matrix_rejects_first_continue_and_replacement() {
+    async fn workflow_v2_retired_launch_matrix_rejects_mutations_without_side_effects() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{
+            conversation, delegation_attention_request, delegation_lineage_budget,
+            delegation_plan_round_authorization, delegation_task_run,
+            delegation_work_unit_budget, delegation_workflow_manifest_revision,
+            delegation_workflow_outbox_event, recovery_authorization,
+        };
         use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+        use sea_orm::PaginatorTrait;
+
+        async fn side_effect_counts(db: &AppDatabase) -> [u64; 9] {
+            [
+                conversation::Entity::find().count(&db.conn).await.unwrap(),
+                delegation_task_run::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_lineage_budget::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_work_unit_budget::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_plan_round_authorization::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                recovery_authorization::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_attention_request::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_workflow_manifest_revision::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_workflow_outbox_event::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+            ]
+        }
 
         fn rejected_pairs() -> Vec<(i64, CompletionProtocolMode, &'static str)> {
             vec![
@@ -35913,25 +36047,59 @@ mod tests {
                     CompletionProtocolMode::V2Shadow,
                     "unsupported_completion_protocol",
                 ),
+                (
+                    2,
+                    CompletionProtocolMode::V2Enforce,
+                    "workflow_v2_retired",
+                ),
             ]
+        }
+
+        fn assert_retirement_navigation(report: &DelegationTaskReport, parent_id: i32) {
+            let navigation = report
+                .workflow_retirement()
+                .expect("retired broker report must carry navigation");
+            assert_eq!(navigation.source_conversation_id, Some(parent_id));
+            assert_eq!(navigation.successor_conversation_id, None);
+            assert!(navigation.can_create_simple_successor);
+
+            let wire = serde_json::to_value(report).unwrap();
+            assert_eq!(
+                wire["workflow_retirement"],
+                serde_json::json!({
+                    "source_conversation_id": parent_id,
+                    "successor_conversation_id": null,
+                    "can_create_simple_successor": true,
+                })
+            );
+            assert_eq!(
+                wire["message"],
+                crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE
+            );
         }
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
             let (db, runs, mock, _events, broker, parent_id) =
                 v2_plan_author_launch_fixture_before_v2_only().await;
             set_launch_workflow_protocol_pair(&db, version, mode).await;
+            let before = side_effect_counts(&db).await;
             let tool_use_id = format!("protocol-pair-first-{index}");
             let report = broker
+                .production()
                 .start_delegation(v2_plan_author_request(parent_id, &tool_use_id))
                 .await;
             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
             assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            if expected_code == "workflow_v2_retired" {
+                assert_retirement_navigation(&report, parent_id);
+            }
             assert!(mock.spawn_args.lock().await.is_empty());
             assert!(runs
                 .load_by_parent_tool_use(parent_id, &tool_use_id)
                 .await
                 .unwrap()
                 .is_none());
+            assert_eq!(side_effect_counts(&db).await, before);
         }
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
@@ -35946,8 +36114,10 @@ mod tests {
             .await;
             let spawn_count = mock.spawn_args.lock().await.len();
             set_launch_workflow_protocol_pair(&db, version, mode).await;
+            let before = side_effect_counts(&db).await;
             let tool_use_id = format!("protocol-pair-continue-{index}");
             let report = broker
+                .production()
                 .continue_delegation(ContinueDelegationRequest {
                     parent_connection_id: "parent-conn".into(),
                     parent_conversation_id: parent_id,
@@ -35962,6 +36132,9 @@ mod tests {
                 .await;
             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
             assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            if expected_code == "workflow_v2_retired" {
+                assert_retirement_navigation(&report, parent_id);
+            }
             assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
             assert!(mock.resume_args.lock().await.is_empty());
             assert!(runs
@@ -35969,6 +36142,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+            assert_eq!(side_effect_counts(&db).await, before);
         }
 
         for (index, (version, mode, expected_code)) in rejected_pairs().into_iter().enumerate() {
@@ -35991,20 +36165,28 @@ mod tests {
                 )
                 .await;
             let spawn_count = mock.spawn_args.lock().await.len();
-            set_launch_workflow_protocol_pair(&db, version, mode).await;
+            set_launch_workflow_protocol_pair(&db, version, mode.clone()).await;
+            let before = side_effect_counts(&db).await;
             let tool_use_id = format!("protocol-pair-replacement-{index}");
             let mut request = v2_plan_author_request(parent_id, &tool_use_id);
             request.replaces_task_id = Some(source_task_id);
             request.replacement_reason = Some("unresumable".into());
-            let report = broker.start_delegation(request).await;
+            if version == 2 && mode == CompletionProtocolMode::V2Enforce {
+                request.task = "CARD RE-EMIT ONLY".into();
+            }
+            let report = broker.production().start_delegation(request).await;
             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
             assert_eq!(report.error_code.as_deref(), Some(expected_code));
+            if expected_code == "workflow_v2_retired" {
+                assert_retirement_navigation(&report, parent_id);
+            }
             assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
             assert!(runs
                 .load_by_parent_tool_use(parent_id, &tool_use_id)
                 .await
                 .unwrap()
                 .is_none());
+            assert_eq!(side_effect_counts(&db).await, before);
         }
     }
 

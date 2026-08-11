@@ -9,9 +9,11 @@ use crate::acp::delegation::types::{
     ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
 };
 use crate::acp::delegation::workflow::{
-    resolve_completion_decision_txn, resolve_design_self_review_txn,
-    retry_completion_artifact_for_user_txn, CompletionMutationError,
+    require_writable_conversation_workflow, resolve_completion_decision_txn,
+    resolve_design_self_review_txn, retry_completion_artifact_for_user_txn,
+    CompletionMutationError, WorkflowStoreError,
 };
+use crate::acp::error::AcpError;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::delegation_attention_request;
 use crate::db::AppDatabase;
@@ -46,6 +48,7 @@ pub async fn resolve_completion_decision_core(
     context: &CompletionMutationContext,
     request: ResolveCompletionDecisionRequest,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    require_writable_completion_context(db, context).await?;
     let opened_at = delegation_attention_request::Entity::find_by_id(&request.cas.attention_id)
         .one(&db.conn)
         .await
@@ -85,6 +88,7 @@ pub async fn retry_completion_artifact_core(
     context: &CompletionMutationContext,
     request: RetryCompletionArtifactRequest,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    require_writable_completion_context(db, context).await?;
     let result = retry_completion_artifact_for_user_txn(
         db,
         context.parent_conversation_id(),
@@ -104,6 +108,7 @@ pub async fn resolve_design_self_review_core(
     context: &CompletionMutationContext,
     request: ResolveDesignSelfReviewRequest,
 ) -> Result<CompletionMutationResult, AppCommandError> {
+    require_writable_completion_context(db, context).await?;
     let opened_at = delegation_attention_request::Entity::find_by_id(&request.cas.attention_id)
         .one(&db.conn)
         .await
@@ -142,6 +147,23 @@ async fn dispatch_after_commit(dispatcher: &CompletionOutboxDispatcher) {
     }
 }
 
+async fn require_writable_completion_context(
+    db: &AppDatabase,
+    context: &CompletionMutationContext,
+) -> Result<(), AppCommandError> {
+    require_writable_conversation_workflow(&db.conn, context.parent_conversation_id())
+        .await
+        .map_err(map_workflow_store_error)
+}
+
+fn map_workflow_store_error(error: WorkflowStoreError) -> AppCommandError {
+    let error = AcpError::from(error);
+    error.app_command_error().unwrap_or_else(|| {
+        AppCommandError::invalid_input(error.to_string())
+            .with_detail(error.code().unwrap_or("workflow_invalid"))
+    })
+}
+
 fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandError {
     let stable_code = error.code();
     let message = error.to_string();
@@ -165,6 +187,13 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
             }
             "unsupported_completion_protocol" => {
                 AppCommandError::new(AppErrorCode::UnsupportedCompletionProtocol, message)
+                    .with_detail(code)
+            }
+            "workflow_v2_retired" => {
+                AppCommandError::new(AppErrorCode::WorkflowV2Retired, message).with_detail(code)
+            }
+            "workflow_identity_corrupt" => {
+                AppCommandError::new(AppErrorCode::WorkflowIdentityCorrupt, message)
                     .with_detail(code)
             }
             _ => AppCommandError::invalid_input(message).with_detail(code),
@@ -206,6 +235,63 @@ mod protocol_error_tests {
         assert_eq!(
             unsupported.detail.as_deref(),
             Some("unsupported_completion_protocol")
+        );
+
+        for (code, expected) in [
+            ("workflow_v2_retired", AppErrorCode::WorkflowV2Retired),
+            (
+                "workflow_identity_corrupt",
+                AppErrorCode::WorkflowIdentityCorrupt,
+            ),
+        ] {
+            let mapped = map_completion_mutation_error(CompletionMutationError::Protocol {
+                code,
+                message: "structured workflow retirement failure".into(),
+            });
+            assert_eq!(mapped.code, expected);
+            assert_eq!(mapped.detail.as_deref(), Some(code));
+        }
+    }
+
+    #[test]
+    fn completion_entry_guard_preserves_retirement_navigation() {
+        let retired = map_workflow_store_error(
+            WorkflowStoreError::workflow_v2_retired_with_navigation(41, Some(84), false),
+        );
+        assert_eq!(retired.code, AppErrorCode::WorkflowV2Retired);
+        assert_eq!(
+            retired.message,
+            "This workflow is archived and read-only. Continue in a Simple successor."
+        );
+        let navigation = retired.i18n_params.expect("retirement navigation");
+        assert_eq!(
+            navigation.get("source_conversation_id").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            navigation
+                .get("successor_conversation_id")
+                .map(String::as_str),
+            Some("84")
+        );
+        assert_eq!(
+            navigation
+                .get("can_create_simple_successor")
+                .map(String::as_str),
+            Some("false")
+        );
+
+        let corrupt = map_workflow_store_error(WorkflowStoreError::WorkflowIdentityCorrupt {
+            source_conversation_id: 41,
+        });
+        assert_eq!(corrupt.code, AppErrorCode::WorkflowIdentityCorrupt);
+        assert_eq!(
+            corrupt
+                .i18n_params
+                .as_ref()
+                .and_then(|params| params.get("source_conversation_id"))
+                .map(String::as_str),
+            Some("41")
         );
     }
 }

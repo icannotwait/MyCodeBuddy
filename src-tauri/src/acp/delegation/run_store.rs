@@ -1013,7 +1013,8 @@ async fn load_terminal_completion_protocol<C: ConnectionTrait>(
             binding.workflow_id
         ),
     })?;
-    crate::acp::delegation::workflow::require_v2_mutation(version, &mode)
+    crate::acp::delegation::workflow::require_v2_mutation_for_connection(conn, version, &mode)
+        .await
         .map_err(terminal_protocol_store_error)?;
     Ok(TerminalCompletionProtocol::V2)
 }
@@ -5546,6 +5547,27 @@ mod tests {
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::AgentType;
+
+    async fn on_terminal_settle_txn<C: ConnectionTrait>(
+        conn: &C,
+        task_id: &str,
+        parent_conversation_id: i32,
+        card_summary_json: Option<&str>,
+        run_status: &DelegationRunStatus,
+        workspace_path: Option<&str>,
+    ) -> Result<WorkflowTxnSideEffect, TaskStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            crate::acp::delegation::workflow::on_terminal_settle_txn(
+                conn,
+                task_id,
+                parent_conversation_id,
+                card_summary_json,
+                run_status,
+                workspace_path,
+            ),
+        )
+        .await
+    }
 
     // ---- task_preview -------------------------------------------------------
 
@@ -14381,7 +14403,9 @@ mod termination_audit {
                 report.error_code.as_deref(),
                 Some("recovery_confirmation_required")
             );
-            let projection = report.recovery.expect("typed recovery projection");
+            let projection = report
+                .recovery_projection()
+                .expect("typed recovery projection");
             assert_eq!(projection.disposition, "confirmation_required");
             assert_eq!(projection.proposed_action.as_deref(), Some("continue"));
             assert_eq!(projection.replacement_reason, None);
@@ -14656,8 +14680,7 @@ mod termination_audit {
                 assert_eq!(report.error_code.as_deref(), Some("busy_thread"));
                 assert!(
                     report
-                        .recovery
-                        .as_ref()
+                        .recovery_projection()
                         .and_then(|projection| projection.proposed_action.as_deref())
                         .is_none(),
                     "busy result must not propose detach or another recovery action"

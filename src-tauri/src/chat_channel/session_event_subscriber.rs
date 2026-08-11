@@ -2002,6 +2002,7 @@ mod async_relay_dedup_tests {
                 state.write().await.turn_in_flight = false;
             }
             conn.send_prompt_background(
+                &db,
                 "conn",
                 vec![PromptInputBlock::Text {
                     text: format!("fill-{i}"),

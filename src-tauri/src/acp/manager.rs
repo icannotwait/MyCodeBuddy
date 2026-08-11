@@ -30,9 +30,7 @@ use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
-use crate::acp::delegation::workflow::{
-    load_completion_protocol_for_conversation, require_v2_mutation,
-};
+use crate::acp::delegation::workflow::require_writable_conversation_workflow;
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
@@ -2298,12 +2296,9 @@ impl ConnectionManager {
             .await
             .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
         if let Some(conversation_id) = state_arc.read().await.conversation_id {
-            if let Some((version, mode)) = load_completion_protocol_for_conversation(db, conversation_id)
+            require_writable_conversation_workflow(&db.conn, conversation_id)
                 .await
-                .map_err(AcpError::from)?
-            {
-                require_v2_mutation(version, &mode).map_err(AcpError::from)?;
-            }
+                .map_err(AcpError::from)?;
         }
         self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Foreground)
             .await?;
@@ -2319,6 +2314,7 @@ impl ConnectionManager {
     /// no title capture (Task 4C may convert chat kickoffs to linked sends).
     pub async fn send_prompt_background(
         &self,
+        db: &AppDatabase,
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
     ) -> Result<(), AcpError> {
@@ -2328,6 +2324,11 @@ impl ConnectionManager {
             .get_state(conn_id)
             .await
             .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        if let Some(conversation_id) = state_arc.read().await.conversation_id {
+            require_writable_conversation_workflow(&db.conn, conversation_id)
+                .await
+                .map_err(AcpError::from)?;
+        }
         self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Background)
             .await?;
         self.send_prompt_inner(None, conn_id, blocks, None, true, false, None)
@@ -2558,12 +2559,9 @@ impl ConnectionManager {
             state.conversation_id
         });
         if let Some(conversation_id) = effective_conversation_id {
-            if let Some((version, mode)) = load_completion_protocol_for_conversation(db, conversation_id)
+            require_writable_conversation_workflow(&db.conn, conversation_id)
                 .await
-                .map_err(AcpError::from)?
-            {
-                require_v2_mutation(version, &mode).map_err(AcpError::from)?;
-            }
+                .map_err(AcpError::from)?;
         }
 
         self.admit_external_prompt(&state_arc, conversation_id, admission_source)
@@ -11798,7 +11796,7 @@ mod tests {
             let state = mgr.get_state("policy-conn").await.unwrap();
             state.write().await.turn_in_flight = false;
         }
-        mgr.send_prompt_background("policy-conn", one_text_block())
+        mgr.send_prompt_background(&policy_db, "policy-conn", one_text_block())
             .await
             .expect("background prompt");
         let ConnectionCommand::Prompt {
@@ -11844,6 +11842,234 @@ mod tests {
             !mark_awaiting_reply,
             "send_prompt_linked_background must enqueue mark_awaiting_reply=false"
         );
+    }
+
+    #[tokio::test]
+    async fn archived_workflow_prompt_surfaces_fence_root_and_bound_child_without_side_effects() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
+
+        use crate::db::entities::delegation_workflow::{
+            self, CompletionProtocolMode, WorkflowState,
+        };
+        use crate::db::entities::delegation_task_run::{
+            AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::entities::{
+            conversation, delegation_attention_request, delegation_lineage_budget,
+            delegation_plan_round_authorization, delegation_task_run,
+            delegation_work_unit_budget, delegation_workflow_manifest_revision,
+            delegation_workflow_run_binding, recovery_authorization,
+        };
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/archived-background-prompt").await;
+        let root = seed_conversation(&db, folder, AgentType::Codex).await;
+        let now = Utc::now();
+        delegation_workflow::ActiveModel {
+            workflow_id: Set("archived-background-prompt".into()),
+            parent_conversation_id: Set(root),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(WorkflowState::Approved),
+            capability_version: Set("workflow_manifest_v2".into()),
+            publication_token: Set("archived-background-prompt-token".into()),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design".into()),
+            plan_fingerprint: Set("plan".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+            legacy_source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let child = seed_conversation(&db, folder, AgentType::Codex).await;
+        delegation_task_run::ActiveModel {
+            task_id: Set("archived-background-child-task".into()),
+            root_task_id: Set("archived-background-child-task".into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(root),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(child),
+            agent_type: Set("codex".into()),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            lineage_root_task_id: Set("archived-background-child-task".into()),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Completed),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("archived-background-child-task".into()),
+            workflow_id: Set("archived-background-prompt".into()),
+            node_id: Set("task-1".into()),
+            manifest_revision: Set(1),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let manager = ConnectionManager::new();
+        let mut receiver = manager
+            .insert_test_connection_live(
+                "archived-background",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        let state = manager.get_state("archived-background").await.unwrap();
+        state.write().await.conversation_id = Some(root);
+        let mut child_receiver = manager
+            .insert_test_connection_live(
+                "archived-bound-child",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        let child_state = manager.get_state("archived-bound-child").await.unwrap();
+        child_state.write().await.conversation_id = Some(child);
+
+        let before = (
+            conversation::Entity::find().count(&db.conn).await.unwrap(),
+            delegation_task_run::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_lineage_budget::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_work_unit_budget::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_plan_round_authorization::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            recovery_authorization::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_attention_request::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_workflow_manifest_revision::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+        );
+        for (connection_id, conversation_id, conversation_state) in [
+            ("archived-background", root, &state),
+            ("archived-bound-child", child, &child_state),
+        ] {
+            let results = [
+                manager
+                    .send_prompt(&db, connection_id, one_text_block(), None)
+                    .await,
+                manager
+                    .send_prompt_background(&db, connection_id, one_text_block())
+                    .await,
+                manager
+                    .send_prompt_linked(
+                        &db,
+                        connection_id,
+                        one_text_block(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+                manager
+                    .send_prompt_linked_background(
+                        &db,
+                        connection_id,
+                        one_text_block(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+                crate::chat_channel::session_commands::send_prompt_linked_for_chat(
+                    &db.conn,
+                    &manager,
+                    connection_id,
+                    conversation_id,
+                    "archived chat prompt",
+                )
+                .await,
+            ];
+            for error in results.into_iter().map(Result::unwrap_err) {
+                assert!(matches!(
+                    error,
+                    AcpError::WorkflowV2Retired {
+                        source_conversation_id: Some(id),
+                        successor_conversation_id: None,
+                        can_create_simple_successor: true,
+                    } if id == root
+                ));
+            }
+            assert!(!conversation_state.read().await.turn_in_flight);
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(child_receiver.try_recv().is_err());
+        let after = (
+            conversation::Entity::find().count(&db.conn).await.unwrap(),
+            delegation_task_run::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_lineage_budget::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_work_unit_budget::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_plan_round_authorization::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            recovery_authorization::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_attention_request::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            delegation_workflow_manifest_revision::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(after, before);
     }
 
     /// Insert a connection with a LIVE command receiver so `send_prompt_inner`'s
@@ -12279,7 +12505,7 @@ mod tests {
             .send_prompt(&db, conn_id, one_text_block(), None)
             .await;
         let background = manager
-            .send_prompt_background(conn_id, one_text_block())
+            .send_prompt_background(&db, conn_id, one_text_block())
             .await;
         for result in [foreground, background] {
             assert!(

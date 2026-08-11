@@ -41,8 +41,8 @@ use super::artifact_resolver::{
 };
 use super::completion_evidence::load_validated_completion_evidence;
 use super::error::{
-    require_v2_mutation, CompletionEvidenceError, WorkflowAdmissionRecoveryError,
-    WorkflowStoreError,
+    require_v2_mutation_for_connection, CompletionEvidenceError,
+    WorkflowAdmissionRecoveryError, WorkflowStoreError,
 };
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::evidence_scope::{
@@ -382,7 +382,8 @@ pub async fn load_workflow_child_mcp_binding(
                     binding.workflow_id
                 ),
             })?;
-    require_v2_mutation(protocol_version, &protocol_mode)
+    require_v2_mutation_for_connection(&db.conn, protocol_version, &protocol_mode)
+        .await
         .map_err(workflow_protocol_admission_err)?;
     Ok(Some(WorkflowChildMcpBinding {
         task_id: task_id.to_string(),
@@ -568,9 +569,11 @@ async fn accept_complete_work_once(
                 .ok_or(CompleteWorkAttemptError::Contract(
                     CompleteWorkError::Unauthorized,
                 ))?;
-        require_v2_mutation(protocol_version, &protocol_mode).map_err(|error| {
-            CompleteWorkAttemptError::Contract(complete_work_store_error(error))
-        })?;
+        require_v2_mutation_for_connection(&txn, protocol_version, &protocol_mode)
+            .await
+            .map_err(|error| {
+                CompleteWorkAttemptError::Contract(complete_work_store_error(error))
+            })?;
         let workflow = delegation_workflow::Entity::find_by_id(binding.workflow_id.clone())
             .one(&txn)
             .await
@@ -581,10 +584,12 @@ async fn accept_complete_work_once(
             .ok_or(CompleteWorkAttemptError::Contract(
                 CompleteWorkError::Unauthorized,
             ))?;
-        require_v2_mutation(
+        require_v2_mutation_for_connection(
+            &txn,
             workflow.completion_protocol_version,
             &workflow.completion_protocol_mode,
         )
+        .await
         .map_err(|error| CompleteWorkAttemptError::Contract(complete_work_store_error(error)))?;
         let node = delegation_workflow_node_binding::Entity::find_by_id((
             binding.workflow_id.clone(),
@@ -806,10 +811,12 @@ pub async fn load_admitted_completion_instruction<C: ConnectionTrait>(
                 "admitted completion workflow is missing",
             )
         })?;
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        conn,
         workflow.completion_protocol_version,
         &workflow.completion_protocol_mode,
     )
+    .await
     .map_err(workflow_protocol_admission_err)?;
     let node = delegation_workflow_node_binding::Entity::find_by_id((
         binding.workflow_id.clone(),
@@ -917,10 +924,12 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         return Ok(WorkflowTxnSideEffect::None);
     };
 
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        conn,
         header.completion_protocol_version,
         &header.completion_protocol_mode,
     )
+    .await
     .map_err(workflow_protocol_admission_err)?;
 
     let Some(key) = input.work_unit_key.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -1132,10 +1141,12 @@ pub async fn on_mapped_run_transition_txn<C: ConnectionTrait>(
     let workflow = load_workflow_header(conn, parent_conversation_id)
         .await?
         .ok_or_else(|| admission_err("workflow_binding_missing", "mapped workflow disappeared"))?;
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        conn,
         workflow.completion_protocol_version,
         &workflow.completion_protocol_mode,
     )
+    .await
     .map_err(workflow_protocol_admission_err)?;
     let now = Utc::now();
     let next_rev = bump_graph_revision(conn, &rb.workflow_id, now).await?;
@@ -1167,10 +1178,12 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     let workflow = load_workflow_header(conn, parent_conversation_id)
         .await?
         .ok_or_else(|| admission_err("workflow_binding_missing", "mapped workflow disappeared"))?;
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        conn,
         workflow.completion_protocol_version,
         &workflow.completion_protocol_mode,
     )
+    .await
     .map_err(workflow_protocol_admission_err)?;
 
     let now = Utc::now();
@@ -2798,7 +2811,9 @@ async fn load_workflow_header<C: ConnectionTrait>(
                 format!("workflow {workflow_id} header disappeared during admission"),
             )
         })?;
-    require_v2_mutation(version, &mode).map_err(workflow_protocol_admission_err)?;
+    require_v2_mutation_for_connection(conn, version, &mode)
+        .await
+        .map_err(workflow_protocol_admission_err)?;
     delegation_workflow::Entity::find_by_id(workflow_id)
         .one(conn)
         .await
@@ -2993,8 +3008,10 @@ mod tests {
         assert_eq!(envs.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
     }
 
-    use crate::acp::delegation::run_store::{Gen1AdmitOutcome, ReservingRunInsert, RunStore};
-    use crate::acp::delegation::store::TerminalTaskWrite;
+    use crate::acp::delegation::run_store::{
+        Gen1AdmitOutcome, PersistedRun, ReservingRunInsert, RunStore as ProductionRunStore,
+    };
+    use crate::acp::delegation::store::{Settlement, TerminalTaskWrite};
     use crate::acp::delegation::workflow::events::{
         WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
     };
@@ -3003,8 +3020,7 @@ mod tests {
         PlanReviewNextAction, PlanReviewRoundStateV2,
     };
     use crate::acp::delegation::workflow::store::{
-        publish_workflow_manifest_fixture, settle_workflow_gate_v2_core, PublishWorkflowRequest,
-        SettleWorkflowV2Request,
+        publish_workflow_manifest_fixture, PublishWorkflowRequest, SettleWorkflowV2Request,
     };
     use crate::acp::delegation::workflow::types::{
         CompletionScopeRole, DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate,
@@ -3014,7 +3030,9 @@ mod tests {
         MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS,
         WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
-    use crate::acp::delegation::workflow::WorkflowStoreError;
+    use crate::acp::delegation::workflow::{
+        TerminalCompletionInput, TerminalCompletionResult, WorkflowStoreError,
+    };
     use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::{
         AdmissionClass as DbAdmissionClass, CompletionState,
@@ -3033,6 +3051,130 @@ mod tests {
     const ADMISSION_PLAN_BYTES: &[u8] =
         b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n";
     const TWO_TASK_PLAN_BYTES: &[u8] = b"## Global Constraints\n\n- exact\n\n## Task 1: Build\n\nbody\n\n## Task 2: Verify\n\nbody\n";
+
+    struct RunStore(ProductionRunStore);
+
+    impl std::ops::Deref for RunStore {
+        type Target = ProductionRunStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl RunStore {
+        fn new(db: Arc<AppDatabase>) -> Self {
+            Self(ProductionRunStore::new(db))
+        }
+
+        fn with_workflow_emitter(self, emitter: EventEmitter) -> Self {
+            Self(self.0.with_workflow_emitter(emitter))
+        }
+
+        async fn admit_gen1_reserving(
+            &self,
+            insert: ReservingRunInsert,
+        ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(
+                self.0.admit_gen1_reserving(insert),
+            )
+            .await
+        }
+
+        async fn resolve_and_stamp_workflow_terminal_artifact(
+            &self,
+            task_id: &str,
+            outcome: CompletionOutcome,
+        ) -> Result<Option<ResolvedArtifact>, TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(
+                self.0
+                    .resolve_and_stamp_workflow_terminal_artifact(task_id, outcome),
+            )
+            .await
+        }
+
+        async fn promote_running(
+            &self,
+            task_id: &str,
+            child_connection_id: impl Into<String>,
+            prompt_accepted_at: chrono::DateTime<Utc>,
+        ) -> Result<PersistedRun, TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(self.0.promote_running(
+                task_id,
+                child_connection_id,
+                prompt_accepted_at,
+            ))
+            .await
+        }
+
+        async fn settle_terminal_with_completion(
+            &self,
+            task_id: &str,
+            terminal: TerminalTaskWrite,
+            completion_input: Option<TerminalCompletionInput>,
+        ) -> Result<(Settlement, Option<TerminalCompletionResult>), TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(
+                self.0
+                    .settle_terminal_with_completion(task_id, terminal, completion_input),
+            )
+            .await
+        }
+
+        async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(
+                self.0.abandon_reserving_claim(task_id),
+            )
+            .await
+        }
+    }
+
+    async fn load_admitted_completion_instruction<C: ConnectionTrait>(
+        conn: &C,
+        task_id: &str,
+    ) -> Result<Option<InstructionBlockV1>, TaskStoreError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::load_admitted_completion_instruction(conn, task_id),
+        )
+        .await
+    }
+
+    async fn append_admitted_completion_instruction<C: ConnectionTrait>(
+        conn: &C,
+        task_id: &str,
+        parent_prose: &str,
+    ) -> Result<String, TaskStoreError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::append_admitted_completion_instruction(conn, task_id, parent_prose),
+        )
+        .await
+    }
+
+    async fn admit_workflow_run_txn<C: ConnectionTrait>(
+        conn: &C,
+        input: &WorkflowAdmitInput<'_>,
+    ) -> Result<WorkflowTxnSideEffect, TaskStoreError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::admit_workflow_run_txn(conn, input),
+        )
+        .await
+    }
+
+    async fn settle_workflow_gate_v2_core(
+        db: &AppDatabase,
+        emitter: &EventEmitter,
+        parent_conversation_id: i32,
+        request: SettleWorkflowV2Request,
+    ) -> Result<super::super::SettleResult, WorkflowStoreError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            crate::acp::delegation::workflow::store::settle_workflow_gate_v2_core(
+                db,
+                emitter,
+                parent_conversation_id,
+                request,
+            ),
+        )
+        .await
+    }
 
     fn emitter_with_rx() -> (
         EventEmitter,

@@ -10,7 +10,7 @@ use codeg_lib::acp::delegation::types::{
     ResolveDesignSelfReviewRequest, RetryCompletionArtifactRequest,
 };
 use codeg_lib::acp::delegation::workflow::store::{
-    publish_workflow_manifest_core, PublishWorkflowRequest,
+    publish_workflow_manifest_fixture, PublishWorkflowRequest,
 };
 use codeg_lib::acp::delegation::workflow::types::{
     DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
@@ -21,7 +21,8 @@ use codeg_lib::acp::delegation::workflow::types::{
 use codeg_lib::acp::delegation::workflow::CompletionAttentionCas;
 use codeg_lib::acp::delegation::workflow::{
     build_work_unit_key, load_completion_projection, materialize_terminal_completion_txn,
-    project_workflow_graph_core, CompletionOutcome, TerminalCompletionInput,
+    project_workflow_graph_core, with_historical_workflow_fixture_mutations, CompletionOutcome,
+    TerminalCompletionInput,
 };
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::entities::delegation_attention_request::AttentionKind;
@@ -72,7 +73,7 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
         profile_id: None,
     })
     .unwrap();
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -97,8 +98,8 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
     let db_arc = Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     });
-    RunStore::new(db_arc)
-        .admit_gen1_reserving(ReservingRunInsert {
+    with_historical_workflow_fixture_mutations(
+        RunStore::new(db_arc).admit_gen1_reserving(ReservingRunInsert {
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,
@@ -122,9 +123,10 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
             replaced_task_id: None,
             replacement_reason: None,
             started_at: Some(Utc::now()),
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
     let run = delegation_task_run::Entity::find_by_id(&task_id)
         .one(&db.conn)
         .await
@@ -419,16 +421,18 @@ async fn completion_projection_is_identical_across_graph_http_and_mcp_surfaces()
         .expect("pending completion must be projected");
     assert_eq!(pending.card.state.as_str(), "needs_decision");
 
-    let response = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, context)
-        .json(&ResolveCompletionDecisionRequest {
-            cas: fixture.cas.clone(),
-            outcome: CompletionOutcome::Done,
-        })
-        .await;
+    let response = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, context)
+            .json(&ResolveCompletionDecisionRequest {
+                cas: fixture.cas.clone(),
+                outcome: CompletionOutcome::Done,
+            }),
+    )
+    .await;
     response.assert_status_ok();
 
     let direct = project_workflow_graph_core(&fixture.state.db, fixture.parent_conversation_id)
@@ -534,12 +538,14 @@ async fn attention_authenticated_context_owns_durable_root_across_core_and_http(
         .unwrap()
         .authorize_completion_root(matching_fixture.parent_conversation_id)
         .unwrap();
-    let resolved = codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
-        &matching_fixture.state.db,
-        matching_fixture.state.delegation_metrics.as_ref(),
-        matching_fixture.state.completion_outbox_dispatcher.as_ref(),
-        &matching_context,
-        matching_request,
+    let resolved = with_historical_workflow_fixture_mutations(
+        codeg_lib::commands::workflow_completion::resolve_completion_decision_core(
+            &matching_fixture.state.db,
+            matching_fixture.state.delegation_metrics.as_ref(),
+            matching_fixture.state.completion_outbox_dispatcher.as_ref(),
+            &matching_context,
+            matching_request,
+        ),
     )
     .await
     .unwrap();
@@ -636,26 +642,30 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
 
     let mut stale_request = request.clone();
     stale_request.cas.node_id.push_str("-stale");
-    let stale = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&stale_request)
-        .await;
+    let stale = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+            .json(&stale_request),
+    )
+    .await;
     assert_eq!(stale.status_code(), 409);
     assert_eq!(error_detail(&stale), "completion_decision_superseded");
 
-    let invalid_role = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&ResolveCompletionDecisionRequest {
-            outcome: CompletionOutcome::Approve,
-            ..request.clone()
-        })
-        .await;
+    let invalid_role = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+            .json(&ResolveCompletionDecisionRequest {
+                outcome: CompletionOutcome::Approve,
+                ..request.clone()
+            }),
+    )
+    .await;
     assert_eq!(invalid_role.status_code(), 400);
     assert_eq!(
         error_detail(&invalid_role),
@@ -676,39 +686,45 @@ async fn attention_authenticated_http_matches_core_for_cas_replay_and_conflict()
         .await;
     assert_eq!(missing.status_code(), 422);
 
-    let first = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&request)
-        .await;
+    let first = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+            .json(&request),
+    )
+    .await;
     first.assert_status_ok();
     let first: CompletionMutationResult = first.json();
     assert!(!first.idempotent_replay);
 
-    let replay = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&request)
-        .await;
+    let replay = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+            .json(&request),
+    )
+    .await;
     replay.assert_status_ok();
     let replay: CompletionMutationResult = replay.json();
     assert!(replay.idempotent_replay);
     assert_eq!(first.graph_revision, replay.graph_revision);
 
-    let conflict = fixture
-        .server
-        .post("/api/resolve_completion_decision")
-        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
-        .json(&ResolveCompletionDecisionRequest {
-            outcome: CompletionOutcome::Blocked,
-            ..request
-        })
-        .await;
+    let conflict = with_historical_workflow_fixture_mutations(
+        fixture
+            .server
+            .post("/api/resolve_completion_decision")
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .add_header(COMPLETION_CONTEXT_HEADER, &completion_context)
+            .json(&ResolveCompletionDecisionRequest {
+                outcome: CompletionOutcome::Blocked,
+                ..request
+            }),
+    )
+    .await;
     assert_eq!(conflict.status_code(), 409);
     assert_eq!(error_detail(&conflict), "completion_decision_conflict");
 }

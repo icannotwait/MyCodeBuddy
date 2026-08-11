@@ -21,6 +21,8 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::ConversationWaitingForSubagents
         | AppErrorCode::DelegateViewerOnly
         | AppErrorCode::LegacyCompletionProtocolReadOnly
+        | AppErrorCode::WorkflowV2Retired
+        | AppErrorCode::WorkflowIdentityCorrupt
         | AppErrorCode::UnsupportedCompletionProtocol
         | AppErrorCode::CompletionInstructionBindingFailed
         | AppErrorCode::SessionRouteConflict
@@ -91,6 +93,8 @@ mod tests {
     fn stable_completion_protocol_errors_map_to_expected_http_status() {
         for code in [
             AppErrorCode::LegacyCompletionProtocolReadOnly,
+            AppErrorCode::WorkflowV2Retired,
+            AppErrorCode::WorkflowIdentityCorrupt,
             AppErrorCode::UnsupportedCompletionProtocol,
             AppErrorCode::CompletionInstructionBindingFailed,
         ] {

@@ -58,7 +58,7 @@ mod tests {
     };
     use crate::acp::delegation::workflow::WorkflowGraphSnapshot;
     use crate::acp::delegation::workflow::{
-        project_workflow_graph_core, publish_workflow_manifest_core, PublishWorkflowRequest,
+        project_workflow_graph_core, publish_workflow_manifest_fixture, PublishWorkflowRequest,
     };
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
@@ -373,7 +373,7 @@ mod tests {
         let (state, _dir) = test_state().await;
         let folder = seed_folder(&state.db, "/tmp/wf-http-snap").await;
         let parent = seed_conversation(&state.db, folder, AgentType::Codex).await;
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &state.db,
             &EventEmitter::Noop,
             parent,

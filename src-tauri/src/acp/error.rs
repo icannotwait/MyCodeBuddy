@@ -85,8 +85,14 @@ pub enum AcpError {
     },
     #[error("legacy completion protocol is read-only")]
     LegacyCompletionProtocolReadOnly,
-    #[error("workflow manifest v2 is retired; use the archived workflow navigation to open or create its Simple successor")]
-    WorkflowV2Retired,
+    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    WorkflowV2Retired {
+        source_conversation_id: Option<i32>,
+        successor_conversation_id: Option<i32>,
+        can_create_simple_successor: bool,
+    },
+    #[error("conversation {source_conversation_id} has conflicting workflow identities")]
+    WorkflowIdentityCorrupt { source_conversation_id: i32 },
     #[error("unsupported completion protocol: {0}")]
     UnsupportedCompletionProtocol(String),
     #[error("completion instruction binding failed: {0}")]
@@ -137,7 +143,8 @@ impl AcpError {
             Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
             Self::LegacyCompletionProtocolReadOnly => Some("legacy_completion_protocol_read_only"),
-            Self::WorkflowV2Retired => Some("workflow_v2_retired"),
+            Self::WorkflowV2Retired { .. } => Some("workflow_v2_retired"),
+            Self::WorkflowIdentityCorrupt { .. } => Some("workflow_identity_corrupt"),
             Self::UnsupportedCompletionProtocol(_) => Some("unsupported_completion_protocol"),
             Self::CompletionInstructionBindingFailed(_) => {
                 Some("completion_instruction_binding_failed")
@@ -234,6 +241,49 @@ impl AcpError {
                 AppErrorCode::LegacyCompletionProtocolReadOnly,
                 "Legacy completion protocol is read-only",
             )),
+            AcpError::WorkflowV2Retired {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            } => {
+                let mut navigation = BTreeMap::from([(
+                    "can_create_simple_successor".into(),
+                    can_create_simple_successor.to_string(),
+                )]);
+                if let Some(source_conversation_id) = source_conversation_id {
+                    navigation.insert(
+                        "source_conversation_id".into(),
+                        source_conversation_id.to_string(),
+                    );
+                }
+                if let Some(successor_conversation_id) = successor_conversation_id {
+                    navigation.insert(
+                        "successor_conversation_id".into(),
+                        successor_conversation_id.to_string(),
+                    );
+                }
+                let mut error = AppCommandError::new(
+                    AppErrorCode::WorkflowV2Retired,
+                    crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE,
+                );
+                error.i18n_params = Some(navigation);
+                Some(error)
+            }
+            AcpError::WorkflowIdentityCorrupt {
+                source_conversation_id,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::WorkflowIdentityCorrupt,
+                    self.to_string(),
+                )
+                .with_i18n(
+                    "backendErrors.workflowIdentityCorrupt",
+                    BTreeMap::from([(
+                        "source_conversation_id".into(),
+                        source_conversation_id.to_string(),
+                    )]),
+                ),
+            ),
             AcpError::UnsupportedCompletionProtocol(detail) => Some(
                 AppCommandError::new(
                     AppErrorCode::UnsupportedCompletionProtocol,
@@ -264,7 +314,20 @@ impl From<WorkflowStoreError> for AcpError {
     fn from(error: WorkflowStoreError) -> Self {
         let message = error.to_string();
         match error {
-            WorkflowStoreError::WorkflowV2Retired => Self::WorkflowV2Retired,
+            WorkflowStoreError::WorkflowV2Retired {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            } => Self::WorkflowV2Retired {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            },
+            WorkflowStoreError::WorkflowIdentityCorrupt {
+                source_conversation_id,
+            } => Self::WorkflowIdentityCorrupt {
+                source_conversation_id,
+            },
             WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
                 Self::LegacyCompletionProtocolReadOnly
             }
@@ -412,6 +475,49 @@ mod tests {
             json!({
                 "code": "turn_in_progress",
                 "message": "turn already in progress for this connection",
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_v2_retired_serializes_structured_navigation() {
+        let value = serde_json::to_value(&AcpError::WorkflowV2Retired {
+            source_conversation_id: Some(41),
+            successor_conversation_id: Some(84),
+            can_create_simple_successor: false,
+        })
+        .expect("serialize retired workflow error");
+        assert_eq!(
+            value,
+            json!({
+                "code": "workflow_v2_retired",
+                "message": crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE,
+                "i18n_params": {
+                    "source_conversation_id": "41",
+                    "successor_conversation_id": "84",
+                    "can_create_simple_successor": "false",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_identity_corrupt_serializes_as_a_structured_app_error() {
+        let value = serde_json::to_value(AcpError::from(
+            WorkflowStoreError::WorkflowIdentityCorrupt {
+                source_conversation_id: 41,
+            },
+        ))
+        .expect("serialize corrupt workflow identity");
+        assert_eq!(
+            value,
+            json!({
+                "code": "workflow_identity_corrupt",
+                "message": "conversation 41 has conflicting workflow identities",
+                "i18n_key": "backendErrors.workflowIdentityCorrupt",
+                "i18n_params": {
+                    "source_conversation_id": "41",
+                },
             })
         );
     }

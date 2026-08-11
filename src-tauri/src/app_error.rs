@@ -115,6 +115,10 @@ pub enum AppErrorCode {
     DelegateViewerOnly,
     /// A mutation targeted a historical protocol-v1 workflow.
     LegacyCompletionProtocolReadOnly,
+    /// A mutation targeted an archived manifest-v2 workflow.
+    WorkflowV2Retired,
+    /// Durable workflow ownership or successor linkage is contradictory.
+    WorkflowIdentityCorrupt,
     /// A persisted workflow protocol pair is unknown or inconsistent.
     UnsupportedCompletionProtocol,
     /// A protocol-v2 completion instruction could not be bound durably.
@@ -310,6 +314,14 @@ mod tests {
             (
                 AppErrorCode::LegacyCompletionProtocolReadOnly,
                 "legacy_completion_protocol_read_only",
+            ),
+            (
+                AppErrorCode::WorkflowV2Retired,
+                "workflow_v2_retired",
+            ),
+            (
+                AppErrorCode::WorkflowIdentityCorrupt,
+                "workflow_identity_corrupt",
             ),
             (
                 AppErrorCode::UnsupportedCompletionProtocol,

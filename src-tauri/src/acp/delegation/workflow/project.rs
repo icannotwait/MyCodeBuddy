@@ -3187,7 +3187,7 @@ mod tests {
     }
 
     use crate::acp::delegation::workflow::admission::{
-        admit_workflow_run_txn, AdmissionDispatchKind, WorkflowAdmitInput,
+        AdmissionDispatchKind, WorkflowAdmitInput,
     };
     use crate::acp::delegation::workflow::completion_evidence::{
         materialize_terminal_completion_txn, TerminalCompletionInput,
@@ -3208,9 +3208,22 @@ mod tests {
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
     use chrono::Utc;
-    use sea_orm::ActiveModelTrait;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait};
     use sea_orm::Set;
     use std::sync::Arc;
+
+    async fn admit_workflow_run_txn<C: ConnectionTrait>(
+        conn: &C,
+        input: &WorkflowAdmitInput<'_>,
+    ) -> Result<
+        crate::acp::delegation::workflow::admission::WorkflowTxnSideEffect,
+        crate::acp::delegation::store::TaskStoreError,
+    > {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            crate::acp::delegation::workflow::admission::admit_workflow_run_txn(conn, input),
+        )
+        .await
+    }
 
     fn emitter() -> EventEmitter {
         EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()))

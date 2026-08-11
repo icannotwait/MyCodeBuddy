@@ -44,17 +44,22 @@ use codeg_lib::acp::delegation::types::{
 };
 use codeg_lib::acp::types::DelegationResultSummary;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, guard_current_final_delivery_core, guard_final_delivery_core,
-    guard_task_final_delivery_core, load_completion_protocol_for_conversation,
-    load_historical_workflow_context, materialize_terminal_completion_txn,
-    project_workflow_graph_core, publish_workflow_manifest_core, recover_workflow_core,
-    settle_workflow_gate_v2_core, CompletionCardV2, CompletionDecisionResolvedPayloadV1,
-    CompletionIntentSource, CompletionOutcome, CompletionProtocolConfigurationRemoved,
-    CompletionRole, DocumentGateKind, DocumentRef, FinalDeliveryGuardRequest,
-    FinalDeliveryGuardResult, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
-    ManifestNodeRole, ManifestPhase, ManifestWorkflowState, PlanReviewChangeV2,
-    PlanReviewNextAction, PublishWorkflowRequest, RecoverWorkflowRequest, ResolutionMode,
-    SettleWorkflowV2Request, TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
+    build_work_unit_key, guard_current_final_delivery_core as production_guard_current_final_delivery,
+    guard_final_delivery_core as production_guard_final_delivery,
+    guard_task_final_delivery_core as production_guard_task_final_delivery,
+    load_completion_protocol_for_conversation, load_historical_workflow_context,
+    materialize_terminal_completion_txn, project_workflow_graph_core,
+    publish_workflow_manifest_core, publish_workflow_manifest_fixture,
+    recover_workflow_core as production_recover_workflow,
+    settle_workflow_gate_v2_core as production_settle_workflow_gate_v2,
+    with_historical_workflow_fixture_mutations, CompletionCardV2,
+    CompletionDecisionResolvedPayloadV1, CompletionIntentSource, CompletionOutcome,
+    CompletionProtocolConfigurationRemoved, CompletionRole, DocumentGateKind, DocumentRef,
+    FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument, ManifestGate,
+    ManifestNode, ManifestNodeKind, ManifestNodeRole, ManifestPhase, ManifestWorkflowState,
+    PlanReviewChangeV2, PlanReviewNextAction, PublishWorkflowRequest, RecoverWorkflowRequest,
+    RecoverWorkflowResult, ResolutionMode, SettleResult, SettleWorkflowV2Request,
+    TerminalCompletionInput, WorkUnitKeyParts, WorkflowStoreError,
     COMPLETION_DECISION_RESOLVED_EVENT, CURRENT_COMPLETION_PROTOCOL_VERSION,
     MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
     WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
@@ -88,6 +93,73 @@ use sea_orm::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+async fn settle_workflow_gate_v2_core(
+    db: &codeg_lib::db::AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    request: SettleWorkflowV2Request,
+) -> Result<SettleResult, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(production_settle_workflow_gate_v2(
+        db,
+        emitter,
+        parent_conversation_id,
+        request,
+    ))
+    .await
+}
+
+async fn recover_workflow_core(
+    db: &codeg_lib::db::AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    request: RecoverWorkflowRequest,
+) -> Result<RecoverWorkflowResult, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(production_recover_workflow(
+        db,
+        emitter,
+        parent_conversation_id,
+        request,
+    ))
+    .await
+}
+
+async fn guard_final_delivery_core(
+    db: &codeg_lib::db::AppDatabase,
+    emitter: &EventEmitter,
+    request: FinalDeliveryGuardRequest,
+) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(production_guard_final_delivery(
+        db, emitter, request,
+    ))
+    .await
+}
+
+async fn guard_current_final_delivery_core(
+    db: &codeg_lib::db::AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    workflow_id: Option<&str>,
+) -> Result<Option<FinalDeliveryGuardResult>, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(production_guard_current_final_delivery(
+        db,
+        emitter,
+        parent_conversation_id,
+        workflow_id,
+    ))
+    .await
+}
+
+async fn guard_task_final_delivery_core(
+    db: &codeg_lib::db::AppDatabase,
+    emitter: &EventEmitter,
+    task_id: &str,
+) -> Result<Option<FinalDeliveryGuardResult>, WorkflowStoreError> {
+    with_historical_workflow_fixture_mutations(production_guard_task_final_delivery(
+        db, emitter, task_id,
+    ))
+    .await
+}
 
 #[derive(Default)]
 struct RecordingCompletionRootWake {
@@ -182,7 +254,7 @@ async fn fixed_v2_creation_persists_across_agent_profiles_and_revisions() {
             .unwrap(),
         );
 
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,
@@ -206,7 +278,7 @@ async fn fixed_v2_creation_persists_across_agent_profiles_and_revisions() {
         document.workflow_id = Some(published.workflow_id.clone());
         document.expected_manifest_revision = Some(published.manifest_revision);
         document.nodes[0].title = Some("revised display title".into());
-        let revised = publish_workflow_manifest_core(
+        let revised = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,
@@ -255,7 +327,7 @@ async fn fixed_v2_creation_rejects_revision_after_header_becomes_historical() {
     )
     .await
     .expect_err("historical workflow revision must be rejected");
-    assert_eq!(error.code(), "legacy_completion_protocol_read_only");
+    assert_eq!(error.code(), "workflow_v2_retired");
 
     let row = delegation_workflow::Entity::find_by_id(&published.workflow_id)
         .one(&db.conn)
@@ -886,7 +958,7 @@ async fn historical_protocol_mutation_matrix() {
         )
         .await
         .expect_err("rejected protocol pair must not publish");
-        assert_eq!(publish_error.code(), expected_code);
+        assert_eq!(publish_error.code(), "workflow_v2_retired");
 
         for (gate_id, expected_review_round, expected_outcome) in [
             ("design", Some(1), Some(GateSettlementOutcome::Approved)),
@@ -1102,7 +1174,7 @@ async fn terminal_protocol_failure_is_typed() {
         let folder = seed_folder(&db, "/tmp/task-5-terminal-corrupt-header").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let child = seed_conversation(&db, folder, AgentType::Codex).await;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,
@@ -1217,7 +1289,7 @@ async fn historical_protocol_cross_parent_mutations_remain_unauthorized() {
     )
     .await
     .expect_err("cross-parent publication must remain unauthorized");
-    assert_eq!(publication_error.code(), "unauthorized");
+    assert_eq!(publication_error.code(), "workflow_v2_retired");
 
     let settle_error = settle_workflow_gate_v2_core(
         &db,
@@ -1348,7 +1420,7 @@ async fn corrupt_header_nonterminal_fences() {
         let folder = seed_folder(&db, &format!("/tmp/task-4-corrupt-header-{index}")).await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
         let mut document = skeleton(&format!("task-4-corrupt-header-{index}"));
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,
@@ -1373,7 +1445,7 @@ async fn corrupt_header_nonterminal_fences() {
         )
         .await
         .expect_err("corrupt header publication must fail closed");
-        assert_eq!(publish_error.code(), "unsupported_completion_protocol");
+        assert_eq!(publish_error.code(), "workflow_v2_retired");
 
         let recover_error = recover_workflow_core(
             &db,
@@ -1555,7 +1627,7 @@ async fn v2_settlement_requires_gate_kind_cas_fields_and_guards_legacy_before_wr
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -1694,7 +1766,7 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
 
     let enforce_parent = seed_conversation(&db, folder, AgentType::Codex).await;
     let (parent, request) = publish(enforce_parent, "task-18-enforce-gate-state");
-    let enforced = publish_workflow_manifest_core(&db, &EventEmitter::Noop, parent, request)
+    let enforced = publish_workflow_manifest_fixture(&db, &EventEmitter::Noop, parent, request)
         .await
         .unwrap();
     let states = delegation_workflow_gate_state::Entity::find()
@@ -1775,7 +1847,7 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
         .find(|node| node.id == "plan-reviewer")
         .unwrap()
         .title = Some("Display-only reviewer title".into());
-    let title_result = publish_workflow_manifest_core(
+    let title_result = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         enforce_parent,
@@ -1804,7 +1876,7 @@ async fn fresh_publication_initializes_gate_state_only_for_v2_enforce() {
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES_V2)),
     });
-    publish_workflow_manifest_core(
+    publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         enforce_parent,
@@ -1899,7 +1971,7 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -1980,7 +2052,7 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
     plan_gate
         .required_reviewer_node_ids
         .push("plan-reviewer-grok".into());
-    let added = publish_workflow_manifest_core(
+    let added = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2027,7 +2099,7 @@ async fn roster_only_republication_selects_only_added_reviewers_and_retires_remo
     plan_gate
         .required_reviewer_node_ids
         .retain(|node_id| node_id != "plan-reviewer-grok");
-    publish_workflow_manifest_core(
+    publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2093,7 +2165,7 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2246,7 +2318,7 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
         node_outcome: None,
         title: None,
     });
-    let added = publish_workflow_manifest_core(
+    let added = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2341,7 +2413,7 @@ async fn roster_only_final_republication_delivers_after_add_and_remove() {
     removed_reviewer.required = Some(false);
     removed_reviewer.node_outcome =
         Some(codeg_lib::acp::delegation::workflow::ManifestNodeOutcome::Canceled);
-    publish_workflow_manifest_core(
+    publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2421,7 +2493,7 @@ async fn admit_v2_fixture_run(
     let runs = Arc::new(RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     })));
-    runs.admit_gen1_reserving(ReservingRunInsert {
+    with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
         task_id: task_id.into(),
         root_task_id: task_id.into(),
         previous_task_id: None,
@@ -2445,7 +2517,7 @@ async fn admit_v2_fixture_run(
         replaced_task_id: None,
         replacement_reason: None,
         started_at: Some(chrono::Utc::now()),
-    })
+    }))
     .await
     .unwrap_or_else(|error| panic!("admit {task_id}: {error:?}"));
 }
@@ -2505,7 +2577,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         rel_path: DESIGN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(DESIGN_BYTES)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -2533,7 +2605,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
     let runs = Arc::new(RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     })));
-    runs.admit_gen1_reserving(ReservingRunInsert {
+    with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
         task_id: task_id.clone(),
         root_task_id: task_id.clone(),
         previous_task_id: None,
@@ -2557,7 +2629,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         replaced_task_id: None,
         replacement_reason: None,
         started_at: Some(chrono::Utc::now()),
-    })
+    }))
     .await
     .unwrap();
 
@@ -2565,9 +2637,13 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
     runs.bind_child_connection_while_reserving(&task_id, &child_connection_id)
         .await
         .unwrap();
-    runs.promote_running(&task_id, &child_connection_id, chrono::Utc::now())
-        .await
-        .unwrap();
+    with_historical_workflow_fixture_mutations(runs.promote_running(
+        &task_id,
+        &child_connection_id,
+        chrono::Utc::now(),
+    ))
+    .await
+    .unwrap();
 
     let broker = Arc::new(
         DelegationBroker::new(
@@ -3040,7 +3116,7 @@ async fn run_session_2889_fixture() -> Session2889Result {
         rel_path: PLAN_REL_PATH.into(),
         digest: format!("sha256:{:x}", Sha256::digest(PLAN_BYTES)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -3151,8 +3227,8 @@ async fn run_session_2889_fixture() -> Session2889Result {
         .count(&db.conn)
         .await
         .unwrap();
-    let continuation = broker
-        .continue_delegation(ContinueDelegationRequest {
+    let continuation = with_historical_workflow_fixture_mutations(
+        broker.continue_delegation(ContinueDelegationRequest {
             parent_connection_id: "session-2889-parent".into(),
             parent_conversation_id: parent,
             parent_tool_use_id: "session-2889-card-reemit".into(),
@@ -3162,8 +3238,9 @@ async fn run_session_2889_fixture() -> Session2889Result {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
-        })
-        .await;
+        }),
+    )
+    .await;
     let persisted_runs = delegation_task_run::Entity::find()
         .filter(delegation_task_run::Column::ParentConversationId.eq(parent))
         .all(&db.conn)
@@ -3279,7 +3356,7 @@ async fn run_final_delivery_fixture(
         rel_path: "docs/superpowers/plans/restarted-plan.md".into(),
         digest: format!("sha256:{:x}", Sha256::digest(plan_bytes)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -3996,7 +4073,7 @@ async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
         &skeleton("task-4-root-bound-legacy"),
     )
     .await;
-    let owned = publish_workflow_manifest_core(
+    let owned = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         child,
@@ -4135,7 +4212,7 @@ async fn valid_v2_attention_outbox_replay_wakes_root_once_and_acknowledges_deliv
     let db = Arc::new(fresh_in_memory_db().await);
     let folder = seed_folder(&db, "/tmp/task-8-root-wake").await;
     let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -4372,7 +4449,7 @@ async fn v2_only_aggregate_acceptance() {
         rel_path: design_rel.into(),
         digest: format!("sha256:{:x}", Sha256::digest(design_bytes)),
     });
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &EventEmitter::Noop,
         parent,
@@ -4484,7 +4561,7 @@ async fn v2_only_aggregate_acceptance() {
     .await;
     assert_eq!(
         legacy_mutation.unwrap_err().code(),
-        "legacy_completion_protocol_read_only"
+        "workflow_v2_retired"
     );
 
     // Dangling terminal: bind against a live v2 workflow, delete the header,
@@ -4507,7 +4584,7 @@ async fn v2_only_aggregate_acceptance() {
         rel_path: design_rel.into(),
         digest: format!("sha256:{:x}", Sha256::digest(design_bytes)),
     });
-    let dangling_published = publish_workflow_manifest_core(
+    let dangling_published = publish_workflow_manifest_fixture(
         &dangling_db,
         &EventEmitter::Noop,
         dangling_parent,
@@ -4536,7 +4613,10 @@ async fn v2_only_aggregate_acceptance() {
         correlation_id: None,
         recovery_authorization_id: None,
     };
-    let dangling_report = broker.start_delegation(dangling_request).await;
+    let dangling_report = with_historical_workflow_fixture_mutations(
+        broker.start_delegation(dangling_request),
+    )
+    .await;
     assert_eq!(
         dangling_report.status,
         TaskStatus::Running,

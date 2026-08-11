@@ -45,7 +45,7 @@ mod tests {
         WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
     use crate::acp::delegation::workflow::{
-        project_workflow_graph_core, publish_workflow_manifest_core, PublishWorkflowRequest,
+        project_workflow_graph_core, publish_workflow_manifest_fixture, PublishWorkflowRequest,
     };
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
@@ -270,7 +270,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/wf-api-snapshot").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
 
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,

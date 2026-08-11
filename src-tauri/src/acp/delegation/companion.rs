@@ -11,12 +11,10 @@
 //! `ask_user_question` (block on a multiple-choice card), `get_session_info`
 //! (resolve a referenced session by id), coordination-only
 //! `request_parent_decision` / `reply_to_delegation`, plus Root-only
-//! `register_simple_workflow` locator registration and legacy Root-only
-//! `workflow_v2` tools (`get_workflow_capabilities`, `get_workflow_state`,
-//! `publish_workflow_manifest`, `settle_workflow_gate`) — whose schemas are
-//! embedded at compile time from [`TOOL_SCHEMA_JSON`] and gated by the
-//! `--features` groups (delegation / coordination_v1 / feedback / ask /
-//! sessions / workflow_v2) and launch role.
+//! `register_simple_workflow` locator registration. Retired `workflow_v2` and
+//! `completion_v2` schemas and dispatch handlers remain embedded for protocol
+//! compatibility tests, but stale launch tokens cannot add them to a new
+//! companion catalog.
 //! Only `delegate_to_agent` registers a broker-side cancel handle; canceling a
 //! status / cancel / feedback / session / decision round-trip merely suppresses
 //! its response — and for `check_user_feedback` also skips the delivery commit,
@@ -209,10 +207,10 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
-    /// Root-only workflow_manifest_v2 mutation/recovery tools. Single bit
-    /// enables all five B9 tools together (structural catalog agreement).
+    /// Retired workflow_manifest_v2 feature bit. Production launch parsing
+    /// leaves this false; historical protocol tests construct it explicitly.
     pub workflow_v2: bool,
-    /// Child-only workflow completion-intent transport.
+    /// Retired child completion feature bit used only by historical tests.
     pub completion_v2: bool,
 }
 
@@ -256,9 +254,6 @@ where
 }
 
 /// Local `get_workflow_capabilities` payload from launch features/role (A15.1).
-/// Does not touch durable workflow state. When `workflow_v2` is on and role is
-/// Root, returns v2 true with the complete operation catalog; otherwise v2 false and
-/// empty operations (tool itself is normally absent when feature is off).
 pub fn local_workflow_capabilities(features: &CompanionFeatures, role: CompanionRole) -> Value {
     let enabled = features.workflow_v2 && role == CompanionRole::Root;
     let operations: Vec<&str> = if enabled {
@@ -309,8 +304,7 @@ impl CompanionFeatures {
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
-                "workflow_v2" => f.workflow_v2 = true,
-                "completion_v2" => f.completion_v2 = true,
+                "workflow_v2" | "completion_v2" => {}
                 _ => {}
             }
         }
@@ -378,7 +372,6 @@ impl CompanionContext {
                 (self.features.delegation && self.features.coordination_v1)
                     || (self.features.workflow_v2 && self.role == CompanionRole::Root)
             }
-            // The complete workflow catalog requires workflow_v2 + Root.
             "get_workflow_capabilities"
             | "get_workflow_state"
             | "publish_workflow_manifest"
@@ -4055,7 +4048,7 @@ mod tests {
         workflow_v2: false,
         completion_v2: false,
     };
-    const WORKFLOW_ROOT: CompanionFeatures = CompanionFeatures {
+    const HISTORICAL_WORKFLOW_ROOT_FIXTURE: CompanionFeatures = CompanionFeatures {
         delegation: true,
         coordination_v1: false,
         feedback: false,
@@ -4063,6 +4056,15 @@ mod tests {
         sessions: false,
         workflow_v2: true,
         completion_v2: false,
+    };
+    const HISTORICAL_COMPLETION_CHILD_FIXTURE: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        coordination_v1: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        workflow_v2: false,
+        completion_v2: true,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -4318,11 +4320,12 @@ mod tests {
         assert!(!def.sessions);
         assert!(!def.workflow_v2);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(
-            " delegation , coordination_v1 , feedback , ask , sessions , workflow_v2 ,bogus",
-        ));
+        let all = CompanionFeatures::parse(Some(concat!(
+            " delegation , coordination_v1 , feedback , ask , sessions , ",
+            "workflow_v2 , completion_v2 ,bogus"
+        )));
         assert!(all.delegation && all.coordination_v1 && all.feedback && all.ask && all.sessions);
-        assert!(all.workflow_v2);
+        assert!(!all.workflow_v2 && !all.completion_v2);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
         assert!(!fb.workflow_v2);
@@ -4331,7 +4334,7 @@ mod tests {
         let sessions = CompanionFeatures::parse(Some("sessions"));
         assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
         let wf = CompanionFeatures::parse(Some("workflow_v2"));
-        assert!(wf.workflow_v2 && !wf.delegation);
+        assert!(!wf.workflow_v2 && !wf.delegation);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
         assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
@@ -4340,32 +4343,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_v2_feature_token_is_exclusive_and_root_only() {
-        let v2 = CompanionFeatures::parse(Some("workflow_v2"));
-        assert!(
-            v2.workflow_tools_enabled(),
-            "the literal workflow_v2 token must enable the atomic workflow catalog"
-        );
+    async fn workflow_v2_stale_feature_tool_catalog_is_retired_for_root_and_child() {
+        let stale = CompanionFeatures::parse(Some("delegation,workflow_v2,completion_v2"));
+        assert!(!stale.workflow_tools_enabled());
 
-        let mut root = ctx_with(v2);
+        let mut root = ctx_with(stale);
         root.role = CompanionRole::Root;
         let root_names = list_tool_names(dispatch_with_context(root, tools_list()).await);
-        let root_workflow_names: Vec<&str> = root_names
+        assert!(root_names.iter().any(|name| name == "delegate_to_agent"));
+        assert!(root_names
             .iter()
-            .map(String::as_str)
-            .filter(|name| WORKFLOW_V2_TOOLS.contains(name))
-            .collect();
-        assert_eq!(root_workflow_names, WORKFLOW_V2_TOOLS);
+            .any(|name| name == "register_simple_workflow"));
+        assert!(WORKFLOW_V2_TOOLS
+            .iter()
+            .all(|tool| !root_names.iter().any(|name| name == tool)));
+        assert!(!root_names.iter().any(|name| name == "complete_work"));
 
-        let mut child = ctx_with(v2);
+        let mut child = ctx_with(stale);
         child.role = CompanionRole::DelegationChild;
         let child_names = list_tool_names(dispatch_with_context(child, tools_list()).await);
-        assert!(
-            WORKFLOW_V2_TOOLS
-                .iter()
-                .all(|tool| !child_names.iter().any(|name| name == tool)),
-            "delegation children must expose no workflow tools: {child_names:?}"
-        );
+        assert!(child_names.iter().any(|name| name == "delegate_to_agent"));
+        assert!(!child_names
+            .iter()
+            .any(|name| name == "register_simple_workflow"));
+        assert!(!child_names.iter().any(|name| name == "complete_work"));
+        assert!(WORKFLOW_V2_TOOLS
+            .iter()
+            .all(|tool| !child_names.iter().any(|name| name == tool)));
 
         let v1 = CompanionFeatures::parse(Some("workflow_v1"));
         assert!(
@@ -4426,11 +4430,11 @@ mod tests {
     }
 
     #[test]
-    fn completion_v2_catalog_is_child_only_and_literal() {
+    fn completion_v2_stale_feature_token_is_ignored() {
         let feature = CompanionFeatures::parse(Some("completion_v2"));
         let mut child = ctx_with(feature);
         child.role = CompanionRole::DelegationChild;
-        assert!(child.allows_tool("complete_work"));
+        assert!(!child.allows_tool("complete_work"));
 
         let mut root = ctx_with(feature);
         root.role = CompanionRole::Root;
@@ -4460,7 +4464,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_work_rejects_unknown_arguments_before_broker_dispatch() {
-        let mut child = ctx_with(CompanionFeatures::parse(Some("completion_v2")));
+        let mut child = ctx_with(HISTORICAL_COMPLETION_CHILD_FIXTURE);
         child.role = CompanionRole::DelegationChild;
         let response = unwrap_respond(
             dispatch_with_context(
@@ -4481,7 +4485,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_work_rejects_multibyte_strings_over_byte_bounds_before_dispatch() {
-        let mut child = ctx_with(CompanionFeatures::parse(Some("completion_v2")));
+        let mut child = ctx_with(HISTORICAL_COMPLETION_CHILD_FIXTURE);
         child.role = CompanionRole::DelegationChild;
         for arguments in [
             json!({"outcome": "approve", "summary": "界".repeat(1366)}),
@@ -4582,8 +4586,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_v2_root_catalog_agrees_with_local_capabilities() {
-        let names = list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
+    async fn historical_workflow_fixture_catalog_agrees_with_local_capabilities() {
+        let names = list_tool_names(
+            dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, tools_list()).await,
+        );
         assert_eq!(
             WORKFLOW_V2_TOOLS,
             &[
@@ -4598,14 +4604,17 @@ mod tests {
         for tool in WORKFLOW_V2_TOOLS {
             assert!(
                 names.iter().any(|n| n == *tool),
-                "root workflow_v2 must expose {tool}; names={names:?}"
+                "historical workflow fixture must expose {tool}; names={names:?}"
             );
         }
         assert_eq!(
             classify_workflow_tool_catalog(names.iter().map(String::as_str)),
             WorkflowCapabilityMode::WorkflowManifestV2
         );
-        let caps = local_workflow_capabilities(&WORKFLOW_ROOT, CompanionRole::Root);
+        let caps = local_workflow_capabilities(
+            &HISTORICAL_WORKFLOW_ROOT_FIXTURE,
+            CompanionRole::Root,
+        );
         assert_eq!(caps["workflow_manifest_v2"], true);
         assert_eq!(caps["versions"][WORKFLOW_CAPABILITY_VERSION], true);
         let ops: Vec<&str> = caps["operations"]
@@ -4623,7 +4632,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_v2_child_hides_all_workflow_tools() {
-        let mut child = ctx_with(WORKFLOW_ROOT);
+        let mut child = ctx_with(HISTORICAL_WORKFLOW_ROOT_FIXTURE);
         child.role = CompanionRole::DelegationChild;
         let names = list_tool_names(dispatch_with_context(child.clone(), tools_list()).await);
         for tool in WORKFLOW_V2_TOOLS {
@@ -4653,7 +4662,7 @@ mod tests {
     #[tokio::test]
     async fn get_workflow_capabilities_answers_locally_without_broker() {
         let action = dispatch_with_features(
-            WORKFLOW_ROOT,
+            HISTORICAL_WORKFLOW_ROOT_FIXTURE,
             &call(9, "get_workflow_capabilities", json!({})),
         )
         .await;
@@ -4696,18 +4705,27 @@ mod tests {
             })
             .to_string();
             let response = unwrap_respond(
-                dispatch_line(&ctx_with(WORKFLOW_ROOT), inflight.clone(), &line).await,
+                dispatch_line(
+                    &ctx_with(HISTORICAL_WORKFLOW_ROOT_FIXTURE),
+                    inflight.clone(),
+                    &line,
+                )
+                .await,
             );
             assert_eq!(response.error.unwrap().code, -32602);
             assert!(inflight.drain_all().await.is_empty());
         }
         assert!(matches!(
-            dispatch_with_features(WORKFLOW_ROOT, &call(2, "get_workflow_state", json!({}))).await,
+            dispatch_with_features(
+                HISTORICAL_WORKFLOW_ROOT_FIXTURE,
+                &call(2, "get_workflow_state", json!({})),
+            )
+            .await,
             LineAction::Spawn(_)
         ));
         assert!(matches!(
             dispatch_with_features(
-                WORKFLOW_ROOT,
+                HISTORICAL_WORKFLOW_ROOT_FIXTURE,
                 &call(3, "get_workflow_state", json!({ "detail": "index" }))
             )
             .await,
@@ -4724,7 +4742,7 @@ mod tests {
         })
         .to_string();
         assert!(matches!(
-            dispatch_with_features(WORKFLOW_ROOT, &accepted_line).await,
+            dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, &accepted_line).await,
             LineAction::Spawn(_)
         ));
 
@@ -4740,7 +4758,12 @@ mod tests {
             })
             .to_string();
             let response = unwrap_respond(
-                dispatch_line(&ctx_with(WORKFLOW_ROOT), inflight.clone(), &line).await,
+                dispatch_line(
+                    &ctx_with(HISTORICAL_WORKFLOW_ROOT_FIXTURE),
+                    inflight.clone(),
+                    &line,
+                )
+                .await,
             );
             assert_eq!(response.id, Value::Null);
             assert_eq!(response.error.as_ref().unwrap().code, -32600);
@@ -5078,7 +5101,7 @@ mod tests {
         let (socket_path, server) = workflow_broker_with_outcome(json!({
             "error": { "code": "not_found", "message": broker_message }
         }));
-        let mut context = ctx_with(WORKFLOW_ROOT);
+        let mut context = ctx_with(HISTORICAL_WORKFLOW_ROOT_FIXTURE);
         context.socket_path = socket_path;
         let line = json!({
             "jsonrpc": "2.0",
@@ -5219,8 +5242,11 @@ mod tests {
             });
             args[field] = value;
             let action =
-                dispatch_with_features(WORKFLOW_ROOT, &call(11, "settle_workflow_gate", args))
-                    .await;
+                dispatch_with_features(
+                    HISTORICAL_WORKFLOW_ROOT_FIXTURE,
+                    &call(11, "settle_workflow_gate", args),
+                )
+                .await;
             let resp = unwrap_respond(action);
             let err = resp
                 .error
@@ -6564,7 +6590,9 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(names.contains(&"request_recovery_authorization".to_string()));
             let workflow_names =
-                list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
+                list_tool_names(
+                    dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, tools_list()).await,
+                );
             assert!(workflow_names.contains(&"recover_workflow".to_string()));
 
             for bad in [
@@ -6653,32 +6681,35 @@ mod tests {
                 );
             }
 
-            for enabled in [
-                WORKFLOW_ROOT,
+            let historical_fixture = HISTORICAL_WORKFLOW_ROOT_FIXTURE;
+            let names = list_tool_names(
+                dispatch_with_features(historical_fixture, tools_list()).await,
+            );
+            assert_eq!(
+                classify_workflow_tool_catalog(names.iter().map(String::as_str)),
+                WorkflowCapabilityMode::WorkflowManifestV2
+            );
+            let without_recover = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| *name != "recover_workflow")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                classify_workflow_tool_catalog(without_recover),
+                WorkflowCapabilityMode::Inconsistent
+            );
+            let capabilities =
+                local_workflow_capabilities(&historical_fixture, CompanionRole::Root);
+            assert_eq!(capabilities["workflow_manifest_v2"], true);
+            assert_eq!(capabilities["operations"], json!(WORKFLOW_V2_TOOLS));
+
+            for disabled in [
+                COORDINATION,
+                CompanionFeatures::parse(Some("")),
                 CompanionFeatures::parse(Some(
                     "delegation,coordination_v1,feedback,ask,sessions,workflow_v2",
                 )),
             ] {
-                let names = list_tool_names(dispatch_with_features(enabled, tools_list()).await);
-                assert_eq!(
-                    classify_workflow_tool_catalog(names.iter().map(String::as_str)),
-                    WorkflowCapabilityMode::WorkflowManifestV2
-                );
-                let without_recover = names
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|name| *name != "recover_workflow")
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    classify_workflow_tool_catalog(without_recover),
-                    WorkflowCapabilityMode::Inconsistent
-                );
-                let capabilities = local_workflow_capabilities(&enabled, CompanionRole::Root);
-                assert_eq!(capabilities["workflow_manifest_v2"], true);
-                assert_eq!(capabilities["operations"], json!(WORKFLOW_V2_TOOLS));
-            }
-
-            for disabled in [COORDINATION, CompanionFeatures::parse(Some(""))] {
                 let disabled_names =
                     list_tool_names(dispatch_with_features(disabled, tools_list()).await);
                 assert!(!disabled_names.contains(&"get_workflow_state".to_string()));

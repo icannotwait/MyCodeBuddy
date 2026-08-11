@@ -541,6 +541,10 @@ pub enum DelegationError {
     /// structured admission code (e.g. `final_early`), not `spawn_failed`.
     #[error("workflow admission rejected ({code}): {message}")]
     WorkflowAdmission { code: String, message: String },
+    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    WorkflowV2Retired {
+        navigation: WorkflowRetirementNavigation,
+    },
 }
 
 /// The single value the broker hands back to the listener / MCP companion.
@@ -593,6 +597,24 @@ pub struct DelegationRecoveryProjection {
     pub cause_code: String,
     pub risk_class: String,
     pub authorization_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRetirementNavigation {
+    pub source_conversation_id: Option<i32>,
+    pub successor_conversation_id: Option<i32>,
+    pub can_create_simple_successor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DelegationTaskReportExtension {
+    Recovery {
+        recovery: DelegationRecoveryProjection,
+    },
+    WorkflowRetirement {
+        workflow_retirement: WorkflowRetirementNavigation,
+    },
 }
 
 impl<'de> Deserialize<'de> for DelegationRecoveryProjection {
@@ -748,8 +770,26 @@ pub struct DelegationTaskReport {
     /// Stall start (`last_agent_activity_at + threshold`); only when stalled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_since: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<DelegationRecoveryProjection>,
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<DelegationTaskReportExtension>,
+}
+
+impl DelegationTaskReport {
+    pub fn recovery_projection(&self) -> Option<&DelegationRecoveryProjection> {
+        match self.recovery.as_ref() {
+            Some(DelegationTaskReportExtension::Recovery { recovery }) => Some(recovery),
+            _ => None,
+        }
+    }
+
+    pub fn workflow_retirement(&self) -> Option<&WorkflowRetirementNavigation> {
+        match self.recovery.as_ref() {
+            Some(DelegationTaskReportExtension::WorkflowRetirement {
+                workflow_retirement,
+            }) => Some(workflow_retirement),
+            _ => None,
+        }
+    }
 }
 
 /// Caller-facing warning when a prior prompt may already have executed
@@ -1067,6 +1107,13 @@ impl DelegationOutcome {
                 child_conversation_id,
             };
         }
+        if let DelegationError::WorkflowV2Retired { .. } = &err {
+            return DelegationOutcome::Err {
+                code: "workflow_v2_retired".into(),
+                message: crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE.into(),
+                child_conversation_id,
+            };
+        }
         let code = match &err {
             DelegationError::DepthLimitExceeded { .. } => "depth_limit",
             DelegationError::InvalidAgentType => "invalid_agent_type",
@@ -1118,6 +1165,7 @@ impl DelegationOutcome {
             DelegationError::CorrelationConflict(_) => "delegation_correlation_conflict",
             // Handled above; unreachable for exhaustive match.
             DelegationError::WorkflowAdmission { .. } => "workflow_admission_rejected",
+            DelegationError::WorkflowV2Retired { .. } => "workflow_v2_retired",
         };
         DelegationOutcome::Err {
             code: code.to_string(),

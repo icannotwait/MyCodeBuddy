@@ -23,7 +23,8 @@ use super::completion_intent::{
 };
 use super::dto::sha256_hex_str;
 use super::error::{
-    require_v2_mutation, CompletionEvidenceError, CompletionRecoveryFenceError, WorkflowStoreError,
+    require_v2_mutation_for_connection, CompletionEvidenceError, CompletionRecoveryFenceError,
+    WorkflowStoreError,
 };
 use super::events::{CompletionDecisionResolvedPayloadV1, COMPLETION_DECISION_RESOLVED_EVENT};
 use super::evidence_scope::{
@@ -261,7 +262,9 @@ async fn require_workflow_v2_completion_mutation<C: ConnectionTrait>(
         .ok_or_else(|| {
             CompletionMutationError::InvalidAttention("workflow protocol header is missing".into())
         })?;
-    require_v2_mutation(version, &mode).map_err(completion_store_mutation_error)
+    require_v2_mutation_for_connection(conn, version, &mode)
+        .await
+        .map_err(completion_store_mutation_error)
 }
 
 async fn require_task_v2_completion_mutation<C: ConnectionTrait>(
@@ -297,7 +300,9 @@ async fn require_task_v2_completion_evidence<C: ConnectionTrait>(
                 "workflow protocol header is missing".into(),
             )
         })?;
-    require_v2_mutation(version, &mode).map_err(completion_store_evidence_error)
+    require_v2_mutation_for_connection(conn, version, &mode)
+        .await
+        .map_err(completion_store_evidence_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3577,17 +3582,17 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
+        QueryOrder, Set, TransactionTrait,
     };
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::{
-        materialize_terminal_completion_txn, open_design_self_review_decision_txn,
-        reconcile_completion_attentions_txn, resolve_completion_decision_txn,
-        resolve_design_self_review_txn, resolve_workflow_completion_attentions_txn,
-        retry_completion_artifact_for_user_txn, retry_completion_artifact_txn,
-        CompletionDecisionPayloadV1, CompletionMutationError, TerminalCompletionInput,
+        materialize_terminal_completion_txn, reconcile_completion_attentions_txn,
+        resolve_workflow_completion_attentions_txn, CompletionAttentionCas,
+        CompletionDecisionPayloadV1, CompletionEvidenceError, CompletionMutationError,
+        CompletionMutationResult, TerminalCompletionInput, TerminalCompletionResult,
         ValidatedReportCandidate,
     };
     use crate::acp::delegation::event_emitter::{
@@ -3632,6 +3637,82 @@ mod tests {
         delegation_workflow_design_root_binding, delegation_workflow_gate_state,
         delegation_workflow_outbox_event,
     };
+
+    async fn resolve_completion_decision_txn(
+        db: &AppDatabase,
+        parent_conversation_id: i32,
+        request: CompletionAttentionCas,
+        outcome: CompletionOutcome,
+        actor_identity: &str,
+    ) -> Result<CompletionMutationResult, CompletionMutationError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::resolve_completion_decision_txn(
+                db,
+                parent_conversation_id,
+                request,
+                outcome,
+                actor_identity,
+            ),
+        )
+        .await
+    }
+
+    async fn open_design_self_review_decision_txn<C: ConnectionTrait>(
+        conn: &C,
+        binding: &delegation_workflow_design_root_binding::Model,
+        parent_conversation_id: i32,
+    ) -> Result<CompletionAttentionCas, CompletionMutationError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::open_design_self_review_decision_txn(conn, binding, parent_conversation_id),
+        )
+        .await
+    }
+
+    async fn resolve_design_self_review_txn(
+        db: &AppDatabase,
+        parent_conversation_id: i32,
+        request: CompletionAttentionCas,
+        outcome: CompletionOutcome,
+        actor_identity: &str,
+    ) -> Result<CompletionMutationResult, CompletionMutationError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::resolve_design_self_review_txn(
+                db,
+                parent_conversation_id,
+                request,
+                outcome,
+                actor_identity,
+            ),
+        )
+        .await
+    }
+
+    async fn retry_completion_artifact_txn(
+        db: &AppDatabase,
+        request: CompletionAttentionCas,
+    ) -> Result<TerminalCompletionResult, CompletionEvidenceError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::retry_completion_artifact_txn(db, request),
+        )
+        .await
+    }
+
+    async fn retry_completion_artifact_for_user_txn(
+        db: &AppDatabase,
+        parent_conversation_id: i32,
+        request: CompletionAttentionCas,
+        metrics: &DelegationMetrics,
+    ) -> Result<CompletionMutationResult, CompletionMutationError> {
+        super::super::with_historical_workflow_fixture_mutations(
+            super::retry_completion_artifact_for_user_txn(
+                db,
+                parent_conversation_id,
+                request,
+                metrics,
+            ),
+        )
+        .await
+    }
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
     use crate::models::AgentType;
@@ -3809,31 +3890,33 @@ mod tests {
 
             let task_id = format!("task-10-{}", uuid::Uuid::new_v4());
             let runs = RunStore::new(db.clone());
-            runs.admit_gen1_reserving(ReservingRunInsert {
-                task_id: task_id.clone(),
-                root_task_id: task_id.clone(),
-                previous_task_id: None,
-                generation: 1,
-                parent_conversation_id: parent,
-                parent_tool_use_id: Some(format!("tool-{task_id}")),
-                child_conversation_id: child,
-                agent_type: "codex".into(),
-                profile_id: None,
-                workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
-                route_fingerprint: Some("task-10-route".into()),
-                launch_snapshot_version: Some("v1".into()),
-                mode_id: None,
-                config_values_json: Some("{}".into()),
-                task_preview: Some("Task 10".into()),
-                request_fingerprint: Some(format!("fp-{task_id}")),
-                admission_class: AdmissionClass::NormalRevision,
-                lineage_root_task_id: task_id.clone(),
-                work_unit_key: Some(author_key),
-                history_only: false,
-                replaced_task_id: None,
-                replacement_reason: None,
-                started_at: Some(Utc::now()),
-            })
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.admit_gen1_reserving(ReservingRunInsert {
+                    task_id: task_id.clone(),
+                    root_task_id: task_id.clone(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: parent,
+                    parent_tool_use_id: Some(format!("tool-{task_id}")),
+                    child_conversation_id: child,
+                    agent_type: "codex".into(),
+                    profile_id: None,
+                    workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
+                    route_fingerprint: Some("task-10-route".into()),
+                    launch_snapshot_version: Some("v1".into()),
+                    mode_id: None,
+                    config_values_json: Some("{}".into()),
+                    task_preview: Some("Task 10".into()),
+                    request_fingerprint: Some(format!("fp-{task_id}")),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: task_id.clone(),
+                    work_unit_key: Some(author_key),
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                }),
+            )
             .await
             .expect("admit Plan Author");
 
@@ -4716,8 +4799,22 @@ mod tests {
         format!("{workflow:?}|{run:?}|{attentions:?}|{outbox:?}")
     }
 
+    async fn completion_decision_resolved_event_count(fixture: &TerminalFixture) -> u64 {
+        delegation_workflow_outbox_event::Entity::find()
+            .filter(
+                delegation_workflow_outbox_event::Column::WorkflowId.eq(&fixture.workflow_id),
+            )
+            .filter(
+                delegation_workflow_outbox_event::Column::EventKind
+                    .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
+            )
+            .count(&fixture.db.conn)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn historical_protocol_mutation_matrix_completion_evidence() {
+    async fn workflow_v2_retired_historical_protocol_mutation_matrix_completion_evidence() {
         use CompletionProtocolMode::{V2Enforce, V2Shadow, V1};
 
         for (index, version, mode, expected_code) in [
@@ -4726,12 +4823,15 @@ mod tests {
             (2, 1, V2Enforce, "legacy_completion_protocol_read_only"),
             (3, 2, V1, "unsupported_completion_protocol"),
             (4, 2, V2Shadow, "unsupported_completion_protocol"),
+            (5, 2, V2Enforce, "workflow_v2_retired"),
         ] {
             let decision = TerminalFixture::new_before_v2_only(IntentFixture::Missing, true).await;
             let decision_cas = decision.materialize().await.attention.unwrap();
             set_fixture_protocol(&decision, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&decision).await;
-            let error = resolve_completion_decision_txn(
+            let before_root_wake_events =
+                completion_decision_resolved_event_count(&decision).await;
+            let error = super::resolve_completion_decision_txn(
                 &decision.db,
                 decision.parent_conversation_id,
                 decision_cas,
@@ -4742,13 +4842,17 @@ mod tests {
             .expect_err("rejected completion decision must not mutate state");
             assert_eq!(error.code(), expected_code, "pair index {index}");
             assert_eq!(completion_mutation_snapshot(&decision).await, before);
+            assert_eq!(
+                completion_decision_resolved_event_count(&decision).await,
+                before_root_wake_events
+            );
 
             let artifact =
                 TerminalFixture::new_before_v2_only(IntentFixture::AssistantText, false).await;
             let artifact_cas = artifact.materialize().await.attention.unwrap();
             set_fixture_protocol(&artifact, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&artifact).await;
-            let error = retry_completion_artifact_for_user_txn(
+            let error = super::retry_completion_artifact_for_user_txn(
                 &artifact.db,
                 artifact.parent_conversation_id,
                 artifact_cas,
@@ -4776,7 +4880,7 @@ mod tests {
             .unwrap();
             set_fixture_protocol(&design, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&design).await;
-            let error = open_design_self_review_decision_txn(
+            let error = super::open_design_self_review_decision_txn(
                 &design.db.conn,
                 &binding,
                 design.parent_conversation_id,
@@ -4811,7 +4915,7 @@ mod tests {
             .unwrap();
             set_fixture_protocol(&design_resolution, version, mode).await;
             let before = completion_mutation_snapshot(&design_resolution).await;
-            let error = resolve_design_self_review_txn(
+            let error = super::resolve_design_self_review_txn(
                 &design_resolution.db,
                 design_resolution.parent_conversation_id,
                 cas,
@@ -5175,11 +5279,13 @@ mod tests {
         let last_path = fixture.input.pre_read_reports.last().unwrap().path.clone();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) = runs
-            .settle_terminal_with_completion(
-                &fixture.task_id,
-                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
-                Some(fixture.input.clone()),
+        let (settlement, completion) =
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.settle_terminal_with_completion(
+                    &fixture.task_id,
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+                    Some(fixture.input.clone()),
+                ),
             )
             .await
             .expect("bounded ambiguity must not roll back terminal settlement");
@@ -5320,14 +5426,16 @@ mod tests {
         active.update(&fixture.db.conn).await.unwrap();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) = runs
-            .settle_terminal_with_completion(
-                &fixture.task_id,
-                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                    .with_card_summary_json(
-                        r#"{"kind":"author","status":"done","plan_digest":"model"}"#,
-                    ),
-                Some(fixture.input.clone()),
+        let (settlement, completion) =
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.settle_terminal_with_completion(
+                    &fixture.task_id,
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                        .with_card_summary_json(
+                            r#"{"kind":"author","status":"done","plan_digest":"model"}"#,
+                        ),
+                    Some(fixture.input.clone()),
+                ),
             )
             .await
             .unwrap();
@@ -5349,12 +5457,18 @@ mod tests {
         active.update(&fixture.db.conn).await.unwrap();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) = runs
-            .settle_terminal_with_completion(
-                &fixture.task_id,
-                TerminalTaskWrite::failed("task_failed", Utc::now(), ConversationStatus::Cancelled)
+        let (settlement, completion) =
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.settle_terminal_with_completion(
+                    &fixture.task_id,
+                    TerminalTaskWrite::failed(
+                        "task_failed",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    )
                     .with_card_summary_json(r#"{"kind":"author","status":"done"}"#),
-                None,
+                    None,
+                ),
             )
             .await
             .unwrap();

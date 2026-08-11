@@ -67,9 +67,15 @@ pub use dto::{
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::{
-    require_v2_mutation, require_writable_conversation_workflow, CompletionEvidenceError, CompletionProtocolConfigurationRemoved,
-    CompletionRecoveryFenceError, WorkflowStoreError,
+    require_v2_mutation, require_v2_mutation_for_connection,
+    require_writable_conversation_workflow,
+    workflow_v2_publication_retired_for_conversation,
+    workflow_v2_retired_for_conversation, CompletionEvidenceError,
+    CompletionProtocolConfigurationRemoved, CompletionRecoveryFenceError, WorkflowStoreError,
+    WORKFLOW_V2_RETIRED_MESSAGE,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use error::with_historical_workflow_fixture_mutations;
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,
@@ -151,7 +157,7 @@ pub use store::{
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub use store::publish_workflow_manifest_fixture;
 #[cfg(test)]
 use store::{

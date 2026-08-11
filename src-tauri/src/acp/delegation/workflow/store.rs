@@ -53,7 +53,9 @@ use super::completion_projection::{
     load_completion_projection, load_workflow_completion_projection_batch,
     validated_design_self_review_outcome, DesignSelfReviewDecisionError,
 };
-use super::error::{require_v2_mutation, WorkflowStoreError};
+use super::error::{
+    require_v2_mutation_for_connection, WorkflowStoreError,
+};
 use super::events::{
     emit_workflow_graph_changed, emit_workflow_recovery_event, WorkflowRecoveryEvent,
 };
@@ -626,17 +628,44 @@ struct ApprovedPlanLineageReset {
 /// Production manifest publication is permanently retired. Historical
 /// manifests remain readable and are seeded through the test-only fixture.
 pub async fn publish_workflow_manifest_core(
-    _db: &AppDatabase,
+    db: &AppDatabase,
     _emitter: &EventEmitter,
-    _parent_conversation_id: i32,
+    parent_conversation_id: i32,
     _req: PublishWorkflowRequest,
 ) -> Result<PublishResult, WorkflowStoreError> {
-    Err(WorkflowStoreError::WorkflowV2Retired)
+    let error = match super::error::workflow_v2_publication_retired_for_conversation(
+        &db.conn,
+        parent_conversation_id,
+    )
+    .await
+    {
+        Ok(error) => error,
+        Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
+        Err(_) => WorkflowStoreError::workflow_v2_retired_with_navigation(
+            parent_conversation_id,
+            None,
+            false,
+        ),
+    };
+    Err(error)
 }
 
 /// Historical manifest fixture publication for read-model tests only.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub async fn publish_workflow_manifest_fixture(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: PublishWorkflowRequest,
+) -> Result<PublishResult, WorkflowStoreError> {
+    super::error::with_historical_workflow_fixture_mutations(
+        publish_workflow_manifest_fixture_inner(db, emitter, parent_conversation_id, req),
+    )
+    .await
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn publish_workflow_manifest_fixture_inner(
     db: &AppDatabase,
     emitter: &EventEmitter,
     parent_conversation_id: i32,
@@ -966,10 +995,12 @@ async fn guard_final_delivery_txn(
         .await
         .map_err(db_err)?
         .ok_or_else(|| WorkflowStoreError::NotFound(request.workflow_id.clone()))?;
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        txn,
         header.completion_protocol_version,
         &header.completion_protocol_mode,
-    )?;
+    )
+    .await?;
     let gate_state = delegation_workflow_gate_state::Entity::find_by_id((
         request.workflow_id.clone(),
         request.gate_id.clone(),
@@ -1348,10 +1379,12 @@ pub async fn recover_workflow_core(
                     .await
                     .map_err(db_err)?
                     .ok_or_else(|| WorkflowStoreError::NotFound(req.workflow_id.clone()))?;
-                require_v2_mutation(
+                require_v2_mutation_for_connection(
+                    txn,
                     header.completion_protocol_version,
                     &header.completion_protocol_mode,
-                )?;
+                )
+                .await?;
 
                 if let Some(replay) =
                     load_committed_recovery_replay_txn(txn, &header, parent_conversation_id, &req)
@@ -1948,6 +1981,19 @@ pub(super) async fn settle_workflow_gate_v2_from_fixture(
     parent_conversation_id: i32,
     req: SettleWorkflowRequest,
 ) -> Result<SettleResult, WorkflowStoreError> {
+    super::error::with_historical_workflow_fixture_mutations(
+        settle_workflow_gate_v2_from_fixture_inner(db, emitter, parent_conversation_id, req),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn settle_workflow_gate_v2_from_fixture_inner(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    parent_conversation_id: i32,
+    req: SettleWorkflowRequest,
+) -> Result<SettleResult, WorkflowStoreError> {
     let expected_review_round = if matches!(&req.evidence, SettleGateEvidence::Plan(_)) {
         delegation_workflow_gate_state::Entity::find_by_id((
             req.workflow_id.clone(),
@@ -2112,10 +2158,12 @@ pub async fn settle_workflow_gate_v2_core(
             actual_parent: guard_header.parent_conversation_id,
         });
     }
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        &db.conn,
         guard_header.completion_protocol_version,
         &guard_header.completion_protocol_mode,
-    )?;
+    )
+    .await?;
     #[cfg(test)]
     honor_settle_v2_preflight_test_gate(&req.workflow_id).await;
     require_owned_stored_v2_header(&db.conn, &req.workflow_id, parent_conversation_id).await?;
@@ -2193,10 +2241,12 @@ pub async fn settle_workflow_gate_v2_core(
             actual_parent: header.parent_conversation_id,
         });
     }
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        &db.conn,
         header.completion_protocol_version,
         &header.completion_protocol_mode,
-    )?;
+    )
+    .await?;
     if req.expected_graph_revision != header.graph_revision as u64 {
         return Err(WorkflowStoreError::StaleGraphRevision {
             expected: req.expected_graph_revision,
@@ -2363,10 +2413,12 @@ async fn settle_workflow_gate_derived_core(
                     }
 
                     if v2_expectation.is_some() {
-                        require_v2_mutation(
+                        require_v2_mutation_for_connection(
+                            txn,
                             header.completion_protocol_version,
                             &header.completion_protocol_mode,
-                        )?;
+                        )
+                        .await?;
                     }
 
                     // v1 preserves cycle-addressed replay before graph CAS. v2
@@ -3454,10 +3506,12 @@ async fn prepare_v2_design_self_review(
                         actual_parent: header.parent_conversation_id,
                     });
                 }
-                require_v2_mutation(
+                require_v2_mutation_for_connection(
+                    txn,
                     header.completion_protocol_version,
                     &header.completion_protocol_mode,
-                )?;
+                )
+                .await?;
                 if req.expected_graph_revision != header.graph_revision as u64 {
                     return Err(WorkflowStoreError::StaleGraphRevision {
                         expected: req.expected_graph_revision,
@@ -5092,7 +5146,7 @@ pub async fn load_completion_protocol_for_conversation(
         let header = load_completion_protocol_header(&db.conn, &workflow_id)
             .await?
             .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.clone()))?;
-        match require_v2_mutation(header.0, &header.1) {
+        match require_v2_mutation_for_connection(&db.conn, header.0, &header.1).await {
             Ok(()) => allowed.get_or_insert(header),
             Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly) => {
                 legacy.get_or_insert(header)
@@ -5114,7 +5168,7 @@ async fn require_stored_v2_header<C: ConnectionTrait>(
     let (version, mode) = load_completion_protocol_header(conn, workflow_id)
         .await?
         .ok_or_else(|| WorkflowStoreError::NotFound(workflow_id.to_string()))?;
-    require_v2_mutation(version, &mode)
+    require_v2_mutation_for_connection(conn, version, &mode).await
 }
 
 async fn require_owned_stored_v2_header<C: ConnectionTrait>(
@@ -5226,10 +5280,12 @@ pub async fn append_state_only_revision_txn(
         .await
         .map_err(db_err)?
         .ok_or_else(|| WorkflowStoreError::NotFound(header.workflow_id.clone()))?;
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        txn,
         current.completion_protocol_version,
         &current.completion_protocol_mode,
-    )?;
+    )
+    .await?;
     if current.active_manifest_revision != header.active_manifest_revision {
         return Err(WorkflowStoreError::StaleManifestRevision {
             expected: header.active_manifest_revision as u64,
@@ -5430,10 +5486,12 @@ async fn publish_in_txn(
                 actual_parent: by_token.parent_conversation_id,
             });
         }
-        require_v2_mutation(
+        require_v2_mutation_for_connection(
+            txn,
             by_token.completion_protocol_version,
             &by_token.completion_protocol_mode,
-        )?;
+        )
+        .await?;
         let active_digest = load_active_manifest_digest_txn(
             txn,
             &by_token.workflow_id,
@@ -5488,10 +5546,12 @@ async fn publish_in_txn(
 
     let by_parent = load_by_parent_kind_txn(txn, parent_conversation_id).await?;
     if let Some(existing) = by_parent.as_ref() {
-        require_v2_mutation(
+        require_v2_mutation_for_connection(
+            txn,
             existing.completion_protocol_version,
             &existing.completion_protocol_mode,
-        )?;
+        )
+        .await?;
     }
 
     let (workflow_id, next_manifest_rev, next_graph_rev, prior_header) =
@@ -6202,10 +6262,12 @@ async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
     }
     // Parent row may be visible before token unique index under rare timings.
     if let Some(by_parent) = load_by_parent_kind_txn(conn, parent_conversation_id).await? {
-        require_v2_mutation(
+        require_v2_mutation_for_connection(
+            conn,
             by_parent.completion_protocol_version,
             &by_parent.completion_protocol_mode,
-        )?;
+        )
+        .await?;
         if by_parent.publication_token == token {
             return Ok(Some(
                 classify_existing_header(
@@ -6239,10 +6301,12 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
             actual_parent: header.parent_conversation_id,
         });
     }
-    require_v2_mutation(
+    require_v2_mutation_for_connection(
+        conn,
         header.completion_protocol_version,
         &header.completion_protocol_mode,
-    )?;
+    )
+    .await?;
     let active_digest =
         load_active_manifest_digest_txn(conn, &header.workflow_id, header.active_manifest_revision)
             .await?;
@@ -6374,10 +6438,12 @@ async fn classify_token_race_fresh(
             if let Some(by_parent) =
                 load_by_parent_kind_txn(&db.conn, parent_conversation_id).await?
             {
-                require_v2_mutation(
+                require_v2_mutation_for_connection(
+                    &db.conn,
                     by_parent.completion_protocol_version,
                     &by_parent.completion_protocol_mode,
-                )?;
+                )
+                .await?;
                 if by_parent.publication_token == token {
                     // Token-equal parent without digest load earlier: classify now.
                     return classify_existing_header(
@@ -8675,6 +8741,70 @@ mod tests {
     use crate::web::event_bridge::WebEventBroadcaster;
     use std::sync::Arc;
 
+    async fn settle_workflow_gate_v2_core(
+        db: &AppDatabase,
+        emitter: &EventEmitter,
+        parent_conversation_id: i32,
+        request: SettleWorkflowV2Request,
+    ) -> Result<SettleResult, WorkflowStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            super::settle_workflow_gate_v2_core(
+                db,
+                emitter,
+                parent_conversation_id,
+                request,
+            ),
+        )
+        .await
+    }
+
+    async fn recover_workflow_core(
+        db: &AppDatabase,
+        emitter: &EventEmitter,
+        parent_conversation_id: i32,
+        request: RecoverWorkflowRequest,
+    ) -> Result<RecoverWorkflowResult, WorkflowStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            super::recover_workflow_core(db, emitter, parent_conversation_id, request),
+        )
+        .await
+    }
+
+    async fn guard_final_delivery_core(
+        db: &AppDatabase,
+        emitter: &EventEmitter,
+        request: FinalDeliveryGuardRequest,
+    ) -> Result<FinalDeliveryGuardResult, WorkflowStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            super::guard_final_delivery_core(db, emitter, request),
+        )
+        .await
+    }
+
+    async fn append_state_only_revision_txn(
+        txn: &DatabaseTransaction,
+        header: &delegation_workflow::Model,
+        request: StateOnlyRevisionRequest<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            super::append_state_only_revision_txn(txn, header, request, now),
+        )
+        .await
+    }
+
+    async fn append_workflow_block_revision_txn(
+        txn: &DatabaseTransaction,
+        header: &delegation_workflow::Model,
+        request: WorkflowBlockEntryRequest<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<StateOnlyRevisionResult, WorkflowStoreError> {
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            super::append_workflow_block_revision_txn(txn, header, request, now),
+        )
+        .await
+    }
+
     #[test]
     fn header_db_error_classification() {
         let permanent = [
@@ -9282,6 +9412,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_historical_publication_does_not_leak_fixture_permission() {
+        use sea_orm::PaginatorTrait;
+
+        let (db, parent) = seed_parent().await;
+        let mut document = skeleton_doc("failed-historical-publication-scope");
+        document.schema_version = MANIFEST_SCHEMA_VERSION + 1;
+        let before = delegation_workflow::Entity::find()
+            .count(&db.conn)
+            .await
+            .unwrap();
+
+        publish_workflow_manifest_fixture(
+            &db,
+            &EventEmitter::Noop,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .expect_err("invalid historical publication must fail");
+
+        assert_eq!(
+            delegation_workflow::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            before
+        );
+        let error = crate::acp::delegation::workflow::require_v2_mutation_for_connection(
+            &db.conn,
+            2,
+            &delegation_workflow::CompletionProtocolMode::V2Enforce,
+        )
+        .await
+        .expect_err("fixture permission must unwind after publication error");
+        assert_eq!(error.code(), "workflow_v2_retired");
+    }
+
+    #[tokio::test]
     async fn manifest_publication_is_retired_without_creating_a_header() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
@@ -9297,12 +9465,119 @@ mod tests {
         .await
         .expect_err("production publication must be retired");
         assert_eq!(error.code(), "workflow_v2_retired");
+        assert_eq!(error.source_conversation_id(), Some(parent));
+        assert_eq!(error.successor_conversation_id(), None);
+        assert_eq!(error.can_create_simple_successor(), Some(true));
         assert!(delegation_workflow::Entity::find()
             .filter(delegation_workflow::Column::ParentConversationId.eq(parent))
             .one(&db.conn)
             .await
             .expect("query headers")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_retired_store_mutations_stop_before_semantic_side_effects() {
+        use crate::db::entities::{
+            delegation_attention_request, delegation_workflow_gate_settlement,
+            delegation_workflow_outbox_event, recovery_authorization,
+        };
+        use sea_orm::PaginatorTrait;
+
+        async fn side_effect_counts(db: &AppDatabase) -> [u64; 5] {
+            [
+                delegation_workflow_manifest_revision::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_workflow_gate_settlement::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                recovery_authorization::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_attention_request::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+                delegation_workflow_outbox_event::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .unwrap(),
+            ]
+        }
+
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let published = publish_workflow_manifest_fixture(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("workflow-v2-retired-store-matrix"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let before = side_effect_counts(&db).await;
+
+        let settlement = super::settle_workflow_gate_v2_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowV2Request {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "missing-gate".into(),
+                expected_graph_revision: published.graph_revision,
+                expected_review_round: None,
+                expected_outcome: None,
+                summary: "must not be parsed".into(),
+                recovery_authorization_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        let recovery = super::recover_workflow_core(
+            &db,
+            &emitter,
+            parent,
+            RecoverWorkflowRequest {
+                workflow_id: published.workflow_id.clone(),
+                recovery_authorization_id: "must-not-be-consumed".into(),
+                expected_manifest_revision: published.manifest_revision,
+                correlation_id: "must-not-be-recorded".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        let delivery = super::guard_final_delivery_core(
+            &db,
+            &emitter,
+            FinalDeliveryGuardRequest {
+                workflow_id: published.workflow_id.clone(),
+                gate_id: "missing-final-gate".into(),
+                workspace_path: PathBuf::from("/must/not/read"),
+                final_reviewer_task_id: "must-not-load".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        for error in [settlement, recovery, delivery] {
+            assert_eq!(error.code(), "workflow_v2_retired");
+            assert_eq!(error.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
+        }
+        assert_eq!(side_effect_counts(&db).await, before);
+        let header = delegation_workflow::Entity::find_by_id(&published.workflow_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.active_manifest_revision as u64, published.manifest_revision);
+        assert_eq!(header.graph_revision as u64, published.graph_revision);
     }
 
     #[tokio::test]
