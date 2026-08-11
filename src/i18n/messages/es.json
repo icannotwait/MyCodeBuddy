@@ -2689,6 +2689,20 @@
         "expandGraphAria": "Expandir grafo del flujo",
         "collapseGraphAria": "Contraer grafo del flujo",
         "collapsedSummary": "Flujo {state}",
+        "archivedTitle": "Flujo archivado",
+        "archivedReadOnly": "Solo lectura",
+        "archivedContinue": "Continuar en Simple",
+        "archivedContinuing": "Continuando...",
+        "archivedOpenSuccessor": "Abrir sucesor Simple",
+        "simpleOpenPlan": "Abrir Plan",
+        "simpleOpenProgress": "Abrir progreso",
+        "simplePartialProjection": "Proyección Simple parcial",
+        "simpleProjectionWarning": "No se pudieron proyectar algunos datos del Plan o del progreso.",
+        "simpleTasks": "Tareas Simple",
+        "simpleTaskCount": "{count} tareas",
+        "simpleNoTasks": "No hay tareas en el Plan",
+        "simpleLiveRun": "Ejecución activa: {status}",
+        "simpleOutOfSync": "El estado de la tarea no está sincronizado",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} en curso",
         "gateBlocked": "{count} bloqueados",
@@ -2749,6 +2763,7 @@
           "estimated": "Estimado"
         },
         "overallState": {
+          "pending": "Pendiente",
           "skeleton": "Esqueleto",
           "estimated": "Estimado",
           "approved": "Aprobado",
@@ -2758,6 +2773,8 @@
           "observed_only": "Solo observado"
         },
         "nodeStatus": {
+          "pending": "Pendiente",
+          "in_progress": "En progreso",
           "estimated": "Estimado",
           "reserving": "Reservando",
           "running": "En ejecución",

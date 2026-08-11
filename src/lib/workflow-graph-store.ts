@@ -22,6 +22,12 @@ import {
 } from "@/lib/api"
 import type { CompletionDecisionResolvedEventPayload } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
+import {
+  getWorkspaceStateStore,
+  type WorkspaceStateStore,
+  type WorkspaceWatchToken,
+} from "@/hooks/use-workspace-state-store"
+import { joinRootRel, normalizeAbsPath } from "@/lib/file-open-target"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
   DelegationRuntimeStats,
@@ -134,6 +140,13 @@ type WorkflowGraphState = {
   activateOverlayInterest: (conversationId: number) => () => void
   /** Acquire live workflow interest and return an idempotent cleanup lease. */
   activateConversation: (conversationId: number) => () => void
+  /** Watch the exact Simple Plan/progress files through a paths-only lease. */
+  activateSimpleFileInterest: (
+    conversationId: number,
+    workspaceRootPath: string,
+    planRelPath: string,
+    progressRelPath: string
+  ) => () => void
   refresh: (conversationId: number) => Promise<void>
   getEntry: (conversationId: number) => ConversationGraphEntry | undefined
   getSnapshot: (conversationId: number) => WorkflowGraphSnapshot | null
@@ -146,6 +159,7 @@ const FIXED_PHASES: PhaseRailKind[] = ["design", "plan", "tasks", "final"]
 const EVENT_READINESS_TIMEOUT_MS = 5_000
 const ACTIVE_AUTHORITY_REFRESH_MS = 15_000
 const FALLBACK_REFRESH_MS = 10 * 60 * 1_000
+const SIMPLE_FILE_REFRESH_DEBOUNCE_MS = 150
 const SOFT_ABSENCE_ERROR = "Workflow graph snapshot unavailable"
 
 function emptyEntry(): ConversationGraphEntry {
@@ -239,6 +253,121 @@ let requiredListenerRetryTimer: ReturnType<typeof setTimeout> | null = null
 const activeConversations = new Map<number, ActiveConversationRecord>()
 const seenCompletionEvents = new Set<string>()
 let activationEpochCounter = 0
+
+type SimpleFileInterestRecord = {
+  count: number
+  workspaceStore: WorkspaceStateStore
+  watchToken: WorkspaceWatchToken
+  unsubscribe: () => void
+  debounceTimer: ReturnType<typeof setTimeout> | null
+}
+
+const simpleFileInterests = new Map<string, SimpleFileInterestRecord>()
+
+function normalizeWorkspaceFileForComparison(
+  workspaceRootPath: string,
+  relPath: string
+): string {
+  const root = normalizeAbsPath(workspaceRootPath)
+  const absolute = joinRootRel(root, relPath)
+  const caseInsensitive = /^[a-zA-Z]:\//.test(root) || root.startsWith("//")
+  return caseInsensitive ? absolute.toLowerCase() : absolute
+}
+
+function activateSimpleFileInterest(
+  get: () => WorkflowGraphState,
+  conversationId: number,
+  workspaceRootPath: string,
+  planRelPath: string,
+  progressRelPath: string
+): () => void {
+  if (
+    !Number.isSafeInteger(conversationId) ||
+    conversationId <= 0 ||
+    !workspaceRootPath.trim() ||
+    !planRelPath.trim() ||
+    !progressRelPath.trim()
+  ) {
+    return () => {}
+  }
+
+  const targets = new Set([
+    normalizeWorkspaceFileForComparison(workspaceRootPath, planRelPath),
+    normalizeWorkspaceFileForComparison(workspaceRootPath, progressRelPath),
+  ])
+  const key = JSON.stringify([
+    conversationId,
+    normalizeWorkspaceFileForComparison(workspaceRootPath, ""),
+    ...Array.from(targets).sort(),
+  ])
+  const existing = simpleFileInterests.get(key)
+  if (existing) {
+    existing.count += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (simpleFileInterests.get(key) !== existing) return
+      existing.count -= 1
+      if (existing.count > 0) return
+      if (existing.debounceTimer != null) {
+        clearTimeout(existing.debounceTimer)
+      }
+      existing.unsubscribe()
+      existing.workspaceStore.release(existing.watchToken)
+      simpleFileInterests.delete(key)
+    }
+  }
+
+  const workspaceStore = getWorkspaceStateStore(workspaceRootPath)
+  const watchToken = workspaceStore.acquire("paths")
+  const record: SimpleFileInterestRecord = {
+    count: 1,
+    workspaceStore,
+    watchToken,
+    unsubscribe: () => {},
+    debounceTimer: null,
+  }
+  record.unsubscribe = workspaceStore.subscribeEnvelopes(
+    ({ changed_paths: changedPaths }) => {
+      const relevant = changedPaths.some((changedPath) =>
+        targets.has(
+          normalizeWorkspaceFileForComparison(workspaceRootPath, changedPath)
+        )
+      )
+      if (!relevant) return
+      if (record.debounceTimer != null) clearTimeout(record.debounceTimer)
+      record.debounceTimer = setTimeout(() => {
+        record.debounceTimer = null
+        void get().refresh(conversationId)
+      }, SIMPLE_FILE_REFRESH_DEBOUNCE_MS)
+    }
+  )
+  simpleFileInterests.set(key, record)
+
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const current = simpleFileInterests.get(key)
+    if (current !== record) return
+    record.count -= 1
+    if (record.count > 0) return
+    if (record.debounceTimer != null) clearTimeout(record.debounceTimer)
+    record.unsubscribe()
+    workspaceStore.release(watchToken)
+    simpleFileInterests.delete(key)
+  }
+}
+
+function disposeSimpleFileInterests(): void {
+  for (const record of simpleFileInterests.values()) {
+    if (record.debounceTimer != null) clearTimeout(record.debounceTimer)
+    record.unsubscribe()
+    record.workspaceStore.release(record.watchToken)
+  }
+  simpleFileInterests.clear()
+}
 
 function totalInterest(active: ActiveConversationRecord): number {
   return active.overlayCount + active.expandedCount
@@ -816,6 +945,20 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   activateConversation: (conversationId) =>
     activateInterest(get, conversationId, "expanded"),
 
+  activateSimpleFileInterest: (
+    conversationId,
+    workspaceRootPath,
+    planRelPath,
+    progressRelPath
+  ) =>
+    activateSimpleFileInterest(
+      get,
+      conversationId,
+      workspaceRootPath,
+      planRelPath,
+      progressRelPath
+    ),
+
   refresh: async (conversationId) => {
     const active = activeConversations.get(conversationId)
     if (!active || totalInterest(active) <= 0) return
@@ -841,6 +984,7 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
       clearFallbackTimer(active)
     }
     activeConversations.clear()
+    disposeSimpleFileInterests()
     seenCompletionEvents.clear()
     activationEpochCounter += 1
     disposeEventListeners()

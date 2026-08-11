@@ -23,6 +23,7 @@ function statusBucket(visualStatus: string): StatusBucket {
     case "completed":
       return "completed"
     case "current":
+    case "in_progress":
     case "running":
       return "active"
     case "blocked":

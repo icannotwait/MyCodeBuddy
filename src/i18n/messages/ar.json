@@ -2689,6 +2689,20 @@
         "expandGraphAria": "توسيع مخطط سير العمل",
         "collapseGraphAria": "طي مخطط سير العمل",
         "collapsedSummary": "سير العمل {state}",
+        "archivedTitle": "سير عمل مؤرشف",
+        "archivedReadOnly": "للقراءة فقط",
+        "archivedContinue": "المتابعة في Simple",
+        "archivedContinuing": "جارٍ المتابعة...",
+        "archivedOpenSuccessor": "فتح خليفة Simple",
+        "simpleOpenPlan": "فتح Plan",
+        "simpleOpenProgress": "فتح التقدم",
+        "simplePartialProjection": "إسقاط Simple جزئي",
+        "simpleProjectionWarning": "تعذر إسقاط بعض بيانات Plan أو التقدم.",
+        "simpleTasks": "مهام Simple",
+        "simpleTaskCount": "{count} مهام",
+        "simpleNoTasks": "لا توجد مهام في Plan",
+        "simpleLiveRun": "تشغيل مباشر: {status}",
+        "simpleOutOfSync": "حالة المهمة غير متزامنة",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} قيد التشغيل",
         "gateBlocked": "{count} محظور",
@@ -2749,6 +2763,7 @@
           "estimated": "مقدّر"
         },
         "overallState": {
+          "pending": "قيد الانتظار",
           "skeleton": "هيكل",
           "estimated": "مقدّر",
           "approved": "معتمد",
@@ -2758,6 +2773,8 @@
           "observed_only": "ملاحظ فقط"
         },
         "nodeStatus": {
+          "pending": "قيد الانتظار",
+          "in_progress": "قيد التنفيذ",
           "estimated": "مقدّر",
           "reserving": "قيد الحجز",
           "running": "قيد التشغيل",

@@ -2689,6 +2689,20 @@
         "expandGraphAria": "ワークフローグラフを展開",
         "collapseGraphAria": "ワークフローグラフを折りたたむ",
         "collapsedSummary": "ワークフロー {state}",
+        "archivedTitle": "アーカイブ済みワークフロー",
+        "archivedReadOnly": "読み取り専用",
+        "archivedContinue": "Simple で続行",
+        "archivedContinuing": "続行中...",
+        "archivedOpenSuccessor": "Simple の後続を開く",
+        "simpleOpenPlan": "Plan を開く",
+        "simpleOpenProgress": "進捗を開く",
+        "simplePartialProjection": "Simple の部分投影",
+        "simpleProjectionWarning": "Plan または進捗の一部を投影できませんでした。",
+        "simpleTasks": "Simple タスク",
+        "simpleTaskCount": "{count} 件のタスク",
+        "simpleNoTasks": "Plan タスクがありません",
+        "simpleLiveRun": "実行中：{status}",
+        "simpleOutOfSync": "タスク状態が同期していません",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} 実行中",
         "gateBlocked": "{count} ブロック",
@@ -2749,6 +2763,7 @@
           "estimated": "推定"
         },
         "overallState": {
+          "pending": "待機",
           "skeleton": "スケルトン",
           "estimated": "推定",
           "approved": "承認済み",
@@ -2758,6 +2773,8 @@
           "observed_only": "観測のみ"
         },
         "nodeStatus": {
+          "pending": "待機",
+          "in_progress": "進行中",
           "estimated": "推定",
           "reserving": "予約中",
           "running": "実行中",

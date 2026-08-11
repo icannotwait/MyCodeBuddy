@@ -13,10 +13,17 @@ import {
   useState,
   useSyncExternalStore,
 } from "react"
-import { ArrowRightIcon, ChevronDownIcon, Eye } from "lucide-react"
+import {
+  AlertTriangleIcon,
+  ArrowRightIcon,
+  ChevronDownIcon,
+  Eye,
+  FileTextIcon,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
+import { useOpenLinkOrFile } from "@/components/ai-elements/link-safety"
 import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
 import { CompletionDecisionCard } from "@/components/chat/completion-decision-card"
 import { phaseProgressFragments } from "@/components/chat/workflow-phase-rail"
@@ -28,6 +35,7 @@ import {
 } from "@/lib/delegation-card"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
 import { formatConversationTitle } from "@/lib/conversation-title"
+import { joinRootRel } from "@/lib/file-open-target"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import {
   buildPhaseRail,
@@ -38,6 +46,7 @@ import {
 } from "@/lib/workflow-graph-store"
 import type {
   AgentType,
+  CompletionProjectionV2,
   WorkflowGraphSnapshot,
   WorkflowNodeSnapshot,
 } from "@/lib/types"
@@ -59,6 +68,7 @@ type LaneBooleanMap = Record<PhaseRailKind, boolean>
 interface WorkflowGraphPanelProps {
   snapshot: WorkflowGraphSnapshot
   conversationId?: number | null
+  workspaceRootPath?: string | null
   className?: string
   onResumeRoot?: () => void | Promise<void>
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
@@ -244,8 +254,253 @@ function buildOperationalLine(
   return segments.length > 0 ? segments.join(" | ") : null
 }
 
+function HistoricalCompletionCard({
+  request,
+}: {
+  request: CompletionProjectionV2
+}) {
+  const t = useTranslations("Folder.chat.workflowGraph")
+  const card = request.card
+  return (
+    <div
+      className="space-y-1.5 border-t border-border/60 pt-2"
+      data-testid="workflow-historical-completion-card"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="min-w-0 text-xs font-medium">
+          {t(
+            card.state === "resolved"
+              ? "completionResolved"
+              : card.state === "needs_decision"
+                ? "completionNeedsDecision"
+                : "completionBlocked"
+          )}
+        </span>
+        {card.evidence_validated && (
+          <span className="shrink-0 text-[10px] text-muted-foreground">
+            {t("completionEvidenceValidated")}
+          </span>
+        )}
+      </div>
+      {card.summary && (
+        <p className="break-words text-xs leading-5 text-muted-foreground">
+          {card.summary}
+        </p>
+      )}
+      {(card.source || card.report_file) && (
+        <div className="flex min-w-0 flex-wrap gap-x-3 text-[10px] text-muted-foreground">
+          {card.source && <span>{t(`completionSource.${card.source}`)}</span>}
+          {card.report_file && (
+            <span className="min-w-0 break-all">
+              {t("completionReportFile", { file: card.report_file })}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SimpleWorkflowProjection({
+  snapshot,
+  workspaceRootPath,
+  className,
+}: {
+  snapshot: WorkflowGraphSnapshot
+  workspaceRootPath?: string | null
+  className?: string
+}) {
+  const t = useTranslations("Folder.chat.workflowGraph")
+  const tLive = useTranslations("Folder.chat.liveTurnStats")
+  const tDel = useTranslations("Folder.chat.delegation")
+  const openLinkOrFile = useOpenLinkOrFile()
+  const needsLiveClock = snapshot.nodes.some((node) =>
+    isLiveNodeStatus(node.status)
+  )
+  const nowMs = useNowMs(needsLiveClock)
+  const locator = snapshot.simple ?? null
+  const partial =
+    locator == null ||
+    snapshot.projection_warning_codes.length > 0 ||
+    snapshot.nodes.some((node) => node.projection_warning_codes.length > 0)
+
+  const openFile = useCallback(
+    (relPath: string) => {
+      const target = workspaceRootPath
+        ? joinRootRel(workspaceRootPath, relPath)
+        : relPath
+      void openLinkOrFile(target)
+    },
+    [openLinkOrFile, workspaceRootPath]
+  )
+
+  const openSession = useCallback((node: WorkflowNodeSnapshot) => {
+    if (!canOpenWorkflowNode(node)) return
+    void openDelegatedChildSession({
+      childConversationId: node.latest_child_conversation_id,
+      agentType: (node.agent_type as AgentType | null) ?? null,
+      title: node.title,
+    })
+  }, [])
+
+  return (
+    <div
+      className={cn("min-w-0 space-y-2", className)}
+      data-testid="workflow-graph-panel"
+      data-compatibility="simple"
+      role="region"
+      aria-label={t("simpleTasks")}
+    >
+      {locator && (
+        <div className="flex min-w-0 gap-1.5" data-testid="simple-file-links">
+          <button
+            type="button"
+            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
+            onClick={() => openFile(locator.plan_rel_path)}
+            title={locator.plan_rel_path}
+            aria-label={t("simpleOpenPlan")}
+          >
+            <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{t("simpleOpenPlan")}</span>
+          </button>
+          <button
+            type="button"
+            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
+            data-testid="simple-progress-link"
+            onClick={() => openFile(locator.progress_rel_path)}
+            title={locator.progress_rel_path}
+            aria-label={t("simpleOpenProgress")}
+          >
+            <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{t("simpleOpenProgress")}</span>
+          </button>
+        </div>
+      )}
+
+      {partial && (
+        <div
+          className="min-w-0 border-s-2 border-amber-500 px-2 py-1 text-xs"
+          data-testid="simple-projection-warning"
+        >
+          <div className="flex min-w-0 items-center gap-1.5 font-medium">
+            <AlertTriangleIcon
+              className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+              aria-hidden
+            />
+            <span className="min-w-0 break-words">
+              {t("simplePartialProjection")}
+            </span>
+          </div>
+          <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
+            {t("simpleProjectionWarning")}
+          </p>
+        </div>
+      )}
+
+      <div className="flex min-w-0 items-center justify-between gap-2 px-1">
+        <span className="min-w-0 text-xs font-semibold">
+          {t("simpleTasks")}
+        </span>
+        <span className="shrink-0 text-[10px] text-muted-foreground">
+          {t("simpleTaskCount", { count: snapshot.nodes.length })}
+        </span>
+      </div>
+
+      {snapshot.nodes.length === 0 ? (
+        <p className="px-1 py-2 text-xs text-muted-foreground">
+          {t("simpleNoTasks")}
+        </p>
+      ) : (
+        <ul className="divide-y divide-border/60 border-y border-border/60">
+          {snapshot.nodes.map((node) => {
+            const title = nodeDisplayTitle(node)
+            const openable = canOpenWorkflowNode(node)
+            const liveRun =
+              node.latest_run_status === "running" ||
+              node.latest_run_status === "reserving"
+                ? node.latest_run_status
+                : isLiveNodeStatus(node.status)
+                  ? node.status
+                  : null
+            const operationalLine = buildOperationalLine(
+              node,
+              nowMs,
+              tLive as unknown as LiveStatsTranslator,
+              tDel as unknown as EditSegmentTranslator
+            )
+            return (
+              <li
+                key={node.node_id}
+                className="flex min-h-12 min-w-0 items-center gap-2 px-1 py-1.5"
+                data-testid={`simple-task-row-${node.node_id}`}
+                data-sync-state={node.sync_state}
+              >
+                <WorkflowStatusIcon visualStatus={node.status} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    {node.task_index != null && (
+                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
+                        {t("taskIndex", { index: node.task_index })}
+                      </span>
+                    )}
+                    <span
+                      className="min-w-0 flex-1 truncate text-xs font-medium"
+                      title={title}
+                    >
+                      {title}
+                    </span>
+                    <Badge
+                      variant="secondary"
+                      className="h-4 shrink-0 px-1 text-[10px]"
+                    >
+                      {t(`nodeStatus.${node.status}`)}
+                    </Badge>
+                  </div>
+                  {liveRun && (
+                    <p className="truncate text-[11px] text-blue-600 dark:text-blue-400">
+                      {t("simpleLiveRun", {
+                        status: t(`nodeStatus.${liveRun}`),
+                      })}
+                    </p>
+                  )}
+                  {operationalLine && (
+                    <p
+                      className="truncate text-[11px] text-muted-foreground"
+                      title={operationalLine}
+                    >
+                      {operationalLine}
+                    </p>
+                  )}
+                  {node.sync_state === "out_of_sync" && (
+                    <p className="break-words text-[11px] text-amber-700 dark:text-amber-300">
+                      {t("simpleOutOfSync")}
+                    </p>
+                  )}
+                </div>
+                {openable && (
+                  <button
+                    type="button"
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md hover:bg-muted/60"
+                    data-testid={`simple-task-open-${node.node_id}`}
+                    onClick={() => openSession(node)}
+                    title={t("openSession")}
+                    aria-label={t("openSession")}
+                  >
+                    <Eye className="size-3.5" aria-hidden />
+                  </button>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   snapshot,
+  workspaceRootPath,
   className,
   onOpenRootConversation,
 }: WorkflowGraphPanelProps) {
@@ -253,7 +508,8 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
   const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tDel = useTranslations("Folder.chat.delegation")
   const [dependenciesExpanded, setDependenciesExpanded] = useState(false)
-  const legacyReadOnly = snapshot.completion_protocol?.version === 1
+  const readOnly =
+    snapshot.archived != null || snapshot.completion_protocol?.version === 1
 
   const needsLiveClock = useMemo(
     () => snapshot.nodes.some((node) => isLiveNodeStatus(node.status)),
@@ -465,10 +721,22 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
             </button>
           )}
         </div>
-        {!legacyReadOnly && node.completion && (
-          <CompletionDecisionCard request={node.completion} />
+        {readOnly && node.completion ? (
+          <HistoricalCompletionCard request={node.completion} />
+        ) : (
+          node.completion && <CompletionDecisionCard request={node.completion} />
         )}
       </div>
+    )
+  }
+
+  if (snapshot.compatibility === "simple") {
+    return (
+      <SimpleWorkflowProjection
+        snapshot={snapshot}
+        workspaceRootPath={workspaceRootPath}
+        className={className}
+      />
     )
   }
 
@@ -479,11 +747,12 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       role="region"
       aria-label={t("graphTitle")}
     >
-      {!legacyReadOnly &&
-        snapshot.completion &&
-        !workflowCompletionIsOnNode && (
+      {snapshot.completion && !workflowCompletionIsOnNode &&
+        (readOnly ? (
+          <HistoricalCompletionCard request={snapshot.completion} />
+        ) : (
           <CompletionDecisionCard request={snapshot.completion} />
-        )}
+        ))}
       {snapshot.completion_protocol && (
         <div className="space-y-2 rounded-md border bg-muted/20 p-2 text-xs">
           {snapshot.completion_protocol.read_only_reason && (

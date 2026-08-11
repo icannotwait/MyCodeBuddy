@@ -36,15 +36,20 @@ import {
 } from "react"
 import { useTranslations } from "next-intl"
 import {
+  ArchiveIcon,
+  ArrowRightIcon,
   BotIcon,
   ChevronDownIcon,
   Eye,
+  FileTextIcon,
   GitBranch,
+  Loader2Icon,
   Maximize2,
   Minimize2,
 } from "lucide-react"
 
 import { AgentIcon } from "@/components/agent-icon"
+import { useOpenLinkOrFile } from "@/components/ai-elements/link-safety"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import { WorkflowGraphPanel } from "@/components/chat/workflow-graph-panel"
 import {
@@ -92,6 +97,9 @@ import {
 } from "@/lib/delegation-card"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { groupDelegationRuns } from "@/lib/delegation-work-unit"
+import { continueArchivedWorkflowInSimple } from "@/lib/api"
+import { toErrorMessage } from "@/lib/app-error"
+import { joinRootRel } from "@/lib/file-open-target"
 import {
   buildPhaseRail,
   canOpenWorkflowNode,
@@ -101,7 +109,7 @@ import {
   type PhaseRailKind,
   type WorkflowSegment,
 } from "@/lib/workflow-graph-store"
-import { cn } from "@/lib/utils"
+import { cn, randomUUID } from "@/lib/utils"
 
 function resolveDefaultPhaseKind(
   phases: readonly PhaseRailItem[]
@@ -143,6 +151,8 @@ interface SubAgentOverlayProps {
    * Detail reseeds do not reinstall active refresh interest.
    */
   workflowGraph?: WorkflowGraphSnapshot | null
+  /** Folder owning the conversation, used for exact Simple file watching. */
+  workspaceRootPath?: string | null
   onResumeRoot?: () => void | Promise<void>
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }
@@ -358,6 +368,138 @@ export function groupDelegationSourcesForOverlay(
   })
 }
 
+function ArchivedWorkflowBanner({
+  snapshot,
+  workspaceRootPath,
+  onOpenRootConversation,
+}: {
+  snapshot: WorkflowGraphSnapshot
+  workspaceRootPath: string | null
+  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
+}) {
+  const t = useTranslations("Folder.chat.workflowGraph")
+  const openLinkOrFile = useOpenLinkOrFile()
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const pendingRef = useRef(false)
+  const archived = snapshot.archived
+  if (!archived) return null
+
+  const successorId =
+    Number.isSafeInteger(archived.successor_conversation_id) &&
+    (archived.successor_conversation_id ?? 0) > 0
+      ? archived.successor_conversation_id!
+      : null
+  const canCreate =
+    archived.can_create_simple_successor &&
+    Number.isSafeInteger(archived.source_conversation_id) &&
+    archived.source_conversation_id > 0
+
+  const openPlan = () => {
+    if (!archived.plan_rel_path) return
+    const target = workspaceRootPath
+      ? joinRootRel(workspaceRootPath, archived.plan_rel_path)
+      : archived.plan_rel_path
+    void openLinkOrFile(target)
+  }
+
+  const continueInSimple = async () => {
+    if (pendingRef.current || !onOpenRootConversation) return
+    if (successorId == null && !canCreate) return
+
+    pendingRef.current = true
+    setPending(true)
+    setError(null)
+    try {
+      if (successorId != null) {
+        await onOpenRootConversation(successorId)
+        return
+      }
+      const requestToken = randomUUID()
+      const result = await continueArchivedWorkflowInSimple(
+        archived.source_conversation_id,
+        requestToken
+      )
+      await onOpenRootConversation(result.successor_conversation_id)
+    } catch (cause: unknown) {
+      setError(toErrorMessage(cause))
+    } finally {
+      pendingRef.current = false
+      setPending(false)
+    }
+  }
+
+  return (
+    <div
+      className="min-w-0 space-y-1.5 border-s-2 border-amber-500 px-2 py-1.5"
+      data-testid="workflow-archived-banner"
+    >
+      <div className="flex min-w-0 items-center gap-1.5">
+        <ArchiveIcon
+          className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+          aria-hidden
+        />
+        <span className="min-w-0 text-xs font-semibold">
+          {t("archivedTitle")}
+        </span>
+        <span className="shrink-0 text-[10px] text-muted-foreground">
+          {t("archivedReadOnly")}
+        </span>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {archived.plan_rel_path && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 min-w-0 text-xs"
+            onClick={openPlan}
+            title={archived.plan_rel_path}
+          >
+            <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">{t("simpleOpenPlan")}</span>
+          </Button>
+        )}
+        {(successorId != null || canCreate) && (
+          <Button
+            type="button"
+            size="sm"
+            className="h-7 min-w-0 text-xs"
+            disabled={pending || !onOpenRootConversation}
+            aria-label={
+              successorId != null
+                ? t("archivedOpenSuccessor")
+                : t("archivedContinue")
+            }
+            onClick={() => void continueInSimple()}
+          >
+            {pending ? (
+              <Loader2Icon
+                className="size-3.5 shrink-0 animate-spin"
+                aria-hidden
+              />
+            ) : (
+              <ArrowRightIcon className="size-3.5 shrink-0" aria-hidden />
+            )}
+            <span className="min-w-0 truncate">
+              {pending
+                ? t("archivedContinuing")
+                : successorId != null
+                  ? t("archivedOpenSuccessor")
+                  : t("archivedContinue")}
+            </span>
+          </Button>
+        )}
+      </div>
+      {error && (
+        <p role="alert" className="break-words text-xs text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
 export const SubAgentOverlay = memo(function SubAgentOverlay({
   delegations,
   activities = [],
@@ -365,6 +507,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   defaultExpanded = true,
   conversationId = null,
   workflowGraph = null,
+  workspaceRootPath = null,
   isActive = true,
   onResumeRoot,
   onOpenRootConversation,
@@ -403,6 +546,10 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     isExpanded &&
     activeSegment === "workflow" &&
     graphExpanded
+  const simpleLocator =
+    graph?.compatibility === "simple" ? (graph.simple ?? null) : null
+  const simplePlanRelPath = simpleLocator?.plan_rel_path ?? null
+  const simpleProgressRelPath = simpleLocator?.progress_rel_path ?? null
 
   // Detail seed only — never installs listener/activation cleanup.
   useEffect(() => {
@@ -427,6 +574,30 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     if (!expandedGraphInterestActive || conversationId == null) return
     return useWorkflowGraphStore.getState().activateConversation(conversationId)
   }, [conversationId, expandedGraphInterestActive])
+
+  useEffect(() => {
+    if (
+      !overlayInterestActive ||
+      conversationId == null ||
+      !workspaceRootPath ||
+      !simplePlanRelPath ||
+      !simpleProgressRelPath
+    ) {
+      return
+    }
+    return useWorkflowGraphStore.getState().activateSimpleFileInterest(
+      conversationId,
+      workspaceRootPath,
+      simplePlanRelPath,
+      simpleProgressRelPath
+    )
+  }, [
+    conversationId,
+    overlayInterestActive,
+    simplePlanRelPath,
+    simpleProgressRelPath,
+    workspaceRootPath,
+  ])
 
   useEffect(() => {
     sizeRef.current = size
@@ -676,7 +847,9 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
             )}
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
-            {hasGraph && activeSegment === "workflow" && (
+            {hasGraph &&
+              graph?.compatibility !== "simple" &&
+              activeSegment === "workflow" && (
               <Button
                 type="button"
                 variant="ghost"
@@ -757,114 +930,148 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
         >
           {hasGraph && activeSegment === "workflow" && graph && (
             <div className="space-y-2" data-testid="workflow-compact-body">
-              {selectedPhase && (
-                <>
-                  <WorkflowPhaseRail
-                    phases={phaseRail}
-                    selectedKind={selectedPhase.kind}
-                    onSelectKind={(kind) => {
-                      setSelectedPhaseKind(kind)
-                      setPhaseSelectionDirty(true)
-                    }}
-                  />
-                  <div
-                    className="px-1 text-xs text-muted-foreground"
-                    data-testid="workflow-phase-summary"
-                  >
-                    {[
-                      tw(`phaseStatus.${selectedPhase.status}`),
-                      ...phaseProgressFragments(selectedPhase, tw),
-                    ].join(" · ")}
-                  </div>
-                </>
+              {graph.archived && (
+                <ArchivedWorkflowBanner
+                  snapshot={graph}
+                  workspaceRootPath={workspaceRootPath}
+                  onOpenRootConversation={onOpenRootConversation}
+                />
               )}
-              {currentNodes.length > 0 && (
-                <div
-                  className="flex min-w-0 flex-col gap-1 px-1"
-                  data-testid="workflow-summary-current-nodes"
-                >
-                  {currentNodes.slice(0, 2).map((node) => {
-                    const openable = canOpenWorkflowNode(node)
-                    const title =
-                      node.title?.trim() || node.summary?.trim() || node.node_id
-                    const content = (
-                      <>
-                        <WorkflowStatusIcon visualStatus={node.status} />
-                        <span className="min-w-0 flex-1 truncate text-xs font-medium">
-                          {title}
-                        </span>
-                        <span className="shrink-0 text-[10px] text-muted-foreground">
-                          {tw(`nodeStatus.${node.status}`)}
-                        </span>
-                        {node.role && (
-                          <Badge variant="outline" className="h-4 text-[10px]">
-                            {tw("roleLabel", { role: node.role })}
-                          </Badge>
-                        )}
-                        {node.agent_type && (
-                          <Badge variant="outline" className="h-4 text-[10px]">
-                            {tw("agentLabel", { agent: node.agent_type })}
-                          </Badge>
-                        )}
-                        {node.round_count != null && node.round_count > 0 && (
-                          <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
-                            {tw("roundCount", { count: node.round_count })}
-                          </span>
-                        )}
-                      </>
-                    )
-                    const rowClass =
-                      "flex min-w-0 w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-start"
-                    if (openable) {
-                      return (
-                        <button
-                          key={node.node_id}
-                          type="button"
-                          className={cn(
-                            rowClass,
-                            "hover:bg-muted/60 transition-colors"
-                          )}
-                          data-testid={`workflow-summary-current-node-${node.node_id}`}
-                          onClick={() => {
-                            void openDelegatedChildSession({
-                              childConversationId:
-                                node.latest_child_conversation_id,
-                              agentType:
-                                (node.agent_type as AgentType | null) ?? null,
-                              title: node.title,
-                            })
-                          }}
-                        >
-                          {content}
-                        </button>
-                      )
-                    }
-                    return (
-                      <div
-                        key={node.node_id}
-                        className={rowClass}
-                        data-testid={`workflow-summary-current-node-${node.node_id}`}
-                      >
-                        {content}
-                      </div>
-                    )
-                  })}
-                  {currentNodes.length > 2 && (
-                    <span className="shrink-0 text-[10px] text-muted-foreground">
-                      {tw("moreCurrentNodes", {
-                        count: currentNodes.length - 2,
-                      })}
-                    </span>
-                  )}
-                </div>
-              )}
-              {graphExpanded && (
+              {graph.compatibility === "simple" ? (
                 <WorkflowGraphPanel
                   snapshot={graph}
                   conversationId={conversationId}
+                  workspaceRootPath={workspaceRootPath}
                   onResumeRoot={onResumeRoot}
                   onOpenRootConversation={onOpenRootConversation}
                 />
+              ) : (
+                <>
+                  {selectedPhase && (
+                    <>
+                      <WorkflowPhaseRail
+                        phases={phaseRail}
+                        selectedKind={selectedPhase.kind}
+                        onSelectKind={(kind) => {
+                          setSelectedPhaseKind(kind)
+                          setPhaseSelectionDirty(true)
+                        }}
+                      />
+                      <div
+                        className="px-1 text-xs text-muted-foreground"
+                        data-testid="workflow-phase-summary"
+                      >
+                        {[
+                          tw(`phaseStatus.${selectedPhase.status}`),
+                          ...phaseProgressFragments(selectedPhase, tw),
+                        ].join(" · ")}
+                      </div>
+                    </>
+                  )}
+                  {currentNodes.length > 0 && (
+                    <div
+                      className="flex min-w-0 flex-col gap-1 px-1"
+                      data-testid="workflow-summary-current-nodes"
+                    >
+                      {currentNodes.slice(0, 2).map((node) => {
+                        const openable = canOpenWorkflowNode(node)
+                        const title =
+                          node.title?.trim() ||
+                          node.summary?.trim() ||
+                          node.node_id
+                        const content = (
+                          <>
+                            <WorkflowStatusIcon visualStatus={node.status} />
+                            <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                              {title}
+                            </span>
+                            <span className="shrink-0 text-[10px] text-muted-foreground">
+                              {tw(`nodeStatus.${node.status}`)}
+                            </span>
+                            {node.role && (
+                              <Badge
+                                variant="outline"
+                                className="h-4 text-[10px]"
+                              >
+                                {tw("roleLabel", { role: node.role })}
+                              </Badge>
+                            )}
+                            {node.agent_type && (
+                              <Badge
+                                variant="outline"
+                                className="h-4 text-[10px]"
+                              >
+                                {tw("agentLabel", {
+                                  agent: node.agent_type,
+                                })}
+                              </Badge>
+                            )}
+                            {node.round_count != null &&
+                              node.round_count > 0 && (
+                                <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
+                                  {tw("roundCount", {
+                                    count: node.round_count,
+                                  })}
+                                </span>
+                              )}
+                          </>
+                        )
+                        const rowClass =
+                          "flex min-w-0 w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-start"
+                        if (openable) {
+                          return (
+                            <button
+                              key={node.node_id}
+                              type="button"
+                              className={cn(
+                                rowClass,
+                                "hover:bg-muted/60 transition-colors"
+                              )}
+                              data-testid={`workflow-summary-current-node-${node.node_id}`}
+                              onClick={() => {
+                                void openDelegatedChildSession({
+                                  childConversationId:
+                                    node.latest_child_conversation_id,
+                                  agentType:
+                                    (node.agent_type as AgentType | null) ??
+                                    null,
+                                  title: node.title,
+                                })
+                              }}
+                            >
+                              {content}
+                            </button>
+                          )
+                        }
+                        return (
+                          <div
+                            key={node.node_id}
+                            className={rowClass}
+                            data-testid={`workflow-summary-current-node-${node.node_id}`}
+                          >
+                            {content}
+                          </div>
+                        )
+                      })}
+                      {currentNodes.length > 2 && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {tw("moreCurrentNodes", {
+                            count: currentNodes.length - 2,
+                          })}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {graphExpanded && (
+                    <WorkflowGraphPanel
+                      snapshot={graph}
+                      conversationId={conversationId}
+                      workspaceRootPath={workspaceRootPath}
+                      onResumeRoot={onResumeRoot}
+                      onOpenRootConversation={onOpenRootConversation}
+                    />
+                  )}
+                </>
               )}
             </div>
           )}

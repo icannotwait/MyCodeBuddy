@@ -11,7 +11,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
-import { getWorkflowGraphSnapshot, resolveCompletionDecision } from "@/lib/api"
+import {
+  continueArchivedWorkflowInSimple,
+  getWorkflowGraphSnapshot,
+  resolveCompletionDecision,
+} from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type {
   CompletionProjectionV2,
@@ -22,6 +26,14 @@ import {
   __resetWorkflowGraphStoreForTests,
   useWorkflowGraphStore,
 } from "@/lib/workflow-graph-store"
+
+const { openWorkflowFile } = vi.hoisted(() => ({
+  openWorkflowFile: vi.fn(async () => {}),
+}))
+
+vi.mock("@/components/ai-elements/link-safety", () => ({
+  useOpenLinkOrFile: () => openWorkflowFile,
+}))
 
 vi.mock("@/hooks/use-delegated-sub-session", () => ({
   useDelegatedSubSession: vi.fn(() => ({
@@ -55,6 +67,7 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api")
   return {
     ...actual,
+    continueArchivedWorkflowInSimple: vi.fn(),
     getWorkflowGraphSnapshot: vi.fn(async () => null),
     resolveCompletionDecision: vi.fn(),
     subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
@@ -369,9 +382,12 @@ function adaptiveTaskGraph(
   }
 }
 
-function renderWithIntl(ui: React.ReactElement) {
+function renderWithIntl(
+  ui: React.ReactElement,
+  messages: typeof enMessages = enMessages
+) {
   return render(
-    <NextIntlClientProvider locale="en" messages={enMessages}>
+    <NextIntlClientProvider locale="en" messages={messages}>
       {ui}
     </NextIntlClientProvider>
   )
@@ -406,9 +422,130 @@ function completionProjection(
   }
 }
 
+function archivedGraph(
+  overrides: Partial<WorkflowGraphSnapshot> = {}
+): WorkflowGraphSnapshot {
+  const graph = skeletonGraph()
+  return {
+    ...graph,
+    completion: completionProjection({
+      card: {
+        ...completionProjection().card,
+        summary: "Historical implementation report",
+        report_file: "reports/task-7.md",
+        evidence_validated: true,
+      },
+    }),
+    completion_protocol: {
+      version: 2,
+      mode: "v2_enforce",
+      creation_mode: "v2_enforce",
+      legacy_source: null,
+      v2_successor: null,
+      read_only_reason: null,
+      automatic_root_wake: false,
+    },
+    archived: {
+      source_conversation_id: 42,
+      plan_rel_path: "docs/superpowers/plans/archive.md",
+      successor_conversation_id: null,
+      can_create_simple_successor: true,
+    },
+    ...overrides,
+  }
+}
+
+function simpleGraph(): WorkflowGraphSnapshot {
+  return {
+    schema_version: 1,
+    workflow_kind: "brainstorm_to_delivery",
+    compatibility: "simple",
+    overall_state: "blocked",
+    simple: {
+      plan_rel_path: "docs/superpowers/plans/simple.md",
+      progress_rel_path: ".superpowers/sdd/42/progress.md",
+      source_conversation_id: 7,
+    },
+    projection_warning_codes: ["simple_progress_block_missing"],
+    current_phase_id: "tasks",
+    current_node_ids: ["simple-task-5"],
+    phases: [{ id: "tasks", kind: "tasks", title: null }],
+    nodes: [
+      node({
+        node_id: "simple-task-1",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 1,
+        title: "Pending task",
+        status: "pending",
+      }),
+      node({
+        node_id: "simple-task-2",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 2,
+        title: "Declared in-progress task",
+        status: "in_progress",
+      }),
+      node({
+        node_id: "simple-task-3",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 3,
+        title: "Completed task",
+        status: "completed",
+      }),
+      node({
+        node_id: "simple-task-4",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 4,
+        title: "Blocked task",
+        status: "blocked",
+        sync_state: "out_of_sync",
+        projection_warning_codes: ["simple_completed_task_missing_commit"],
+      }),
+      node({
+        node_id: "simple-task-5",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 5,
+        title: "Live child activity",
+        status: "running",
+        latest_run_status: "running",
+        latest_child_conversation_id: 105,
+        latest_task_id: "task-live",
+        is_observed: true,
+        run_count: 1,
+        started_at: "2026-08-11T00:00:00.000Z",
+        tool_call_count: 4,
+      }),
+    ],
+    edges: [
+      { from: "simple-task-1", to: "simple-task-2" },
+      { from: "simple-task-2", to: "simple-task-3" },
+    ],
+    gates: [
+      {
+        gate_id: "must-not-render",
+        gate_kind: "tasks",
+        resolution_mode: "parent_adjudication",
+        required_reviewer_node_ids: ["simple-task-1"],
+        required_count: 1,
+        returned_count: 0,
+        running_count: 0,
+        blocked_count: 0,
+      },
+    ],
+    completion: completionProjection(),
+  }
+}
+
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   vi.mocked(openDelegatedChildSession).mockClear()
+  openWorkflowFile.mockClear()
+  vi.mocked(continueArchivedWorkflowInSimple).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
   vi.mocked(resolveCompletionDecision).mockReset()
@@ -416,6 +553,143 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe("Task 7 archived and Simple workflow rendering", () => {
+  it("keeps archived history navigable while removing every mutation affordance", async () => {
+    const onOpenRootConversation = vi.fn()
+    const graph = archivedGraph({
+      archived: {
+        source_conversation_id: 42,
+        plan_rel_path: "docs/superpowers/plans/archive.md",
+        successor_conversation_id: 84,
+        can_create_simple_successor: false,
+      },
+    })
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        conversationId={42}
+        workflowGraph={graph}
+        workspaceRootPath={"D:\\Repo"}
+        onOpenRootConversation={onOpenRootConversation}
+      />
+    )
+
+    expect(screen.getByTestId("workflow-archived-banner")).toHaveTextContent(
+      "Archived workflow"
+    )
+    await userEvent.click(screen.getByRole("button", { name: "Open Plan" }))
+    expect(openWorkflowFile).toHaveBeenCalledWith(
+      "D:/Repo/docs/superpowers/plans/archive.md"
+    )
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open Simple successor" })
+    )
+    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
+    expect(continueArchivedWorkflowInSimple).not.toHaveBeenCalled()
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Expand workflow graph" })
+    )
+    expect(screen.getByText("Historical implementation report")).toBeVisible()
+    expect(screen.getByText("Report: reports/task-7.md")).toBeVisible()
+    expect(screen.getAllByText("0 / 2").length).toBeGreaterThan(0)
+    await userEvent.click(
+      screen.getByTestId("workflow-graph-node-open-n-req")
+    )
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({ childConversationId: 77 })
+    )
+
+    expect(screen.queryAllByTestId("completion-decision-card")).toHaveLength(0)
+    expect(screen.queryByRole("button", { name: "Done" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Retry artifact" })).toBeNull()
+  })
+
+  it("renders Simple task state, live activity, bounded warnings, and exact file links", async () => {
+    const messages = structuredClone(enMessages)
+    messages.Folder.chat.workflowGraph.simpleOpenProgress =
+      "Open the deliberately long translated progress document label"
+
+    renderWithIntl(
+      <div className="w-72">
+        <SubAgentOverlay
+          delegations={[]}
+          conversationId={42}
+          workflowGraph={simpleGraph()}
+          workspaceRootPath="/repo"
+        />
+      </div>,
+      messages
+    )
+
+    expect(
+      within(screen.getByTestId("simple-task-row-simple-task-1")).getByText(
+        "Pending"
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByTestId("simple-task-row-simple-task-2")).getByText(
+        "In progress"
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByTestId("simple-task-row-simple-task-3")).getByText(
+        "Completed"
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByTestId("simple-task-row-simple-task-4")).getByText(
+        "Blocked"
+      )
+    ).toBeVisible()
+    expect(screen.getByText("Partial Simple projection")).toBeVisible()
+    expect(screen.getByText("Task status is out of sync")).toBeVisible()
+    expect(screen.getByText("Live run: Running")).toBeVisible()
+
+    await userEvent.click(
+      screen.getByTestId("simple-task-open-simple-task-5")
+    )
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({ childConversationId: 105 })
+    )
+
+    await userEvent.click(screen.getByRole("button", { name: "Open Plan" }))
+    await userEvent.click(screen.getByTestId("simple-progress-link"))
+    expect(openWorkflowFile).toHaveBeenNthCalledWith(
+      1,
+      "/repo/docs/superpowers/plans/simple.md"
+    )
+    expect(openWorkflowFile).toHaveBeenNthCalledWith(
+      2,
+      "/repo/.superpowers/sdd/42/progress.md"
+    )
+    expect(screen.getByTestId("simple-progress-link")).toHaveClass("min-w-0")
+
+    expect(screen.queryByText("Reviewer cohort")).toBeNull()
+    expect(screen.queryByText("Decision required")).toBeNull()
+    expect(screen.queryByText("Evidence validated")).toBeNull()
+    expect(screen.queryByText("0 / 1")).toBeNull()
+  })
+
+  it("marks a Simple projection partial when warnings exist only on tasks", () => {
+    const graph = simpleGraph()
+    graph.projection_warning_codes = []
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        conversationId={42}
+        workflowGraph={graph}
+        workspaceRootPath="/repo"
+      />
+    )
+
+    expect(screen.getByText("Partial Simple projection")).toBeVisible()
+  })
 })
 
 describe("SubAgentOverlay A13 workflow mount", () => {

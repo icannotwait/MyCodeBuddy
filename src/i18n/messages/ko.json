@@ -2689,6 +2689,20 @@
         "expandGraphAria": "워크플로 그래프 펼치기",
         "collapseGraphAria": "워크플로 그래프 접기",
         "collapsedSummary": "워크플로 {state}",
+        "archivedTitle": "보관된 워크플로",
+        "archivedReadOnly": "읽기 전용",
+        "archivedContinue": "Simple에서 계속",
+        "archivedContinuing": "계속하는 중...",
+        "archivedOpenSuccessor": "Simple 후속 대화 열기",
+        "simpleOpenPlan": "Plan 열기",
+        "simpleOpenProgress": "진행 상황 열기",
+        "simplePartialProjection": "부분 Simple 프로젝션",
+        "simpleProjectionWarning": "일부 Plan 또는 진행 데이터를 표시할 수 없습니다.",
+        "simpleTasks": "Simple 작업",
+        "simpleTaskCount": "작업 {count}개",
+        "simpleNoTasks": "Plan 작업이 없습니다",
+        "simpleLiveRun": "실시간 실행: {status}",
+        "simpleOutOfSync": "작업 상태가 동기화되지 않음",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} 실행 중",
         "gateBlocked": "{count} 차단됨",
@@ -2749,6 +2763,7 @@
           "estimated": "예상"
         },
         "overallState": {
+          "pending": "대기",
           "skeleton": "골격",
           "estimated": "예상",
           "approved": "승인됨",
@@ -2758,6 +2773,8 @@
           "observed_only": "관측만"
         },
         "nodeStatus": {
+          "pending": "대기",
+          "in_progress": "진행 중",
           "estimated": "예상",
           "reserving": "예약 중",
           "running": "실행 중",

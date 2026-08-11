@@ -13,6 +13,7 @@ const {
   subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
   subscribeWorkflowCompatibilityNudge,
+  getWorkspaceStateStore,
 } = vi.hoisted(() => ({
   WORKFLOW_GRAPH_CHANGED_EVENT: "workflow_graph://changed",
   WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT:
@@ -21,6 +22,7 @@ const {
   subscribeCompletionDecisionResolved: vi.fn(async () => () => {}),
   subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
   subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
+  getWorkspaceStateStore: vi.fn(),
 }))
 
 // Pass hoisted mocks through directly — do not re-wrap with `...args: unknown[]`
@@ -32,6 +34,10 @@ vi.mock("@/lib/api", () => ({
   subscribeCompletionDecisionResolved,
   subscribeWorkflowGraphChanged,
   subscribeWorkflowCompatibilityNudge,
+}))
+
+vi.mock("@/hooks/use-workspace-state-store", () => ({
+  getWorkspaceStateStore,
 }))
 
 import {
@@ -205,6 +211,39 @@ function settledSnapshot(
   })
 }
 
+function simpleSnapshot(
+  overrides: Partial<WorkflowGraphSnapshot> = {}
+): WorkflowGraphSnapshot {
+  return baseSnapshot({
+    workflow_id: null,
+    manifest_revision: null,
+    graph_revision: null,
+    manifest_state: null,
+    compatibility: "simple",
+    overall_state: "in_progress",
+    simple: {
+      plan_rel_path: "docs/Plan.md",
+      progress_rel_path: ".superpowers/sdd/42/progress.md",
+      source_conversation_id: 7,
+    },
+    current_phase_id: "tasks",
+    current_node_ids: ["simple-task-1"],
+    phases: [{ id: "tasks", kind: "tasks", title: null }],
+    nodes: [
+      node({
+        node_id: "simple-task-1",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 1,
+        title: "Current projection",
+        status: "in_progress",
+      }),
+    ],
+    gates: [],
+    ...overrides,
+  })
+}
+
 type Deferred<T> = {
   promise: Promise<T>
   resolve: (value: T) => void
@@ -227,12 +266,54 @@ async function flushMicrotasks(): Promise<void> {
   }
 }
 
+type WorkspaceEnvelope = {
+  seq: number
+  kind: string
+  fs_event_kind?: string
+  changed_paths: string[]
+}
+
+let workspaceEnvelopeListeners = new Set<
+  (envelope: WorkspaceEnvelope) => void
+>()
+const workspaceAcquire = vi.fn(() => ({ mode: "paths" as const }))
+const workspaceRelease = vi.fn()
+const workspaceUnsubscribe = vi.fn()
+
+function emitWorkspacePaths(changedPaths: string[]): void {
+  const envelope = {
+    seq: 1,
+    kind: "fs_change",
+    fs_event_kind: "modify",
+    changed_paths: changedPaths,
+  }
+  for (const listener of workspaceEnvelopeListeners) listener(envelope)
+}
+
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
   getWorkflowGraphSnapshot.mockReset()
   subscribeWorkflowGraphChanged.mockReset()
   subscribeCompletionDecisionResolved.mockReset()
   subscribeWorkflowCompatibilityNudge.mockReset()
+  getWorkspaceStateStore.mockReset()
+  workspaceEnvelopeListeners = new Set()
+  workspaceAcquire.mockClear()
+  workspaceRelease.mockClear()
+  workspaceUnsubscribe.mockClear()
+  getWorkspaceStateStore.mockReturnValue({
+    acquire: workspaceAcquire,
+    release: workspaceRelease,
+    subscribeEnvelopes: vi.fn(
+      (listener: (envelope: WorkspaceEnvelope) => void) => {
+        workspaceEnvelopeListeners.add(listener)
+        return () => {
+          workspaceEnvelopeListeners.delete(listener)
+          workspaceUnsubscribe()
+        }
+      }
+    ),
+  })
   subscribeWorkflowGraphChanged.mockResolvedValue(() => {})
   subscribeCompletionDecisionResolved.mockResolvedValue(() => {})
   subscribeWorkflowCompatibilityNudge.mockResolvedValue(() => {})
@@ -240,6 +321,176 @@ beforeEach(() => {
 
 afterEach(() => {
   __resetWorkflowGraphStoreForTests()
+})
+
+describe("Simple workspace exact-path refresh", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  async function activateSimpleWatch(conversationId = 310) {
+    getWorkflowGraphSnapshot.mockResolvedValue(simpleSnapshot())
+    const releaseOverlay = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(conversationId)
+    await flushMicrotasks()
+    getWorkflowGraphSnapshot.mockClear()
+    const releaseFiles = useWorkflowGraphStore
+      .getState()
+      .activateSimpleFileInterest(
+        conversationId,
+        "C:\\Repo",
+        "docs/Plan.md",
+        ".superpowers/sdd/42/progress.md"
+      )
+    return { releaseOverlay, releaseFiles }
+  }
+
+  it("ignores unrelated, folder, prefix, suffix, and POSIX case lookalike paths", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatch()
+
+    emitWorkspacePaths([
+      "docs",
+      "docs/Plan.md.bak",
+      "archive/docs/Plan.md",
+      ".superpowers/sdd/42/progress.md.tmp",
+      ".superpowers/sdd/420/progress.md",
+      "README.md",
+    ])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    releaseFiles()
+    releaseOverlay()
+
+    getWorkflowGraphSnapshot.mockResolvedValue(simpleSnapshot())
+    const releasePosixOverlay = useWorkflowGraphStore
+      .getState()
+      .activateOverlayInterest(311)
+    await flushMicrotasks()
+    getWorkflowGraphSnapshot.mockClear()
+    const releasePosixFiles = useWorkflowGraphStore
+      .getState()
+      .activateSimpleFileInterest(
+        311,
+        "/repo",
+        "docs/Plan.md",
+        ".superpowers/sdd/42/progress.md"
+      )
+    emitWorkspacePaths(["docs/plan.md"])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    releasePosixFiles()
+    releasePosixOverlay()
+  })
+
+  it("debounces exact normalized Plan and progress bursts to one refresh each", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatch()
+
+    emitWorkspacePaths(["DOCS\\PLAN.MD"])
+    emitWorkspacePaths(["docs/./Plan.md"])
+    emitWorkspacePaths([".superpowers\\sdd\\42\\progress.md"])
+    await vi.advanceTimersByTimeAsync(149)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(1)
+
+    emitWorkspacePaths([".superpowers/sdd/42/progress.md"])
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    releaseFiles()
+    releaseOverlay()
+    expect(workspaceAcquire).toHaveBeenCalledWith("paths")
+    expect(workspaceUnsubscribe).toHaveBeenCalledTimes(1)
+    expect(workspaceRelease).toHaveBeenCalledTimes(1)
+  })
+
+  it("shares path watches and cancels a pending refresh on final cleanup", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatch(313)
+    const releaseDuplicate = useWorkflowGraphStore
+      .getState()
+      .activateSimpleFileInterest(
+        313,
+        "C:\\Repo",
+        "docs/Plan.md",
+        ".superpowers/sdd/42/progress.md"
+      )
+
+    expect(workspaceAcquire).toHaveBeenCalledTimes(1)
+    emitWorkspacePaths(["docs/Plan.md"])
+    releaseFiles()
+    expect(workspaceUnsubscribe).not.toHaveBeenCalled()
+    releaseDuplicate()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    expect(workspaceUnsubscribe).toHaveBeenCalledTimes(1)
+    expect(workspaceRelease).toHaveBeenCalledTimes(1)
+    releaseOverlay()
+  })
+
+  it("prevents an older exact-path request from overwriting a newer projection", async () => {
+    const { releaseOverlay, releaseFiles } = await activateSimpleWatch(312)
+    const stale = deferred<WorkflowGraphSnapshot | null>()
+    const current = deferred<WorkflowGraphSnapshot | null>()
+    getWorkflowGraphSnapshot
+      .mockReturnValueOnce(stale.promise)
+      .mockReturnValueOnce(current.promise)
+
+    emitWorkspacePaths(["docs/Plan.md"])
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    emitWorkspacePaths([".superpowers/sdd/42/progress.md"])
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+
+    current.resolve(
+      simpleSnapshot({
+        nodes: [
+          node({
+            node_id: "simple-task-1",
+            kind: "task",
+            phase_id: "tasks",
+            task_index: 1,
+            title: "New projection",
+            status: "completed",
+          }),
+        ],
+      })
+    )
+    await flushMicrotasks()
+    stale.resolve(
+      simpleSnapshot({
+        nodes: [
+          node({
+            node_id: "simple-task-1",
+            kind: "task",
+            phase_id: "tasks",
+            task_index: 1,
+            title: "Stale projection",
+            status: "pending",
+          }),
+        ],
+      })
+    )
+    await flushMicrotasks()
+
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(312)?.nodes[0]?.title
+    ).toBe("New projection")
+
+    releaseFiles()
+    releaseOverlay()
+  })
 })
 
 describe("workflow-graph-store revision gate", () => {

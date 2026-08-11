@@ -2689,6 +2689,20 @@
         "expandGraphAria": "Développer le graphe",
         "collapseGraphAria": "Réduire le graphe",
         "collapsedSummary": "Flux {state}",
+        "archivedTitle": "Flux archivé",
+        "archivedReadOnly": "Lecture seule",
+        "archivedContinue": "Continuer dans Simple",
+        "archivedContinuing": "Continuation...",
+        "archivedOpenSuccessor": "Ouvrir le successeur Simple",
+        "simpleOpenPlan": "Ouvrir le Plan",
+        "simpleOpenProgress": "Ouvrir la progression",
+        "simplePartialProjection": "Projection Simple partielle",
+        "simpleProjectionWarning": "Certaines données du Plan ou de progression n'ont pas pu être projetées.",
+        "simpleTasks": "Tâches Simple",
+        "simpleTaskCount": "{count} tâches",
+        "simpleNoTasks": "Aucune tâche dans le Plan",
+        "simpleLiveRun": "Exécution active : {status}",
+        "simpleOutOfSync": "L'état de la tâche est désynchronisé",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} en cours",
         "gateBlocked": "{count} bloqués",
@@ -2749,6 +2763,7 @@
           "estimated": "Estimé"
         },
         "overallState": {
+          "pending": "En attente",
           "skeleton": "Squelette",
           "estimated": "Estimé",
           "approved": "Approuvé",
@@ -2758,6 +2773,8 @@
           "observed_only": "Observé uniquement"
         },
         "nodeStatus": {
+          "pending": "En attente",
+          "in_progress": "En cours",
           "estimated": "Estimé",
           "reserving": "Réservation",
           "running": "En cours",

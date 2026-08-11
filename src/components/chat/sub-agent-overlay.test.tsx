@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -10,8 +10,13 @@ import enMessages from "@/i18n/messages/en.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import { continueArchivedWorkflowInSimple } from "@/lib/api"
 import { getActiveBackendCacheKey } from "@/lib/transport"
-import type { DelegationRunSnapshot } from "@/lib/types"
+import type {
+  DelegationRunSnapshot,
+  SimpleSuccessorResult,
+  WorkflowGraphSnapshot,
+} from "@/lib/types"
 
 // The rows resolve their model from `useDelegatedSubSession` (live binding) and
 // the connections store (child pending-permission). Stub both — the same
@@ -44,6 +49,18 @@ vi.mock("@/lib/open-delegated-child-session", () => ({
   openDelegatedChildSession: (...args: unknown[]) =>
     openDelegatedChildSession(...args),
 }))
+
+vi.mock("@/components/ai-elements/link-safety", () => ({
+  useOpenLinkOrFile: () => vi.fn(async () => {}),
+}))
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api")
+  return {
+    ...actual,
+    continueArchivedWorkflowInSimple: vi.fn(),
+  }
+})
 
 const { useDelegatedSubSession } =
   await import("@/hooks/use-delegated-sub-session")
@@ -124,12 +141,50 @@ function snapshotCacheKey(
   return `${getActiveBackendCacheKey()}\0${parentConversationId}\0${taskId}`
 }
 
+function archivedSnapshot(): WorkflowGraphSnapshot {
+  return {
+    schema_version: 1,
+    workflow_id: "archived-workflow",
+    workflow_kind: "brainstorm_to_delivery",
+    manifest_revision: 3,
+    graph_revision: 7,
+    manifest_state: "approved",
+    compatibility: "manifest",
+    overall_state: "approved",
+    archived: {
+      source_conversation_id: 42,
+      plan_rel_path: "docs/plan.md",
+      successor_conversation_id: null,
+      can_create_simple_successor: true,
+    },
+    projection_warning_codes: [],
+    current_phase_id: null,
+    current_node_ids: [],
+    phases: [],
+    nodes: [],
+    edges: [],
+    gates: [],
+  }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((accept) => {
+    resolve = accept
+  })
+  return { promise, resolve }
+}
+
 describe("SubAgentOverlay", () => {
   beforeEach(() => {
     localStorage.clear()
     delegationRunSnapshotCache.reset()
     bindings = {}
     openDelegatedChildSession.mockClear()
+    vi.mocked(continueArchivedWorkflowInSimple).mockReset()
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
       binding: bindings[id],
@@ -144,6 +199,108 @@ describe("SubAgentOverlay", () => {
       <SubAgentOverlay delegations={[]} overlayKey="k-empty" />
     )
     expect(container.firstChild).toBeNull()
+  })
+
+  it("deduplicates an archived successor action with one stable request token", async () => {
+    const pending = deferred<SimpleSuccessorResult>()
+    const onOpenRootConversation = vi.fn()
+    vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(pending.promise)
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        workflowGraph={archivedSnapshot()}
+        onOpenRootConversation={onOpenRootConversation}
+      />
+    )
+
+    const action = screen.getByRole("button", { name: "Continue in Simple" })
+    fireEvent.click(action)
+    fireEvent.click(action)
+
+    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
+    const [sourceConversationId, requestToken] = vi.mocked(
+      continueArchivedWorkflowInSimple
+    ).mock.calls[0]
+    expect(sourceConversationId).toBe(42)
+    expect(requestToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
+    expect(action).toBeDisabled()
+
+    await act(async () => {
+      pending.resolve({
+        successor_conversation_id: 84,
+        created: true,
+        plan_rel_path: "docs/plan.md",
+        progress_rel_path: ".superpowers/sdd/84/progress.md",
+        bootstrap_prompt: "Continue the archived workflow.",
+      })
+      await pending.promise
+    })
+    expect(onOpenRootConversation).toHaveBeenCalledTimes(1)
+    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
+  })
+
+  it("deduplicates navigation while an existing Simple successor is opening", async () => {
+    const navigation = deferred<void>()
+    const onOpenRootConversation = vi.fn(() => navigation.promise)
+    const snapshot = archivedSnapshot()
+    snapshot.archived = {
+      ...snapshot.archived!,
+      successor_conversation_id: 84,
+      can_create_simple_successor: false,
+    }
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        workflowGraph={snapshot}
+        onOpenRootConversation={onOpenRootConversation}
+      />
+    )
+
+    const action = screen.getByRole("button", {
+      name: "Open Simple successor",
+    })
+    fireEvent.click(action)
+    fireEvent.click(action)
+
+    expect(onOpenRootConversation).toHaveBeenCalledTimes(1)
+    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
+    expect(continueArchivedWorkflowInSimple).not.toHaveBeenCalled()
+    expect(action).toBeDisabled()
+
+    await act(async () => {
+      navigation.resolve()
+      await navigation.promise
+    })
+  })
+
+  it("keeps archived source history visible when successor creation fails", async () => {
+    vi.mocked(continueArchivedWorkflowInSimple).mockRejectedValue(
+      new Error("Unable to create successor")
+    )
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        workflowGraph={archivedSnapshot()}
+        onOpenRootConversation={vi.fn()}
+      />
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Continue in Simple" })
+    )
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Unable to create successor"
+      )
+    )
+    expect(screen.getByTestId("workflow-archived-banner")).toBeVisible()
+    expect(screen.getAllByText("Workflow").length).toBeGreaterThan(0)
+    expect(
+      screen.getByRole("button", { name: "Continue in Simple" })
+    ).toBeEnabled()
   })
 
   it("expands by default and lists every sub-agent", () => {

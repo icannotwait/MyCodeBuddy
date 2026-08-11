@@ -2689,6 +2689,20 @@
         "expandGraphAria": "展開工作流程圖",
         "collapseGraphAria": "收合工作流程圖",
         "collapsedSummary": "工作流程 {state}",
+        "archivedTitle": "已封存工作流程",
+        "archivedReadOnly": "唯讀",
+        "archivedContinue": "以 Simple 繼續",
+        "archivedContinuing": "正在繼續...",
+        "archivedOpenSuccessor": "開啟 Simple 後繼對話",
+        "simpleOpenPlan": "開啟 Plan",
+        "simpleOpenProgress": "開啟進度",
+        "simplePartialProjection": "Simple 投影不完整",
+        "simpleProjectionWarning": "部分 Plan 或進度資料無法投影。",
+        "simpleTasks": "Simple 任務",
+        "simpleTaskCount": "{count} 個任務",
+        "simpleNoTasks": "找不到 Plan 任務",
+        "simpleLiveRun": "即時執行：{status}",
+        "simpleOutOfSync": "任務狀態不同步",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} 進行中",
         "gateBlocked": "{count} 已封鎖",
@@ -2749,6 +2763,7 @@
           "estimated": "預估"
         },
         "overallState": {
+          "pending": "待開始",
           "skeleton": "骨架",
           "estimated": "預估",
           "approved": "已核准",
@@ -2758,6 +2773,8 @@
           "observed_only": "僅觀測"
         },
         "nodeStatus": {
+          "pending": "待開始",
+          "in_progress": "進行中",
           "estimated": "預估",
           "reserving": "預留中",
           "running": "執行中",

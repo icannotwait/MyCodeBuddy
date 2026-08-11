@@ -2689,6 +2689,20 @@
         "expandGraphAria": "Expand workflow graph",
         "collapseGraphAria": "Collapse workflow graph",
         "collapsedSummary": "Workflow {state}",
+        "archivedTitle": "Archived workflow",
+        "archivedReadOnly": "Read-only",
+        "archivedContinue": "Continue in Simple",
+        "archivedContinuing": "Continuing...",
+        "archivedOpenSuccessor": "Open Simple successor",
+        "simpleOpenPlan": "Open Plan",
+        "simpleOpenProgress": "Open progress",
+        "simplePartialProjection": "Partial Simple projection",
+        "simpleProjectionWarning": "Some Plan or progress data could not be projected.",
+        "simpleTasks": "Simple tasks",
+        "simpleTaskCount": "{count} tasks",
+        "simpleNoTasks": "No Plan tasks found",
+        "simpleLiveRun": "Live run: {status}",
+        "simpleOutOfSync": "Task status is out of sync",
         "gateProgress": "{returned} / {required}",
         "gateRunning": "{count} running",
         "gateBlocked": "{count} blocked",
@@ -2776,6 +2790,7 @@
           "estimated": "Estimated"
         },
         "overallState": {
+          "pending": "Pending",
           "skeleton": "Skeleton",
           "estimated": "Estimated",
           "approved": "Approved",
@@ -2785,6 +2800,8 @@
           "observed_only": "Observed"
         },
         "nodeStatus": {
+          "pending": "Pending",
+          "in_progress": "In progress",
           "estimated": "Estimated",
           "reserving": "Reserving",
           "running": "Running",

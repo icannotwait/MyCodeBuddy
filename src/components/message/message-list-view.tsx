@@ -1094,6 +1094,11 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   const workflowGraph = useConversationRuntimeStore(
     (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
   )
+  const workflowWorkspaceRoot = useConversationRuntimeStore(
+    (s) =>
+      s.byConversationId.get(conversationId)?.detail?.summary.folder_path ??
+      null
+  )
 
   return (
     <SubAgentOverlay
@@ -1104,6 +1109,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       defaultExpanded
       conversationId={conversationId}
       workflowGraph={workflowGraph}
+      workspaceRootPath={workflowWorkspaceRoot}
       isActive={isActive}
       onResumeRoot={onResumeRoot}
       onOpenRootConversation={onOpenRootConversation}
@@ -1570,6 +1576,11 @@ export function MessageListView({
   const workflowGraph = useConversationRuntimeStore(
     (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
   )
+  const workflowWorkspaceRoot = useConversationRuntimeStore(
+    (s) =>
+      s.byConversationId.get(conversationId)?.detail?.summary.folder_path ??
+      null
+  )
 
   const storeActivities = useConversationRuntimeStore((s) =>
     selectDelegationActivities(s, conversationId)
@@ -1934,6 +1945,7 @@ export function MessageListView({
             defaultExpanded
             conversationId={conversationId}
             workflowGraph={workflowGraph}
+            workspaceRootPath={workflowWorkspaceRoot}
             isActive={isActive}
             onResumeRoot={onResumeRoot}
             onOpenRootConversation={onOpenRootConversation}
