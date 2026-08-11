@@ -2485,6 +2485,9 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::StaleTaskId(m) => DelegationError::StaleTaskId(m),
         TaskStoreError::NotContinuable(m) => DelegationError::NotContinuable(m),
         TaskStoreError::NotFound(m) => DelegationError::NotFound(m),
+        TaskStoreError::WorkflowV2Retired { navigation } => {
+            DelegationError::WorkflowV2Retired { navigation }
+        }
         TaskStoreError::WorkflowAdmission { code, message } => {
             DelegationError::WorkflowAdmission { code, message }
         }
@@ -7960,16 +7963,16 @@ impl DelegationBroker {
             .await
         {
             Ok(protocol) => protocol,
-            Err(TaskStoreError::WorkflowAdmission { code, message }) => {
-                tracing::warn!(
-                    task_id = %task_id,
-                    error_code = %code,
-                    error = %message,
-                    "[delegation] completion protocol rejected terminal output"
-                );
-                return prepare_typed_terminal_failure(code, terminal.finished_at);
-            }
             Err(error) => {
+                if let Some(code) = error.workflow_admission_code() {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error_code = %code,
+                        error = %error,
+                        "[delegation] completion protocol rejected terminal output"
+                    );
+                    return prepare_typed_terminal_failure(code, terminal.finished_at);
+                }
                 tracing::warn!(
                     task_id = %task_id,
                     error = %error,
@@ -19541,6 +19544,57 @@ mod tests {
             instruction_transient.durable_error_code("spawn_failed"),
             "persistence_error"
         );
+    }
+
+    #[test]
+    fn transaction_retirement_fence_preserves_navigation_in_broker_report() {
+        let store_error =
+            crate::acp::delegation::run_store::terminal_protocol_store_error(
+                crate::acp::delegation::workflow::WorkflowStoreError::workflow_v2_retired_with_navigation(
+                    41,
+                    Some(84),
+                    false,
+                ),
+            );
+        let report = report_err(
+            AgentType::Codex,
+            store_err_to_delegation_error(store_error),
+            Some(52),
+        );
+
+        assert_eq!(report.error_code.as_deref(), Some("workflow_v2_retired"));
+        assert_eq!(
+            report.message.as_deref(),
+            Some(crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE)
+        );
+        assert_eq!(report.child_conversation_id, Some(52));
+        assert_eq!(
+            report.workflow_retirement(),
+            Some(&WorkflowRetirementNavigation {
+                source_conversation_id: Some(41),
+                successor_conversation_id: Some(84),
+                can_create_simple_successor: false,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["workflow_retirement"],
+            serde_json::json!({
+                "source_conversation_id": 41,
+                "successor_conversation_id": 84,
+                "can_create_simple_successor": false,
+            })
+        );
+
+        let generic = store_err_to_delegation_error(TaskStoreError::WorkflowAdmission {
+            code: "gate_not_ready".into(),
+            message: "ordinary workflow admission rejection".into(),
+        });
+        assert!(matches!(
+            generic,
+            DelegationError::WorkflowAdmission { ref code, ref message }
+                if code == "gate_not_ready"
+                    && message == "ordinary workflow admission rejection"
+        ));
     }
 
     #[tokio::test]

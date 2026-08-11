@@ -36,7 +36,9 @@ use crate::acp::delegation::store::{
     PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
-use crate::acp::delegation::types::{DelegationRecoveryProjection, TaskStatus};
+use crate::acp::delegation::types::{
+    DelegationRecoveryProjection, TaskStatus, WorkflowRetirementNavigation,
+};
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
 };
@@ -973,10 +975,21 @@ fn completion_recovery_fence_error(error: CompletionRecoveryFenceError) -> TaskS
     }
 }
 
-fn terminal_protocol_store_error(
+pub(super) fn terminal_protocol_store_error(
     error: crate::acp::delegation::workflow::WorkflowStoreError,
 ) -> TaskStoreError {
     match error {
+        crate::acp::delegation::workflow::WorkflowStoreError::WorkflowV2Retired {
+            source_conversation_id,
+            successor_conversation_id,
+            can_create_simple_successor,
+        } => TaskStoreError::WorkflowV2Retired {
+            navigation: WorkflowRetirementNavigation {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            },
+        },
         crate::acp::delegation::workflow::WorkflowStoreError::Persistence(message) => {
             TaskStoreError::Transient(message)
         }
@@ -2532,7 +2545,7 @@ impl RunStore {
                         insert.parent_conversation_id,
                     )
                     .await
-                    .map_err(workflow_protocol_admission_err)?;
+                    .map_err(terminal_protocol_store_error)?;
                     if let Some(source_task_id) = insert.replaced_task_id.as_deref() {
                         ensure_task_completion_recovery_not_fenced_txn(txn, source_task_id)
                             .await
@@ -2836,7 +2849,7 @@ impl RunStore {
                         admission.parent_conversation_id,
                     )
                     .await
-                    .map_err(workflow_protocol_admission_err)?;
+                    .map_err(terminal_protocol_store_error)?;
                     // SQLite read transactions cannot safely upgrade after a
                     // concurrent replacement writes. Take the writer reservation
                     // before every eligibility read so replacement and continue
@@ -4338,7 +4351,16 @@ impl RunStore {
                     let mut protocol_failure = false;
                     let protocol = match load_terminal_completion_protocol(txn, &task_id).await {
                         Ok(protocol) => protocol,
-                        Err(TaskStoreError::WorkflowAdmission { code, message }) => {
+                        Err(error) => {
+                            let (code, message) = match error {
+                                TaskStoreError::WorkflowAdmission { code, message } => {
+                                    (code, message)
+                                }
+                                retired @ TaskStoreError::WorkflowV2Retired { .. } => {
+                                    ("workflow_v2_retired".into(), retired.to_string())
+                                }
+                                other => return Err(other),
+                            };
                             tracing::warn!(
                                 task_id = %task_id,
                                 error_code = %code,
@@ -4369,7 +4391,6 @@ impl RunStore {
                             }
                             TerminalCompletionProtocol::Standalone
                         }
-                        Err(error) => return Err(error),
                     };
 
                     let termination_audit_json =

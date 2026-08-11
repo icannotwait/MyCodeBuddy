@@ -23,6 +23,7 @@ use crate::acp::delegation::runtime_stats::{
 };
 use crate::acp::delegation::types::{
     cold_task_report_message, DelegationRecoveryProjection, DelegationTaskReport, TaskStatus,
+    WorkflowRetirementNavigation,
 };
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
@@ -347,6 +348,10 @@ pub enum TaskStoreError {
     /// Wire code is the structured `code` field (e.g. `final_early`).
     #[error("workflow admission rejected ({code}): {message}")]
     WorkflowAdmission { code: String, message: String },
+    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    WorkflowV2Retired {
+        navigation: WorkflowRetirementNavigation,
+    },
 }
 
 impl TaskStoreError {
@@ -384,6 +389,7 @@ impl TaskStoreError {
             // this static umbrella remains for call sites that only need a
             // coarse bucket.
             Self::WorkflowAdmission { .. } => Some("workflow_admission_rejected"),
+            Self::WorkflowV2Retired { .. } => Some("workflow_v2_retired"),
             // Pre-admission ownership fence — broker maps to spawn_failed.
             Self::BindOwnershipConflict(_) => Some("spawn_failed"),
             Self::Transient(_) | Self::Permanent(_) => None,
@@ -403,6 +409,7 @@ impl TaskStoreError {
     pub fn workflow_admission_code(&self) -> Option<&str> {
         match self {
             Self::WorkflowAdmission { code, .. } => Some(code.as_str()),
+            Self::WorkflowV2Retired { .. } => Some("workflow_v2_retired"),
             _ => None,
         }
     }

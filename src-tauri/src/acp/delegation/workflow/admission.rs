@@ -731,6 +731,17 @@ fn admission_err(code: &str, msg: impl Into<String>) -> TaskStoreError {
 
 fn workflow_protocol_admission_err(error: WorkflowStoreError) -> TaskStoreError {
     match error {
+        WorkflowStoreError::WorkflowV2Retired {
+            source_conversation_id,
+            successor_conversation_id,
+            can_create_simple_successor,
+        } => TaskStoreError::WorkflowV2Retired {
+            navigation: crate::acp::delegation::types::WorkflowRetirementNavigation {
+                source_conversation_id,
+                successor_conversation_id,
+                can_create_simple_successor,
+            },
+        },
         WorkflowStoreError::Persistence(message) => TaskStoreError::Transient(message),
         other => admission_err(other.code(), other.to_string()),
     }
