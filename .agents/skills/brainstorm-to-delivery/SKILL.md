@@ -55,7 +55,8 @@ implement Task code.
    from Task 1. Give every Task exact file ownership, interfaces, verification
    commands, report location, and commit boundary. Express dependencies through
    prior Task outputs so execution remains serial.
-4. After the Plan exists on disk, call the root-only registration tool:
+4. After the Plan exists on disk, call the root-only
+   `register_simple_workflow` tool:
 
 ```json
 {
@@ -142,7 +143,7 @@ Plan touchpoints.
 
 ## 5. Execute Tasks serially
 
-Use these routes:
+Execute implementation Tasks serially with these routes:
 
 | Work | First run | Later work on the same unit |
 | --- | --- | --- |
@@ -215,10 +216,15 @@ supported reason and budget remains. Supply the original agent/profile/key,
 `not_supported`, `admission_failed`, or `admission_unknown`. Record replacement
 intent before the call and the new task/child IDs after admission.
 
-An established work unit has at most two unexpected continuations and one
-replacement across its lineage. Preserve inherited consumption. When those
-rails are exhausted or the required agent remains unavailable after discovery,
-record the typed blocker and surface it to the user.
+Preserve inherited consumption across each established work-unit lineage:
+
+| Generic recovery rail | Limit |
+| --- | --- |
+| Unexpected continuations | 2 |
+| Logical replacement | 1 |
+
+When either rail is exhausted or the required agent remains unavailable after
+discovery, record the typed blocker and surface it to the user.
 
 ## 7. Final review and delivery
 

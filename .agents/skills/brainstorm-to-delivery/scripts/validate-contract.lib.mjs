@@ -7,6 +7,10 @@ export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
 export const MAX_PROGRESS_BLOCK_BYTES = 64 * 1024
 
+const MAX_I32 = 0x7fffffff
+const MAX_U32 = 0xffffffff
+const MAX_UNEXPECTED_CONTINUATIONS = 2
+
 const PROGRESS_MARKER = "<!-- codeg-simple-progress-v1"
 const COMMENT_END = "-->"
 const TASK_STATUSES = new Set([
@@ -262,9 +266,166 @@ function frontmatter(skillMarkdown) {
   return entries
 }
 
+function numberedSkillSections(skill) {
+  const sections = []
+  let current = null
+  let fence = null
+  for (const line of skill.split(/\r?\n/)) {
+    if (fence) {
+      if (fenceEnd(line, fence)) fence = null
+      if (current) current.lines.push(line)
+      continue
+    }
+    fence = fenceStart(line)
+    if (fence) {
+      if (current) current.lines.push(line)
+      continue
+    }
+    const heading = line.match(/^##\s+([1-9][0-9]*)\.\s+\S/)
+    if (heading) {
+      current = { index: Number(heading[1]), lines: [] }
+      sections.push(current)
+    } else if (current) {
+      current.lines.push(line)
+    }
+  }
+  return sections.map((section) => ({
+    index: section.index,
+    body: section.lines.join("\n"),
+  }))
+}
+
+function missingTokens(body, tokens) {
+  const lower = body.toLowerCase()
+  return tokens.filter((token) => !lower.includes(token.toLowerCase()))
+}
+
+function validateOrderedSkillContract(skill, failures) {
+  const sections = numberedSkillSections(skill)
+  if (sections.map((section) => section.index).join(",") !== "1,2,3,4,5,6,7") {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Skill must contain exactly seven numbered workflow sections in order"
+    )
+    return
+  }
+
+  const requiredBySection = new Map([
+    [
+      1,
+      [
+        "compaction",
+        "register_simple_workflow",
+        "delegate_to_agent",
+        "continue_delegation",
+        "get_delegation_status",
+        "request_recovery_authorization",
+      ],
+    ],
+    [2, ["writing-plans", "register_simple_workflow", "pending", "review"]],
+    [3, ["codeg-simple-progress-v1", "reserving", "observed"]],
+    [4, ["git status", "staged diff", "unstaged diff", "preserve"]],
+    [
+      5,
+      [
+        "serial",
+        "delegate_to_agent",
+        "continue_delegation",
+        "work_unit_key",
+        "grok",
+        "codex",
+        "task_ids",
+      ],
+    ],
+    [
+      6,
+      [
+        "recovery_confirmation_required",
+        "recovery_authorization_id",
+        "fresh_dispatch",
+        "unresumable",
+        "budget_exhausted_continue",
+        "not_supported",
+        "admission_failed",
+        "admission_unknown",
+      ],
+    ],
+    [
+      7,
+      [
+        "final_review_status",
+        "in_progress",
+        "completed",
+        "independent",
+        "codex",
+        "commit",
+      ],
+    ],
+  ])
+
+  for (const section of sections) {
+    const missing = missingTokens(
+      section.body,
+      requiredBySection.get(section.index)
+    )
+    if (missing.length > 0) {
+      fail(
+        failures,
+        "B2D-SKILL-004",
+        `Skill section ${section.index} lacks contract elements: ` +
+          missing.join(", ")
+      )
+    }
+  }
+
+  const planSection = sections[1].body.toLowerCase()
+  const writingPlans = planSection.indexOf("writing-plans")
+  const planExists = planSection.indexOf("plan exists", writingPlans + 1)
+  const registration = planSection.indexOf(
+    "register_simple_workflow",
+    planExists + 1
+  )
+  if (writingPlans < 0 || planExists < 0 || registration < 0) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Skill section 2 must order writing-plans, Plan existence, then " +
+        "registration"
+    )
+  }
+
+  const progressSection = sections[2].body.toLowerCase()
+  const before = progressSection.indexOf("before")
+  const reserving = progressSection.indexOf("reserving", before + 1)
+  const after = progressSection.indexOf("after", reserving + 1)
+  if (before < 0 || reserving < 0 || after < 0) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Skill section 3 must record reserving intent before mutation and " +
+        "update after state changes"
+    )
+  }
+
+  const recoverySection = sections[5].body
+  if (
+    !/unexpected continuations?[\s\S]{0,80}\|\s*2\s*\|/i.test(
+      recoverySection
+    ) ||
+    !/logical replacement[\s\S]{0,80}\|\s*1\s*\|/i.test(recoverySection)
+  ) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Skill section 6 must retain the 2-continuation and 1-replacement rails"
+    )
+  }
+}
+
 /**
- * Validate metadata and retirement identifiers without matching workflow
- * prose.
+ * Validate metadata and the structural ordered contract without matching exact
+ * workflow prose.
  */
 export function validateSkillMarkdown(skillMarkdown) {
   const skill = String(skillMarkdown ?? "")
@@ -331,6 +492,8 @@ export function validateSkillMarkdown(skillMarkdown) {
       )
     }
   }
+
+  validateOrderedSkillContract(skill, failures)
 
   return { failures, notes }
 }
@@ -445,10 +608,15 @@ function validateRun(run, taskIndex, runIndex, failures) {
     }
   }
   const parsedKey = parseRecognizedWorkUnitKey(run.work_unit_key)
+  if (run.profile_id === "none") {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} profile_id must use null rather than the key token "none"`
+    )
+  }
   const runProfile =
-    run.profile_id === undefined ||
-    run.profile_id === null ||
-    run.profile_id === "none"
+    run.profile_id === undefined || run.profile_id === null
       ? null
       : run.profile_id
   if (
@@ -490,23 +658,32 @@ function validateRun(run, taskIndex, runIndex, failures) {
   if (
     run.child_conversation_id !== undefined &&
     run.child_conversation_id !== null &&
-    !positiveInteger(run.child_conversation_id)
+    (!positiveInteger(run.child_conversation_id) ||
+      run.child_conversation_id > MAX_I32)
   ) {
     fail(
       failures,
       "B2D-PROGRESS-006",
-      `${label} child_conversation_id must be a positive integer`
+      `${label} child_conversation_id must be a positive signed 32-bit integer`
     )
   }
   if (
     run.recovery_count !== undefined &&
     run.recovery_count !== null &&
-    (!Number.isInteger(run.recovery_count) || run.recovery_count < 0)
+    (!Number.isInteger(run.recovery_count) ||
+      run.recovery_count < 0 ||
+      run.recovery_count > MAX_U32)
   ) {
     fail(
       failures,
       "B2D-PROGRESS-006",
-      `${label} recovery_count must be a non-negative integer`
+      `${label} recovery_count must be an unsigned 32-bit integer`
+    )
+  } else if (run.recovery_count > MAX_UNEXPECTED_CONTINUATIONS) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} recovery_count permits at most 2 unexpected continuations`
     )
   }
 
@@ -529,14 +706,105 @@ function validateRun(run, taskIndex, runIndex, failures) {
   }
 }
 
+function runProfileIdentity(run) {
+  return run.profile_id === undefined || run.profile_id === null
+    ? null
+    : run.profile_id
+}
+
+function validateTaskRunLineages(task, failures, taskIds) {
+  const groups = new Map()
+  for (const [runIndex, run] of task.runs.entries()) {
+    if (!isObject(run)) continue
+    if (nonEmptyString(run.task_id)) {
+      if (taskIds.has(run.task_id)) {
+        fail(
+          failures,
+          "B2D-PROGRESS-006",
+          `Task ${task.index} run ${runIndex + 1} repeats task_id ` +
+            run.task_id
+        )
+      } else {
+        taskIds.add(run.task_id)
+      }
+    }
+    if (!nonEmptyString(run.role)) continue
+    const group = groups.get(run.role) ?? []
+    group.push({ run, runIndex })
+    groups.set(run.role, group)
+  }
+
+  for (const [role, entries] of groups) {
+    const first = entries[0].run
+    const firstProfile = runProfileIdentity(first)
+    const priorTaskIds = new Set()
+    const replacementAttempts = new Map()
+    for (const { run, runIndex } of entries) {
+      const label = `Task ${task.index} ${role} run ${runIndex + 1}`
+      if (
+        run.work_unit_key !== first.work_unit_key ||
+        run.agent_type !== first.agent_type ||
+        runProfileIdentity(run) !== firstProfile
+      ) {
+        fail(
+          failures,
+          "B2D-PROGRESS-006",
+          `${label} changes key, agent, or profile within one lineage`
+        )
+      }
+
+      const replaced = nonEmptyString(run.replaced_task_id)
+      const reason = nonEmptyString(run.replacement_reason)
+      if (replaced && reason) {
+        if (!priorTaskIds.has(run.replaced_task_id)) {
+          fail(
+            failures,
+            "B2D-PROGRESS-006",
+            `${label} replaced_task_id must name a prior same-lineage run`
+          )
+        }
+        const replacement = JSON.stringify([
+          run.replaced_task_id,
+          run.replacement_reason,
+        ])
+        const priorAttempt = replacementAttempts.get(replacement)
+        if (
+          priorAttempt &&
+          (priorAttempt.state !== "failed" ||
+            (priorAttempt.child_conversation_id !== undefined &&
+              priorAttempt.child_conversation_id !== null))
+        ) {
+          fail(
+            failures,
+            "B2D-PROGRESS-006",
+            `${label} repeats a replacement after its prior attempt was ` +
+              "admitted"
+          )
+        }
+        replacementAttempts.set(replacement, run)
+      }
+      if (nonEmptyString(run.task_id)) priorTaskIds.add(run.task_id)
+    }
+    if (replacementAttempts.size > 1) {
+      fail(
+        failures,
+        "B2D-PROGRESS-006",
+        `Task ${task.index} ${role} exceeds one logical replacement`
+      )
+    }
+  }
+}
+
 function validateProgressTasks(snapshot, plan, failures) {
   if (!Array.isArray(snapshot.tasks)) {
     fail(failures, "B2D-PROGRESS-005", "progress tasks must be an array")
     return []
   }
-  const planIndexes = new Set(plan.tasks.map((task) => task.index))
+  const orderedPlanIndexes = plan.tasks.map((task) => task.index)
+  const planIndexes = new Set(orderedPlanIndexes)
   const seen = new Set()
   const tasks = []
+  const taskIds = new Set()
 
   for (const task of snapshot.tasks) {
     if (!isObject(task) || !positiveInteger(task.index)) {
@@ -587,18 +855,23 @@ function validateProgressTasks(snapshot, plan, failures) {
       task.runs.forEach((run, index) =>
         validateRun(run, task.index, index, failures)
       )
+      validateTaskRunLineages(task, failures, taskIds)
     }
     tasks.push(task)
+  }
+  const progressIndexes = tasks.map((task) => task.index)
+  if (progressIndexes.join(",") !== orderedPlanIndexes.join(",")) {
+    fail(
+      failures,
+      "B2D-PROGRESS-005",
+      "progress Task indices must exactly match the ordered Plan Task indices"
+    )
   }
   return tasks
 }
 
-function validateSerialState(snapshot, plan, tasks, failures) {
-  const byIndex = new Map(tasks.map((task) => [task.index, task]))
-  const ordered = plan.tasks.map(
-    (task) =>
-      byIndex.get(task.index) ?? { index: task.index, status: "pending" }
-  )
+function validateSerialState(snapshot, tasks, failures) {
+  const ordered = tasks
   const frontiers = ordered.filter((task) =>
     ["in_progress", "blocked"].includes(task.status)
   )
@@ -778,7 +1051,7 @@ export function parseSimpleProgress(
   }
 
   const tasks = validateProgressTasks(snapshot, plan, failures)
-  validateSerialState(snapshot, plan, tasks, failures)
+  validateSerialState(snapshot, tasks, failures)
   return { ...progress, failures }
 }
 
