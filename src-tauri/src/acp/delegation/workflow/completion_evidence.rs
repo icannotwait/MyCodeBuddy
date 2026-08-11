@@ -3608,7 +3608,7 @@ mod tests {
         FinalReviewerEvaluationV1, RemediationContextInputV1,
     };
     use crate::acp::delegation::workflow::store::{
-        get_workflow_state_core, publish_workflow_manifest_core, PublishWorkflowRequest,
+        get_workflow_state_core, publish_workflow_manifest_fixture, PublishWorkflowRequest,
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode,
@@ -3788,7 +3788,7 @@ mod tests {
             })
             .unwrap();
             let document = skeleton_document("task-10", &author_key, &author_node_id);
-            let published = publish_workflow_manifest_core(
+            let published = publish_workflow_manifest_fixture(
                 &db,
                 &EventEmitter::Noop,
                 parent,

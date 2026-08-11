@@ -2297,6 +2297,14 @@ impl ConnectionManager {
             .get_state(conn_id)
             .await
             .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        if let Some(conversation_id) = state_arc.read().await.conversation_id {
+            if let Some((version, mode)) = load_completion_protocol_for_conversation(db, conversation_id)
+                .await
+                .map_err(AcpError::from)?
+            {
+                require_v2_mutation(version, &mode).map_err(AcpError::from)?;
+            }
+        }
         self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Foreground)
             .await?;
         // Non-linked UI sends: register mandatory routes + mark attention.
@@ -2542,21 +2550,19 @@ impl ConnectionManager {
             )
         };
 
-        // Linked root prompts must pass the persisted protocol fence before
-        // admission, hydration, transcript/status writes, routing, or send.
-        if delegation.is_none() {
-            let effective_conversation_id = conversation_id.or({
-                let state = state_arc.read().await;
-                state.conversation_id
-            });
-            if let Some(conversation_id) = effective_conversation_id {
-                if let Some((version, mode)) =
-                    load_completion_protocol_for_conversation(db, conversation_id)
-                        .await
-                        .map_err(AcpError::from)?
-                {
-                    require_v2_mutation(version, &mode).map_err(AcpError::from)?;
-                }
+        // Any linked conversation with durable v2 identity is archived. A new
+        // prebound child has no run binding yet and therefore remains eligible
+        // for its first prompt.
+        let effective_conversation_id = conversation_id.or({
+            let state = state_arc.read().await;
+            state.conversation_id
+        });
+        if let Some(conversation_id) = effective_conversation_id {
+            if let Some((version, mode)) = load_completion_protocol_for_conversation(db, conversation_id)
+                .await
+                .map_err(AcpError::from)?
+            {
+                require_v2_mutation(version, &mode).map_err(AcpError::from)?;
             }
         }
 

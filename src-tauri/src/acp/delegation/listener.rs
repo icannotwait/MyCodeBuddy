@@ -1829,7 +1829,10 @@ impl DelegationListener {
             &state.completion_protocol.mode,
         ) {
             Ok(()) => {}
-            Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly) => {
+            Err(
+                WorkflowStoreError::LegacyCompletionProtocolReadOnly
+                | WorkflowStoreError::WorkflowV2Retired,
+            ) => {
                 return serde_json::to_value(state).unwrap_or_else(|error| {
                     WorkflowWireError::Internal(format!(
                         "serialize historical workflow state: {error}"
@@ -2749,6 +2752,7 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
 
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
     let code = match &err {
+        WorkflowStoreError::WorkflowV2Retired => "workflow_v2_retired",
         WorkflowStoreError::Validation(WorkflowError::RiskAssessmentInvalid(_)) => {
             "risk_assessment_invalid"
         }
@@ -3184,7 +3188,7 @@ mod tests {
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
     };
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
-    use crate::acp::delegation::workflow::publish_workflow_manifest_core;
+    use crate::acp::delegation::workflow::publish_workflow_manifest_fixture;
     use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
     use chrono::Utc;
     use serde_json::json;
@@ -9173,7 +9177,7 @@ mod tests {
             "task_policies": []
         }))
         .unwrap();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             parent,
@@ -9571,7 +9575,7 @@ mod tests {
         let mut foreign_document: ManifestDocument =
             serde_json::from_value(manifest.clone()).unwrap();
         foreign_document.publication_token = "listener-v2-foreign".into();
-        let foreign = publish_workflow_manifest_core(
+        let foreign = publish_workflow_manifest_fixture(
             &db,
             &EventEmitter::Noop,
             foreign_parent,

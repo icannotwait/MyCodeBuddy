@@ -46,7 +46,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
     let parent_folder = seed_folder(&db, workspace.to_str().unwrap()).await;
     let parent = seed_conversation(&db, parent_folder, AgentType::Codex).await;
     let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
-    let published = publish_workflow_manifest_core(
+    let published = publish_workflow_manifest_fixture(
         &db,
         &emitter,
         parent,
@@ -185,7 +185,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
     direct_publication.expected_manifest_revision = Some(8);
     direct_publication.workflow_state = ManifestWorkflowState::Approved;
     direct_publication.publication_token = "session-2566-initial".into();
-    let rejected = publish_workflow_manifest_core(
+    let rejected = publish_workflow_manifest_fixture(
         &db,
         &emitter,
         parent,

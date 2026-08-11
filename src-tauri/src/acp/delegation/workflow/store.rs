@@ -623,8 +623,20 @@ struct ApprovedPlanLineageReset {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Publish or update a workflow manifest (CAS + publication_token).
+/// Production manifest publication is permanently retired. Historical
+/// manifests remain readable and are seeded through the test-only fixture.
 pub async fn publish_workflow_manifest_core(
+    _db: &AppDatabase,
+    _emitter: &EventEmitter,
+    _parent_conversation_id: i32,
+    _req: PublishWorkflowRequest,
+) -> Result<PublishResult, WorkflowStoreError> {
+    Err(WorkflowStoreError::WorkflowV2Retired)
+}
+
+/// Historical manifest fixture publication for read-model tests only.
+#[cfg(test)]
+pub async fn publish_workflow_manifest_fixture(
     db: &AppDatabase,
     emitter: &EventEmitter,
     parent_conversation_id: i32,
@@ -9250,7 +9262,7 @@ mod tests {
     async fn workflow_manifest_v2_persisted_header_stamps_capability_version() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9267,6 +9279,30 @@ mod tests {
             .expect("persisted header");
         assert_eq!(header.capability_version, "workflow_manifest_v2");
         assert_eq!(WORKFLOW_CAPABILITY_VERSION, "workflow_manifest_v2");
+    }
+
+    #[tokio::test]
+    async fn manifest_publication_is_retired_without_creating_a_header() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+
+        let error = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: skeleton_doc("workflow-v2-retired-publication"),
+            },
+        )
+        .await
+        .expect_err("production publication must be retired");
+        assert_eq!(error.code(), "workflow_v2_retired");
+        assert!(delegation_workflow::Entity::find()
+            .filter(delegation_workflow::Column::ParentConversationId.eq(parent))
+            .one(&db.conn)
+            .await
+            .expect("query headers")
+            .is_none());
     }
 
     #[tokio::test]
@@ -9441,7 +9477,7 @@ mod tests {
             .unwrap()
             .deps
             .clear();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9639,7 +9675,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut document = design_plan_doc("workflow-manifest-v2-upgrade");
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9662,7 +9698,7 @@ mod tests {
         };
 
         downgrade_header().await;
-        let replay = publish_workflow_manifest_core(
+        let replay = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9682,7 +9718,7 @@ mod tests {
         document.workflow_id = Some(published.workflow_id.clone());
         document.expected_manifest_revision = Some(1);
         document.plan.as_mut().expect("Plan document").digest = "sha256:plan-v2".into();
-        let update = publish_workflow_manifest_core(
+        let update = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9701,7 +9737,7 @@ mod tests {
     async fn workflow_v2_caller_artifact_digest_is_not_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -9743,7 +9779,7 @@ mod tests {
     async fn workflow_manifest_v2_author_card_digest_mismatch_has_typed_marker() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10521,7 +10557,7 @@ mod tests {
             doc.workflow_id = Some(self.workflow_id.clone());
             doc.expected_manifest_revision = Some(1);
             doc.plan.as_mut().unwrap().digest = "sha256:plan-v2".into();
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &self.db,
                 &emitter,
                 self.parent,
@@ -10536,7 +10572,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let publication_token = "tok-two-task-index".to_string();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10558,7 +10594,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let publication_token = "tok-open-plan-sources".to_string();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10700,7 +10736,7 @@ mod tests {
             .unwrap();
         gate.reviewer_cohort_node_ids = vec![reviewer_ids[0].into()];
         gate.required_reviewer_node_ids = gate.reviewer_cohort_node_ids.clone();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10864,7 +10900,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
         let doc = design_plan_doc("tok-1");
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10883,7 +10919,7 @@ mod tests {
         assert_eq!(evt.payload["graph_revision"].as_u64(), Some(1));
 
         // Same token + same digest → idempotent, no second event.
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10901,7 +10937,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-mm");
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10916,7 +10952,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-OTHER".into();
         }
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10938,7 +10974,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-cas");
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10954,7 +10990,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-v2".into();
         }
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10976,7 +11012,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-upd");
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -10993,7 +11029,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-v2".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11015,7 +11051,7 @@ mod tests {
         let folder_b = seed_folder(&db, "/tmp/wf-b").await;
         let parent_b = seed_conversation(&db, folder_b, AgentType::Codex).await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent_a,
@@ -11056,7 +11092,7 @@ mod tests {
     async fn settle_before_all_reviewers_rejected() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11092,7 +11128,7 @@ mod tests {
     async fn settle_happy_path_idempotent_and_conflict() {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11160,7 +11196,7 @@ mod tests {
     async fn cycle_n_plus_1_rejects_cycle_n_runs() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11337,7 +11373,7 @@ mod tests {
     async fn zero_reviewer_design_requires_self_review_decision() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11387,7 +11423,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut document = zero_reviewer_design_doc("task3-preflight-pair-flip");
         document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11573,7 +11609,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut document = zero_reviewer_design_doc("task4-preflight-corrupt-mode");
         document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11668,7 +11704,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut document = zero_reviewer_design_doc("task13-design-self-review");
         document.design.as_mut().unwrap().digest = format!("sha256:{}", sha256_hex(design_bytes));
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -11950,7 +11986,7 @@ mod tests {
                 })
                 .unwrap(),
             );
-            let published = publish_workflow_manifest_core(
+            let published = publish_workflow_manifest_fixture(
                 &db,
                 &emitter,
                 parent,
@@ -12097,7 +12133,7 @@ mod tests {
     async fn caller_finding_counts_do_not_bypass_design_self_review() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12133,7 +12169,7 @@ mod tests {
     async fn summary_oversize_reject() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12169,7 +12205,7 @@ mod tests {
     async fn caller_negative_finding_counts_are_not_v2_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12208,7 +12244,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-b14");
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12252,7 +12288,7 @@ mod tests {
             plan.digest = "sha256:plan-rev".into();
         }
 
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12279,7 +12315,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut document = design_plan_doc("typed-cohort-frozen");
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12306,7 +12342,7 @@ mod tests {
         document.expected_manifest_revision = Some(1);
         document.task_policies[0].risk.reason = "changed after cohort admission".into();
         document.plan.as_mut().expect("Plan document").digest = "sha256:plan-revision".into();
-        let error = publish_workflow_manifest_core(
+        let error = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12325,7 +12361,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-b143");
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12366,7 +12402,7 @@ mod tests {
             plan.digest = "sha256:plan-cancel".into();
         }
 
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12403,7 +12439,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-idmut");
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12447,7 +12483,7 @@ mod tests {
             plan.digest = "sha256:plan-id".into();
         }
 
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12466,7 +12502,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         set_inject_publish_persistence_failure(true);
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12497,7 +12533,7 @@ mod tests {
     async fn get_workflow_state_index_preserves_recovery_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12543,7 +12579,7 @@ mod tests {
     async fn second_create_token_conflict() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12553,7 +12589,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12573,7 +12609,7 @@ mod tests {
     async fn a2_stale_manifest_revision_on_run_binding_rejected() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12626,7 +12662,7 @@ mod tests {
     async fn a2_stale_artifact_digest_rejected() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12678,7 +12714,7 @@ mod tests {
     async fn failed_reviewer_cannot_approve() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let r = publish_workflow_manifest_core(
+        let r = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12834,7 +12870,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-a8-demote");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12877,7 +12913,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-structural-v2".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12918,7 +12954,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-edge-demote");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12939,7 +12975,7 @@ mod tests {
             from: "task-1-impl".into(),
             to: "final-reviewer".into(),
         });
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -12969,7 +13005,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-design-digest-demote");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13019,7 +13055,7 @@ mod tests {
         if let Some(ref mut design) = doc.design {
             design.digest = "sha256:design-edited".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13072,7 +13108,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-plan-only-keeps-design");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13119,7 +13155,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-only-v2".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13167,7 +13203,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-state-only-approve");
         doc.workflow_state = ManifestWorkflowState::Estimated;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13207,7 +13243,7 @@ mod tests {
         doc.workflow_id = Some(r1.workflow_id.clone());
         doc.expected_manifest_revision = Some(1);
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13248,7 +13284,7 @@ mod tests {
         let doc = design_plan_doc("tok-race-same");
 
         let (r1, r2) = tokio::join!(
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &db,
                 &emitter_a,
                 parent,
@@ -13256,7 +13292,7 @@ mod tests {
                     document: doc.clone(),
                 },
             ),
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &db,
                 &emitter_b,
                 parent,
@@ -13300,13 +13336,13 @@ mod tests {
         }
 
         let (r1, r2) = tokio::join!(
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &db,
                 &emitter_a,
                 parent,
                 PublishWorkflowRequest { document: doc_a },
             ),
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &db,
                 &emitter_b,
                 parent,
@@ -13343,7 +13379,7 @@ mod tests {
     async fn task4_v2_skeleton_estimated_after_author_and_cas_replay() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let skeleton = publish_workflow_manifest_core(
+        let skeleton = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13373,13 +13409,13 @@ mod tests {
         let update_request = PublishWorkflowRequest {
             document: estimated,
         };
-        let updated = publish_workflow_manifest_core(&db, &emitter, parent, update_request.clone())
+        let updated = publish_workflow_manifest_fixture(&db, &emitter, parent, update_request.clone())
             .await
             .expect("estimated publish after Author evidence");
         assert_eq!(updated.manifest_revision, 2);
         assert_eq!(updated.workflow_state, ManifestWorkflowState::Estimated);
 
-        let replay = publish_workflow_manifest_core(&db, &emitter, parent, update_request)
+        let replay = publish_workflow_manifest_fixture(&db, &emitter, parent, update_request)
             .await
             .expect("same CAS payload replay");
         assert!(replay.idempotent_replay);
@@ -13402,7 +13438,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-task4-v1");
         doc.schema_version = 1;
-        let error = publish_workflow_manifest_core(
+        let error = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13467,7 +13503,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let doc = two_reviewer_plan_doc("tok-task4-subset-fp");
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13507,7 +13543,7 @@ mod tests {
             .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
             .unwrap()
             .required_reviewer_node_ids = vec!["plan-reviewer-1".into()];
-        let updated = publish_workflow_manifest_core(
+        let updated = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13617,7 +13653,7 @@ mod tests {
             reviewer_node_ids: vec![CODEX_REVIEWER_NODE_ID.into(), GROK_REVIEWER_NODE_ID.into()],
         };
 
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13747,7 +13783,7 @@ mod tests {
             reviewer_node_ids: vec!["task-1-rev".into(), "task-1-rev-grok".into()],
         };
 
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13888,7 +13924,7 @@ mod tests {
     async fn task4_caller_author_identity_does_not_override_durable_review_bindings() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -13969,7 +14005,7 @@ mod tests {
     async fn task4_plan_reducer_requires_infrastructure_successful_reviewer_evidence() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14059,7 +14095,7 @@ mod tests {
     async fn task4_parent_supplied_lineage_reset_reason_is_not_v2_authority() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14102,7 +14138,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-task4-gate-rename");
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14173,7 +14209,7 @@ mod tests {
             .find(|gate| gate.gate_kind == Some(DocumentGateKind::Plan))
             .unwrap()
             .id = "renamed-plan".into();
-        let updated = publish_workflow_manifest_core(
+        let updated = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14199,7 +14235,7 @@ mod tests {
     async fn workflow_v2_completed_review_scope_survives_later_author_completion() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14285,7 +14321,7 @@ mod tests {
     async fn task4_latest_plan_reviewer_binding_is_required() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14378,7 +14414,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc_a = design_plan_doc("tok-task4-historical-a");
         doc_a.workflow_state = ManifestWorkflowState::Approved;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14442,7 +14478,7 @@ mod tests {
         doc_b.expected_manifest_revision = Some(2);
         doc_b.publication_token = "tok-task4-historical-b".into();
         doc_b.task_policies[0].risk.reason = "fingerprint B risk".into();
-        let published_b = publish_workflow_manifest_core(
+        let published_b = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14496,7 +14532,7 @@ mod tests {
         doc_a.workflow_id = Some(published.workflow_id.clone());
         doc_a.expected_manifest_revision = Some(3);
         doc_a.publication_token = "tok-task4-historical-a-again".into();
-        let published_a_again = publish_workflow_manifest_core(
+        let published_a_again = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14518,7 +14554,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         let mut doc = design_plan_doc("tok-task4-material-reapprove");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14580,7 +14616,7 @@ mod tests {
         doc.workflow_id = Some(published.workflow_id.clone());
         doc.expected_manifest_revision = Some(2);
         doc.task_policies[0].risk.reason = "material risk-policy correction".into();
-        let updated = publish_workflow_manifest_core(
+        let updated = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14640,7 +14676,7 @@ mod tests {
     async fn task4_retired_plan_author_evidence_fails_closed() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14719,7 +14755,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let doc = two_reviewer_plan_doc("tok-task4-scoped");
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14808,7 +14844,7 @@ mod tests {
     async fn task4_approved_plan_replay_fails_closed_after_state_revision() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -14893,7 +14929,7 @@ mod tests {
     async fn task4_plan_stagnation_rewrite_then_user_decision_blocks() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -15007,7 +15043,7 @@ mod tests {
     async fn task4_caller_findings_cannot_override_durable_plan_approval() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -15141,7 +15177,7 @@ mod tests {
             parent: i32,
             document: ManifestDocument,
         ) -> Result<PublishResult, WorkflowStoreError> {
-            publish_workflow_manifest_core(db, emitter, parent, PublishWorkflowRequest { document })
+            publish_workflow_manifest_fixture(db, emitter, parent, PublishWorkflowRequest { document })
                 .await
         }
 
@@ -15773,7 +15809,7 @@ mod tests {
             parent: i32,
             document: ManifestDocument,
         ) -> Result<PublishResult, WorkflowStoreError> {
-            publish_workflow_manifest_core(db, emitter, parent, PublishWorkflowRequest { document })
+            publish_workflow_manifest_fixture(db, emitter, parent, PublishWorkflowRequest { document })
                 .await
         }
 
@@ -17828,7 +17864,7 @@ mod tests {
             } else {
                 target
             };
-            let published = publish_workflow_manifest_core(
+            let published = publish_workflow_manifest_fixture(
                 &db,
                 &emitter,
                 parent,
@@ -17904,7 +17940,7 @@ mod tests {
         ) {
             let (db, parent) = seed_parent().await;
             let (emitter, mut rx) = emitter_with_rx();
-            let published = publish_workflow_manifest_core(
+            let published = publish_workflow_manifest_fixture(
                 &db,
                 &emitter,
                 parent,
@@ -18810,7 +18846,7 @@ mod tests {
                 .as_mut()
                 .expect("estimated fixture Plan")
                 .digest = "sha256:plan-after-recovery".into();
-            let later = publish_workflow_manifest_core(
+            let later = publish_workflow_manifest_fixture(
                 &db,
                 &emitter,
                 parent,

@@ -3194,7 +3194,7 @@ mod tests {
     };
     use crate::acp::delegation::workflow::key::build_work_unit_key;
     use crate::acp::delegation::workflow::store::{
-        publish_workflow_manifest_core, PublishWorkflowRequest,
+        publish_workflow_manifest_fixture, PublishWorkflowRequest,
     };
     use crate::acp::delegation::workflow::types::{
         DocumentGateKind, DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase,
@@ -3934,7 +3934,7 @@ mod tests {
             ),
         ] {
             let (db, parent) = seed_parent().await;
-            publish_workflow_manifest_core(
+            publish_workflow_manifest_fixture(
                 &db,
                 &emitter(),
                 parent,
@@ -3987,7 +3987,7 @@ mod tests {
     #[tokio::test]
     async fn v2_graph_projection_does_not_reload_terminal_rows_per_node() {
         let (db, parent) = seed_parent().await;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4056,7 +4056,7 @@ mod tests {
     #[tokio::test]
     async fn v2_graph_batch_rejects_cross_parent_completion_run_binding() {
         let (db, parent) = seed_parent().await;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4119,7 +4119,7 @@ mod tests {
     #[tokio::test]
     async fn task6_high_route_counts_strict_and_and_invalidates_both_old_approvals() {
         let (db, parent) = seed_parent().await;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4269,7 +4269,7 @@ mod tests {
     #[tokio::test]
     async fn task6_author_precedes_plan_reviewers_and_final_shape_is_unchanged() {
         let (db, parent) = seed_parent().await;
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4317,7 +4317,7 @@ mod tests {
     async fn project_manifest_overlay_no_work_unit_key() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-tok-1");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4393,7 +4393,7 @@ mod tests {
     async fn corrupt_manifest_omits_graph() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-corrupt");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4430,7 +4430,7 @@ mod tests {
                     .into(),
             );
         }
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4491,7 +4491,7 @@ mod tests {
     async fn node_title_falls_back_to_task_preview_and_child_title() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-title-fallback");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4657,7 +4657,7 @@ mod tests {
     async fn b12_vocabulary_on_nodes() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-b12");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4730,7 +4730,7 @@ mod tests {
     async fn projection_b13_stale_reviewer_not_completed() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-b13");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4809,7 +4809,7 @@ mod tests {
     async fn a9_orphan_recognized_runs_as_observed_nodes() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-a9");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4901,7 +4901,7 @@ mod tests {
         // Corrupt active manifest → project_inner Ok(None) / soft path → None.
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-soft-corrupt");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4935,7 +4935,7 @@ mod tests {
     async fn a9_key_matched_run_without_run_binding_overlays_node() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-a9-keymatch");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -4993,7 +4993,7 @@ mod tests {
     async fn final_first_pass_uses_task_implementer_branch_tip() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-final-tip");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -5080,7 +5080,7 @@ mod tests {
     async fn final_first_pass_pending_when_tasks_exist_without_digest() {
         let (db, parent) = seed_parent().await;
         let doc = design_plan_doc("proj-final-pending");
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             parent,
@@ -5408,7 +5408,7 @@ mod tests {
     async fn completion_v2_review_fixes_projection_reopens_same_lineage_new_round() {
         let (db, parent) = seed_parent().await;
         let em = emitter();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -5498,7 +5498,7 @@ mod tests {
         let em = emitter();
         let mut doc = design_plan_doc("tok-stale-gate");
         doc.workflow_state = ManifestWorkflowState::Approved;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -5582,7 +5582,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-v2".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -5616,7 +5616,7 @@ mod tests {
         let em = emitter();
         let mut doc = design_plan_doc("tok-cr-cycle");
         doc.workflow_state = ManifestWorkflowState::Estimated;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -5717,7 +5717,7 @@ mod tests {
         let em = emitter();
         let mut doc = design_plan_doc("tok-stale-fp");
         doc.workflow_state = ManifestWorkflowState::Estimated;
-        let r1 = publish_workflow_manifest_core(
+        let r1 = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -5801,7 +5801,7 @@ mod tests {
         if let Some(ref mut plan) = doc.plan {
             plan.digest = "sha256:plan-structural-v3".into();
         }
-        let r2 = publish_workflow_manifest_core(
+        let r2 = publish_workflow_manifest_fixture(
             &db,
             &em,
             parent,
@@ -6252,7 +6252,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_header_precedes_conflicting_simple_descriptor_and_exposes_successor() {
         let (db, archived_parent) = seed_parent().await;
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             archived_parent,

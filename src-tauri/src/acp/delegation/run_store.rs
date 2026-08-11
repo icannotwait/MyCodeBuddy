@@ -46,8 +46,8 @@ use crate::acp::delegation::workflow::{
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, ArtifactFailure,
     CompletionEvidenceError, CompletionIntentReason, CompletionOutcome,
     CompletionRecoveryFenceError, CompletionRole, CompletionToolIntent, ResolvedArtifact,
-    TerminalCompletionInput, TerminalCompletionResult, WorkflowAdmitInput, WorkflowChildMcpBinding,
-    WorkflowTxnSideEffect,
+    require_writable_conversation_workflow, TerminalCompletionInput, TerminalCompletionResult,
+    WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -2526,6 +2526,12 @@ impl RunStore {
                 let insert = insert.clone();
                 let authorization = authorization.clone();
                 Box::pin(async move {
+                    require_writable_conversation_workflow(
+                        txn,
+                        insert.parent_conversation_id,
+                    )
+                    .await
+                    .map_err(workflow_protocol_admission_err)?;
                     if let Some(source_task_id) = insert.replaced_task_id.as_deref() {
                         ensure_task_completion_recovery_not_fenced_txn(txn, source_task_id)
                             .await
@@ -2824,6 +2830,12 @@ impl RunStore {
                 let admission = admission.clone();
                 let authorization = authorization.clone();
                 Box::pin(async move {
+                    require_writable_conversation_workflow(
+                        txn,
+                        admission.parent_conversation_id,
+                    )
+                    .await
+                    .map_err(workflow_protocol_admission_err)?;
                     // SQLite read transactions cannot safely upgrade after a
                     // concurrent replacement writes. Take the writer reservation
                     // before every eligibility read so replacement and continue

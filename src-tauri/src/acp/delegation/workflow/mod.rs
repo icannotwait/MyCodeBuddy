@@ -67,7 +67,7 @@ pub use dto::{
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::{
-    require_v2_mutation, CompletionEvidenceError, CompletionProtocolConfigurationRemoved,
+    require_v2_mutation, require_writable_conversation_workflow, CompletionEvidenceError, CompletionProtocolConfigurationRemoved,
     CompletionRecoveryFenceError, WorkflowStoreError,
 };
 pub use events::{
@@ -151,6 +151,8 @@ pub use store::{
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
+#[cfg(test)]
+pub use store::publish_workflow_manifest_fixture;
 #[cfg(test)]
 use store::{
     settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core, SettleGateEvidence,

@@ -116,7 +116,9 @@ use crate::acp::delegation::workflow::admission::append_admitted_completion_inst
 use crate::acp::delegation::workflow::CompletionResolution;
 #[cfg(test)]
 use crate::acp::delegation::workflow::CompletionRole;
-use crate::acp::delegation::workflow::{TerminalCompletionInput, ValidatedReportCandidate};
+use crate::acp::delegation::workflow::{
+    require_writable_conversation_workflow, TerminalCompletionInput, ValidatedReportCandidate,
+};
 use crate::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
     AcpTerminationSummaryV1, DelegationTerminationAuditV1, ParentEndContext,
@@ -6365,6 +6367,28 @@ impl DelegationBroker {
             );
         }
 
+        // Resolve archived ownership before allocating the provisional child,
+        // folder, budget, or task-run reservation. The transaction fence in
+        // RunStore remains the race backstop.
+        if let Some(runs) = self.run_store.as_ref() {
+            if let Err(error) = require_writable_conversation_workflow(
+                &runs.db().conn,
+                req.parent_conversation_id,
+            )
+            .await
+            {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::WorkflowAdmission {
+                        code: error.code().into(),
+                        message: error.to_string(),
+                    },
+                    None,
+                );
+            }
+        }
+
         // Bounded task label used by the started event and every meta write —
         // the frontend card's fallback when the parent tool call's `raw_input`
         // never carried the arguments (Cursor's identity-less announcements).
@@ -9269,6 +9293,23 @@ impl DelegationBroker {
                 None,
             );
         };
+
+        if let Err(error) = require_writable_conversation_workflow(
+            &runs.db().conn,
+            req.parent_conversation_id,
+        )
+        .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                AgentType::ClaudeCode,
+                DelegationError::WorkflowAdmission {
+                    code: error.code().into(),
+                    message: error.to_string(),
+                },
+                None,
+            );
+        }
 
         // Load target for ownership / route material only (not_found on miss).
         let target = match runs.load_by_task_id(&req.target_task_id).await {

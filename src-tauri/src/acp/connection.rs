@@ -4148,12 +4148,10 @@ async fn inject_codeg_mcp(
     } else {
         crate::acp::delegation::transport::CompanionRole::Root
     };
-    // A15.1 / A4: workflow mutation tools only on Root when persistence paths
-    // are available (delegation stack + run store). Children never get the bit.
-    let workflow_v2 = matches!(role, crate::acp::delegation::transport::CompanionRole::Root)
-        && delegation_enabled;
-    let completion_v2 = role == crate::acp::delegation::transport::CompanionRole::DelegationChild
-        && binding.is_some_and(|binding| binding.protocol_version == 2);
+    // Manifest v2 and its child completion transport are retired for every new
+    // companion launch. Historical direct calls remain server-fenced.
+    let workflow_v2 = false;
+    let completion_v2 = false;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
@@ -21095,7 +21093,7 @@ mod tests {
                 None => std::env::remove_var("CODEG_MCP_BIN"),
             }
         }
-        let injected = injected.expect("forced v2 child injection");
+        let injected = injected.expect("forced child injection");
 
         let McpServer::Stdio(server) = &servers[0] else {
             panic!("expected stdio companion");
@@ -21104,7 +21102,7 @@ mod tests {
             let index = server.args.iter().position(|value| value == name).unwrap();
             server.args[index + 1].as_str()
         };
-        assert!(argument_after("--features")
+        assert!(!argument_after("--features")
             .split(',')
             .any(|feature| feature == "completion_v2"));
         assert_eq!(argument_after("--role"), "delegation_child");
@@ -21118,7 +21116,7 @@ mod tests {
             token.role,
             crate::acp::delegation::transport::CompanionRole::DelegationChild
         );
-        assert!(token.completion_v2);
+        assert!(!token.completion_v2);
         assert_eq!(token.bound_task_id.as_deref(), Some("bound-task"));
     }
 

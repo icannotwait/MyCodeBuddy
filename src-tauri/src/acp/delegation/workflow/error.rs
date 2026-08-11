@@ -1,6 +1,7 @@
 //! Store and validation errors for the workflow graph.
 
 use thiserror::Error;
+use sea_orm::ConnectionTrait;
 
 use crate::db::entities::delegation_workflow::CompletionProtocolMode;
 
@@ -9,6 +10,7 @@ pub use super::evidence_scope::EvidenceScopeError;
 pub use super::plan_material::{PlanMaterialError, PlanMaterialErrorKind};
 use super::plan_review::PlanReviewError;
 use super::recovery_policy::WorkflowRecoveryProjection;
+use super::simple::{resolve_conversation_workflow_mode, SimpleWorkflowError};
 pub use super::types::WorkflowError;
 
 pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
@@ -100,6 +102,9 @@ impl WorkflowAdmissionRecoveryError {
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkflowStoreError {
+    #[error("workflow manifest v2 is retired; use the archived workflow navigation to open or create its Simple successor")]
+    WorkflowV2Retired,
+
     #[error(transparent)]
     Validation(#[from] WorkflowError),
 
@@ -228,6 +233,7 @@ pub enum WorkflowStoreError {
 impl WorkflowStoreError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::WorkflowV2Retired => "workflow_v2_retired",
             Self::LegacyCompletionProtocolReadOnly => "legacy_completion_protocol_read_only",
             Self::UnsupportedCompletionProtocol { .. }
             | Self::UnsupportedCompletionProtocolHeader(_) => "unsupported_completion_protocol",
@@ -260,7 +266,13 @@ pub fn require_v2_mutation(
     mode: &CompletionProtocolMode,
 ) -> Result<(), WorkflowStoreError> {
     if version == 2 && mode == &CompletionProtocolMode::V2Enforce {
+        // Historical fixtures still exercise the read/projector machinery in
+        // unit tests. Every production entry point uses this branch as the
+        // retirement fence; fixture publication is separately cfg(test).
+        #[cfg(test)]
         return Ok(());
+        #[cfg(not(test))]
+        return Err(WorkflowStoreError::WorkflowV2Retired);
     }
     if version == 1 {
         return Err(WorkflowStoreError::LegacyCompletionProtocolReadOnly);
@@ -269,6 +281,25 @@ pub fn require_v2_mutation(
         version,
         mode: mode.clone(),
     })
+}
+
+/// Durable fence for all new mutations originating from a conversation. The
+/// resolver follows both root ownership and run bindings, so an archived child
+/// cannot bypass the retired root by presenting only its child id.
+pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+) -> Result<(), WorkflowStoreError> {
+    let mode = resolve_conversation_workflow_mode(conn, conversation_id)
+        .await
+        .map_err(|error| match error {
+            SimpleWorkflowError::Persistence(message) => WorkflowStoreError::Persistence(message),
+            other => WorkflowStoreError::Persistence(other.to_string()),
+        })?;
+    if mode.is_archived_or_corrupt() {
+        return Err(WorkflowStoreError::WorkflowV2Retired);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

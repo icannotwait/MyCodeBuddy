@@ -901,14 +901,13 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     conn: &C,
     input: &WorkflowAdmitInput<'_>,
 ) -> Result<WorkflowTxnSideEffect, TaskStoreError> {
-    let Some(key) = input.work_unit_key.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(WorkflowTxnSideEffect::None);
-    };
-
-    let recognized = parse_recognized_work_unit_key(key);
     let header = load_workflow_header(conn, input.parent_conversation_id).await?;
 
     let Some(header) = header else {
+        let Some(key) = input.work_unit_key.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(WorkflowTxnSideEffect::None);
+        };
+        let recognized = parse_recognized_work_unit_key(key);
         // No durable manifest: A1 keys nudge only; non-A1 / legacy no-op.
         if recognized.is_some() {
             return Ok(WorkflowTxnSideEffect::CompatibilityNudge {
@@ -917,6 +916,17 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         }
         return Ok(WorkflowTxnSideEffect::None);
     };
+
+    require_v2_mutation(
+        header.completion_protocol_version,
+        &header.completion_protocol_mode,
+    )
+    .map_err(workflow_protocol_admission_err)?;
+
+    let Some(key) = input.work_unit_key.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(WorkflowTxnSideEffect::None);
+    };
+    let recognized = parse_recognized_work_unit_key(key);
 
     // Workflow header present but key not A1 grammar → ignore (Sessions only).
     let Some(parsed) = recognized else {
@@ -1119,6 +1129,14 @@ pub async fn on_mapped_run_transition_txn<C: ConnectionTrait>(
         // Not mapped — maybe A1 key without binding (nudge only on admit).
         return Ok(WorkflowTxnSideEffect::None);
     };
+    let workflow = load_workflow_header(conn, parent_conversation_id)
+        .await?
+        .ok_or_else(|| admission_err("workflow_binding_missing", "mapped workflow disappeared"))?;
+    require_v2_mutation(
+        workflow.completion_protocol_version,
+        &workflow.completion_protocol_mode,
+    )
+    .map_err(workflow_protocol_admission_err)?;
     let now = Utc::now();
     let next_rev = bump_graph_revision(conn, &rb.workflow_id, now).await?;
     Ok(WorkflowTxnSideEffect::GraphChanged {
@@ -1146,6 +1164,14 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     let Some(rb) = load_run_binding(conn, task_id).await? else {
         return Ok(WorkflowTxnSideEffect::None);
     };
+    let workflow = load_workflow_header(conn, parent_conversation_id)
+        .await?
+        .ok_or_else(|| admission_err("workflow_binding_missing", "mapped workflow disappeared"))?;
+    require_v2_mutation(
+        workflow.completion_protocol_version,
+        &workflow.completion_protocol_mode,
+    )
+    .map_err(workflow_protocol_admission_err)?;
 
     let now = Utc::now();
     let summary = card_summary_json.and_then(parse_and_validate_summary_json);
@@ -2977,7 +3003,7 @@ mod tests {
         PlanReviewNextAction, PlanReviewRoundStateV2,
     };
     use crate::acp::delegation::workflow::store::{
-        publish_workflow_manifest_core, settle_workflow_gate_v2_core, PublishWorkflowRequest,
+        publish_workflow_manifest_fixture, settle_workflow_gate_v2_core, PublishWorkflowRequest,
         SettleWorkflowV2Request,
     };
     use crate::acp::delegation::workflow::types::{
@@ -3422,7 +3448,7 @@ mod tests {
         token: &str,
     ) -> (String, u64) {
         let mut doc = sample_doc(token, ManifestWorkflowState::Estimated);
-        let pub_r = publish_workflow_manifest_core(
+        let pub_r = publish_workflow_manifest_fixture(
             db,
             emitter,
             parent,
@@ -3462,7 +3488,7 @@ mod tests {
         doc.expected_manifest_revision = Some(pub_r.manifest_revision);
         doc.workflow_state = ManifestWorkflowState::Approved;
         doc.publication_token = format!("{token}-upd");
-        let pub2 = publish_workflow_manifest_core(
+        let pub2 = publish_workflow_manifest_fixture(
             db,
             emitter,
             parent,
@@ -3480,7 +3506,7 @@ mod tests {
         parent: i32,
         mut doc: ManifestDocument,
     ) -> String {
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             db,
             emitter,
             parent,
@@ -3510,7 +3536,7 @@ mod tests {
         doc.expected_manifest_revision = Some(published.manifest_revision);
         doc.workflow_state = ManifestWorkflowState::Approved;
         doc.publication_token.push_str("-approved");
-        let approved = publish_workflow_manifest_core(
+        let approved = publish_workflow_manifest_fixture(
             db,
             emitter,
             parent,
@@ -4403,7 +4429,7 @@ mod tests {
             .deps = vec!["plan-author".into()];
         document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
         document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -4536,7 +4562,7 @@ mod tests {
         document.expected_manifest_revision = Some(first_settlement.manifest_revision);
         document.publication_token.push_str("-corrected");
         document.plan.as_mut().unwrap().digest = task9_sha256(CORRECTED_PLAN_BYTES);
-        let corrected = publish_workflow_manifest_core(
+        let corrected = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -4710,7 +4736,7 @@ mod tests {
             .deps = vec!["plan-author".into()];
         document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
         document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -4833,7 +4859,7 @@ mod tests {
         document.expected_manifest_revision = Some(first_settlement.manifest_revision);
         document.publication_token.push_str("-corrected");
         document.plan.as_mut().unwrap().digest = task9_sha256(CORRECTED_PLAN_BYTES);
-        let corrected = publish_workflow_manifest_core(
+        let corrected = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -4910,7 +4936,7 @@ mod tests {
         document.expected_manifest_revision = Some(corrected.manifest_revision);
         document.publication_token.push_str("-replacement");
         document.plan.as_mut().unwrap().digest = task9_sha256(REPLACEMENT_PLAN_BYTES);
-        publish_workflow_manifest_core(&db, &emitter, parent, PublishWorkflowRequest { document })
+        publish_workflow_manifest_fixture(&db, &emitter, parent, PublishWorkflowRequest { document })
             .await
             .unwrap();
 
@@ -5386,7 +5412,7 @@ mod tests {
         let mut document = sample_doc("task9-scope", ManifestWorkflowState::Estimated);
         document.design.as_mut().unwrap().digest = task9_sha256(DESIGN_BYTES);
         document.plan.as_mut().unwrap().digest = task9_sha256(PLAN_BYTES);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -5840,7 +5866,7 @@ mod tests {
         let mut document = sample_doc("task9-malformed-plan", ManifestWorkflowState::Estimated);
         document.design.as_mut().unwrap().digest = task9_sha256(DESIGN_BYTES);
         document.plan.as_mut().unwrap().digest = task9_sha256(MALFORMED_PLAN_BYTES);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6305,7 +6331,7 @@ mod tests {
     async fn task5_plan_author_admits_on_skeleton_before_plan_digest_exists() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6344,7 +6370,7 @@ mod tests {
     async fn task5_plan_author_rejects_non_codex_identity() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6386,7 +6412,7 @@ mod tests {
     async fn task5_plan_author_continuation_reuses_its_own_conversation() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6481,7 +6507,7 @@ mod tests {
         );
         document.design.as_mut().unwrap().digest = task9_sha256(ADMISSION_DESIGN_BYTES);
         document.plan.as_mut().unwrap().digest = task9_sha256(ADMISSION_PLAN_BYTES);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6593,7 +6619,7 @@ mod tests {
     async fn task5_author_and_plan_reviewer_cannot_share_child_conversation() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6661,7 +6687,7 @@ mod tests {
     async fn task5_two_plan_reviewers_cannot_share_child_conversation() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6910,7 +6936,7 @@ mod tests {
     async fn task5_policy_revision_is_allowed_before_admission_but_frozen_afterward() {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
-        let first = publish_workflow_manifest_core(
+        let first = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6923,7 +6949,7 @@ mod tests {
         let mut high = high_risk_doc("tok-task5-policy-material");
         high.workflow_id = Some(first.workflow_id.clone());
         high.expected_manifest_revision = Some(first.manifest_revision);
-        let revised = publish_workflow_manifest_core(
+        let revised = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -6987,7 +7013,7 @@ mod tests {
         high.expected_manifest_revision = Some(revised.manifest_revision);
         high.publication_token = "tok-task5-policy-after".into();
         high.task_policies[0].risk.reason = "post-admission policy mutation".into();
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -7012,7 +7038,7 @@ mod tests {
             sample_doc("tok-task5-route-removal", ManifestWorkflowState::Estimated);
         removed_route.workflow_id = Some(first.workflow_id);
         removed_route.expected_manifest_revision = Some(revised.manifest_revision);
-        let err = publish_workflow_manifest_core(
+        let err = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -7656,7 +7682,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         // Estimated only — no plan settlement.
         let doc = sample_doc("tok-a83", ManifestWorkflowState::Estimated);
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -7701,7 +7727,7 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let doc = sample_doc("task7-blocked-admission", ManifestWorkflowState::Blocked);
-        let published = publish_workflow_manifest_core(
+        let published = publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -8803,7 +8829,7 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         // Estimated with full graph still must not admit Final (lifecycle gate).
         let doc = sample_doc("tok-final-est", ManifestWorkflowState::Estimated);
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter,
             parent,
@@ -8846,7 +8872,7 @@ mod tests {
         let (db2, parent2) = seed_parent().await;
         let (emitter2, _) = emitter_with_rx();
         let blocked = sample_doc("tok-final-blocked", ManifestWorkflowState::Blocked);
-        publish_workflow_manifest_core(
+        publish_workflow_manifest_fixture(
             &db2,
             &emitter2,
             parent2,

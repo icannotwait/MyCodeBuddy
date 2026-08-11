@@ -85,6 +85,8 @@ pub enum AcpError {
     },
     #[error("legacy completion protocol is read-only")]
     LegacyCompletionProtocolReadOnly,
+    #[error("workflow manifest v2 is retired; use the archived workflow navigation to open or create its Simple successor")]
+    WorkflowV2Retired,
     #[error("unsupported completion protocol: {0}")]
     UnsupportedCompletionProtocol(String),
     #[error("completion instruction binding failed: {0}")]
@@ -135,6 +137,7 @@ impl AcpError {
             Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
             Self::LegacyCompletionProtocolReadOnly => Some("legacy_completion_protocol_read_only"),
+            Self::WorkflowV2Retired => Some("workflow_v2_retired"),
             Self::UnsupportedCompletionProtocol(_) => Some("unsupported_completion_protocol"),
             Self::CompletionInstructionBindingFailed(_) => {
                 Some("completion_instruction_binding_failed")
@@ -261,6 +264,7 @@ impl From<WorkflowStoreError> for AcpError {
     fn from(error: WorkflowStoreError) -> Self {
         let message = error.to_string();
         match error {
+            WorkflowStoreError::WorkflowV2Retired => Self::WorkflowV2Retired,
             WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
                 Self::LegacyCompletionProtocolReadOnly
             }
