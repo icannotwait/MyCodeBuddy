@@ -1761,7 +1761,7 @@ mod tests {
         )
         .await;
         let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
-            "workflow-oversized-design-locator",
+            "workflow-oversized-design-locator".to_owned(),
             1,
         ))
         .one(&db.conn)
@@ -1810,7 +1810,7 @@ mod tests {
         )
         .await;
         let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
-            "workflow-normalized-oversized-design-locator",
+            "workflow-normalized-oversized-design-locator".to_owned(),
             1,
         ))
         .one(&db.conn)
@@ -1858,7 +1858,7 @@ mod tests {
         )
         .await;
         let revision = delegation_workflow_manifest_revision::Entity::find_by_id((
-            "workflow-malformed-design-locator",
+            "workflow-malformed-design-locator".to_owned(),
             1,
         ))
         .one(&db.conn)
