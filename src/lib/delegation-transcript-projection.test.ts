@@ -270,6 +270,65 @@ function conversation2582Messages(): AdaptedMessage[] {
 }
 
 describe("projectDelegationTranscript", () => {
+  it("collapses replayed snapshots of the same exact run into one card", () => {
+    const first = delegate("same-tool", "run-1", "unit-a")
+    const latest = delegate("same-tool", "run-1", "unit-a")
+    latest.meta = {
+      "codeg.delegation": {
+        status: "running",
+        task_id: "run-1",
+        runtime_stats: {
+          started_at: "2026-07-27T00:00:00Z",
+          tool_call_count: 9,
+          edit_tool_call_count: 2,
+          touched_files: [],
+          touched_files_truncated: false,
+          line_counts_complete: false,
+        },
+      },
+    }
+
+    const projected = projectDelegationTranscript(
+      [assistant("1", first), assistant("2", latest)],
+      2075
+    )
+
+    const cards = workUnits(projected.messages)
+    expect(cards).toHaveLength(1)
+    expect(cards[0].key).toBe("wu:unit-a:run-1")
+    expect(cards[0].sources).toEqual([first, latest])
+  })
+
+  it("uses the latest snapshot identity for the collapsed run", () => {
+    const first = delegate("same-tool", "provisional-run", "provisional-unit")
+    const latest = delegate("same-tool", "run-1", "unit-a")
+
+    const projected = projectDelegationTranscript(
+      [assistant("1", first), assistant("2", latest)],
+      2075
+    )
+
+    const cards = workUnits(projected.messages)
+    expect(cards).toHaveLength(1)
+    expect(cards[0].key).toBe("wu:unit-a:run-1")
+    expect(cards[0].sources).toEqual([first, latest])
+  })
+
+  it("keeps different tool calls separate when their task id matches", () => {
+    const first = delegate("tool-1", "run-1", "unit-a")
+    const second = delegate("tool-2", "run-1", "unit-a")
+
+    const projected = projectDelegationTranscript(
+      [assistant("1", first), assistant("2", second)],
+      2075
+    )
+
+    expect(workUnits(projected.messages).map((card) => card.sources)).toEqual([
+      [first],
+      [second],
+    ])
+  })
+
   it("projects a multi-turn history while keeping an indivisible mixed call", () => {
     const messages = [
       assistant("1", delegate("tool-1", "run-1", "unit-a")),

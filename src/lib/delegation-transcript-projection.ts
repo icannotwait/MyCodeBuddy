@@ -21,6 +21,11 @@ import {
 } from "@/lib/delegation-work-unit"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 
+function exactRunKey<T>(record: DelegationRunRecord<T>): string {
+  const { parentConversationId, parentToolUseId } = record.identity
+  return `${parentConversationId}\u0000run\u0000${parentToolUseId}`
+}
+
 function walkToolCalls(
   parts: readonly AdaptedContentPart[],
   visit: (part: AdaptedToolCallPart) => void
@@ -202,7 +207,32 @@ export function projectDelegationTranscript(
 } {
   const records = collectDelegationRunRecords(messages, parentConversationId)
 
-  const grouped = groupDelegationRuns(records)
+  // Cold-history replay can materialize one tool call in multiple turns. Keep
+  // its first timeline position while the latest snapshot defines identity.
+  const snapshotsByRun = new Map<
+    string,
+    {
+      latest: DelegationRunRecord<AdaptedToolCallPart>
+      sources: AdaptedToolCallPart[]
+    }
+  >()
+  for (const record of records) {
+    const runKey = exactRunKey(record)
+    const snapshots = snapshotsByRun.get(runKey)
+    if (snapshots) {
+      snapshots.latest = record
+      snapshots.sources.push(record.value)
+    } else {
+      snapshotsByRun.set(runKey, {
+        latest: record,
+        sources: [record.value],
+      })
+    }
+  }
+
+  const grouped = groupDelegationRuns(
+    [...snapshotsByRun.values()].map((snapshots) => snapshots.latest)
+  )
   // Identity grouping still folds status polls / live residual rows, but each
   // turn (run) keeps its own card at its original transcript position so multi-
   // turn continue/re-entry results stay visible as separate cards.
@@ -213,11 +243,13 @@ export function projectDelegationTranscript(
   >()
   for (const unit of grouped.units) {
     for (const run of unit.runs) {
+      const sources = snapshotsByRun.get(exactRunKey(run))?.sources ?? [
+        run.value,
+      ]
       const runId =
         run.identity.taskId ??
         run.identity.parentToolUseId ??
         run.value.toolCallId
-      const sources = [run.value]
       const canonical: AdaptedDelegationWorkUnitPart = {
         type: "delegation-work-unit",
         // Per-run key keeps React list identity stable when a work unit has
@@ -228,7 +260,9 @@ export function projectDelegationTranscript(
           run.identity.taskId && canceledTaskIds.has(run.identity.taskId)
         ),
       }
-      sourceReplacement.set(run.value, canonical)
+      sources.forEach((source, index) => {
+        sourceReplacement.set(source, index === 0 ? canonical : null)
+      })
     }
   }
 

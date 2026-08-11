@@ -1245,6 +1245,24 @@ describe("MessageListView delegation work-unit projection", () => {
     ).toEqual(["tool-1", "tool-2"])
   })
 
+  it("renders replayed snapshots of one exact run as a single card", () => {
+    seedHistory([
+      userTurn("u1", "start"),
+      workUnitRunTurn("a1", "same-tool", "run-1"),
+      workUnitRunTurn("a2", "same-tool", "run-1", {
+        generation: 2,
+        terminal: true,
+      }),
+    ])
+
+    renderMessageList()
+
+    const card = screen.getByTestId("delegation-work-unit")
+    expect(card).toHaveAttribute("data-work-unit-key", "wu:unit-a:run-1")
+    expect(card).toHaveAttribute("data-source-count", "2")
+    expect(card).toHaveAttribute("data-latest-status", "completed")
+  })
+
   it("applies whole-call folding to promoted localTurns", () => {
     seedHistory([
       userTurn("u1", "start"),
