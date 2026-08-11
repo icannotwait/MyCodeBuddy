@@ -768,9 +768,11 @@ async fn project_manifest_mode(
             .map(|descriptor| descriptor.parent_conversation_id),
         can_create_simple_successor: successor.is_none(),
     };
-    let projection_warning_codes = identity_corrupt
-        .then(|| vec!["workflow_identity_corrupt".to_string()])
-        .unwrap_or_default();
+    let projection_warning_codes = if identity_corrupt {
+        vec!["workflow_identity_corrupt".to_string()]
+    } else {
+        Default::default()
+    };
 
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
@@ -6242,7 +6244,7 @@ mod tests {
             plan_rel_path: Set("C:/private/plan.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
             source_workflow_id: Set(None),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         }
         .insert(&db.conn)
@@ -6283,8 +6285,8 @@ mod tests {
             plan_rel_path: Set("docs/superpowers/plans/p.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{successor}/progress.md")),
             source_workflow_id: Set(Some(published.workflow_id.clone())),
-            created_at: Set(now.clone()),
-            updated_at: Set(now.clone()),
+            created_at: Set(now),
+            updated_at: Set(now),
         }
         .insert(&db.conn)
         .await
@@ -6294,7 +6296,7 @@ mod tests {
             plan_rel_path: Set("docs/conflicting.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{archived_parent}/progress.md")),
             source_workflow_id: Set(None),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         }
         .insert(&db.conn)

@@ -573,7 +573,7 @@ async fn load_existing_successor<C: ConnectionTrait>(
         .with_detail("workflow_identity_corrupt"));
     }
     if normalize_bounded_successor_locator(&descriptor.progress_rel_path)
-        .map_or(true, |normalized| normalized != descriptor.progress_rel_path)
+        .is_none_or(|normalized| normalized != descriptor.progress_rel_path)
     {
         return Err(AppCommandError::new(
             AppErrorCode::WorkflowIdentityCorrupt,

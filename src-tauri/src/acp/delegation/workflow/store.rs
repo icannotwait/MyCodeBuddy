@@ -94,11 +94,15 @@ use super::state_dto::{
 };
 use super::types::{
     DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
-    ManifestNodeOutcome, ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
+    ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
     NormalizedGate, NormalizedManifest, NormalizedNode, PlanChangeClassification, ResolutionMode,
-    WorkflowBlockCause, CURRENT_COMPLETION_PROTOCOL_VERSION, MAX_ADJUDICATION_SUMMARY_BYTES,
+    WorkflowBlockCause, MAX_ADJUDICATION_SUMMARY_BYTES,
     WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use super::types::CURRENT_COMPLETION_PROTOCOL_VERSION;
+#[cfg(any(test, feature = "test-utils"))]
+use super::types::ManifestNodeOutcome;
 use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
@@ -373,7 +377,7 @@ fn note_binding_diff_invocation() {
     BINDING_DIFF_INVOCATION_COUNT.with(|count| count.set(count.get() + 1));
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "test-utils"))]
 fn note_binding_diff_invocation() {}
 
 // ---------------------------------------------------------------------------
@@ -451,6 +455,7 @@ pub struct WorkflowBlockEntryRequest<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-utils"))]
 fn publish_result(
     workflow_id: String,
     manifest_revision: u64,
@@ -5194,6 +5199,7 @@ async fn require_owned_stored_v2_header<C: ConnectionTrait>(
     require_stored_v2_header(conn, workflow_id).await
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn ensure_parent_exists(
     db: &AppDatabase,
     parent_conversation_id: i32,
@@ -5208,6 +5214,7 @@ async fn ensure_parent_exists(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn load_by_publication_token_txn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     token: &str,
@@ -5231,6 +5238,7 @@ async fn load_by_publication_token_txn<C: sea_orm::ConnectionTrait>(
         .map_err(db_err)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn load_active_manifest_digest_txn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -5433,8 +5441,10 @@ pub async fn append_workflow_block_revision_txn(
 }
 
 /// Internal marker: winner not visible in this txn snapshot; outer must re-read.
+#[cfg(any(test, feature = "test-utils"))]
 const TOKEN_RACE_RECLASSIFY_MARKER: &str = "__workflow_publication_token_race_reclassify__";
 
+#[cfg(any(test, feature = "test-utils"))]
 fn is_token_race_reclassify_marker(err: &WorkflowStoreError) -> bool {
     matches!(
         err,
@@ -5442,6 +5452,7 @@ fn is_token_race_reclassify_marker(err: &WorkflowStoreError) -> bool {
     )
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn is_unique_constraint(err: &sea_orm::DbErr) -> bool {
     let s = err.to_string();
     s.contains("UNIQUE")
@@ -5451,6 +5462,7 @@ fn is_unique_constraint(err: &sea_orm::DbErr) -> bool {
         || s.contains("2067") // SQLITE_CONSTRAINT_UNIQUE
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn is_busy_or_snapshot_err_str(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.contains("busy")
@@ -5460,11 +5472,13 @@ fn is_busy_or_snapshot_err_str(s: &str) -> bool {
         || s.contains("5") && lower.contains("sqlite") // SQLITE_BUSY
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn is_token_race_db_err(err: &sea_orm::DbErr) -> bool {
     is_unique_constraint(err) || is_busy_or_snapshot_err_str(&err.to_string())
 }
 
 /// Core publish body (runs inside a single write transaction).
+#[cfg(any(test, feature = "test-utils"))]
 async fn publish_in_txn(
     txn: &sea_orm::DatabaseTransaction,
     parent_conversation_id: i32,
@@ -5861,6 +5875,7 @@ async fn publish_in_txn(
     )
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn initialize_v2_gate_states_txn(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
@@ -6030,6 +6045,7 @@ async fn initialize_v2_gate_states_txn(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn required_final_reviewer_node_ids(normalized: &NormalizedManifest) -> Vec<String> {
     canonical_string_set(
         &normalized
@@ -6045,6 +6061,7 @@ fn required_final_reviewer_node_ids(normalized: &NormalizedManifest) -> Vec<Stri
     )
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn is_pending_plan_corrective_round_txn(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
@@ -6092,6 +6109,7 @@ async fn is_pending_plan_corrective_round_txn(
     }))
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn delete_plan_round_authorization_txn(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
@@ -6107,6 +6125,7 @@ async fn delete_plan_round_authorization_txn(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn workflow_gate_lineage(material: &serde_json::Value) -> Result<String, WorkflowStoreError> {
     let canonical = canonical_json(material)
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
@@ -6124,6 +6143,7 @@ fn workflow_gate_lineage(material: &serde_json::Value) -> Result<String, Workflo
 /// - `Err(Persistence(TOKEN_RACE_RECLASSIFY_MARKER))` — winner not visible; outer
 ///   must re-read with a fresh snapshot (never returned as raw busy/unique).
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-utils"))]
 async fn insert_header_create_or_reclassify(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
@@ -6224,6 +6244,7 @@ async fn insert_header_create_or_reclassify(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn load_by_parent_kind_txn<C: sea_orm::ConnectionTrait>(
     conn: &C,
     parent_conversation_id: i32,
@@ -6240,6 +6261,7 @@ async fn load_by_parent_kind_txn<C: sea_orm::ConnectionTrait>(
 }
 
 /// Re-read winner after a race. `None` = not visible under this snapshot.
+#[cfg(any(test, feature = "test-utils"))]
 async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
     conn: &C,
     token: &str,
@@ -6287,6 +6309,7 @@ async fn classify_token_race_visible<C: sea_orm::ConnectionTrait>(
     Ok(None)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     conn: &C,
     mut header: delegation_workflow::Model,
@@ -6343,6 +6366,7 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     Ok(result)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn stamp_workflow_capability_version<C: sea_orm::ConnectionTrait>(
     conn: &C,
     header: delegation_workflow::Model,
@@ -6360,6 +6384,7 @@ async fn stamp_workflow_capability_version<C: sea_orm::ConnectionTrait>(
 /// Never invents `PublicationTokenMismatch` without a real `workflow_id`.
 /// Same digest → idempotent replay; different digest → mismatch with that id.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn classify_header_against_digest(
     token: &str,
     expected_parent: i32,
@@ -6398,6 +6423,7 @@ pub(crate) fn classify_header_against_digest(
 }
 
 /// Backoff schedule for post-race re-reads (~500ms total).
+#[cfg(any(test, feature = "test-utils"))]
 const TOKEN_RACE_BACKOFF_MS: &[u64] = &[5, 10, 20, 40, 80, 100, 120, 125];
 
 /// Fresh-snapshot reclassify after concurrent unique/busy (outer, after txn ends).
@@ -6406,6 +6432,7 @@ const TOKEN_RACE_BACKOFF_MS: &[u64] = &[5, 10, 20, 40, 80, 100, 120, 125];
 /// - Durable same-token row + different digest → PublicationTokenMismatch (real id)
 /// - Parent has other-token workflow → PublicationTokenConflict
 /// - Still absent after exponential backoff → Busy (retryable), **never** fabricated Mismatch
+#[cfg(any(test, feature = "test-utils"))]
 async fn classify_token_race_fresh(
     db: &AppDatabase,
     token: &str,
@@ -6478,6 +6505,7 @@ fn document_digest_for_gate(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn load_observed_node_ids<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -6490,12 +6518,14 @@ async fn load_observed_node_ids<C: sea_orm::ConnectionTrait>(
     Ok(rows.into_iter().map(|r| r.node_id).collect())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn frozen_cohort_error(task_index: i64) -> WorkflowStoreError {
     WorkflowStoreError::CohortFrozen {
         node_id: format!("Task {task_index}"),
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn retired_reactivation_candidate<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -6516,6 +6546,7 @@ async fn retired_reactivation_candidate<C: sea_orm::ConnectionTrait>(
     }))
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 enum BindingDiffAction {
     Reactivate {
         binding: delegation_workflow_node_binding::Model,
@@ -6536,12 +6567,14 @@ enum BindingDiffAction {
     },
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 struct BindingDiffPlan {
     workflow_id: String,
     actions: Vec<BindingDiffAction>,
 }
 
 /// Validate every binding lifecycle decision without performing a write.
+#[cfg(any(test, feature = "test-utils"))]
 fn plan_binding_diff(
     workflow_id: &str,
     normalized: &NormalizedManifest,
@@ -6699,6 +6732,7 @@ fn plan_binding_diff(
     })
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn binding_identity_matches(
     workflow_id: &str,
     binding: &delegation_workflow_node_binding::Model,
@@ -6714,6 +6748,7 @@ fn binding_identity_matches(
         && node.task_index.map(i64::from) == binding.task_index
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn binding_identity_conflict(
     binding: &delegation_workflow_node_binding::Model,
 ) -> WorkflowStoreError {
@@ -6722,6 +6757,7 @@ fn binding_identity_conflict(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn require_exact_binding_identity(
     workflow_id: &str,
     binding: &delegation_workflow_node_binding::Model,
@@ -6733,6 +6769,7 @@ fn require_exact_binding_identity(
 }
 
 /// Apply a preflighted binding plan. No lifecycle validation belongs here.
+#[cfg(any(test, feature = "test-utils"))]
 async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
     conn: &C,
     next_revision: i64,
@@ -6818,6 +6855,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
 }
 
 /// Drop is legal only when cancellation is explicit for the binding or its pair.
+#[cfg(any(test, feature = "test-utils"))]
 fn is_canceled_drop(
     normalized: &NormalizedManifest,
     binding: &delegation_workflow_node_binding::Model,
@@ -8283,6 +8321,7 @@ fn plan_next_action_from_db(action: &DbPlanReviewNextAction) -> PlanReviewNextAc
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn compute_supersedes(
     prior: Option<&delegation_workflow::Model>,
     new_state: ManifestWorkflowState,
@@ -8301,6 +8340,7 @@ fn compute_supersedes(
 }
 
 /// True when Plan material structure changed between revisions (A8).
+#[cfg(any(test, feature = "test-utils"))]
 fn plan_structure_changed(prior: &NormalizedManifest, next: &NormalizedManifest) -> bool {
     plan_structure_fingerprint(prior) != plan_structure_fingerprint(next)
 }
@@ -8540,6 +8580,7 @@ pub(crate) fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn manifest_document_digest_with_state(
     normalized: &NormalizedManifest,
     workflow_state: ManifestWorkflowState,
