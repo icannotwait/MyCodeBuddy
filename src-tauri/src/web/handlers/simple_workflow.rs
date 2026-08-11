@@ -38,9 +38,9 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::{json, Value};
 
+    use crate::acp::delegation::workflow::register_simple_workflow;
     use crate::app_state::AppState;
     use crate::commands::simple_workflow::test_support::seed_archived_workflow;
-    use crate::acp::delegation::workflow::register_simple_workflow;
     use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;

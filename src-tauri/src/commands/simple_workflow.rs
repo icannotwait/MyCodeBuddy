@@ -23,9 +23,9 @@ use crate::db::entities::{
     delegation_workflow_manifest_revision, delegation_workflow_run_binding, folder,
     simple_workflow,
 };
+use crate::db::error::DbError;
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
-use crate::db::error::DbError;
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 
@@ -323,9 +323,6 @@ async fn is_durably_bound_archived_child(
         .filter(
             delegation_task_run::Column::ChildConversationId.eq(source_conversation_id),
         )
-        .filter(
-            delegation_task_run::Column::ParentConversationId.eq(root_conversation_id),
-        )
         .into_tuple::<String>()
         .all(&db.conn)
         .await
@@ -610,16 +607,12 @@ async fn converge_successor_conflict(
     source: &ArchivedSource,
     attempt: u8,
     error: AppCommandError,
-    committed_candidate_id: Option<i32>,
 ) -> Result<Option<SimpleSuccessorResult>, AppCommandError> {
     #[cfg(test)]
     test_record_retry();
     tokio::time::sleep(successor_retry_delay(attempt)).await;
     match load_existing_successor(&db.conn, source).await {
-        Ok(Some(mut existing)) => {
-            existing.created = committed_candidate_id == Some(existing.successor_conversation_id);
-            Ok(Some(existing))
-        }
+        Ok(Some(existing)) => Ok(Some(existing)),
         Ok(None) if attempt < SIMPLE_SUCCESSOR_TXN_MAX_ATTEMPTS => Ok(None),
         Ok(None) => Err(error),
         Err(fresh_error)
@@ -643,7 +636,7 @@ async fn create_or_load_successor(
             Ok(None) => {}
             Err(error) if is_retryable_successor_app_error(&error) => {
                 if let Some(existing) =
-                    converge_successor_conflict(db, source, attempt, error, None).await?
+                    converge_successor_conflict(db, source, attempt, error).await?
                 {
                     return Ok(existing);
                 }
@@ -657,7 +650,7 @@ async fn create_or_load_successor(
             Err(error) if is_retryable_successor_db_err(&error) => {
                 let error = AppCommandError::database_error(error.to_string());
                 if let Some(existing) =
-                    converge_successor_conflict(db, source, attempt, error, None).await?
+                    converge_successor_conflict(db, source, attempt, error).await?
                 {
                     return Ok(existing);
                 }
@@ -671,7 +664,7 @@ async fn create_or_load_successor(
                 Err(error) if is_retryable_successor_db_err(&error) => {
                     let error = AppCommandError::database_error(error.to_string());
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error, None)
+                        converge_successor_conflict(db, source, attempt, error)
                             .await?
                     {
                         return Ok(existing);
@@ -686,7 +679,7 @@ async fn create_or_load_successor(
                 rollback_successor_attempt(txn).await?;
                 if retryable {
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error, None)
+                        converge_successor_conflict(db, source, attempt, error)
                             .await?
                     {
                         return Ok(existing);
@@ -715,7 +708,7 @@ async fn create_or_load_successor(
                 rollback_successor_attempt(txn).await?;
                 if retryable {
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error, None)
+                        converge_successor_conflict(db, source, attempt, error)
                             .await?
                     {
                         return Ok(existing);
@@ -747,7 +740,7 @@ async fn create_or_load_successor(
             rollback_successor_attempt(txn).await?;
             if retryable {
                 if let Some(existing) =
-                    converge_successor_conflict(db, source, attempt, error, None).await?
+                    converge_successor_conflict(db, source, attempt, error).await?
                 {
                     return Ok(existing);
                 }
@@ -768,14 +761,8 @@ async fn create_or_load_successor(
             }
             Err(error) if is_retryable_successor_db_err(&error) => {
                 let error = AppCommandError::database_error(error.to_string());
-                if let Some(existing) = converge_successor_conflict(
-                    db,
-                    source,
-                    attempt,
-                    error,
-                    Some(candidate.id),
-                )
-                .await?
+                if let Some(existing) =
+                    converge_successor_conflict(db, source, attempt, error).await?
                 {
                     return Ok(existing);
                 }
@@ -1363,6 +1350,10 @@ mod tests {
         .unwrap();
         let conversations_before = live_conversation_count(&db).await;
         let descriptors_before = descriptor_count(&db).await;
+        let title_jobs_before = auto_title_job::Entity::find()
+            .count(&db.conn)
+            .await
+            .unwrap();
 
         let error = continue_archived_workflow_in_simple_core(
             &db,
@@ -1377,6 +1368,10 @@ mod tests {
         assert_eq!(error.message, SIMPLE_SUCCESSOR_SOURCE_NOT_ARCHIVED_MESSAGE);
         assert_eq!(live_conversation_count(&db).await, conversations_before);
         assert_eq!(descriptor_count(&db).await, descriptors_before);
+        assert_eq!(
+            auto_title_job::Entity::find().count(&db.conn).await.unwrap(),
+            title_jobs_before
+        );
     }
 
     #[tokio::test]
@@ -1786,6 +1781,7 @@ mod tests {
         assert!(control.retries() >= 1);
         assert_eq!(first.successor_conversation_id, second.successor_conversation_id);
         assert_eq!(usize::from(first.created) + usize::from(second.created), 1);
+        assert!(first.created ^ second.created);
         assert_eq!(live_conversation_count(&db).await, conversations_before + 1);
         assert_eq!(descriptor_count(&db).await, 1);
     }
@@ -1823,10 +1819,13 @@ mod tests {
             .one(&db.conn)
             .await
             .unwrap();
-        let revisions_before = delegation_workflow_manifest_revision::Entity::find()
-            .count(&db.conn)
-            .await
-            .unwrap();
+        let revision_before = delegation_workflow_manifest_revision::Entity::find_by_id((
+            source.workflow_id.clone(),
+            1,
+        ))
+        .one(&db.conn)
+        .await
+        .unwrap();
         let runs_before = delegation_task_run::Entity::find()
             .count(&db.conn)
             .await
@@ -1863,11 +1862,14 @@ mod tests {
             header_before
         );
         assert_eq!(
-            delegation_workflow_manifest_revision::Entity::find()
-                .count(&db.conn)
-                .await
-                .unwrap(),
-            revisions_before
+            delegation_workflow_manifest_revision::Entity::find_by_id((
+                source.workflow_id.clone(),
+                1,
+            ))
+            .one(&db.conn)
+            .await
+            .unwrap(),
+            revision_before
         );
         assert_eq!(
             delegation_task_run::Entity::find()
