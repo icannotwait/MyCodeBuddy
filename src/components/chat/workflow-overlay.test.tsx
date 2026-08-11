@@ -642,7 +642,11 @@ describe("Task 7 archived and Simple workflow rendering", () => {
     )
     expect(screen.getByText("Historical implementation report")).toBeVisible()
     expect(screen.getByText("Report: reports/task-7.md")).toBeVisible()
-    expect(screen.getAllByText("0 / 2").length).toBeGreaterThan(0)
+    expect(
+      within(screen.getByTestId("workflow-graph-lane-plan")).getByText(
+        "0 / 2 · 1 running"
+      )
+    ).toBeVisible()
     await userEvent.click(
       screen.getByTestId("workflow-graph-node-open-n-req")
     )
