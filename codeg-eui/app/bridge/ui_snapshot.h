@@ -43,22 +43,19 @@ struct UiSnapshot {
     std::uint64_t tEndNs{};
 };
 
-inline std::string copy_slice(CodegEuiSlice slice, const char* field) {
-    if (slice.len == 0) {
+inline std::string copy_slice(CodegEuiSlice slice, const char* /*field*/) {
+    if (slice.len == 0 || slice.ptr == nullptr) {
         return {};
-    }
-    if (slice.ptr == nullptr) {
-        throw std::invalid_argument(std::string(field) + " has null data");
     }
     return {reinterpret_cast<const char*>(slice.ptr), slice.len};
 }
 
 inline UiSnapshot copy_frame(const CodegEuiFrame& frame) {
     if (frame.sessions_len > 0 && frame.sessions == nullptr) {
-        throw std::invalid_argument("sessions has null data");
+        return {};
     }
     if (frame.completions_len > 0 && frame.completions == nullptr) {
-        throw std::invalid_argument("completions has null data");
+        return {};
     }
 
     UiSnapshot snapshot;

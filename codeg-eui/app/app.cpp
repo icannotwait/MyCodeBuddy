@@ -63,16 +63,29 @@ Host& host() {
   return value;
 }
 
-void paintErrorStrip(eui::Ui& ui, const ShellLayout& layout, const std::string& text) {
+const components::theme::ThemeColorTokens& darkTheme() {
+  static const auto tokens = components::theme::dark();
+  return tokens;
+}
+
+void panelBackground(eui::Ui& ui, const char* id, float width, float height,
+                     const eui::Color& fill) {
+  ui.rect(id).size(width, height).color(fill).build();
+}
+
+void paintErrorStrip(eui::Ui& ui, const ShellLayout& layout,
+                     const std::string& text) {
   if (text.empty()) {
     return;
   }
   ui.stack("error.strip")
       .position(layout.errorStrip.x, layout.errorStrip.y)
       .size(layout.errorStrip.width, layout.errorStrip.height)
-      .background({0.35f, 0.12f, 0.12f, 1.0f})
       .content([&] {
+        panelBackground(ui, "error.strip.bg", layout.errorStrip.width,
+                        layout.errorStrip.height, {0.35f, 0.12f, 0.12f, 1.0f});
         ui.text("error.strip.text")
+            .position(8, 0)
             .size(layout.errorStrip.width - 16.0f, layout.errorStrip.height)
             .text(text)
             .fontSize(13.0f)
@@ -86,13 +99,16 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
   h.shell.recompute(width, height);
   const ShellLayout& layout = h.shell.layout();
   const auto& model = h.model;
+  const auto& theme = darkTheme();
 
   // Sidebar
   ui.stack("shell.sidebar")
       .position(layout.sidebar.x, layout.sidebar.y)
       .size(layout.sidebar.width, layout.sidebar.height)
-      .background({0.07f, 0.08f, 0.10f, 1.0f})
       .content([&] {
+        panelBackground(ui, "shell.sidebar.bg", layout.sidebar.width,
+                        layout.sidebar.height, {0.07f, 0.08f, 0.10f, 1.0f});
+
         ui.text("shell.brand")
             .position(12, 12)
             .size(220, 28)
@@ -102,11 +118,12 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
             .build();
 
         const bool newEnabled = h.shell.newSessionEnabled(model);
-        ui.button("shell.new")
+        components::button(ui, "shell.new")
             .position(12, 52)
             .size(224, 36)
             .text("New session")
-            .enabled(newEnabled)
+            .theme(theme)
+            .disabled(!newEnabled)
             .onClick([&] {
               if (newEnabled) {
                 (void)h.client.enqueueCreateSession(model.selectedAgent);
@@ -114,27 +131,32 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
             })
             .build();
 
-        ui.input("shell.workspace")
+        components::input(ui, "shell.workspace")
             .position(12, 100)
             .size(224, 32)
             .value(model.workspacePath)
             .placeholder("Workspace path")
-            .onSubmit([&](const std::string& path) {
+            .theme(theme)
+            .onChange([&](const std::string& path) {
               h.model.workspacePath = path;
-              (void)h.client.enqueueSetWorkspace(path);
+            })
+            .onEnter([&] {
+              (void)h.client.enqueueSetWorkspace(h.model.workspacePath);
             })
             .build();
 
-        ui.button("shell.agent.codex")
+        components::button(ui, "shell.agent.codex")
             .position(12, 144)
             .size(108, 32)
             .text("Codex")
+            .theme(theme, model.selectedAgent == "codex")
             .onClick([&] { h.model.selectedAgent = "codex"; })
             .build();
-        ui.button("shell.agent.grok")
+        components::button(ui, "shell.agent.grok")
             .position(128, 144)
             .size(108, 32)
             .text("Grok")
+            .theme(theme, model.selectedAgent == "grok")
             .onClick([&] { h.model.selectedAgent = "grok"; })
             .build();
 
@@ -142,12 +164,13 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
         for (const auto& session : model.snapshot.sessions) {
           const std::string id =
               "shell.session." + std::to_string(session.conversationId);
-          ui.button(id.c_str())
+          components::button(ui, id)
               .position(12, y)
               .size(224, 36)
               .text(session.title.empty()
                         ? ("#" + std::to_string(session.conversationId))
                         : session.title)
+              .theme(theme, false)
               .onClick([&, cid = session.conversationId] {
                 h.model.selectedConversationId = cid;
                 (void)h.client.enqueueSelectSession(cid);
@@ -156,16 +179,18 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
           y += 40;
         }
 
-        ui.button("shell.nav.chat")
+        components::button(ui, "shell.nav.chat")
             .position(12, layout.sidebar.height - 96)
             .size(224, 36)
             .text("Chat")
+            .theme(theme, h.shell.route() == Route::Chat)
             .onClick([&] { h.shell.navigate(Route::Chat); })
             .build();
-        ui.button("shell.nav.settings")
+        components::button(ui, "shell.nav.settings")
             .position(12, layout.sidebar.height - 52)
             .size(224, 36)
             .text("Settings")
+            .theme(theme, h.shell.route() == Route::Settings)
             .onClick([&] { h.shell.navigate(Route::Settings); })
             .build();
       })
@@ -175,8 +200,9 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
   ui.stack("shell.header")
       .position(layout.header.x, layout.header.y)
       .size(layout.header.width, layout.header.height)
-      .background({0.09f, 0.10f, 0.12f, 1.0f})
       .content([&] {
+        panelBackground(ui, "shell.header.bg", layout.header.width,
+                        layout.header.height, {0.09f, 0.10f, 0.12f, 1.0f});
         const std::string status = h.shell.statusLabel(model);
         ui.text("shell.header.status")
             .position(16, 12)
@@ -197,8 +223,9 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
     ui.stack("settings.root")
         .position(layout.content.x, layout.content.y)
         .size(layout.content.width, layout.content.height)
-        .background({0.06f, 0.07f, 0.09f, 1.0f})
         .content([&] {
+          panelBackground(ui, "settings.root.bg", layout.content.width,
+                          layout.content.height, {0.06f, 0.07f, 0.09f, 1.0f});
           ui.text("settings.title")
               .position(16, 16)
               .size(400, 28)
@@ -206,24 +233,27 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
               .fontSize(18.0f)
               .color({0.94f, 0.96f, 0.98f, 1.0f})
               .build();
-          ui.button("settings.tab.codex")
+          components::button(ui, "settings.tab.codex")
               .position(16, 56)
               .size(120, 32)
               .text("Codex")
+              .theme(theme, h.settings.activeTab() == Agent::Codex)
               .onClick([&] { h.settings.setActiveTab(Agent::Codex); })
               .build();
-          ui.button("settings.tab.grok")
+          components::button(ui, "settings.tab.grok")
               .position(144, 56)
               .size(120, 32)
               .text("Grok")
+              .theme(theme, h.settings.activeTab() == Agent::Grok)
               .onClick([&] { h.settings.setActiveTab(Agent::Grok); })
               .build();
           auto& active = h.settings.active();
-          ui.button("settings.probe")
+          components::button(ui, "settings.probe")
               .position(16, 104)
               .size(120, 32)
               .text(active.probePending() ? "Probing…" : "Probe")
-              .enabled(!active.probePending())
+              .theme(theme)
+              .disabled(active.probePending())
               .onClick([&] {
                 if (h.client.enqueueProbe(agentWire(h.settings.activeTab()))) {
                   for (const auto& e : h.model.pending) {
@@ -234,11 +264,12 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
                 }
               })
               .build();
-          ui.button("settings.save")
+          components::button(ui, "settings.save")
               .position(148, 104)
               .size(120, 32)
               .text(active.savePending() ? "Saving…" : "Save")
-              .enabled(!active.savePending())
+              .theme(theme)
+              .disabled(active.savePending())
               .onClick([&] {
                 const std::string json =
                     h.settings.buildPatchJson(h.settings.activeTab());
@@ -255,7 +286,8 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
           ui.text("settings.hint")
               .position(16, 156)
               .size(layout.content.width - 32, 80)
-              .text("Facade fields only. Secrets never shown in the error strip.")
+              .text(
+                  "Facade fields only. Secrets never shown in the error strip.")
               .fontSize(13.0f)
               .color({0.7f, 0.74f, 0.78f, 1.0f})
               .build();
@@ -268,8 +300,9 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
     ui.stack("chat.root")
         .position(layout.content.x, layout.content.y)
         .size(layout.content.width, layout.content.height)
-        .background({0.055f, 0.062f, 0.075f, 1.0f})
         .content([&] {
+          panelBackground(ui, "chat.root.bg", layout.content.width,
+                          layout.content.height, {0.055f, 0.062f, 0.075f, 1.0f});
           float y = 12;
           int index = 0;
           for (const auto& line : lines) {
@@ -277,15 +310,15 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
             std::string body;
             if (line.role == "tool") {
               body = ChatState::projectToolLine(line.toolName, line.toolStatus);
-            } else if (line.role == "user") {
-              body = line.text;
             } else {
               body = line.text;
             }
             ui.text(key.c_str())
                 .position(16, y)
                 .size(layout.content.width - 32, 48)
-                .text((line.role == "user" ? "You: " : line.role == "tool" ? "" : "Agent: ") +
+                .text((line.role == "user"     ? "You: "
+                       : line.role == "tool"   ? ""
+                                               : "Agent: ") +
                       body)
                 .fontSize(14.0f)
                 .color({0.90f, 0.92f, 0.94f, 1.0f})
@@ -308,25 +341,25 @@ void paintShell(eui::Ui& ui, float width, float height, Host& h) {
     ui.stack("chat.composer")
         .position(layout.composer.x, layout.composer.y)
         .size(layout.composer.width, layout.composer.height)
-        .background({0.08f, 0.09f, 0.11f, 1.0f})
         .content([&] {
-          const bool canSend = h.chat.state().sendEnabled(model) ||
-                               (!h.chat.state().composer.empty() && model.canSend() &&
-                                !h.chat.state().sendRequestId.has_value());
-          ui.input("chat.input")
+          panelBackground(ui, "chat.composer.bg", layout.composer.width,
+                          layout.composer.height, {0.08f, 0.09f, 0.11f, 1.0f});
+          components::input(ui, "chat.input")
               .position(12, 6)
               .size(layout.composer.width - 120, 32)
               .value(h.chat.state().composer)
               .placeholder("Message")
+              .theme(theme)
               .onChange([&](const std::string& value) {
                 h.chat.state().composer = value;
               })
               .build();
-          ui.button("chat.send")
+          components::button(ui, "chat.send")
               .position(layout.composer.width - 100, 6)
               .size(88, 32)
               .text("Send")
-              .enabled(canSend || !h.chat.state().composer.empty())
+              .theme(theme)
+              .disabled(h.chat.state().composer.empty())
               .onClick([&] {
                 (void)h.chat.trySend(h.model, [&](const std::string& text) {
                   return h.client.enqueueSend(text);
@@ -370,7 +403,6 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
 
   h.client.pollIfDue(std::chrono::steady_clock::now());
 
-  // Complete settings pending when completions arrive
   for (const auto& raw : h.model.snapshot.completions) {
     Completion c{raw.requestId, static_cast<Operation>(raw.op),
                  static_cast<CompletionStatus>(raw.status), raw.resultPayload,
@@ -382,11 +414,10 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
 
   paintShell(ui, screen.width, screen.height, h);
 
-  // Persistent 1x1 ticker for smoke frame counting (post-shell).
   ui.stack("smoke.ticker")
       .position(0, 0)
       .size(1, 1)
-      .onFrame([&] {
+      .onFrame([&](float) {
         if (h.smoke.onFrameCallback()) {
           if (GLFWwindow* window = glfwGetCurrentContext()) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
