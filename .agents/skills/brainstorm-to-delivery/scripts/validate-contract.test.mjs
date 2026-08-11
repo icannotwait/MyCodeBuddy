@@ -1,14 +1,16 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   MAX_PLAN_DOCUMENT_BYTES,
   MAX_PROGRESS_BLOCK_BYTES,
@@ -17,11 +19,77 @@ import {
   validateSimpleDocuments,
   validateSkillMarkdown,
 } from "./validate-contract.lib.mjs"
-import { readUtf8FileBounded } from "./validate-contract.mjs"
+import {
+  canonicalPathsEqual,
+  isDirectInvocation,
+  readUtf8FileBounded,
+} from "./validate-contract.mjs"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const realSkill = readFileSync(join(__dirname, "..", "SKILL.md"), "utf8")
+const validatorScript = join(__dirname, "validate-contract.mjs")
 const planRelPath = "docs/superpowers/plans/example.md"
+
+const SKILL_CONTRACT = {
+  schema_version: 1,
+  phase_order: [
+    "establish-current-truth",
+    "produce-plan-and-register",
+    "maintain-progress",
+    "apply-workspace-gate",
+    "execute-tasks-serially",
+    "recover-generic-runs",
+    "complete-final-review",
+  ],
+  interfaces: {
+    plan_authoring: "writing-plans",
+    registration: "register_simple_workflow",
+    first_run: "delegate_to_agent",
+    later_run: "continue_delegation",
+    join: "get_delegation_status",
+    recovery_authorization: "request_recovery_authorization",
+  },
+  plan_setup_order: [
+    "create-progress",
+    "write-plan",
+    "confirm-plan-on-disk",
+    "register-simple-workflow",
+    "sync-plan-tasks",
+    "review-plan",
+  ],
+  progress: {
+    marker: "codeg-simple-progress-v1",
+    mutation_order: [
+      "record-reserving-intent",
+      "delegate",
+      "record-admission",
+      "record-observed-state",
+    ],
+  },
+  workspace_policy: "preserve-user-changes",
+  task_execution: {
+    order: "serial",
+    implementer: "grok",
+    reviewer: "codex",
+    review: "independent",
+  },
+  recovery: {
+    unexpected_continuations: 2,
+    logical_replacements: 1,
+    replacement_retry: "pre-admission-only",
+  },
+  final_review: {
+    required: true,
+    independent: true,
+    reviewer: "codex",
+  },
+}
+
+function skillContractBlock(contract = SKILL_CONTRACT) {
+  return `<!-- codeg-b2d-skill-contract-v1
+${JSON.stringify(contract, null, 2)}
+-->`
+}
 
 const METADATA_ONLY_SKILL = `---
 name: brainstorm-to-delivery
@@ -40,11 +108,13 @@ description: Use when a completed Brainstorm must become a local delivery.
 
 # Brainstorm to Delivery
 
+${skillContractBlock()}
+
 ## 1. Discover current truth
 
 After compaction, inspect live schemas for `register_simple_workflow`,
 `delegate_to_agent`, `continue_delegation`, `get_delegation_status`, and
-`request_recovery_authorization`.
+`request_recovery_authorization`. Refresh discovery before resuming.
 
 ## 2. Plan then register
 
@@ -228,6 +298,19 @@ function swapPlanAndProgressSections(skill) {
   )
 }
 
+function replaceNumberedSectionBody(skill, index, body) {
+  const heading = skill.indexOf(`## ${index}.`)
+  const bodyStart = skill.indexOf("\n", heading) + 1
+  const end =
+    index === 7 ? skill.length : skill.indexOf(`## ${index + 1}.`, bodyStart)
+  assert.ok(heading >= 0 && bodyStart > heading && end > bodyStart)
+  return skill.slice(0, bodyStart) + `\n${body.trim()}\n\n` + skill.slice(end)
+}
+
+function replaceSkillContract(skill, contract) {
+  return skill.replace(skillContractBlock(), skillContractBlock(contract))
+}
+
 describe("Skill metadata contract", () => {
   it("rejects metadata-only guidance without the ordered contract", () => {
     assertHasRule(
@@ -304,26 +387,108 @@ describe("Skill metadata contract", () => {
     )
   })
 
-  it("requires phase-specific ordering and safety rails", () => {
+  it("requires one unfenced machine-readable positive contract", () => {
+    const parallel = structuredClone(SKILL_CONTRACT)
+    parallel.task_execution.order = "parallel"
+    const unlimitedRecovery = structuredClone(SKILL_CONTRACT)
+    unlimitedRecovery.recovery.unexpected_continuations = 99
+    const disabledRegistration = structuredClone(SKILL_CONTRACT)
+    disabledRegistration.interfaces.registration = "none"
+    const optionalFinal = structuredClone(SKILL_CONTRACT)
+    optionalFinal.final_review.required = false
+    const reordered = structuredClone(SKILL_CONTRACT)
+    const secondPhase = reordered.phase_order[1]
+    reordered.phase_order[1] = reordered.phase_order[2]
+    reordered.phase_order[2] = secondPhase
+
+    for (const mutation of [
+      CONTRACT_SKILL.replace(skillContractBlock(), ""),
+      CONTRACT_SKILL.replace(
+        skillContractBlock(),
+        `\`\`\`json\n${skillContractBlock()}\n\`\`\``
+      ),
+      `${CONTRACT_SKILL}\n${skillContractBlock()}\n`,
+      replaceSkillContract(CONTRACT_SKILL, parallel),
+      replaceSkillContract(CONTRACT_SKILL, unlimitedRecovery),
+      replaceSkillContract(CONTRACT_SKILL, disabledRegistration),
+      replaceSkillContract(CONTRACT_SKILL, optionalFinal),
+      replaceSkillContract(CONTRACT_SKILL, reordered),
+    ]) {
+      assertHasRule(
+        validateSkillMarkdown(mutation).failures,
+        "B2D-SKILL-004"
+      )
+    }
+  })
+
+  it("rejects negative instructions for every ordered behavior", () => {
+    const preambleNegative = CONTRACT_SKILL.replace(
+      skillContractBlock(),
+      skillContractBlock() +
+        "\n\nNever use writing-plans; once the Plan exists, do not call " +
+        "register_simple_workflow."
+    )
+    assertHasRule(
+      validateSkillMarkdown(preambleNegative).failures,
+      "B2D-SKILL-004"
+    )
+
     const mutations = [
-      CONTRACT_SKILL.replace("`writing-plans`", "planning"),
-      CONTRACT_SKILL.replace(
-        "Use `writing-plans` to write\nthe Plan. After the Plan exists, " +
-          "call `register_simple_workflow`",
-        "Call `register_simple_workflow`, then use `writing-plans` to " +
-          "write the Plan. The Plan exists afterward"
-      ),
-      CONTRACT_SKILL.replace(
-        "Before delegation, write reserving\nintent. After every observed " +
-          "state change",
-        "After every observed state change, write reserving intent before " +
-          "delegation"
-      ),
-      CONTRACT_SKILL.replace("Execute Tasks serially.", "Execute Tasks."),
-      CONTRACT_SKILL.replace("| Unexpected continuations | 2 |", ""),
-      CONTRACT_SKILL.replace("`final_review_status`", "final status"),
+      [
+        2,
+        "Never use writing-plans. Once the Plan exists, do not call " +
+          "register_simple_workflow; leave Tasks pending and skip Plan review.",
+      ],
+      [
+        3,
+        "Never write codeg-simple-progress-v1 before delegation. Do not " +
+          "record reserving intent; ignore every observed update after " +
+          "state changes.",
+      ],
+      [
+        5,
+        "Do not execute Tasks serially. Never use delegate_to_agent, " +
+          "continue_delegation, or stable work_unit_key; Grok, Codex, and " +
+          "task_ids are prohibited.",
+      ],
+      [
+        6,
+        "Treat recovery_confirmation_required and recovery_authorization_id " +
+          "as forbidden. Avoid fresh_dispatch for unresumable, " +
+          "budget_exhausted_continue, not_supported, admission_failed, and " +
+          "admission_unknown. Never enforce | Unexpected continuations | 2 | " +
+          "or | Logical replacement | 1 |.",
+      ],
+      [
+        7,
+        "Do not set final_review_status to in_progress or completed. Never " +
+          "request an independent Codex final review or commit owned changes.",
+      ],
     ]
-    for (const mutation of mutations) {
+
+    for (const [index, body] of mutations) {
+      assertHasRule(
+        validateSkillMarkdown(
+          replaceNumberedSectionBody(CONTRACT_SKILL, index, body)
+        ).failures,
+        "B2D-SKILL-004"
+      )
+    }
+  })
+
+  it("rejects keyword-only and fenced workflow placeholders", () => {
+    const keywordOnly = replaceNumberedSectionBody(
+      CONTRACT_SKILL,
+      2,
+      "writing-plans plan exists register_simple_workflow pending review."
+    )
+    const fenced = replaceNumberedSectionBody(
+      CONTRACT_SKILL,
+      2,
+      "```text\nwriting-plans plan exists register_simple_workflow " +
+        "pending review.\n```"
+    )
+    for (const mutation of [keywordOnly, fenced]) {
       assertHasRule(
         validateSkillMarkdown(mutation).failures,
         "B2D-SKILL-004"
@@ -810,7 +975,7 @@ describe("Simple progress parsing and validation", () => {
   })
 })
 
-describe("bounded CLI file reads", () => {
+describe("CLI file reads and direct invocation", () => {
   it("accepts an exact UTF-8 byte boundary and rejects overflow", () => {
     const directory = mkdtempSync(join(tmpdir(), "b2d-validator-"))
     const fixture = join(directory, "fixture.md")
@@ -827,6 +992,67 @@ describe("bounded CLI file reads", () => {
         () => readUtf8FileBounded(fixture, 1, "fixture"),
         /fixture is not valid UTF-8/
       )
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it("compares canonical paths with platform-appropriate casing", () => {
+    assert.equal(
+      canonicalPathsEqual(
+        "C:\\Repo\\Skill\\validate-contract.mjs",
+        "c:\\repo\\skill\\VALIDATE-CONTRACT.MJS",
+        "win32"
+      ),
+      true
+    )
+    assert.equal(
+      canonicalPathsEqual("/Repo/Skill", "/repo/skill", "linux"),
+      false
+    )
+  })
+
+  it("runs when invoked through a symlink or junction", () => {
+    const directory = mkdtempSync(join(tmpdir(), "b2d-validator-entry-"))
+    const aliasDirectory = join(directory, "skill-scripts")
+    try {
+      symlinkSync(
+        dirname(validatorScript),
+        aliasDirectory,
+        process.platform === "win32" ? "junction" : "dir"
+      )
+      const aliasScript = join(aliasDirectory, "validate-contract.mjs")
+      assert.equal(
+        isDirectInvocation(aliasScript, pathToFileURL(validatorScript).href),
+        true
+      )
+      const result = spawnSync(process.execPath, [aliasScript], {
+        encoding: "utf8",
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(
+        result.stdout,
+        /PASS: brainstorm-to-delivery Simple contract/
+      )
+
+      if (process.platform === "win32") {
+        const alternateCase = validatorScript.toUpperCase()
+        assert.equal(
+          isDirectInvocation(
+            alternateCase,
+            pathToFileURL(validatorScript).href
+          ),
+          true
+        )
+        const caseResult = spawnSync(process.execPath, [alternateCase], {
+          encoding: "utf8",
+        })
+        assert.equal(caseResult.status, 0, caseResult.stderr)
+        assert.match(
+          caseResult.stdout,
+          /PASS: brainstorm-to-delivery Simple contract/
+        )
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }

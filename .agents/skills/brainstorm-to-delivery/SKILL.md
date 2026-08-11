@@ -21,6 +21,66 @@ Implementation Plan.
 implementation, independent review, fix loops, reports, and final review. This
 Skill supplies the Codeg routing and Simple progress contract below.
 
+The following positive contract is authoritative. Execute its phases and
+ordered actions exactly; use the numbered sections for operational detail.
+
+<!-- codeg-b2d-skill-contract-v1
+{
+  "schema_version": 1,
+  "phase_order": [
+    "establish-current-truth",
+    "produce-plan-and-register",
+    "maintain-progress",
+    "apply-workspace-gate",
+    "execute-tasks-serially",
+    "recover-generic-runs",
+    "complete-final-review"
+  ],
+  "interfaces": {
+    "plan_authoring": "writing-plans",
+    "registration": "register_simple_workflow",
+    "first_run": "delegate_to_agent",
+    "later_run": "continue_delegation",
+    "join": "get_delegation_status",
+    "recovery_authorization": "request_recovery_authorization"
+  },
+  "plan_setup_order": [
+    "create-progress",
+    "write-plan",
+    "confirm-plan-on-disk",
+    "register-simple-workflow",
+    "sync-plan-tasks",
+    "review-plan"
+  ],
+  "progress": {
+    "marker": "codeg-simple-progress-v1",
+    "mutation_order": [
+      "record-reserving-intent",
+      "delegate",
+      "record-admission",
+      "record-observed-state"
+    ]
+  },
+  "workspace_policy": "preserve-user-changes",
+  "task_execution": {
+    "order": "serial",
+    "implementer": "grok",
+    "reviewer": "codex",
+    "review": "independent"
+  },
+  "recovery": {
+    "unexpected_continuations": 2,
+    "logical_replacements": 1,
+    "replacement_retry": "pre-admission-only"
+  },
+  "final_review": {
+    "required": true,
+    "independent": true,
+    "reviewer": "codex"
+  }
+}
+-->
+
 ## 1. Establish current truth
 
 1. Read repository instructions, the Brainstorm, relevant code and tests,

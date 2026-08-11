@@ -11,8 +11,130 @@ const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
 const MAX_UNEXPECTED_CONTINUATIONS = 2
 
+const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v1"
 const PROGRESS_MARKER = "<!-- codeg-simple-progress-v1"
 const COMMENT_END = "-->"
+const REQUIRED_SKILL_CONTRACT = {
+  schema_version: 1,
+  phase_order: [
+    "establish-current-truth",
+    "produce-plan-and-register",
+    "maintain-progress",
+    "apply-workspace-gate",
+    "execute-tasks-serially",
+    "recover-generic-runs",
+    "complete-final-review",
+  ],
+  interfaces: {
+    plan_authoring: "writing-plans",
+    registration: "register_simple_workflow",
+    first_run: "delegate_to_agent",
+    later_run: "continue_delegation",
+    join: "get_delegation_status",
+    recovery_authorization: "request_recovery_authorization",
+  },
+  plan_setup_order: [
+    "create-progress",
+    "write-plan",
+    "confirm-plan-on-disk",
+    "register-simple-workflow",
+    "sync-plan-tasks",
+    "review-plan",
+  ],
+  progress: {
+    marker: "codeg-simple-progress-v1",
+    mutation_order: [
+      "record-reserving-intent",
+      "delegate",
+      "record-admission",
+      "record-observed-state",
+    ],
+  },
+  workspace_policy: "preserve-user-changes",
+  task_execution: {
+    order: "serial",
+    implementer: "grok",
+    reviewer: "codex",
+    review: "independent",
+  },
+  recovery: {
+    unexpected_continuations: 2,
+    logical_replacements: 1,
+    replacement_retry: "pre-admission-only",
+  },
+  final_review: {
+    required: true,
+    independent: true,
+    reviewer: "codex",
+  },
+}
+const CONTRACT_ACTIONS = [
+  "writing-plans",
+  "register_simple_workflow",
+  "codeg-simple-progress-v1",
+  "reserving",
+  "delegate_to_agent",
+  "continue_delegation",
+  "get_delegation_status",
+  "request_recovery_authorization",
+  "recovery_confirmation_required",
+  "recovery_authorization_id",
+  "fresh_dispatch",
+  "serial(?:ly)?",
+  "unexpected continuations?",
+  "logical replacements?",
+  "final_review_status",
+  "final\\s+review",
+  "independent\\s+codex\\s+final\\s+review",
+].join("|")
+const NEGATIVE_CONTRACT_DIRECTIVE = new RegExp(
+  `\\b(?:never|(?:do|does|shall)\\s+not|don't|must\\s+not|` +
+    `should\\s+not|skip|omit|avoid|forbid(?:den)?|prohibit(?:ed)?|` +
+    `decline\\s+to|refuse\\s+to|refrain\\s+from)\\b` +
+    `[^.!?\\n]{0,200}` +
+    `(?:${CONTRACT_ACTIONS})`,
+  "i"
+)
+const NEGATED_CONTRACT_ACTION = new RegExp(
+  `(?:${CONTRACT_ACTIONS})[^.!?\\n]{0,120}` +
+    `\\b(?:must\\s+not|should\\s+not|shall\\s+not|may\\s+not|` +
+    `(?:is|are)\\s+(?:forbidden|prohibited))\\b`,
+  "i"
+)
+const POSITIVE_SKILL_DIRECTIVES = new Set([
+  "adjudicate",
+  "call",
+  "choose",
+  "commit",
+  "complete",
+  "continue",
+  "create",
+  "dispatch",
+  "execute",
+  "handle",
+  "inspect",
+  "join",
+  "keep",
+  "mark",
+  "prefer",
+  "preserve",
+  "read",
+  "re-read",
+  "record",
+  "refresh",
+  "replace",
+  "replay",
+  "report",
+  "request",
+  "route",
+  "run",
+  "set",
+  "supply",
+  "treat",
+  "update",
+  "use",
+  "write",
+])
 const TASK_STATUSES = new Set([
   "pending",
   "in_progress",
@@ -270,20 +392,20 @@ function numberedSkillSections(skill) {
   const sections = []
   let current = null
   let fence = null
-  for (const line of skill.split(/\r?\n/)) {
+  for (const [lineIndex, line] of skill.split(/\r?\n/).entries()) {
     if (fence) {
       if (fenceEnd(line, fence)) fence = null
-      if (current) current.lines.push(line)
       continue
     }
     fence = fenceStart(line)
-    if (fence) {
-      if (current) current.lines.push(line)
-      continue
-    }
+    if (fence) continue
     const heading = line.match(/^##\s+([1-9][0-9]*)\.\s+\S/)
     if (heading) {
-      current = { index: Number(heading[1]), lines: [] }
+      current = {
+        index: Number(heading[1]),
+        line: lineIndex + 1,
+        lines: [],
+      }
       sections.push(current)
     } else if (current) {
       current.lines.push(line)
@@ -291,13 +413,130 @@ function numberedSkillSections(skill) {
   }
   return sections.map((section) => ({
     index: section.index,
+    line: section.line,
     body: section.lines.join("\n"),
   }))
 }
 
-function missingTokens(body, tokens) {
-  const lower = body.toLowerCase()
-  return tokens.filter((token) => !lower.includes(token.toLowerCase()))
+function embeddedSkillContracts(skill) {
+  const contracts = []
+  let contract = null
+  let fence = null
+  for (const [lineIndex, line] of skill.split(/\r?\n/).entries()) {
+    if (contract) {
+      if (line.trim() === COMMENT_END) {
+        contracts.push({
+          line: contract.line,
+          source: contract.lines.join("\n"),
+        })
+        contract = null
+      } else {
+        contract.lines.push(line)
+      }
+      continue
+    }
+    if (fence) {
+      if (fenceEnd(line, fence)) fence = null
+      continue
+    }
+    fence = fenceStart(line)
+    if (fence) continue
+    if (line.trim() === SKILL_CONTRACT_MARKER) {
+      contract = { line: lineIndex + 1, lines: [] }
+    }
+  }
+  return { contracts, unterminated: contract !== null }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (!isObject(value)) return value
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalJson(value[key])])
+  )
+}
+
+function skillContractsEqual(actual, expected) {
+  return (
+    JSON.stringify(canonicalJson(actual)) ===
+    JSON.stringify(canonicalJson(expected))
+  )
+}
+
+function visibleSkillProse(body) {
+  return body.replace(/<!--[\s\S]*?-->/g, " ")
+}
+
+function unfencedVisibleSkillProse(skill) {
+  const lines = []
+  let fence = null
+  for (const line of skill.split(/\r?\n/)) {
+    if (fence) {
+      if (fenceEnd(line, fence)) fence = null
+      continue
+    }
+    fence = fenceStart(line)
+    if (!fence) lines.push(line)
+  }
+  return visibleSkillProse(lines.join("\n"))
+}
+
+function hasSubstantiveSkillProse(body) {
+  const prose = visibleSkillProse(body)
+    .replace(/`[^`\r\n]*`/g, " ")
+    .replace(/^\s*\|.*$/gm, " ")
+  const words = prose.match(/[A-Za-z][A-Za-z-]*/g) ?? []
+  const directives = words.filter((word) =>
+    POSITIVE_SKILL_DIRECTIVES.has(word.toLowerCase())
+  )
+  return (
+    words.length >= 6 &&
+    directives.length >= 2 &&
+    /[.!:](?:\s|$)/m.test(prose)
+  )
+}
+
+function validateEmbeddedSkillContract(skill, firstSectionLine, failures) {
+  const { contracts, unterminated } = embeddedSkillContracts(skill)
+  if (unterminated || contracts.length !== 1) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Skill requires exactly one complete unfenced structured contract"
+    )
+    return
+  }
+
+  const embedded = contracts[0]
+  if (embedded.line >= firstSectionLine) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Structured contract must precede the numbered workflow"
+    )
+  }
+
+  let contract
+  try {
+    contract = JSON.parse(embedded.source)
+  } catch {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Structured contract must contain valid JSON"
+    )
+    return
+  }
+
+  if (!skillContractsEqual(contract, REQUIRED_SKILL_CONTRACT)) {
+    fail(
+      failures,
+      "B2D-SKILL-004",
+      "Structured contract must match the required positive Simple semantics"
+    )
+  }
 }
 
 function validateOrderedSkillContract(skill, failures) {
@@ -311,121 +550,33 @@ function validateOrderedSkillContract(skill, failures) {
     return
   }
 
-  const requiredBySection = new Map([
-    [
-      1,
-      [
-        "compaction",
-        "register_simple_workflow",
-        "delegate_to_agent",
-        "continue_delegation",
-        "get_delegation_status",
-        "request_recovery_authorization",
-      ],
-    ],
-    [2, ["writing-plans", "register_simple_workflow", "pending", "review"]],
-    [3, ["codeg-simple-progress-v1", "reserving", "observed"]],
-    [4, ["git status", "staged diff", "unstaged diff", "preserve"]],
-    [
-      5,
-      [
-        "serial",
-        "delegate_to_agent",
-        "continue_delegation",
-        "work_unit_key",
-        "grok",
-        "codex",
-        "task_ids",
-      ],
-    ],
-    [
-      6,
-      [
-        "recovery_confirmation_required",
-        "recovery_authorization_id",
-        "fresh_dispatch",
-        "unresumable",
-        "budget_exhausted_continue",
-        "not_supported",
-        "admission_failed",
-        "admission_unknown",
-      ],
-    ],
-    [
-      7,
-      [
-        "final_review_status",
-        "in_progress",
-        "completed",
-        "independent",
-        "codex",
-        "commit",
-      ],
-    ],
-  ])
-
+  validateEmbeddedSkillContract(skill, sections[0].line, failures)
   for (const section of sections) {
-    const missing = missingTokens(
-      section.body,
-      requiredBySection.get(section.index)
-    )
-    if (missing.length > 0) {
+    if (!hasSubstantiveSkillProse(section.body)) {
       fail(
         failures,
         "B2D-SKILL-004",
-        `Skill section ${section.index} lacks contract elements: ` +
-          missing.join(", ")
+        `Skill section ${section.index} requires substantive unfenced guidance`
       )
     }
   }
 
-  const planSection = sections[1].body.toLowerCase()
-  const writingPlans = planSection.indexOf("writing-plans")
-  const planExists = planSection.indexOf("plan exists", writingPlans + 1)
-  const registration = planSection.indexOf(
-    "register_simple_workflow",
-    planExists + 1
-  )
-  if (writingPlans < 0 || planExists < 0 || registration < 0) {
-    fail(
-      failures,
-      "B2D-SKILL-004",
-      "Skill section 2 must order writing-plans, Plan existence, then " +
-        "registration"
-    )
-  }
-
-  const progressSection = sections[2].body.toLowerCase()
-  const before = progressSection.indexOf("before")
-  const reserving = progressSection.indexOf("reserving", before + 1)
-  const after = progressSection.indexOf("after", reserving + 1)
-  if (before < 0 || reserving < 0 || after < 0) {
-    fail(
-      failures,
-      "B2D-SKILL-004",
-      "Skill section 3 must record reserving intent before mutation and " +
-        "update after state changes"
-    )
-  }
-
-  const recoverySection = sections[5].body
+  const prose = unfencedVisibleSkillProse(skill)
   if (
-    !/unexpected continuations?[\s\S]{0,80}\|\s*2\s*\|/i.test(
-      recoverySection
-    ) ||
-    !/logical replacement[\s\S]{0,80}\|\s*1\s*\|/i.test(recoverySection)
+    NEGATIVE_CONTRACT_DIRECTIVE.test(prose) ||
+    NEGATED_CONTRACT_ACTION.test(prose)
   ) {
     fail(
       failures,
       "B2D-SKILL-004",
-      "Skill section 6 must retain the 2-continuation and 1-replacement rails"
+      "Skill prose negates a required contract action"
     )
   }
 }
 
 /**
- * Validate metadata and the structural ordered contract without matching exact
- * workflow prose.
+ * Validate metadata and the embedded positive contract without matching exact
+ * natural-language workflow prose.
  */
 export function validateSkillMarkdown(skillMarkdown) {
   const skill = String(skillMarkdown ?? "")

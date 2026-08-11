@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-import { closeSync, fstatSync, openSync, readSync } from "node:fs"
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { TextDecoder } from "node:util"
 import { fileURLToPath } from "node:url"
@@ -47,6 +53,24 @@ export function readUtf8FileBounded(path, maxBytes, label) {
     }
   } finally {
     closeSync(handle)
+  }
+}
+
+export function canonicalPathsEqual(left, right, platform = process.platform) {
+  const normalize =
+    platform === "win32" ? (value) => value.toLowerCase() : (value) => value
+  return normalize(left) === normalize(right)
+}
+
+export function isDirectInvocation(entryPath, moduleUrl) {
+  if (!entryPath) return false
+  try {
+    return canonicalPathsEqual(
+      realpathSync.native(resolve(entryPath)),
+      realpathSync.native(fileURLToPath(moduleUrl))
+    )
+  } catch {
+    return false
   }
 }
 
@@ -126,9 +150,6 @@ function run(args) {
   return 0
 }
 
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   process.exitCode = run(process.argv.slice(2))
 }
