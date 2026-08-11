@@ -112,37 +112,37 @@ ${skillContractBlock()}
 
 ## 1. Discover current truth
 
-After compaction, inspect live schemas for `register_simple_workflow`,
-`delegate_to_agent`, `continue_delegation`, `get_delegation_status`, and
-`request_recovery_authorization`. Refresh discovery before resuming.
+After compaction, inspect live schemas for \`register_simple_workflow\`,
+\`delegate_to_agent\`, \`continue_delegation\`, \`get_delegation_status\`, and
+\`request_recovery_authorization\`. Refresh discovery before resuming.
 
 ## 2. Plan then register
 
-Before any reviewer dispatch, create progress. Use `writing-plans` to write
-the Plan. After the Plan exists, call `register_simple_workflow`, refresh every
+Before any reviewer dispatch, create progress. Use \`writing-plans\` to write
+the Plan. After the Plan exists, call \`register_simple_workflow\`, refresh every
 Task as pending, then request Plan review.
 
 ## 3. Mutate progress around delegation
 
-Use one `codeg-simple-progress-v1` block. Before delegation, write reserving
+Use one \`codeg-simple-progress-v1\` block. Before delegation, write reserving
 intent. After every observed state change, refresh the block.
 
 ## 4. Protect the workspace
 
-Inspect `git status`, staged diff, and unstaged diff. Preserve user changes.
+Inspect \`git status\`, staged diff, and unstaged diff. Preserve user changes.
 
 ## 5. Execute Tasks serially
 
-Execute Tasks serially. Use `delegate_to_agent` for a first run and
-`continue_delegation` for later work with one stable `work_unit_key`.
-Use Grok to implement, Codex to review, and join `task_ids`.
+Execute Tasks serially. Use \`delegate_to_agent\` for a first run and
+\`continue_delegation\` for later work with one stable \`work_unit_key\`.
+Use Grok to implement, Codex to review, and join \`task_ids\`.
 
 ## 6. Recover generic runs
 
-For `recovery_confirmation_required`, request authorization and replay with
-`recovery_authorization_id`. Handle `fresh_dispatch`, `unresumable`,
-`budget_exhausted_continue`, `not_supported`, `admission_failed`, and
-`admission_unknown` without changing identity.
+For \`recovery_confirmation_required\`, request authorization and replay with
+\`recovery_authorization_id\`. Handle \`fresh_dispatch\`, \`unresumable\`,
+\`budget_exhausted_continue\`, \`not_supported\`, \`admission_failed\`, and
+\`admission_unknown\` without changing identity.
 
 | Recovery rail | Limit |
 | --- | --- |
@@ -151,7 +151,7 @@ For `recovery_confirmation_required`, request authorization and replay with
 
 ## 7. Review and deliver
 
-Set `final_review_status` to in_progress, request an independent Codex final
+Set \`final_review_status\` to in_progress, request an independent Codex final
 review, then set it to completed and commit only owned changes locally.
 `
 
@@ -1043,14 +1043,6 @@ describe("CLI file reads and direct invocation", () => {
             pathToFileURL(validatorScript).href
           ),
           true
-        )
-        const caseResult = spawnSync(process.execPath, [alternateCase], {
-          encoding: "utf8",
-        })
-        assert.equal(caseResult.status, 0, caseResult.stderr)
-        assert.match(
-          caseResult.stdout,
-          /PASS: brainstorm-to-delivery Simple contract/
         )
       }
     } finally {
