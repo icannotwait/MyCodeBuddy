@@ -390,6 +390,7 @@ function ArchivedWorkflowBanner({
   const pendingRef = useRef(false)
   const mountedRef = useRef(true)
   const actionGenerationRef = useRef(0)
+  const navigationRef = useRef(onOpenRootConversation)
   const archived = snapshot.archived
 
   const successorId =
@@ -406,12 +407,16 @@ function ArchivedWorkflowBanner({
   const actionScopeKey = JSON.stringify([
     conversationId,
     snapshot.workflow_id ?? null,
-    snapshot.graph_revision ?? null,
     archived?.source_conversation_id ?? null,
-    archived?.successor_conversation_id ?? null,
-    archived?.can_create_simple_successor ?? false,
+    successorId,
+    canCreate,
     archived?.plan_rel_path ?? null,
+    onOpenRootConversation != null,
   ])
+
+  useIsomorphicLayoutEffect(() => {
+    navigationRef.current = onOpenRootConversation
+  }, [onOpenRootConversation])
 
   useIsomorphicLayoutEffect(() => {
     mountedRef.current = true
@@ -431,7 +436,7 @@ function ArchivedWorkflowBanner({
       actionGenerationRef.current += 1
       pendingRef.current = false
     }
-  }, [actionScopeKey, onOpenRootConversation, snapshot])
+  }, [actionScopeKey])
 
   if (!archived) return null
 
@@ -444,7 +449,7 @@ function ArchivedWorkflowBanner({
   }
 
   const continueInSimple = async () => {
-    if (pendingRef.current || !onOpenRootConversation) return
+    if (pendingRef.current || !navigationRef.current) return
     if (successorId == null && !canCreate) return
 
     pendingRef.current = true
@@ -457,7 +462,9 @@ function ArchivedWorkflowBanner({
       actionGenerationRef.current === actionGeneration
     try {
       if (successorId != null) {
-        await onOpenRootConversation(successorId)
+        const navigate = navigationRef.current
+        if (!navigate || !actionIsCurrent()) return
+        await navigate(successorId)
         return
       }
       const requestToken = randomUUID()
@@ -466,7 +473,9 @@ function ArchivedWorkflowBanner({
         requestToken
       )
       if (!actionIsCurrent()) return
-      await onOpenRootConversation(result.successor_conversation_id)
+      const navigate = navigationRef.current
+      if (!navigate) return
+      await navigate(result.successor_conversation_id)
     } catch (cause: unknown) {
       if (!actionIsCurrent()) return
       setError(toErrorMessage(cause))

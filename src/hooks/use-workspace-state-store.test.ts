@@ -100,6 +100,48 @@ describe("workspace state store full/paths token machine", () => {
     await vi.advanceTimersByTimeAsync(700)
   })
 
+  it("preserves filesystem hints from the initial catch-up replay", async () => {
+    const root = "/machine/initial-catch-up-fs-event-kind"
+    mockedApi.getWorkspaceSnapshot.mockResolvedValueOnce({
+      root_path: root,
+      seq: 1,
+      version: 1,
+      full: false,
+      tree_snapshot: null,
+      git_snapshot: null,
+      deltas: [
+        {
+          seq: 1,
+          kind: "meta",
+          fs_event_kind: "modify",
+          payload: [{ kind: "meta", reason: "fs_events" }],
+          requires_resync: false,
+          changed_paths: [],
+        },
+      ],
+      degraded: false,
+      is_git_repo: true,
+    })
+    const store = getWorkspaceStateStore(root)
+    const listener = vi.fn()
+    const unsubscribe = store.subscribeEnvelopes(listener)
+    const token = store.acquire("paths")
+
+    await drain()
+    await drain()
+
+    expect(listener).toHaveBeenCalledWith({
+      seq: 1,
+      kind: "meta",
+      fs_event_kind: "modify",
+      changed_paths: [],
+    })
+
+    unsubscribe()
+    store.release(token)
+    await vi.advanceTimersByTimeAsync(700)
+  })
+
   it("registers a paths-only subscription without tree/git scanning", async () => {
     const store = getWorkspaceStateStore("/machine/t1")
     const token = store.acquire("paths")

@@ -280,14 +280,24 @@ const workspaceAcquire = vi.fn(() => ({ mode: "paths" as const }))
 const workspaceRelease = vi.fn()
 const workspaceUnsubscribe = vi.fn()
 
-function emitWorkspacePaths(changedPaths: string[]): void {
-  const envelope = {
+function emitWorkspaceEnvelope(
+  envelope: Omit<WorkspaceEnvelope, "seq">
+): void {
+  const sequencedEnvelope = {
     seq: 1,
-    kind: "fs_change",
+    ...envelope,
+  }
+  for (const listener of workspaceEnvelopeListeners) {
+    listener(sequencedEnvelope)
+  }
+}
+
+function emitWorkspacePaths(changedPaths: string[]): void {
+  emitWorkspaceEnvelope({
+    kind: "meta",
     fs_event_kind: "modify",
     changed_paths: changedPaths,
-  }
-  for (const listener of workspaceEnvelopeListeners) listener(envelope)
+  })
 }
 
 beforeEach(() => {
@@ -398,22 +408,43 @@ describe("Simple workspace exact-path refresh", () => {
     releasePosixOverlay()
   })
 
-  it("treats an empty overflow envelope as one debounced sweep without matching unrelated paths", async () => {
+  it("sweeps only empty filesystem envelopes and keeps nonempty exact-path filtering", async () => {
     const first = await activateSimpleWatch(314)
     const second = await activateSimpleWatch(318)
 
-    emitWorkspacePaths([])
+    for (const kind of ["meta", "fs_delta", "git_delta", "resync_hint"]) {
+      emitWorkspaceEnvelope({ kind, changed_paths: [] })
+      await vi.advanceTimersByTimeAsync(200)
+      expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+    }
+    emitWorkspaceEnvelope({
+      kind: "meta",
+      fs_event_kind: "resync",
+      changed_paths: [],
+    })
+    await vi.advanceTimersByTimeAsync(200)
+    expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
+
+    emitWorkspaceEnvelope({
+      kind: "git_delta",
+      fs_event_kind: "modify",
+      changed_paths: [],
+    })
     await vi.advanceTimersByTimeAsync(100)
-    emitWorkspacePaths(["README.md"])
+    emitWorkspaceEnvelope({ kind: "meta", changed_paths: ["README.md"] })
     await vi.advanceTimersByTimeAsync(49)
     expect(getWorkflowGraphSnapshot).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
     await flushMicrotasks()
     expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
 
-    emitWorkspacePaths(["README.md"])
-    await vi.advanceTimersByTimeAsync(500)
-    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(2)
+    emitWorkspaceEnvelope({
+      kind: "meta",
+      changed_paths: ["docs/Plan.md"],
+    })
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+    expect(getWorkflowGraphSnapshot).toHaveBeenCalledTimes(4)
 
     first.releaseFiles()
     first.releaseOverlay()

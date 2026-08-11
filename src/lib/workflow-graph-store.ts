@@ -274,6 +274,10 @@ function normalizeWorkspaceFileForComparison(
   return caseInsensitive ? absolute.toLowerCase() : absolute
 }
 
+function isFilesystemEventKind(value: string | undefined): boolean {
+  return value === "create" || value === "remove" || value === "modify"
+}
+
 function activateSimpleFileInterest(
   get: () => WorkflowGraphState,
   conversationId: number,
@@ -329,14 +333,18 @@ function activateSimpleFileInterest(
     debounceTimer: null,
   }
   record.unsubscribe = workspaceStore.subscribeEnvelopes(
-    ({ changed_paths: changedPaths }) => {
+    ({ fs_event_kind: fsEventKind, changed_paths: changedPaths }) => {
       const relevant =
-        changedPaths.length === 0 ||
-        changedPaths.some((changedPath) =>
-          targets.has(
-            normalizeWorkspaceFileForComparison(workspaceRootPath, changedPath)
-          )
-        )
+        changedPaths.length === 0
+          ? isFilesystemEventKind(fsEventKind)
+          : changedPaths.some((changedPath) =>
+              targets.has(
+                normalizeWorkspaceFileForComparison(
+                  workspaceRootPath,
+                  changedPath
+                )
+              )
+            )
       if (!relevant) return
       if (record.debounceTimer != null) clearTimeout(record.debounceTimer)
       record.debounceTimer = setTimeout(() => {

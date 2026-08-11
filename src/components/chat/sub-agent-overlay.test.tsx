@@ -248,6 +248,51 @@ describe("SubAgentOverlay", () => {
     expect(onOpenRootConversation).toHaveBeenCalledWith(84)
   })
 
+  it("keeps a pending archived action across equivalent graph and callback rerenders", async () => {
+    const pending = deferred<SimpleSuccessorResult>()
+    const initialNavigation = vi.fn()
+    const latestNavigation = vi.fn()
+    vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(pending.promise)
+    const first = archivedSnapshot()
+    const equivalent = archivedSnapshot()
+    equivalent.graph_revision = 8
+    const view = (
+      snapshot: WorkflowGraphSnapshot,
+      onOpenRootConversation: (conversationId: number) => void
+    ) => (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SubAgentOverlay
+          delegations={[]}
+          conversationId={501}
+          workflowGraph={snapshot}
+          onOpenRootConversation={onOpenRootConversation}
+        />
+      </NextIntlClientProvider>
+    )
+    const { rerender } = render(view(first, initialNavigation))
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Continue in Simple" })
+    )
+    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
+
+    rerender(view(equivalent, latestNavigation))
+    const action = screen.getByRole("button", { name: "Continue in Simple" })
+    expect(action).toBeDisabled()
+    fireEvent.click(action)
+    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      pending.resolve(successorResult())
+      await pending.promise
+    })
+
+    expect(initialNavigation).not.toHaveBeenCalled()
+    expect(latestNavigation).toHaveBeenCalledTimes(1)
+    expect(latestNavigation).toHaveBeenCalledWith(84)
+    expect(action).toBeEnabled()
+  })
+
   it("deduplicates navigation while an existing Simple successor is opening", async () => {
     const navigation = deferred<void>()
     const onOpenRootConversation = vi.fn(() => navigation.promise)

@@ -492,6 +492,7 @@ class WorkspaceStateStore {
             this.notifyEnvelope({
               seq: envelope.seq,
               kind: envelope.kind,
+              fs_event_kind: envelope.fs_event_kind,
               changed_paths: envelope.changed_paths ?? [],
             })
           }
