@@ -2905,11 +2905,12 @@ mod tests {
     }
 
     use super::*;
+    use crate::acp::delegation::workflow::{load_simple_workflow, register_simple_workflow};
     use crate::acp::delegation::route::DelegationRoutePolicy;
     use crate::app_error::AppErrorCode;
     use crate::auto_title::InternalSessionPurpose;
     use crate::db::service::import_service;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -6551,6 +6552,32 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 .await
                 .is_err(),
             "a row FK violation must propagate through the strict importer"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_core_removes_its_simple_workflow_descriptor() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/simple-delete-conversation").await;
+        let conversation = seed_conversation(&db, folder, AgentType::Codex).await;
+        register_simple_workflow(&db.conn, conversation, "docs/plan.md", None)
+            .await
+            .expect("register Simple descriptor");
+
+        delete_conversation_core(
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            conversation,
+        )
+        .await
+        .expect("soft delete conversation");
+
+        assert!(
+            load_simple_workflow(&db.conn, conversation)
+                .await
+                .expect("load descriptor")
+                .is_none(),
+            "soft deletion must release the Simple descriptor"
         );
     }
 }

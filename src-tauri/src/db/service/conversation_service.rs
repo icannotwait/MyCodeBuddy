@@ -629,6 +629,7 @@ pub async fn update_external_id(
 /// was removed and active work must be cancelled after commit.
 pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<bool, DbError> {
     use sea_orm::sea_query::Expr;
+    use crate::db::entities::simple_workflow;
 
     let txn = conn.begin().await?;
     let changed = conversation::Entity::update_many()
@@ -651,6 +652,9 @@ pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Res
     )
     .await
     .map_err(|error| DbError::Database(sea_orm::DbErr::Custom(error.to_string())))?;
+    simple_workflow::Entity::delete_by_id(conversation_id)
+        .exec(&txn)
+        .await?;
     let removed = cancel_job(&txn, conversation_id).await?;
     txn.commit().await?;
     Ok(removed)

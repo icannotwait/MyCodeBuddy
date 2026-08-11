@@ -33,3 +33,4 @@ pub use super::model_provider::Entity as ModelProvider;
 pub use super::opened_tab::Entity as OpenedTab;
 pub use super::quick_message::Entity as QuickMessage;
 pub use super::recovery_authorization::Entity as RecoveryAuthorization;
+pub use super::simple_workflow::Entity as SimpleWorkflow;

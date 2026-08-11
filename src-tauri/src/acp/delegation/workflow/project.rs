@@ -5,7 +5,8 @@
 //! fails conversation detail: corrupt manifests and projection errors omit the
 //! graph (`None`) with a warn log.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
@@ -19,6 +20,7 @@ use crate::db::entities::delegation_workflow_gate_state;
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_run_binding;
+use crate::db::entities::{conversation, folder, simple_workflow};
 use crate::db::AppDatabase;
 
 use super::completion_evidence::V2GateEvidenceIdentity;
@@ -28,15 +30,20 @@ use super::completion_projection::{
 };
 use super::dto::{
     redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
-    ProjectedNodeStatus, PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot,
-    WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowOverallState,
-    WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    ArchivedWorkflowNavigationSnapshot, ProjectedNodeStatus, PublicIdAllocator,
+    SimpleWorkflowLocatorSnapshot, WorkflowCompatibility, WorkflowEdgeSnapshot,
+    WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowNodeSyncState,
+    WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 use super::gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
     ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
+use super::simple_parse::{
+    read_simple_plan, read_simple_progress, SimpleDeclaredStatus, SimpleFinalReviewStatus,
+    SimpleParseError, SimplePlanDocument, SimpleProgressDocument,
+};
 use super::types::{
     ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
     ManifestWorkflowState, NormalizedGate, ParsedWorkUnitKey, ResolutionMode, TaskHardTriggerKind,
@@ -359,6 +366,10 @@ async fn project_inner(
     conn: &sea_orm::DatabaseConnection,
     parent_conversation_id: i32,
 ) -> Result<Option<WorkflowGraphSnapshot>, ProjectError> {
+    let descriptor = simple_workflow::Entity::find_by_id(parent_conversation_id)
+        .one(conn)
+        .await
+        .map_err(db_err)?;
     let header = delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
         .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
@@ -367,7 +378,11 @@ async fn project_inner(
         .map_err(db_err)?;
 
     if let Some(header) = header {
-        return project_manifest_mode(conn, &header).await;
+        return project_manifest_mode(conn, &header, descriptor.is_some()).await;
+    }
+
+    if let Some(descriptor) = descriptor {
+        return project_simple_mode(conn, &descriptor).await;
     }
 
     // No durable header → observed-only from recognized A1 keys (A11/B7).
@@ -377,6 +392,7 @@ async fn project_inner(
 async fn project_manifest_mode(
     conn: &sea_orm::DatabaseConnection,
     header: &delegation_workflow::Model,
+    identity_corrupt: bool,
 ) -> Result<Option<WorkflowGraphSnapshot>, ProjectError> {
     let rev_row = delegation_workflow_manifest_revision::Entity::find_by_id((
         header.workflow_id.clone(),
@@ -739,6 +755,23 @@ async fn project_manifest_mode(
             .cloned()
     });
 
+    let successor = simple_workflow::Entity::find()
+        .filter(simple_workflow::Column::SourceWorkflowId.eq(header.workflow_id.clone()))
+        .one(conn)
+        .await
+        .map_err(db_err)?;
+    let archived = ArchivedWorkflowNavigationSnapshot {
+        source_conversation_id: header.parent_conversation_id,
+        plan_rel_path: Some(normalized.plan_target_rel_path.clone()),
+        successor_conversation_id: successor
+            .as_ref()
+            .map(|descriptor| descriptor.parent_conversation_id),
+        can_create_simple_successor: successor.is_none(),
+    };
+    let projection_warning_codes = identity_corrupt
+        .then(|| vec!["workflow_identity_corrupt".to_string()])
+        .unwrap_or_default();
+
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
         workflow_id: Some(id_map.map_id(&header.workflow_id)),
@@ -750,6 +783,9 @@ async fn project_manifest_mode(
         completion,
         compatibility: WorkflowCompatibility::Manifest,
         overall_state,
+        simple: None,
+        archived: Some(archived),
+        projection_warning_codes,
         current_phase_id,
         current_node_ids,
         phases,
@@ -949,6 +985,8 @@ fn project_node_from_binding(
         returned_reviewer_count: None,
         title,
         status,
+        sync_state: WorkflowNodeSyncState::InSync,
+        projection_warning_codes: vec![],
         status_reason,
         run_count,
         active_child_generation,
@@ -1002,6 +1040,8 @@ fn project_node_from_manifest_only(
         returned_reviewer_count: None,
         title: first_display_title([mn.title.as_deref()]),
         status: ProjectedNodeStatus::Estimated,
+        sync_state: WorkflowNodeSyncState::InSync,
+        projection_warning_codes: vec![],
         status_reason: None,
         run_count: 0,
         active_child_generation: None,
@@ -1883,6 +1923,8 @@ fn append_orphan_observed_nodes(
             returned_reviewer_count: None,
             title: orphan_title,
             status,
+            sync_state: WorkflowNodeSyncState::InSync,
+            projection_warning_codes: vec![],
             status_reason: Some("orphan_observed".into()),
             run_count: key_runs.len() as u64,
             active_child_generation: Some(latest.generation),
@@ -2059,6 +2101,421 @@ fn derive_overall_state(
     }
 }
 
+fn push_projection_warning(warnings: &mut Vec<String>, code: &str) {
+    const MAX_WARNINGS: usize = 64;
+    if warnings.len() < MAX_WARNINGS && !warnings.iter().any(|item| item == code) {
+        warnings.push(code.to_string());
+    }
+}
+
+fn simple_parse_warning(prefix: &str, error: &SimpleParseError) -> String {
+    let suffix = match error {
+        SimpleParseError::InvalidPath => "invalid_path",
+        SimpleParseError::InvalidUtf8 => "invalid_utf8",
+        SimpleParseError::SizeLimitExceeded => "size_limit_exceeded",
+        SimpleParseError::Unavailable(_) => "unavailable",
+    };
+    format!("simple_{prefix}_{suffix}")
+}
+
+fn simple_declared_node_status(status: Option<&SimpleDeclaredStatus>) -> ProjectedNodeStatus {
+    match status {
+        None | Some(SimpleDeclaredStatus::Pending | SimpleDeclaredStatus::Unknown(_)) => {
+            ProjectedNodeStatus::Pending
+        }
+        Some(SimpleDeclaredStatus::InProgress) => ProjectedNodeStatus::InProgress,
+        Some(SimpleDeclaredStatus::Completed) => ProjectedNodeStatus::Completed,
+        Some(SimpleDeclaredStatus::Blocked) => ProjectedNodeStatus::Blocked,
+    }
+}
+
+fn run_matches_task_index(run: &delegation_task_run::Model, task_index: u32) -> bool {
+    run.work_unit_key
+        .as_deref()
+        .and_then(parse_recognized_work_unit_key)
+        .is_some_and(|parsed| {
+            matches!(
+                parsed,
+                ParsedWorkUnitKey::TaskImplementer {
+                    task_index: index,
+                    ..
+                } | ParsedWorkUnitKey::TaskReviewer {
+                    task_index: index,
+                    ..
+                } if index == task_index
+            )
+        })
+}
+
+async fn project_simple_mode(
+    conn: &sea_orm::DatabaseConnection,
+    descriptor: &simple_workflow::Model,
+) -> Result<Option<WorkflowGraphSnapshot>, ProjectError> {
+    let parent = conversation::Entity::find_by_id(descriptor.parent_conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await
+        .map_err(db_err)?;
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    let workspace = folder::Entity::find_by_id(parent.folder_id)
+        .one(conn)
+        .await
+        .map_err(db_err)?;
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+
+    let mut projection_warning_codes = Vec::new();
+    let plan = match read_simple_plan(Path::new(&workspace.path), &descriptor.plan_rel_path).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            push_projection_warning(
+                &mut projection_warning_codes,
+                &simple_parse_warning("plan", &error),
+            );
+            SimplePlanDocument::default()
+        }
+    };
+    for warning in &plan.warning_codes {
+        push_projection_warning(&mut projection_warning_codes, warning);
+    }
+    let progress = match read_simple_progress(
+        Path::new(&workspace.path),
+        &descriptor.progress_rel_path,
+        &descriptor.plan_rel_path,
+    )
+    .await
+    {
+        Ok(progress) => progress,
+        Err(error) => {
+            push_projection_warning(
+                &mut projection_warning_codes,
+                &simple_parse_warning("progress", &error),
+            );
+            SimpleProgressDocument::default()
+        }
+    };
+    for warning in &progress.warning_codes {
+        push_projection_warning(&mut projection_warning_codes, warning);
+    }
+
+    let parent_runs = delegation_task_run::Entity::find()
+        .filter(
+            delegation_task_run::Column::ParentConversationId
+                .eq(descriptor.parent_conversation_id),
+        )
+        .order_by_asc(delegation_task_run::Column::CreatedAt)
+        .all(conn)
+        .await
+        .map_err(db_err)?;
+    let runs_by_id = parent_runs
+        .iter()
+        .map(|run| (run.task_id.as_str(), run))
+        .collect::<HashMap<_, _>>();
+    let progress_by_index = progress
+        .snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| (task.index, task))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let plan_indices = plan
+        .tasks
+        .iter()
+        .map(|task| task.index)
+        .collect::<BTreeSet<_>>();
+    for task_index in progress_by_index.keys() {
+        if !plan_indices.contains(task_index) {
+            push_projection_warning(
+                &mut projection_warning_codes,
+                "simple_progress_task_missing_from_plan",
+            );
+        }
+    }
+    let active_task_index = progress
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.active_task_index);
+    if active_task_index.is_some_and(|task_index| !plan_indices.contains(&task_index)) {
+        push_projection_warning(
+            &mut projection_warning_codes,
+            "simple_progress_active_task_missing_from_plan",
+        );
+    }
+
+    let mut nodes = Vec::with_capacity(plan.tasks.len());
+    let mut edges = Vec::with_capacity(plan.tasks.len().saturating_sub(1));
+    let mut prior_node_id: Option<String> = None;
+    for task in &plan.tasks {
+        let declared = progress_by_index.get(&task.index).copied();
+        let mut node_warning_codes = Vec::new();
+        let mut task_runs = parent_runs
+            .iter()
+            .filter(|run| run_matches_task_index(run, task.index))
+            .collect::<Vec<_>>();
+        if let Some(declared) = declared {
+            for reference in &declared.runs {
+                if let Some(task_id) = reference.task_id.as_deref() {
+                    match runs_by_id.get(task_id).copied() {
+                        Some(run) if run_matches_task_index(run, task.index) => {
+                            if !task_runs.iter().any(|candidate| candidate.task_id == run.task_id) {
+                                task_runs.push(run);
+                            }
+                        }
+                        Some(_) => push_projection_warning(
+                            &mut node_warning_codes,
+                            "simple_run_task_index_mismatch",
+                        ),
+                        None => push_projection_warning(
+                            &mut node_warning_codes,
+                            "simple_run_reference_missing",
+                        ),
+                    }
+                }
+            }
+            if matches!(declared.status, SimpleDeclaredStatus::Completed)
+                && declared.commit.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                push_projection_warning(
+                    &mut node_warning_codes,
+                    "simple_completed_task_missing_commit",
+                );
+            }
+        }
+        task_runs.sort_by(|left, right| {
+            right
+                .generation
+                .cmp(&left.generation)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+        });
+        task_runs.dedup_by(|left, right| left.task_id == right.task_id);
+        let latest = task_runs.first().copied();
+        if declared.is_some_and(|task| matches!(task.status, SimpleDeclaredStatus::Completed))
+            && latest.is_some_and(|run| {
+                matches!(
+                    run.status,
+                    DelegationRunStatus::Failed | DelegationRunStatus::Canceled
+                )
+            })
+        {
+            push_projection_warning(
+                &mut node_warning_codes,
+                "simple_completed_task_terminal_run_failed",
+            );
+        }
+
+        let mut status = simple_declared_node_status(declared.map(|task| &task.status));
+        if let Some(run) = latest {
+            status = match run.status {
+                DelegationRunStatus::Reserving => ProjectedNodeStatus::Reserving,
+                DelegationRunStatus::Running => ProjectedNodeStatus::Running,
+                DelegationRunStatus::Completed
+                | DelegationRunStatus::Failed
+                | DelegationRunStatus::Canceled => status,
+            };
+        }
+        if declared.is_some_and(|task| matches!(task.status, SimpleDeclaredStatus::Unknown(_))) {
+            push_projection_warning(
+                &mut node_warning_codes,
+                "simple_progress_unknown_task_status",
+            );
+        }
+        for warning in &node_warning_codes {
+            push_projection_warning(&mut projection_warning_codes, warning);
+        }
+
+        let runtime = latest
+            .map(run_card_runtime)
+            .unwrap_or_else(empty_run_card_runtime);
+        let node_id = format!("simple-task-{}", task.index);
+        let deps = prior_node_id.iter().cloned().collect::<Vec<_>>();
+        if let Some(prior) = prior_node_id.as_ref() {
+            edges.push(WorkflowEdgeSnapshot {
+                id: Some(format!("simple-edge-{}-{}", task.index - 1, task.index)),
+                from: prior.clone(),
+                to: node_id.clone(),
+            });
+        }
+        let (role, agent_type, profile_id) = if let Some(run) = latest {
+            let role = declared
+                .and_then(|task| task.runs.last())
+                .map(|run| run.role.clone())
+                .filter(|role| !role.trim().is_empty());
+            (role, Some(run.agent_type.clone()), run.profile_id.clone())
+        } else {
+            let run = declared.and_then(|task| task.runs.last());
+            (
+                run.map(|run| run.role.clone())
+                    .filter(|role| !role.trim().is_empty()),
+                run.map(|run| run.agent_type.clone())
+                    .filter(|agent| !agent.trim().is_empty()),
+                run.and_then(|run| run.profile_id.clone()),
+            )
+        };
+        let (model, effort) = model_and_effort_from_config_json(
+            latest.and_then(|run| run.config_values_json.as_deref()),
+        );
+        nodes.push(WorkflowNodeSnapshot {
+            node_id: node_id.clone(),
+            kind: "task".into(),
+            phase_id: Some("tasks".into()),
+            role,
+            agent_type,
+            model,
+            effort,
+            profile_id,
+            task_index: Some(task.index),
+            task_risk_level: None,
+            task_risk_reason_codes: vec![],
+            required_reviewer_count: None,
+            returned_reviewer_count: None,
+            title: Some(redact_display_string(&task.title)),
+            status,
+            sync_state: if node_warning_codes.is_empty() {
+                WorkflowNodeSyncState::InSync
+            } else {
+                WorkflowNodeSyncState::OutOfSync
+            },
+            projection_warning_codes: node_warning_codes,
+            status_reason: None,
+            run_count: task_runs.len() as u64,
+            active_child_generation: latest.map(|run| run.generation),
+            replacement_count: task_runs
+                .iter()
+                .filter(|run| run.replaced_task_id.is_some())
+                .count() as u64,
+            gate_cycle: None,
+            round_count: latest.map(|run| run.generation.saturating_sub(1).max(0) as u64),
+            latest_task_id: latest.map(|run| safe_public_id(&run.task_id)),
+            latest_child_conversation_id: latest.map(|run| run.child_conversation_id),
+            latest_run_status: latest.map(|run| run_status_str(&run.status).to_string()),
+            started_at: runtime.started_at,
+            finished_at: runtime.finished_at,
+            elapsed_completed_ms: sum_elapsed_completed_ms(&task_runs, latest),
+            tool_call_count: runtime.tool_call_count,
+            edit_tool_call_count: runtime.edit_tool_call_count,
+            touched_file_count: runtime.touched_file_count,
+            touched_files_truncated: runtime.touched_files_truncated,
+            additions: runtime.additions,
+            deletions: runtime.deletions,
+            line_counts_complete: runtime.line_counts_complete,
+            summary: None,
+            completion: None,
+            is_observed: latest.is_some(),
+            retained_observed: false,
+            required: true,
+            node_outcome: None,
+            deps,
+        });
+        prior_node_id = Some(node_id);
+    }
+    enrich_nodes_display_from_children(conn, &mut nodes).await;
+
+    let final_review = progress
+        .snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.final_review_status);
+    let any_blocked = nodes
+        .iter()
+        .any(|node| matches!(node.status, ProjectedNodeStatus::Blocked))
+        || matches!(final_review, Some(SimpleFinalReviewStatus::Blocked));
+    let all_tasks_completed = !nodes.is_empty()
+        && nodes
+            .iter()
+            .all(|node| matches!(node.status, ProjectedNodeStatus::Completed));
+    let all_completed = all_tasks_completed
+        && matches!(final_review, Some(SimpleFinalReviewStatus::Completed));
+    let any_started = nodes.iter().any(|node| {
+        !matches!(node.status, ProjectedNodeStatus::Pending) || node.run_count > 0
+    }) || matches!(
+        final_review,
+        Some(
+            SimpleFinalReviewStatus::InProgress
+                | SimpleFinalReviewStatus::Completed
+                | SimpleFinalReviewStatus::Blocked
+        )
+    );
+    let overall_state = if any_blocked {
+        WorkflowOverallState::Blocked
+    } else if all_completed {
+        WorkflowOverallState::Completed
+    } else if any_started {
+        WorkflowOverallState::InProgress
+    } else {
+        WorkflowOverallState::Pending
+    };
+    let current = nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.status,
+                ProjectedNodeStatus::Blocked
+                    | ProjectedNodeStatus::Reserving
+                    | ProjectedNodeStatus::Running
+                    | ProjectedNodeStatus::InProgress
+            )
+        })
+        .map(|node| node.node_id.clone())
+        .collect::<Vec<_>>();
+    let current_node_ids = if let Some(active_task_index) = active_task_index
+        .filter(|task_index| plan_indices.contains(task_index))
+    {
+        vec![format!("simple-task-{active_task_index}")]
+    } else if current.is_empty() {
+        nodes
+            .iter()
+            .find(|node| matches!(node.status, ProjectedNodeStatus::Pending))
+            .map(|node| vec![node.node_id.clone()])
+            .unwrap_or_default()
+    } else {
+        current
+    };
+    let source_conversation_id = match descriptor.source_workflow_id.as_deref() {
+        Some(workflow_id) => delegation_workflow::Entity::find_by_id(workflow_id)
+            .one(conn)
+            .await
+            .map_err(db_err)?
+            .map(|workflow| workflow.parent_conversation_id),
+        None => None,
+    };
+
+    Ok(Some(WorkflowGraphSnapshot {
+        schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+        workflow_id: None,
+        workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+        manifest_revision: None,
+        graph_revision: None,
+        manifest_state: None,
+        completion_protocol: None,
+        completion: None,
+        compatibility: WorkflowCompatibility::Simple,
+        overall_state,
+        simple: Some(SimpleWorkflowLocatorSnapshot {
+            plan_rel_path: descriptor.plan_rel_path.clone(),
+            progress_rel_path: descriptor.progress_rel_path.clone(),
+            source_conversation_id,
+        }),
+        archived: None,
+        projection_warning_codes,
+        current_phase_id: (!current_node_ids.is_empty()).then(|| "tasks".into()),
+        current_node_ids,
+        phases: vec![WorkflowPhaseSnapshot {
+            id: "tasks".into(),
+            kind: Some("tasks".into()),
+            title: None,
+        }],
+        nodes,
+        edges,
+        gates: vec![],
+    }))
+}
+
 async fn project_observed_only(
     conn: &sea_orm::DatabaseConnection,
     parent_conversation_id: i32,
@@ -2155,6 +2612,8 @@ async fn project_observed_only(
             returned_reviewer_count: None,
             title: observed_title,
             status,
+            sync_state: WorkflowNodeSyncState::InSync,
+            projection_warning_codes: vec![],
             status_reason: None,
             run_count,
             active_child_generation: Some(latest.generation),
@@ -2221,6 +2680,9 @@ async fn project_observed_only(
         completion: None,
         compatibility: WorkflowCompatibility::ObservedOnly,
         overall_state: WorkflowOverallState::ObservedOnly,
+        simple: None,
+        archived: None,
+        projection_warning_codes: vec![],
         current_phase_id,
         current_node_ids,
         phases,
@@ -4412,6 +4874,9 @@ mod tests {
             completion: None,
             compatibility: WorkflowCompatibility::ObservedOnly,
             overall_state: WorkflowOverallState::ObservedOnly,
+            simple: None,
+            archived: None,
+            projection_warning_codes: vec![],
             current_phase_id: None,
             current_node_ids: vec![],
             phases: vec![],
@@ -4803,6 +5268,8 @@ mod tests {
             returned_reviewer_count: None,
             title: None,
             status: ProjectedNodeStatus::Completed,
+            sync_state: WorkflowNodeSyncState::InSync,
+            projection_warning_codes: vec![],
             status_reason: None,
             run_count: 1,
             active_child_generation: Some(1),
@@ -5550,5 +6017,202 @@ mod tests {
             DerivedBranchTip::Pending,
             "highest completed task_index wins even with empty digest → Pending, not earlier A"
         );
+    }
+
+    #[tokio::test]
+    async fn simple_projection_uses_plan_progress_and_durable_runs_without_gates() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Durable mismatch\n\n## Task 2: Active work\n",
+        )
+        .expect("write Simple plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+        let pending = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("Simple snapshot");
+        assert_eq!(pending.compatibility, WorkflowCompatibility::Simple);
+        assert_eq!(pending.overall_state, WorkflowOverallState::Pending);
+        assert_eq!(pending.current_node_ids, vec!["simple-task-1"]);
+        assert!(pending.gates.is_empty(), "Simple mode must not create gates");
+
+        insert_run(
+            &db,
+            parent,
+            "simple-failed",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Failed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        std::fs::write(
+            std::path::Path::new(&workspace)
+                .join(format!(".superpowers/sdd/{parent}/progress.md")),
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","active_task_index":2,"tasks":[{"index":1,"status":"completed","runs":[{"task_id":"simple-failed","role":"implementer","agent_type":"codex","state":"failed"}]},{"index":2,"status":"in_progress"}],"final_review_status":"pending"}
+-->"#,
+        )
+        .expect("write Simple progress");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("Simple snapshot after progress");
+        assert_eq!(snapshot.overall_state, WorkflowOverallState::InProgress);
+        assert_eq!(snapshot.current_node_ids, vec!["simple-task-2"]);
+        let first = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.task_index == Some(1))
+            .expect("first task");
+        assert_eq!(first.status, ProjectedNodeStatus::Completed);
+        assert_eq!(first.sync_state, WorkflowNodeSyncState::OutOfSync);
+        assert!(first
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_completed_task_missing_commit"));
+        assert!(first
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_completed_task_terminal_run_failed"));
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.task_index == Some(2))
+                .expect("second task")
+                .status,
+            ProjectedNodeStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_projection_warns_for_stale_progress_only_and_invalid_active_tasks() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Only planned task\n",
+        )
+        .expect("write Simple plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+        std::fs::write(
+            std::path::Path::new(&workspace)
+                .join(format!(".superpowers/sdd/{parent}/progress.md")),
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/stale-plan.md","active_task_index":99,"tasks":[{"index":99,"status":"completed","commit":"abc"}],"final_review_status":"pending"}
+-->"#,
+        )
+        .expect("write stale Simple progress");
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("Simple snapshot");
+        assert_eq!(snapshot.overall_state, WorkflowOverallState::Pending);
+        for expected in [
+            "simple_progress_plan_path_mismatch",
+            "simple_progress_task_missing_from_plan",
+            "simple_progress_active_task_missing_from_plan",
+        ] {
+            assert!(
+                snapshot
+                    .projection_warning_codes
+                    .iter()
+                    .any(|code| code == expected),
+                "missing projection warning: {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_header_precedes_conflicting_simple_descriptor_and_exposes_successor() {
+        let (db, archived_parent) = seed_parent().await;
+        let published = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            archived_parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("simple-header-precedence"),
+            },
+        )
+        .await
+        .expect("publish archived manifest");
+        let successor_folder = seed_folder(&db, "/tmp/simple-header-successor").await;
+        let successor = seed_conversation(&db, successor_folder, AgentType::Codex).await;
+        let now = Utc::now();
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(successor),
+            plan_rel_path: Set("docs/superpowers/plans/p.md".into()),
+            progress_rel_path: Set(format!(".superpowers/sdd/{successor}/progress.md")),
+            source_workflow_id: Set(Some(published.workflow_id.clone())),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("successor descriptor");
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(archived_parent),
+            plan_rel_path: Set("docs/conflicting.md".into()),
+            progress_rel_path: Set(format!(".superpowers/sdd/{archived_parent}/progress.md")),
+            source_workflow_id: Set(None),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("conflicting descriptor");
+
+        let snapshot = project_workflow_graph_core(&db, archived_parent)
+            .await
+            .expect("header projection");
+        assert_eq!(snapshot.compatibility, WorkflowCompatibility::Manifest);
+        assert!(snapshot.simple.is_none());
+        assert!(snapshot
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "workflow_identity_corrupt"));
+        let archived = snapshot.archived.expect("archived navigation");
+        assert_eq!(archived.source_conversation_id, archived_parent);
+        assert_eq!(archived.successor_conversation_id, Some(successor));
+        assert!(!archived.can_create_simple_successor);
+    }
+
+    #[test]
+    fn simple_projection_warning_codes_are_deduplicated_and_bounded() {
+        let mut warnings = Vec::new();
+        push_projection_warning(&mut warnings, "duplicate");
+        push_projection_warning(&mut warnings, "duplicate");
+        for index in 0..100 {
+            push_projection_warning(&mut warnings, &format!("warning-{index}"));
+        }
+        assert_eq!(warnings.first().map(String::as_str), Some("duplicate"));
+        assert_eq!(warnings.len(), 64);
     }
 }

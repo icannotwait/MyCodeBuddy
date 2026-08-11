@@ -758,10 +758,11 @@ export interface DbConversationDetail {
 }
 
 /** Mirrors Rust `WorkflowCompatibility`. */
-export type WorkflowCompatibility = "manifest" | "observed_only"
+export type WorkflowCompatibility = "manifest" | "simple" | "observed_only"
 
 /** Mirrors Rust `WorkflowOverallState`. */
 export type WorkflowOverallState =
+  | "pending"
   | "skeleton"
   | "estimated"
   | "approved"
@@ -772,6 +773,8 @@ export type WorkflowOverallState =
 
 /** Mirrors Rust `ProjectedNodeStatus`. */
 export type ProjectedNodeStatus =
+  | "pending"
+  | "in_progress"
   | "estimated"
   | "reserving"
   | "running"
@@ -860,12 +863,28 @@ export interface WorkflowGraphSnapshot {
   completion?: CompletionProjectionV2 | null
   compatibility: WorkflowCompatibility
   overall_state: WorkflowOverallState
+  simple?: SimpleWorkflowLocatorSnapshot | null
+  archived?: ArchivedWorkflowNavigationSnapshot | null
+  projection_warning_codes: string[]
   current_phase_id?: string | null
   current_node_ids: string[]
   phases: WorkflowPhaseSnapshot[]
   nodes: WorkflowNodeSnapshot[]
   edges: WorkflowEdgeSnapshot[]
   gates: WorkflowGateSnapshot[]
+}
+
+export interface SimpleWorkflowLocatorSnapshot {
+  plan_rel_path: string
+  progress_rel_path: string
+  source_conversation_id?: number | null
+}
+
+export interface ArchivedWorkflowNavigationSnapshot {
+  source_conversation_id: number
+  plan_rel_path?: string | null
+  successor_conversation_id?: number | null
+  can_create_simple_successor: boolean
 }
 
 export interface WorkflowPhaseSnapshot {
@@ -892,6 +911,8 @@ export interface WorkflowNodeSnapshot {
   returned_reviewer_count?: number | null
   title?: string | null
   status: ProjectedNodeStatus
+  sync_state: "in_sync" | "out_of_sync"
+  projection_warning_codes: string[]
   status_reason?: string | null
   run_count: number
   active_child_generation?: number | null

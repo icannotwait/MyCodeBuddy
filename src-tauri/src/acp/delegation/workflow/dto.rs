@@ -20,6 +20,8 @@ pub const WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub enum WorkflowCompatibility {
     /// Active durable manifest + bindings overlaid with runs/gates.
     Manifest,
+    /// Plan/progress locator plus durable delegation lifecycle.
+    Simple,
     /// Recognized A1 keys only; no durable workflow header.
     ObservedOnly,
 }
@@ -28,6 +30,7 @@ pub enum WorkflowCompatibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowOverallState {
+    Pending,
     Skeleton,
     Estimated,
     Approved,
@@ -41,6 +44,8 @@ pub enum WorkflowOverallState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectedNodeStatus {
+    Pending,
+    InProgress,
     Estimated,
     Reserving,
     Running,
@@ -52,6 +57,32 @@ pub enum ProjectedNodeStatus {
     WaitingReview,
     WaitingAdjudication,
     Superseded,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeSyncState {
+    #[default]
+    InSync,
+    OutOfSync,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleWorkflowLocatorSnapshot {
+    pub plan_rel_path: String,
+    pub progress_rel_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_conversation_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedWorkflowNavigationSnapshot {
+    pub source_conversation_id: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_rel_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_conversation_id: Option<i32>,
+    pub can_create_simple_successor: bool,
 }
 
 /// Safe, redacted graph snapshot attached to conversation detail / live reads.
@@ -73,6 +104,12 @@ pub struct WorkflowGraphSnapshot {
     pub completion: Option<super::completion_projection::CompletionProjectionV2>,
     pub compatibility: WorkflowCompatibility,
     pub overall_state: WorkflowOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simple: Option<SimpleWorkflowLocatorSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<ArchivedWorkflowNavigationSnapshot>,
+    #[serde(default)]
+    pub projection_warning_codes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_phase_id: Option<String>,
     pub current_node_ids: Vec<String>,
@@ -127,6 +164,10 @@ pub struct WorkflowNodeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub status: ProjectedNodeStatus,
+    #[serde(default)]
+    pub sync_state: WorkflowNodeSyncState,
+    #[serde(default)]
+    pub projection_warning_codes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
     /// B12: all generations for this work unit.
@@ -605,6 +646,9 @@ mod tests {
             completion_protocol: None,
             completion: None,
             overall_state: WorkflowOverallState::Estimated,
+            simple: None,
+            archived: None,
+            projection_warning_codes: vec![],
             current_phase_id: None,
             current_node_ids: vec![],
             phases: vec![],
@@ -624,6 +668,8 @@ mod tests {
                 returned_reviewer_count: None,
                 title: None,
                 status: ProjectedNodeStatus::Estimated,
+                sync_state: WorkflowNodeSyncState::InSync,
+                projection_warning_codes: vec![],
                 status_reason: None,
                 run_count: 0,
                 active_child_generation: None,
@@ -659,5 +705,91 @@ mod tests {
             !json.contains("work_unit_key"),
             "redacted snapshot must not serialize work_unit_key: {json}"
         );
+        let value = serde_json::to_value(&snap).expect("serialize snapshot value");
+        assert_eq!(value["nodes"][0]["sync_state"], "in_sync");
+        assert_eq!(value["nodes"][0]["projection_warning_codes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn simple_and_archived_snapshots_have_stable_navigation_wire_shapes() {
+        let simple = WorkflowGraphSnapshot {
+            schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+            workflow_id: None,
+            workflow_kind: "brainstorm_to_delivery".into(),
+            manifest_revision: None,
+            graph_revision: None,
+            manifest_state: None,
+            completion_protocol: None,
+            completion: None,
+            compatibility: WorkflowCompatibility::Simple,
+            overall_state: WorkflowOverallState::Pending,
+            simple: Some(SimpleWorkflowLocatorSnapshot {
+                plan_rel_path: "docs/superpowers/plans/plan.md".into(),
+                progress_rel_path: ".superpowers/sdd/42/progress.md".into(),
+                source_conversation_id: Some(7),
+            }),
+            archived: None,
+            projection_warning_codes: vec!["simple_progress_block_missing".into()],
+            current_phase_id: Some("tasks".into()),
+            current_node_ids: vec!["simple-task-1".into()],
+            phases: vec![],
+            nodes: vec![],
+            edges: vec![],
+            gates: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(simple).expect("serialize Simple snapshot"),
+            serde_json::json!({
+                "schema_version": 1,
+                "workflow_kind": "brainstorm_to_delivery",
+                "compatibility": "simple",
+                "overall_state": "pending",
+                "simple": {
+                    "plan_rel_path": "docs/superpowers/plans/plan.md",
+                    "progress_rel_path": ".superpowers/sdd/42/progress.md",
+                    "source_conversation_id": 7,
+                },
+                "projection_warning_codes": ["simple_progress_block_missing"],
+                "current_phase_id": "tasks",
+                "current_node_ids": ["simple-task-1"],
+                "phases": [],
+                "nodes": [],
+                "edges": [],
+                "gates": [],
+            })
+        );
+
+        let archived = WorkflowGraphSnapshot {
+            schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+            workflow_id: Some("pub_workflow".into()),
+            workflow_kind: "brainstorm_to_delivery".into(),
+            manifest_revision: Some(3),
+            graph_revision: Some(5),
+            manifest_state: Some("approved".into()),
+            completion_protocol: None,
+            completion: None,
+            compatibility: WorkflowCompatibility::Manifest,
+            overall_state: WorkflowOverallState::Approved,
+            simple: None,
+            archived: Some(ArchivedWorkflowNavigationSnapshot {
+                source_conversation_id: 7,
+                plan_rel_path: Some("docs/superpowers/plans/plan.md".into()),
+                successor_conversation_id: Some(42),
+                can_create_simple_successor: false,
+            }),
+            projection_warning_codes: vec![],
+            current_phase_id: None,
+            current_node_ids: vec![],
+            phases: vec![],
+            nodes: vec![],
+            edges: vec![],
+            gates: vec![],
+        };
+        let archived_json = serde_json::to_value(archived).expect("serialize archived snapshot");
+        assert_eq!(archived_json["compatibility"], "manifest");
+        assert_eq!(archived_json["archived"]["source_conversation_id"], 7);
+        assert_eq!(archived_json["archived"]["successor_conversation_id"], 42);
+        assert_eq!(archived_json["projection_warning_codes"], serde_json::json!([]));
+        assert!(archived_json.get("simple").is_none());
     }
 }

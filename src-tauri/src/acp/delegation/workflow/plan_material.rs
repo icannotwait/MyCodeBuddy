@@ -204,12 +204,12 @@ struct TaskIdentityGoldenProjectionV1 {
 }
 
 #[derive(Debug)]
-struct HeadingSpan {
-    level: u8,
-    line_start: usize,
-    body_start: usize,
-    is_atx: bool,
-    text: String,
+pub(crate) struct HeadingSpan {
+    pub(crate) level: u8,
+    pub(crate) line_start: usize,
+    pub(crate) body_start: usize,
+    pub(crate) is_atx: bool,
+    pub(crate) text: String,
 }
 
 #[derive(Debug)]
@@ -888,7 +888,9 @@ impl PlanChangeClassification {
     }
 }
 
-fn collect_headings_and_front_matter(source: &str) -> (Vec<HeadingSpan>, Option<Range<usize>>) {
+pub(crate) fn collect_headings_and_front_matter(
+    source: &str,
+) -> (Vec<HeadingSpan>, Option<Range<usize>>) {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
@@ -963,7 +965,7 @@ fn collect_headings_and_front_matter(source: &str) -> (Vec<HeadingSpan>, Option<
     (headings, front_matter)
 }
 
-fn normalize_source_for_parsing(source: &str) -> String {
+pub(crate) fn normalize_source_for_parsing(source: &str) -> String {
     source
         .strip_prefix('\u{feff}')
         .unwrap_or(source)

@@ -16,6 +16,8 @@ pub mod plan_material;
 pub mod plan_review;
 pub mod project;
 pub mod recovery_policy;
+pub mod simple;
+pub mod simple_parse;
 pub mod state_dto;
 pub mod store;
 pub mod types;
@@ -59,8 +61,9 @@ pub use completion_projection::{
 };
 pub use dto::{
     redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
-    WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
-    WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
+    ArchivedWorkflowNavigationSnapshot, SimpleWorkflowLocatorSnapshot, WorkflowCompatibility,
+    WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot,
+    WorkflowNodeSyncState, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::{
@@ -116,6 +119,17 @@ pub use recovery_policy::{
     WorkflowRecoveryDocumentIdentity, WorkflowRecoveryFrozenTaskCohort,
     WorkflowRecoveryPlanGateEvidence, WorkflowRecoveryPlanIdentity, WorkflowRecoveryProjection,
     WorkflowRecoveryRiskClass, WorkflowRecoverySnapshot, WorkflowRecoveryStopCode,
+};
+pub use simple::{
+    load_simple_workflow, register_simple_workflow, register_simple_workflow_with_source,
+    resolve_conversation_workflow_mode, ConversationWorkflowMode, SimpleWorkflowError,
+    SimpleWorkflowRegistration,
+};
+pub use simple_parse::{
+    parse_simple_plan, parse_simple_progress, read_simple_plan, read_simple_progress,
+    SimpleDeclaredStatus, SimpleFinalReviewStatus, SimpleParseError, SimplePlanDocument,
+    SimplePlanTask, SimpleProgressDocument, SimpleProgressRun, SimpleProgressSnapshot,
+    SimpleProgressTask,
 };
 pub use state_dto::{
     project_workflow_state_index, ActionableTaskRouteDto, PlanFindingStubDto,

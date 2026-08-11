@@ -57,6 +57,7 @@ mod m20260806_000002_final_reviewer_snapshots;
 mod m20260806_000003_plan_round_authorization;
 mod m20260806_000004_legacy_restart_context;
 mod m20260809_000001_completion_protocol_v2_only;
+mod m20260811_000001_simple_workflows;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -119,6 +120,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260806_000003_plan_round_authorization::Migration),
             Box::new(m20260806_000004_legacy_restart_context::Migration),
             Box::new(m20260809_000001_completion_protocol_v2_only::Migration),
+            Box::new(m20260811_000001_simple_workflows::Migration),
         ]
     }
 }
