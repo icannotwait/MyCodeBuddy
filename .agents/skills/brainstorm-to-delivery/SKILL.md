@@ -5,420 +5,243 @@ description: Use when a Codeg conversation provides a completed Brainstorm file 
 
 # Brainstorm to Delivery
 
-Treat the completed Brainstorm named in this conversation as the requirements
-baseline. Do not re-brainstorm. Advance to a locally deliverable result except
-at explicit hard gates.
+Treat the completed Brainstorm named by the user as the requirements baseline.
+Do not repeat brainstorming. Continue through planning, implementation,
+verification, independent final review, and local delivery unless a decision
+changes requirements, scope, architecture, or user data handling.
 
-**Core principle:** The parent orchestrates. A Codex Plan Author owns every Plan
-file and revision. Risk-routed Task cohorts implement and review. The parent
-must not implement Task code and must not write or rewrite the Plan.
+**Core contract:** The Plan defines the work. One structured progress document
+records orchestration. Generic delegation runs execute it. The parent keeps
+those sources reconciled and adjudicates reports against repository evidence.
 
-**Human acceptance is post-coding, not mid-pipeline:** Every step that needs a
-human to look, click, approve UX, or UAT belongs **after all implementation
-logic is written and automated gates pass**. Human acceptance is a
-**post-delivery checklist item**; it must not gate Task order, block commit/
-report, or sit between coding Tasks. Encode it in the final report as
-follow-up for the user—not as an in-Plan Task gate that stalls delivery.
-(Hard gates that change requirements, scope, architecture, user data handling,
-or true `user_decision_required` still pause; those are not “acceptance of
-finished work.”)
+**REQUIRED SUB-SKILL:** Use `writing-plans` to create and revise the
+Implementation Plan.
 
-**REQUIRED SUB-SKILL:** Invoke and fully follow `subagent-driven-development`
-for workspace gates, Task briefs, reports, review packages, fix loops, ledgers,
-and final whole-branch review. **REQUIRED SUB-SKILL for Plans:** the Codex Plan
-Author must invoke and fully follow `writing-plans`. Do not paste those Skills'
-full procedures here.
+**REQUIRED SUB-SKILL:** Use `subagent-driven-development` for Task briefs,
+implementation, independent review, fix loops, reports, and final review. This
+Skill supplies the Codeg routing and Simple progress contract below.
 
-**Violating the letter of these routing rules is violating their spirit.**
+## 1. Establish current truth
 
-## Codeg roles and tools
+1. Read repository instructions, the Brainstorm, relevant code and tests,
+   recent commits, and existing user changes.
+2. Inspect the live MCP schemas before constructing calls. Refresh tool
+   discovery before declaring a required agent or tool unavailable.
+3. Use this workflow allowlist even when an older client displays additional
+   workflow surfaces: `register_simple_workflow`, `delegate_to_agent`,
+   `continue_delegation`, `get_delegation_status`, `get_session_info`, and
+   `request_recovery_authorization` when a typed generic recovery response
+   requires it.
+4. Re-read the Plan, progress document, reports, Git state, and live generic
+   run status after compaction, interruption, or resumed work. Treat earlier
+   reasoning as provisional until disk and tool evidence confirm it.
 
-| Route | Role | Agent |
+The parent coordinates and adjudicates. Routed children implement and review
+Task code. The parent may update the Plan and progress document but does not
+implement Task code.
+
+## 2. Produce the Plan and establish progress
+
+1. Choose workspace-relative Plan and progress paths. Before any reviewer
+   dispatch, create the progress document with the block from Section 3, an
+   empty `tasks` array, `active_task_index: null`, and a Markdown thread ledger.
+2. Self-check the Brainstorm for completeness and implementability. When it
+   spans modules, migration, concurrency, security, persistence, public
+   compatibility, or material ambiguity, record review intent in the ledger
+   and request independent document review. Update the ledger after every
+   observed state change; return revisions to the same reviewer thread.
+3. Use `writing-plans` to write a Plan no larger than 2 MiB. Its
+   `## Task N: Title` or `### Task N: Title` headings are contiguous and ordered
+   from Task 1. Give every Task exact file ownership, interfaces, verification
+   commands, report location, and commit boundary. Express dependencies through
+   prior Task outputs so execution remains serial.
+4. After the Plan exists on disk, call the root-only registration tool:
+
+```json
+{
+  "plan_rel_path": "docs/superpowers/plans/example.md",
+  "progress_rel_path": ".superpowers/sdd/<root-id>/progress.md"
+}
+```
+
+Both values are normalized workspace-relative paths. When no progress path was
+established, omit `progress_rel_path` and create the document at the returned
+path. Conversation identity is token-bound and is not an argument. Treat
+registration as locator metadata: an unavailable descriptor leaves the Plan,
+progress, and generic delegation contracts in force.
+
+5. Immediately refresh the block from the registered Plan: include every Task
+   as `pending`, keep `active_task_index: null`, and preserve the document-review
+   ledger. Refresh it again whenever a Plan revision changes Task headings.
+6. Record Plan-review intent in the Markdown ledger, then request an independent
+   Codex Plan review. Add user-named document reviewers only to Brainstorm/Plan
+   review. The parent adjudicates findings from documents and repository facts,
+   revises the Plan, and continues the same reviewer threads until Critical and
+   Important findings are resolved.
+7. Pause when a valid finding requires a user-owned change to requirements,
+   scope, architecture, or user data handling.
+
+## 3. Maintain the progress contract
+
+Keep the progress document at or below 512 KiB, with exactly one structured
+block at or below 64 KiB:
+
+```text
+<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/superpowers/plans/example.md",
+  "active_task_index": null,
+  "tasks": [
+    {
+      "index": 1,
+      "status": "pending",
+      "runs": []
+    },
+    {
+      "index": 2,
+      "status": "pending",
+      "runs": []
+    }
+  ],
+  "final_review_status": "pending",
+  "updated_at": "2026-08-11T00:00:00Z"
+}
+-->
+```
+
+Use Task statuses `pending`, `in_progress`, `completed`, or `blocked`. Mirror
+observed generic run states as `reserving`, `running`, `completed`, `failed`,
+`canceled`, `cancelled`, `stalled`, or `unknown`. Keep commands, findings,
+recovery history, and the final-review thread ledger as normal Markdown after
+the block.
+
+Replace the whole block before each Task delegation mutation and after every
+observed Task state change. Before admission, set the current Task and
+`active_task_index`, then record intended role, agent, profile, action, and
+stable `work_unit_key` with state `reserving`. After admission, fill the
+returned task and child IDs. After status changes, record the observed state.
+For document and final-review runs, make the same before/after updates in the
+Markdown thread ledger. Mark a Task completed only after parent adjudication
+confirms implementation, review, repository evidence, and covering
+verification.
+
+## 4. Apply the workspace gate
+
+Immediately before Task execution, and again after a material Plan revision or
+recovery, inspect branch, HEAD, `git status`, staged diff, unstaged diff, and
+Plan touchpoints.
+
+- Preserve every pre-existing or user-owned change.
+- Continue with a recorded warning only when changes are few, attributable,
+  non-overlapping, and can be excluded from Task commits and review.
+- Request a user decision when ownership is unclear, changes overlap Task
+  files, or the Task cannot be committed and reviewed independently.
+- Tell every writing child that it is not alone in the worktree and must work
+  with current files without reverting other changes.
+
+## 5. Execute Tasks serially
+
+Use these routes:
+
+| Work | First run | Later work on the same unit |
 | --- | --- | --- |
-| Normal | Implementer / fixer | Grok |
-| Normal | Independent reviewer | Codex |
-| High | Implementer / fixer | Codex |
-| High | Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
-| High | Independent reviewer 2 | Grok (independent child) |
+| Task implementation/fix | Grok via `delegate_to_agent` | Same Grok via `continue_delegation` |
+| Task independent review | Fresh Codex via `delegate_to_agent` | Same Codex via `continue_delegation` |
+| Final whole-branch review | Fresh Codex via `delegate_to_agent` | Same Codex for interrupted recovery and fix re-review |
 
-Cross-agent routing uses Codeg `delegate_to_agent` / `continue_delegation`
-(`agent_type: "grok"` | `"codex"`). Discover delayed MCP tools before reporting
-agent unavailability. `spawn_agent` cannot select Grok and is not the Codeg
-route. Missing required agents or tools → hard block; never substitute agent
-types or implement in the parent.
+For a first run, call `delegate_to_agent` with `agent_type`, a self-contained
+`task`, a fresh `correlation_id`, `profile_id` when selected, `working_dir` when
+needed, and the stable `work_unit_key`. Include the Brainstorm/Plan references,
+exact Task scope, constraints, current repository state, required checks,
+report path, and the instruction to preserve unrelated work.
 
-### Thread ledger and A1 `work_unit_key`
+Use stable keys of at most 200 characters:
 
-Maintain a durable thread ledger in `.superpowers/sdd/progress.md` (or
-equivalent): `work_unit_key`, role, `agent_type`, profile, child id,
-`latest_task_id`, state, recovery_count, replacement metadata, plus workflow
-id / publication_token / revisions / gate settlements / plan path+digest.
-
-Keys are workspace-relative, NFC/B1-normalized, `|`-separated, ≤200 scalars:
-
-| Unit             | Materials                                           |
-| ---------------- | --------------------------------------------------- |
-| Design reviewer  | `design\|{rel}\|reviewer\|{agent}\|{profile\|none}` |
-| Plan Author      | `plan\|{rel}\|author\|codex\|{profile\|none}`       |
-| Plan reviewer    | `plan\|{rel}\|reviewer\|{agent}\|{profile\|none}`   |
-| Task implementer | `task\|{n}\|implementer\|{agent}\|{profile\|none}`  |
-| Task reviewer    | `task\|{n}\|reviewer\|{agent}\|{profile\|none}`     |
-| Final reviewer   | `final_review\|reviewer\|{agent}\|{profile\|none}`  |
-| Final fixer      | `final_review\|fixer\|{agent}\|{profile\|none}`     |
-
-Prefer `continue_delegation` when the ledger shows a recoverable thread.
-Same-key cold `delegate_to_agent` without `replaces_task_id` is invalid once
-lineage exists. Recovery is a **new turn**: re-inspect disk, treat prior
-reasoning as provisional, rebuild missing reports, and re-run covering tests.
-
-## Workflow capability (v2 only)
-
-Before first Design dispatch, call `get_workflow_capabilities`. Require the
-full v2 tool set (`get_workflow_capabilities`, `get_workflow_state`,
-`publish_workflow_manifest`, `settle_workflow_gate`, `recover_workflow`).
-Missing or inconsistent tools → hard block. **Do not use legacy capability
-mode or any pre-v2 manifest schema.**
-
-Publish with schema v2 only (`workflow_kind=brainstorm_to_delivery`), required
-`plan_target_rel_path`, `risk_policy_version: "b2d_task_risk_v1"`, Task
-policies/routes, Plan `reviewer_cohort_node_ids`, and Author node. Use a ledger
-`publication_token` (UUID) for skeleton create; same digest retries reuse it;
-digest mismatch → hard stop + `get_workflow_state`. CAS updates carry
-`workflow_id` + `expected_manifest_revision`.
-
-Lifecycle: skeleton (target path + Author work unit, no Plan digest yet) →
-estimated (digest, matrix, policies, routes, full initial required set) →
-parent `settle_workflow_gate` → approved. Material Plan change demotes to
-estimated and reopens Plan review.
-
-Recovery is index-first. Treat recovery_sources and actionable_task_routes as
-authoritative. Read each workspace report_file before settlement, use
-get_session_info for bounded child transcripts, and use get_delegation_status
-for selected run outcomes. Never depend on inline finding summaries.
-
-Recovery is status-first and resume-first. Cancellation-family evidence never
-maps to unresumable, and tool_stalled_timeout is not a replacement source.
-For tool_stalled_timeout, use a confirmed same-key continue; only genuine
-unexpected transport loss may continue without confirmation when central
-policy permits.
-
-Delegation recovery follows this exact ordered recipe: make the projected call;
-receive typed recovery_confirmation_required; call
-request_recovery_authorization; then replay the exact rejected continue or
-replacement call with recovery_authorization_id and the same key, profile, and
-action. Never persist recovery_authorization_id in status, ledger, report, or
-completion projection.
-
-Workflow recovery follows this exact ordered recipe: get_workflow_state; call
-request_recovery_authorization; then call receipt-required recover_workflow.
-An enabled catalog missing recover_workflow hard-blocks. recover_workflow never
-generates a challenge. user_decision_required requires exact reset_plan_lineage
-authorization tied to the displayed reason hash; its receipt is the durable
-requirements-change reason and begins a new authorized stagnation baseline.
-
-First admission freezes the key, role, agent, profile, and inherited continue
-and replacement counters. Pre-admission profile or route correction is a
-material Plan revision. Recovery never changes key/profile or resets inherited
-consumption. Exhausted continue uses same-key budget_exhausted_continue replacement
-only while replacement budget remains; after replacement consumption, block.
-
-Before every delegation or continue, write ledger intent with intended key,
-role, agent, profile, and action. Fill latest_task_id after admission and
-reconcile from platform state after recovery.
-
-### Protocol-v2 completion and durable re-entry
-
-For a protocol-v2 workflow, workers call `complete_work` when exposed or emit
-one explicit terminal or report conclusion otherwise. The Parent advances only
-from platform `completion.state` and workflow admission state. It never asks a
-child to supply semantic IDs, digests, a Card, or completion-format repair.
-
-When `completion.state` is `needs_decision` or `artifact_recovery`, surface the
-durable typed attention and wait. After resolution or a user continuation turn,
-reload workflow state at the root and re-enter gate settlement or admission.
-Never continue, replace, or reopen the semantically terminal child. Genuine
-incomplete work, stall, cancellation, and transport or process loss stay on the
-existing typed recovery path.
-
-Design, Plan, Task, and Final gates advance from platform outcomes and validated
-scope. Review pass outcomes are `approve` and `approve_with_minors`; producer
-pass outcomes are `done` and `done_with_concerns`. For a non-pass Final, consume
-only the platform Final-findings package and context before dispatching the
-Final Fixer.
-
-### Frozen v1 historical branch
-
-A workflow whose frozen completion protocol remains v1 retains its historical
-Card/count settlement behavior. This branch is only for legacy history. A v2
-successor starts from durable root restart state; no v1 evidence or settlement
-may cross into it.
-
-Normal Task review independently recomputes b2d_task_risk_v1. Migration,
-security/authorization, concurrency, persistence/state-machine,
-externally visible compatibility, and ambiguity each trigger external Design
-review.
-
-Respect platform bounds (Tasks≤100, nodes≤400, edges≤800, gates≤50, adj≤4KiB,
-JSON≤512KiB). Details of wire fields live in tools/validation—do not restate
-full schemas here.
-
-## 1. Conditional Design review
-
-Self-check the Brainstorm. External Design review when: cross-module/large
-surface, migration, concurrency, security, real ambiguity, or high-risk design
-without independent evidence. Otherwise v2 still uses Design gate
-`resolution_mode=self_review` with empty `required_reviewer_node_ids` plus
-design rel_path/digest, then explicit settle.
-
-With external Design reviewers: `parent_adjudication` and the full required
-set. After a Design revision, reload workflow state and follow the
-platform-selected reviewer nodes and lineage. Pause for the user only if fixes
-change requirements, scope, architecture, or user data handling.
-
-## 2. Plan production
-
-1. Publish a v2 skeleton with the target Plan path and a **fresh Codex Plan
-   Author** work unit (`plan|…|author|codex|…`).
-2. Dispatch that Author. Require complete `writing-plans` behavior. Parent
-   supplies Design, constraints, configured Plan reviewer group, policy version
-   `b2d_task_risk_v1`, and Task Routing Matrix format. **Author owns the Plan
-   file and all revisions. Parent must not write or rewrite the Plan**; parent
-   may only reject invalid output and adjudicate evidence.
-   **Plan shape rule:** Task sequence is implement → automated verify → producer
-   commit/review → (next Task) … → pre-Final aggregation/freeze → Final review
-   → deliver/report. Do **not** insert human-only acceptance, manual QA
-   walkthrough, or “wait for user sign-off” Tasks between logic Tasks. List
-   human UAT/acceptance only in the Plan’s post-delivery / residual work section
-   (or final report follow-ups).
-3. Publish estimated with the platform-resolved Plan digest, Task Routing
-   Matrix, task policies/routes, complete Plan `reviewer_cohort_node_ids`, and
-   full initial `required_reviewer_node_ids`. Plan reviewers are separate
-   children from the Author and each other. Never ask the Author or reviewers
-   to produce IDs or digests used as semantic authority.
-4. **Initial Plan review** follows the complete platform-selected reviewer set
-   and its current gate lineage.
-5. After each Plan revision, reload workflow state and dispatch exactly the
-   platform-selected Plan nodes for that lineage. Do not reconstruct a review
-   round from model findings, severity counts, expected rounds, or a parent
-   ledger.
-6. Material Plan changes still republish through manifest CAS. Scope, public or
-   shared interfaces, Task decomposition/order, any Task risk or route,
-   persistence, migration, security, concurrency, lifecycle, or reviewer
-   membership/profile changes let the platform open the required full-group
-   lineage. Do not locally override its selected set.
-7. Platform `user_decision_required` or another typed hard block is the only
-   pause for Plan stagnation or a requirements change. A platform-selected
-   holistic rewrite remains Author-owned. Only a
-   user-approved requirements change with its durable receipt begins a new
-   lineage. Use the exact
-   authorization/recovery path above, then reload that lineage from the root.
-8. On Plan recovery, use the index-first procedure, verify referenced reports,
-   and follow platform-selected nodes and lineage. Reports are operational
-   context, not semantic settlement evidence.
-
-## 3. Task risk policy (`b2d_task_risk_v1`)
-
-Classify every Task **before** first implementation admission. Missing,
-contradictory, or unversioned risk data invalidates the manifest—never silent
-`normal`.
-
-**Hard triggers → always `high`:**
-`concurrency_lifecycle`, `security_trust_boundary`,
-`migration_destructive_persistence`, `public_compatibility`, `unsafe_ffi`,
-`update_rollback`.
-
-**Soft signals (no hard trigger):** sum distinct active scores —
-`cross_runtime_or_process`=2; each of `broad_production_surface`,
-`multiple_ownership_modules`, `shared_interface`, `dependency_or_build`,
-`multi_layer_without_test_seam` =1. Soft ≥3 → `high`; 0–2 → `normal`.
-
-Author records evidence, not bare booleans. Matrix row per Task: index, title,
-files/modules, hard/soft evidence, soft total, final level+reason, implementer,
-reviewer set, policy version. Matrix and manifest must agree or approval blocks.
-
-**Pre-admission** risk correction requires a **material Plan revision** and
-**full-group** Plan review. **Post-admission** invalidation **blocks** the Task
-and escalates; preserve frozen cohort and partial work. Do **not** mutate
-`cohort_frozen`, swap implementer, append an unreviewed route, or continue under
-a known-wrong classification.
-
-## 4. Task route
-
-### Normal route
-
-| Role | Agent |
+| Work unit | Key |
 | --- | --- |
-| Implementer / fixer | Grok |
-| Independent reviewer | Codex |
+| Design reviewer | `design|{design_rel_path}|reviewer|{agent}|{profile_or_none}` |
+| Plan reviewer | `plan|{plan_rel_path}|reviewer|{agent}|{profile_or_none}` |
+| Task implementer | `task|{index}|implementer|{agent}|{profile_or_none}` |
+| Task reviewer | `task|{index}|reviewer|{agent}|{profile_or_none}` |
+| Final reviewer | `final_review|reviewer|codex|{profile_or_none}` |
 
-### High route
+Normalize path material, keep role/agent/profile fixed for the work unit, and
+store the key plus latest task ID, child ID, recovery count, and replacement
+metadata in progress.
 
-| Role | Agent |
-| --- | --- |
-| Implementer / fixer | Codex |
-| Independent reviewer 1 | Codex (≠ implementer, ≠ Author) |
-| Independent reviewer 2 | Grok (independent child) |
+Complete each Task's implementation, targeted checks, Task-owned commit,
+independent review, fixes, and re-review before starting the next Task. The
+parent reads every report, checks it against the current diff/commit and test
+evidence, resolves Critical and Important findings, and records retained Minor
+findings with reasons.
 
-- First admission of any cohort member freezes policy + all route identities
-  (`cohort_frozen`).
-- High gate is **strict AND**. Both reviewers start from the same package
-  (may run concurrently). Parent waits for both, deduplicates, sends **one
-  consolidated fix** to the implementer. Every new implement/fix artifact
-  invalidates both prior reviews (including an earlier approve); both
-  reviewers re-review the latest artifact after every fix.
-- Every review must cover the latest producer `task_id` as `reviewed_task_id`
-  and the same non-empty platform-resolved `artifact_digest`. Code Reviewers
-  re-resolve a clean `HEAD` at admission and completion and require it to equal
-  the producer commit recorded by platform evidence.
-- Missing, failed, stale, or unavailable reviewer → **block**. Never
-  downgrade high→normal to save time/tokens. High never ships on a single
-  approval.
-- Serial Task implementation only. Match A1 keys to approved manifest nodes.
-- Canceling a frozen cohort: finish its gate or publish blocked/canceled
-  **retaining bindings**—never silent drop; never “stop talking” as cancel.
+Join required runs with `get_delegation_status` using `task_ids`,
+`return_when: "all_terminal_or_attention"`, and `wait_ms: 0`. Re-join only
+required runs that remain active.
 
-## 5. Workspace gate (before Task execution)
+## 6. Continue and replace from generic run state
 
-When the approved Plan is about to execute (again after material re-approval):
-inspect `git status` and full unstaged/staged diffs. Before every protocol-v2
-Implementer or Final Fixer admission, the platform must resolve `HEAD`, require
-`git status --porcelain` to be exactly empty, and persist
-`producer_baseline_head`. An unresolvable or dirty baseline blocks dispatch;
-there is no unrelated-dirt allowance. Never stash, commit, overwrite, or
-discard user work unasked.
+Prefer `continue_delegation` when the progress ledger and fresh status show a
+recoverable established work unit. Supply its latest terminal `task_id`, a
+self-contained new-turn `task`, a fresh `correlation_id`, and the same
+`work_unit_key`. A continuation prompt must require the child to:
 
-A passing Implementer or Final Fixer completion requires a clean
-workflow-owned producer commit different from that baseline. Only durable Task
-policy `allow_noop_verification = true` may authorize a verified no-op. Task and
-Final code Reviewers validate clean `HEAD` against that producer commit at both
-admission and completion.
+1. re-inspect Git, current files, diffs, reports, and relevant test evidence;
+2. treat pre-interruption reasoning as provisional;
+3. audit partial filesystem changes;
+4. recreate any report that is not durably present; and
+5. rerun covering checks before claiming completion.
 
-## 6. Execute with SDD specialization
+When a generic call returns `recovery_confirmation_required`, call
+`request_recovery_authorization` with `subject_kind: "delegation_task"`, the
+returned task ID as `subject_id`, and a fresh `correlation_id`. Replay the exact
+rejected call with its `recovery_authorization_id`, unchanged action, key,
+agent, and profile. Keep that authorization ID transport-only; do not write it
+to progress or reports.
 
-Run full `subagent-driven-development`. B2D only overrides agent routing:
+When typed generic state selects `fresh_dispatch` for a first run that failed
+before admission and never established child or resume identity, call
+`delegate_to_agent` again with the same agent, profile, and key and without
+`replaces_task_id`. When a replacement itself fails before reaching `running`
+and typed state selects a pre-admission retry, repeat the same replacement key,
+`replaces_task_id`, and `replacement_reason`. These pre-running retries preserve
+the existing lineage and do not consume its one-replacement rail.
 
-- Risk route replaces generic model discretion for Task agent types.
-- Normal: one Grok implementer + one Codex reviewer.
-- High: Codex implementer + Codex and Grok reviewers; join at one gate.
-- Admitted key, role, agent, and profile remain frozen through every fix round.
-- Finish all Final history aggregation, tidy commits, and branch-tracked report
-  changes before Final Reviewer admission. Final whole-branch review remains a
-  new Codex child after all active Task gates pass; Final Fixer is Grok on a
-  platform-projected non-pass Final only.
-- A passing Final freezes the reviewed delivery `HEAD` through delivery and
-  reporting. Post-settlement drift is `final_artifact_drift`; reopen Final on
-  the new platform lineage instead of delivering or adding a post-pass commit.
+Use a fresh `delegate_to_agent` replacement only when generic state selects a
+supported reason and budget remains. Supply the original agent/profile/key,
+`replaces_task_id` for the latest terminal source, and the exact
+`replacement_reason`: `unresumable`, `budget_exhausted_continue`,
+`not_supported`, `admission_failed`, or `admission_unknown`. Record replacement
+intent before the call and the new task/child IDs after admission.
 
-## 7. Verify, commit, report
+An established work unit has at most two unexpected continuations and one
+replacement across its lineage. Preserve inherited consumption. When those
+rails are exhausted or the required agent remains unavailable after discovery,
+record the typed blocker and surface it to the user.
 
-Per-Task targeted checks; final scope-appropriate test/lint/build. Re-run after
-fixes. Each passing producer commits only workflow-owned changes before review;
-local commits only—no merge/push/PR. Prepare branch-tracked aggregation and
-reports before Final Reviewer admission. After a passing Final, deliver and
-report the same frozen commit without another branch mutation. Final reporting
-includes results, diffs, commands, reviews, retained Minors/risks, commits,
-worktree, and blockers.
+## 7. Final review and delivery
 
-**Delivery is code-complete when automated gates and Final review pass**—not
-when a human has manually accepted the feature. Put remaining human acceptance
-(UAT scripts, visual checks, product sign-off) in the final report as
-**post-delivery items**. Do not leave the workflow open waiting for that
-acceptance, and do not treat missing human UAT as a delivery blocker.
+After every implementation Task is complete:
 
-## Quick reference under pressure
+1. Re-read the Brainstorm, Plan, progress, Task reports, retained findings,
+   commits, full diff, and worktree state.
+2. Run scope-appropriate tests, lint, build, and project checks; rerun checks
+   invalidated by fixes.
+3. Set `final_review_status` to `in_progress`, record final-review intent in the
+   Markdown ledger, and dispatch a fresh independent Codex final reviewer.
+4. Adjudicate final findings from its report and current repository facts.
+   Route fixes through the owning implementer work unit, rerun covering checks,
+   and continue the same final-review Codex thread to review the changed
+   delivery state.
+5. Set final review to `completed` only when the reviewed repository state is
+   locally deliverable. A later code or report mutation reopens verification
+   and final review.
+6. Commit only owned changes locally. Do not merge, push, or create a PR unless
+   the user separately requests it.
 
-| Pressure | Required action |
-| --- | --- |
-| “Finish Plan review fast” after an Author revision | Reload state and dispatch exactly the platform-selected Plan nodes for the current lineage. |
-| “Migration is mechanical—use cheap Grok” | Hard triggers → **high**: Codex implementer + Codex **and** Grok reviewers |
-| High Task: one reviewer approved, other unavailable | **Block**; never pass or downgrade |
-| Plan stagnation appears unresolved | Follow the platform-selected holistic rewrite or typed user-decision route; never rebuild it from counts. |
-| “Parent will tweak the Plan / Task code” | Forbidden. Author owns Plan; routed implementers own code |
-| Pre-admission risk looks wrong | Material Plan revision + platform-selected full-group lineage |
-| Post-admission risk looks wrong | Block + escalate; do not mutate `cohort_frozen` |
-| Urgency / small Task | Still Author + Plan review + risk route + SDD |
-| Agent unavailable | Hard block; no agent substitution |
-| Design Gate approved | Design Gate approved -> dispatch Plan Author automatically. |
-| Plan Gate approved | Plan Gate approved -> run Workspace gate, then dispatch the first eligible Task automatically. |
-| Task Gate passed | Task Gate passed -> dispatch the next eligible Task or Final review automatically. |
-| Final review approved | Final review approved -> deliver and report the frozen commit automatically. |
-| Final has a platform non-pass outcome | Consume only the platform Final-findings package/context, then dispatch Final Fixer (Grok). Do not request extra user approval. |
-| `needs_decision` or artifact recovery | Surface durable attention and wait. After resolution, reload root workflow state and re-enter settlement/admission; never continue or replace the terminal child. |
-| Protocol-v1 history | Keep it on the frozen v1 historical branch; restart a v2 successor at the root and never import v1 evidence or settlement. |
-| Cancellation-family / `tool_stalled_timeout` | Never map cancellation to `unresumable`; stall uses confirmed same-key continue before replacement. |
-| Typed delegation recovery challenge | Projected call -> `recovery_confirmation_required` -> `request_recovery_authorization` -> exact rejected call replay with the ID. |
-| Workflow recovery | `get_workflow_state` -> `request_recovery_authorization` -> receipt-required `recover_workflow`; a missing enabled tool hard-blocks. |
-| Continue budget exhausted | Same-key `budget_exhausted_continue` replacement if its budget remains; otherwise block. |
-| Any phase could continue | Only pause for a hard block, `user_decision_required`, or an unresolved choice that changes requirements, scope, architecture, or user data handling. |
-| Plan wants “user accepts UI” between Tasks | Reject that shape: finish all logic + automated gates first; human acceptance is post-delivery only. |
-| “Stop for manual QA before coding the rest” | Forbidden as a delivery gate. Complete implementation; list manual QA in the final report. |
-| Ledger or document status is stale/conflicting | Run `get_workflow_state`, reconcile durable state, then continue. Stale text is not a gate. |
-| Context compacted / recovery resumed | One index read for gates, selected nodes, lineages, and current/next routes; read referenced reports and bounded secondary detail before settle |
-
-## Rationalizations
-
-| Excuse | Reality |
-| --- | --- |
-| “Full group every Plan revision is safer.” | Reload the platform-selected nodes and lineage; material changes select the required full group. |
-| “One Codex approval is enough on high.” | High is strict AND on both reviewers covering the same latest artifact. |
-| “Grok is fine for migrations/updaters.” | Those hard triggers force high + Codex implementer. |
-| “Skip the missing reviewer to ship.” | Unavailable required reviewer blocks the gate. |
-| “I’ll rewrite the Plan in the parent.” | Parent must not write the Plan; continue the Author. |
-| “Change the route after admission.” | `cohort_frozen`; post-admission invalidation blocks, never mutates. |
-| “I can infer the next holistic rewrite from finding counts.” | Follow the platform-selected Author/reviewer route; counts are not v2 authority. |
-| “Reset Plan lineage after compaction.” | Platform state is durable; only a user-approved requirements-change receipt opens a new lineage. |
-| “Direct parent implement is faster.” | Parent only orchestrates. |
-| “`spawn_agent` can’t pick Grok.” | Use Codeg `delegate_to_agent`. |
-| “The Gate is approved, but I should ask the user to confirm the next phase.” | An approved Gate is not a user gate. Dispatch the next admissible work unit in the same parent turn. |
-| “A ledger or document still says pending, so I should stop.” | Reconcile with `get_workflow_state`; only its hard block or an explicit pause condition may stop advancement. |
-| “Cancellation means the child is unresumable, so replacement is faster.” | Cancellation-family evidence never proves `unresumable`; preserve the admitted key/profile and follow the confirmed authorization sequence. |
-| “A stalled tool can be replaced immediately because the deadline is tight.” | `tool_stalled_timeout` is resume-first and requires a confirmed same-key continue. |
-| “The old four-tool catalog is close enough.” | Workflow recovery requires `recover_workflow`; its absence from an enabled catalog hard-blocks. |
-| “The user approved in prose, so the workflow can reset.” | Prose never settles. `user_decision_required` needs the exact reason-hash-bound `reset_plan_lineage` receipt. |
-| “Final said request_changes in prose / report; start fixer.” | Reload platform completion state. Only its non-pass outcome plus Final-findings package authorizes the Final Fixer. |
-| “The child concluded, but completion is unclear; continue it for a cleaner answer.” | A semantically terminal child is never continued or replaced. Surface typed attention, wait, then re-enter from root state. |
-| “Final passed; add one tidy/report commit.” | Final freezes the reviewed commit. Aggregate before admission; any later drift reopens Final. |
-| “User must accept this screen before Task 4.” | Human acceptance is post-coding. Deliver all logic first; acceptance is a report follow-up, not a Task gate. |
-| “Delivery isn’t done until someone clicks through UAT.” | Delivery = implementation + automated verify + Final. Human UAT is post-delivery residual work. |
-
-## Red flags — stop
-
-- Parent writing Plan or Task code
-- Pre-v2 manifest schema, legacy capability mode, or old pair-freeze wording
-- Full Plan group forced for purely localized open-finding re-review
-- High Task shipping on a single approval or a downgraded route
-- Grok implementer on hard-trigger Tasks
-- Gate pass without matching `reviewed_task_id` + non-empty `artifact_digest`
-- Silent cohort drop or conversation-stop as cancel
-- Cancellation or stall treated as proof of `unresumable`
-- Recovery changes key/profile, resets consumption, or skips the typed challenge
-- Prose approval, missing recovery receipt, or an incomplete enabled tool catalog
-- Human-only acceptance / manual UAT inserted as a Task gate mid-implementation
-- Workflow left open waiting for product sign-off after code + automated gates pass
-
-## End-to-end example
-
-User: `Deliver from docs/brainstorm/payment.md. Parallel reviewers: @Code Buddy`
-
-1. Capability probe → v2 tools only → UUID `publication_token` → skeleton with
-   `plan_target_rel_path=docs/superpowers/plans/payment.md` and Author node
-   `plan|docs/superpowers/plans/payment.md|author|codex|none`.
-2. Conditional Design review (A1 Design keys; platform outcomes; settle).
-3. Dispatch Codex Plan Author with Design + `writing-plans` + matrix format +
-   `b2d_task_risk_v1`. Author writes Plan with per-Task risk rows.
-4. Estimated publish: platform digest, policies, routes,
-   `reviewer_cohort_node_ids`, and full initial required set. Reviewers bind to
-   the same platform Author evidence.
-5. After an Author revision, reload state and dispatch only platform-selected
-   Plan nodes on the current lineage. Material risk change opens the required
-   full-group lineage.
-6. Typed stagnation or requirements attention waits for durable resolution;
-   then root re-entry loads the platform-selected Author/reviewer route.
-7. Clean workspace gate → sequential Tasks: normal Tasks `grok`+`codex`; a
-   migration Task high → `codex` implementer + `codex` and `grok` reviewers.
-   Producer commits precede review; both reviewers cover the same platform
-   `reviewed_task_id`/`artifact_digest`; fixes reopen both.
-8. After all Task gates pass, finish aggregation and admit new Final Codex. A
-   platform non-pass package routes to Final Fixer; a pass freezes the reviewed
-   commit through local delivery/reporting. Recovery always starts with the
-   compact index, referenced workspace reports, and bounded child/run lookups.
+Report the delivered result, files and commits, exact commands and outcomes,
+review conclusions, retained Minors/risks, worktree state, and blockers.
+Automated evidence plus final review establish local delivery. Put manual UAT
+or product sign-off that does not change requirements in post-delivery
+follow-up rather than between implementation Tasks.
