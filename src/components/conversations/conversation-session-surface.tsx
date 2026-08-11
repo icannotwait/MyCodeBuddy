@@ -2233,6 +2233,7 @@ export const ConversationSessionSurface = memo(
         <MessageListView
           conversationId={effectiveConversationId}
           agentType={selectedAgent}
+          workspaceRootPath={folder?.path ?? null}
           connStatus={connStatus}
           isActive={isActive}
           sendSignal={sendSignal}

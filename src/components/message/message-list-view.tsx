@@ -113,6 +113,7 @@ import { useStickToBottomContext } from "use-stick-to-bottom"
 interface MessageListViewProps {
   conversationId: number
   agentType: AgentType
+  workspaceRootPath?: string | null
   connStatus?: ConnectionStatus | null
   isActive?: boolean
   sendSignal?: number
@@ -1041,6 +1042,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   historicalDelegations,
   historicalActivities,
   historicalKey,
+  workspaceRootPath,
   isActive,
   onResumeRoot,
   onOpenRootConversation,
@@ -1056,6 +1058,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
    */
   historicalActivities: DelegationActivityView[]
   historicalKey: string
+  workspaceRootPath: string | null
   isActive: boolean
   onResumeRoot?: () => void | Promise<void>
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
@@ -1094,11 +1097,6 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   const workflowGraph = useConversationRuntimeStore(
     (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
   )
-  const workflowWorkspaceRoot = useConversationRuntimeStore(
-    (s) =>
-      s.byConversationId.get(conversationId)?.detail?.summary.folder_path ??
-      null
-  )
 
   return (
     <SubAgentOverlay
@@ -1109,7 +1107,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       defaultExpanded
       conversationId={conversationId}
       workflowGraph={workflowGraph}
-      workspaceRootPath={workflowWorkspaceRoot}
+      workspaceRootPath={workspaceRootPath}
       isActive={isActive}
       onResumeRoot={onResumeRoot}
       onOpenRootConversation={onOpenRootConversation}
@@ -1120,6 +1118,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
 export function MessageListView({
   conversationId,
   agentType,
+  workspaceRootPath = null,
   connStatus,
   isActive = true,
   sendSignal = 0,
@@ -1576,11 +1575,6 @@ export function MessageListView({
   const workflowGraph = useConversationRuntimeStore(
     (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
   )
-  const workflowWorkspaceRoot = useConversationRuntimeStore(
-    (s) =>
-      s.byConversationId.get(conversationId)?.detail?.summary.folder_path ??
-      null
-  )
 
   const storeActivities = useConversationRuntimeStore((s) =>
     selectDelegationActivities(s, conversationId)
@@ -1932,6 +1926,7 @@ export function MessageListView({
             historicalDelegations={allSessionDelegations}
             historicalActivities={sessionActivities}
             historicalKey={subAgentOverlayKey}
+            workspaceRootPath={workspaceRootPath}
             isActive={isActive}
             onResumeRoot={onResumeRoot}
             onOpenRootConversation={onOpenRootConversation}
@@ -1945,7 +1940,7 @@ export function MessageListView({
             defaultExpanded
             conversationId={conversationId}
             workflowGraph={workflowGraph}
-            workspaceRootPath={workflowWorkspaceRoot}
+            workspaceRootPath={workspaceRootPath}
             isActive={isActive}
             onResumeRoot={onResumeRoot}
             onOpenRootConversation={onOpenRootConversation}

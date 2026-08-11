@@ -242,6 +242,7 @@ vi.mock("@/components/chat/sub-agent-overlay", () => ({
     defaultExpanded?: boolean
     overlayKey?: string | null
     isActive?: boolean
+    workspaceRootPath?: string | null
   }) => {
     subAgentOverlayPropsSpy(props)
     return <div data-testid="sub-agent-overlay-capture" />
@@ -527,6 +528,7 @@ function lastOverlayProps(): {
   defaultExpanded?: boolean
   overlayKey?: string | null
   isActive?: boolean
+  workspaceRootPath?: string | null
 } {
   const calls = subAgentOverlayPropsSpy.mock.calls
   expect(calls.length).toBeGreaterThan(0)
@@ -702,6 +704,7 @@ function messageListUi(options?: {
   waitingForSubagentsArmedAtMs?: number | null
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
   isActive?: boolean
+  workspaceRootPath?: string | null
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -710,6 +713,7 @@ function messageListUi(options?: {
         agentType="codex"
         connStatus={options?.connStatus ?? "prompting"}
         isActive={options?.isActive ?? true}
+        workspaceRootPath={options?.workspaceRootPath ?? null}
         showMessageNav={false}
         waitingForSubagentsArmedAtMs={
           options?.waitingForSubagentsArmedAtMs ?? null
@@ -723,6 +727,7 @@ function renderMessageList(options?: {
   waitingForSubagentsArmedAtMs?: number | null
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
   isActive?: boolean
+  workspaceRootPath?: string | null
 }) {
   return render(messageListUi(options))
 }
@@ -1617,6 +1622,17 @@ describe("MessageListView sub-agent overlay composition", () => {
     __resetStreamingPerformanceConfigForTests()
     renderMessageList({ isActive: false })
     expect(lastOverlayProps().isActive).toBe(false)
+  })
+
+  it("fails if the incremental overlay drops the explicit workspace root", () => {
+    renderMessageList({ workspaceRootPath: "D:\\Repo\\Task7" })
+    expect(lastOverlayProps().workspaceRootPath).toBe("D:\\Repo\\Task7")
+  })
+
+  it("fails if the direct overlay drops the explicit workspace root", () => {
+    __resetStreamingPerformanceConfigForTests()
+    renderMessageList({ workspaceRootPath: "D:\\Repo\\Task7" })
+    expect(lastOverlayProps().workspaceRootPath).toBe("D:\\Repo\\Task7")
   })
 })
 
