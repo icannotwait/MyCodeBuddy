@@ -9257,7 +9257,7 @@ mod tests {
         let created = listener
             .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                 token: "simple-root".into(),
-                plan_rel_path: "docs/./plan.md".into(),
+                plan_rel_path: "./docs//plan.md".into(),
                 progress_rel_path: None,
             })
             .await;
