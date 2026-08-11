@@ -121,6 +121,10 @@ pub enum AppErrorCode {
     WorkflowIdentityCorrupt,
     /// The archived workflow's active Plan cannot be read safely.
     SimpleSuccessorPlanUnavailable,
+    /// The requested source has no archived workflow ownership.
+    SimpleSuccessorSourceNotArchived,
+    /// The requested source already belongs to Simple mode.
+    SimpleSuccessorSourceAlreadySimple,
     /// A persisted workflow protocol pair is unknown or inconsistent.
     UnsupportedCompletionProtocol,
     /// A protocol-v2 completion instruction could not be bound durably.
@@ -328,6 +332,14 @@ mod tests {
             (
                 AppErrorCode::SimpleSuccessorPlanUnavailable,
                 "simple_successor_plan_unavailable",
+            ),
+            (
+                AppErrorCode::SimpleSuccessorSourceNotArchived,
+                "simple_successor_source_not_archived",
+            ),
+            (
+                AppErrorCode::SimpleSuccessorSourceAlreadySimple,
+                "simple_successor_source_already_simple",
             ),
             (
                 AppErrorCode::UnsupportedCompletionProtocol,

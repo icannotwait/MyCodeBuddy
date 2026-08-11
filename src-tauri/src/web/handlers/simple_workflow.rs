@@ -40,6 +40,7 @@ mod tests {
 
     use crate::app_state::AppState;
     use crate::commands::simple_workflow::test_support::seed_archived_workflow;
+    use crate::acp::delegation::workflow::register_simple_workflow;
     use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
@@ -151,6 +152,10 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let ordinary = seed_conversation(&db, folder, AgentType::Codex).await;
+        let simple = seed_conversation(&db, folder, AgentType::Codex).await;
+        register_simple_workflow(&db.conn, simple, "docs/plan.md", None)
+            .await
+            .unwrap();
         let archived = seed_conversation(&db, folder, AgentType::Codex).await;
         seed_archived_workflow(
             &db,
@@ -175,7 +180,34 @@ mod tests {
         )
         .await;
         assert_eq!(ordinary_status, StatusCode::BAD_REQUEST);
-        assert_eq!(ordinary_body["code"], "invalid_input");
+        assert_eq!(
+            ordinary_body["code"],
+            "simple_successor_source_not_archived"
+        );
+        assert_eq!(
+            ordinary_body["message"],
+            "Source conversation is not an archived workflow"
+        );
+
+        let (simple_status, simple_body) = call_json(
+            state.clone(),
+            workspace.path(),
+            json!({
+                "sourceConversationId": simple,
+                "clientRequestToken": "simple-http-request",
+            }),
+            Some("Bearer secret"),
+        )
+        .await;
+        assert_eq!(simple_status, StatusCode::CONFLICT);
+        assert_eq!(
+            simple_body["code"],
+            "simple_successor_source_already_simple"
+        );
+        assert_eq!(
+            simple_body["message"],
+            "Source conversation already uses Simple"
+        );
 
         let (plan_status, plan_body) = call_json(
             state,

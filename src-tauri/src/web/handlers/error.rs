@@ -14,7 +14,8 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::TerminalShellUnsupported
         | AppErrorCode::RouteUnavailable
         | AppErrorCode::InvalidPattern
-        | AppErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        | AppErrorCode::InvalidRequest
+        | AppErrorCode::SimpleSuccessorSourceNotArchived => StatusCode::BAD_REQUEST,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress
@@ -23,6 +24,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::LegacyCompletionProtocolReadOnly
         | AppErrorCode::WorkflowV2Retired
         | AppErrorCode::WorkflowIdentityCorrupt
+        | AppErrorCode::SimpleSuccessorSourceAlreadySimple
         | AppErrorCode::UnsupportedCompletionProtocol
         | AppErrorCode::CompletionInstructionBindingFailed
         | AppErrorCode::SessionRouteConflict
