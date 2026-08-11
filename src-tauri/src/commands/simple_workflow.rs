@@ -1907,6 +1907,9 @@ mod tests {
         )
         .await;
         let conversations_before = live_conversation_count(&db).await;
+        // Each disk fixture handle has a one-connection pool. Use a second
+        // handle so both read transactions can reach the race barrier.
+        let competing_db = fresh_disk_db(database.path()).await;
         let control = std::sync::Arc::new(SimpleSuccessorTestControl::snapshot_race(2));
 
         let (first, second) = tokio::join!(
@@ -1917,7 +1920,7 @@ mod tests {
                 control.clone()
             ),
             continue_archived_workflow_in_simple_controlled(
-                &db,
+                &competing_db,
                 source,
                 "concurrent-request-b",
                 control.clone()
