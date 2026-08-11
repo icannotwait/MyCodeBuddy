@@ -35469,7 +35469,7 @@ mod tests {
             )
             .with_task_store(task_store)
             .with_run_store(runs.clone()),
-        ));
+        )));
         enable_delegation(&broker).await;
         (db, runs, mock, events, broker, parent.id)
     }
