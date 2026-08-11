@@ -9955,6 +9955,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let revision_count = delegation_workflow_manifest_revision::Entity::find()
+            .count(&db.conn)
+            .await
+            .unwrap();
         let cross_parent = listener
             .process_get_workflow_state(BrokerGetWorkflowStateRequest {
                 token: "workflow-v2-token".into(),

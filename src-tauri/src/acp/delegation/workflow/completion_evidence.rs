@@ -4250,8 +4250,9 @@ mod tests {
                 .unwrap()
                 .len();
 
-            let error = RunStore::new(fixture.db.clone())
-                .admit_continue_reserving(ContinueRunAdmission {
+            let runs = RunStore::new(fixture.db.clone());
+            let error = super::super::with_historical_workflow_fixture_mutations(
+                runs.admit_continue_reserving(ContinueRunAdmission {
                     task_id: format!("{}-continue", fixture.task_id),
                     parent_conversation_id: fixture.parent_conversation_id,
                     parent_tool_use_id: format!("continue-{}", fixture.task_id),
@@ -4259,15 +4260,16 @@ mod tests {
                     task_preview: "must be fenced".into(),
                     request_fingerprint: format!("continue-fp-{}", fixture.task_id),
                     work_unit_key: None,
-                })
+                }),
+            )
                 .await
                 .unwrap_err();
             assert_eq!(error.workflow_admission_code(), Some(expected_code));
 
             let source_run = fixture.stored_run().await;
             let replacement_task_id = format!("{}-replacement", fixture.task_id);
-            let replacement_error = RunStore::new(fixture.db.clone())
-                .admit_gen1_reserving(ReservingRunInsert {
+            let replacement_error = super::super::with_historical_workflow_fixture_mutations(
+                runs.admit_gen1_reserving(ReservingRunInsert {
                     task_id: replacement_task_id.clone(),
                     root_task_id: replacement_task_id.clone(),
                     previous_task_id: None,
@@ -4291,7 +4293,8 @@ mod tests {
                     replaced_task_id: Some(fixture.task_id.clone()),
                     replacement_reason: Some("unresumable".into()),
                     started_at: Some(Utc::now()),
-                })
+                }),
+            )
                 .await
                 .unwrap_err();
             assert_eq!(

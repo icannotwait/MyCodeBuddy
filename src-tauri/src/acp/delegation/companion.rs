@@ -3090,9 +3090,10 @@ mod tests {
         let resp = unwrap_respond(dispatch_for_test(line).await);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"delegate_to_agent"));
+        assert!(names.contains(&"register_simple_workflow"));
         assert!(names.contains(&"continue_delegation"));
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
@@ -5426,8 +5427,8 @@ mod tests {
             dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
-        // delegate + continue + status + cancel
-        assert_eq!(names.len(), 4);
+        // delegate + Simple registration + continue + status + cancel
+        assert_eq!(names.len(), 5);
         assert!(names.contains(&"continue_delegation".to_string()));
     }
 
@@ -5463,6 +5464,7 @@ mod tests {
             names,
             vec![
                 "delegate_to_agent",
+                "register_simple_workflow",
                 "continue_delegation",
                 "get_delegation_status",
                 "cancel_delegation",
@@ -5485,8 +5487,8 @@ mod tests {
             dispatch_with_features(BOTH, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(names.contains(&"check_user_feedback".to_string()));
-        // delegation tools (4) + feedback (1)
-        assert_eq!(names.len(), 5);
+        // delegation tools (5, including Simple registration) + feedback (1)
+        assert_eq!(names.len(), 6);
         assert!(names.contains(&"continue_delegation".to_string()));
     }
 

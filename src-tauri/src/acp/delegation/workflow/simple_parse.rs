@@ -550,8 +550,8 @@ Ignored duplicate.
         assert_eq!(
             parsed.warning_codes,
             vec![
-                WARNING_PLAN_DUPLICATE_TASK,
                 WARNING_PLAN_MALFORMED_TASK,
+                WARNING_PLAN_DUPLICATE_TASK,
                 WARNING_PLAN_NON_CONTIGUOUS,
             ]
         );

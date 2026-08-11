@@ -35407,6 +35407,32 @@ mod tests {
             .await
         }
 
+        async fn settle_terminal(
+            &self,
+            runs: &RunStore,
+            task_id: &str,
+            terminal: TerminalTaskWrite,
+        ) -> Result<crate::acp::delegation::store::Settlement, TaskStoreError> {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                runs.settle_terminal(task_id, terminal),
+            )
+            .await
+        }
+
+        async fn workflow_child_mcp_binding(
+            &self,
+            runs: &RunStore,
+            task_id: &str,
+        ) -> Result<
+            Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
+            TaskStoreError,
+        > {
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                runs.workflow_child_mcp_binding(task_id),
+            )
+            .await
+        }
+
         async fn get_task_status(
             &self,
             parent_connection_id: &str,
@@ -35634,15 +35660,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        runs.settle_terminal(
+        broker
+            .settle_terminal(
+                runs.as_ref(),
             &run.task_id,
             TerminalTaskWrite::legacy_without_audit(
                 TaskStatus::Canceled,
                 Some("parent_canceled".into()),
             ),
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
         release_tx.send(()).unwrap();
 
         let report = driver.await.unwrap();
@@ -35716,7 +35744,8 @@ mod tests {
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
         let continued_task_id = report.task_id.clone().unwrap();
         assert_eq!(
-            runs.workflow_child_mcp_binding(&continued_task_id)
+            broker
+                .workflow_child_mcp_binding(runs.as_ref(), &continued_task_id)
                 .await
                 .unwrap(),
             Some(crate::acp::delegation::workflow::WorkflowChildMcpBinding {

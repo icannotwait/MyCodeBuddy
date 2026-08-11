@@ -3131,6 +3131,22 @@ mod tests {
             .await
         }
 
+        async fn settle_pre_admission_failure_if_owned(
+            &self,
+            task_id: &str,
+            expected_child_connection_id: &str,
+            terminal: TerminalTaskWrite,
+        ) -> Result<Option<Settlement>, TaskStoreError> {
+            super::super::with_historical_workflow_fixture_mutations(
+                self.0.settle_pre_admission_failure_if_owned(
+                    task_id,
+                    expected_child_connection_id,
+                    terminal,
+                ),
+            )
+            .await
+        }
+
         async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
             super::super::with_historical_workflow_fixture_mutations(
                 self.0.abandon_reserving_claim(task_id),

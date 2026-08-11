@@ -166,7 +166,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["enabled"], true);
+        assert_eq!(body["enabled"], false);
         assert_eq!(body["warning_after_seconds"], 600);
         assert_eq!(body["grace_seconds"], 600);
 

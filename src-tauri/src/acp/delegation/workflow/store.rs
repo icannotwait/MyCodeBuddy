@@ -9677,7 +9677,8 @@ mod tests {
             let runs = RunStore::new(Arc::new(AppDatabase {
                 conn: db.conn.clone(),
             }));
-            runs.admit_gen1_reserving(ReservingRunInsert {
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.admit_gen1_reserving(ReservingRunInsert {
                 task_id: task_id.into(),
                 root_task_id: task_id.into(),
                 previous_task_id: None,
@@ -9701,7 +9702,8 @@ mod tests {
                 replaced_task_id: None,
                 replacement_reason: None,
                 started_at: Some(Utc::now()),
-            })
+                }),
+            )
             .await
             .unwrap();
             let run = delegation_task_run::Entity::find_by_id(task_id)
@@ -9714,7 +9716,8 @@ mod tests {
             run.reached_running_at = Set(Some(Utc::now()));
             run.finished_at = Set(Some(Utc::now()));
             run.update(&db.conn).await.unwrap();
-            let completion = materialize_terminal_completion_txn(
+            let completion = super::super::with_historical_workflow_fixture_mutations(
+                materialize_terminal_completion_txn(
                 &db.conn,
                 TerminalCompletionInput {
                     task_id: task_id.into(),
@@ -9722,7 +9725,8 @@ mod tests {
                     final_assistant_text: final_text.into(),
                     pre_read_reports: Vec::new(),
                     pre_read_artifact: None,
-                },
+                    },
+                ),
             )
             .await
             .unwrap();
@@ -10295,7 +10299,8 @@ mod tests {
         };
         run.insert(&db.conn).await.expect("insert run");
 
-        super::super::admission::admit_workflow_run_txn(
+        super::super::with_historical_workflow_fixture_mutations(
+            super::super::admission::admit_workflow_run_txn(
             &db.conn,
             &super::super::admission::WorkflowAdmitInput {
                 parent_conversation_id: parent,
@@ -10309,7 +10314,8 @@ mod tests {
                 kind: super::super::admission::AdmissionDispatchKind::FirstDispatch,
                 admission_class: AdmissionClass::NormalRevision,
                 workspace_path: workspace.to_str(),
-            },
+                },
+            ),
         )
         .await
         .expect("admit completion fixture run");
@@ -10344,7 +10350,8 @@ mod tests {
             "approve_with_minors" => "approve with minors",
             other => other,
         };
-        let result = super::super::completion_evidence::materialize_terminal_completion_txn(
+        let result = super::super::with_historical_workflow_fixture_mutations(
+            super::super::completion_evidence::materialize_terminal_completion_txn(
             &db.conn,
             super::super::completion_evidence::TerminalCompletionInput {
                 task_id: task_id.to_string(),
@@ -10352,7 +10359,8 @@ mod tests {
                 final_assistant_text: format!("Conclusion: {conclusion}"),
                 pre_read_reports: Vec::new(),
                 pre_read_artifact: None,
-            },
+                },
+            ),
         )
         .await
         .unwrap_or_else(|error| panic!("materialize {task_id}: {error:?}"));
@@ -12106,12 +12114,14 @@ mod tests {
             latest_run_id: attention.latest_run_id.unwrap(),
             node_id: completion_attention_public_node_id(&attention.node_id.unwrap()),
         };
-        let resolved = resolve_design_self_review_txn(
-            &db,
-            parent,
-            cas,
-            CompletionOutcome::Approve,
-            "authenticated-user",
+        let resolved = super::super::with_historical_workflow_fixture_mutations(
+            resolve_design_self_review_txn(
+                &db,
+                parent,
+                cas,
+                CompletionOutcome::Approve,
+                "authenticated-user",
+            ),
         )
         .await
         .unwrap();
@@ -12343,7 +12353,8 @@ mod tests {
             let runs = RunStore::new(Arc::new(AppDatabase {
                 conn: db.conn.clone(),
             }));
-            runs.admit_gen1_reserving(ReservingRunInsert {
+            super::super::with_historical_workflow_fixture_mutations(
+                runs.admit_gen1_reserving(ReservingRunInsert {
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
                 previous_task_id: None,
@@ -12367,7 +12378,8 @@ mod tests {
                 replaced_task_id: None,
                 replacement_reason: None,
                 started_at: Some(Utc::now()),
-            })
+                }),
+            )
             .await
             .unwrap();
             let run = delegation_task_run::Entity::find_by_id(&task_id)
@@ -12394,7 +12406,8 @@ mod tests {
             .insert(&db.conn)
             .await
             .unwrap();
-            let completion = materialize_terminal_completion_txn(
+            let completion = super::super::with_historical_workflow_fixture_mutations(
+                materialize_terminal_completion_txn(
                 &db.conn,
                 TerminalCompletionInput {
                     task_id: task_id.clone(),
@@ -12402,7 +12415,8 @@ mod tests {
                     final_assistant_text: "typed completion intent wins".into(),
                     pre_read_reports: Vec::new(),
                     pre_read_artifact: None,
-                },
+                    },
+                ),
             )
             .await
             .unwrap();
@@ -16405,12 +16419,14 @@ mod tests {
             .await
             .expect("load active digest")
             .expect("active digest");
-            let reclassified = classify_existing_header(
-                &db.conn,
-                header,
-                parent,
-                &blocked.publication_token,
-                &active_digest,
+            let reclassified = crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                classify_existing_header(
+                    &db.conn,
+                    header,
+                    parent,
+                    &blocked.publication_token,
+                    &active_digest,
+                ),
             )
             .await
             .expect("race reclassifies blocked publication");
@@ -19289,7 +19305,8 @@ mod tests {
             .await
             .expect("insert reserving Task run");
             let txn = db.conn.begin().await.expect("begin Task admission");
-            admit_workflow_run_txn(
+            crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                admit_workflow_run_txn(
                 &txn,
                 &WorkflowAdmitInput {
                     parent_conversation_id: parent,
@@ -19303,7 +19320,8 @@ mod tests {
                     kind: AdmissionDispatchKind::FirstDispatch,
                     admission_class: AdmissionClass::NormalRevision,
                     workspace_path: Some(workspace.as_str()),
-                },
+                    },
+                ),
             )
             .await
             .expect("admit Task after recovery");

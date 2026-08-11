@@ -5991,10 +5991,11 @@ mod tests {
         .await
         .expect("insert workflow run binding");
         ensure_bound(store, task_id, &format!("conn-{task_id}")).await;
-        store
-            .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
-            .await
-            .expect("promote mapped run");
+        crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+            store.promote_running(task_id, format!("conn-{task_id}"), Utc::now()),
+        )
+        .await
+        .expect("promote mapped run");
     }
 
     #[tokio::test]
