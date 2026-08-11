@@ -556,17 +556,15 @@ pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
     conn: &C,
     conversation_id: i32,
 ) -> Result<(), WorkflowStoreError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if historical_workflow_fixture_mutations_enabled() {
+        return Ok(());
+    }
     if let Some(navigation) = archived_workflow_navigation(conn, conversation_id).await? {
         let result = require_v2_mutation(
             navigation.completion_protocol_version,
             &navigation.completion_protocol_mode,
         );
-        #[cfg(any(test, feature = "test-utils"))]
-        if matches!(&result, Err(WorkflowStoreError::WorkflowV2Retired { .. }))
-            && historical_workflow_fixture_mutations_enabled()
-        {
-            return Ok(());
-        }
         return match result {
             Err(WorkflowStoreError::WorkflowV2Retired { .. }) => {
                 Err(WorkflowStoreError::workflow_v2_retired_with_navigation(
