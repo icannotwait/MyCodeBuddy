@@ -663,17 +663,10 @@ struct SkillScenario {
     name: &'static str,
     routes: &'static [SkillRoute],
     expected_actions: &'static [SkillAction],
-    /// Exact routing sentence from the Skill Forward checklist.
-    policy_outcome: &'static str,
     /// Each route must not reuse any of these prior work-unit keys.
     must_differ_from: &'static [&'static str],
     max_unexpected_continues: i64,
     max_replacements: i64,
-}
-
-/// Collapse Skill markdown wrapping so contract phrases match across line breaks.
-fn normalize_skill_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn skill_forward_scenarios() -> Vec<SkillScenario> {
@@ -691,7 +684,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 },
             ],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "platform-selected reviewer nodes and lineage",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -703,8 +695,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome:
-                "Admitted key, role, agent, and profile remain frozen through every fix round",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -716,7 +706,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome: "Every new implement/fix artifact invalidates both prior reviews",
             must_differ_from: &["task|3|implementer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -734,7 +723,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 },
             ],
             expected_actions: &[SkillAction::FreshDelegate],
-            policy_outcome: "Normal: one Grok implementer + one Codex reviewer.",
             must_differ_from: &["task|3|implementer|none", "task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -746,7 +734,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::FreshDelegate],
-            policy_outcome: "Final whole-branch review remains a new Codex child",
             must_differ_from: &["task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -758,7 +745,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Replacement],
-            policy_outcome: "Recovery is status-first and resume-first",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -770,8 +756,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::Continue],
-            policy_outcome:
-                "Prefer `continue_delegation` when the ledger shows a recoverable thread",
             must_differ_from: &["task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -783,7 +767,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Codex,
             }],
             expected_actions: &[SkillAction::BlockNoSubstitute],
-            policy_outcome: "Hard block; no agent substitution",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -795,8 +778,6 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 agent: AgentType::Grok,
             }],
             expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
-            policy_outcome:
-                "only while replacement budget remains; after replacement consumption, block",
             must_differ_from: &[],
             max_unexpected_continues: 2,
             max_replacements: 1,
@@ -814,33 +795,93 @@ fn skill_forward_routing_invariants_nine_scenarios() {
         .join("SKILL.md");
     let skill = std::fs::read_to_string(&skill_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
-    let skill = normalize_skill_whitespace(&skill);
-    // Markers must match current Skill contract language (not legacy prose).
-    // Runtime wire codes such as busy_thread are asserted elsewhere.
-    for marker in [
-        "Design, Plan, Task, and Final gates advance from platform outcomes",
-        "continue_delegation",
-        "work_unit_key",
-        "agent_type: \"grok\"",
-        "\"codex\"",
-        "Admitted key, role, agent, and profile remain frozen",
-        "final_review",
-        "unresumable",
-        "budget_exhausted_continue",
-        "Final whole-branch review remains a new Codex child",
-    ] {
-        assert!(
-            skill.contains(marker),
-            "Skill-forward policy lost required marker `{marker}`"
-        );
-    }
+    const CONTRACT_MARKER: &str = "<!-- codeg-b2d-skill-contract-v1";
+    let mut contract_markers = skill.match_indices(CONTRACT_MARKER);
+    let (contract_start, _) = contract_markers.next().unwrap_or_else(|| {
+        panic!(
+            "{} is missing structured contract marker `{CONTRACT_MARKER}`",
+            skill_path.display()
+        )
+    });
+    assert!(
+        contract_markers.next().is_none(),
+        "{} must contain exactly one `{CONTRACT_MARKER}` comment",
+        skill_path.display()
+    );
+    let contract_body = &skill[contract_start + CONTRACT_MARKER.len()..];
+    let contract_end = contract_body.find("-->").unwrap_or_else(|| {
+        panic!(
+            "{} structured contract is missing its `-->` terminator",
+            skill_path.display()
+        )
+    });
+    let contract: serde_json::Value = serde_json::from_str(contract_body[..contract_end].trim())
+        .unwrap_or_else(|error| {
+            panic!(
+                "parse structured contract JSON in {}: {error}",
+                skill_path.display()
+            )
+        });
+
+    assert_eq!(
+        contract["phase_order"],
+        serde_json::json!([
+            "establish-current-truth",
+            "produce-plan-and-register",
+            "maintain-progress",
+            "apply-workspace-gate",
+            "execute-tasks-serially",
+            "recover-generic-runs",
+            "complete-final-review"
+        ]),
+        "structured contract phase_order"
+    );
+    assert_eq!(
+        [
+            contract["interfaces"]["first_run"].as_str(),
+            contract["interfaces"]["later_run"].as_str(),
+            contract["interfaces"]["join"].as_str(),
+        ],
+        [
+            Some("delegate_to_agent"),
+            Some("continue_delegation"),
+            Some("get_delegation_status"),
+        ],
+        "structured contract delegation interfaces"
+    );
+    assert_eq!(
+        contract["task_execution"],
+        serde_json::json!({
+            "order": "serial",
+            "implementer": "grok",
+            "reviewer": "codex",
+            "review": "independent"
+        }),
+        "structured contract task execution"
+    );
+    assert_eq!(
+        contract["recovery"],
+        serde_json::json!({
+            "unexpected_continuations": 2,
+            "logical_replacements": 1,
+            "replacement_retry": "pre-admission-only"
+        }),
+        "structured contract recovery limits"
+    );
+    assert_eq!(
+        contract["final_review"],
+        serde_json::json!({
+            "required": true,
+            "independent": true,
+            "reviewer": "codex"
+        }),
+        "structured contract final review"
+    );
 
     let scenarios = skill_forward_scenarios();
     assert_eq!(scenarios.len(), 9, "design skill-forward matrix size");
 
-    // Keep all nine Skill Forward outcomes explicit. The fixture is allowed to
-    // read the documentation, but must fail if either the documented routing
-    // sentence or its concrete continue/fresh/replacement/block outcome drifts.
+    // Keep all nine Skill Forward outcomes explicit.
     let expected_matrix: [(&str, &[SkillAction]); 9] = [
         (
             "design_plan_rereview_continue_same_reviewer",
@@ -881,12 +922,6 @@ fn skill_forward_routing_invariants_nine_scenarios() {
 
     let mut keys = BTreeSet::new();
     for s in &scenarios {
-        assert!(
-            skill.contains(s.policy_outcome),
-            "Skill Forward policy lost the documented outcome for {}: {}",
-            s.name,
-            s.policy_outcome
-        );
         assert!(
             !s.routes.is_empty(),
             "{} must have at least one route",
