@@ -67,6 +67,7 @@ struct SimpleSuccessorTestControl {
     empty_link_waits: std::sync::atomic::AtomicUsize,
     retries: std::sync::atomic::AtomicUsize,
     rollbacks: std::sync::atomic::AtomicUsize,
+    auto_title_job_seen: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -120,6 +121,7 @@ impl SimpleSuccessorTestControl {
             empty_link_waits: std::sync::atomic::AtomicUsize::new(0),
             retries: std::sync::atomic::AtomicUsize::new(0),
             rollbacks: std::sync::atomic::AtomicUsize::new(0),
+            auto_title_job_seen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -142,6 +144,16 @@ impl SimpleSuccessorTestControl {
 
     fn rollbacks(&self) -> usize {
         self.rollbacks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_auto_title_job_seen(&self, seen: bool) {
+        self.auto_title_job_seen
+            .store(seen, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn auto_title_job_seen(&self) -> bool {
+        self.auto_title_job_seen
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -172,6 +184,23 @@ fn test_record_retry() {
 #[cfg(test)]
 fn test_record_rollback() {
     let _ = SIMPLE_SUCCESSOR_TEST_CONTROL.try_with(|control| control.record_rollback());
+}
+
+#[cfg(test)]
+async fn test_record_auto_title_enrollment(
+    txn: &sea_orm::DatabaseTransaction,
+    conversation_id: i32,
+) -> Result<(), AppCommandError> {
+    let Ok(control) = SIMPLE_SUCCESSOR_TEST_CONTROL.try_with(|control| control.clone()) else {
+        return Ok(());
+    };
+    let seen = crate::db::entities::auto_title_job::Entity::find_by_id(conversation_id)
+        .one(txn)
+        .await
+        .map_err(|error| AppCommandError::database_error(error.to_string()))?
+        .is_some();
+    control.record_auto_title_job_seen(seen);
+    Ok(())
 }
 
 fn validate_request_token(token: &str) -> Result<(), AppCommandError> {
@@ -719,6 +748,8 @@ async fn create_or_load_successor(
             }
         };
         #[cfg(test)]
+        test_record_auto_title_enrollment(&txn, candidate.id).await?;
+        #[cfg(test)]
         if test_should_fail_after_candidate() {
             rollback_successor_attempt(txn).await?;
             return Err(AppCommandError::database_error(
@@ -1075,6 +1106,7 @@ mod tests {
     };
     use crate::app_error::AppErrorCode;
     use crate::app_state::AppState;
+    use crate::auto_title::{enable_title_api_for_test, title_key};
     use crate::commands::conversations::delete_conversation_with_cleanup_core;
     use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::entities::{
@@ -1792,6 +1824,8 @@ mod tests {
         std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
         std::fs::write(workspace.path().join("docs/plan.md"), "# Plan\n").unwrap();
         let db = fresh_in_memory_db().await;
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
         let source = seed_conversation(&db, folder, AgentType::Codex).await;
         let source_row = conversation::Entity::find_by_id(source)
@@ -1842,6 +1876,10 @@ mod tests {
 
         assert_eq!(error.code, AppErrorCode::DatabaseError);
         assert_eq!(control.rollbacks(), 1);
+        assert!(
+            control.auto_title_job_seen(),
+            "candidate auto-title enrollment must be visible inside the transaction"
+        );
         assert_eq!(live_conversation_count(&db).await, conversations_before);
         assert_eq!(descriptor_count(&db).await, 0);
         assert_eq!(
