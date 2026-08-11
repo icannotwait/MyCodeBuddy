@@ -39,7 +39,7 @@ use super::gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
     ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
 };
-use super::key::parse_recognized_work_unit_key;
+use super::key::{normalize_rel_path, parse_recognized_work_unit_key};
 use super::simple_parse::{
     read_simple_plan, read_simple_progress, SimpleDeclaredStatus, SimpleFinalReviewStatus,
     SimpleParseError, SimplePlanDocument, SimpleProgressDocument,
@@ -2168,6 +2168,8 @@ async fn project_simple_mode(
     };
 
     let mut projection_warning_codes = Vec::new();
+    let safe_plan_rel_path = normalize_rel_path(&descriptor.plan_rel_path).ok();
+    let safe_progress_rel_path = normalize_rel_path(&descriptor.progress_rel_path).ok();
     let plan = match read_simple_plan(Path::new(&workspace.path), &descriptor.plan_rel_path).await {
         Ok(plan) => plan,
         Err(error) => {
@@ -2496,11 +2498,13 @@ async fn project_simple_mode(
         completion: None,
         compatibility: WorkflowCompatibility::Simple,
         overall_state,
-        simple: Some(SimpleWorkflowLocatorSnapshot {
-            plan_rel_path: descriptor.plan_rel_path.clone(),
-            progress_rel_path: descriptor.progress_rel_path.clone(),
-            source_conversation_id,
-        }),
+        simple: safe_plan_rel_path
+            .zip(safe_progress_rel_path)
+            .map(|(plan_rel_path, progress_rel_path)| SimpleWorkflowLocatorSnapshot {
+                plan_rel_path,
+                progress_rel_path,
+                source_conversation_id,
+            }),
         archived: None,
         projection_warning_codes,
         current_phase_id: (!current_node_ids.is_empty()).then(|| "tasks".into()),
@@ -6065,7 +6069,7 @@ mod tests {
             std::path::Path::new(&workspace)
                 .join(format!(".superpowers/sdd/{parent}/progress.md")),
             r#"<!-- codeg-simple-progress-v1
-{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","active_task_index":2,"tasks":[{"index":1,"status":"completed","runs":[{"task_id":"simple-failed","role":"implementer","agent_type":"codex","state":"failed"}]},{"index":2,"status":"in_progress"}],"final_review_status":"pending"}
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","active_task_index":2,"tasks":[{"index":1,"status":"completed","runs":[{"task_id":"simple-failed","role":"implementer","agent_type":"codex","state":"failed"}]},{"index":2,"status":"in_progress","runs":[{"task_id":"simple-failed","role":"implementer","agent_type":"codex","state":"failed"}]}],"final_review_status":"pending"}
 -->"#,
         )
         .expect("write Simple progress");
@@ -6090,15 +6094,16 @@ mod tests {
             .projection_warning_codes
             .iter()
             .any(|code| code == "simple_completed_task_terminal_run_failed"));
-        assert_eq!(
-            snapshot
-                .nodes
-                .iter()
-                .find(|node| node.task_index == Some(2))
-                .expect("second task")
-                .status,
-            ProjectedNodeStatus::InProgress
-        );
+        let second = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.task_index == Some(2))
+            .expect("second task");
+        assert_eq!(second.status, ProjectedNodeStatus::InProgress);
+        assert!(second
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_run_task_index_mismatch"));
     }
 
     #[tokio::test]
@@ -6148,6 +6153,100 @@ mod tests {
                 "missing projection warning: {expected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn simple_projection_uses_final_review_state_and_tolerates_missing_plan() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Finish work\n",
+        )
+        .expect("write Simple plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+        let progress_path = std::path::Path::new(&workspace)
+            .join(format!(".superpowers/sdd/{parent}/progress.md"));
+        std::fs::write(
+            &progress_path,
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","tasks":[{"index":1,"status":"completed","commit":"abc123"}],"final_review_status":"completed"}
+-->"#,
+        )
+        .expect("write completed progress");
+        assert_eq!(
+            project_workflow_graph_core(&db, parent)
+                .await
+                .expect("completed Simple snapshot")
+                .overall_state,
+            WorkflowOverallState::Completed
+        );
+
+        std::fs::write(
+            &progress_path,
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","tasks":[{"index":1,"status":"completed","commit":"abc123"}],"final_review_status":"blocked"}
+-->"#,
+        )
+        .expect("write blocked progress");
+        assert_eq!(
+            project_workflow_graph_core(&db, parent)
+                .await
+                .expect("blocked Simple snapshot")
+                .overall_state,
+            WorkflowOverallState::Blocked
+        );
+
+        std::fs::remove_file(std::path::Path::new(&workspace).join("docs/simple-plan.md"))
+            .expect("remove Simple plan");
+        let missing = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("partial snapshot for missing Plan");
+        assert!(missing.nodes.is_empty());
+        assert!(missing
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_plan_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn simple_projection_never_exposes_invalid_descriptor_paths() {
+        let (db, parent) = seed_parent().await;
+        let now = Utc::now();
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(parent),
+            plan_rel_path: Set("C:/private/plan.md".into()),
+            progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
+            source_workflow_id: Set(None),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert corrupt descriptor fixture");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("partial Simple snapshot");
+        assert_eq!(snapshot.compatibility, WorkflowCompatibility::Simple);
+        assert!(snapshot.simple.is_none());
+        assert!(snapshot
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_plan_invalid_path"));
+        let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(!encoded.contains("C:/private"));
     }
 
     #[tokio::test]

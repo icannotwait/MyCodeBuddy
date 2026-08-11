@@ -614,6 +614,18 @@ Run verification: `cargo test second`
             parsed.tasks[1].verification_text.as_deref(),
             Some("Run verification: `cargo test second`")
         );
+
+        let oversized_section = format!(
+            "## Task 1: Large\n\n{}\n\n## Task 2: Next\n",
+            "x".repeat(MAX_PLAN_SECTION_BYTES + 128)
+        );
+        let bounded = parse_simple_plan(oversized_section.as_bytes())
+            .expect("oversized section remains recoverable");
+        assert!(bounded.tasks[0].body.len() <= MAX_PLAN_SECTION_BYTES);
+        assert!(bounded
+            .warning_codes
+            .iter()
+            .any(|code| code == WARNING_PLAN_SECTION_TRUNCATED));
     }
 
     #[test]
@@ -637,6 +649,25 @@ Run verification: `cargo test second`
         let parsed = parse_simple_progress(duplicate, "docs/plan.md").expect("parse duplicate");
         assert_eq!(parsed.snapshot.expect("safe snapshot").tasks.len(), 1);
         assert_eq!(parsed.warning_codes, vec![WARNING_PROGRESS_DUPLICATE_TASK]);
+
+        let invalid_json = br#"<!-- codeg-simple-progress-v1
+{not-json}
+-->"#;
+        let invalid = parse_simple_progress(invalid_json, "docs/plan.md")
+            .expect("invalid JSON is recoverable");
+        assert!(invalid.snapshot.is_none());
+        assert_eq!(invalid.warning_codes, vec![WARNING_PROGRESS_INVALID_JSON]);
+
+        let multiple = br#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/plan.md","tasks":[],"final_review_status":"pending"}
+-->
+<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/plan.md","tasks":[],"final_review_status":"completed"}
+-->"#;
+        let multiple = parse_simple_progress(multiple, "docs/plan.md")
+            .expect("the first of multiple blocks remains readable");
+        assert!(multiple.snapshot.is_some());
+        assert_eq!(multiple.warning_codes, vec![WARNING_PROGRESS_MULTIPLE]);
     }
 
     #[test]
@@ -665,6 +696,11 @@ Run verification: `cargo test second`
         );
         assert_eq!(
             parse_simple_plan(&[0xff]).expect_err("invalid UTF-8"),
+            SimpleParseError::InvalidUtf8
+        );
+        assert_eq!(
+            parse_simple_progress(&[0xff], "docs/plan.md")
+                .expect_err("progress invalid UTF-8"),
             SimpleParseError::InvalidUtf8
         );
         assert_eq!(

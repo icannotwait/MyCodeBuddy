@@ -58,6 +58,7 @@ function baseSnapshot(
     manifest_state: "estimated",
     compatibility: "manifest",
     overall_state: "estimated",
+    projection_warning_codes: [],
     current_phase_id: "plan",
     current_node_ids: ["n-plan-r1"],
     phases: [
@@ -129,6 +130,8 @@ function node(
     returned_reviewer_count: null,
     title: overrides.node_id,
     status: "estimated",
+    sync_state: "in_sync",
+    projection_warning_codes: [],
     status_reason: null,
     run_count: 0,
     active_child_generation: null,
