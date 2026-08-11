@@ -62,6 +62,10 @@ use crate::acp::delegation::workflow::{
     FinalDeliveryGuardResult, PlanReviewError, RecoverWorkflowRequest,
     SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::delegation::workflow::{
+    historical_workflow_fixture_mutations_enabled, with_historical_workflow_fixture_mutations,
+};
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
     accept_complete_work_txn, ManifestDocument, PublishWorkflowRequest,
@@ -370,6 +374,29 @@ pub struct DelegationListener {
 }
 
 impl DelegationListener {
+    fn spawn_connection<C>(self: Arc<Self>, mut conn: C)
+    where
+        C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    {
+        #[cfg(any(test, feature = "test-utils"))]
+        let inherit_historical_fixture = historical_workflow_fixture_mutations_enabled();
+
+        tokio::spawn(async move {
+            #[cfg(any(test, feature = "test-utils"))]
+            let result = if inherit_historical_fixture {
+                with_historical_workflow_fixture_mutations(self.serve_one(&mut conn)).await
+            } else {
+                self.serve_one(&mut conn).await
+            };
+            #[cfg(not(any(test, feature = "test-utils")))]
+            let result = self.serve_one(&mut conn).await;
+
+            if let Err(error) = result {
+                tracing::error!("[delegation] connection failed: {error}");
+            }
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         broker: Arc<DelegationBroker>,
@@ -472,13 +499,9 @@ impl DelegationListener {
         tracing::info!("[delegation] listening on UDS {}", socket_path.display());
         loop {
             match listener.accept().await {
-                Ok((mut conn, _)) => {
+                Ok((conn, _)) => {
                     let me = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        if let Err(e) = me.serve_one(&mut conn).await {
-                            tracing::error!("[delegation] connection failed: {e}");
-                        }
-                    });
+                    me.spawn_connection(conn);
                 }
                 Err(e) => {
                     tracing::error!("[delegation] accept failed: {e}");
@@ -515,12 +538,7 @@ impl DelegationListener {
             // opens during this turn finds a server instance to connect to.
             server = ServerOptions::new().create(&path_str)?;
             let me = Arc::clone(&self);
-            tokio::spawn(async move {
-                let mut conn = connected;
-                if let Err(e) = me.serve_one(&mut conn).await {
-                    tracing::error!("[delegation] connection failed: {e}");
-                }
-            });
+            me.spawn_connection(connected);
         }
     }
 

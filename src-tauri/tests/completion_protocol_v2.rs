@@ -40,19 +40,19 @@ use codeg_lib::acp::delegation::transport::{
 };
 use codeg_lib::acp::delegation::types::{
     ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
-    DelegationSuccess, ResolveCompletionDecisionRequest, TaskStatus,
+    DelegationSuccess, TaskStatus,
 };
-use codeg_lib::acp::types::DelegationResultSummary;
 use codeg_lib::acp::delegation::workflow::{
-    build_work_unit_key, guard_current_final_delivery_core as production_guard_current_final_delivery,
+    accept_complete_work_txn, build_work_unit_key,
+    guard_current_final_delivery_core as production_guard_current_final_delivery,
     guard_final_delivery_core as production_guard_final_delivery,
     guard_task_final_delivery_core as production_guard_task_final_delivery,
     load_completion_protocol_for_conversation, load_historical_workflow_context,
     materialize_terminal_completion_txn, project_workflow_graph_core,
     publish_workflow_manifest_core, publish_workflow_manifest_fixture,
-    recover_workflow_core as production_recover_workflow,
+    recover_workflow_core as production_recover_workflow, resolve_completion_decision_txn,
     settle_workflow_gate_v2_core as production_settle_workflow_gate_v2,
-    with_historical_workflow_fixture_mutations, CompletionCardV2,
+    with_historical_workflow_fixture_mutations, CompleteWorkRequest, CompletionCardV2,
     CompletionDecisionResolvedPayloadV1, CompletionIntentSource, CompletionOutcome,
     CompletionProtocolConfigurationRemoved, CompletionRole, DocumentGateKind, DocumentRef,
     FinalDeliveryGuardRequest, FinalDeliveryGuardResult, ManifestDocument, ManifestGate,
@@ -67,6 +67,7 @@ use codeg_lib::acp::delegation::workflow::{
 use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::ConnectionManager;
 use codeg_lib::acp::question::{QuestionSpec, RegisteredQuestion, SessionQuestionAccess};
+use codeg_lib::acp::types::DelegationResultSummary;
 use codeg_lib::acp::types::PromptInputBlock;
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
@@ -83,7 +84,6 @@ use codeg_lib::db::test_helpers::{
     seed_conversation, seed_folder, HistoricalWorkflowSeed,
 };
 use codeg_lib::models::AgentType;
-use codeg_lib::web::auth::COMPLETION_CONTEXT_HEADER;
 use codeg_lib::web::event_bridge::EventEmitter;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
@@ -2469,6 +2469,26 @@ enum CapabilityCase {
     ObsoleteCardPlusNaturalConclusion,
 }
 
+const HISTORICAL_WORKFLOW_ROOT_FEATURES: CompanionFeatures = CompanionFeatures {
+    delegation: true,
+    coordination_v1: false,
+    feedback: false,
+    ask: false,
+    sessions: false,
+    workflow_v2: true,
+    completion_v2: false,
+};
+
+const HISTORICAL_COMPLETION_CHILD_FEATURES: CompanionFeatures = CompanionFeatures {
+    delegation: false,
+    coordination_v1: false,
+    feedback: false,
+    ask: false,
+    sessions: false,
+    workflow_v2: false,
+    completion_v2: true,
+};
+
 struct CapabilityResult {
     child_run_count: u64,
     card_summary_json: Option<String>,
@@ -2706,10 +2726,10 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         "listener readiness: {readiness}"
     );
     let child_companion = CompanionContext {
-        parent_connection_id: child_connection_id,
+        parent_connection_id: child_connection_id.clone(),
         socket_path: socket_path.to_string_lossy().into_owned(),
         token: child_token,
-        features: CompanionFeatures::parse(Some("completion_v2")),
+        features: HISTORICAL_COMPLETION_CHILD_FEATURES,
         role: CompanionRole::DelegationChild,
         connection_incarnation_id: format!("incarnation-{task_id}"),
         disabled_agents: Vec::new(),
@@ -2718,7 +2738,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         parent_connection_id,
         socket_path: socket_path.to_string_lossy().into_owned(),
         token: root_token,
-        features: CompanionFeatures::parse(Some("delegation,workflow_v2")),
+        features: HISTORICAL_WORKFLOW_ROOT_FEATURES,
         role: CompanionRole::Root,
         connection_incarnation_id: format!("root-incarnation-{task_id}"),
         disabled_agents: Vec::new(),
@@ -2733,32 +2753,32 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         .any(|name| name == "complete_work"));
 
     if matches!(case, CapabilityCase::ToolCompleteWork) {
-        let arguments = json!({
-            "outcome": "done",
-            "summary": "tool completion",
-        });
+        let request = CompleteWorkRequest {
+            outcome: CompletionOutcome::Done,
+            summary: Some("tool completion".into()),
+            report_file: None,
+        };
         let stable_tool_call_id = format!("complete-work-{task_id}");
-        let first = call_companion_tool(
-            &child_companion,
-            7,
-            "complete_work",
-            arguments.clone(),
-            Some(&stable_tool_call_id),
-        )
-        .await;
-        let replay = call_companion_tool(
-            &child_companion,
-            8,
-            "complete_work",
-            arguments,
-            Some(&stable_tool_call_id),
-        )
-        .await;
-        assert_eq!(
-            first["structuredContent"]["intent_id"],
-            replay["structuredContent"]["intent_id"]
-        );
-        assert_eq!(first["structuredContent"]["accepted_ordinal"], 1);
+        let first = with_historical_workflow_fixture_mutations(accept_complete_work_txn(
+            runs.db(),
+            &task_id,
+            &child_connection_id,
+            &stable_tool_call_id,
+            &request,
+        ))
+        .await
+        .unwrap();
+        let replay = with_historical_workflow_fixture_mutations(accept_complete_work_txn(
+            runs.db(),
+            &task_id,
+            &child_connection_id,
+            &stable_tool_call_id,
+            &request,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(first.intent_id, replay.intent_id);
+        assert_eq!(first.accepted_ordinal, 1);
     }
 
     let run = delegation_task_run::Entity::find_by_id(&task_id)
@@ -2832,29 +2852,15 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
     ))
     .unwrap();
     if matches!(case, CapabilityCase::AmbiguousThenUserAdjudication) {
-        let context_response = server
-            .post("/api/get_workflow_graph_snapshot")
-            .add_header("authorization", "Bearer task-18-token")
-            .json(&json!({ "conversationId": parent }))
-            .await;
-        context_response.assert_status_ok();
-        let context = context_response
-            .headers()
-            .get(COMPLETION_CONTEXT_HEADER)
-            .expect("snapshot must issue a completion context")
-            .to_str()
-            .unwrap()
-            .to_string();
-        let response = server
-            .post("/api/resolve_completion_decision")
-            .add_header("authorization", "Bearer task-18-token")
-            .add_header(COMPLETION_CONTEXT_HEADER, context)
-            .json(&ResolveCompletionDecisionRequest {
-                cas: terminal.attention.expect("ambiguous completion decision"),
-                outcome: CompletionOutcome::Done,
-            })
-            .await;
-        response.assert_status_ok();
+        with_historical_workflow_fixture_mutations(resolve_completion_decision_txn(
+            &db,
+            parent,
+            terminal.attention.expect("ambiguous completion decision"),
+            CompletionOutcome::Done,
+            "task-18-capability-adjudication",
+        ))
+        .await
+        .unwrap();
     }
 
     let stored_run = delegation_task_run::Entity::find_by_id(&task_id)
@@ -3585,7 +3591,9 @@ async fn run_final_delivery_fixture(
         EventEmitter::Noop,
     );
     let socket_path = workflow_socket_path();
-    let listener_task = tokio::spawn(listener.run(socket_path.clone()));
+    let listener_task = tokio::spawn(with_historical_workflow_fixture_mutations(
+        listener.run(socket_path.clone()),
+    ));
     // Retry only transport readiness (NotFound / ConnectionRefused). Do not
     // pre-probe with get_workflow_state: that path mutates delivery state and
     // can change the first enrichment error_code under test.
@@ -4055,7 +4063,7 @@ async fn root_protocol_loader_scans_older_bound_generation_when_latest_is_unboun
 }
 
 #[tokio::test]
-async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
+async fn root_protocol_loader_retires_when_conversation_owns_archived_v2() {
     let legacy_parent = 101;
     let legacy_workflow_id = "wf-task-4-root-bound-legacy";
     let db = historical_completion_protocol_db(&[historical_workflow_seed(
@@ -4096,19 +4104,24 @@ async fn root_protocol_loader_rejects_bound_legacy_when_conversation_owns_v2() {
 
     let first = load_completion_protocol_for_conversation(&db, child)
         .await
-        .unwrap();
+        .expect_err("owned archived v2 workflow must retire the loader");
     assert_eq!(
-        first,
-        Some((1, delegation_workflow::CompletionProtocolMode::V1,)),
-        "owned v2 workflow must not mask a rejecting bound legacy workflow"
+        first.code(),
+        "workflow_v2_retired",
+        "a bound legacy workflow must not mask the owned archived workflow"
     );
-    assert_eq!(
-        load_completion_protocol_for_conversation(&db, child)
-            .await
-            .unwrap(),
+    let second = load_completion_protocol_for_conversation(&db, child)
+        .await
+        .expect_err("owned archived v2 workflow must retire every loader attempt");
+    assert!(matches!(
         first,
-        "conflicting durable associations must resolve deterministically"
-    );
+        WorkflowStoreError::WorkflowV2Retired { .. }
+    ));
+    assert!(matches!(
+        second,
+        WorkflowStoreError::WorkflowV2Retired { .. }
+    ));
+    assert_eq!(second.code(), first.code());
     assert_ne!(legacy.workflow_id, owned.workflow_id);
 }
 

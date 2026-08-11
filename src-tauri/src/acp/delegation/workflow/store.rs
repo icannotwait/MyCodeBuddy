@@ -5073,7 +5073,7 @@ fn db_err(e: sea_orm::DbErr) -> WorkflowStoreError {
     WorkflowStoreError::Persistence(e.to_string())
 }
 
-fn map_completion_protocol_header_db_error(error: sea_orm::DbErr) -> WorkflowStoreError {
+pub(crate) fn map_completion_protocol_header_db_error(error: sea_orm::DbErr) -> WorkflowStoreError {
     match error {
         sea_orm::DbErr::Type(message) => {
             WorkflowStoreError::UnsupportedCompletionProtocolHeader(message)

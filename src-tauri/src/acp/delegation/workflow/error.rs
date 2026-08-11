@@ -1,6 +1,6 @@
 //! Store and validation errors for the workflow graph.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 use thiserror::Error;
@@ -15,6 +15,7 @@ pub use super::evidence_scope::EvidenceScopeError;
 pub use super::plan_material::{PlanMaterialError, PlanMaterialErrorKind};
 use super::plan_review::PlanReviewError;
 use super::recovery_policy::WorkflowRecoveryProjection;
+use super::store::map_completion_protocol_header_db_error;
 pub use super::types::WorkflowError;
 
 pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
@@ -364,7 +365,7 @@ where
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-fn historical_workflow_fixture_mutations_enabled() -> bool {
+pub(crate) fn historical_workflow_fixture_mutations_enabled() -> bool {
     HISTORICAL_WORKFLOW_FIXTURE_MUTATIONS
         .try_with(|()| true)
         .unwrap_or(false)
@@ -438,31 +439,37 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
     }
 
     let workflows = delegation_workflow::Entity::find()
+        .select_only()
+        .column(delegation_workflow::Column::WorkflowId)
+        .column(delegation_workflow::Column::ParentConversationId)
+        .column(delegation_workflow::Column::CompletionProtocolVersion)
+        .column(delegation_workflow::Column::CompletionProtocolMode)
         .filter(delegation_workflow::Column::WorkflowId.is_in(workflow_ids.iter().cloned()))
+        .into_tuple::<(String, i32, i64, CompletionProtocolMode)>()
         .all(conn)
         .await
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
-        .into_iter()
-        .map(|workflow| (workflow.workflow_id.clone(), workflow))
-        .collect::<BTreeMap<_, _>>();
+        .map_err(map_completion_protocol_header_db_error)?;
     if workflows.len() != 1 || workflows.len() != workflow_ids.len() {
         return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
             source_conversation_id: conversation_id,
         });
     }
-    let (workflow_id, workflow) = workflows.into_iter().next().expect("one workflow");
+    let (
+        workflow_id,
+        parent_conversation_id,
+        completion_protocol_version,
+        completion_protocol_mode,
+    ) = workflows.into_iter().next().expect("one workflow");
 
     if simple_workflow::Entity::find()
-        .filter(
-            simple_workflow::Column::ParentConversationId.eq(workflow.parent_conversation_id),
-        )
+        .filter(simple_workflow::Column::ParentConversationId.eq(parent_conversation_id))
         .one(conn)
         .await
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?
         .is_some()
     {
         return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
-            source_conversation_id: workflow.parent_conversation_id,
+            source_conversation_id: parent_conversation_id,
         });
     }
 
@@ -473,18 +480,18 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
     if successors.len() > 1 {
         return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
-            source_conversation_id: workflow.parent_conversation_id,
+            source_conversation_id: parent_conversation_id,
         });
     }
 
     Ok(Some(ArchivedWorkflowNavigation {
-        source_conversation_id: workflow.parent_conversation_id,
+        source_conversation_id: parent_conversation_id,
         successor_conversation_id: successors
             .into_iter()
             .next()
             .map(|successor| successor.parent_conversation_id),
-        completion_protocol_version: workflow.completion_protocol_version,
-        completion_protocol_mode: workflow.completion_protocol_mode,
+        completion_protocol_version,
+        completion_protocol_mode,
     }))
 }
 
@@ -906,5 +913,75 @@ mod tests {
             error,
             WorkflowStoreError::WorkflowV2Retired { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn archived_workflow_navigation_preserves_corrupt_header_classification() {
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+
+        use crate::db::entities::delegation_workflow::{self, WorkflowState};
+        use crate::db::test_helpers::{
+            complete_historical_completion_protocol_migrations,
+            historical_completion_protocol_db_before_v2_only, seed_conversation, seed_folder,
+        };
+        use crate::models::AgentType;
+
+        let db = historical_completion_protocol_db_before_v2_only().await;
+        let folder = seed_folder(&db, "/tmp/workflow-corrupt-header-navigation").await;
+        let conversation_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let now = Utc::now();
+        delegation_workflow::ActiveModel {
+            workflow_id: Set("workflow-corrupt-header-navigation".into()),
+            parent_conversation_id: Set(conversation_id),
+            workflow_kind: Set("brainstorm_to_delivery".into()),
+            schema_version: Set(2),
+            active_manifest_revision: Set(1),
+            graph_revision: Set(1),
+            workflow_state: Set(WorkflowState::Approved),
+            capability_version: Set("workflow_manifest_v2".into()),
+            publication_token: Set("workflow-corrupt-header-navigation-token".into()),
+            supersedes_approved_revision: Set(None),
+            structural_revision: Set(1),
+            design_fingerprint: Set("design".into()),
+            plan_fingerprint: Set("plan".into()),
+            block_cause_code: Set(None),
+            block_source_manifest_revision: Set(None),
+            completion_protocol_version: Set(2),
+            completion_protocol_mode: Set(CompletionProtocolMode::V2Enforce),
+            legacy_source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "UPDATE delegation_workflows SET completion_protocol_mode = 'corrupt_mode' \
+                 WHERE workflow_id = 'workflow-corrupt-header-navigation'",
+            ))
+            .await
+            .unwrap();
+        db.conn
+            .execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .unwrap();
+        complete_historical_completion_protocol_migrations(&db).await;
+
+        let error = archived_workflow_navigation(&db.conn, conversation_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkflowStoreError::UnsupportedCompletionProtocolHeader(_)
+        ));
+        assert_eq!(error.code(), "unsupported_completion_protocol");
+        assert!(!error.is_retryable());
     }
 }

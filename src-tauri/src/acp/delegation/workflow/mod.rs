@@ -66,6 +66,10 @@ pub use dto::{
     WorkflowNodeSyncState, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use error::historical_workflow_fixture_mutations_enabled;
+#[cfg(any(test, feature = "test-utils"))]
+pub use error::with_historical_workflow_fixture_mutations;
 pub use error::{
     require_v2_mutation, require_v2_mutation_for_connection,
     require_writable_conversation_workflow,
@@ -74,8 +78,6 @@ pub use error::{
     CompletionProtocolConfigurationRemoved, CompletionRecoveryFenceError, WorkflowStoreError,
     WORKFLOW_V2_RETIRED_MESSAGE,
 };
-#[cfg(any(test, feature = "test-utils"))]
-pub use error::with_historical_workflow_fixture_mutations;
 pub use events::{
     emit_workflow_compatibility_nudge, emit_workflow_graph_changed, emit_workflow_recovery_event,
     CompletionDecisionResolvedPayloadV1, WorkflowRecoveryEvent, COMPLETION_DECISION_RESOLVED_EVENT,
