@@ -1651,7 +1651,7 @@ mod tauri_app {
     #[cfg(test)]
     mod tests {
         #[test]
-        fn production_tauri_registry_contains_simple_successor_command() {
+        fn production_tauri_registry_contains_retired_simple_successor_command() {
             assert!(super::production_tauri_command_paths().contains(
                 &"crate :: commands :: simple_workflow :: continue_archived_workflow_in_simple"
             ));

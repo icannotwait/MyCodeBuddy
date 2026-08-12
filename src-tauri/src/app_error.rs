@@ -119,12 +119,8 @@ pub enum AppErrorCode {
     WorkflowV2Retired,
     /// Durable workflow ownership or successor linkage is contradictory.
     WorkflowIdentityCorrupt,
-    /// The archived workflow's active Plan cannot be read safely.
-    SimpleSuccessorPlanUnavailable,
-    /// The requested source has no archived workflow ownership.
-    SimpleSuccessorSourceNotArchived,
-    /// The requested source already belongs to Simple mode.
-    SimpleSuccessorSourceAlreadySimple,
+    /// The removed archived-to-Simple successor operation was invoked.
+    SimpleSuccessorCreationRetired,
     /// A persisted workflow protocol pair is unknown or inconsistent.
     UnsupportedCompletionProtocol,
     /// A protocol-v2 completion instruction could not be bound durably.
@@ -330,16 +326,8 @@ mod tests {
                 "workflow_identity_corrupt",
             ),
             (
-                AppErrorCode::SimpleSuccessorPlanUnavailable,
-                "simple_successor_plan_unavailable",
-            ),
-            (
-                AppErrorCode::SimpleSuccessorSourceNotArchived,
-                "simple_successor_source_not_archived",
-            ),
-            (
-                AppErrorCode::SimpleSuccessorSourceAlreadySimple,
-                "simple_successor_source_already_simple",
+                AppErrorCode::SimpleSuccessorCreationRetired,
+                "simple_successor_creation_retired",
             ),
             (
                 AppErrorCode::UnsupportedCompletionProtocol,

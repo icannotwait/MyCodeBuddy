@@ -150,19 +150,6 @@ pub async fn acp_connect(
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
 
-    crate::commands::simple_workflow::admit_simple_successor_bootstrap_after_connect(
-        db,
-        manager,
-        &connection_id,
-        params.conversation_id,
-    )
-    .await
-    .map_err(|error| {
-        error
-            .app_command_error()
-            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
-    })?;
-
     Ok(Json(connection_id))
 }
 

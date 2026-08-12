@@ -8627,14 +8627,6 @@ pub async fn acp_connect(
         }
     }
 
-    crate::commands::simple_workflow::admit_simple_successor_bootstrap_after_connect(
-        &db,
-        &manager,
-        &connection_id,
-        conversation_id,
-    )
-    .await?;
-
     Ok(connection_id)
 }
 
