@@ -768,12 +768,13 @@ Expected staged paths: exactly the eleven Rust files listed above.
 - Modify: `src-tauri/src/acp/delegation/workflow/error.rs`
 - Modify: `src-tauri/src/acp/delegation/listener.rs`
 - Modify: `src-tauri/src/web/handlers/simple_workflow.rs`
+- Modify: `src-tauri/src/db/service/conversation_service.rs`
 
 **Interfaces:**
 - Consumes: ordinary `register_simple_workflow(conn, parent_conversation_id, plan_rel_path, progress_rel_path)` callers unchanged.
 - Produces: `register_simple_workflow_txn(conn, parent_conversation_id, plan_rel_path, progress_rel_path)` with no source parameter.
 - Produces: clean-install `simple_workflows(parent_conversation_id, plan_rel_path, progress_rel_path, created_at, updated_at)` and no bootstrap table.
-- Removes: `register_simple_workflow_with_source`, successor Plan eligibility helpers, source-specific `SimpleWorkflowError` variants, the source relation, and bootstrap entity/migration registration.
+- Removes: `register_simple_workflow_with_source`, successor Plan eligibility helpers, source-specific `SimpleWorkflowError` variants, the source relation, bootstrap entity/migration registration, and the now-unused `create_root_with_route_override_in_transaction` helper left behind by Task 1.
 
 - [ ] **Step 1: Rewrite migration and store tests for the final schema**
 
@@ -936,6 +937,8 @@ simple_workflow::ActiveModel {
 
 Keep normalization, default progress path, idempotent no-op detection, locator update, parent existence/root checks, archived mode conflict, and corrupt dual-identity detection unchanged. Remove `source_workflow_id` fields from remaining `ActiveModel` fixtures in `project.rs`, `error.rs`, and `listener.rs` without changing their test purpose.
 
+Delete the unused `create_root_with_route_override_in_transaction` function from `src-tauri/src/db/service/conversation_service.rs`. Task 1 removed its only caller. Do not change any remaining conversation-creation APIs.
+
 - [ ] **Step 5: Run focused GREEN plus migration regressions**
 
 ```powershell
@@ -967,13 +970,13 @@ Expected: the forbidden scan returns no matches (exit 1), while both preservatio
 - [ ] **Step 7: Inspect and commit only locator/schema changes**
 
 ```powershell
-git diff --check -- src-tauri/src/db/migration/m20260811_000001_simple_workflows.rs src-tauri/src/db/migration/m20260812_000001_simple_successor_bootstraps.rs src-tauri/src/db/migration/mod.rs src-tauri/src/db/entities/simple_workflow.rs src-tauri/src/db/entities/simple_successor_bootstrap.rs src-tauri/src/db/entities/mod.rs src-tauri/src/acp/delegation/workflow/simple.rs src-tauri/src/acp/delegation/workflow/mod.rs src-tauri/src/acp/delegation/workflow/project.rs src-tauri/src/acp/delegation/workflow/error.rs src-tauri/src/acp/delegation/listener.rs src-tauri/src/web/handlers/simple_workflow.rs
-git add -- src-tauri/src/db/migration/m20260811_000001_simple_workflows.rs src-tauri/src/db/migration/m20260812_000001_simple_successor_bootstraps.rs src-tauri/src/db/migration/mod.rs src-tauri/src/db/entities/simple_workflow.rs src-tauri/src/db/entities/simple_successor_bootstrap.rs src-tauri/src/db/entities/mod.rs src-tauri/src/acp/delegation/workflow/simple.rs src-tauri/src/acp/delegation/workflow/mod.rs src-tauri/src/acp/delegation/workflow/project.rs src-tauri/src/acp/delegation/workflow/error.rs src-tauri/src/acp/delegation/listener.rs src-tauri/src/web/handlers/simple_workflow.rs
+git diff --check -- src-tauri/src/db/migration/m20260811_000001_simple_workflows.rs src-tauri/src/db/migration/m20260812_000001_simple_successor_bootstraps.rs src-tauri/src/db/migration/mod.rs src-tauri/src/db/entities/simple_workflow.rs src-tauri/src/db/entities/simple_successor_bootstrap.rs src-tauri/src/db/entities/mod.rs src-tauri/src/acp/delegation/workflow/simple.rs src-tauri/src/acp/delegation/workflow/mod.rs src-tauri/src/acp/delegation/workflow/project.rs src-tauri/src/acp/delegation/workflow/error.rs src-tauri/src/acp/delegation/listener.rs src-tauri/src/web/handlers/simple_workflow.rs src-tauri/src/db/service/conversation_service.rs
+git add -- src-tauri/src/db/migration/m20260811_000001_simple_workflows.rs src-tauri/src/db/migration/m20260812_000001_simple_successor_bootstraps.rs src-tauri/src/db/migration/mod.rs src-tauri/src/db/entities/simple_workflow.rs src-tauri/src/db/entities/simple_successor_bootstrap.rs src-tauri/src/db/entities/mod.rs src-tauri/src/acp/delegation/workflow/simple.rs src-tauri/src/acp/delegation/workflow/mod.rs src-tauri/src/acp/delegation/workflow/project.rs src-tauri/src/acp/delegation/workflow/error.rs src-tauri/src/acp/delegation/listener.rs src-tauri/src/web/handlers/simple_workflow.rs src-tauri/src/db/service/conversation_service.rs
 git diff --cached --name-status
 git commit -m "refactor(workflow): remove simple successor persistence"
 ```
 
-Expected staged paths: exactly twelve entries in `git diff --cached --name-status` — ten modified files plus two deleted files (`m20260812_000001_simple_successor_bootstraps.rs` and `entities/simple_successor_bootstrap.rs`).
+Expected staged paths: exactly thirteen entries in `git diff --cached --name-status` — eleven modified files plus two deleted files (`m20260812_000001_simple_successor_bootstraps.rs` and `entities/simple_successor_bootstrap.rs`).
 
 ---
 
