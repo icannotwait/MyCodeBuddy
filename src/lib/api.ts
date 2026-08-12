@@ -157,7 +157,6 @@ import type {
   CompletionAttentionCas,
   CompletionOutcome,
   CompletionProjectionV2,
-  SimpleSuccessorResult,
   WorkflowGraphSnapshot,
 } from "./types"
 
@@ -1927,16 +1926,6 @@ export async function getWorkflowGraphSnapshot(
   conversationId: number
 ): Promise<WorkflowGraphSnapshot | null> {
   return getTransport().call("get_workflow_graph_snapshot", { conversationId })
-}
-
-export async function continueArchivedWorkflowInSimple(
-  sourceConversationId: number,
-  clientRequestToken: string
-): Promise<SimpleSuccessorResult> {
-  return getTransport().call("continue_archived_workflow_in_simple", {
-    sourceConversationId,
-    clientRequestToken,
-  })
 }
 
 export interface CompletionMutationResult {

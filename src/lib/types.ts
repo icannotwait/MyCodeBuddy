@@ -877,22 +877,13 @@ export interface WorkflowGraphSnapshot {
 export interface SimpleWorkflowLocatorSnapshot {
   plan_rel_path: string
   progress_rel_path: string
-  source_conversation_id?: number | null
 }
 
 export interface ArchivedWorkflowNavigationSnapshot {
   source_conversation_id: number
   plan_rel_path?: string | null
-  successor_conversation_id?: number | null
+  successor_conversation_id: number | null
   can_create_simple_successor: boolean
-}
-
-export interface SimpleSuccessorResult {
-  successor_conversation_id: number
-  created: boolean
-  plan_rel_path: string
-  progress_rel_path: string
-  bootstrap_prompt: string
 }
 
 export interface WorkflowPhaseSnapshot {

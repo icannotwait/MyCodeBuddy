@@ -17,7 +17,6 @@ import {
   cancelToolWatchdogLease,
   closeFolderIfEmpty,
   CONVERSATION_POPOUT_RUNTIME_RESTART_REQUIRED_I18N_KEY,
-  continueArchivedWorkflowInSimple,
   deleteConversation,
   extendToolWatchdogLease,
   getFolderConversation,
@@ -49,42 +48,6 @@ describe("completion protocol frontend command removal", () => {
     expect(mockTransport.call).toHaveBeenCalledWith("delete_conversation", {
       conversationId: 42,
     })
-  })
-})
-
-describe("Simple successor transport payload", () => {
-  beforeEach(() => {
-    mockTransport.call.mockReset()
-    mockTransport.call.mockResolvedValue({
-      successor_conversation_id: 84,
-      created: true,
-      plan_rel_path: "docs/plan.md",
-      progress_rel_path: ".superpowers/sdd/84/progress.md",
-      bootstrap_prompt: "bootstrap",
-    })
-  })
-
-  it("sends only the archived source id and stable client request token", async () => {
-    const result = await continueArchivedWorkflowInSimple(42, "request-123")
-
-    expect(mockTransport.call).toHaveBeenCalledWith(
-      "continue_archived_workflow_in_simple",
-      {
-        sourceConversationId: 42,
-        clientRequestToken: "request-123",
-      }
-    )
-    expect(result).toEqual({
-      successor_conversation_id: 84,
-      created: true,
-      plan_rel_path: "docs/plan.md",
-      progress_rel_path: ".superpowers/sdd/84/progress.md",
-      bootstrap_prompt: "bootstrap",
-    })
-    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
-    expect(args).not.toHaveProperty("folderId")
-    expect(args).not.toHaveProperty("agentType")
-    expect(args).not.toHaveProperty("delegationRouteOverride")
   })
 })
 

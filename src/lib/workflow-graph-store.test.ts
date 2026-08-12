@@ -224,7 +224,6 @@ function simpleSnapshot(
     simple: {
       plan_rel_path: "docs/Plan.md",
       progress_rel_path: ".superpowers/sdd/42/progress.md",
-      source_conversation_id: 7,
     },
     current_phase_id: "tasks",
     current_node_ids: ["simple-task-1"],

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -10,13 +10,8 @@ import enMessages from "@/i18n/messages/en.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
-import { continueArchivedWorkflowInSimple } from "@/lib/api"
 import { getActiveBackendCacheKey } from "@/lib/transport"
-import type {
-  DelegationRunSnapshot,
-  SimpleSuccessorResult,
-  WorkflowGraphSnapshot,
-} from "@/lib/types"
+import type { DelegationRunSnapshot, WorkflowGraphSnapshot } from "@/lib/types"
 
 // The rows resolve their model from `useDelegatedSubSession` (live binding) and
 // the connections store (child pending-permission). Stub both — the same
@@ -53,14 +48,6 @@ vi.mock("@/lib/open-delegated-child-session", () => ({
 vi.mock("@/components/ai-elements/link-safety", () => ({
   useOpenLinkOrFile: () => vi.fn(async () => {}),
 }))
-
-vi.mock("@/lib/api", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api")
-  return {
-    ...actual,
-    continueArchivedWorkflowInSimple: vi.fn(),
-  }
-})
 
 const { useDelegatedSubSession } =
   await import("@/hooks/use-delegated-sub-session")
@@ -155,7 +142,7 @@ function archivedSnapshot(): WorkflowGraphSnapshot {
       source_conversation_id: 42,
       plan_rel_path: "docs/plan.md",
       successor_conversation_id: null,
-      can_create_simple_successor: true,
+      can_create_simple_successor: false,
     },
     projection_warning_codes: [],
     current_phase_id: null,
@@ -167,37 +154,12 @@ function archivedSnapshot(): WorkflowGraphSnapshot {
   }
 }
 
-function deferred<T>(): {
-  promise: Promise<T>
-  resolve: (value: T) => void
-  reject: (reason?: unknown) => void
-} {
-  let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((accept, decline) => {
-    resolve = accept
-    reject = decline
-  })
-  return { promise, resolve, reject }
-}
-
-function successorResult(): SimpleSuccessorResult {
-  return {
-    successor_conversation_id: 84,
-    created: true,
-    plan_rel_path: "docs/plan.md",
-    progress_rel_path: ".superpowers/sdd/84/progress.md",
-    bootstrap_prompt: "Continue the archived workflow.",
-  }
-}
-
 describe("SubAgentOverlay", () => {
   beforeEach(() => {
     localStorage.clear()
     delegationRunSnapshotCache.reset()
     bindings = {}
     openDelegatedChildSession.mockClear()
-    vi.mocked(continueArchivedWorkflowInSimple).mockReset()
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
       binding: bindings[id],
@@ -214,229 +176,43 @@ describe("SubAgentOverlay", () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it("deduplicates an archived successor action with one stable request token", async () => {
-    const pending = deferred<SimpleSuccessorResult>()
-    const onOpenRootConversation = vi.fn()
-    vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(pending.promise)
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        workflowGraph={archivedSnapshot()}
-        onOpenRootConversation={onOpenRootConversation}
-      />
-    )
-
-    const action = screen.getByRole("button", { name: "Continue in Simple" })
-    fireEvent.click(action)
-    fireEvent.click(action)
-
-    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
-    const [sourceConversationId, requestToken] = vi.mocked(
-      continueArchivedWorkflowInSimple
-    ).mock.calls[0]
-    expect(sourceConversationId).toBe(42)
-    expect(requestToken).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-    )
-    expect(action).toBeDisabled()
-
-    await act(async () => {
-      pending.resolve(successorResult())
-      await pending.promise
-    })
-    expect(onOpenRootConversation).toHaveBeenCalledTimes(1)
-    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
-  })
-
-  it("keeps a pending archived action across equivalent graph and callback rerenders", async () => {
-    const pending = deferred<SimpleSuccessorResult>()
-    const initialNavigation = vi.fn()
-    const latestNavigation = vi.fn()
-    vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(pending.promise)
-    const first = archivedSnapshot()
-    const equivalent = archivedSnapshot()
-    equivalent.graph_revision = 8
-    const view = (
-      snapshot: WorkflowGraphSnapshot,
-      onOpenRootConversation: (conversationId: number) => void
-    ) => (
-      <NextIntlClientProvider locale="en" messages={enMessages}>
-        <SubAgentOverlay
-          delegations={[]}
-          conversationId={501}
-          workflowGraph={snapshot}
-          onOpenRootConversation={onOpenRootConversation}
-        />
-      </NextIntlClientProvider>
-    )
-    const { rerender } = render(view(first, initialNavigation))
-
-    fireEvent.click(screen.getByRole("button", { name: "Continue in Simple" }))
-    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
-
-    rerender(view(equivalent, latestNavigation))
-    const action = screen.getByRole("button", { name: "Continue in Simple" })
-    expect(action).toBeDisabled()
-    fireEvent.click(action)
-    expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      pending.resolve(successorResult())
-      await pending.promise
-    })
-
-    expect(initialNavigation).not.toHaveBeenCalled()
-    expect(latestNavigation).toHaveBeenCalledTimes(1)
-    expect(latestNavigation).toHaveBeenCalledWith(84)
-    expect(action).toBeEnabled()
-  })
-
-  it("deduplicates navigation while an existing Simple successor is opening", async () => {
-    const navigation = deferred<void>()
-    const onOpenRootConversation = vi.fn(() => navigation.promise)
-    const snapshot = archivedSnapshot()
-    snapshot.archived = {
-      ...snapshot.archived!,
+  it.each([
+    {
       successor_conversation_id: 84,
       can_create_simple_successor: false,
-    }
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        workflowGraph={snapshot}
-        onOpenRootConversation={onOpenRootConversation}
-      />
-    )
-
-    const action = screen.getByRole("button", {
-      name: "Open Simple successor",
-    })
-    fireEvent.click(action)
-    fireEvent.click(action)
-
-    expect(onOpenRootConversation).toHaveBeenCalledTimes(1)
-    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
-    expect(continueArchivedWorkflowInSimple).not.toHaveBeenCalled()
-    expect(action).toBeDisabled()
-
-    await act(async () => {
-      navigation.resolve()
-      await navigation.promise
-    })
-  })
-
-  it("keeps archived source history visible when successor creation fails", async () => {
-    vi.mocked(continueArchivedWorkflowInSimple).mockRejectedValue(
-      new Error("Unable to create successor")
-    )
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[]}
-        workflowGraph={archivedSnapshot()}
-        onOpenRootConversation={vi.fn()}
-      />
-    )
-
-    fireEvent.click(screen.getByRole("button", { name: "Continue in Simple" }))
-
-    await waitFor(() =>
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "Unable to create successor"
-      )
-    )
-    expect(screen.getByTestId("workflow-archived-banner")).toBeVisible()
-    expect(screen.getAllByText("Workflow").length).toBeGreaterThan(0)
-    expect(
-      screen.getByRole("button", { name: "Continue in Simple" })
-    ).toBeEnabled()
-  })
-
-  it.each(["resolve", "reject"] as const)(
-    "ignores an archived successor %s after the overlay unmounts",
-    async (outcome) => {
-      const pending = deferred<SimpleSuccessorResult>()
+    },
+    {
+      successor_conversation_id: null,
+      can_create_simple_successor: true,
+    },
+  ])(
+    "keeps archived history visible without a successor action",
+    async (compatibilityValues) => {
+      const snapshot = archivedSnapshot()
+      snapshot.archived = {
+        ...snapshot.archived!,
+        ...compatibilityValues,
+      }
       const onOpenRootConversation = vi.fn()
-      vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(
-        pending.promise
-      )
-      const { unmount } = renderWithIntl(
+
+      renderWithIntl(
         <SubAgentOverlay
           delegations={[]}
-          workflowGraph={archivedSnapshot()}
+          workflowGraph={snapshot}
+          workspaceRootPath="D:\\Repo"
           onOpenRootConversation={onOpenRootConversation}
         />
       )
 
-      fireEvent.click(
-        screen.getByRole("button", { name: "Continue in Simple" })
-      )
-      expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
-      unmount()
-
-      await act(async () => {
-        if (outcome === "resolve") {
-          pending.resolve(successorResult())
-        } else {
-          pending.reject(new Error("stale archived failure"))
-        }
-        await pending.promise.catch(() => undefined)
-      })
-
-      expect(onOpenRootConversation).not.toHaveBeenCalled()
-    }
-  )
-
-  it.each(["resolve", "reject"] as const)(
-    "ignores an archived successor %s after the archived source changes",
-    async (outcome) => {
-      const pending = deferred<SimpleSuccessorResult>()
-      const onOpenRootConversation = vi.fn()
-      vi.mocked(continueArchivedWorkflowInSimple).mockReturnValue(
-        pending.promise
-      )
-      const first = archivedSnapshot()
-      const second = archivedSnapshot()
-      second.archived = {
-        ...second.archived!,
-        source_conversation_id: 43,
-        plan_rel_path: "docs/next-plan.md",
-      }
-      const view = (snapshot: WorkflowGraphSnapshot) => (
-        <NextIntlClientProvider locale="en" messages={enMessages}>
-          <SubAgentOverlay
-            delegations={[]}
-            workflowGraph={snapshot}
-            onOpenRootConversation={onOpenRootConversation}
-          />
-        </NextIntlClientProvider>
-      )
-      const { rerender } = render(view(first))
-
-      fireEvent.click(
-        screen.getByRole("button", { name: "Continue in Simple" })
-      )
-      expect(continueArchivedWorkflowInSimple).toHaveBeenCalledTimes(1)
-      rerender(view(second))
-      await waitFor(() =>
-        expect(
-          screen.getByRole("button", { name: "Continue in Simple" })
-        ).toBeEnabled()
-      )
-
-      await act(async () => {
-        if (outcome === "resolve") {
-          pending.resolve(successorResult())
-        } else {
-          pending.reject(new Error("stale archived failure"))
-        }
-        await pending.promise.catch(() => undefined)
-      })
-
-      expect(onOpenRootConversation).not.toHaveBeenCalled()
-      expect(screen.queryByRole("alert")).toBeNull()
+      expect(screen.getByTestId("workflow-archived-banner")).toBeVisible()
+      expect(screen.getByRole("button", { name: "Open Plan" })).toBeVisible()
       expect(
-        screen.getByRole("button", { name: "Continue in Simple" })
-      ).toBeEnabled()
+        screen.queryByRole("button", { name: "Continue in Simple" })
+      ).toBeNull()
+      expect(
+        screen.queryByRole("button", { name: "Open Simple successor" })
+      ).toBeNull()
+      expect(onOpenRootConversation).not.toHaveBeenCalled()
     }
   )
 

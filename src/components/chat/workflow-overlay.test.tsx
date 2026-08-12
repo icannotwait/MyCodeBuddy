@@ -11,11 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
-import {
-  continueArchivedWorkflowInSimple,
-  getWorkflowGraphSnapshot,
-  resolveCompletionDecision,
-} from "@/lib/api"
+import { getWorkflowGraphSnapshot, resolveCompletionDecision } from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import type {
   CompletionProjectionV2,
@@ -88,7 +84,6 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api")
   return {
     ...actual,
-    continueArchivedWorkflowInSimple: vi.fn(),
     getWorkflowGraphSnapshot: vi.fn(async () => null),
     resolveCompletionDecision: vi.fn(),
     subscribeWorkflowGraphChanged: vi.fn(async () => () => {}),
@@ -484,7 +479,7 @@ function archivedGraph(
       source_conversation_id: 42,
       plan_rel_path: "docs/superpowers/plans/archive.md",
       successor_conversation_id: null,
-      can_create_simple_successor: true,
+      can_create_simple_successor: false,
     },
     ...overrides,
   }
@@ -499,7 +494,6 @@ function simpleGraph(): WorkflowGraphSnapshot {
     simple: {
       plan_rel_path: "docs/superpowers/plans/simple.md",
       progress_rel_path: ".superpowers/sdd/42/progress.md",
-      source_conversation_id: 7,
     },
     projection_warning_codes: ["simple_progress_block_missing"],
     current_phase_id: "tasks",
@@ -591,7 +585,6 @@ beforeEach(() => {
     release: workspaceRelease,
     subscribeEnvelopes: workspaceSubscribeEnvelopes,
   })
-  vi.mocked(continueArchivedWorkflowInSimple).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockReset()
   vi.mocked(getWorkflowGraphSnapshot).mockResolvedValue(null)
   vi.mocked(resolveCompletionDecision).mockReset()
@@ -631,11 +624,13 @@ describe("Task 7 archived and Simple workflow rendering", () => {
       "D:/Repo/docs/superpowers/plans/archive.md"
     )
 
-    await userEvent.click(
-      screen.getByRole("button", { name: "Open Simple successor" })
-    )
-    expect(onOpenRootConversation).toHaveBeenCalledWith(84)
-    expect(continueArchivedWorkflowInSimple).not.toHaveBeenCalled()
+    expect(
+      screen.queryByRole("button", { name: "Continue in Simple" })
+    ).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: "Open Simple successor" })
+    ).toBeNull()
+    expect(onOpenRootConversation).not.toHaveBeenCalled()
 
     await userEvent.click(
       screen.getByRole("button", { name: "Expand workflow graph" })
@@ -656,6 +651,46 @@ describe("Task 7 archived and Simple workflow rendering", () => {
     expect(screen.queryByRole("button", { name: "Done" })).toBeNull()
     expect(screen.queryByRole("button", { name: "Retry artifact" })).toBeNull()
   })
+
+  it.each([
+    {
+      successor_conversation_id: 84,
+      can_create_simple_successor: false,
+    },
+    {
+      successor_conversation_id: null,
+      can_create_simple_successor: true,
+    },
+  ])(
+    "keeps archived history visible without a successor action",
+    async (compatibilityValues) => {
+      const snapshot = archivedGraph()
+      snapshot.archived = {
+        ...snapshot.archived!,
+        ...compatibilityValues,
+      }
+      const onOpenRootConversation = vi.fn()
+
+      renderWithIntl(
+        <SubAgentOverlay
+          delegations={[]}
+          workflowGraph={snapshot}
+          workspaceRootPath="D:\\Repo"
+          onOpenRootConversation={onOpenRootConversation}
+        />
+      )
+
+      expect(screen.getByTestId("workflow-archived-banner")).toBeVisible()
+      expect(screen.getByRole("button", { name: "Open Plan" })).toBeVisible()
+      expect(
+        screen.queryByRole("button", { name: "Continue in Simple" })
+      ).toBeNull()
+      expect(
+        screen.queryByRole("button", { name: "Open Simple successor" })
+      ).toBeNull()
+      expect(onOpenRootConversation).not.toHaveBeenCalled()
+    }
+  )
 
   it("renders Simple task state, live activity, bounded warnings, and exact file links", async () => {
     const messages = structuredClone(enMessages)

@@ -28,7 +28,6 @@ import {
   memo,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -38,13 +37,11 @@ import {
 import { useTranslations } from "next-intl"
 import {
   ArchiveIcon,
-  ArrowRightIcon,
   BotIcon,
   ChevronDownIcon,
   Eye,
   FileTextIcon,
   GitBranch,
-  Loader2Icon,
   Maximize2,
   Minimize2,
 } from "lucide-react"
@@ -98,8 +95,6 @@ import {
 } from "@/lib/delegation-card"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { groupDelegationRuns } from "@/lib/delegation-work-unit"
-import { continueArchivedWorkflowInSimple } from "@/lib/api"
-import { toErrorMessage } from "@/lib/app-error"
 import { joinRootRel } from "@/lib/file-open-target"
 import {
   buildPhaseRail,
@@ -110,10 +105,7 @@ import {
   type PhaseRailKind,
   type WorkflowSegment,
 } from "@/lib/workflow-graph-store"
-import { cn, randomUUID } from "@/lib/utils"
-
-const useIsomorphicLayoutEffect =
-  typeof window !== "undefined" ? useLayoutEffect : useEffect
+import { cn } from "@/lib/utils"
 
 function resolveDefaultPhaseKind(
   phases: readonly PhaseRailItem[]
@@ -374,69 +366,14 @@ export function groupDelegationSourcesForOverlay(
 
 function ArchivedWorkflowBanner({
   snapshot,
-  conversationId,
   workspaceRootPath,
-  onOpenRootConversation,
 }: {
   snapshot: WorkflowGraphSnapshot
-  conversationId: number | null
   workspaceRootPath: string | null
-  onOpenRootConversation?: (conversationId: number) => void | Promise<void>
 }) {
   const t = useTranslations("Folder.chat.workflowGraph")
   const openLinkOrFile = useOpenLinkOrFile()
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const pendingRef = useRef(false)
-  const mountedRef = useRef(true)
-  const actionGenerationRef = useRef(0)
-  const navigationRef = useRef(onOpenRootConversation)
   const archived = snapshot.archived
-
-  const successorId =
-    archived != null &&
-    Number.isSafeInteger(archived.successor_conversation_id) &&
-    (archived.successor_conversation_id ?? 0) > 0
-      ? archived.successor_conversation_id!
-      : null
-  const canCreate =
-    archived != null &&
-    archived.can_create_simple_successor &&
-    Number.isSafeInteger(archived.source_conversation_id) &&
-    archived.source_conversation_id > 0
-  const actionScopeKey = JSON.stringify([
-    conversationId,
-    snapshot.workflow_id ?? null,
-    archived?.source_conversation_id ?? null,
-    successorId,
-    canCreate,
-    archived?.plan_rel_path ?? null,
-    onOpenRootConversation != null,
-  ])
-
-  useIsomorphicLayoutEffect(() => {
-    navigationRef.current = onOpenRootConversation
-  }, [onOpenRootConversation])
-
-  useIsomorphicLayoutEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-      actionGenerationRef.current += 1
-      pendingRef.current = false
-    }
-  }, [])
-
-  useIsomorphicLayoutEffect(() => {
-    actionGenerationRef.current += 1
-    pendingRef.current = false
-    setPending(false)
-    setError(null)
-    return () => {
-      actionGenerationRef.current += 1
-      pendingRef.current = false
-    }
-  }, [actionScopeKey])
 
   if (!archived) return null
 
@@ -446,44 +383,6 @@ function ArchivedWorkflowBanner({
       ? joinRootRel(workspaceRootPath, archived.plan_rel_path)
       : archived.plan_rel_path
     void openLinkOrFile(target)
-  }
-
-  const continueInSimple = async () => {
-    if (pendingRef.current || !navigationRef.current) return
-    if (successorId == null && !canCreate) return
-
-    pendingRef.current = true
-    setPending(true)
-    setError(null)
-    const actionGeneration = actionGenerationRef.current + 1
-    actionGenerationRef.current = actionGeneration
-    const actionIsCurrent = () =>
-      mountedRef.current && actionGenerationRef.current === actionGeneration
-    try {
-      if (successorId != null) {
-        const navigate = navigationRef.current
-        if (!navigate || !actionIsCurrent()) return
-        await navigate(successorId)
-        return
-      }
-      const requestToken = randomUUID()
-      const result = await continueArchivedWorkflowInSimple(
-        archived.source_conversation_id,
-        requestToken
-      )
-      if (!actionIsCurrent()) return
-      const navigate = navigationRef.current
-      if (!navigate) return
-      await navigate(result.successor_conversation_id)
-    } catch (cause: unknown) {
-      if (!actionIsCurrent()) return
-      setError(toErrorMessage(cause))
-    } finally {
-      if (actionIsCurrent()) {
-        pendingRef.current = false
-        setPending(false)
-      }
-    }
   }
 
   return (
@@ -517,42 +416,7 @@ function ArchivedWorkflowBanner({
             <span className="truncate">{t("simpleOpenPlan")}</span>
           </Button>
         )}
-        {(successorId != null || canCreate) && (
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 min-w-0 text-xs"
-            disabled={pending || !onOpenRootConversation}
-            aria-label={
-              successorId != null
-                ? t("archivedOpenSuccessor")
-                : t("archivedContinue")
-            }
-            onClick={() => void continueInSimple()}
-          >
-            {pending ? (
-              <Loader2Icon
-                className="size-3.5 shrink-0 animate-spin"
-                aria-hidden
-              />
-            ) : (
-              <ArrowRightIcon className="size-3.5 shrink-0" aria-hidden />
-            )}
-            <span className="min-w-0 truncate">
-              {pending
-                ? t("archivedContinuing")
-                : successorId != null
-                  ? t("archivedOpenSuccessor")
-                  : t("archivedContinue")}
-            </span>
-          </Button>
-        )}
       </div>
-      {error && (
-        <p role="alert" className="break-words text-xs text-destructive">
-          {error}
-        </p>
-      )}
     </div>
   )
 }
@@ -992,9 +856,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
               {graph.archived && (
                 <ArchivedWorkflowBanner
                   snapshot={graph}
-                  conversationId={conversationId}
                   workspaceRootPath={workspaceRootPath}
-                  onOpenRootConversation={onOpenRootConversation}
                 />
               )}
               {graph.compatibility === "simple" ? (
