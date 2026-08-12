@@ -7,8 +7,6 @@ pub struct Model {
     pub parent_conversation_id: i32,
     pub plan_rel_path: String,
     pub progress_rel_path: String,
-    #[sea_orm(unique)]
-    pub source_workflow_id: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }
@@ -22,13 +20,6 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     ParentConversation,
-    #[sea_orm(
-        belongs_to = "super::delegation_workflow::Entity",
-        from = "Column::SourceWorkflowId",
-        to = "super::delegation_workflow::Column::WorkflowId",
-        on_delete = "SetNull"
-    )]
-    SourceWorkflow,
 }
 
 impl Related<super::conversation::Entity> for Entity {

@@ -9453,6 +9453,7 @@ mod tests {
                 "This workflow is archived and read-only. Create a new conversation and use a new Design."
             );
             assert_eq!(outcome["error"]["source_conversation_id"], parent);
+            assert_eq!(outcome["error"]["successor_conversation_id"], Value::Null);
             assert_eq!(outcome["error"]["can_create_simple_successor"], false);
             assert_eq!(
                 delegation_workflow::Entity::find()
@@ -9520,7 +9521,6 @@ mod tests {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("docs/conflicting-simple-plan.md".into()),
             progress_rel_path: Set(".superpowers/sdd/conflict/progress.md".into()),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }

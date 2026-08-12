@@ -10,15 +10,14 @@ use sea_orm::{
 use thiserror::Error;
 
 use crate::db::entities::{
-    conversation, delegation_task_run, delegation_workflow, delegation_workflow_manifest_revision,
-    delegation_workflow_run_binding, folder, simple_workflow,
+    conversation, delegation_task_run, delegation_workflow, delegation_workflow_run_binding,
+    simple_workflow,
 };
 
 use super::key::{normalize_rel_path, parse_recognized_work_unit_key};
-use super::types::{ManifestDocument, WorkflowError};
+use super::types::WorkflowError;
 
 const WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY: &str = "brainstorm_to_delivery";
-pub const MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConversationWorkflowMode {
@@ -91,10 +90,6 @@ pub enum SimpleWorkflowError {
     },
     #[error("conversation {parent_conversation_id} has conflicting workflow identities")]
     IdentityCorrupt { parent_conversation_id: i32 },
-    #[error("source workflow was not found: {0}")]
-    SourceWorkflowNotFound(String),
-    #[error("descriptor source workflow cannot be changed")]
-    SourceWorkflowMismatch,
     #[error("simple workflow persistence failed: {0}")]
     Persistence(String),
 }
@@ -103,10 +98,8 @@ impl SimpleWorkflowError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "workflow_invalid_path",
-            Self::ConversationNotFound(_) | Self::SourceWorkflowNotFound(_) => "workflow_not_found",
-            Self::ModeConflict { .. }
-            | Self::IdentityCorrupt { .. }
-            | Self::SourceWorkflowMismatch => "workflow_mode_conflict",
+            Self::ConversationNotFound(_) => "workflow_not_found",
+            Self::ModeConflict { .. } | Self::IdentityCorrupt { .. } => "workflow_mode_conflict",
             Self::Persistence(_) => "workflow_persistence_failure",
         }
     }
@@ -118,80 +111,6 @@ fn db_error(error: sea_orm::DbErr) -> SimpleWorkflowError {
 
 pub fn default_simple_progress_rel_path(parent_conversation_id: i32) -> String {
     format!(".superpowers/sdd/{parent_conversation_id}/progress.md")
-}
-
-pub fn normalize_simple_successor_plan_locator(rel_path: &str) -> Option<String> {
-    if rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
-        return None;
-    }
-    let normalized = normalize_rel_path(rel_path).ok()?;
-    (normalized.len() <= MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES).then_some(normalized)
-}
-
-pub async fn eligible_simple_successor_plan(
-    workspace: &std::path::Path,
-    rel_path: &str,
-) -> Option<String> {
-    let normalized = normalize_simple_successor_plan_locator(rel_path)?;
-    super::simple_parse::read_simple_plan(workspace, &normalized)
-        .await
-        .ok()?;
-    Some(normalized)
-}
-
-pub async fn archived_workflow_simple_successor_plan_eligible<C: ConnectionTrait>(
-    conn: &C,
-    workflow_id: &str,
-    source_conversation_id: i32,
-) -> Result<bool, SimpleWorkflowError> {
-    let Some(workflow) = delegation_workflow::Entity::find_by_id(workflow_id)
-        .one(conn)
-        .await
-        .map_err(db_error)?
-    else {
-        return Ok(false);
-    };
-    if workflow.parent_conversation_id != source_conversation_id {
-        return Ok(false);
-    }
-    let Some(source) = conversation::Entity::find_by_id(source_conversation_id)
-        .filter(conversation::Column::DeletedAt.is_null())
-        .one(conn)
-        .await
-        .map_err(db_error)?
-    else {
-        return Ok(false);
-    };
-    if source.parent_id.is_some() {
-        return Ok(false);
-    }
-    let Some(workspace) = folder::Entity::find_by_id(source.folder_id)
-        .filter(folder::Column::DeletedAt.is_null())
-        .one(conn)
-        .await
-        .map_err(db_error)?
-    else {
-        return Ok(false);
-    };
-    let Some(revision) = delegation_workflow_manifest_revision::Entity::find_by_id((
-        workflow_id.to_string(),
-        workflow.active_manifest_revision,
-    ))
-    .one(conn)
-    .await
-    .map_err(db_error)?
-    else {
-        return Ok(false);
-    };
-    let Ok(document) = serde_json::from_str::<ManifestDocument>(&revision.document_json) else {
-        return Ok(false);
-    };
-    Ok(eligible_simple_successor_plan(
-        std::path::Path::new(&workspace.path),
-        &document.plan_target_rel_path,
-    )
-    .await
-    .is_some())
 }
 
 pub async fn load_simple_workflow<C: ConnectionTrait>(
@@ -209,7 +128,6 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
     parent_conversation_id: i32,
     plan_rel_path: &str,
     progress_rel_path: Option<&str>,
-    source_workflow_id: Option<&str>,
 ) -> Result<SimpleWorkflowRegistration, SimpleWorkflowError> {
     let parent = conversation::Entity::find_by_id(parent_conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
@@ -254,27 +172,9 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
             .as_str(),
     )?;
 
-    if let Some(source_workflow_id) = source_workflow_id {
-        let source_exists = delegation_workflow::Entity::find_by_id(source_workflow_id)
-            .one(conn)
-            .await
-            .map_err(db_error)?
-            .is_some();
-        if !source_exists {
-            return Err(SimpleWorkflowError::SourceWorkflowNotFound(
-                source_workflow_id.to_string(),
-            ));
-        }
-    }
-
     let now = Utc::now();
     match existing {
         Some(current) => {
-            if source_workflow_id.is_some()
-                && current.source_workflow_id.as_deref() != source_workflow_id
-            {
-                return Err(SimpleWorkflowError::SourceWorkflowMismatch);
-            }
             let unchanged = current.plan_rel_path == plan_rel_path
                 && current.progress_rel_path == progress_rel_path;
             if unchanged {
@@ -300,7 +200,6 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
                 parent_conversation_id: Set(parent_conversation_id),
                 plan_rel_path: Set(plan_rel_path),
                 progress_rel_path: Set(progress_rel_path),
-                source_workflow_id: Set(source_workflow_id.map(str::to_owned)),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -328,27 +227,6 @@ pub async fn register_simple_workflow(
         parent_conversation_id,
         plan_rel_path,
         progress_rel_path,
-        None,
-    )
-    .await?;
-    txn.commit().await.map_err(db_error)?;
-    Ok(registration)
-}
-
-pub async fn register_simple_workflow_with_source(
-    conn: &DatabaseConnection,
-    parent_conversation_id: i32,
-    plan_rel_path: &str,
-    progress_rel_path: Option<&str>,
-    source_workflow_id: &str,
-) -> Result<SimpleWorkflowRegistration, SimpleWorkflowError> {
-    let txn = conn.begin().await.map_err(db_error)?;
-    let registration = register_simple_workflow_txn(
-        &txn,
-        parent_conversation_id,
-        plan_rel_path,
-        progress_rel_path,
-        Some(source_workflow_id),
     )
     .await?;
     txn.commit().await.map_err(db_error)?;
@@ -485,17 +363,15 @@ pub async fn resolve_conversation_workflow_mode<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use sea_orm::{ActiveModelTrait, Set};
 
     use super::{
-        load_simple_workflow, register_simple_workflow, register_simple_workflow_with_source,
-        resolve_conversation_workflow_mode, ConversationWorkflowMode,
+        load_simple_workflow, register_simple_workflow, resolve_conversation_workflow_mode,
+        ConversationWorkflowMode,
     };
     use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
     use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode, WorkflowState};
     use crate::db::entities::delegation_workflow_run_binding;
-    use crate::db::entities::simple_workflow;
-    use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
     use crate::models::agent::AgentType;
@@ -737,45 +613,5 @@ mod tests {
                 root_conversation_id
             } if workflow_id == "workflow-corrupt" && root_conversation_id == corrupt
         ));
-    }
-
-    #[tokio::test]
-    async fn simple_workflow_store_soft_delete_releases_source_link() {
-        let db = fresh_in_memory_db().await;
-        let folder = seed_folder(&db, "/tmp/simple-soft-delete").await;
-        let archived = seed_conversation(&db, folder, AgentType::Codex).await;
-        let first = seed_conversation(&db, folder, AgentType::Codex).await;
-        let second = seed_conversation(&db, folder, AgentType::Codex).await;
-        seed_workflow(&db, archived, "workflow-source-link").await;
-
-        register_simple_workflow_with_source(
-            &db.conn,
-            first,
-            "docs/plan.md",
-            None,
-            "workflow-source-link",
-        )
-        .await
-        .expect("first successor link");
-        conversation_service::soft_delete(&db.conn, first)
-            .await
-            .expect("soft delete successor");
-        assert!(simple_workflow::Entity::find()
-            .filter(simple_workflow::Column::ParentConversationId.eq(first))
-            .one(&db.conn)
-            .await
-            .expect("load deleted descriptor")
-            .is_none());
-
-        let replacement = register_simple_workflow_with_source(
-            &db.conn,
-            second,
-            "docs/plan.md",
-            None,
-            "workflow-source-link",
-        )
-        .await
-        .expect("replacement successor link");
-        assert_eq!(replacement.descriptor.parent_conversation_id, second);
     }
 }

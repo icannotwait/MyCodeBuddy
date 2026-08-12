@@ -127,11 +127,8 @@ pub use recovery_policy::{
     WorkflowRecoveryRiskClass, WorkflowRecoverySnapshot, WorkflowRecoveryStopCode,
 };
 pub use simple::{
-    archived_workflow_simple_successor_plan_eligible, eligible_simple_successor_plan,
-    load_simple_workflow, normalize_simple_successor_plan_locator, register_simple_workflow,
-    register_simple_workflow_with_source, resolve_conversation_workflow_mode,
+    load_simple_workflow, register_simple_workflow, resolve_conversation_workflow_mode,
     ConversationWorkflowMode, SimpleWorkflowError, SimpleWorkflowRegistration,
-    MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES,
 };
 pub use simple_parse::{
     parse_simple_plan, parse_simple_progress, read_simple_plan, read_simple_progress,

@@ -20,7 +20,7 @@ mod tests {
     use crate::db::entities::delegation_workflow::CompletionProtocolMode;
     use crate::db::entities::{
         auto_title_job, conversation, delegation_attention_request, delegation_task_run,
-        delegation_workflow, recovery_authorization, simple_successor_bootstrap, simple_workflow,
+        delegation_workflow, recovery_authorization, simple_workflow,
     };
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -70,7 +70,6 @@ mod tests {
     struct SideEffectSnapshot {
         conversations: u64,
         simple_workflows: u64,
-        simple_successor_bootstraps: u64,
         delegation_workflows: u64,
         delegation_runs: u64,
         attention_requests: u64,
@@ -83,10 +82,6 @@ mod tests {
         SideEffectSnapshot {
             conversations: conversation::Entity::find().count(&db.conn).await.unwrap(),
             simple_workflows: simple_workflow::Entity::find().count(&db.conn).await.unwrap(),
-            simple_successor_bootstraps: simple_successor_bootstrap::Entity::find()
-                .count(&db.conn)
-                .await
-                .unwrap(),
             delegation_workflows: delegation_workflow::Entity::find()
                 .count(&db.conn)
                 .await

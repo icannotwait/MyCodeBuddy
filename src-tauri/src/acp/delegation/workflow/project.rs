@@ -6292,7 +6292,6 @@ mod tests {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("C:/private/plan.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -6314,9 +6313,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_header_precedes_conflicting_simple_descriptor_and_exposes_successor() {
+    async fn manifest_header_precedes_conflicting_simple_descriptor_and_reports_retired_successor()
+    {
         let (db, archived_parent) = seed_parent().await;
-        let published = publish_workflow_manifest_fixture(
+        publish_workflow_manifest_fixture(
             &db,
             &emitter(),
             archived_parent,
@@ -6333,7 +6333,6 @@ mod tests {
             parent_conversation_id: Set(successor),
             plan_rel_path: Set("docs/superpowers/plans/p.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{successor}/progress.md")),
-            source_workflow_id: Set(Some(published.workflow_id.clone())),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -6344,7 +6343,6 @@ mod tests {
             parent_conversation_id: Set(archived_parent),
             plan_rel_path: Set("docs/conflicting.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{archived_parent}/progress.md")),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -6363,7 +6361,6 @@ mod tests {
             .any(|code| code == "workflow_identity_corrupt"));
         let archived = snapshot.archived.expect("archived navigation");
         assert_eq!(archived.source_conversation_id, archived_parent);
-        // Linked source_workflow_id stays until Task 4 removes the column.
         assert_eq!(archived.successor_conversation_id, None);
         assert!(!archived.can_create_simple_successor);
     }
@@ -6456,7 +6453,6 @@ mod tests {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("docs/conflicting.md".into()),
             progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }

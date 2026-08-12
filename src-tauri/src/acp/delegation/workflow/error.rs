@@ -716,7 +716,6 @@ mod tests {
             parent_conversation_id: Set(successor),
             plan_rel_path: Set("docs/plan.md".into()),
             progress_rel_path: Set(".superpowers/sdd/successor/progress.md".into()),
-            source_workflow_id: Set(Some("workflow-retired-navigation".into())),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -874,7 +873,6 @@ mod tests {
             parent_conversation_id: Set(simple),
             plan_rel_path: Set("docs/simple-plan.md".into()),
             progress_rel_path: Set(".superpowers/sdd/simple/progress.md".into()),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -946,7 +944,6 @@ mod tests {
             parent_conversation_id: Set(archived),
             plan_rel_path: Set("docs/conflicting-plan.md".into()),
             progress_rel_path: Set(".superpowers/sdd/conflict/progress.md".into()),
-            source_workflow_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
