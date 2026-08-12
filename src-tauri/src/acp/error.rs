@@ -85,7 +85,9 @@ pub enum AcpError {
     },
     #[error("legacy completion protocol is read-only")]
     LegacyCompletionProtocolReadOnly,
-    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    #[error(
+        "This workflow is archived and read-only. Create a new conversation and use a new Design."
+    )]
     WorkflowV2Retired {
         source_conversation_id: Option<i32>,
         successor_conversation_id: Option<i32>,
@@ -483,7 +485,7 @@ mod tests {
     fn workflow_v2_retired_serializes_structured_navigation() {
         let value = serde_json::to_value(&AcpError::WorkflowV2Retired {
             source_conversation_id: Some(41),
-            successor_conversation_id: Some(84),
+            successor_conversation_id: None,
             can_create_simple_successor: false,
         })
         .expect("serialize retired workflow error");
@@ -494,7 +496,6 @@ mod tests {
                 "message": crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE,
                 "i18n_params": {
                     "source_conversation_id": "41",
-                    "successor_conversation_id": "84",
                     "can_create_simple_successor": "false",
                 },
             })

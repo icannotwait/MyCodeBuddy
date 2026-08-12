@@ -19552,8 +19552,6 @@ mod tests {
             crate::acp::delegation::run_store::terminal_protocol_store_error(
                 crate::acp::delegation::workflow::WorkflowStoreError::workflow_v2_retired_with_navigation(
                     41,
-                    Some(84),
-                    false,
                 ),
             );
         let report = report_err(
@@ -19572,7 +19570,7 @@ mod tests {
             report.workflow_retirement(),
             Some(&WorkflowRetirementNavigation {
                 source_conversation_id: Some(41),
-                successor_conversation_id: Some(84),
+                successor_conversation_id: None,
                 can_create_simple_successor: false,
             })
         );
@@ -19580,7 +19578,7 @@ mod tests {
             serde_json::to_value(&report).unwrap()["workflow_retirement"],
             serde_json::json!({
                 "source_conversation_id": 41,
-                "successor_conversation_id": 84,
+                "successor_conversation_id": null,
                 "can_create_simple_successor": false,
             })
         );

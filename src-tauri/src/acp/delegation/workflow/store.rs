@@ -646,11 +646,9 @@ pub async fn publish_workflow_manifest_core(
     {
         Ok(error) => error,
         Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
-        Err(_) => WorkflowStoreError::workflow_v2_retired_with_navigation(
-            parent_conversation_id,
-            None,
-            false,
-        ),
+        Err(_) => {
+            WorkflowStoreError::workflow_v2_retired_with_navigation(parent_conversation_id)
+        },
     };
     Err(error)
 }
@@ -9508,7 +9506,7 @@ mod tests {
         assert_eq!(error.code(), "workflow_v2_retired");
         assert_eq!(error.source_conversation_id(), Some(parent));
         assert_eq!(error.successor_conversation_id(), None);
-        assert_eq!(error.can_create_simple_successor(), Some(true));
+        assert_eq!(error.can_create_simple_successor(), Some(false));
         assert!(delegation_workflow::Entity::find()
             .filter(delegation_workflow::Column::ParentConversationId.eq(parent))
             .one(&db.conn)

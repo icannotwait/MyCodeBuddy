@@ -22,7 +22,7 @@ pub const WORKFLOW_RECOVERY_REQUIRED: &str = "workflow_recovery_required";
 pub const WORKFLOW_RECOVERY_NOT_AVAILABLE: &str = "workflow_recovery_not_available";
 pub const WORKFLOW_RECOVERY_CONFLICT: &str = "workflow_recovery_conflict";
 pub const WORKFLOW_V2_RETIRED_MESSAGE: &str =
-    "This workflow is archived and read-only. Continue in a Simple successor.";
+    "This workflow is archived and read-only. Create a new conversation and use a new Design.";
 
 #[cfg(any(test, feature = "test-utils"))]
 tokio::task_local! {
@@ -114,7 +114,9 @@ impl WorkflowAdmissionRecoveryError {
 /// Errors from publish / settle / get_workflow_state core paths.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkflowStoreError {
-    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    #[error(
+        "This workflow is archived and read-only. Create a new conversation and use a new Design."
+    )]
     WorkflowV2Retired {
         source_conversation_id: Option<i32>,
         successor_conversation_id: Option<i32>,
@@ -279,15 +281,11 @@ impl WorkflowStoreError {
         }
     }
 
-    pub const fn workflow_v2_retired_with_navigation(
-        source_conversation_id: i32,
-        successor_conversation_id: Option<i32>,
-        can_create_simple_successor: bool,
-    ) -> Self {
+    pub const fn workflow_v2_retired_with_navigation(source_conversation_id: i32) -> Self {
         Self::WorkflowV2Retired {
             source_conversation_id: Some(source_conversation_id),
-            successor_conversation_id,
-            can_create_simple_successor,
+            successor_conversation_id: None,
+            can_create_simple_successor: false,
         }
     }
 
@@ -389,8 +387,6 @@ pub async fn require_v2_mutation_for_connection<C: ConnectionTrait>(
 #[derive(Debug)]
 struct ArchivedWorkflowNavigation {
     source_conversation_id: i32,
-    workflow_id: String,
-    successor_conversation_id: Option<i32>,
     completion_protocol_version: i64,
     completion_protocol_mode: CompletionProtocolMode,
 }
@@ -454,7 +450,7 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
         });
     }
     let (
-        workflow_id,
+        _workflow_id,
         parent_conversation_id,
         completion_protocol_version,
         completion_protocol_mode,
@@ -472,24 +468,8 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
         });
     }
 
-    let successors = simple_workflow::Entity::find()
-        .filter(simple_workflow::Column::SourceWorkflowId.eq(workflow_id.clone()))
-        .all(conn)
-        .await
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
-    if successors.len() > 1 {
-        return Err(WorkflowStoreError::WorkflowIdentityCorrupt {
-            source_conversation_id: parent_conversation_id,
-        });
-    }
-
     Ok(Some(ArchivedWorkflowNavigation {
         source_conversation_id: parent_conversation_id,
-        workflow_id,
-        successor_conversation_id: successors
-            .into_iter()
-            .next()
-            .map(|successor| successor.parent_conversation_id),
         completion_protocol_version,
         completion_protocol_mode,
     }))
@@ -509,30 +489,14 @@ pub async fn workflow_v2_retired_for_conversation<C: ConnectionTrait>(
             WorkflowStoreError::WorkflowV2Retired { .. } => {
                 WorkflowStoreError::workflow_v2_retired_with_navigation(
                     navigation.source_conversation_id,
-                    navigation.successor_conversation_id,
-                    navigation.successor_conversation_id.is_none()
-                        && super::simple::archived_workflow_simple_successor_plan_eligible(
-                            conn,
-                            &navigation.workflow_id,
-                            navigation.source_conversation_id,
-                        )
-                        .await
-                        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
                 )
             }
             other => other,
         });
     }
 
-    let simple = simple_workflow::Entity::find()
-        .filter(simple_workflow::Column::ParentConversationId.eq(conversation_id))
-        .one(conn)
-        .await
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
     Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
         conversation_id,
-        simple.as_ref().map(|_| conversation_id),
-        simple.is_none(),
     ))
 }
 
@@ -546,27 +510,11 @@ pub async fn workflow_v2_publication_retired_for_conversation<C: ConnectionTrait
     if let Some(navigation) = archived_workflow_navigation(conn, conversation_id).await? {
         return Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
             navigation.source_conversation_id,
-            navigation.successor_conversation_id,
-            navigation.successor_conversation_id.is_none()
-                && super::simple::archived_workflow_simple_successor_plan_eligible(
-                    conn,
-                    &navigation.workflow_id,
-                    navigation.source_conversation_id,
-                )
-                .await
-                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
         ));
     }
 
-    let simple = simple_workflow::Entity::find()
-        .filter(simple_workflow::Column::ParentConversationId.eq(conversation_id))
-        .one(conn)
-        .await
-        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
     Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
         conversation_id,
-        simple.as_ref().map(|_| conversation_id),
-        simple.is_none(),
     ))
 }
 
@@ -590,15 +538,6 @@ pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
             Err(WorkflowStoreError::WorkflowV2Retired { .. }) => {
                 Err(WorkflowStoreError::workflow_v2_retired_with_navigation(
                     navigation.source_conversation_id,
-                    navigation.successor_conversation_id,
-                    navigation.successor_conversation_id.is_none()
-                        && super::simple::archived_workflow_simple_successor_plan_eligible(
-                            conn,
-                            &navigation.workflow_id,
-                            navigation.source_conversation_id,
-                        )
-                        .await
-                        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
                 ))
             }
             result => result,
@@ -792,7 +731,7 @@ mod tests {
             assert_eq!(error.code(), "workflow_v2_retired");
             assert_eq!(error.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
             assert_eq!(error.source_conversation_id(), Some(root));
-            assert_eq!(error.successor_conversation_id(), Some(successor));
+            assert_eq!(error.successor_conversation_id(), None);
             assert_eq!(error.can_create_simple_successor(), Some(false));
         }
 
@@ -831,11 +770,11 @@ mod tests {
             InvalidUtf8,
         }
 
-        for (case, expected) in [
-            (PlanCase::Eligible, true),
-            (PlanCase::Missing, false),
-            (PlanCase::Oversized, false),
-            (PlanCase::InvalidUtf8, false),
+        for case in [
+            PlanCase::Eligible,
+            PlanCase::Missing,
+            PlanCase::Oversized,
+            PlanCase::InvalidUtf8,
         ] {
             let workspace = tempfile::tempdir().expect("workspace");
             std::fs::create_dir_all(workspace.path().join("docs")).expect("create docs");
@@ -891,7 +830,7 @@ mod tests {
                 assert_eq!(error.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
                 assert_eq!(error.source_conversation_id(), Some(root));
                 assert_eq!(error.successor_conversation_id(), None);
-                assert_eq!(error.can_create_simple_successor(), Some(expected));
+                assert_eq!(error.can_create_simple_successor(), Some(false));
             }
             assert_eq!(
                 conversation::Entity::find()

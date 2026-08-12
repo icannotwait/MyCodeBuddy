@@ -1642,17 +1642,11 @@ impl DelegationListener {
                     Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
                     Err(_) => WorkflowStoreError::workflow_v2_retired_with_navigation(
                         parent_conversation_id,
-                        None,
-                        false,
                     ),
                 }
             }
             (None, Some(parent_conversation_id)) => {
-                WorkflowStoreError::workflow_v2_retired_with_navigation(
-                    parent_conversation_id,
-                    None,
-                    false,
-                )
+                WorkflowStoreError::workflow_v2_retired_with_navigation(parent_conversation_id)
             }
             _ => WorkflowStoreError::workflow_v2_retired(),
         };
@@ -1672,19 +1666,13 @@ impl DelegationListener {
                 match workflow_v2_retired_for_conversation(&runs.db().conn, conversation_id).await {
                     Ok(error) => error,
                     Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
-                    Err(_) => WorkflowStoreError::workflow_v2_retired_with_navigation(
-                        conversation_id,
-                        None,
-                        false,
-                    ),
+                    Err(_) => {
+                        WorkflowStoreError::workflow_v2_retired_with_navigation(conversation_id)
+                    },
                 }
             }
             (None, Some(conversation_id)) => {
-                WorkflowStoreError::workflow_v2_retired_with_navigation(
-                    conversation_id,
-                    None,
-                    false,
-                )
+                WorkflowStoreError::workflow_v2_retired_with_navigation(conversation_id)
             }
             _ => WorkflowStoreError::workflow_v2_retired(),
         }
@@ -9462,10 +9450,10 @@ mod tests {
             );
             assert_eq!(
                 outcome["error"]["message"],
-                "This workflow is archived and read-only. Continue in a Simple successor."
+                "This workflow is archived and read-only. Create a new conversation and use a new Design."
             );
             assert_eq!(outcome["error"]["source_conversation_id"], parent);
-            assert_eq!(outcome["error"]["can_create_simple_successor"], true);
+            assert_eq!(outcome["error"]["can_create_simple_successor"], false);
             assert_eq!(
                 delegation_workflow::Entity::find()
                     .count(&db.conn)
@@ -9630,7 +9618,7 @@ mod tests {
             assert_eq!(outcome["error"]["code"], "workflow_v2_retired");
             assert_eq!(
                 outcome["error"]["message"],
-                "This workflow is archived and read-only. Continue in a Simple successor."
+                "This workflow is archived and read-only. Create a new conversation and use a new Design."
             );
             assert_eq!(outcome["error"]["source_conversation_id"], parent);
             assert_eq!(

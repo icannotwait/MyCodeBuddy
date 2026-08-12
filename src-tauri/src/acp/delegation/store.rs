@@ -348,7 +348,9 @@ pub enum TaskStoreError {
     /// Wire code is the structured `code` field (e.g. `final_early`).
     #[error("workflow admission rejected ({code}): {message}")]
     WorkflowAdmission { code: String, message: String },
-    #[error("This workflow is archived and read-only. Continue in a Simple successor.")]
+    #[error(
+        "This workflow is archived and read-only. Create a new conversation and use a new Design."
+    )]
     WorkflowV2Retired {
         navigation: WorkflowRetirementNavigation,
     },

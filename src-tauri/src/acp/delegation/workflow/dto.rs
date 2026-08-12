@@ -71,8 +71,6 @@ pub enum WorkflowNodeSyncState {
 pub struct SimpleWorkflowLocatorSnapshot {
     pub plan_rel_path: String,
     pub progress_rel_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_conversation_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +78,7 @@ pub struct ArchivedWorkflowNavigationSnapshot {
     pub source_conversation_id: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_rel_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub successor_conversation_id: Option<i32>,
     pub can_create_simple_successor: bool,
 }
@@ -726,7 +724,6 @@ mod tests {
             simple: Some(SimpleWorkflowLocatorSnapshot {
                 plan_rel_path: "docs/superpowers/plans/plan.md".into(),
                 progress_rel_path: ".superpowers/sdd/42/progress.md".into(),
-                source_conversation_id: Some(7),
             }),
             archived: None,
             projection_warning_codes: vec!["simple_progress_block_missing".into()],
@@ -747,7 +744,6 @@ mod tests {
                 "simple": {
                     "plan_rel_path": "docs/superpowers/plans/plan.md",
                     "progress_rel_path": ".superpowers/sdd/42/progress.md",
-                    "source_conversation_id": 7,
                 },
                 "projection_warning_codes": ["simple_progress_block_missing"],
                 "current_phase_id": "tasks",
@@ -774,7 +770,7 @@ mod tests {
             archived: Some(ArchivedWorkflowNavigationSnapshot {
                 source_conversation_id: 7,
                 plan_rel_path: Some("docs/superpowers/plans/plan.md".into()),
-                successor_conversation_id: Some(42),
+                successor_conversation_id: None,
                 can_create_simple_successor: false,
             }),
             projection_warning_codes: vec![],
@@ -787,8 +783,15 @@ mod tests {
         };
         let archived_json = serde_json::to_value(archived).expect("serialize archived snapshot");
         assert_eq!(archived_json["compatibility"], "manifest");
-        assert_eq!(archived_json["archived"]["source_conversation_id"], 7);
-        assert_eq!(archived_json["archived"]["successor_conversation_id"], 42);
+        assert_eq!(
+            archived_json["archived"],
+            serde_json::json!({
+                "source_conversation_id": 7,
+                "plan_rel_path": "docs/superpowers/plans/plan.md",
+                "successor_conversation_id": null,
+                "can_create_simple_successor": false,
+            })
+        );
         assert_eq!(archived_json["projection_warning_codes"], serde_json::json!([]));
         assert!(archived_json.get("simple").is_none());
     }

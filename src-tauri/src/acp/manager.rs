@@ -12030,7 +12030,7 @@ mod tests {
                     AcpError::WorkflowV2Retired {
                         source_conversation_id: Some(id),
                         successor_conversation_id: None,
-                        can_create_simple_successor: true,
+                        can_create_simple_successor: false,
                     } if id == root
                 ));
             }

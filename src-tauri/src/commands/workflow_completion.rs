@@ -255,25 +255,19 @@ mod protocol_error_tests {
 
     #[test]
     fn completion_entry_guard_preserves_retirement_navigation() {
-        let retired = map_workflow_store_error(
-            WorkflowStoreError::workflow_v2_retired_with_navigation(41, Some(84), false),
-        );
+        let retired =
+            map_workflow_store_error(WorkflowStoreError::workflow_v2_retired_with_navigation(41));
         assert_eq!(retired.code, AppErrorCode::WorkflowV2Retired);
         assert_eq!(
             retired.message,
-            "This workflow is archived and read-only. Continue in a Simple successor."
+            "This workflow is archived and read-only. Create a new conversation and use a new Design."
         );
         let navigation = retired.i18n_params.expect("retirement navigation");
         assert_eq!(
             navigation.get("source_conversation_id").map(String::as_str),
             Some("41")
         );
-        assert_eq!(
-            navigation
-                .get("successor_conversation_id")
-                .map(String::as_str),
-            Some("84")
-        );
+        assert!(navigation.get("successor_conversation_id").is_none());
         assert_eq!(
             navigation
                 .get("can_create_simple_successor")

@@ -755,26 +755,11 @@ async fn project_manifest_mode(
             .cloned()
     });
 
-    let successor = simple_workflow::Entity::find()
-        .filter(simple_workflow::Column::SourceWorkflowId.eq(header.workflow_id.clone()))
-        .one(conn)
-        .await
-        .map_err(db_err)?;
     let archived = ArchivedWorkflowNavigationSnapshot {
         source_conversation_id: header.parent_conversation_id,
         plan_rel_path: Some(normalized.plan_target_rel_path.clone()),
-        successor_conversation_id: successor
-            .as_ref()
-            .map(|descriptor| descriptor.parent_conversation_id),
-        can_create_simple_successor: !identity_corrupt
-            && successor.is_none()
-            && super::simple::archived_workflow_simple_successor_plan_eligible(
-                conn,
-                &header.workflow_id,
-                header.parent_conversation_id,
-            )
-            .await
-            .unwrap_or(false),
+        successor_conversation_id: None,
+        can_create_simple_successor: false,
     };
     let projection_warning_codes = if identity_corrupt {
         vec!["workflow_identity_corrupt".to_string()]
@@ -2507,15 +2492,6 @@ async fn project_simple_mode(
     } else {
         current
     };
-    let source_conversation_id = match descriptor.source_workflow_id.as_deref() {
-        Some(workflow_id) => delegation_workflow::Entity::find_by_id(workflow_id)
-            .one(conn)
-            .await
-            .map_err(db_err)?
-            .map(|workflow| workflow.parent_conversation_id),
-        None => None,
-    };
-
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
         workflow_id: None,
@@ -2531,7 +2507,6 @@ async fn project_simple_mode(
             |(plan_rel_path, progress_rel_path)| SimpleWorkflowLocatorSnapshot {
                 plan_rel_path,
                 progress_rel_path,
-                source_conversation_id,
             },
         ),
         archived: None,
@@ -6388,12 +6363,13 @@ mod tests {
             .any(|code| code == "workflow_identity_corrupt"));
         let archived = snapshot.archived.expect("archived navigation");
         assert_eq!(archived.source_conversation_id, archived_parent);
-        assert_eq!(archived.successor_conversation_id, Some(successor));
+        // Linked source_workflow_id stays until Task 4 removes the column.
+        assert_eq!(archived.successor_conversation_id, None);
         assert!(!archived.can_create_simple_successor);
     }
 
     #[tokio::test]
-    async fn simple_projection_archived_advertises_successor_only_for_readable_bounded_utf8_plan() {
+    async fn simple_projection_archived_always_reports_retired_successor_fields() {
         enum PlanCase {
             Eligible,
             Missing,
@@ -6401,11 +6377,11 @@ mod tests {
             InvalidUtf8,
         }
 
-        for (case, expected) in [
-            (PlanCase::Eligible, true),
-            (PlanCase::Missing, false),
-            (PlanCase::Oversized, false),
-            (PlanCase::InvalidUtf8, false),
+        for case in [
+            PlanCase::Eligible,
+            PlanCase::Missing,
+            PlanCase::Oversized,
+            PlanCase::InvalidUtf8,
         ] {
             let (db, parent) = seed_parent().await;
             let published = publish_workflow_manifest_fixture(
@@ -6447,7 +6423,7 @@ mod tests {
             let archived = snapshot.archived.expect("archived navigation");
 
             assert_eq!(archived.successor_conversation_id, None);
-            assert_eq!(archived.can_create_simple_successor, expected);
+            assert!(!archived.can_create_simple_successor);
             assert_eq!(
                 simple_workflow::Entity::find()
                     .count(&db.conn)
