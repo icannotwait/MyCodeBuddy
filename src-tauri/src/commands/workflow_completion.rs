@@ -267,7 +267,7 @@ mod protocol_error_tests {
             navigation.get("source_conversation_id").map(String::as_str),
             Some("41")
         );
-        assert!(navigation.get("successor_conversation_id").is_none());
+        assert!(!navigation.contains_key("successor_conversation_id"));
         assert_eq!(
             navigation
                 .get("can_create_simple_successor")
