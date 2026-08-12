@@ -279,6 +279,8 @@ async fn simple_successor_creation_retired_http_ignores_every_authenticated_body
         serde_json::json!({ "sourceConversationId": archived_child, "clientRequestToken": "archived-child" }).to_string(),
         serde_json::json!({ "sourceConversationId": deleted, "clientRequestToken": "deleted" }).to_string(),
         serde_json::json!({ "sourceConversationId": missing, "clientRequestToken": "missing" }).to_string(),
+        // Intentional replay of the archived body: the second call must remain
+        // a no-op retirement conflict with no additional side effects.
         serde_json::json!({ "sourceConversationId": archived, "clientRequestToken": "archived" }).to_string(),
     ];
 
@@ -775,9 +777,17 @@ Expected staged paths: exactly the eleven Rust files listed above.
 
 - [ ] **Step 1: Rewrite migration and store tests for the final schema**
 
-Replace the source-link migration test with schema introspection plus the surviving parent cascade:
+Replace the source-link migration test with schema introspection plus the surviving parent cascade. Assert the complete `PRAGMA table_info` rows (`name`, `type`, `notnull`, `pk`), not only column names:
 
 ```rust
+#[derive(Debug, PartialEq, Eq)]
+struct ColumnInfo {
+    name: String,
+    col_type: String,
+    notnull: i64,
+    pk: i64,
+}
+
 #[tokio::test]
 async fn simple_workflow_migration_is_locator_only_and_has_no_bootstrap_schema() {
     let db = fresh_in_memory_db().await;
@@ -790,20 +800,50 @@ async fn simple_workflow_migration_is_locator_only_and_has_no_bootstrap_schema()
         .await
         .unwrap()
         .into_iter()
-        .map(|row| row.try_get::<String>("", "name").unwrap())
+        .map(|row| ColumnInfo {
+            name: row.try_get::<String>("", "name").unwrap(),
+            col_type: row.try_get::<String>("", "type").unwrap(),
+            notnull: row.try_get::<i64>("", "notnull").unwrap(),
+            pk: row.try_get::<i64>("", "pk").unwrap(),
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(
         columns,
         vec![
-            "parent_conversation_id",
-            "plan_rel_path",
-            "progress_rel_path",
-            "created_at",
-            "updated_at",
+            ColumnInfo {
+                name: "parent_conversation_id".into(),
+                col_type: "INTEGER".into(),
+                notnull: 1,
+                pk: 1,
+            },
+            ColumnInfo {
+                name: "plan_rel_path".into(),
+                col_type: "TEXT".into(),
+                notnull: 1,
+                pk: 0,
+            },
+            ColumnInfo {
+                name: "progress_rel_path".into(),
+                col_type: "TEXT".into(),
+                notnull: 1,
+                pk: 0,
+            },
+            ColumnInfo {
+                name: "created_at".into(),
+                col_type: "TEXT".into(),
+                notnull: 1,
+                pk: 0,
+            },
+            ColumnInfo {
+                name: "updated_at".into(),
+                col_type: "TEXT".into(),
+                notnull: 1,
+                pk: 0,
+            },
         ]
     );
-    assert!(!columns.iter().any(|column| column == "source_workflow_id"));
+    assert!(!columns.iter().any(|column| column.name == "source_workflow_id"));
 
     let bootstrap_count: i64 = db
         .conn
@@ -933,7 +973,7 @@ git diff --cached --name-status
 git commit -m "refactor(workflow): remove simple successor persistence"
 ```
 
-Expected staged paths: exactly the twelve listed paths, with the bootstrap migration and entity shown as deleted.
+Expected staged paths: exactly twelve entries in `git diff --cached --name-status` — ten modified files plus two deleted files (`m20260812_000001_simple_successor_bootstraps.rs` and `entities/simple_successor_bootstrap.rs`).
 
 ---
 
@@ -949,36 +989,58 @@ Expected staged paths: exactly the twelve listed paths, with the bootstrap migra
 
 This is an evidence task, not another behavior change. Its RED evidence is the four recorded pre-implementation failures from Tasks 1-4; do not manufacture a new failure by weakening or reverting the implementation.
 
+Use this checked-command helper for every native `pnpm`, `cargo`, `git`, and `rg` invocation in Task 5. Capture `$LASTEXITCODE` immediately; PowerShell does not throw on a nonzero native exit by itself. Never let a later command overwrite an unrecorded code.
+
+```powershell
+function Assert-NativeExit {
+  param(
+    [Parameter(Mandatory)][int]$Code,
+    [Parameter(Mandatory)][string]$Label,
+    [int[]]$Allowed = @(0)
+  )
+  if ($Allowed -notcontains $Code) {
+    throw "$Label failed with exit code $Code (allowed: $($Allowed -join ', '))"
+  }
+}
+```
+
 - [ ] **Step 1: Run repository-wide static contract scans**
 
 From the repository root:
 
 ```powershell
 $forbiddenFrontend = rg -n 'continueArchivedWorkflowInSimple|SimpleSuccessorResult|archivedContinue|archivedContinuing|archivedOpenSuccessor' src
-if ($LASTEXITCODE -eq 0) { $forbiddenFrontend; throw 'frontend successor surface remains' }
-if ($LASTEXITCODE -ne 1) { throw 'frontend successor scan failed' }
+Assert-NativeExit -Code $LASTEXITCODE -Label 'frontend successor forbidden scan' -Allowed @(1)
 
 $forbiddenRust = rg -n 'SimpleBootstrapPromptSink|admit_pending_simple_successor_bootstrap|admit_simple_successor_bootstrap_after_connect|register_simple_workflow_with_source|eligible_simple_successor_plan|normalize_simple_successor_plan_locator|simple_successor_bootstraps' src-tauri/src
-if ($LASTEXITCODE -eq 0) { $forbiddenRust; throw 'Rust successor engine remains' }
-if ($LASTEXITCODE -ne 1) { throw 'Rust successor scan failed' }
+Assert-NativeExit -Code $LASTEXITCODE -Label 'Rust successor forbidden scan' -Allowed @(1)
 
-rg -n 'continue_archived_workflow_in_simple' src-tauri/src/commands/simple_workflow.rs src-tauri/src/web/handlers/simple_workflow.rs src-tauri/src/web/router.rs src-tauri/src/lib.rs
-rg -n 'simple_successor_creation_retired|Automatic Simple successor creation is retired; create a new conversation and use a new Design\.' src-tauri/src
-rg -n 'successor_conversation_id|can_create_simple_successor' src-tauri/src/acp/delegation/workflow/dto.rs src/lib/types.ts
-rg -n 'legacy_source_workflow_id' src-tauri/src/db/entities/delegation_workflow.rs src-tauri/src/db/migration
-rg -n 'v2_successor' src-tauri/src src/lib/types.ts
+$continueMatches = rg -n 'continue_archived_workflow_in_simple' src-tauri/src/commands/simple_workflow.rs src-tauri/src/web/handlers/simple_workflow.rs src-tauri/src/web/router.rs src-tauri/src/lib.rs
+Assert-NativeExit -Code $LASTEXITCODE -Label 'continue_archived_workflow_in_simple preservation scan'
+$retiredMatches = rg -n 'simple_successor_creation_retired|Automatic Simple successor creation is retired; create a new conversation and use a new Design\.' src-tauri/src
+Assert-NativeExit -Code $LASTEXITCODE -Label 'retirement contract preservation scan'
+$archivedMatches = rg -n 'successor_conversation_id|can_create_simple_successor' src-tauri/src/acp/delegation/workflow/dto.rs src/lib/types.ts
+Assert-NativeExit -Code $LASTEXITCODE -Label 'archived compatibility field scan'
+$legacyMatches = rg -n 'legacy_source_workflow_id' src-tauri/src/db/entities/delegation_workflow.rs src-tauri/src/db/migration
+Assert-NativeExit -Code $LASTEXITCODE -Label 'legacy_source_workflow_id preservation scan'
+$v2SuccessorMatches = rg -n 'v2_successor' src-tauri/src src/lib/types.ts
+Assert-NativeExit -Code $LASTEXITCODE -Label 'v2_successor preservation scan'
 ```
 
-Expected: both forbidden scans have no matches; every positive preservation/contract scan has matches. Review every positive match and confirm it belongs to the stable rejection API, archived compatibility DTO, or explicitly preserved unrelated identity.
+Expected: both forbidden scans exit 1 with no matches; every positive preservation/contract scan exits 0 and has matches. Review every stored positive match (`$continueMatches`, `$retiredMatches`, `$archivedMatches`, `$legacyMatches`, `$v2SuccessorMatches`) and confirm it belongs to the stable rejection API, archived compatibility DTO, or explicitly preserved unrelated identity. A missing positive match or a non-0/1 `rg` error blocks the report.
 
 - [ ] **Step 2: Run full frontend verification**
 
 ```powershell
 pnpm test
+$pnpmTestCode = $LASTEXITCODE
+Assert-NativeExit -Code $pnpmTestCode -Label 'pnpm test'
 pnpm eslint .
+$pnpmEslintCode = $LASTEXITCODE
+Assert-NativeExit -Code $pnpmEslintCode -Label 'pnpm eslint .'
 ```
 
-Expected: both commands exit 0. Record Vitest's exact passed-file/test totals and ESLint's warning count in the report; any new error or warning in an owned file blocks completion.
+Expected: both commands exit 0. Record Vitest's exact passed-file/test totals, ESLint's warning count, and both captured exit codes in the report; any new error or warning in an owned file blocks completion.
 
 - [ ] **Step 3: Run the full Rust matrix serially**
 
@@ -987,43 +1049,87 @@ From `src-tauri/`:
 ```powershell
 $env:RUST_MIN_STACK = '16777216'
 cargo test --features test-utils
+$desktopTestCode = $LASTEXITCODE
+Assert-NativeExit -Code $desktopTestCode -Label 'desktop cargo test'
 cargo test --no-default-features --features server --bin codeg-server --lib
+$serverTestCode = $LASTEXITCODE
+Assert-NativeExit -Code $serverTestCode -Label 'server cargo test'
 cargo clippy --all-targets --features test-utils -- -D warnings
+$desktopClippyCode = $LASTEXITCODE
+Assert-NativeExit -Code $desktopClippyCode -Label 'desktop cargo clippy'
 cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings
+$serverClippyCode = $LASTEXITCODE
+Assert-NativeExit -Code $serverClippyCode -Label 'server cargo clippy'
 cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
+$mcpClippyCode = $LASTEXITCODE
+Assert-NativeExit -Code $mcpClippyCode -Label 'mcp cargo clippy'
 Remove-Item Env:RUST_MIN_STACK
 ```
 
-Expected: all five commands exit 0. Record exact desktop/server test totals, ignored counts, and zero-warning Clippy outcomes. Run one command at a time and wait 30-60 seconds between status checks; do not launch another Cargo process until the preceding process terminates.
+Expected: all five commands exit 0. Record each captured exit code, exact desktop/server test totals, ignored counts, and zero-warning Clippy outcomes. Run one command at a time and wait 30-60 seconds between status checks; do not launch another Cargo process until the preceding process terminates.
 
 - [ ] **Step 4: Build the frontend from a clean detached worktree**
 
-Run from the repository root after Tasks 1-4 are committed. Resolve and validate the exact temporary target before adding or removing it:
+Run from the repository root after Tasks 1-4 are committed. Resolve and validate the exact temporary target before adding or removing it. The parent of a drive-root checkout such as `D:\MyCodeBuddy` is `D:\`; do not concatenate another separator onto an already-terminated root, and do not use `StartsWith($parent + DirectorySeparatorChar)` (that prefix becomes `D:\\` and rejects the required `D:\MyCodeBuddy-build-...` path).
 
 ```powershell
 $reviewedCommit = git rev-parse HEAD
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git rev-parse HEAD'
 $repoRoot = (git rev-parse --show-toplevel).Trim()
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git rev-parse --show-toplevel'
 $repoParent = Split-Path -Parent $repoRoot
 $buildWorktree = Join-Path $repoParent ("MyCodeBuddy-build-" + $reviewedCommit.Substring(0, 12))
 $resolvedParent = [System.IO.Path]::GetFullPath($repoParent)
 $resolvedBuild = [System.IO.Path]::GetFullPath($buildWorktree)
-if (-not $resolvedBuild.StartsWith($resolvedParent + [System.IO.Path]::DirectorySeparatorChar)) {
-  throw "detached build path escaped the repository parent"
+$relativeToParent = [System.IO.Path]::GetRelativePath($resolvedParent, $resolvedBuild)
+if (
+  [string]::IsNullOrWhiteSpace($relativeToParent) -or
+  [System.IO.Path]::IsPathRooted($relativeToParent) -or
+  $relativeToParent -eq '.' -or
+  $relativeToParent.StartsWith('..')
+) {
+  throw "detached build path escaped the repository parent: parent=$resolvedParent build=$resolvedBuild relative=$relativeToParent"
 }
 if (Test-Path -LiteralPath $resolvedBuild) {
   throw "detached build path already exists: $resolvedBuild"
 }
 
+$installCode = $null
+$buildCode = $null
+$removeCode = $null
+$primaryFailure = $null
 git worktree add --detach $resolvedBuild $reviewedCommit
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git worktree add'
 try {
   pnpm --dir $resolvedBuild install --frozen-lockfile
+  $installCode = $LASTEXITCODE
+  if ($installCode -ne 0) {
+    throw "detached pnpm install failed with exit code $installCode"
+  }
   pnpm --dir $resolvedBuild build
+  $buildCode = $LASTEXITCODE
+  if ($buildCode -ne 0) {
+    throw "detached pnpm build failed with exit code $buildCode"
+  }
+} catch {
+  $primaryFailure = $_
 } finally {
   git worktree remove --force $resolvedBuild
+  $removeCode = $LASTEXITCODE
+}
+$failures = @()
+if ($null -ne $primaryFailure) {
+  $failures += [string]$primaryFailure.Exception.Message
+}
+if ($null -eq $removeCode -or $removeCode -ne 0) {
+  $failures += "git worktree remove failed with exit code $removeCode"
+}
+if ($failures.Count -gt 0) {
+  throw ($failures -join '; ')
 }
 ```
 
-Expected: install and static-export build exit 0 at `$reviewedCommit`; all static pages complete. Confirm `git worktree list` no longer contains the validated temporary target. Do not delete or modify any other worktree.
+Expected: `$installCode` and `$buildCode` are 0 at `$reviewedCommit`; all static pages complete; `$removeCode` is 0. Cleanup always runs and is always checked, even when install or build fails. If both a primary command and cleanup fail, the thrown message contains both failures. Record the containment result as accepted plus `$relativeToParent`, and record the three numeric codes. Do not write `$resolvedParent` or `$resolvedBuild` into the verification report; those absolute temporary paths may appear only in operator-facing throw text. Confirm `git worktree list` no longer contains the validated temporary target. Do not delete or modify any other worktree.
 
 - [ ] **Step 5: Write the verification report from observed evidence**
 
@@ -1042,7 +1148,7 @@ Record both zero-match forbidden scans and all positive compatibility-preservati
 
 ## Frontend
 
-Record `pnpm test`, `pnpm eslint .`, and detached `pnpm build` with exact exit codes and totals.
+Record `pnpm test`, `pnpm eslint .`, and detached `pnpm build` with exact exit codes and totals. For the detached build, record `$relativeToParent`, whether containment was accepted, and `$installCode`/`$buildCode`/`$removeCode`. Omit absolute temporary paths.
 
 ## Rust
 
@@ -1057,26 +1163,34 @@ Confirm `continue_archived_workflow_in_simple` remains registered, archived succ
 State concrete residual risks supported by the runs. If every required gate is green, state that no delivery blocker remains; do not erase pre-existing unrelated warnings or untracked files.
 ```
 
-Use `apply_patch` to create the report. Do not include raw environment secrets, absolute temporary paths, or unrelated worktree inventory beyond the preservation statement.
+Use `apply_patch` to create the report. Do not include raw environment secrets, absolute temporary paths (`$resolvedParent`, `$resolvedBuild`, or any other checkout/worktree absolute), or unrelated worktree inventory beyond the preservation statement. Detached-build containment evidence is `$relativeToParent` plus accepted/rejected only.
 
 - [ ] **Step 6: Perform final diff and tracked-clean checks**
 
 ```powershell
 git diff --check c2954121..HEAD
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git diff --check c2954121..HEAD'
 git status --short --branch
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git status --short --branch'
 git log --oneline --decorate -8
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git log --oneline --decorate -8'
 git status --short --ignored=matching -- .superpowers/sdd/2026-08-12-simple-successor-creation-retirement/verification-report.md
+Assert-NativeExit -Code $LASTEXITCODE -Label 'path-scoped ignored status'
 ```
 
-Expected before staging the report: no tracked implementation diff remains. The path-scoped ignored-status command shows only `!! .superpowers/sdd/2026-08-12-simple-successor-creation-retirement/` because the repository intentionally ignores new SDD artifacts. Existing `.codex-tmp-*` and `.task-runtimes/` entries remain untouched and untracked.
+Expected before staging the report: `git diff --check` exits 0 and no tracked implementation diff remains. The path-scoped ignored-status command shows only `!! .superpowers/sdd/2026-08-12-simple-successor-creation-retirement/` because the repository intentionally ignores new SDD artifacts. Existing `.codex-tmp-*` and `.task-runtimes/` entries remain untouched and untracked.
 
 - [ ] **Step 7: Commit only the evidence report**
 
 ```powershell
 git add -f -- .superpowers/sdd/2026-08-12-simple-successor-creation-retirement/verification-report.md
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git add verification-report.md'
 git diff --cached --name-status
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git diff --cached --name-status'
 git commit -m "docs(workflow): verify simple successor retirement"
+Assert-NativeExit -Code $LASTEXITCODE -Label 'git commit verification-report.md'
 git status --short --branch
+Assert-NativeExit -Code $LASTEXITCODE -Label 'final git status --short --branch'
 ```
 
 Expected staged path: only the verification report. After commit, tracked status is clean; protected unrelated untracked paths remain visible and unchanged.
