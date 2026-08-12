@@ -1,5 +1,6 @@
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 
@@ -7,21 +8,20 @@ use crate::acp::delegation::route::DelegationRoutePolicy;
 use crate::acp::delegation::store::{
     classify_sqlite_transient, classify_sqlite_transient_msg, extract_sqlite_codes,
 };
-use crate::acp::delegation::workflow::key::normalize_rel_path;
 use crate::acp::delegation::workflow::simple::{
-    default_simple_progress_rel_path, register_simple_workflow_txn,
+    default_simple_progress_rel_path, eligible_simple_successor_plan,
+    normalize_simple_successor_plan_locator, register_simple_workflow_txn,
 };
 use crate::acp::delegation::workflow::types::ManifestDocument;
 use crate::acp::delegation::workflow::{
-    emit_workflow_compatibility_nudge, read_simple_plan, require_v2_mutation,
-    resolve_conversation_workflow_mode, ConversationWorkflowMode, SimpleWorkflowError,
-    WorkflowStoreError,
+    emit_workflow_compatibility_nudge, require_v2_mutation, resolve_conversation_workflow_mode,
+    ConversationWorkflowMode, SimpleWorkflowError, WorkflowStoreError,
 };
+use crate::acp::error::AcpError;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::{
-    conversation, delegation_task_run, delegation_workflow,
-    delegation_workflow_manifest_revision, delegation_workflow_run_binding, folder,
-    simple_workflow,
+    conversation, delegation_task_run, delegation_workflow, delegation_workflow_manifest_revision,
+    delegation_workflow_run_binding, folder, simple_successor_bootstrap, simple_workflow,
 };
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -29,8 +29,150 @@ use crate::db::AppDatabase;
 use crate::models::AgentType;
 use crate::web::event_bridge::EventEmitter;
 
+#[async_trait::async_trait]
+pub trait SimpleBootstrapPromptSink: Send + Sync {
+    async fn send_bootstrap_prompt(
+        &self,
+        db: &AppDatabase,
+        connection_id: &str,
+        successor_conversation_id: i32,
+        prompt: &str,
+        client_message_id: &str,
+    ) -> Result<(), AcpError>;
+}
+
+fn bootstrap_admission_lock(
+    successor_conversation_id: i32,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(lock) = locks
+        .get(&successor_conversation_id)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return lock;
+    }
+    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(successor_conversation_id, std::sync::Arc::downgrade(&lock));
+    lock
+}
+
+pub async fn admit_pending_simple_successor_bootstrap<S: SimpleBootstrapPromptSink + ?Sized>(
+    db: &AppDatabase,
+    sink: &S,
+    connection_id: &str,
+    successor_conversation_id: i32,
+) -> Result<bool, AcpError> {
+    let lock = bootstrap_admission_lock(successor_conversation_id);
+    let _guard = lock.lock().await;
+    let Some(bootstrap) = simple_successor_bootstrap::Entity::find()
+        .filter(
+            simple_successor_bootstrap::Column::SuccessorConversationId
+                .eq(successor_conversation_id),
+        )
+        .one(&db.conn)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    if matches!(
+        bootstrap.status,
+        simple_successor_bootstrap::SimpleSuccessorBootstrapStatus::Admitted
+    ) {
+        return Ok(false);
+    }
+
+    let message_id = format!("simple-bootstrap-{}", bootstrap.id);
+    sink.send_bootstrap_prompt(
+        db,
+        connection_id,
+        successor_conversation_id,
+        &bootstrap.prompt,
+        &message_id,
+    )
+    .await?;
+
+    let admitted_prompt = bootstrap.prompt.clone();
+    let mut active: simple_successor_bootstrap::ActiveModel = bootstrap.into();
+    let now = chrono::Utc::now();
+    active.admitted_prompt = Set(Some(admitted_prompt));
+    active.status = Set(simple_successor_bootstrap::SimpleSuccessorBootstrapStatus::Admitted);
+    active.admitted_at = Set(Some(now));
+    active.updated_at = Set(now);
+    active
+        .update(&db.conn)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    Ok(true)
+}
+
+#[async_trait::async_trait]
+impl SimpleBootstrapPromptSink for crate::acp::manager::ConnectionManager {
+    async fn send_bootstrap_prompt(
+        &self,
+        db: &AppDatabase,
+        connection_id: &str,
+        successor_conversation_id: i32,
+        prompt: &str,
+        client_message_id: &str,
+    ) -> Result<(), AcpError> {
+        let successor = conversation::Entity::find_by_id(successor_conversation_id)
+            .filter(conversation::Column::DeletedAt.is_null())
+            .one(&db.conn)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+            .ok_or_else(|| AcpError::protocol("Simple successor conversation was deleted"))?;
+        let linked = self
+            .send_prompt_linked_with_message_id(
+                db,
+                connection_id,
+                vec![crate::acp::types::PromptInputBlock::Text {
+                    text: prompt.to_string(),
+                }],
+                Some(successor.folder_id),
+                Some(successor_conversation_id),
+                None,
+                Some(client_message_id.to_string()),
+                None,
+            )
+            .await?;
+        if linked != Some(successor_conversation_id) {
+            return Err(AcpError::protocol(
+                "Simple bootstrap prompt linked a different conversation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub async fn admit_simple_successor_bootstrap_after_connect(
+    db: &AppDatabase,
+    manager: &crate::acp::manager::ConnectionManager,
+    connection_id: &str,
+    conversation_id: Option<i32>,
+) -> Result<(), AcpError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    if let Err(error) =
+        admit_pending_simple_successor_bootstrap(db, manager, connection_id, conversation_id).await
+    {
+        let _ = manager
+            .disconnect_with_origin(
+                connection_id,
+                crate::acp::termination::AcpDisconnectOrigin::AbandonedConnect,
+            )
+            .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 const MAX_CLIENT_REQUEST_TOKEN_BYTES: usize = 256;
-const MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES: usize = 4 * 1024;
 const MAX_SIMPLE_SUCCESSOR_BOOTSTRAP_BYTES: usize = 16 * 1024;
 const SIMPLE_SUCCESSOR_TXN_MAX_ATTEMPTS: u8 = 10;
 const SIMPLE_SUCCESSOR_SOURCE_NOT_ARCHIVED_MESSAGE: &str =
@@ -115,12 +257,8 @@ impl SimpleSuccessorTestControl {
         Self {
             empty_link_barrier: empty_link_parties
                 .map(|parties| std::sync::Arc::new(tokio::sync::Barrier::new(parties))),
-            empty_link_slots: std::sync::atomic::AtomicUsize::new(
-                empty_link_parties.unwrap_or(0),
-            ),
-            fail_after_registration: std::sync::atomic::AtomicUsize::new(
-                fail_after_registration,
-            ),
+            empty_link_slots: std::sync::atomic::AtomicUsize::new(empty_link_parties.unwrap_or(0)),
+            fail_after_registration: std::sync::atomic::AtomicUsize::new(fail_after_registration),
             empty_link_waits: std::sync::atomic::AtomicUsize::new(0),
             retries: std::sync::atomic::AtomicUsize::new(0),
             rollbacks: std::sync::atomic::AtomicUsize::new(0),
@@ -241,22 +379,19 @@ fn workflow_error(error: WorkflowStoreError) -> AppCommandError {
     let message = error.to_string();
     let stable_code = error.code();
     match error {
-        WorkflowStoreError::LegacyCompletionProtocolReadOnly => AppCommandError::new(
-            AppErrorCode::LegacyCompletionProtocolReadOnly,
-            message,
-        )
-        .with_detail(stable_code),
+        WorkflowStoreError::LegacyCompletionProtocolReadOnly => {
+            AppCommandError::new(AppErrorCode::LegacyCompletionProtocolReadOnly, message)
+                .with_detail(stable_code)
+        }
         WorkflowStoreError::UnsupportedCompletionProtocol { .. }
-        | WorkflowStoreError::UnsupportedCompletionProtocolHeader(_) => AppCommandError::new(
-            AppErrorCode::UnsupportedCompletionProtocol,
-            message,
-        )
-        .with_detail(stable_code),
-        WorkflowStoreError::WorkflowIdentityCorrupt { .. } => AppCommandError::new(
-            AppErrorCode::WorkflowIdentityCorrupt,
-            message,
-        )
-        .with_detail(stable_code),
+        | WorkflowStoreError::UnsupportedCompletionProtocolHeader(_) => {
+            AppCommandError::new(AppErrorCode::UnsupportedCompletionProtocol, message)
+                .with_detail(stable_code)
+        }
+        WorkflowStoreError::WorkflowIdentityCorrupt { .. } => {
+            AppCommandError::new(AppErrorCode::WorkflowIdentityCorrupt, message)
+                .with_detail(stable_code)
+        }
         WorkflowStoreError::NotFound(_) | WorkflowStoreError::ParentNotFound(_) => {
             AppCommandError::not_found(message).with_detail(stable_code)
         }
@@ -280,11 +415,10 @@ fn simple_error(error: SimpleWorkflowError) -> AppCommandError {
         }
         SimpleWorkflowError::ModeConflict { .. }
         | SimpleWorkflowError::IdentityCorrupt { .. }
-        | SimpleWorkflowError::SourceWorkflowMismatch => AppCommandError::new(
-            AppErrorCode::WorkflowIdentityCorrupt,
-            message,
-        )
-        .with_detail(stable_code),
+        | SimpleWorkflowError::SourceWorkflowMismatch => {
+            AppCommandError::new(AppErrorCode::WorkflowIdentityCorrupt, message)
+                .with_detail(stable_code)
+        }
         SimpleWorkflowError::Validation(_) => {
             AppCommandError::invalid_input(message).with_detail(stable_code)
         }
@@ -303,11 +437,7 @@ fn plan_unavailable(plan_rel_path: &str) -> AppCommandError {
 }
 
 fn normalize_bounded_successor_locator(rel_path: &str) -> Option<String> {
-    if rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
-        return None;
-    }
-    let normalized = normalize_rel_path(rel_path).ok()?;
-    (normalized.len() <= MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES).then_some(normalized)
+    normalize_simple_successor_plan_locator(rel_path)
 }
 
 fn parse_route_override(
@@ -327,6 +457,14 @@ fn parse_route_override(
 }
 
 fn bootstrap_prompt(source: &ArchivedSource, progress_rel_path: &str) -> String {
+    bootstrap_prompt_for_locators(source, &source.plan_rel_path, progress_rel_path)
+}
+
+fn bootstrap_prompt_for_locators(
+    source: &ArchivedSource,
+    plan_rel_path: &str,
+    progress_rel_path: &str,
+) -> String {
     let mut lines = vec![
         "This is a Simple successor conversation.".to_string(),
         format!(
@@ -338,7 +476,7 @@ fn bootstrap_prompt(source: &ArchivedSource, progress_rel_path: &str) -> String 
         lines.push(format!("Design: `{design_rel_path}`."));
     }
     lines.extend([
-        format!("Plan: `{}`.", source.plan_rel_path),
+        format!("Plan: `{plan_rel_path}`."),
         format!("Progress: `{progress_rel_path}`."),
         "Inspect Git and the filesystem before reconstructing repository-grounded progress."
             .to_string(),
@@ -376,9 +514,7 @@ async fn is_durably_bound_archived_child(
     let task_ids = delegation_task_run::Entity::find()
         .select_only()
         .column(delegation_task_run::Column::TaskId)
-        .filter(
-            delegation_task_run::Column::ChildConversationId.eq(source_conversation_id),
-        )
+        .filter(delegation_task_run::Column::ChildConversationId.eq(source_conversation_id))
         .into_tuple::<String>()
         .all(&db.conn)
         .await
@@ -425,9 +561,7 @@ async fn load_archived_source(
         } => {
             return Err(AppCommandError::new(
                 AppErrorCode::WorkflowIdentityCorrupt,
-                format!(
-                    "conversation {root_conversation_id} has conflicting workflow identities"
-                ),
+                format!("conversation {root_conversation_id} has conflicting workflow identities"),
             )
             .with_detail("workflow_identity_corrupt"));
         }
@@ -489,31 +623,31 @@ async fn load_archived_source(
         )
         .with_detail("workflow_identity_corrupt")
     })?;
-    let document: ManifestDocument = serde_json::from_str(&revision.document_json).map_err(|_| {
-        AppCommandError::new(
-            AppErrorCode::WorkflowIdentityCorrupt,
-            "archived workflow active revision is invalid",
-        )
-        .with_detail("workflow_identity_corrupt")
-    })?;
+    let document: ManifestDocument =
+        serde_json::from_str(&revision.document_json).map_err(|_| {
+            AppCommandError::new(
+                AppErrorCode::WorkflowIdentityCorrupt,
+                "archived workflow active revision is invalid",
+            )
+            .with_detail("workflow_identity_corrupt")
+        })?;
     let raw_plan_rel_path = document.plan_target_rel_path;
-    let plan_rel_path = normalize_bounded_successor_locator(&raw_plan_rel_path)
-        .ok_or_else(|| plan_unavailable(&raw_plan_rel_path))?;
-    read_simple_plan(std::path::Path::new(&workspace.path), &plan_rel_path)
-        .await
-        .map_err(|_| plan_unavailable(&plan_rel_path))?;
+    let plan_rel_path =
+        eligible_simple_successor_plan(std::path::Path::new(&workspace.path), &raw_plan_rel_path)
+            .await
+            .ok_or_else(|| plan_unavailable(&raw_plan_rel_path))?;
 
     let agent_type = AgentType::from_wire(&source.agent_type).ok_or_else(|| {
         AppCommandError::new(
             AppErrorCode::WorkflowIdentityCorrupt,
-            format!(
-                "conversation {root_conversation_id} has an invalid agent type"
-            ),
+            format!("conversation {root_conversation_id} has an invalid agent type"),
         )
         .with_detail("workflow_identity_corrupt")
     })?;
-    let route_override =
-        parse_route_override(source.delegation_route_override.as_deref(), root_conversation_id)?;
+    let route_override = parse_route_override(
+        source.delegation_route_override.as_deref(),
+        root_conversation_id,
+    )?;
     let successor_title = source.title.and_then(|title| {
         let title = title.trim();
         (!title.is_empty()).then(|| format!("{title} (Simple)"))
@@ -546,13 +680,13 @@ async fn load_existing_successor<C: ConnectionTrait>(
     let Some(descriptor) = descriptor else {
         return Ok(None);
     };
-    if descriptor.plan_rel_path != source.plan_rel_path {
+    let Some(plan_rel_path) = normalize_bounded_successor_locator(&descriptor.plan_rel_path) else {
         return Err(AppCommandError::new(
             AppErrorCode::WorkflowIdentityCorrupt,
-            "Simple successor locator conflicts with its archived source",
+            "Simple successor Plan locator is invalid",
         )
         .with_detail("workflow_identity_corrupt"));
-    }
+    };
     let successor = conversation::Entity::find_by_id(descriptor.parent_conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
         .one(conn)
@@ -572,21 +706,53 @@ async fn load_existing_successor<C: ConnectionTrait>(
         )
         .with_detail("workflow_identity_corrupt"));
     }
-    if normalize_bounded_successor_locator(&descriptor.progress_rel_path)
-        .is_none_or(|normalized| normalized != descriptor.progress_rel_path)
-    {
+    let Some(progress_rel_path) =
+        normalize_bounded_successor_locator(&descriptor.progress_rel_path)
+    else {
         return Err(AppCommandError::new(
             AppErrorCode::WorkflowIdentityCorrupt,
             "Simple successor progress locator is invalid",
         )
         .with_detail("workflow_identity_corrupt"));
+    };
+    let expected_prompt = bootstrap_prompt_for_locators(source, &plan_rel_path, &progress_rel_path);
+    let bootstrap = simple_successor_bootstrap::Entity::find()
+        .filter(simple_successor_bootstrap::Column::SuccessorConversationId.eq(successor.id))
+        .one(conn)
+        .await
+        .map_err(|error| AppCommandError::database_error(error.to_string()))?
+        .ok_or_else(|| {
+            AppCommandError::new(
+                AppErrorCode::WorkflowIdentityCorrupt,
+                "Simple successor bootstrap identity is missing",
+            )
+            .with_detail("workflow_identity_corrupt")
+        })?;
+    if bootstrap.source_workflow_id != source.workflow_id {
+        return Err(AppCommandError::new(
+            AppErrorCode::WorkflowIdentityCorrupt,
+            "Simple successor bootstrap source conflicts with its descriptor",
+        )
+        .with_detail("workflow_identity_corrupt"));
     }
+    let bootstrap_prompt = if bootstrap.prompt != expected_prompt {
+        let mut active: simple_successor_bootstrap::ActiveModel = bootstrap.into();
+        active.prompt = Set(expected_prompt.clone());
+        active.updated_at = Set(chrono::Utc::now());
+        active
+            .update(conn)
+            .await
+            .map_err(|error| AppCommandError::database_error(error.to_string()))?;
+        expected_prompt
+    } else {
+        bootstrap.prompt
+    };
     Ok(Some(SimpleSuccessorResult {
         successor_conversation_id: successor.id,
         created: false,
-        plan_rel_path: descriptor.plan_rel_path,
-        bootstrap_prompt: bootstrap_prompt(source, &descriptor.progress_rel_path),
-        progress_rel_path: descriptor.progress_rel_path,
+        plan_rel_path,
+        bootstrap_prompt,
+        progress_rel_path,
     }))
 }
 
@@ -680,6 +846,7 @@ async fn converge_successor_conflict(
 async fn create_or_load_successor(
     db: &AppDatabase,
     source: &ArchivedSource,
+    client_request_token: &str,
 ) -> Result<SimpleSuccessorResult, AppCommandError> {
     for attempt in 1..=SIMPLE_SUCCESSOR_TXN_MAX_ATTEMPTS {
         match load_existing_successor(&db.conn, source).await {
@@ -715,8 +882,7 @@ async fn create_or_load_successor(
                 Err(error) if is_retryable_successor_db_err(&error) => {
                     let error = AppCommandError::database_error(error.to_string());
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error)
-                            .await?
+                        converge_successor_conflict(db, source, attempt, error).await?
                     {
                         return Ok(existing);
                     }
@@ -730,8 +896,7 @@ async fn create_or_load_successor(
                 rollback_successor_attempt(txn).await?;
                 if retryable {
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error)
-                            .await?
+                        converge_successor_conflict(db, source, attempt, error).await?
                     {
                         return Ok(existing);
                     }
@@ -759,8 +924,7 @@ async fn create_or_load_successor(
                 rollback_successor_attempt(txn).await?;
                 if retryable {
                     if let Some(existing) =
-                        converge_successor_conflict(db, source, attempt, error)
-                            .await?
+                        converge_successor_conflict(db, source, attempt, error).await?
                     {
                         return Ok(existing);
                     }
@@ -794,6 +958,36 @@ async fn create_or_load_successor(
         }
         #[cfg(test)]
         test_record_candidate_registration(&txn, candidate.id, &source.workflow_id).await?;
+        let prompt = bootstrap_prompt(source, &progress_rel_path);
+        let now = chrono::Utc::now();
+        if let Err(error) = (simple_successor_bootstrap::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            successor_conversation_id: Set(candidate.id),
+            source_workflow_id: Set(source.workflow_id.clone()),
+            client_request_token: Set(client_request_token.to_string()),
+            prompt: Set(prompt.clone()),
+            admitted_prompt: Set(None),
+            status: Set(simple_successor_bootstrap::SimpleSuccessorBootstrapStatus::Pending),
+            admitted_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .insert(&txn)
+        .await
+        {
+            let retryable = is_retryable_successor_db_err(&error);
+            let error = AppCommandError::database_error(error.to_string());
+            rollback_successor_attempt(txn).await?;
+            if retryable {
+                if let Some(existing) =
+                    converge_successor_conflict(db, source, attempt, error).await?
+                {
+                    return Ok(existing);
+                }
+                continue;
+            }
+            return Err(error);
+        }
         #[cfg(test)]
         if test_should_fail_after_registration() {
             rollback_successor_attempt(txn).await?;
@@ -808,7 +1002,7 @@ async fn create_or_load_successor(
                     successor_conversation_id: candidate.id,
                     created: true,
                     plan_rel_path: source.plan_rel_path.clone(),
-                    bootstrap_prompt: bootstrap_prompt(source, &progress_rel_path),
+                    bootstrap_prompt: prompt,
                     progress_rel_path,
                 });
             }
@@ -835,10 +1029,14 @@ async fn create_or_load_successor(
 async fn create_or_load_successor_controlled(
     db: &AppDatabase,
     source: &ArchivedSource,
+    client_request_token: &str,
     control: std::sync::Arc<SimpleSuccessorTestControl>,
 ) -> Result<SimpleSuccessorResult, AppCommandError> {
     SIMPLE_SUCCESSOR_TEST_CONTROL
-        .scope(control, create_or_load_successor(db, source))
+        .scope(
+            control,
+            create_or_load_successor(db, source, client_request_token),
+        )
         .await
 }
 
@@ -851,7 +1049,7 @@ async fn continue_archived_workflow_in_simple_controlled(
 ) -> Result<SimpleSuccessorResult, AppCommandError> {
     validate_request_token(client_request_token)?;
     let source = load_archived_source(db, source_conversation_id).await?;
-    create_or_load_successor_controlled(db, &source, control).await
+    create_or_load_successor_controlled(db, &source, client_request_token, control).await
 }
 
 pub async fn continue_archived_workflow_in_simple_core(
@@ -862,7 +1060,7 @@ pub async fn continue_archived_workflow_in_simple_core(
 ) -> Result<SimpleSuccessorResult, AppCommandError> {
     validate_request_token(client_request_token)?;
     let source = load_archived_source(db, source_conversation_id).await?;
-    let result = create_or_load_successor(db, &source).await?;
+    let result = create_or_load_successor(db, &source, client_request_token).await?;
     if result.created {
         crate::commands::conversations::emit_conversation_upsert(
             emitter,
@@ -904,12 +1102,8 @@ pub(crate) mod test_support {
         WorkUnitKeyParts, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN, PHASE_PLAN,
         TASK_RISK_POLICY_VERSION, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
-    use crate::db::entities::delegation_task_run::{
-        self, AdmissionClass, DelegationRunStatus,
-    };
-    use crate::db::entities::delegation_workflow::{
-        self, CompletionProtocolMode, WorkflowState,
-    };
+    use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
+    use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode, WorkflowState};
     use crate::db::entities::{
         delegation_workflow_manifest_revision, delegation_workflow_run_binding,
     };
@@ -1115,16 +1309,20 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait,
+        QueryFilter, Set, Statement,
     };
 
     use super::test_support::{seed_archived_workflow, seed_bound_child};
     use super::*;
     use crate::acp::delegation::route::DelegationRoutePolicy;
+    use crate::acp::delegation::spawner::DelegationLink;
     use crate::acp::delegation::workflow::plan_material::MAX_PLAN_MATERIAL_BYTES;
     use crate::acp::delegation::workflow::{
-        load_simple_workflow, register_simple_workflow,
-        workflow_v2_retired_for_conversation,
+        load_simple_workflow, register_simple_workflow, workflow_v2_retired_for_conversation,
+    };
+    use crate::acp::delegation::workflow::{
+        normalize_rel_path, MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES,
     };
     use crate::app_error::AppErrorCode;
     use crate::app_state::AppState;
@@ -1140,8 +1338,71 @@ mod tests {
         fresh_disk_db, fresh_in_memory_db, seed_conversation, seed_folder,
     };
     use crate::models::AgentType;
-    use crate::acp::delegation::spawner::DelegationLink;
     use crate::web::event_bridge::EventEmitter;
+
+    #[derive(Default)]
+    struct RecordingBootstrapSink {
+        calls: tokio::sync::Mutex<Vec<(String, i32, String, String)>>,
+        fail_remaining: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        block_first: bool,
+    }
+
+    impl RecordingBootstrapSink {
+        fn failing_once() -> Self {
+            Self {
+                fail_remaining: std::sync::atomic::AtomicUsize::new(1),
+                ..Default::default()
+            }
+        }
+
+        fn blocking_first() -> Self {
+            Self {
+                block_first: true,
+                ..Default::default()
+            }
+        }
+
+        async fn calls(&self) -> Vec<(String, i32, String, String)> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimpleBootstrapPromptSink for RecordingBootstrapSink {
+        async fn send_bootstrap_prompt(
+            &self,
+            _db: &AppDatabase,
+            connection_id: &str,
+            successor_conversation_id: i32,
+            prompt: &str,
+            client_message_id: &str,
+        ) -> Result<(), AcpError> {
+            self.calls.lock().await.push((
+                connection_id.to_string(),
+                successor_conversation_id,
+                prompt.to_string(),
+                client_message_id.to_string(),
+            ));
+            if self.block_first && self.calls.lock().await.len() == 1 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if self
+                .fail_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| (remaining > 0).then(|| remaining - 1),
+                )
+                .is_ok()
+            {
+                return Err(AcpError::protocol("controlled bootstrap send failure"));
+            }
+            Ok(())
+        }
+    }
 
     async fn live_conversation_count(db: &crate::db::AppDatabase) -> u64 {
         conversation::Entity::find()
@@ -1156,6 +1417,44 @@ mod tests {
             .count(&db.conn)
             .await
             .expect("descriptor count")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BootstrapRow {
+        successor_conversation_id: i32,
+        source_workflow_id: String,
+        client_request_token: String,
+        prompt: String,
+        status: String,
+        admitted_at: Option<String>,
+    }
+
+    async fn bootstrap_rows(db: &crate::db::AppDatabase) -> Vec<BootstrapRow> {
+        db.conn
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT successor_conversation_id, source_workflow_id, client_request_token, \
+                 prompt, status, admitted_at FROM simple_successor_bootstraps ORDER BY id"
+                    .to_string(),
+            ))
+            .await
+            .expect("query durable Simple bootstrap intents")
+            .into_iter()
+            .map(|row| BootstrapRow {
+                successor_conversation_id: row
+                    .try_get("", "successor_conversation_id")
+                    .expect("successor_conversation_id"),
+                source_workflow_id: row
+                    .try_get("", "source_workflow_id")
+                    .expect("source_workflow_id"),
+                client_request_token: row
+                    .try_get("", "client_request_token")
+                    .expect("client_request_token"),
+                prompt: row.try_get("", "prompt").expect("prompt"),
+                status: row.try_get("", "status").expect("status"),
+                admitted_at: row.try_get("", "admitted_at").expect("admitted_at"),
+            })
+            .collect()
     }
 
     #[cfg(windows)]
@@ -1248,6 +1547,19 @@ mod tests {
             assert!(!result.bootstrap_prompt.contains(forbidden));
         }
 
+        assert_eq!(
+            bootstrap_rows(&db).await,
+            vec![BootstrapRow {
+                successor_conversation_id: result.successor_conversation_id,
+                source_workflow_id: "workflow-successor-root".into(),
+                client_request_token: "successor-request-root".into(),
+                prompt: result.bootstrap_prompt.clone(),
+                status: "pending".into(),
+                admitted_at: None,
+            }],
+            "creation must durably retain the validated token and exact prompt"
+        );
+
         let successor = conversation::Entity::find_by_id(result.successor_conversation_id)
             .one(&db.conn)
             .await
@@ -1256,7 +1568,10 @@ mod tests {
         assert_eq!(successor.folder_id, folder);
         assert_eq!(successor.parent_id, None);
         assert_eq!(successor.agent_type, "codex");
-        assert_eq!(successor.title.as_deref(), Some("Archived delivery (Simple)"));
+        assert_eq!(
+            successor.title.as_deref(),
+            Some("Archived delivery (Simple)")
+        );
         assert_eq!(
             successor.delegation_route_override.as_deref(),
             Some("codeg")
@@ -1273,10 +1588,9 @@ mod tests {
             descriptor.source_workflow_id.as_deref(),
             Some("workflow-successor-root")
         );
-        let retired_navigation =
-            workflow_v2_retired_for_conversation(&db.conn, source)
-                .await
-                .unwrap();
+        let retired_navigation = workflow_v2_retired_for_conversation(&db.conn, source)
+            .await
+            .unwrap();
         assert_eq!(
             retired_navigation.successor_conversation_id(),
             Some(result.successor_conversation_id)
@@ -1323,7 +1637,10 @@ mod tests {
         .await
         .expect("reopen successor");
         assert!(!replay.created);
-        assert_eq!(replay.successor_conversation_id, result.successor_conversation_id);
+        assert_eq!(
+            replay.successor_conversation_id,
+            result.successor_conversation_id
+        );
     }
 
     #[tokio::test]
@@ -1362,11 +1679,12 @@ mod tests {
             .unwrap();
         assert_eq!(successor.agent_type, "grok");
         assert!(result.bootstrap_prompt.contains(&root.to_string()));
-        assert!(!result.bootstrap_prompt.contains(&format!("conversation {child}")));
-        let retired_navigation =
-            workflow_v2_retired_for_conversation(&db.conn, child)
-                .await
-                .unwrap();
+        assert!(!result
+            .bootstrap_prompt
+            .contains(&format!("conversation {child}")));
+        let retired_navigation = workflow_v2_retired_for_conversation(&db.conn, child)
+            .await
+            .unwrap();
         assert_eq!(retired_navigation.source_conversation_id(), Some(root));
         assert_eq!(
             retired_navigation.successor_conversation_id(),
@@ -1431,7 +1749,10 @@ mod tests {
         assert_eq!(live_conversation_count(&db).await, conversations_before);
         assert_eq!(descriptor_count(&db).await, descriptors_before);
         assert_eq!(
-            auto_title_job::Entity::find().count(&db.conn).await.unwrap(),
+            auto_title_job::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
             title_jobs_before
         );
     }
@@ -1528,11 +1849,7 @@ mod tests {
 
         let legacy_db =
             crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
-        let legacy_folder = seed_folder(
-            &legacy_db,
-            workspace.path().to_str().unwrap(),
-        )
-        .await;
+        let legacy_folder = seed_folder(&legacy_db, workspace.path().to_str().unwrap()).await;
         let legacy = seed_conversation(&legacy_db, legacy_folder, AgentType::Codex).await;
         seed_archived_workflow(
             &legacy_db,
@@ -1617,14 +1934,10 @@ mod tests {
             "invalid\nrequest".to_string(),
             "x".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES + 1),
         ] {
-            let error = continue_archived_workflow_in_simple_core(
-                &db,
-                &EventEmitter::Noop,
-                source,
-                &token,
-            )
-            .await
-            .unwrap_err();
+            let error =
+                continue_archived_workflow_in_simple_core(&db, &EventEmitter::Noop, source, &token)
+                    .await
+                    .unwrap_err();
             assert_eq!(error.code, AppErrorCode::InvalidInput);
         }
         assert_eq!(live_conversation_count(&db).await, conversations_before);
@@ -1698,7 +2011,9 @@ mod tests {
             assert_eq!(error.code, AppErrorCode::SimpleSuccessorPlanUnavailable);
             assert_eq!(live_conversation_count(&db).await, conversations_before);
             assert_eq!(descriptor_count(&db).await, descriptors_before);
-            assert!(!error.to_string().contains(workspace.path().to_str().unwrap()));
+            assert!(!error
+                .to_string()
+                .contains(workspace.path().to_str().unwrap()));
             if matches!(failure, Failure::Absolute) {
                 assert_eq!(error.detail, None);
             }
@@ -1768,8 +2083,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let mut document: ManifestDocument =
-            serde_json::from_str(&revision.document_json).unwrap();
+        let mut document: ManifestDocument = serde_json::from_str(&revision.document_json).unwrap();
         document.design.as_mut().unwrap().rel_path =
             "d".repeat(MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES + 1);
         let mut revision: delegation_workflow_manifest_revision::ActiveModel = revision.into();
@@ -1817,10 +2131,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let mut document: ManifestDocument =
-            serde_json::from_str(&revision.document_json).unwrap();
-        document.design.as_mut().unwrap().rel_path =
-            locator_that_expands_past_successor_bound();
+        let mut document: ManifestDocument = serde_json::from_str(&revision.document_json).unwrap();
+        document.design.as_mut().unwrap().rel_path = locator_that_expands_past_successor_bound();
         let mut revision: delegation_workflow_manifest_revision::ActiveModel = revision.into();
         revision.document_json = Set(serde_json::to_string(&document).unwrap());
         revision.update(&db.conn).await.unwrap();
@@ -1865,8 +2177,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let mut document: ManifestDocument =
-            serde_json::from_str(&revision.document_json).unwrap();
+        let mut document: ManifestDocument = serde_json::from_str(&revision.document_json).unwrap();
         document.design.as_mut().unwrap().rel_path = "../outside-design.md".into();
         let mut revision: delegation_workflow_manifest_revision::ActiveModel = revision.into();
         revision.document_json = Set(serde_json::to_string(&document).unwrap());
@@ -1930,11 +2241,26 @@ mod tests {
         let second = second.unwrap();
         assert_eq!(control.empty_link_waits(), 2);
         assert!(control.retries() >= 1);
-        assert_eq!(first.successor_conversation_id, second.successor_conversation_id);
+        assert_eq!(
+            first.successor_conversation_id,
+            second.successor_conversation_id
+        );
         assert_eq!(usize::from(first.created) + usize::from(second.created), 1);
         assert!(first.created ^ second.created);
         assert_eq!(live_conversation_count(&db).await, conversations_before + 1);
         assert_eq!(descriptor_count(&db).await, 1);
+        let bootstraps = bootstrap_rows(&db).await;
+        assert_eq!(bootstraps.len(), 1);
+        assert_eq!(
+            bootstraps[0].successor_conversation_id,
+            first.successor_conversation_id
+        );
+        assert!(matches!(
+            bootstraps[0].client_request_token.as_str(),
+            "concurrent-request-a" | "concurrent-request-b"
+        ));
+        assert_eq!(bootstraps[0].prompt, first.bootstrap_prompt);
+        assert_eq!(first.bootstrap_prompt, second.bootstrap_prompt);
     }
 
     #[tokio::test]
@@ -1967,7 +2293,10 @@ mod tests {
         .await;
         let source = load_archived_source(&db, source).await.unwrap();
         let conversations_before = live_conversation_count(&db).await;
-        let title_jobs_before = auto_title_job::Entity::find().count(&db.conn).await.unwrap();
+        let title_jobs_before = auto_title_job::Entity::find()
+            .count(&db.conn)
+            .await
+            .unwrap();
         let descriptors_before = descriptor_count(&db).await;
         let source_links_before = simple_workflow::Entity::find()
             .filter(simple_workflow::Column::SourceWorkflowId.eq(source.workflow_id.clone()))
@@ -1995,9 +2324,14 @@ mod tests {
             .unwrap();
         let control = std::sync::Arc::new(SimpleSuccessorTestControl::fail_after_registration());
 
-        let error = create_or_load_successor_controlled(&db, &source, control.clone())
-            .await
-            .unwrap_err();
+        let error = create_or_load_successor_controlled(
+            &db,
+            &source,
+            "rollback-bootstrap-token",
+            control.clone(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code, AppErrorCode::DatabaseError);
         assert_eq!(control.rollbacks(), 1);
@@ -2011,6 +2345,7 @@ mod tests {
         );
         assert_eq!(live_conversation_count(&db).await, conversations_before);
         assert_eq!(descriptor_count(&db).await, descriptors_before);
+        assert!(bootstrap_rows(&db).await.is_empty());
         assert_eq!(
             simple_workflow::Entity::find()
                 .filter(simple_workflow::Column::SourceWorkflowId.eq(source.workflow_id.clone()))
@@ -2020,7 +2355,10 @@ mod tests {
             source_links_before
         );
         assert_eq!(
-            auto_title_job::Entity::find().count(&db.conn).await.unwrap(),
+            auto_title_job::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
             title_jobs_before
         );
         assert!(conversation::Entity::find()
@@ -2098,10 +2436,12 @@ mod tests {
         )
         .await
         .expect("public successor delete");
-        assert!(load_simple_workflow(&state.db.conn, first.successor_conversation_id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            load_simple_workflow(&state.db.conn, first.successor_conversation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let second = continue_archived_workflow_in_simple_core(
             &state.db,
@@ -2112,7 +2452,284 @@ mod tests {
         .await
         .unwrap();
         assert!(second.created);
-        assert_ne!(second.successor_conversation_id, first.successor_conversation_id);
+        assert_ne!(
+            second.successor_conversation_id,
+            first.successor_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_successor_replay_uses_updated_live_locators_without_another_bootstrap() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
+        std::fs::write(workspace.path().join("docs/plan.md"), "# Original Plan\n").unwrap();
+        std::fs::write(
+            workspace.path().join("docs/replacement-plan.md"),
+            "# Replacement Plan\n",
+        )
+        .unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let source = seed_conversation(&db, folder, AgentType::Codex).await;
+        seed_archived_workflow(
+            &db,
+            source,
+            "workflow-successor-locator-replay",
+            "docs/plan.md",
+            None,
+            2,
+            CompletionProtocolMode::V2Enforce,
+        )
+        .await;
+
+        let first = continue_archived_workflow_in_simple_core(
+            &db,
+            &EventEmitter::Noop,
+            source,
+            "locator-request-a",
+        )
+        .await
+        .expect("create successor");
+        let replacement_progress = format!(
+            ".superpowers/sdd/{}/replacement-progress.md",
+            first.successor_conversation_id
+        );
+        register_simple_workflow(
+            &db.conn,
+            first.successor_conversation_id,
+            "docs/replacement-plan.md",
+            Some(&replacement_progress),
+        )
+        .await
+        .expect("update descriptor through normal registration");
+
+        let replay = continue_archived_workflow_in_simple_core(
+            &db,
+            &EventEmitter::Noop,
+            source,
+            "locator-request-b",
+        )
+        .await
+        .expect("replay successor");
+
+        assert_eq!(
+            replay.successor_conversation_id,
+            first.successor_conversation_id
+        );
+        assert!(!replay.created);
+        assert_eq!(replay.plan_rel_path, "docs/replacement-plan.md");
+        assert_eq!(replay.progress_rel_path, replacement_progress);
+        assert!(replay.bootstrap_prompt.contains("docs/replacement-plan.md"));
+        assert!(!replay.bootstrap_prompt.contains("`docs/plan.md`"));
+        let bootstraps = bootstrap_rows(&db).await;
+        assert_eq!(bootstraps.len(), 1);
+        assert_eq!(bootstraps[0].client_request_token, "locator-request-a");
+        assert_eq!(bootstraps[0].prompt, replay.bootstrap_prompt);
+    }
+
+    async fn seed_pending_bootstrap_fixture() -> (
+        crate::db::AppDatabase,
+        tempfile::TempDir,
+        SimpleSuccessorResult,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs")).unwrap();
+        std::fs::write(workspace.path().join("docs/plan.md"), "# Plan\n").unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+        let source = seed_conversation(&db, folder, AgentType::Codex).await;
+        seed_archived_workflow(
+            &db,
+            source,
+            &format!("workflow-bootstrap-admission-{source}"),
+            "docs/plan.md",
+            None,
+            2,
+            CompletionProtocolMode::V2Enforce,
+        )
+        .await;
+        let result = continue_archived_workflow_in_simple_core(
+            &db,
+            &EventEmitter::Noop,
+            source,
+            "bootstrap-admission-request",
+        )
+        .await
+        .expect("create pending bootstrap");
+        (db, workspace, result)
+    }
+
+    #[tokio::test]
+    async fn simple_successor_bootstrap_concurrent_admission_sends_once_and_replay_is_noop() {
+        let (db, _workspace, successor) = seed_pending_bootstrap_fixture().await;
+        let db = std::sync::Arc::new(db);
+        let sink = std::sync::Arc::new(RecordingBootstrapSink::blocking_first());
+
+        let first = tokio::spawn({
+            let db = db.clone();
+            let sink = sink.clone();
+            async move {
+                admit_pending_simple_successor_bootstrap(
+                    db.as_ref(),
+                    sink.as_ref(),
+                    "bootstrap-connection-a",
+                    successor.successor_conversation_id,
+                )
+                .await
+            }
+        });
+        sink.entered.notified().await;
+        let second = tokio::spawn({
+            let db = db.clone();
+            let sink = sink.clone();
+            async move {
+                admit_pending_simple_successor_bootstrap(
+                    db.as_ref(),
+                    sink.as_ref(),
+                    "bootstrap-connection-b",
+                    successor.successor_conversation_id,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        sink.release.notify_one();
+        assert!(first.await.unwrap().unwrap());
+        assert!(!second.await.unwrap().unwrap());
+        assert!(!admit_pending_simple_successor_bootstrap(
+            db.as_ref(),
+            sink.as_ref(),
+            "bootstrap-connection-c",
+            successor.successor_conversation_id,
+        )
+        .await
+        .unwrap());
+
+        let calls = sink.calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, successor.successor_conversation_id);
+        assert_eq!(calls[0].2, successor.bootstrap_prompt);
+        assert!(calls[0].3.starts_with("simple-bootstrap-"));
+        assert!(!calls[0].3.starts_with("turn-"));
+        let bootstraps = bootstrap_rows(db.as_ref()).await;
+        assert_eq!(bootstraps[0].status, "admitted");
+        assert!(bootstraps[0].admitted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn simple_successor_bootstrap_send_failure_remains_pending_then_admits_once() {
+        let (db, _workspace, successor) = seed_pending_bootstrap_fixture().await;
+        let sink = RecordingBootstrapSink::failing_once();
+
+        let error = admit_pending_simple_successor_bootstrap(
+            &db,
+            &sink,
+            "bootstrap-failing-connection",
+            successor.successor_conversation_id,
+        )
+        .await
+        .expect_err("controlled prompt failure");
+        assert!(error
+            .to_string()
+            .contains("controlled bootstrap send failure"));
+        let pending = bootstrap_rows(&db).await;
+        assert_eq!(pending[0].status, "pending");
+        assert_eq!(pending[0].admitted_at, None);
+
+        assert!(admit_pending_simple_successor_bootstrap(
+            &db,
+            &sink,
+            "bootstrap-retry-connection",
+            successor.successor_conversation_id,
+        )
+        .await
+        .expect("retry succeeds"));
+        assert!(!admit_pending_simple_successor_bootstrap(
+            &db,
+            &sink,
+            "bootstrap-replay-connection",
+            successor.successor_conversation_id,
+        )
+        .await
+        .expect("admitted replay is a no-op"));
+        assert_eq!(sink.calls().await.len(), 2);
+        assert_eq!(bootstrap_rows(&db).await[0].status, "admitted");
+    }
+
+    #[tokio::test]
+    async fn simple_successor_post_connect_hook_uses_linked_prompt_and_marks_admitted() {
+        let (db, _workspace, successor) = seed_pending_bootstrap_fixture().await;
+        let manager = crate::acp::manager::ConnectionManager::new();
+        let mut receiver = manager
+            .insert_test_connection_live(
+                "bootstrap-real-connection",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        admit_simple_successor_bootstrap_after_connect(
+            &db,
+            &manager,
+            "bootstrap-real-connection",
+            Some(successor.successor_conversation_id),
+        )
+        .await
+        .expect("shared post-connect hook admits bootstrap");
+
+        let command = receiver.recv().await.expect("linked prompt command");
+        let crate::acp::connection::ConnectionCommand::Prompt {
+            blocks,
+            user_message,
+            mark_awaiting_reply,
+            ..
+        } = command
+        else {
+            panic!("expected bootstrap Prompt command");
+        };
+        assert!(mark_awaiting_reply);
+        assert!(matches!(
+            blocks.as_slice(),
+            [crate::acp::types::PromptInputBlock::Text { text }]
+                if text == &successor.bootstrap_prompt
+        ));
+        let (message_id, _) = user_message.expect("foreground user-message projection");
+        assert!(message_id.starts_with("simple-bootstrap-"));
+        assert_eq!(bootstrap_rows(&db).await[0].status, "admitted");
+    }
+
+    #[tokio::test]
+    async fn simple_successor_post_connect_hook_disconnects_failed_connection_and_keeps_pending() {
+        let (db, _workspace, successor) = seed_pending_bootstrap_fixture().await;
+        let manager = crate::acp::manager::ConnectionManager::new();
+        manager
+            .insert_test_connection(
+                "bootstrap-dead-connection",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        let error = admit_simple_successor_bootstrap_after_connect(
+            &db,
+            &manager,
+            "bootstrap-dead-connection",
+            Some(successor.successor_conversation_id),
+        )
+        .await
+        .expect_err("dead prompt lane must fail admission");
+
+        assert!(matches!(error, AcpError::ProcessExited));
+        assert!(!manager
+            .connections
+            .lock()
+            .await
+            .contains_key("bootstrap-dead-connection"));
+        let bootstrap = bootstrap_rows(&db).await;
+        assert_eq!(bootstrap[0].status, "pending");
+        assert_eq!(bootstrap[0].admitted_at, None);
     }
 
     #[test]

@@ -766,7 +766,15 @@ async fn project_manifest_mode(
         successor_conversation_id: successor
             .as_ref()
             .map(|descriptor| descriptor.parent_conversation_id),
-        can_create_simple_successor: successor.is_none(),
+        can_create_simple_successor: !identity_corrupt
+            && successor.is_none()
+            && super::simple::archived_workflow_simple_successor_plan_eligible(
+                conn,
+                &header.workflow_id,
+                header.parent_conversation_id,
+            )
+            .await
+            .unwrap_or(false),
     };
     let projection_warning_codes = if identity_corrupt {
         vec!["workflow_identity_corrupt".to_string()]
@@ -2207,8 +2215,7 @@ async fn project_simple_mode(
 
     let parent_runs = delegation_task_run::Entity::find()
         .filter(
-            delegation_task_run::Column::ParentConversationId
-                .eq(descriptor.parent_conversation_id),
+            delegation_task_run::Column::ParentConversationId.eq(descriptor.parent_conversation_id),
         )
         .order_by_asc(delegation_task_run::Column::CreatedAt)
         .all(conn)
@@ -2259,6 +2266,17 @@ async fn project_simple_mode(
     for task in &plan.tasks {
         let declared = progress_by_index.get(&task.index).copied();
         let mut node_warning_codes = Vec::new();
+        if declared.is_some()
+            && progress
+                .warning_codes
+                .iter()
+                .any(|warning| warning == "simple_progress_plan_path_mismatch")
+        {
+            push_projection_warning(
+                &mut node_warning_codes,
+                "simple_progress_plan_path_mismatch",
+            );
+        }
         let mut task_runs = parent_runs
             .iter()
             .filter(|run| run_matches_task_index(run, task.index))
@@ -2268,7 +2286,10 @@ async fn project_simple_mode(
                 if let Some(task_id) = reference.task_id.as_deref() {
                     match runs_by_id.get(task_id).copied() {
                         Some(run) if run_matches_task_index(run, task.index) => {
-                            if !task_runs.iter().any(|candidate| candidate.task_id == run.task_id) {
+                            if !task_runs
+                                .iter()
+                                .any(|candidate| candidate.task_id == run.task_id)
+                            {
                                 task_runs.push(run);
                             }
                         }
@@ -2284,7 +2305,12 @@ async fn project_simple_mode(
                 }
             }
             if matches!(declared.status, SimpleDeclaredStatus::Completed)
-                && declared.commit.as_deref().map(str::trim).unwrap_or("").is_empty()
+                && declared
+                    .commit
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
             {
                 push_projection_warning(
                     &mut node_warning_codes,
@@ -2433,18 +2459,19 @@ async fn project_simple_mode(
         && nodes
             .iter()
             .all(|node| matches!(node.status, ProjectedNodeStatus::Completed));
-    let all_completed = all_tasks_completed
-        && matches!(final_review, Some(SimpleFinalReviewStatus::Completed));
-    let any_started = nodes.iter().any(|node| {
-        !matches!(node.status, ProjectedNodeStatus::Pending) || node.run_count > 0
-    }) || matches!(
-        final_review,
-        Some(
-            SimpleFinalReviewStatus::InProgress
-                | SimpleFinalReviewStatus::Completed
-                | SimpleFinalReviewStatus::Blocked
-        )
-    );
+    let all_completed =
+        all_tasks_completed && matches!(final_review, Some(SimpleFinalReviewStatus::Completed));
+    let any_started = nodes
+        .iter()
+        .any(|node| !matches!(node.status, ProjectedNodeStatus::Pending) || node.run_count > 0)
+        || matches!(
+            final_review,
+            Some(
+                SimpleFinalReviewStatus::InProgress
+                    | SimpleFinalReviewStatus::Completed
+                    | SimpleFinalReviewStatus::Blocked
+            )
+        );
     let overall_state = if any_blocked {
         WorkflowOverallState::Blocked
     } else if all_completed {
@@ -2467,8 +2494,8 @@ async fn project_simple_mode(
         })
         .map(|node| node.node_id.clone())
         .collect::<Vec<_>>();
-    let current_node_ids = if let Some(active_task_index) = active_task_index
-        .filter(|task_index| plan_indices.contains(task_index))
+    let current_node_ids = if let Some(active_task_index) =
+        active_task_index.filter(|task_index| plan_indices.contains(task_index))
     {
         vec![format!("simple-task-{active_task_index}")]
     } else if current.is_empty() {
@@ -2500,13 +2527,13 @@ async fn project_simple_mode(
         completion: None,
         compatibility: WorkflowCompatibility::Simple,
         overall_state,
-        simple: safe_plan_rel_path
-            .zip(safe_progress_rel_path)
-            .map(|(plan_rel_path, progress_rel_path)| SimpleWorkflowLocatorSnapshot {
+        simple: safe_plan_rel_path.zip(safe_progress_rel_path).map(
+            |(plan_rel_path, progress_rel_path)| SimpleWorkflowLocatorSnapshot {
                 plan_rel_path,
                 progress_rel_path,
                 source_conversation_id,
-            }),
+            },
+        ),
         archived: None,
         projection_warning_codes,
         current_phase_id: (!current_node_ids.is_empty()).then(|| "tasks".into()),
@@ -3188,9 +3215,7 @@ mod tests {
         );
     }
 
-    use crate::acp::delegation::workflow::admission::{
-        AdmissionDispatchKind, WorkflowAdmitInput,
-    };
+    use crate::acp::delegation::workflow::admission::{AdmissionDispatchKind, WorkflowAdmitInput};
     use crate::acp::delegation::workflow::completion_evidence::{
         materialize_terminal_completion_txn, TerminalCompletionInput,
     };
@@ -3210,8 +3235,8 @@ mod tests {
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, ConnectionTrait};
     use sea_orm::Set;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, PaginatorTrait};
     use std::sync::Arc;
 
     async fn admit_workflow_run_txn<C: ConnectionTrait>(
@@ -6066,7 +6091,10 @@ mod tests {
         assert_eq!(pending.compatibility, WorkflowCompatibility::Simple);
         assert_eq!(pending.overall_state, WorkflowOverallState::Pending);
         assert_eq!(pending.current_node_ids, vec!["simple-task-1"]);
-        assert!(pending.gates.is_empty(), "Simple mode must not create gates");
+        assert!(
+            pending.gates.is_empty(),
+            "Simple mode must not create gates"
+        );
 
         insert_run(
             &db,
@@ -6171,6 +6199,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_projection_stale_plan_marks_every_snapshot_task_out_of_sync() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Completed declaration\n\n## Task 2: Active declaration\n",
+        )
+        .expect("write Simple plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+        std::fs::write(
+            std::path::Path::new(&workspace)
+                .join(format!(".superpowers/sdd/{parent}/progress.md")),
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/previous-plan.md","active_task_index":2,"tasks":[{"index":1,"status":"completed","commit":"abc123"},{"index":2,"status":"in_progress"}],"final_review_status":"pending"}
+-->"#,
+        )
+        .expect("write stale same-index progress");
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("Simple snapshot");
+
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.nodes[0].status, ProjectedNodeStatus::Completed);
+        assert_eq!(snapshot.nodes[1].status, ProjectedNodeStatus::InProgress);
+        for node in &snapshot.nodes {
+            assert_eq!(node.sync_state, WorkflowNodeSyncState::OutOfSync);
+            assert!(node
+                .projection_warning_codes
+                .iter()
+                .any(|code| code == "simple_progress_plan_path_mismatch"));
+        }
+    }
+
+    #[tokio::test]
     async fn simple_projection_uses_final_review_state_and_tolerates_missing_plan() {
         let (db, parent) = seed_parent().await;
         let workspace = parent_workspace(&db, parent).await;
@@ -6191,8 +6265,8 @@ mod tests {
         )
         .await
         .expect("register Simple descriptor");
-        let progress_path = std::path::Path::new(&workspace)
-            .join(format!(".superpowers/sdd/{parent}/progress.md"));
+        let progress_path =
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}/progress.md"));
         std::fs::write(
             &progress_path,
             r#"<!-- codeg-simple-progress-v1
@@ -6316,6 +6390,113 @@ mod tests {
         assert_eq!(archived.source_conversation_id, archived_parent);
         assert_eq!(archived.successor_conversation_id, Some(successor));
         assert!(!archived.can_create_simple_successor);
+    }
+
+    #[tokio::test]
+    async fn simple_projection_archived_advertises_successor_only_for_readable_bounded_utf8_plan() {
+        enum PlanCase {
+            Eligible,
+            Missing,
+            Oversized,
+            InvalidUtf8,
+        }
+
+        for (case, expected) in [
+            (PlanCase::Eligible, true),
+            (PlanCase::Missing, false),
+            (PlanCase::Oversized, false),
+            (PlanCase::InvalidUtf8, false),
+        ] {
+            let (db, parent) = seed_parent().await;
+            let published = publish_workflow_manifest_fixture(
+                &db,
+                &emitter(),
+                parent,
+                PublishWorkflowRequest {
+                    document: design_plan_doc(&format!("archived-plan-eligibility-{parent}")),
+                },
+            )
+            .await
+            .expect("publish archived manifest");
+            let workspace = parent_workspace(&db, parent).await;
+            let plan_path = std::path::Path::new(&workspace).join("docs/superpowers/plans/p.md");
+            match case {
+                PlanCase::Eligible => {}
+                PlanCase::Missing => std::fs::remove_file(&plan_path).expect("remove Plan"),
+                PlanCase::Oversized => std::fs::write(
+                    &plan_path,
+                    vec![
+                        b'x';
+                        crate::acp::delegation::workflow::plan_material::MAX_PLAN_MATERIAL_BYTES
+                            + 1
+                    ],
+                )
+                .expect("write oversized Plan"),
+                PlanCase::InvalidUtf8 => {
+                    std::fs::write(&plan_path, [0xff, 0xfe]).expect("write invalid UTF-8 Plan")
+                }
+            }
+            let descriptors_before = simple_workflow::Entity::find()
+                .count(&db.conn)
+                .await
+                .expect("descriptor count");
+
+            let snapshot = project_workflow_graph_core(&db, parent)
+                .await
+                .expect("archived graph");
+            let archived = snapshot.archived.expect("archived navigation");
+
+            assert_eq!(archived.successor_conversation_id, None);
+            assert_eq!(archived.can_create_simple_successor, expected);
+            assert_eq!(
+                simple_workflow::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .expect("descriptor count after projection"),
+                descriptors_before
+            );
+            assert_eq!(
+                snapshot.workflow_id,
+                Some(safe_public_id(&published.workflow_id))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_projection_archived_corrupt_identity_never_advertises_successor_creation() {
+        let (db, parent) = seed_parent().await;
+        publish_workflow_manifest_fixture(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("archived-corrupt-no-successor"),
+            },
+        )
+        .await
+        .expect("publish archived manifest");
+        let now = Utc::now();
+        simple_workflow::ActiveModel {
+            parent_conversation_id: Set(parent),
+            plan_rel_path: Set("docs/conflicting.md".into()),
+            progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
+            source_workflow_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("conflicting Simple identity");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("corrupt archived graph");
+        assert!(
+            !snapshot
+                .archived
+                .expect("archived navigation")
+                .can_create_simple_successor
+        );
     }
 
     #[test]

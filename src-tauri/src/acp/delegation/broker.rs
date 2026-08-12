@@ -36145,7 +36145,7 @@ mod tests {
                 .expect("retired broker report must carry navigation");
             assert_eq!(navigation.source_conversation_id, Some(parent_id));
             assert_eq!(navigation.successor_conversation_id, None);
-            assert!(navigation.can_create_simple_successor);
+            assert!(!navigation.can_create_simple_successor);
 
             let wire = serde_json::to_value(report).unwrap();
             assert_eq!(
@@ -36153,7 +36153,7 @@ mod tests {
                 serde_json::json!({
                     "source_conversation_id": parent_id,
                     "successor_conversation_id": null,
-                    "can_create_simple_successor": true,
+                    "can_create_simple_successor": false,
                 })
             );
             assert_eq!(

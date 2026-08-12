@@ -60,11 +60,10 @@ pub use completion_projection::{
     COMPLETION_CARD_SUMMARY_MAX_BYTES,
 };
 pub use dto::{
-    redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
-    ArchivedWorkflowNavigationSnapshot, SimpleWorkflowLocatorSnapshot, WorkflowCompatibility,
-    WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot,
-    WorkflowNodeSyncState, WorkflowOverallState, WorkflowPhaseSnapshot,
-    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    redact_display_string, safe_public_id, ArchivedWorkflowNavigationSnapshot, ProjectedNodeStatus,
+    PublicIdAllocator, SimpleWorkflowLocatorSnapshot, WorkflowCompatibility, WorkflowEdgeSnapshot,
+    WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowNodeSyncState,
+    WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) use error::historical_workflow_fixture_mutations_enabled;
@@ -72,8 +71,7 @@ pub(crate) use error::historical_workflow_fixture_mutations_enabled;
 pub use error::with_historical_workflow_fixture_mutations;
 pub use error::{
     require_v2_mutation, require_v2_mutation_for_connection,
-    require_writable_conversation_workflow,
-    workflow_v2_publication_retired_for_conversation,
+    require_writable_conversation_workflow, workflow_v2_publication_retired_for_conversation,
     workflow_v2_retired_for_conversation, CompletionEvidenceError,
     CompletionProtocolConfigurationRemoved, CompletionRecoveryFenceError, WorkflowStoreError,
     WORKFLOW_V2_RETIRED_MESSAGE,
@@ -129,9 +127,11 @@ pub use recovery_policy::{
     WorkflowRecoveryRiskClass, WorkflowRecoverySnapshot, WorkflowRecoveryStopCode,
 };
 pub use simple::{
-    load_simple_workflow, register_simple_workflow, register_simple_workflow_with_source,
-    resolve_conversation_workflow_mode, ConversationWorkflowMode, SimpleWorkflowError,
-    SimpleWorkflowRegistration,
+    archived_workflow_simple_successor_plan_eligible, eligible_simple_successor_plan,
+    load_simple_workflow, normalize_simple_successor_plan_locator, register_simple_workflow,
+    register_simple_workflow_with_source, resolve_conversation_workflow_mode,
+    ConversationWorkflowMode, SimpleWorkflowError, SimpleWorkflowRegistration,
+    MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES,
 };
 pub use simple_parse::{
     parse_simple_plan, parse_simple_progress, read_simple_plan, read_simple_progress,
@@ -147,6 +147,8 @@ pub use state_dto::{
     WorkflowStateDto, WorkflowStateIndexDto, DIGEST_PREFIX_HEX_CHARS, INDEX_MAX_FINDING_STUBS,
     INDEX_MAX_NODES,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use store::publish_workflow_manifest_fixture;
 pub use store::{
     append_state_only_revision_txn, append_workflow_block_revision_txn,
     estimated_plan_publication_material_decision, get_workflow_state_core,
@@ -159,8 +161,6 @@ pub use store::{
     StateOnlyRevisionResult, WorkflowBlockEntryRequest, WorkflowPublicationDisposition,
     WorkflowRecoveryRequiredProjection, WORKFLOW_CAPABILITY_VERSION,
 };
-#[cfg(any(test, feature = "test-utils"))]
-pub use store::publish_workflow_manifest_fixture;
 #[cfg(test)]
 use store::{
     settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core, SettleGateEvidence,

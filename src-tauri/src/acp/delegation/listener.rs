@@ -8783,7 +8783,7 @@ mod tests {
                     );
                     assert_eq!(response["error"]["source_conversation_id"], fixture.parent_id);
                     assert_eq!(response["error"]["successor_conversation_id"], Value::Null);
-                    assert_eq!(response["error"]["can_create_simple_successor"], true);
+                    assert_eq!(response["error"]["can_create_simple_successor"], false);
                 }
                 assert_eq!(
                     delegation_completion_tool_intent::Entity::find()

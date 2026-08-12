@@ -1,0 +1,58 @@
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum SimpleSuccessorBootstrapStatus {
+    #[sea_orm(string_value = "pending")]
+    Pending,
+    #[sea_orm(string_value = "admitted")]
+    Admitted,
+}
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "simple_successor_bootstraps")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i32,
+    #[sea_orm(unique)]
+    pub successor_conversation_id: i32,
+    #[sea_orm(unique)]
+    pub source_workflow_id: String,
+    pub client_request_token: String,
+    #[sea_orm(column_type = "Text")]
+    pub prompt: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub admitted_prompt: Option<String>,
+    pub status: SimpleSuccessorBootstrapStatus,
+    pub admitted_at: Option<DateTimeUtc>,
+    pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::simple_workflow::Entity",
+        from = "Column::SuccessorConversationId",
+        to = "super::simple_workflow::Column::ParentConversationId",
+        on_delete = "Cascade"
+    )]
+    SuccessorWorkflow,
+    #[sea_orm(
+        belongs_to = "super::delegation_workflow::Entity",
+        from = "Column::SourceWorkflowId",
+        to = "super::delegation_workflow::Column::WorkflowId",
+        on_delete = "Cascade"
+    )]
+    SourceWorkflow,
+}
+
+impl Related<super::simple_workflow::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SuccessorWorkflow.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}

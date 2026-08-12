@@ -10,14 +10,15 @@ use sea_orm::{
 use thiserror::Error;
 
 use crate::db::entities::{
-    conversation, delegation_task_run, delegation_workflow, delegation_workflow_run_binding,
-    simple_workflow,
+    conversation, delegation_task_run, delegation_workflow, delegation_workflow_manifest_revision,
+    delegation_workflow_run_binding, folder, simple_workflow,
 };
 
 use super::key::{normalize_rel_path, parse_recognized_work_unit_key};
-use super::types::WorkflowError;
+use super::types::{ManifestDocument, WorkflowError};
 
 const WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY: &str = "brainstorm_to_delivery";
+pub const MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConversationWorkflowMode {
@@ -102,9 +103,7 @@ impl SimpleWorkflowError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "workflow_invalid_path",
-            Self::ConversationNotFound(_) | Self::SourceWorkflowNotFound(_) => {
-                "workflow_not_found"
-            }
+            Self::ConversationNotFound(_) | Self::SourceWorkflowNotFound(_) => "workflow_not_found",
             Self::ModeConflict { .. }
             | Self::IdentityCorrupt { .. }
             | Self::SourceWorkflowMismatch => "workflow_mode_conflict",
@@ -119,6 +118,80 @@ fn db_error(error: sea_orm::DbErr) -> SimpleWorkflowError {
 
 pub fn default_simple_progress_rel_path(parent_conversation_id: i32) -> String {
     format!(".superpowers/sdd/{parent_conversation_id}/progress.md")
+}
+
+pub fn normalize_simple_successor_plan_locator(rel_path: &str) -> Option<String> {
+    if rel_path.len() > MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES {
+        return None;
+    }
+    let normalized = normalize_rel_path(rel_path).ok()?;
+    (normalized.len() <= MAX_SIMPLE_SUCCESSOR_LOCATOR_BYTES).then_some(normalized)
+}
+
+pub async fn eligible_simple_successor_plan(
+    workspace: &std::path::Path,
+    rel_path: &str,
+) -> Option<String> {
+    let normalized = normalize_simple_successor_plan_locator(rel_path)?;
+    super::simple_parse::read_simple_plan(workspace, &normalized)
+        .await
+        .ok()?;
+    Some(normalized)
+}
+
+pub async fn archived_workflow_simple_successor_plan_eligible<C: ConnectionTrait>(
+    conn: &C,
+    workflow_id: &str,
+    source_conversation_id: i32,
+) -> Result<bool, SimpleWorkflowError> {
+    let Some(workflow) = delegation_workflow::Entity::find_by_id(workflow_id)
+        .one(conn)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(false);
+    };
+    if workflow.parent_conversation_id != source_conversation_id {
+        return Ok(false);
+    }
+    let Some(source) = conversation::Entity::find_by_id(source_conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(false);
+    };
+    if source.parent_id.is_some() {
+        return Ok(false);
+    }
+    let Some(workspace) = folder::Entity::find_by_id(source.folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .one(conn)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(revision) = delegation_workflow_manifest_revision::Entity::find_by_id((
+        workflow_id.to_string(),
+        workflow.active_manifest_revision,
+    ))
+    .one(conn)
+    .await
+    .map_err(db_error)?
+    else {
+        return Ok(false);
+    };
+    let Ok(document) = serde_json::from_str::<ManifestDocument>(&revision.document_json) else {
+        return Ok(false);
+    };
+    Ok(eligible_simple_successor_plan(
+        std::path::Path::new(&workspace.path),
+        &document.plan_target_rel_path,
+    )
+    .await
+    .is_some())
 }
 
 pub async fn load_simple_workflow<C: ConnectionTrait>(
@@ -155,9 +228,7 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
 
     let workflow = delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
-        .filter(
-            delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-        )
+        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
         .one(conn)
         .await
         .map_err(db_error)?;
@@ -307,7 +378,9 @@ async fn root_conversation_id<C: ConnectionTrait>(
         .one(conn)
         .await
         .map_err(db_error)?;
-    Ok(run_parent.or(conversation.parent_id).unwrap_or(conversation.id))
+    Ok(run_parent
+        .or(conversation.parent_id)
+        .unwrap_or(conversation.id))
 }
 
 async fn bound_workflows<C: ConnectionTrait>(
@@ -355,9 +428,7 @@ pub async fn resolve_conversation_workflow_mode<C: ConnectionTrait>(
     let mut workflows = bound_workflows(conn, conversation_id).await?;
     let root_workflows = delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::ParentConversationId.eq(fallback_root))
-        .filter(
-            delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-        )
+        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
         .all(conn)
         .await
         .map_err(db_error)?;
@@ -421,9 +492,7 @@ mod tests {
         resolve_conversation_workflow_mode, ConversationWorkflowMode,
     };
     use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
-    use crate::db::entities::delegation_workflow::{
-        self, CompletionProtocolMode, WorkflowState,
-    };
+    use crate::db::entities::delegation_workflow::{self, CompletionProtocolMode, WorkflowState};
     use crate::db::entities::delegation_workflow_run_binding;
     use crate::db::entities::simple_workflow;
     use crate::db::service::conversation_service;
@@ -460,12 +529,7 @@ mod tests {
         .expect("workflow header");
     }
 
-    async fn seed_recognized_run(
-        db: &AppDatabase,
-        parent: i32,
-        child: i32,
-        task_id: &str,
-    ) {
+    async fn seed_recognized_run(db: &AppDatabase, parent: i32, child: i32, task_id: &str) {
         let now = Utc::now();
         delegation_task_run::ActiveModel {
             task_id: Set(task_id.into()),
@@ -523,31 +587,26 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/simple-register").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
 
-        let created = register_simple_workflow(
-            &db.conn,
-            parent,
-            "./docs//superpowers/plans/plan.md",
-            None,
-        )
-        .await
-        .expect("register");
+        let created =
+            register_simple_workflow(&db.conn, parent, "./docs//superpowers/plans/plan.md", None)
+                .await
+                .expect("register");
         assert!(created.created);
         assert!(!created.updated);
-        assert_eq!(created.descriptor.plan_rel_path, "docs/superpowers/plans/plan.md");
+        assert_eq!(
+            created.descriptor.plan_rel_path,
+            "docs/superpowers/plans/plan.md"
+        );
         assert_eq!(
             created.descriptor.progress_rel_path,
             format!(".superpowers/sdd/{parent}/progress.md")
         );
         let original_created_at = created.descriptor.created_at;
 
-        let replay = register_simple_workflow(
-            &db.conn,
-            parent,
-            "docs/superpowers/plans/plan.md",
-            None,
-        )
-        .await
-        .expect("idempotent replay");
+        let replay =
+            register_simple_workflow(&db.conn, parent, "docs/superpowers/plans/plan.md", None)
+                .await
+                .expect("idempotent replay");
         assert!(!replay.created);
         assert!(!replay.updated);
         assert_eq!(replay.descriptor.created_at, original_created_at);
@@ -562,7 +621,10 @@ mod tests {
         .expect("locator update");
         assert!(!updated.created);
         assert!(updated.updated);
-        assert_eq!(updated.descriptor.plan_rel_path, "docs/superpowers/plans/revised.md");
+        assert_eq!(
+            updated.descriptor.plan_rel_path,
+            "docs/superpowers/plans/revised.md"
+        );
         assert_eq!(
             updated.descriptor.progress_rel_path,
             ".superpowers/sdd/custom/progress.md"

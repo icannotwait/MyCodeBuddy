@@ -389,6 +389,7 @@ pub async fn require_v2_mutation_for_connection<C: ConnectionTrait>(
 #[derive(Debug)]
 struct ArchivedWorkflowNavigation {
     source_conversation_id: i32,
+    workflow_id: String,
     successor_conversation_id: Option<i32>,
     completion_protocol_version: i64,
     completion_protocol_mode: CompletionProtocolMode,
@@ -404,9 +405,7 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
             .select_only()
             .column(delegation_workflow::Column::WorkflowId)
             .filter(delegation_workflow::Column::ParentConversationId.eq(conversation_id))
-            .filter(
-                delegation_workflow::Column::WorkflowKind.eq("brainstorm_to_delivery"),
-            )
+            .filter(delegation_workflow::Column::WorkflowKind.eq("brainstorm_to_delivery"))
             .into_tuple::<String>()
             .all(conn)
             .await
@@ -474,7 +473,7 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
     }
 
     let successors = simple_workflow::Entity::find()
-        .filter(simple_workflow::Column::SourceWorkflowId.eq(workflow_id))
+        .filter(simple_workflow::Column::SourceWorkflowId.eq(workflow_id.clone()))
         .all(conn)
         .await
         .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?;
@@ -486,6 +485,7 @@ async fn archived_workflow_navigation<C: ConnectionTrait>(
 
     Ok(Some(ArchivedWorkflowNavigation {
         source_conversation_id: parent_conversation_id,
+        workflow_id,
         successor_conversation_id: successors
             .into_iter()
             .next()
@@ -510,7 +510,14 @@ pub async fn workflow_v2_retired_for_conversation<C: ConnectionTrait>(
                 WorkflowStoreError::workflow_v2_retired_with_navigation(
                     navigation.source_conversation_id,
                     navigation.successor_conversation_id,
-                    navigation.successor_conversation_id.is_none(),
+                    navigation.successor_conversation_id.is_none()
+                        && super::simple::archived_workflow_simple_successor_plan_eligible(
+                            conn,
+                            &navigation.workflow_id,
+                            navigation.source_conversation_id,
+                        )
+                        .await
+                        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
                 )
             }
             other => other,
@@ -540,7 +547,14 @@ pub async fn workflow_v2_publication_retired_for_conversation<C: ConnectionTrait
         return Ok(WorkflowStoreError::workflow_v2_retired_with_navigation(
             navigation.source_conversation_id,
             navigation.successor_conversation_id,
-            navigation.successor_conversation_id.is_none(),
+            navigation.successor_conversation_id.is_none()
+                && super::simple::archived_workflow_simple_successor_plan_eligible(
+                    conn,
+                    &navigation.workflow_id,
+                    navigation.source_conversation_id,
+                )
+                .await
+                .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
         ));
     }
 
@@ -577,7 +591,14 @@ pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
                 Err(WorkflowStoreError::workflow_v2_retired_with_navigation(
                     navigation.source_conversation_id,
                     navigation.successor_conversation_id,
-                    navigation.successor_conversation_id.is_none(),
+                    navigation.successor_conversation_id.is_none()
+                        && super::simple::archived_workflow_simple_successor_plan_eligible(
+                            conn,
+                            &navigation.workflow_id,
+                            navigation.source_conversation_id,
+                        )
+                        .await
+                        .map_err(|error| WorkflowStoreError::Persistence(error.to_string()))?,
                 ))
             }
             result => result,
@@ -661,13 +682,10 @@ mod tests {
         assert_eq!(fixture_error, "fixture failed");
 
         for db in [&fixture_db, &ordinary_db] {
-            let error = require_v2_mutation_for_connection(
-                &db.conn,
-                2,
-                &CompletionProtocolMode::V2Enforce,
-            )
-            .await
-            .unwrap_err();
+            let error =
+                require_v2_mutation_for_connection(&db.conn, 2, &CompletionProtocolMode::V2Enforce)
+                    .await
+                    .unwrap_err();
             assert_eq!(error.code(), "workflow_v2_retired");
         }
         assert_eq!(
@@ -683,9 +701,7 @@ mod tests {
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, Set};
 
-        use crate::db::entities::delegation_task_run::{
-            self, AdmissionClass, DelegationRunStatus,
-        };
+        use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
         use crate::db::entities::{
             delegation_workflow, delegation_workflow_run_binding, simple_workflow,
         };
@@ -800,14 +816,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writable_guard_allows_ordinary_simple_and_no_manifest_a1_but_rejects_corrupt_identity(
-    ) {
+    async fn workflow_v2_retired_advertises_successor_only_for_readable_bounded_utf8_plan() {
+        use sea_orm::{EntityTrait, PaginatorTrait};
+
+        use crate::commands::simple_workflow::test_support::seed_archived_workflow;
+        use crate::db::entities::{conversation, simple_workflow};
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        enum PlanCase {
+            Eligible,
+            Missing,
+            Oversized,
+            InvalidUtf8,
+        }
+
+        for (case, expected) in [
+            (PlanCase::Eligible, true),
+            (PlanCase::Missing, false),
+            (PlanCase::Oversized, false),
+            (PlanCase::InvalidUtf8, false),
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::create_dir_all(workspace.path().join("docs")).expect("create docs");
+            let plan_path = workspace.path().join("docs/plan.md");
+            std::fs::write(&plan_path, "# Plan\n").expect("write eligible Plan");
+            let db = fresh_in_memory_db().await;
+            let folder = seed_folder(&db, workspace.path().to_str().unwrap()).await;
+            let root = seed_conversation(&db, folder, AgentType::Codex).await;
+            seed_archived_workflow(
+                &db,
+                root,
+                &format!("workflow-retired-plan-eligibility-{root}"),
+                "docs/plan.md",
+                None,
+                2,
+                CompletionProtocolMode::V2Enforce,
+            )
+            .await;
+            match case {
+                PlanCase::Eligible => {}
+                PlanCase::Missing => std::fs::remove_file(&plan_path).expect("remove Plan"),
+                PlanCase::Oversized => std::fs::write(
+                    &plan_path,
+                    vec![
+                        b'x';
+                        crate::acp::delegation::workflow::plan_material::MAX_PLAN_MATERIAL_BYTES
+                            + 1
+                    ],
+                )
+                .expect("write oversized Plan"),
+                PlanCase::InvalidUtf8 => {
+                    std::fs::write(&plan_path, [0xff, 0xfe]).expect("write invalid UTF-8 Plan")
+                }
+            }
+            let conversations_before = conversation::Entity::find()
+                .count(&db.conn)
+                .await
+                .expect("conversation count");
+            let descriptors_before = simple_workflow::Entity::find()
+                .count(&db.conn)
+                .await
+                .expect("descriptor count");
+
+            for error in [
+                workflow_v2_retired_for_conversation(&db.conn, root)
+                    .await
+                    .expect("retired navigation"),
+                require_writable_conversation_workflow(&db.conn, root)
+                    .await
+                    .expect_err("archived root remains read-only"),
+            ] {
+                assert_eq!(error.code(), "workflow_v2_retired");
+                assert_eq!(error.to_string(), WORKFLOW_V2_RETIRED_MESSAGE);
+                assert_eq!(error.source_conversation_id(), Some(root));
+                assert_eq!(error.successor_conversation_id(), None);
+                assert_eq!(error.can_create_simple_successor(), Some(expected));
+            }
+            assert_eq!(
+                conversation::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .expect("conversation count after guards"),
+                conversations_before
+            );
+            assert_eq!(
+                simple_workflow::Entity::find()
+                    .count(&db.conn)
+                    .await
+                    .expect("descriptor count after guards"),
+                descriptors_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writable_guard_allows_ordinary_simple_and_no_manifest_a1_but_rejects_corrupt_identity()
+    {
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
-        use crate::db::entities::delegation_task_run::{
-            self, AdmissionClass, DelegationRunStatus,
-        };
+        use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
         use crate::db::entities::delegation_workflow::{self, WorkflowState};
         use crate::db::entities::{conversation, simple_workflow};
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
